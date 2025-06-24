@@ -102,11 +102,11 @@ class StairCmd(HLIPCommandTerm):
 
 
     def box_center(
-              self,
-     x: torch.Tensor,
-     y: torch.Tensor,
-     origin: torch.Tensor,
-     cfg
+          self,
+          x: torch.Tensor,
+          y: torch.Tensor,
+          origin: torch.Tensor,
+          cfg
      ) -> torch.Tensor:
      """
      For each (x, y), returns the 3D center of the box it lies in:
@@ -207,6 +207,34 @@ class StairCmd(HLIPCommandTerm):
 
      return centers, bounds_lo, bounds_hi
 
+
+    def check_height(self,local_offsets):
+     terrain_importer = self.env.scene.terrain
+     env_origins = terrain_importer.env_origins           # (N, 3) world-space origin per env
+     terrain_origins = terrain_importer.terrain_origins   # (rows, cols, 3)
+     cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['pyramid_stairs']
+     cell_x, cell_y = cfg.size
+
+     # 2) Compute world-frame desired foot positions from stance-foot frame offsets
+     #    Local offset in stance-foot frame (N,3)
+     
+
+     # 3) Map desired XY into terrain grid-local frame
+     # local_xy = desired_world[:, :2] - env_origins[:, :2]       # (N,2)
+
+     # 4) Determine subterrain cell indices
+     desired_world = self.stance_foot_pos_0 + local_offsets           # (N,3)
+     idx_i, idx_j = self.find_grid_idx(self.stance_foot_pos_0, terrain_origins)
+
+     # 5) Fetch each cell's world origin
+     cell_origins = terrain_origins[idx_i, idx_j]               # (N,3)
+
+     box_center, box_bounds_lo, box_bounds_hi = self.box_center(desired_world[:,0], desired_world[:,1], cell_origins, cfg)
+
+     #height change relative to the initial height
+     stance_foot_box_center, stance_foot_box_bounds_lo, stance_foot_box_bounds_hi = self.box_center(self.stance_foot_pos_0[:,0], self.stance_foot_pos_0[:,1], cell_origins, cfg)
+     return box_center, box_bounds_lo, box_bounds_hi, stance_foot_box_center
+
     def update_z_height(self, Ux: torch.Tensor, Uy: torch.Tensor) -> torch.Tensor:
           """
           Compute and return the stair height under a desired foot target, where Ux and Uy
@@ -221,32 +249,10 @@ class StairCmd(HLIPCommandTerm):
                height_under_foot (Tensor[N]): absolute world Z heights at each target
           """
           # 1) Terrain importer & configs
-          terrain_importer = self.env.scene.terrain
-          env_origins = terrain_importer.env_origins           # (N, 3) world-space origin per env
-          terrain_origins = terrain_importer.terrain_origins   # (rows, cols, 3)
-          cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['pyramid_stairs']
-          cell_x, cell_y = cfg.size
-
-          # 2) Compute world-frame desired foot positions from stance-foot frame offsets
-          #    Local offset in stance-foot frame (N,3)
           local_offsets = torch.stack([Ux, Uy, torch.zeros_like(Ux)], dim=-1)
-          #    Rotate into world frame using stance-foot orientation
-          #    assume self.stance_foot_quat_0 is (N,4) quaternion of stance foot in world
           desired_world = self.stance_foot_pos_0 + local_offsets           # (N,3)
-
-          # 3) Map desired XY into terrain grid-local frame
-          # local_xy = desired_world[:, :2] - env_origins[:, :2]       # (N,2)
-
-          # 4) Determine subterrain cell indices
-          idx_i, idx_j = self.find_grid_idx(self.stance_foot_pos_0, terrain_origins)
-
-          # 5) Fetch each cell's world origin
-          cell_origins = terrain_origins[idx_i, idx_j]               # (N,3)
-
-          box_center, box_bounds_lo, box_bounds_hi = self.box_center(desired_world[:,0], desired_world[:,1], cell_origins, cfg)
-
-          #height change relative to the initial height
-          stance_foot_box_center, stance_foot_box_bounds_lo, stance_foot_box_bounds_hi = self.box_center(self.stance_foot_pos_0[:,0], self.stance_foot_pos_0[:,1], cell_origins, cfg)
+          
+          box_center, box_bounds_lo, box_bounds_hi, stance_foot_box_center = self.check_height(local_offsets)
           self.z_height = box_center[:, 2] - stance_foot_box_center[:, 2]
           self.stance_foot_box_z = stance_foot_box_center[:, 2]
           self.target_foot_box_center = box_center
@@ -662,7 +668,7 @@ class StairCmd(HLIPCommandTerm):
                Xdesire=y0,
           )
           # Concatenate x and y components
-          com_z = torch.ones((N,), device=self.device) * self.com_z + self.phase_var * self.z_height
+          com_z = torch.ones((N,), device=self.device) * self.com_z 
           com_zd = torch.ones((N), device=self.device) * self.z_height/T
           com_pos_des = torch.stack([com_x, com_y,com_z], dim=-1)  # Shape: (N,2)
           com_vel_des = torch.stack([com_xd, com_yd,com_zd], dim=-1)  # Shape: (N,2)
@@ -675,8 +681,12 @@ class StairCmd(HLIPCommandTerm):
 
           # clip foot target based on kinematic range
           self.foot_target = foot_target[:,0:2]
-
-          z_sw_max_tensor = self.cfg.z_sw_max + self.z_height
+          start_box_center,_,_,_ = self.check_height(self.swing2stance_foot_pos_0)
+          delta_z = start_box_center[:,2] - self.stance_foot_box_z
+ 
+          # if going down stairs, no need to modify z_sw_max only modify z_sw_neg
+          z_sw_max_tensor = torch.where(self.z_height < 0, self.cfg.z_sw_max, self.cfg.z_sw_max +self.z_height)
+          z_sw_max_tensor = torch.where(z_sw_max_tensor<start_box_center[:,2], self.cfg.z_sw_max +delta_z,z_sw_max_tensor)
           z_sw_neg_tensor = self.cfg.z_sw_min + self.z_height
 
           # Create horizontal control points with batch dimension
@@ -697,11 +707,23 @@ class StairCmd(HLIPCommandTerm):
           # Convert bht to tensor if it's not already
           bht_tensor = torch.tensor(bht, device=self.device) if not isinstance(bht, torch.Tensor) else bht
 
+          # check if sw_z is actually above the stair
+          
+          
+          
           sign = torch.sign(foot_target[:, 1])
           foot_pos, sw_z = calculate_cur_swing_foot_pos_stair(
-               bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
+               bht_tensor, delta_z, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
                foot_target[:, 0], foot_target[:, 1]
           )
+
+          targ_box_center,_,_,_ = self.check_height(foot_pos)
+          # choose clearances (metres)
+          clr_peak = 0.02                # 4 cm at t = 0.5
+          # margin_t = clr_peak * (3 * bht * (1 - bht)**2)   # [B]
+          margin_t = torch.zeros((N), device=self.device)
+          z_req = targ_box_center[:, 2] - self.stance_foot_box_z + margin_t
+          foot_pos[:, 2] = torch.maximum(foot_pos[:, 2], z_req)
 
           flat_foot_pos, flat_sw_z = calculate_cur_swing_foot_pos(
                bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,

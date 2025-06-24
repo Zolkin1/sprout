@@ -78,7 +78,7 @@ class StairPPOCfg(PPORunnerCfg):
         height_map_shape=(1, 25,25),
     )
     resume = True
-    resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/stair/g1/2025-06-19_09-41-08/model_38600.pt"
+    resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/height-scan-flat/g1/2025-06-18_13-27-29/model_3600.pt"
 
 
 

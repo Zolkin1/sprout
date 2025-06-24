@@ -439,10 +439,13 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.1,0.1)
         # STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.1,0.1)
         # self.scene.terrain.terrain_generator = STAIR_CFG
-        STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.1,0.15)
-        STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.1,0.15)
-        STAIR_CFG.sub_terrains["pyramid_stairs"].holes = True
-        STAIR_CFG.sub_terrains["pyramid_stairs_inv"].holes = True
+        stair_range = (0.05,0.05)
+        STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = stair_range
+        STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = stair_range
+        STAIR_CFG.sub_terrains["stairs_inv_w_hole"].step_height_range = stair_range
+        STAIR_CFG.sub_terrains["stairs_w_hole"].step_height_range = stair_range
+        # STAIR_CFG.sub_terrains["pyramid_stairs"].holes = True
+        # STAIR_CFG.sub_terrains["pyramid_stairs_inv"].holes = True
         # STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.025,0.025)
         # del STAIR_CFG.sub_terrains["pyramid_stairs_inv"]
         # del STAIR_CFG.sub_terrains["pyramid_stairs"]
@@ -451,7 +454,7 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # del STAIR_CFG.sub_terrains["flat_stairs_inv"]
         # del STAIR_CFG.sub_terrains["flat_stairs"]
         self.scene.terrain.terrain_generator = STAIR_CFG
-        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 2
 
 
