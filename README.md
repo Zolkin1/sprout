@@ -153,6 +153,10 @@ python /robot_rl/scripts/rsl_rl/play.py --task=G1-vel --num_envs=10 --checkpoint
 First, set the environment variable `ROBOT_RL_ROOT` to the repo path.
 
 
-## Other Deps
+# Other Deps
 pygame
 mujoco
+
+# Updating IsaacLab
+Go to the IsaacLab directory (where you cloned it). Then pull the version you want from git. 
+Then in that folder run `./isaaclab.sh --install`.
