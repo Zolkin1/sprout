@@ -12,7 +12,7 @@ After Obelisk has been built you can just run
 ```
 obk-build
 ```
-and 
+and
 ```
 obk-clean
 ```
@@ -60,7 +60,7 @@ You can make sure that you can see the remote control with
 sudo evtest
 ```
 
-Then you can run 
+Then you can run
 ```
 sudo chmod 666 /dev/input/eventX
 ```

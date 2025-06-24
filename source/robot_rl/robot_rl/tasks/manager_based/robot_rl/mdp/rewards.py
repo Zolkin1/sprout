@@ -5,19 +5,17 @@
 
 from __future__ import annotations
 
-import torch
 import math
 from typing import TYPE_CHECKING
 
+import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import wrap_to_pi
 from isaaclab.sensors import ContactSensor
-from isaaclab.markers import VisualizationMarkers
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
 
 def feet_air_time_positive_biped(env, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Reward long steps taken by the feet for bipeds.
@@ -46,10 +44,13 @@ def feet_air_time_positive_biped(env, command_name: str, sensor_cfg: SceneEntity
     reward *= torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
     return reward
 
-def foot_clearance(env: ManagerBasedRLEnv,
-                   target_height: float,
-                   sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
-                   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
+
+def foot_clearance(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
     """Reward foot clearance."""
     asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -64,28 +65,31 @@ def foot_clearance(env: ManagerBasedRLEnv,
 
     return torch.sum(pos_error, dim=(1))
 
+
 def phase_contact(
     env: ManagerBasedRLEnv,
-        period: float = 0.8,
-        command_name: str | None = None,
+    period: float = 0.8,
+    command_name: str | None = None,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Reward foot contact with regards to phase."""
-    asset: Articulation = env.scene[asset_cfg.name]
+    # asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     # Get contact state
     res = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
 
     # Contact phase
-    tp = (env.sim.current_time % period) / period     # Scaled between 0-1
-    phi_c = torch.tensor(math.sin(2*torch.pi*tp)/math.sqrt(math.sin(2*torch.pi*tp)**2 + 0.04), device=env.device)
+    tp = (env.sim.current_time % period) / period  # Scaled between 0-1
+    phi_c = torch.tensor(
+        math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp) ** 2 + 0.04), device=env.device
+    )
 
     stance_i = 0
     if phi_c > 0:
         stance_i = 1
 
-     # check if robot needs to be standing
+    # check if robot needs to be standing
     if command_name is not None:
         command_norm = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
         is_small_command = command_norm < 0.005
@@ -93,23 +97,31 @@ def phase_contact(
             is_stance = stance_i == i
             # set is_stance to be true if the command is small
             is_stance = is_stance | is_small_command
-            contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
+            contact = (
+                contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0]
+                > 1.0
+            )
             res += ~(contact ^ is_stance)
     else:
         for i in range(2):
             is_stance = stance_i == i
             # set is_stance to be true if the command is small
-            is_stance = is_stance
-            contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
+            contact = (
+                contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0]
+                > 1.0
+            )
             res += ~(contact ^ is_stance)
     return res
 
-def contact_no_vel(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+
+def contact_no_vel(
+    env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """Reward feet contact with zero velocity."""
     # extract the used quantities (to enable type-hinting)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     contacts = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
     asset = env.scene[asset_cfg.name]
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids] * contacts.unsqueeze(-1)
-    penalize = torch.square(body_vel[:,:,:3])
-    return torch.sum(penalize, dim=(1,2))
+    penalize = torch.square(body_vel[:, :, :3])
+    return torch.sum(penalize, dim=(1, 2))

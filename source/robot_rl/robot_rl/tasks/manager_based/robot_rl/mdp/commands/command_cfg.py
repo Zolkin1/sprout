@@ -1,9 +1,10 @@
 from dataclasses import MISSING
 
-from isaaclab.utils import configclass
 from isaaclab.managers import CommandTermCfg
+from isaaclab.utils import configclass
 
 from .command_terms import GaitPeriodCommand
+
 
 @configclass
 class GaitPeriodCfg(CommandTermCfg):

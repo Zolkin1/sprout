@@ -6,8 +6,8 @@ This project is a set of tools for end-to-end development of RL for robots. Spec
 
 - RL development using IsaacLab and IsaacSim.
 - sim2sim transfer using Mujoco.
-- Hardware transfer using Obelisk (ROS2) - note that ROS2 is NOT a dependency of this project - the hardware 
-interface can be run through a docker/dev-container provided in this repo. See below for more information. 
+- Hardware transfer using Obelisk (ROS2) - note that ROS2 is NOT a dependency of this project - the hardware
+interface can be run through a docker/dev-container provided in this repo. See below for more information.
 
 ## Installation
 
@@ -78,7 +78,7 @@ To run the sim2sim transfer, go to the `transfer/sim/` directory. From this dire
 python g1_runner.py --config_file=/path/to/config/file
 ```
 
-The config file holds all the information about how the RL policy is used including which policy to load, scaling of 
+The config file holds all the information about how the RL policy is used including which policy to load, scaling of
 observations and actions, and default angles.
 
 To add an additional robot, the associated robot sim files will need to be added into the `transfer/sim/robots/` folder,
@@ -100,7 +100,7 @@ pre-commit run --all-files
 ```
 
 ## Obelisk Transfer
-First, set the environment variable `ROBOT_RL_ROOT` to the path to the `/transfer/obelisk` folder. 
+First, set the environment variable `ROBOT_RL_ROOT` to the path to the `/transfer/obelisk` folder.
 Now we can being building the docker container.
 
 ### Prerequisites
@@ -108,7 +108,7 @@ Now we can being building the docker container.
   - Installation guide: [Docker Compose Installation](https://docs.docker.com/compose/install/linux/#install-using-the-repository)
 - VSCode with devcontainer support (recommended)
 
-We recommend using VSCode's devcontainer feature to run the Docker environment, although in theory you can run this 
+We recommend using VSCode's devcontainer feature to run the Docker environment, although in theory you can run this
 as a vanilla docker container.
 
 ### Initial Setup (VSCode devcontainer)

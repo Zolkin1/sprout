@@ -1,14 +1,4 @@
-import math
-import torch
-
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from isaaclab.managers import RewardTermCfg as RewTerm
 
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCfg
 
@@ -17,12 +7,14 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCf
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 
+
 ##
 # Environment configuration
 ##
 @configclass
 class G1RoughEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -36,13 +28,17 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         # No height scanner for now
         self.scene.height_scanner = None
 
-
         ##
         # Randomization
         ##
         # -- Push Params -- #
-        self.events.push_robot.params["velocity_range"] = {"x": (-1, 1), "y": (-1, 1), "roll": (-0.4, 0.4),
-                                                           "pitch": (-0.4, 0.4), "yaw": (-0.4, 0.4)}
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-1, 1),
+            "y": (-1, 1),
+            "roll": (-0.4, 0.4),
+            "pitch": (-0.4, 0.4),
+            "yaw": (-0.4, 0.4),
+        }
         # -- Base Mass Params -- #
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
@@ -71,8 +67,8 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5) # 0 - 1
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.4,0.4) #(-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5)  # 0 - 1
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.4, 0.4)  # (-1.0, 1.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.3, 0.3)
 
         ##
@@ -85,8 +81,8 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         # Rewards
         ##
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
-        self.rewards.track_ang_vel_z_exp.weight = 2. #1.0 #0.5
-        self.rewards.lin_vel_z_l2.weight =  -2.0 # TODO reduce this maybe?
+        self.rewards.track_ang_vel_z_exp.weight = 2.0  # 1.0 #0.5
+        self.rewards.lin_vel_z_l2.weight = -2.0  # TODO reduce this maybe?
         self.rewards.ang_vel_xy_l2.weight = -0.05
         self.rewards.dof_torques_l2.weight = -1.0e-5
         self.rewards.dof_acc_l2.weight = -2.5e-7
@@ -102,7 +98,7 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         self.rewards.feet_clearance.weight = -20.0
         self.rewards.phase_contact.weight = 0.25
 
-        self.rewards.joint_deviation_arms.weight = -0.5             # Arms regularization
+        self.rewards.joint_deviation_arms.weight = -0.5  # Arms regularization
         self.rewards.joint_deviation_torso.weight = -1.0
 
         self.rewards.height_torso.params["target_height"] = 0.75

@@ -1,16 +1,20 @@
 from __future__ import annotations
-from typing import Sequence, TYPE_CHECKING
+
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
-
 from isaaclab.managers import CommandTerm
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
     from .command_cfg import GaitPeriodCfg
+
 
 class GaitPeriodCommand(CommandTerm):
     """Command generator that generates gait periods."""
+
     cfg: GaitPeriodCfg
 
     def __init__(self, cfg: GaitPeriodCfg, env: ManagerBasedEnv):
@@ -55,7 +59,6 @@ class GaitPeriodCommand(CommandTerm):
 
         # Gait periods
         self.periods[env_ids] = r.uniform_(*self.cfg.period_range)
-
 
     def _update_command(self):
         """Update the command based on the current state."""

@@ -44,22 +44,24 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import gymnasium as gym
 import os
 import time
+
+import gymnasium as gym
+import isaaclab_tasks  # noqa: F401
 import torch
-
-from rsl_rl.runners import OnPolicyRunner
-
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
-
-import isaaclab_tasks  # noqa: F401
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+)
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
+from rsl_rl.runners import OnPolicyRunner
 
 import robot_rl.tasks  # noqa: F401
 

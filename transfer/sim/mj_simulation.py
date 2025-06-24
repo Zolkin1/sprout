@@ -1,15 +1,14 @@
-from typing import Tuple
+import csv
+import math
 import os
 import time
-import math
-import numpy as np
-import csv
-import yaml
+from datetime import datetime
+
 import mujoco
 import mujoco.viewer
-from datetime import datetime
+import numpy as np
 import pygame
-from scipy.optimize import direct
+import yaml
 
 
 def get_model_data(robot: str, scene: str):
@@ -26,6 +25,7 @@ def get_model_data(robot: str, scene: str):
 
     return mj_model, mj_data
 
+
 def get_projected_gravity(quat):
     qw = quat[0]
     qx = quat[1]
@@ -40,6 +40,7 @@ def get_projected_gravity(quat):
 
     return pg
 
+
 def log_row_to_csv(filename, data):
     """
     Appends a single row of data to an existing CSV file.
@@ -51,12 +52,13 @@ def log_row_to_csv(filename, data):
     try:
         # Open in append mode ('a') to add data to the end of the file
         # newline='' is important to prevent extra blank rows
-        with open(filename, 'a', newline='') as csvfile:
+        with open(filename, "a", newline="") as csvfile:
             csv_writer = csv.writer(csvfile)
             csv_writer.writerow(data)
         # print(f"Appended row to {filename}") # Uncomment for verbose logging
     except Exception as e:
         print(f"Error appending row to {filename}: {e}")
+
 
 def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
     """Run the simulation."""
@@ -73,12 +75,14 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
     # Compute sim steps per policy update
     sim_steps_per_policy_update = int(policy.dt / mj_model.opt.timestep)
     sim_loop_rate = sim_steps_per_policy_update * mj_model.opt.timestep
-    viewer_rate = math.ceil((1/100) / mj_model.opt.timestep)
+    viewer_rate = math.ceil((1 / 100) / mj_model.opt.timestep)
     print(viewer_rate)
 
-    print(f"Starting mujoco simulation with robot {robot}.\n"
-          f"Policy dt set to {policy.dt} s ({sim_steps_per_policy_update} steps per policy update.)\n"
-          f"Simulation dt set to {mj_model.opt.timestep} s. Sim loop rate set to {sim_loop_rate} s.\n")
+    print(
+        f"Starting mujoco simulation with robot {robot}.\n"
+        f"Policy dt set to {policy.dt} s ({sim_steps_per_policy_update} steps per policy update.)\n"
+        f"Simulation dt set to {mj_model.opt.timestep} s. Sim loop rate set to {sim_loop_rate} s.\n"
+    )
     nu = policy.get_num_actions()
 
     # Setup joystick
@@ -94,7 +98,7 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
         print(f"Using controller: {joystick.get_name()}")
 
     if log:
-        # Make a new directroy based on the current time
+        # Make a new directory based on the current time
         now = datetime.now()
         timestamp_str = now.strftime("%Y-%m-%d-%H-%M-%S")
         new_folder_path = os.path.join(log_dir, timestamp_str)
@@ -106,20 +110,20 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
         print(f"Saving rerun logs to {new_folder_path}.")
         log_file = os.path.join(new_folder_path, "sim_log.csv")
         sim_config = {
-            'simulator': "mujoco",
-            'robot': robot,
-            'policy': policy.get_chkpt_path(),
-            'policy_dt': policy.dt,
-            'data_structure' : [
-                {'name': 'time', 'length': 1},
-                {'name': 'qpos', 'length': mj_data.qpos.shape[0]},
-                {'name': 'qvel', 'length': mj_data.qvel.shape[0]},
-                {'name': 'obs', 'length': policy.get_num_obs()},
-                {'name': 'action', 'length': policy.get_num_actions()},
-                {'name': 'torque', 'length': mj_data.qpos.shape[0] - 7},
-            ]
+            "simulator": "mujoco",
+            "robot": robot,
+            "policy": policy.get_chkpt_path(),
+            "policy_dt": policy.dt,
+            "data_structure": [
+                {"name": "time", "length": 1},
+                {"name": "qpos", "length": mj_data.qpos.shape[0]},
+                {"name": "qvel", "length": mj_data.qvel.shape[0]},
+                {"name": "obs", "length": policy.get_num_obs()},
+                {"name": "action", "length": policy.get_num_actions()},
+                {"name": "torque", "length": mj_data.qpos.shape[0] - 7},
+            ],
         }
-        with open(os.path.join(new_folder_path, "sim_config.yaml"), 'w') as f:
+        with open(os.path.join(new_folder_path, "sim_config.yaml"), "w") as f:
             yaml.dump(sim_config, f)
 
     x_y_num_rays = (5, 5)
@@ -131,8 +135,7 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
         # Setup geoms
         ray_pos = ray_cast_sensor(mj_model, mj_data, "height_sensor_site", (1, 1), x_y_num_rays)
         # Add custom debug spheres
-        ii = 0
-        for pos in ray_pos.reshape(-1, 3):
+        for ii, pos in enumerate(ray_pos.reshape(-1, 3)):
             mujoco.mjv_initGeom(
                 viewer.user_scn.geoms[ii],
                 type=mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -142,7 +145,6 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
                 rgba=np.array([1, 0, 0, 1]),
             )
             viewer.user_scn.ngeom += 1
-            ii += 1
 
         while viewer.is_running():
             start_time = time.time()
@@ -172,8 +174,7 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
                     vyaw = np.clip(vyaw, -1.5, 1.5)
                 des_vel[0] = vx
                 des_vel[1] = vy
-                des_vel[2] = vyaw   # TODO: Why does this not seem to work?
-
+                des_vel[2] = vyaw  # TODO: Why does this not seem to work?
 
             # Extract relevant info
             sim_time = mj_data.time
@@ -189,10 +190,8 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
             # Step the simulator
             for i in range(sim_steps_per_policy_update):
                 ray_pos = ray_cast_sensor(mj_model, mj_data, "height_sensor_site", (1, 1), x_y_num_rays)
-                ii = 0
-                for pos in ray_pos.reshape(-1, 3):
+                for ii, pos in enumerate(ray_pos.reshape(-1, 3)):
                     viewer.user_scn.geoms[ii].pos = pos
-                    ii += 1
 
                 # Update scene
                 mujoco.mjv_updateScene(mj_model, mj_data, opt, None, cam, mujoco.mjtCatBit.mjCAT_ALL, scene)
@@ -203,19 +202,27 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str):
                     for j in range(mj_model.nu):
                         torques.append(mj_data.actuator_force[j])
 
-                    log_row_to_csv(log_file, [mj_data.time] + mj_data.qpos.tolist() + mj_data.qvel.tolist() + obs[0, :].numpy().tolist() + u.tolist() + torques)
+                    log_row_to_csv(
+                        log_file,
+                        [mj_data.time]
+                        + mj_data.qpos.tolist()
+                        + mj_data.qvel.tolist()
+                        + obs[0, :].numpy().tolist()
+                        + u.tolist()
+                        + torques,
+                    )
                 if i % viewer_rate == 0:
                     viewer.sync()
 
             # Try to run in roughly realtime
             elapsed = time.time() - start_time
-            if elapsed < 1*sim_loop_rate:
-                time.sleep(1*sim_loop_rate - elapsed)
+            if elapsed < 1 * sim_loop_rate:
+                time.sleep(1 * sim_loop_rate - elapsed)
 
 
-def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_rays: Tuple[int, int]) -> np.array:
+def ray_cast_sensor(model, data, site_name, size: tuple[float, float], x_y_num_rays: tuple[int, int]) -> np.array:
     """Using a grid pattern, create a height map using ray casting.
-        Return the global 3d position of the ray collision.
+    Return the global 3d position of the ray collision.
     """
 
     ray_pos_shape = x_y_num_rays
@@ -229,8 +236,8 @@ def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_r
     # Add to the global z
     site_pos[2] = site_pos[2] + 10
 
-    site_pos[0] = site_pos[0] - size[0] / 2.
-    site_pos[1] = site_pos[1] - size[1] / 2.
+    site_pos[0] = site_pos[0] - size[0] / 2.0
+    site_pos[1] = site_pos[1] - size[1] / 2.0
 
     # Ray information
     direction = np.zeros(3)
@@ -238,11 +245,10 @@ def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_r
     geom_group = np.zeros(6, dtype=np.int32)
     geom_group[2] = 1  # Only include group 2
 
-
     # Ray spacing
     spacing = np.zeros(3)
-    spacing[0] = size[0]/(x_y_num_rays[0] - 1)
-    spacing[1] = size[1]/(x_y_num_rays[1] - 1)
+    spacing[0] = size[0] / (x_y_num_rays[0] - 1)
+    spacing[1] = size[1] / (x_y_num_rays[1] - 1)
 
     # Loop through the rays
     for xray in range(x_y_num_rays[0]):
@@ -253,9 +259,9 @@ def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_r
             offset[1] = spacing[1] * yray
 
             ray_origin = offset + site_pos
-            ray_pos[xray, yray, 2] = -mujoco.mj_ray(model, data,
-                          ray_origin.astype(np.float64), direction.astype(np.float64),
-                          geom_group, 1, -1, geom_id)
+            ray_pos[xray, yray, 2] = -mujoco.mj_ray(
+                model, data, ray_origin.astype(np.float64), direction.astype(np.float64), geom_group, 1, -1, geom_id
+            )
 
             ray_pos[xray, yray, :] = ray_origin + ray_pos[xray, yray, :]
     # print(f"ray_pos: {ray_pos}, shape: {ray_pos.shape}")

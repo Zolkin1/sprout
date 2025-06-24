@@ -1,9 +1,8 @@
 import argparse
 import os
 
-import yaml
 import numpy as np
-
+import yaml
 from mj_simulation import run_simulation
 from rl_policy_wrapper import RLPolicy
 
@@ -15,9 +14,8 @@ args = parser.parse_args()
 config_file = args.config_file
 
 
-
 # Parse the config file
-with open(config_file, "r") as f:
+with open(config_file) as f:
     config = yaml.load(f, Loader=yaml.FullLoader)
     checkpoint_path = config["checkpoint_path"]
     dt = config["dt"]
@@ -32,12 +30,18 @@ with open(config_file, "r") as f:
     command_scale = config["command_scale"]
 
 # Make the RL policy
-policy = RLPolicy(dt=dt, checkpoint_path=checkpoint_path, num_obs=num_obs, num_action=num_action, period=period,
-                  cmd_scale=command_scale, action_scale=action_scale, default_angles=default_angles,
-                  qvel_scale=qvel_scale, ang_vel_scale=ang_vel_scale,)
+policy = RLPolicy(
+    dt=dt,
+    checkpoint_path=checkpoint_path,
+    num_obs=num_obs,
+    num_action=num_action,
+    period=period,
+    cmd_scale=command_scale,
+    action_scale=action_scale,
+    default_angles=default_angles,
+    qvel_scale=qvel_scale,
+    ang_vel_scale=ang_vel_scale,
+)
 
 # Run the simulator
-run_simulation(policy, robot_name, scene="basic_scene", log=True, log_dir=os.getcwd()+"/logs/")
-
-
-
+run_simulation(policy, robot_name, scene="basic_scene", log=True, log_dir=os.getcwd() + "/logs/")

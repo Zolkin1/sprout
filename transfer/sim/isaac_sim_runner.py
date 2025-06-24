@@ -34,19 +34,17 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-import torch
 import csv
 import os
-import numpy as np
-import yaml
 from datetime import datetime
 
-import isaacsim.core.utils.prims as prim_utils
-
 import isaaclab.sim as sim_utils
+import isaacsim.core.utils.prims as prim_utils
+import numpy as np
+import torch
+import yaml
 from isaaclab.assets import Articulation
 from isaaclab.sim import SimulationContext
-
 from rl_policy_wrapper import RLPolicy
 
 ##
@@ -79,6 +77,7 @@ def design_scene() -> tuple[dict, list[list[float]]]:
     scene_entities = {"robot": robot}
     return scene_entities, origins
 
+
 def log_row_to_csv(filename, data):
     """
     Appends a single row of data to an existing CSV file.
@@ -90,12 +89,13 @@ def log_row_to_csv(filename, data):
     try:
         # Open in append mode ('a') to add data to the end of the file
         # newline='' is important to prevent extra blank rows
-        with open(filename, 'a', newline='') as csvfile:
+        with open(filename, "a", newline="") as csvfile:
             csv_writer = csv.writer(csvfile)
             csv_writer.writerow(data)
         # print(f"Appended row to {filename}") # Uncomment for verbose logging
     except Exception as e:
         print(f"Error appending row to {filename}: {e}")
+
 
 def run_simulator(log_file: str, policy_wrapper):
     """Runs the simulation loop."""
@@ -149,9 +149,15 @@ def run_simulator(log_file: str, policy_wrapper):
             print("[INFO]: Resetting robot state...")
         if count % 4 == 0:
             # -- generate action from policy
-            obs = policy_wrapper.create_obs(robot.data.joint_pos[0, :].cpu().numpy(), robot.data.root_ang_vel_b[0, :].cpu().numpy(),
-                                            robot.data.joint_vel[0, :].cpu().numpy(), sim.current_time,
-                                            robot.data.projected_gravity_b[0, :].cpu().numpy(), des_vel, "isaac")
+            obs = policy_wrapper.create_obs(
+                robot.data.joint_pos[0, :].cpu().numpy(),
+                robot.data.root_ang_vel_b[0, :].cpu().numpy(),
+                robot.data.joint_vel[0, :].cpu().numpy(),
+                sim.current_time,
+                robot.data.projected_gravity_b[0, :].cpu().numpy(),
+                des_vel,
+                "isaac",
+            )
             action_mj = policy_wrapper.get_action(obs)
             action_isaac = policy_wrapper.get_action_isaac()
 
@@ -173,16 +179,19 @@ def run_simulator(log_file: str, policy_wrapper):
         robot.update(sim_dt)
 
         # TODO: Get the torques
-        torques = np.zeros(21)  # TODO: get this number programatically
-        row = ([sim.current_time] + robot.data.root_pos_w[0,:].cpu().numpy().tolist()
-               + robot.data.root_quat_w[0, :].cpu().numpy().tolist()
-               + policy_wrapper.convert_to_mujoco(robot.data.joint_pos[0, :].cpu().numpy()).tolist()
-               + robot.data.root_lin_vel_b[0, :].cpu().numpy().tolist()
-               + robot.data.root_ang_vel_b[0, :].cpu().numpy().tolist()
-               + policy_wrapper.convert_to_mujoco(robot.data.joint_vel[0,:].cpu().numpy()).tolist()
-               + obs[0,:].numpy().tolist()
-               + action_mj.tolist()
-               + torques.tolist())
+        torques = np.zeros(21)  # TODO: get this number programmatically
+        row = (
+            [sim.current_time]
+            + robot.data.root_pos_w[0, :].cpu().numpy().tolist()
+            + robot.data.root_quat_w[0, :].cpu().numpy().tolist()
+            + policy_wrapper.convert_to_mujoco(robot.data.joint_pos[0, :].cpu().numpy()).tolist()
+            + robot.data.root_lin_vel_b[0, :].cpu().numpy().tolist()
+            + robot.data.root_ang_vel_b[0, :].cpu().numpy().tolist()
+            + policy_wrapper.convert_to_mujoco(robot.data.joint_vel[0, :].cpu().numpy()).tolist()
+            + obs[0, :].numpy().tolist()
+            + action_mj.tolist()
+            + torques.tolist()
+        )
         log_row_to_csv(log_file, row)
 
 
@@ -191,7 +200,7 @@ def main():
     # Parse the config file
     config_file = args_cli.config_file
 
-    with open(config_file, "r") as f:
+    with open(config_file) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
         checkpoint_path = config["checkpoint_path"]
         dt = config["dt"]
@@ -206,12 +215,21 @@ def main():
         command_scale = config["command_scale"]
 
     # Make the RL policy
-    policy = RLPolicy(dt=dt, checkpoint_path=checkpoint_path, num_obs=num_obs, num_action=num_action, period=period,
-                      cmd_scale=command_scale, action_scale=action_scale, default_angles=default_angles,
-                      qvel_scale=qvel_scale, ang_vel_scale=ang_vel_scale, )
+    policy = RLPolicy(
+        dt=dt,
+        checkpoint_path=checkpoint_path,
+        num_obs=num_obs,
+        num_action=num_action,
+        period=period,
+        cmd_scale=command_scale,
+        action_scale=action_scale,
+        default_angles=default_angles,
+        qvel_scale=qvel_scale,
+        ang_vel_scale=ang_vel_scale,
+    )
 
     # Setup the logging
-    # Make a new directroy based on the current time
+    # Make a new directory based on the current time
     now = datetime.now()
     timestamp_str = now.strftime("%Y-%m-%d-%H-%M-%S")
     new_folder_path = os.path.join(os.getcwd(), "transfer/sim/logs/" + timestamp_str)
@@ -223,20 +241,20 @@ def main():
     print(f"Saving rerun logs to {new_folder_path}.")
     log_file = os.path.join(new_folder_path, "sim_log.csv")
     sim_config = {
-        'simulator': "isaacsim",
-        'robot': robot_name,
-        'policy': policy.get_chkpt_path(),
-        'policy_dt': policy.dt,
-        'data_structure': [
-            {'name': 'time', 'length': 1},
-            {'name': 'qpos', 'length': 28},
-            {'name': 'qvel', 'length': 27},
-            {'name': 'obs', 'length': policy.get_num_obs()},
-            {'name': 'action', 'length': policy.get_num_actions()},
-            {'name': 'torque', 'length': 21},
-        ]
+        "simulator": "isaacsim",
+        "robot": robot_name,
+        "policy": policy.get_chkpt_path(),
+        "policy_dt": policy.dt,
+        "data_structure": [
+            {"name": "time", "length": 1},
+            {"name": "qpos", "length": 28},
+            {"name": "qvel", "length": 27},
+            {"name": "obs", "length": policy.get_num_obs()},
+            {"name": "action", "length": policy.get_num_actions()},
+            {"name": "torque", "length": 21},
+        ],
     }
-    with open(os.path.join(new_folder_path, "sim_config.yaml"), 'w') as f:
+    with open(os.path.join(new_folder_path, "sim_config.yaml"), "w") as f:
         yaml.dump(sim_config, f)
 
     # Run the simulator
