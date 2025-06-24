@@ -65,9 +65,9 @@ TODO: Discuss custom train and play scripts.
 
 RL Task list:
 
-| Task          | Robot    | Hardware Tested?   | Description                                                      |
-|---------------|----------|--------------------|------------------------------------------------------------------|
-| `G1-flat-vel` | G1       | :white_check_mark: | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
+| Task          |   Robot    |   Hardware Tested?   | Description                                                      |
+|---------------|:----------:|:--------------------:|------------------------------------------------------------------|
+| `G1-flat-vel` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
 
 
 ## sim2sim Transfer
