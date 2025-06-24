@@ -14,138 +14,13 @@ from .hlip_cmd import _transfer_to_global_frame, _transfer_to_local_frame, wrap_
 from .ref_gen import _ncr
 from .clf import CLF
 import re
+from .exo_hzd_cmd import bezier_deg
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .cmd_cfg import HZDCommandCfg
-
-
-def bezier_deg(
-    order: int,
-    tau: torch.Tensor,            # [batch], each in [0,1]
-    step_dur: torch.Tensor,       # [batch]
-    control_points: torch.Tensor, # [n_dim, degree+1]
-    degree: int,
-) -> torch.Tensor:
-    """
-    Computes (for each τ in the batch) either
-      • the vector‐valued Bezier position B(τ) ∈ R^{n_dim}, or
-      • its time derivative B'(τ) ∈ R^{n_dim},
-
-    where `control_points` is shared across the whole batch and has shape [n_dim, degree+1].
-
-    Args:
-      order: 0 → position, 1 → time‐derivative.
-      tau:       shape [batch], clipped to [0,1].
-      step_dur:  shape [batch], positive scalars.
-      control_points: shape [n_dim, degree+1].
-      degree:    polynomial degree (so there are `degree+1` control points).
-
-    Returns:
-      If order==0: a tensor of shape [batch, n_dim], the Bezier‐position at each τ[i].
-      If order==1: a tensor of shape [batch, n_dim], the time‐derivative at each τ[i].
-    """
-    # 1) Clamp tau into [0,1]
-    tau = torch.clamp(tau, 0.0, 1.0)         # [batch]
-    batch = tau.size(0)
-
-    # 2) Extract n_dim from control_points
-    #    control_points: [n_dim, degree+1]
-    n_dim = control_points.shape[0]
-
-    if order == 1:
-        # ─── DERIVATIVE CASE ────────────────────────────────────────────────────
-        # We want:
-        #   B'(τ) = degree * sum_{i=0..degree-1} [
-        #             (CP_{i+1} - CP_i) * C(degree-1, i)
-        #             * (1-τ)^(degree-1-i) * τ^i
-        #          ]  / step_dur.
-
-        # 3) Compute CP differences along the "degree+1" axis:
-        #    cp_diff: [n_dim, degree], where
-        #      cp_diff[:, i] = control_points[:, i+1] - control_points[:, i].
-        cp_diff = control_points[:, 1:] - control_points[:, :-1]  # [n_dim, degree]
-
-        # 4) Binomial coefficients for (degree-1 choose i), i=0..degree-1:
-        #    coefs_diff: [degree].
-        coefs_diff = torch.tensor(
-            [_ncr(degree - 1, i) for i in range(degree)],
-            dtype=control_points.dtype,
-            device=control_points.device
-        )  # [degree]
-
-        # 5) Build (τ^i) and ((1-τ)^(degree-1-i)) for i=0..degree-1:
-        i_vec = torch.arange(degree, device=control_points.device)  # [degree]
-
-        #    tau_pow:     [batch, degree],  τ^i
-        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
-
-        #    one_minus_pow: [batch, degree], (1-τ)^(degree-1-i)
-        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - 1 - i_vec).unsqueeze(0))
-
-        # 6) Combine into a single “weight matrix” for the derivative:
-        #    weight_deriv[b, i] = degree * C(degree-1, i) * (1-τ[b])^(degree-1-i) * (τ[b])^i
-        #    → shape [batch, degree]
-        weight_deriv = (degree
-                        * coefs_diff.unsqueeze(0)        # [1, degree]
-                        * one_minus_pow                 # [batch, degree]
-                        * tau_pow)                       # [batch, degree]
-        # Now weight_deriv: [batch, degree]
-
-        # 7) Multiply these weights by cp_diff to get a [batch, n_dim] result:
-        #    For each batch b:  B'_b =  Σ_{i=0..degree-1} weight_deriv[b,i] * cp_diff[:,i],
-        #    which is exactly a mat‐mul:  weight_deriv[b,:] @ (cp_diff^T) → [n_dim].
-        #
-        #    cp_diff^T: [degree, n_dim], so (weight_deriv @ cp_diff^T) → [batch, n_dim].
-        Bdot = torch.matmul(weight_deriv, cp_diff.transpose(0, 1))  # [batch, n_dim]
-
-        # 8) Finally divide by step_dur:
-        return Bdot / step_dur.unsqueeze(1)  # [batch, n_dim]
-
-
-    else:
-        # ─── POSITION CASE ────────────────────────────────────────────────────────
-        # We want:
-        #   B(τ) = Σ_{i=0..degree} [
-        #            CP_i * C(degree, i) * (1-τ)^(degree-i) * τ^i
-        #         ].
-
-        # 3) Binomial coefficients for (degree choose i), i=0..degree:
-        #    coefs_pos: [degree+1]
-        coefs_pos = torch.tensor(
-            [_ncr(degree, i) for i in range(degree + 1)],
-            dtype=control_points.dtype,
-            device=control_points.device
-        )  # [degree+1]
-
-        # 4) Build τ^i and (1-τ)^(degree-i) for i=0..degree:
-        i_vec = torch.arange(degree + 1, device=control_points.device)  # [degree+1]
-
-        #    tau_pow:        [batch, degree+1]
-        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
-
-        #    one_minus_pow:  [batch, degree+1]
-        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - i_vec).unsqueeze(0))
-
-        # 5) Combine into a “weight matrix” for position:
-        #    weight_pos[b, i] = C(degree, i) * (1-τ[b])^(degree-i) * (τ[b])^i.
-        #    → shape [batch, degree+1]
-        weight_pos = (coefs_pos.unsqueeze(0)    # [1, degree+1]
-                      * one_minus_pow          # [batch, degree+1]
-                      * tau_pow)               # [batch, degree+1]
-        # Now weight_pos: [batch, degree+1]
-
-        # 6) Multiply by control_points to get [batch, n_dim]:
-        #    For each batch b:  B_b = Σ_{i=0..degree} weight_pos[b,i] * control_points[:,i],
-        #    i.e.  weight_pos[b,:]  (shape [degree+1]) @ (control_points^T) ([degree+1, n_dim]) → [n_dim].
-        #
-        #    So:  B = weight_pos @ control_points^T  → [batch, n_dim].
-        B = torch.matmul(weight_pos, control_points.transpose(0, 1))  # [batch, n_dim]
-
-        return B
-
 
 
 class HZDCommandTerm(CommandTerm):
@@ -163,7 +38,6 @@ class HZDCommandTerm(CommandTerm):
 
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
 
-        self.foot_target = torch.zeros((self.num_envs, 2), device=self.device)
 
         self.metrics = {}
      
@@ -196,28 +70,11 @@ class HZDCommandTerm(CommandTerm):
 
 
         
-        # env.scene[cfg.asset_name].data.joint_names
-
-        # joint_names = jt_config.get_joint_names()
-        # self._left_traj = self.jt_config.get_trajectory_remap(joint_names).to(self.device)
-        # self._right_traj = self.jt_config.get_trajectory(joint_names).to(self.device)
-
-        # self.num_joints = num_joints
-        # self.joint_ids = joint_indices
-
-        # self.joint_coeffs = torch.stack([torch.tensor(c, device=self.device) if isinstance(c, list) else c.to(self.device) for c in matched_coeffs], dim=0)
-        # self.joint_coeffs_remap = torch.stack([torch.tensor(c, device=self.device) if isinstance(c, list) else c.to(self.device) for c in matched_remap_coeffs], dim=0)
-
-        # self._joint_ids, self._joint_names = self._asset.find_joints(
-        #     self.cfg.joint_names, preserve_order=self.cfg.preserve_order
-        # )
-        # # grav = torch.abs(torch.tensor(self.env.cfg.sim.gravity[2], device=self.device))
-      
 
         self.mass = sum(self.robot.data.default_mass.T)[0]
         
         self.clf = CLF(
-            [],[], 18, self.env.cfg.sim.dt,
+            [],[], cfg.num_outputs, self.env.cfg.sim.dt,
             Q_weights=np.array(cfg.Q_weights),
             R_weights=np.array(cfg.R_weights),
             device=self.device
@@ -229,7 +86,7 @@ class HZDCommandTerm(CommandTerm):
 
     @property
     def command(self):
-        return self.foot_target
+        return self.y_out
     
 
     def _resample_command(self, env_ids):
@@ -416,26 +273,4 @@ class HZDCommandTerm(CommandTerm):
         self.vdot = vdot
         self.v = vcur
        
-        if self.debug_vis:
-            # Visualize foot target in global frame
-            base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)
-            N = base_velocity.shape[0]
-            foot_target = torch.cat([self.foot_target, torch.zeros((N, 1), device=self.device)], dim=-1)
-            p_ft_global = _transfer_to_global_frame(foot_target, self.robot.data.root_quat_w) + self.robot.data.root_pos_w
           
-            self.footprint_visualizer.visualize(
-                translations=p_ft_global,
-                orientations=yaw_quat(self.robot.data.root_quat_w).repeat_interleave(2, dim=0),
-            )
-            
-            
-            # Print debug info for first environment
-            # print(f"Base velocity: {base_velocity[0]}")
-            # print(f"y_out reference: {self.y_out}")
-            # print(f"dy_out reference: {self.dy_out}")
-            # print(f"foot_target: {self.foot_target[0]}")
-            # print(f"swing2stance: {self.swing2stance[0]}")
-            # print(f"Com2stance: {self.com2stance[0]}")
-            # # print(f"Current foot position: {self.robot.data.body_pos_w[0, self.feet_bodies.body_ids[0], :2]}")
-            # print("---")
-

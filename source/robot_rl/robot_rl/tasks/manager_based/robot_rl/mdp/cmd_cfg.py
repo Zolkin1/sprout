@@ -1,5 +1,5 @@
 from .hlip_cmd import HLIPCommandTerm
-from .hzd_cmd import HZDCommandTerm
+from .exo_hzd_cmd import HZDCommandTerm
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -150,7 +150,7 @@ class HZDCommandCfg(CommandTermCfg):
     class_type: type = HZDCommandTerm
     asset_name: str = "robot"
     foot_body_name: str = ".*_ankle_roll_link"
-    num_joints: int = 12
+    num_outputs: int = 21
     num_coeffs: int = 8
     joint_patterns: list = [".*HipJoint", ".*KneeJoint", ".*AnkleJoint"]  # Regex patterns to match joint names
     resampling_time_range: tuple[float, float] = (5.0, 15.0)

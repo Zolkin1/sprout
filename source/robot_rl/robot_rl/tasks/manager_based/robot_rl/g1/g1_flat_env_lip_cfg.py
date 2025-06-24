@@ -39,21 +39,7 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
         # no terrain curriculum
         self.curriculum.terrain_levels = None
 
-        ##
-        # Commands
-        ##
-        # self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
-        # self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
-        # self.commands.base_velocity.ranges.ang_vel_z = (0, 0)   # For now, making the heading match the velocity
 
-        ##
-        # Rewards
-        ##
-        # -- Task
-
-        # self.rewards.lin_vel_z_l2.weight = 0.0
-        # self.rewards.track_lin_vel_xy_exp.weight = 2.5
-        # self.rewards.track_ang_vel_z_exp.weight = 0.75
 
 
 class G1FlatRefTrackingEnvCfg(G1FlatLipEnvCfg):
@@ -97,6 +83,3 @@ class G1FlatLipEnvCfg_PLAY(G1FlatLipEnvCfg):
         # self.events.push_robot = None
         self.events.push_robot.interval_range_s = (5.0,5.0)
         self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0,0)} #(-3.14, 3.14)},
-        # self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
-        # self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        # self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
