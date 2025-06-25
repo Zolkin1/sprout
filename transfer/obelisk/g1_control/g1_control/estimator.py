@@ -1,13 +1,12 @@
 from typing import List, Optional
 
 import numpy as np
-
-from obelisk_py.core.estimation import ObeliskEstimator
 from obelisk_estimator_msgs.msg import EstimatedState
-from obelisk_sensor_msgs.msg import ObkJointEncoders
-from obelisk_sensor_msgs.msg import ObkImu
+from obelisk_py.core.estimation import ObeliskEstimator
 from obelisk_py.core.utils.ros import spin_obelisk
+from obelisk_sensor_msgs.msg import ObkImu, ObkJointEncoders
 from rclpy.executors import SingleThreadedExecutor
+
 
 class G1Estimator(ObeliskEstimator):
     """Example position setpoint controller."""
@@ -23,7 +22,6 @@ class G1Estimator(ObeliskEstimator):
             key="sub_joint_encoders",  # key can be specified here or in the config file
         )
 
-
         self.register_obk_subscription(
             "sub_pelvis_imu",
             self.pelvis_imu_callback,  # type: ignore
@@ -31,7 +29,7 @@ class G1Estimator(ObeliskEstimator):
             key="sub_pelivs_imu",  # key can be specified here or in the config file
         )
 
-        self.base_pos = np.ones(3) #np.zeros(3)
+        self.base_pos = np.ones(3)  # np.zeros(3)
         self.base_quat = np.zeros(4)
 
         self.base_vel = np.zeros(3)
@@ -39,7 +37,7 @@ class G1Estimator(ObeliskEstimator):
 
         self.received_joint_encoders = False
         self.received_imu = False
-        
+
     def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
         """Callback for the joint encoders."""
         self.joint_angles = msg.joint_pos
@@ -73,7 +71,8 @@ class G1Estimator(ObeliskEstimator):
 
             return estimated_state
 
-def main(args: Optional[List] = None) -> None:
+
+def main(args: list | None = None) -> None:
     """Main entrypoint."""
     spin_obelisk(args, G1Estimator, SingleThreadedExecutor)
 

@@ -1,5 +1,5 @@
 # Running the Docker
-For now, we suggest bringing the docker up in a `devcontainer` within vscode.
+For now, we suggest bringing the docker up in a `devcontainer` within VSCode.
 
 # Setup within the Docker
 Run
@@ -12,7 +12,7 @@ After Obelisk has been built you can just run
 ```
 obk-build
 ```
-and 
+and
 ```
 obk-clean
 ```
@@ -52,9 +52,7 @@ init ----------> damping -------> user_pose ---------> low_level_ctrl
 ```
 At `user_pose`, the robot will snap to the default position specified by `user_pose` in `hardware_config.yaml` and hold that.
 
-At low level ctrl, the output from the controller node will be applied to robot.
-
-TODO: Still need to test the hardware config on the hardware.
+At `low_level_ctrl`, the output from the controller node will be applied to robot.
 
 # Setting up the Xbox remote
 You can make sure that you can see the remote control with
@@ -62,7 +60,7 @@ You can make sure that you can see the remote control with
 sudo evtest
 ```
 
-Then you can run 
+Then you can run
 ```
 sudo chmod 666 /dev/input/eventX
 ```

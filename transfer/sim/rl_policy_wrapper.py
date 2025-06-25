@@ -1,13 +1,26 @@
-import torch
 import numpy as np
+import torch
 
-class RLPolicy():
+
+class RLPolicy:
     """RL Policy Wrapper"""
-    def __init__(self, dt: float, checkpoint_path: str, num_obs: int, num_action: int,
-                 cmd_scale: list, period: float, action_scale: float, default_angles: np.array, qvel_scale: float,
-                 ang_vel_scale: float, height_map_scale=None):
+
+    def __init__(
+        self,
+        dt: float,
+        checkpoint_path: str,
+        num_obs: int,
+        num_action: int,
+        cmd_scale: list,
+        period: float,
+        action_scale: float,
+        default_angles: np.array,
+        qvel_scale: float,
+        ang_vel_scale: float,
+        height_map_scale=None,
+    ):
         """Initialize RL Policy Wrapper.
-            freq: time between actions (s)
+        freq: time between actions (s)
         """
         self.dt = dt
         self.checkpoint_path = checkpoint_path
@@ -28,27 +41,27 @@ class RLPolicy():
             pass
 
         self.isaac_to_mujoco = {
-            0: 0,       # left_hip_pitch
-            1: 6,       # right_hip_pitch
-            2: 12,       # waist_yaw
-            3: 1,       # left_hip_roll
-            4: 7,       # right_hip_roll
-            5: 13,       # left_shoulder_pitch
-            6: 17,       # right_shoulder_pitch
-            7: 2,       # left_hip_yaw
-            8: 8,       # right_hip_yaw
-            9: 14,       # left_shoulder_roll
-            10: 18,     # right_shoulder_roll
-            11: 3,     # left_knee
-            12: 9,     # right_knee
-            13: 15,     # left_shoulder_yaw
-            14: 19,     # right_shoulder_yaw
-            15: 4,     # left_ankle_pitch
-            16: 10,     # right_ankle_pitch
-            17: 16,     # left_elbow
-            18: 20,     # right_elbow
-            19: 5,     # left_ankle_roll
-            20: 11,     # right_ankle_roll
+            0: 0,  # left_hip_pitch
+            1: 6,  # right_hip_pitch
+            2: 12,  # waist_yaw
+            3: 1,  # left_hip_roll
+            4: 7,  # right_hip_roll
+            5: 13,  # left_shoulder_pitch
+            6: 17,  # right_shoulder_pitch
+            7: 2,  # left_hip_yaw
+            8: 8,  # right_hip_yaw
+            9: 14,  # left_shoulder_roll
+            10: 18,  # right_shoulder_roll
+            11: 3,  # left_knee
+            12: 9,  # right_knee
+            13: 15,  # left_shoulder_yaw
+            14: 19,  # right_shoulder_yaw
+            15: 4,  # left_ankle_pitch
+            16: 10,  # right_ankle_pitch
+            17: 16,  # left_elbow
+            18: 20,  # right_elbow
+            19: 5,  # left_ankle_roll
+            20: 11,  # right_ankle_roll
         }
 
         # Load in the policy
@@ -61,38 +74,50 @@ class RLPolicy():
         if torch.cuda.is_available():
             self.policy = self.policy.cuda()
 
-    def create_obs(self, qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel,
-                   height_map=None, sensor_pos=None, convention="mj"):
+    def create_obs(
+        self,
+        qjoints,
+        body_ang_vel,
+        qvel,
+        time,
+        projected_gravity,
+        des_vel,
+        height_map=None,
+        sensor_pos=None,
+        convention="mj",
+    ):
         """Create the observation vector from the sensor data"""
         obs = np.zeros(self.num_obs, dtype=np.float32)
 
-        obs[:3] = body_ang_vel*self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = projected_gravity                                        # Projected gravity
-        obs[6] = des_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = des_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = des_vel[2]*self.cmd_scale[2]                                   # Command velocity
+        obs[:3] = body_ang_vel * self.ang_vel_scale  # Angular velocity
+        obs[3:6] = projected_gravity  # Projected gravity
+        obs[6] = des_vel[0] * self.cmd_scale[0]  # Command velocity
+        obs[7] = des_vel[1] * self.cmd_scale[1]  # Command velocity
+        obs[8] = des_vel[2] * self.cmd_scale[2]  # Command velocity
 
         nj = len(qjoints)
         if convention == "mj":
             qj = qjoints - self.default_angles
-            obs[9 : 9 + nj] = self.convert_to_isaac(qj)                                          # Joint pos
-            obs[9 + nj : 9 + 2*nj] = self.convert_to_isaac(qvel) * self.qvel_scale                            # Joint vel
+            obs[9 : 9 + nj] = self.convert_to_isaac(qj)  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = self.convert_to_isaac(qvel) * self.qvel_scale  # Joint vel
         else:
             qj = qjoints - self.convert_to_isaac(self.default_angles)
-            obs[9: 9 + nj] = qj  # Joint pos
-            obs[9 + nj: 9 + 2 * nj] = qvel * self.qvel_scale  # Joint vel
+            obs[9 : 9 + nj] = qj  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = qvel * self.qvel_scale  # Joint vel
 
-        obs[9 + 2*nj : 9 + 3*nj] = self.action_isaac                              # Past action
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action_isaac  # Past action
 
-        sin_phase = np.sin(2 * np.pi * time/self.period)
-        cos_phase = np.cos(2 * np.pi * time/self.period)
+        sin_phase = np.sin(2 * np.pi * time / self.period)
+        cos_phase = np.cos(2 * np.pi * time / self.period)
 
         if height_map is not None:
             height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
-            obs[9 + 3 * nj:9 + 3 * nj + height_obs.shape[0]] = height_obs
-            obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array([sin_phase, cos_phase])     # Phases
+            obs[9 + 3 * nj : 9 + 3 * nj + height_obs.shape[0]] = height_obs
+            obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array(
+                [sin_phase, cos_phase]
+            )  # Phases
         else:
-            obs[9 + 3*nj : 9 + 3*nj + 2] = np.array([sin_phase, cos_phase])     # Phases
+            obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 
@@ -139,11 +164,11 @@ class RLPolicy():
 
     def convert_height_map_to_obs(self, height_map, sensor_pos, offset=0.5):
         """Converts the (N, M, 3) height map to an observation vector.
-            sensor_pos is the position of the position of the sensor
-            offset is the same as the height_scan issac lab function.
+        sensor_pos is the position of the position of the sensor
+        offset is the same as the height_scan issac lab function.
         """
         obs = np.zeros(height_map.shape[0] * height_map[1])
-        if self.height_map_scale != None:
+        if self.height_map_scale is not None:
             # IsaacLab default is "xy" for the grid ordering
             for x in range(height_map.shape[0]):
                 for y in range(height_map[1]):

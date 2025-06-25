@@ -1,5 +1,5 @@
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ActuatorNetMLPCfg, DCMotorCfg, ImplicitActuatorCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
 ROBOT_ASSETS = "robot_assets/g1"
@@ -21,27 +21,25 @@ G1_CFG = ArticulationCfg(
             enabled_self_collisions=False, solver_position_iteration_count=8, solver_velocity_iteration_count=4
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.01, rest_offset=0.0),
-
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.75),   # TODO: Consider setting this higher if I init issues
+        pos=(0.0, 0.0, 0.75),  # TODO: Consider setting this higher if I init issues
         joint_pos={
             ".*_hip_pitch_joint": -0.42,
-            ".*_hip_roll_joint": 0.,
-            ".*_hip_yaw_joint": 0.,
+            ".*_hip_roll_joint": 0.0,
+            ".*_hip_yaw_joint": 0.0,
             ".*_knee_joint": 0.81,
             ".*_ankle_pitch_joint": -0.4,
-            ".*_ankle_roll_joint": 0.,
-            "waist_yaw_joint": 0.,
-            "left_shoulder_pitch_joint": 0.,
+            ".*_ankle_roll_joint": 0.0,
+            "waist_yaw_joint": 0.0,
+            "left_shoulder_pitch_joint": 0.0,
             "left_shoulder_roll_joint": 0.27,
-            "right_shoulder_pitch_joint": 0.,
+            "right_shoulder_pitch_joint": 0.0,
             "right_shoulder_roll_joint": -0.27,
             ".*_elbow_joint": 0.5,
             # ".*_wrist_roll_joint": 0.,
             # ".*_wrist_pitch_joint": 0.,
             # ".*_wrist_yaw_joint": 0.,
-
             # "left_one_joint": 1.0,
             # "right_one_joint": -1.0,
             # "left_two_joint": 0.52,
@@ -112,13 +110,13 @@ G1_CFG = ArticulationCfg(
             ],
             effort_limit_sim=300,
             velocity_limit_sim=100.0,
-            stiffness= {
+            stiffness={
                 ".*_shoulder_pitch_joint": 100.0,
                 ".*_shoulder_roll_joint": 100.0,
                 ".*_shoulder_yaw_joint": 50.0,
                 ".*_elbow_joint": 50.0,
             },
-            damping= {
+            damping={
                 ".*_shoulder_pitch_joint": 2.0,
                 ".*_shoulder_roll_joint": 2.0,
                 ".*_shoulder_yaw_joint": 2.0,
