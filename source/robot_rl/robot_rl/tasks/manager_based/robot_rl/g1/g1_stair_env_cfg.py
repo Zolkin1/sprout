@@ -21,7 +21,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import Co
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from robot_rl.tasks.manager_based.robot_rl.mdp.stair_cfg import StairHLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.command.stair_cfg import StairHLIPCommandCfg
 ##
 # Pre-defined configs
 ##

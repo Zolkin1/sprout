@@ -18,7 +18,7 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvC
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg  #Inherit from the base envs
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
-from robot_rl.tasks.manager_based.robot_rl.mdp.cmd_cfg import HLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.command.cmd_cfg import HLIPCommandCfg
 ##
 # Pre-defined configs
 ##

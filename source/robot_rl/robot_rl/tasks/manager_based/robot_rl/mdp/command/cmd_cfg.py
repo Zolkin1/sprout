@@ -1,5 +1,5 @@
 from .hlip_cmd import HLIPCommandTerm
-from .exo_hzd_cmd import HZDCommandTerm
+from .hzd_cmd import HZDCommandTerm
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg

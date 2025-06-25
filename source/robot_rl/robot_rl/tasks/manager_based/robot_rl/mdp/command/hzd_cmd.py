@@ -8,19 +8,16 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
-from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
+# from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
 
 from .hlip_cmd import _transfer_to_global_frame, _transfer_to_local_frame, wrap_to_pi
 from .ref_gen import _ncr
 from .clf import CLF
 import re
+
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .cmd_cfg import HZDCommandCfg
-
 
 def bezier_deg(
     order: int,
@@ -145,7 +142,14 @@ def bezier_deg(
         B = torch.matmul(weight_pos, control_points.transpose(0, 1))  # [batch, n_dim]
 
         return B
+    
+class JointTrajectoryConfig:
+    def __init__(self):
+        self.joint_trajectories = {}
+        self.base_trajectories = {}
 
+if TYPE_CHECKING:
+    from .cmd_cfg import HZDCommandCfg
 
 
 class HZDCommandTerm(CommandTerm):
@@ -163,7 +167,6 @@ class HZDCommandTerm(CommandTerm):
 
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
 
-        self.foot_target = torch.zeros((self.num_envs, 2), device=self.device)
 
         self.metrics = {}
      
@@ -196,28 +199,11 @@ class HZDCommandTerm(CommandTerm):
 
 
         
-        # env.scene[cfg.asset_name].data.joint_names
-
-        # joint_names = jt_config.get_joint_names()
-        # self._left_traj = self.jt_config.get_trajectory_remap(joint_names).to(self.device)
-        # self._right_traj = self.jt_config.get_trajectory(joint_names).to(self.device)
-
-        # self.num_joints = num_joints
-        # self.joint_ids = joint_indices
-
-        # self.joint_coeffs = torch.stack([torch.tensor(c, device=self.device) if isinstance(c, list) else c.to(self.device) for c in matched_coeffs], dim=0)
-        # self.joint_coeffs_remap = torch.stack([torch.tensor(c, device=self.device) if isinstance(c, list) else c.to(self.device) for c in matched_remap_coeffs], dim=0)
-
-        # self._joint_ids, self._joint_names = self._asset.find_joints(
-        #     self.cfg.joint_names, preserve_order=self.cfg.preserve_order
-        # )
-        # # grav = torch.abs(torch.tensor(self.env.cfg.sim.gravity[2], device=self.device))
-      
 
         self.mass = sum(self.robot.data.default_mass.T)[0]
         
         self.clf = CLF(
-            [],[], 18, self.env.cfg.sim.dt,
+            [],[], cfg.num_outputs, self.env.cfg.sim.dt,
             Q_weights=np.array(cfg.Q_weights),
             R_weights=np.array(cfg.R_weights),
             device=self.device
@@ -229,7 +215,7 @@ class HZDCommandTerm(CommandTerm):
 
     @property
     def command(self):
-        return self.foot_target
+        return self.y_out
     
 
     def _resample_command(self, env_ids):
@@ -416,26 +402,4 @@ class HZDCommandTerm(CommandTerm):
         self.vdot = vdot
         self.v = vcur
        
-        if self.debug_vis:
-            # Visualize foot target in global frame
-            base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)
-            N = base_velocity.shape[0]
-            foot_target = torch.cat([self.foot_target, torch.zeros((N, 1), device=self.device)], dim=-1)
-            p_ft_global = _transfer_to_global_frame(foot_target, self.robot.data.root_quat_w) + self.robot.data.root_pos_w
           
-            self.footprint_visualizer.visualize(
-                translations=p_ft_global,
-                orientations=yaw_quat(self.robot.data.root_quat_w).repeat_interleave(2, dim=0),
-            )
-            
-            
-            # Print debug info for first environment
-            # print(f"Base velocity: {base_velocity[0]}")
-            # print(f"y_out reference: {self.y_out}")
-            # print(f"dy_out reference: {self.dy_out}")
-            # print(f"foot_target: {self.foot_target[0]}")
-            # print(f"swing2stance: {self.swing2stance[0]}")
-            # print(f"Com2stance: {self.com2stance[0]}")
-            # # print(f"Current foot position: {self.robot.data.body_pos_w[0, self.feet_bodies.body_ids[0], :2]}")
-            # print("---")
-

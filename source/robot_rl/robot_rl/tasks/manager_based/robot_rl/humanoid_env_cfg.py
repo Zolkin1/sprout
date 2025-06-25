@@ -21,7 +21,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg, RewardsCfg, ObservationsCfg, EventCfg   #Inherit from the base envs
 import isaaclab.sim as sim_utils
-from robot_rl.tasks.manager_based.robot_rl.mdp.cmd_cfg import HLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.command.cmd_cfg import HLIPCommandCfg
 
 from . import mdp
 
