@@ -99,47 +99,53 @@ class HLIPCommandCfg(CommandTermCfg):
 
 
 HZD_Q_weights = [
-    1.0,1.0,#base_x
-    1.0,1.0,#base_y
-    1.0,1.0,#base_z
-    1.0,1.0,#base_roll
-    1.0,1.0,#base_pitch
-    1.0,1.0,#base_yaw
-    1.0,1.0,#left hip
-    1.0,1.0,#right hip
-    1.0,1.0,#left_hip 2
-    1.0,1.0,#right hip 2
-    1.0,1.0,#left hip 3
-    1.0,1.0,#right hip 3
-    1.0,1.0,#left knee
-    1.0,1.0,#right knee
-    1.0,1.0,#left ankle
-    1.0,1.0,#right ankle
-    1.0,1.0,#left ankle 2
-    1.0,1.0,#right ankle 2
+    1.0, 1.0,  # left_hip_pitch_joint
+    1.0, 1.0,  # right_hip_pitch_joint
+    1.0, 1.0,  # waist_yaw_joint
+    1.0, 1.0,  # left_hip_roll_joint
+    1.0, 1.0,  # right_hip_roll_joint
+    1.0, 1.0,  # left_shoulder_pitch_joint
+    1.0, 1.0,  # right_shoulder_pitch_joint
+    1.0, 1.0,  # left_hip_yaw_joint
+    1.0, 1.0,  # right_hip_yaw_joint
+    1.0, 1.0,  # left_shoulder_roll_joint
+    1.0, 1.0,  # right_shoulder_roll_joint
+    1.0, 1.0,  # left_knee_joint
+    1.0, 1.0,  # right_knee_joint
+    1.0, 1.0,  # left_shoulder_yaw_joint
+    1.0, 1.0,  # right_shoulder_yaw_joint
+    1.0, 1.0,  # left_ankle_pitch_joint
+    1.0, 1.0,  # right_ankle_pitch_joint
+    1.0, 1.0,  # left_elbow_joint
+    1.0, 1.0,  # right_elbow_joint
+    1.0, 1.0,  # left_ankle_roll_joint
+    1.0, 1.0,  # right_ankle_roll_joint
 ]
 
 
 HZD_R_weights = [
-      1.0,#base x
-      1.0,#base y
-      1.0,#base z
-      1.0,#base roll
-      1.0,#base pitch
-      1.0,#base yaw
-      1.0,#left hip
-      1.0,#right hip
-      1.0,#left_hip 2
-      1.0,#right hip 2
-      1.0,#left hip 3
-      1.0,#right hip 3
-      1.0,#left knee
-      1.0,#right knee
-      1.0,#left ankle
-      1.0,#right ankle
-      1.0,#left ankle 2
-      1.0,#right ankle 2
-    ]
+    1.0,  # left_hip_pitch_joint
+    1.0,  # right_hip_pitch_joint
+    1.0,  # waist_yaw_joint
+    1.0,  # left_hip_roll_joint
+    1.0,  # right_hip_roll_joint
+    1.0,  # left_shoulder_pitch_joint
+    1.0,  # right_shoulder_pitch_joint
+    1.0,  # left_hip_yaw_joint
+    1.0,  # right_hip_yaw_joint
+    1.0,  # left_shoulder_roll_joint
+    1.0,  # right_shoulder_roll_joint
+    1.0,  # left_knee_joint
+    1.0,  # right_knee_joint
+    1.0,  # left_shoulder_yaw_joint
+    1.0,  # right_shoulder_yaw_joint
+    1.0,  # left_ankle_pitch_joint
+    1.0,  # right_ankle_pitch_joint
+    1.0,  # left_elbow_joint
+    1.0,  # right_elbow_joint
+    1.0,  # left_ankle_roll_joint
+    1.0,  # right_ankle_roll_joint
+]
 
 
 @configclass
@@ -151,11 +157,7 @@ class HZDCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     foot_body_name: str = ".*_ankle_roll_link"
     num_outputs: int = 21
-    num_coeffs: int = 8
-    joint_patterns: list = [".*HipJoint", ".*KneeJoint", ".*AnkleJoint"]  # Regex patterns to match joint names
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
-    traj_coeff: dict[str, torch.Tensor] = {}
-    traj_coeff_remap: dict[str, torch.Tensor] = {}
     debug_vis: bool = False
     trajectory_tracking_visualizer_cfg: dict = {}
     Q_weights = HZD_Q_weights

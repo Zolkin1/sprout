@@ -11,7 +11,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.mdp.cmd_cfg import HZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.command.cmd_cfg import HZDCommandCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg 
 ##
 # Pre-defined configs
@@ -21,7 +21,7 @@ from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 class G1FlatHZDCommandsCfg(CommandsCfg):
 
      hzd_ref = HZDCommandCfg()
-     hzd_ref.foot_body_name = ".*HenkeAnkleLink"
+
 
 ##
 # Environment configuration

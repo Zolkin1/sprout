@@ -1,23 +1,24 @@
 import torch
 import math
+import yaml
 from isaaclab.utils import configclass
 import numpy as np
 
-from isaaclab.managers import CommandTermCfg,CommandTerm
+from isaaclab.managers import CommandTermCfg, CommandTerm
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
 # from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
 
-from .hlip_cmd import _transfer_to_global_frame, _transfer_to_local_frame, wrap_to_pi
+from .hlip_cmd import _transfer_to_local_frame
 from .ref_gen import _ncr
 from .clf import CLF
-import re
 
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING
+
 
 def bezier_deg(
     order: int,
@@ -82,7 +83,7 @@ def bezier_deg(
         #    one_minus_pow: [batch, degree], (1-τ)^(degree-1-i)
         one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - 1 - i_vec).unsqueeze(0))
 
-        # 6) Combine into a single “weight matrix” for the derivative:
+        # 6) Combine into a single "weight matrix" for the derivative:
         #    weight_deriv[b, i] = degree * C(degree-1, i) * (1-τ[b])^(degree-1-i) * (τ[b])^i
         #    → shape [batch, degree]
         weight_deriv = (degree
@@ -126,7 +127,7 @@ def bezier_deg(
         #    one_minus_pow:  [batch, degree+1]
         one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - i_vec).unsqueeze(0))
 
-        # 5) Combine into a “weight matrix” for position:
+        # 5) Combine into a "weight matrix" for position:
         #    weight_pos[b, i] = C(degree, i) * (1-τ[b])^(degree-i) * (τ[b])^i.
         #    → shape [batch, degree+1]
         weight_pos = (coefs_pos.unsqueeze(0)    # [1, degree+1]
@@ -142,11 +143,78 @@ def bezier_deg(
         B = torch.matmul(weight_pos, control_points.transpose(0, 1))  # [batch, n_dim]
 
         return B
-    
+
+
 class JointTrajectoryConfig:
-    def __init__(self):
+    def __init__(self, yaml_path=None):
         self.joint_trajectories = {}
         self.base_trajectories = {}
+        self.isaac_joint_indices = []  # Store Isaac indices in YAML order
+        
+        if yaml_path:
+            self.load_from_yaml(yaml_path)
+    
+    def load_from_yaml(self, yaml_path, robot=None):
+        """Load bezier coefficients from YAML file and find corresponding Isaac joint indices."""
+        with open(yaml_path, 'r') as file:
+            data = yaml.safe_load(file)
+        
+        # Extract bezier coefficients and joint order
+        bezier_coeffs = data['bezier_coeffs']
+        yaml_joint_order = data['joint_order']
+        spline_order = data['spline_order']
+        
+        # Calculate number of control points per joint
+        num_control_points = spline_order + 1
+        num_joints = len(yaml_joint_order)
+        
+        # Reshape bezier coefficients to [num_joints, num_control_points]
+        bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_joints, num_control_points)
+        
+        # Store coefficients in YAML order
+        for i, joint_name in enumerate(yaml_joint_order):
+            self.joint_trajectories[joint_name] = bezier_coeffs_reshaped[i].tolist()
+        
+        # Find Isaac joint indices if robot is provided
+        if robot is not None:
+            self.isaac_joint_indices = []
+            for joint_name in yaml_joint_order:
+                indices = robot.find_joints(joint_name)
+                if len(indices) > 0:
+                    self.isaac_joint_indices.append(indices[0])
+                else:
+                    raise ValueError(f"Joint {joint_name} not found in robot")
+        
+        # Store step period
+        self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
+        
+        return self
+    
+    def remap_jt_symmetric(self):
+        """Create symmetric mapping for left/right joints."""
+        symmetric_mapping = {}
+        for joint_name, coeffs in self.joint_trajectories.items():
+            if joint_name.startswith('left_'):
+                right_joint_name = joint_name.replace('left_', 'right_')
+                if right_joint_name in self.joint_trajectories:
+                    # For symmetric joints, we might need to negate certain coefficients
+                    # This depends on the specific joint and coordinate system
+                    symmetric_mapping[joint_name] = coeffs
+            elif joint_name.startswith('right_'):
+                left_joint_name = joint_name.replace('right_', 'left_')
+                if left_joint_name in self.joint_trajectories:
+                    symmetric_mapping[joint_name] = coeffs
+            else:
+                # Non-symmetric joints (like waist_yaw_joint) remain the same
+                symmetric_mapping[joint_name] = coeffs
+        
+        return symmetric_mapping
+    
+    def remap_base_symmetric(self):
+        """Create symmetric mapping for base trajectories."""
+        # For now, return empty dict as base trajectories are not used in this example
+        return {}
+
 
 if TYPE_CHECKING:
     from .cmd_cfg import HZDCommandCfg
@@ -161,12 +229,8 @@ class HZDCommandTerm(CommandTerm):
 
         self.debug_vis = cfg.debug_vis
 
-        # load polynomial coefficients
-        # propagate remapped coeffcient, step period, etc.
-        self.T = 1.0
 
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
-
 
         self.metrics = {}
      
@@ -175,14 +239,17 @@ class HZDCommandTerm(CommandTerm):
 
         # self.com_z = torch.ones((self.num_envs), device=self.device)*self.z0
 
-        # load joint trajectory config
+        # load joint trajectory config from YAML
+        yaml_path = "source/robot_rl/robot_rl/assets/robots/g1_solution.yaml"
         self.jt_config = JointTrajectoryConfig()
+        self.jt_config.load_from_yaml(yaml_path, self.robot)
+        self.T = self.jt_config.T  # Update T from YAML
+        
         right_jt_coeffs = self.jt_config.joint_trajectories
         right_base_coeffs = self.jt_config.base_trajectories
         left_jt_coeffs = self.jt_config.remap_jt_symmetric()
         left_base_coeffs = self.jt_config.remap_base_symmetric()
 
-        
         left_coeffs = []
         right_coeffs = []
         for key in self.jt_config.base_trajectories.keys():
@@ -190,20 +257,17 @@ class HZDCommandTerm(CommandTerm):
             left_coeffs.append(left_base_coeffs[key])
 
         for key in self.jt_config.joint_trajectories.keys():
-           
             right_coeffs.append(right_jt_coeffs[key])
             left_coeffs.append(left_jt_coeffs[key])
 
         self.right_coeffs = torch.tensor(right_coeffs, device=self.device)
         self.left_coeffs = torch.tensor(left_coeffs, device=self.device)
 
-
-        
-
         self.mass = sum(self.robot.data.default_mass.T)[0]
         
         self.clf = CLF(
-            [],[], cfg.num_outputs, self.env.cfg.sim.dt,
+           cfg.num_outputs, self.env.cfg.sim.dt,
+           batch_size=self.num_envs,
             Q_weights=np.array(cfg.Q_weights),
             R_weights=np.array(cfg.R_weights),
             device=self.device
@@ -235,20 +299,19 @@ class HZDCommandTerm(CommandTerm):
         # swing_foot_pos = foot_pos[:, int(0.5 + 0.5 * torch.sign(phi_c))]
         # Only compare x,y coordinates of foot target
         base_offset = 6
-        self.metrics["err_left_sagittal_knee"] = torch.abs(self.y_out[:,6+base_offset] - self.y_act[:,6+base_offset])
-        self.metrics["err_right_sagittal_knee"] = torch.abs(self.y_out[:,7+base_offset] - self.y_act[:,7+base_offset])
-        self.metrics["err_left_sagittal_ankle"] = torch.abs(self.y_out[:,8+base_offset] - self.y_act[:,8+base_offset])
-        self.metrics["err_right_sagittal_ankle"] = torch.abs(self.y_out[:,9+base_offset] - self.y_act[:,9+base_offset])
-        self.metrics["err_left_henke_ankle"] = torch.abs(self.y_out[:,10+base_offset] - self.y_act[:,10+base_offset])
-        self.metrics["err_right_henke_ankle"] = torch.abs(self.y_out[:,11+base_offset] - self.y_act[:,11+base_offset])
-        
+        self.metrics["err_left_sagittal_knee"] = torch.abs(self.y_out[:, 6 + base_offset] - self.y_act[:, 6 + base_offset])
+        self.metrics["err_right_sagittal_knee"] = torch.abs(self.y_out[:, 7 + base_offset] - self.y_act[:, 7 + base_offset])
+        self.metrics["err_left_sagittal_ankle"] = torch.abs(self.y_out[:, 8 + base_offset] - self.y_act[:, 8 + base_offset])
+        self.metrics["err_right_sagittal_ankle"] = torch.abs(self.y_out[:, 9 + base_offset] - self.y_act[:, 9 + base_offset])
+        self.metrics["err_left_henke_ankle"] = torch.abs(self.y_out[:, 10 + base_offset] - self.y_act[:, 10 + base_offset])
+        self.metrics["err_right_henke_ankle"] = torch.abs(self.y_out[:, 11 + base_offset] - self.y_act[:, 11 + base_offset])
 
-        self.metrics["err_left_frontal_hip"] = torch.abs(self.y_out[:,0+base_offset] - self.y_act[:,0+base_offset])
-        self.metrics["err_right_frontal_hip"] = torch.abs(self.y_out[:,1+base_offset] - self.y_act[:,1+base_offset])
-        self.metrics["err_left_transverse_hip"] = torch.abs(self.y_out[:,2+base_offset] - self.y_act[:,2+base_offset])
-        self.metrics["err_right_transverse_hip"] = torch.abs(self.y_out[:,3+base_offset] - self.y_act[:,3+base_offset])
-        self.metrics["err_left_sagittal_hip"] = torch.abs(self.y_out[:,4+base_offset] - self.y_act[:,4+base_offset])
-        self.metrics["err_right_sagittal_hip"] = torch.abs(self.y_out[:,5+base_offset] - self.y_act[:,5+base_offset])
+        self.metrics["err_left_frontal_hip"] = torch.abs(self.y_out[:, 0 + base_offset] - self.y_act[:, 0 + base_offset])
+        self.metrics["err_right_frontal_hip"] = torch.abs(self.y_out[:, 1 + base_offset] - self.y_act[:, 1 + base_offset])
+        self.metrics["err_left_transverse_hip"] = torch.abs(self.y_out[:, 2 + base_offset] - self.y_act[:, 2 + base_offset])
+        self.metrics["err_right_transverse_hip"] = torch.abs(self.y_out[:, 3 + base_offset] - self.y_act[:, 3 + base_offset])
+        self.metrics["err_left_sagittal_hip"] = torch.abs(self.y_out[:, 4 + base_offset] - self.y_act[:, 4 + base_offset])
+        self.metrics["err_right_sagittal_hip"] = torch.abs(self.y_out[:, 5 + base_offset] - self.y_act[:, 5 + base_offset])
 
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
@@ -258,32 +321,29 @@ class HZDCommandTerm(CommandTerm):
 
     def update_Stance_Swing_idx(self):
         Tswing = self.T 
-        tp = (self.env.sim.current_time % (2*Tswing)) / (2*Tswing)  
+        tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)  
         phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + self.T), device=self.env.device)
 
-
-
-        new_stance_idx = int(0.5 - 0.5*torch.sign(phi_c))
+        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
         
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
                 self.stance_idx = new_stance_idx
-            #update stance foot pos, ori
+            # update stance foot pos, ori
             foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
             foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
             self.stance_foot_pos_0 = foot_pos_w[:, new_stance_idx, :]
-            self.stance_foot_ori_quat_0 = foot_ori_w[:,new_stance_idx,:]
-            self.stance_foot_ori_0 = self.get_euler_from_quat(foot_ori_w[:,new_stance_idx,:])
+            self.stance_foot_ori_quat_0 = foot_ori_w[:, new_stance_idx, :]
+            self.stance_foot_ori_0 = self.get_euler_from_quat(foot_ori_w[:, new_stance_idx, :])
        
         self.stance_idx = new_stance_idx
 
-
         if tp < 0.5:
-            self.phase_var = 2*tp
+            self.phase_var = 2 * tp
         else:
-            self.phase_var = 2*tp-1
-        self.cur_swing_time = self.phase_var*Tswing
+            self.phase_var = 2 * tp - 1
+        self.cur_swing_time = self.phase_var * Tswing
 
 
     def generate_reference_trajectory(self):
@@ -307,7 +367,7 @@ class HZDCommandTerm(CommandTerm):
         self.dy_out = des_jt_vel
 
 
-    def nom_bezier_curve(self,control_points: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def nom_bezier_curve(self, control_points: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
         Evaluates multiple Bezier curves at given time points using the control points.
 
@@ -319,7 +379,7 @@ class HZDCommandTerm(CommandTerm):
         Returns:
             torch.Tensor: Tensor of shape [num_curves, dim] representing the evaluated points on the Bezier curves.
         """
-        dim,num_control_points = control_points.shape
+        dim, num_control_points = control_points.shape
         n = num_control_points - 1
 
         num_curves = t.shape[0]
@@ -331,7 +391,7 @@ class HZDCommandTerm(CommandTerm):
             bernstein_poly = binomial_coeff * (t ** i) * ((1 - t) ** (n - i))  # Bernstein basis polynomial
 
             # Add the contribution of each control point to each curve
-            curve_points += bernstein_poly.unsqueeze(-1) * control_points[:,i]
+            curve_points += bernstein_poly.unsqueeze(-1) * control_points[:, i]
 
         return curve_points
 
@@ -354,7 +414,6 @@ class HZDCommandTerm(CommandTerm):
         foot_pos_w = data.body_pos_w[:, self.feet_bodies_idx, :]
         foot_ori_w = data.body_quat_w[:, self.feet_bodies_idx, :]
 
-
         # Store raw foot positions
         self.stance_foot_pos = foot_pos_w[:, self.stance_idx, :]
         self.stance_foot_ori = self.get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
@@ -362,8 +421,8 @@ class HZDCommandTerm(CommandTerm):
         foot_lin_vel_w = data.body_lin_vel_w[:, self.feet_bodies_idx, :]
         foot_ang_vel_w = data.body_ang_vel_w[:, self.feet_bodies_idx, :]
 
-        self.stance_foot_vel = foot_lin_vel_w[:,self.stance_idx,:]
-        self.stance_foot_ang_vel = foot_ang_vel_w[:,self.stance_idx,:]
+        self.stance_foot_vel = foot_lin_vel_w[:, self.stance_idx, :]
+        self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
 
         base_pos = data.root_pos_w 
         base_pos_stance = base_pos - self.stance_foot_pos_0
@@ -371,7 +430,7 @@ class HZDCommandTerm(CommandTerm):
         pelvis_ori = self.get_euler_from_quat(data.root_quat_w)
         pelvis_omega_local = _transfer_to_local_frame(data.root_ang_vel_w, self.stance_foot_ori_quat_0)
 
-        #convert to euler rate?
+        # convert to euler rate?
 
         jt_pos = data.joint_pos
         jt_vel = data.joint_vel
@@ -388,17 +447,15 @@ class HZDCommandTerm(CommandTerm):
             jt_vel,
         ], dim=-1)
 
-
-
     def _update_command(self):
         
         self.update_Stance_Swing_idx()
         self.generate_reference_trajectory()
         self.get_actual_state()
         
-        #how to handle for the first step?
-        #i.e. v is not defined
-        vdot,vcur = self.clf.compute_vdot(self.y_act,self.y_out,self.dy_act,self.dy_out,self.v)
+        # how to handle for the first step?
+        # i.e. v is not defined
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.v)
         self.vdot = vdot
         self.v = vcur
        
