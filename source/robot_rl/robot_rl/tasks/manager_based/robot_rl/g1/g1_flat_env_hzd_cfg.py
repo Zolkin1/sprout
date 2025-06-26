@@ -51,6 +51,9 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
         
+        self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
+        self.commands.base_velocity.ranges.lin_vel_y = (0,0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
         ##
         # Scene
         ##
@@ -102,6 +105,6 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
         self.observations.policy.enable_corruption = False
         # remove random pushing
         self.events.base_external_force_torque = None
-        # self.events.push_robot = None
-        self.events.push_robot.interval_range_s = (5.0,5.0)
+        self.events.push_robot = None
+        # self.events.push_robot.interval_range_s = (5.0,5.0)
         self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0,0)} #(-3.14, 3.14)},

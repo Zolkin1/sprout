@@ -30,7 +30,8 @@ EXPERIMENT_NAMES = {
     "ref_tracking": "g1",
     "stair": "g1",
     "clf_vdot": "g1",
-    "height-scan-flat": "g1"
+    "height-scan-flat": "g1",
+    "flat-hzd": "g1"
 }
 
 SIM_ENVIRONMENTS = {
@@ -41,6 +42,7 @@ SIM_ENVIRONMENTS = {
     "clf_vdot": "G1-flat-ref-play",
     "stair": "G1-stair-play",
     "height-scan-flat": "G1-height-scan-flat-play",
+    "flat-hzd": "G1-flat-hzd-play",
 }
 
 class DataLogger:
@@ -159,13 +161,13 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def extract_reference_trajectory(env, log_vars):
+def extract_reference_trajectory(env, log_vars,command_name):
     # Get the underlying environment by unwrapping
     unwrapped_env = env.unwrapped
 
     cfg_name = type(env.cfg).__name__
 
-    ref = unwrapped_env.command_manager.get_term("hlip_ref")
+    ref = unwrapped_env.command_manager.get_term(command_name)
     results = {}
 
     for var in log_vars:
@@ -395,6 +397,11 @@ def main():
         timestep = 0
         print("[DEBUG] Starting simulation loop")
 
+        if args_cli.env_type == "flat-hzd":
+            command_name = "hzd_ref"
+        else:
+            command_name = "hlip_ref"
+
         # viewer = env.unwrapped.scene.viewer
 
         # Choose the robot's prim path
@@ -414,7 +421,7 @@ def main():
                 
                 # Log data
                 if args_cli.log_data:
-                    data = extract_reference_trajectory(env, log_vars)
+                    data = extract_reference_trajectory(env, log_vars,command_name)
                     logger.log_from_dict(data)
 
             timestep += 1

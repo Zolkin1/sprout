@@ -8,7 +8,7 @@ from isaaclab.managers import CommandTermCfg, CommandTerm
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
-
+from robot_rl.assets.robots.g1_21j import build_relabel_matrix
 # from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
 
 from .hlip_cmd import _transfer_to_local_frame
@@ -171,6 +171,8 @@ class JointTrajectoryConfig:
         # Reshape bezier coefficients to [num_joints, num_control_points]
         bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_joints, num_control_points)
         
+        self.bezier_coeffs = bezier_coeffs_reshaped
+        self.joint_order = yaml_joint_order
         # Store coefficients in YAML order
         for i, joint_name in enumerate(yaml_joint_order):
             self.joint_trajectories[joint_name] = bezier_coeffs_reshaped[i].tolist()
@@ -193,27 +195,17 @@ class JointTrajectoryConfig:
     def remap_jt_symmetric(self):
         """Create symmetric mapping for left/right joints."""
         symmetric_mapping = {}
-        for joint_name, coeffs in self.joint_trajectories.items():
-            if joint_name.startswith('left_'):
-                right_joint_name = joint_name.replace('left_', 'right_')
-                if right_joint_name in self.joint_trajectories:
-                    # For symmetric joints, we might need to negate certain coefficients
-                    # This depends on the specific joint and coordinate system
-                    symmetric_mapping[joint_name] = coeffs
-            elif joint_name.startswith('right_'):
-                left_joint_name = joint_name.replace('right_', 'left_')
-                if left_joint_name in self.joint_trajectories:
-                    symmetric_mapping[joint_name] = coeffs
-            else:
-                # Non-symmetric joints (like waist_yaw_joint) remain the same
-                symmetric_mapping[joint_name] = coeffs
+        #grab R from g1_r
+        R = build_relabel_matrix()
+        traj = R @ self.bezier_coeffs
+        
+        # Create mapping from joint names to their mirrored coefficients
+        for i, joint_name in enumerate(self.joint_order):
+            symmetric_mapping[joint_name] = traj[i].tolist()
         
         return symmetric_mapping
     
-    def remap_base_symmetric(self):
-        """Create symmetric mapping for base trajectories."""
-        # For now, return empty dict as base trajectories are not used in this example
-        return {}
+
 
 
 if TYPE_CHECKING:
@@ -243,25 +235,25 @@ class HZDCommandTerm(CommandTerm):
         yaml_path = "source/robot_rl/robot_rl/assets/robots/g1_solution.yaml"
         self.jt_config = JointTrajectoryConfig()
         self.jt_config.load_from_yaml(yaml_path, self.robot)
-        self.T = self.jt_config.T  # Update T from YAML
+        self.T = self.env.cfg.commands.step_period.period_range[0]/2
         
         right_jt_coeffs = self.jt_config.joint_trajectories
-        right_base_coeffs = self.jt_config.base_trajectories
+    
         left_jt_coeffs = self.jt_config.remap_jt_symmetric()
-        left_base_coeffs = self.jt_config.remap_base_symmetric()
+   
 
-        left_coeffs = []
-        right_coeffs = []
-        for key in self.jt_config.base_trajectories.keys():
-            right_coeffs.append(right_base_coeffs[key])
-            left_coeffs.append(left_base_coeffs[key])
+        left_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg+1), device=self.device)
+        right_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg+1), device=self.device)
 
+        
         for key in self.jt_config.joint_trajectories.keys():
-            right_coeffs.append(right_jt_coeffs[key])
-            left_coeffs.append(left_jt_coeffs[key])
+            joint_idx = self.robot.find_joints(key)[0]
+            right_coeffs[joint_idx] = torch.tensor(right_jt_coeffs[key], device=self.device)
+            left_coeffs[joint_idx] = torch.tensor(left_jt_coeffs[key], device=self.device)
 
-        self.right_coeffs = torch.tensor(right_coeffs, device=self.device)
-        self.left_coeffs = torch.tensor(left_coeffs, device=self.device)
+        self.right_coeffs = right_coeffs
+        self.left_coeffs = left_coeffs
+
 
         self.mass = sum(self.robot.data.default_mass.T)[0]
         
@@ -303,20 +295,11 @@ class HZDCommandTerm(CommandTerm):
 
         # swing_foot_pos = foot_pos[:, int(0.5 + 0.5 * torch.sign(phi_c))]
         # Only compare x,y coordinates of foot target
-        base_offset = 6
-        self.metrics["err_left_sagittal_knee"] = torch.abs(self.y_out[:, 6 + base_offset] - self.y_act[:, 6 + base_offset])
-        self.metrics["err_right_sagittal_knee"] = torch.abs(self.y_out[:, 7 + base_offset] - self.y_act[:, 7 + base_offset])
-        self.metrics["err_left_sagittal_ankle"] = torch.abs(self.y_out[:, 8 + base_offset] - self.y_act[:, 8 + base_offset])
-        self.metrics["err_right_sagittal_ankle"] = torch.abs(self.y_out[:, 9 + base_offset] - self.y_act[:, 9 + base_offset])
-        self.metrics["err_left_henke_ankle"] = torch.abs(self.y_out[:, 10 + base_offset] - self.y_act[:, 10 + base_offset])
-        self.metrics["err_right_henke_ankle"] = torch.abs(self.y_out[:, 11 + base_offset] - self.y_act[:, 11 + base_offset])
-
-        self.metrics["err_left_frontal_hip"] = torch.abs(self.y_out[:, 0 + base_offset] - self.y_act[:, 0 + base_offset])
-        self.metrics["err_right_frontal_hip"] = torch.abs(self.y_out[:, 1 + base_offset] - self.y_act[:, 1 + base_offset])
-        self.metrics["err_left_transverse_hip"] = torch.abs(self.y_out[:, 2 + base_offset] - self.y_act[:, 2 + base_offset])
-        self.metrics["err_right_transverse_hip"] = torch.abs(self.y_out[:, 3 + base_offset] - self.y_act[:, 3 + base_offset])
-        self.metrics["err_left_sagittal_hip"] = torch.abs(self.y_out[:, 4 + base_offset] - self.y_act[:, 4 + base_offset])
-        self.metrics["err_right_sagittal_hip"] = torch.abs(self.y_out[:, 5 + base_offset] - self.y_act[:, 5 + base_offset])
+        
+        # Update metrics using actual joint names from the YAML file
+        for i, joint_name in enumerate(self.robot.joint_names):
+            error_key = f"error_{joint_name}"
+            self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
 
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
@@ -335,6 +318,7 @@ class HZDCommandTerm(CommandTerm):
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
                 self.stance_idx = new_stance_idx
+
             # update stance foot pos, ori
             foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
             foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
@@ -349,7 +333,7 @@ class HZDCommandTerm(CommandTerm):
         else:
             self.phase_var = 2 * tp - 1
         self.cur_swing_time = self.phase_var * Tswing
-
+        
 
     def generate_reference_trajectory(self):
         base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)

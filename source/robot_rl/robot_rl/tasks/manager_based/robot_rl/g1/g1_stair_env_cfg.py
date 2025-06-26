@@ -27,7 +27,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.command.stair_cfg import StairHLI
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from robot_rl.tasks.manager_based.robot_rl.g1.ObservationCfg import G1StairObservationsCfg
+from source.robot_rl.robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 #
 
 
