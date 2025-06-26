@@ -11,14 +11,14 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.mdp.command.cmd_cfg import HZDCommandCfg
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 ##
 # Pre-defined configs
 ##
 from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 
-class G1FlatHZDCommandsCfg(CommandsCfg):
+class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
 
      hzd_ref = HZDCommandCfg()
 
@@ -35,6 +35,22 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         # post init of parent
         super().__post_init__()
 
+
+        # change the observation command name to hzd_ref
+        self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj_vel.params["command_name"] = "hzd_ref"
+
+        # change the reward command name to hzd_ref
+        self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
+        self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
+        self.rewards.clf_reward.params["command_name"] = "hzd_ref"
+        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
+        
+        
         ##
         # Scene
         ##
@@ -70,7 +86,7 @@ class G1FlatHZDVdotEnvCfg(G1FlatHZDEnvCfg):
             func=mdp.clf_decreasing_condition,
             weight=2.0,
             params={
-                "command_name": "hlip_ref",
+                "command_name": "hzd_ref",
             }
         )
 

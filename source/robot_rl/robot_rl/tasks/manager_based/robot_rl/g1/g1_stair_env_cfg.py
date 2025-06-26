@@ -3,8 +3,7 @@ import torch
 
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
+
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -14,111 +13,26 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import TerminationsCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
-from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards, G1RoughLipObservationsCfg
+from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg,
+                                                                    
+from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG
 
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg  #Inherit from the base envs
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
+
 from robot_rl.tasks.manager_based.robot_rl.mdp.command.stair_cfg import StairHLIPCommandCfg
 ##
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-
+from robot_rl.tasks.manager_based.robot_rl.g1.ObservationCfg import G1StairObservationsCfg
 #
-@configclass
-class G1StairObservationsCfg:
-    """Observation specifications for the G1 Flat environment."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            noise=Unoise(n_min=-0.1, n_max=0.1),
-            scale=1,
-            clip=(-1.0, 1.0)
-        )
-        
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},scale=(2.0,2.0,2.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5),scale=0.05)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(
-            func=mdp.stair_sin_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        cos_phase = ObsTerm(
-            func=mdp.stair_cos_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        step_duration = ObsTerm(
-            func=mdp.step_duration,
-            params={"command_name": "hlip_ref"},
-        )
-        # des_foot_pos = ObsTerm(func=mdp.generated_commands, params={"command_name": "hlip_ref"},history_length=1,scale=(1.0,1.0))
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Observations for critic group."""
-        height_scan = ObsTerm(
-            func=mdp.height_scan,
-            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            scale=1,
-            clip=(-1.0, 1.0)
-        )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel,scale=1.0)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel,scale=1.0)
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-        )
-        # root_quat = ObsTerm(func=mdp.root_quat)
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},scale=(2.0,2.0,2.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(
-            func=mdp.stair_sin_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        cos_phase = ObsTerm(
-            func=mdp.stair_cos_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        step_duration = ObsTerm(
-            func=mdp.step_duration,
-            params={"command_name": "hlip_ref"},
-        )
-        contact_state = ObsTerm(
-            func=mdp.contact_state,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-        )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel,scale=1.0)
-        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=0.1)
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=0.1)
-       
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
 
 
 @configclass
-class G1StairCommandsCfg(CommandsCfg):
+class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     hlip_ref = StairHLIPCommandCfg()
 
@@ -133,12 +47,6 @@ class G1StairRewardsCfg(G1RoughLipRewards):
         weight=4.0,
     )
 
-    # swing_foot_contact = RewTerm(
-    #     func=mdp.swing_foot_contact_penalty,
-    #     params={"command_name": "hlip_ref",
-    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-    #     weight=-2.0,
-    # )
 
 @configclass
 class G1StairsTerminationCfg(TerminationsCfg):
@@ -251,24 +159,16 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params["max_clf"] = 100.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
-        # self.rewards.track_ang_vel_z_exp.weight = 1.0
- 
-        # torque, acc, vel, action rate regularization
-        # self.rewards.dof_torques_l2.weight = -1.0e-5
+
         self.rewards.dof_pos_limits.weight = -1.0
         self.rewards.dof_acc_l2.weight = -2.5e-7
         self.rewards.dof_vel_l2.weight = -1.0e-5
         self.rewards.action_rate_l2.weight = -0.001
-        # self.rewards.joint_deviation_arms.weight = -1.0             # Arms regularization
-        # self.rewards.joint_deviation_torso.weight = -1.0
+
         
         self.rewards.joint_deviation_arms = None
         self.rewards.joint_deviation_torso = None
-        # self.rewards.dof_pos_limits = None
-        # self.rewards.dof_vel_l2 = None
-        # self.rewards.dof_acc_l2 = None
-        # self.rewards.dof_torques_l2 = None
-        # self.rewards.action_rate_l2 = None  
+
         self.rewards.height_torso = None
         
 
@@ -376,24 +276,18 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params["max_clf"] = 50.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
-        # self.rewards.track_ang_vel_z_exp.weight = 1.0
  
         # torque, acc, vel, action rate regularization
-        # self.rewards.dof_torques_l2.weight = -1.0e-5
+
         self.rewards.dof_pos_limits.weight = -1.0
         self.rewards.dof_acc_l2.weight = -2.5e-7
         self.rewards.dof_vel_l2.weight = -1.0e-5
         self.rewards.action_rate_l2.weight = -0.001
-        # self.rewards.joint_deviation_arms.weight = -1.0             # Arms regularization
-        # self.rewards.joint_deviation_torso.weight = -1.0
+
         
         self.rewards.joint_deviation_arms = None
         self.rewards.joint_deviation_torso = None
-        # self.rewards.dof_pos_limits = None
-        # self.rewards.dof_vel_l2 = None
-        # self.rewards.dof_acc_l2 = None
-        # self.rewards.dof_torques_l2 = None
-        # self.rewards.action_rate_l2 = None  
+
         self.rewards.height_torso = None
 
 class G1HeightScanPlay_EnvCfg(G1HeightScanFlatEnvCfg):

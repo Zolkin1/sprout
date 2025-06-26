@@ -276,6 +276,11 @@ class HZDCommandTerm(CommandTerm):
         self.v = torch.zeros((self.num_envs), device=self.device)
         self.stance_idx = None
 
+        self.y_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+
 
     @property
     def command(self):
@@ -356,12 +361,14 @@ class HZDCommandTerm(CommandTerm):
         else:
             ctrl_points = self.left_coeffs
      
+
+     
         phase_var_tensor = torch.full((N,), self.phase_var, device=self.device)
         des_jt_pos = bezier_deg(
-            0, phase_var_tensor, T, ctrl_points, torch.tensor(7, device=self.device)
+            0, phase_var_tensor, T, ctrl_points, torch.tensor(self.cfg.bez_deg, device=self.device)
         )
         
-        des_jt_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, 7)
+        des_jt_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, self.cfg.bez_deg)
 
         self.y_out = des_jt_pos
         self.dy_out = des_jt_vel
@@ -424,28 +431,20 @@ class HZDCommandTerm(CommandTerm):
         self.stance_foot_vel = foot_lin_vel_w[:, self.stance_idx, :]
         self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
 
-        base_pos = data.root_pos_w 
-        base_pos_stance = base_pos - self.stance_foot_pos_0
-        base_vel = data.root_lin_vel_w
-        pelvis_ori = self.get_euler_from_quat(data.root_quat_w)
-        pelvis_omega_local = _transfer_to_local_frame(data.root_ang_vel_w, self.stance_foot_ori_quat_0)
+        # base_pos = data.root_pos_w 
+        # base_pos_stance = base_pos - self.stance_foot_pos_0
+        # base_vel = data.root_lin_vel_w
+        # pelvis_ori = self.get_euler_from_quat(data.root_quat_w)
+        # pelvis_omega_local = _transfer_to_local_frame(data.root_ang_vel_w, self.stance_foot_ori_quat_0)
 
         # convert to euler rate?
 
         jt_pos = data.joint_pos
         jt_vel = data.joint_vel
         # 4. Assemble state vectors
-        self.y_act = torch.cat([
-            base_pos_stance,
-            pelvis_ori,
-            jt_pos
-        ], dim=-1)
+        self.y_act = jt_pos
 
-        self.dy_act = torch.cat([
-            base_vel,
-            pelvis_omega_local,
-            jt_vel,
-        ], dim=-1)
+        self.dy_act = jt_vel
 
     def _update_command(self):
         
@@ -455,7 +454,7 @@ class HZDCommandTerm(CommandTerm):
         
         # how to handle for the first step?
         # i.e. v is not defined
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.v)
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, [])
         self.vdot = vdot
         self.v = vcur
        

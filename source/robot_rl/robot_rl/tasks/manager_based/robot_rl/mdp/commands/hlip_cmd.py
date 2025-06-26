@@ -66,7 +66,10 @@ class HLIPCommandTerm(CommandTerm):
         self.T_ds = cfg.T_ds
         self.z0 = cfg.z0
         self.y_nom = cfg.y_nom
-        self.T = cfg.gait_period/2
+
+        #grab from gait period command
+        self.T = env.command_manager.get_command("gait_period")/2
+        
         self.debug_vis = cfg.debug_vis
         if self.debug_vis:
             self.footprint_visualizer = VisualizationMarkers(cfg.footprint_cfg)

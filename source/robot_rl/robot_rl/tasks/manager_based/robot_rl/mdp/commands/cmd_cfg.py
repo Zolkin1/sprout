@@ -157,6 +157,7 @@ class HZDCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     foot_body_name: str = ".*_ankle_roll_link"
     num_outputs: int = 21
+    bez_deg: int = 5
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
     debug_vis: bool = False
     trajectory_tracking_visualizer_cfg: dict = {}

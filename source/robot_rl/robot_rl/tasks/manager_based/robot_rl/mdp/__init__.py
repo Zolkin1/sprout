@@ -13,3 +13,4 @@ from .rewards.rewards import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
 from .curriculums.curriculums import *  # noqa: F401, F403
 from .terminations.terminations import *  # noqa: F401, F403
+from .commands import *  # noqa: F401, F403
