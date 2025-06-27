@@ -13,7 +13,7 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import TerminationsCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 
-from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg,
+from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
                                                                     
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG
@@ -22,7 +22,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import Co
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.command.stair_cfg import StairHLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stair_cfg import StairHLIPCommandCfg
 ##
 # Pre-defined configs
 ##

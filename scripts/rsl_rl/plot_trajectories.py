@@ -74,8 +74,8 @@ def plot_trajectories(data, save_dir=None):
         'cur_swing_time': ['Time'],
         'y_act': g1_formatted_labels,
         'dy_act': g1_formatted_labels,
-        'v': ['Velocity'],
-        'vdot': ['Acceleration'],
+        'v': ['v'],
+        'vdot': ['vdot'],
         'reward': ['Reward']
     }
     
@@ -269,14 +269,14 @@ def plot_trajectories(data, save_dir=None):
         vdot_data = processed_data['vdot']
         fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
         
-        axs[0].plot(time_steps, v_data[:, env_ids], label='CLF Velocity', color='green', linewidth=2)
-        axs[0].set_title('CLF Velocity (v)')
+        axs[0].plot(time_steps, v_data[:, env_ids], label='CLF v', color='green', linewidth=2)
+        axs[0].set_title('CLF (v)')
         axs[0].set_ylabel(units['v'][0] if 'v' in units else '')
         axs[0].grid(True, alpha=0.3)
         axs[0].legend()
         
-        axs[1].plot(time_steps, vdot_data[:, env_ids], label='CLF Acceleration', color='magenta', linewidth=2)
-        axs[1].set_title('CLF Acceleration (v̇)')
+        axs[1].plot(time_steps, vdot_data[:, env_ids], label='CLF vdot ', color='magenta', linewidth=2)
+        axs[1].set_title('CLF (v̇)')
         axs[1].set_xlabel('Time Steps')
         axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
         axs[1].grid(True, alpha=0.3)

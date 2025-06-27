@@ -64,6 +64,14 @@ class G1RoughLipObservationsCfg():
     critic: CriticCfg = CriticCfg()
 
 
+@configclass
+class G1FlatHZDObservationsCfg(G1RoughLipObservationsCfg):
+    class PolicyCfg(G1RoughLipObservationsCfg.PolicyCfg):
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"},scale=1.0)
+
+    policy: PolicyCfg = PolicyCfg()
+
+
 
 @configclass
 class G1StairObservationsCfg:
