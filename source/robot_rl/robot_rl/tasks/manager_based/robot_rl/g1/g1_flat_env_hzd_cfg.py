@@ -50,6 +50,9 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
+
+        self.rewards.clf_reward.params["max_clf"] = 50.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         
         self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)

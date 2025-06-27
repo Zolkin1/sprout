@@ -99,27 +99,27 @@ class HLIPCommandCfg(CommandTermCfg):
 
 
 HZD_Q_weights = [
-    1.0, 1.0,  # left_hip_pitch_joint
-    1.0, 1.0,  # right_hip_pitch_joint
-    1.0, 1.0,  # waist_yaw_joint
-    1.0, 1.0,  # left_hip_roll_joint
-    1.0, 1.0,  # right_hip_roll_joint
-    1.0, 1.0,  # left_shoulder_pitch_joint
-    1.0, 1.0,  # right_shoulder_pitch_joint
-    1.0, 1.0,  # left_hip_yaw_joint
-    1.0, 1.0,  # right_hip_yaw_joint
-    1.0, 1.0,  # left_shoulder_roll_joint
-    1.0, 1.0,  # right_shoulder_roll_joint
-    1.0, 1.0,  # left_knee_joint
-    1.0, 1.0,  # right_knee_joint
-    1.0, 1.0,  # left_shoulder_yaw_joint
-    1.0, 1.0,  # right_shoulder_yaw_joint
-    1.0, 1.0,  # left_ankle_pitch_joint
-    1.0, 1.0,  # right_ankle_pitch_joint
-    1.0, 1.0,  # left_elbow_joint
-    1.0, 1.0,  # right_elbow_joint
-    1.0, 1.0,  # left_ankle_roll_joint
-    1.0, 1.0,  # right_ankle_roll_joint
+    10.0, 1.0,  # left_hip_pitch_joint
+    10.0, 1.0,  # right_hip_pitch_joint
+    10.0, 1.0,  # waist_yaw_joint
+    10.0, 1.0,  # left_hip_roll_joint
+    10.0, 1.0,  # right_hip_roll_joint
+    10.0, 1.0,  # left_shoulder_pitch_joint
+    10.0, 1.0,  # right_shoulder_pitch_joint
+    10.0, 1.0,  # left_hip_yaw_joint
+    10.0, 1.0,  # right_hip_yaw_joint
+    10.0, 1.0,  # left_shoulder_roll_joint
+    10.0, 1.0,  # right_shoulder_roll_joint
+    20.0, 1.0,  # left_knee_joint
+    20.0, 1.0,  # right_knee_joint
+    10.0, 1.0,  # left_shoulder_yaw_joint
+    10.0, 1.0,  # right_shoulder_yaw_joint
+    10.0, 1.0,  # left_ankle_pitch_joint
+    10.0, 1.0,  # right_ankle_pitch_joint
+    10.0, 1.0,  # left_elbow_joint
+    10.0, 1.0,  # right_elbow_joint
+    20.0, 1.0,  # left_ankle_roll_joint
+    20.0, 1.0,  # right_ankle_roll_joint
 ]
 
 
