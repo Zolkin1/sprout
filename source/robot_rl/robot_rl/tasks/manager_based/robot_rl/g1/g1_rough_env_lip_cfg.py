@@ -37,7 +37,7 @@ class G1RoughLipCommandsCfg(HumanoidCommandsCfg):
 class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000})
+    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
 
 # Lip specific rewards
 ##
@@ -76,6 +76,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         weight=-2.0,
         params={
             "command_name": "hlip_ref",
+            "alpha": 1.0,
             "max_clf_decreasing": 200.0,
         }
     )

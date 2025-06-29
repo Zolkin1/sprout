@@ -32,7 +32,7 @@ class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
 class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
     commands: G1FlatHZDCommandsCfg = G1FlatHZDCommandsCfg()
-    observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
+    # observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -55,6 +55,7 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params["max_clf"] = 20.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_decreasing_condition.params["alpha"] = 10.0
         
         self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
@@ -70,6 +71,7 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.observations.policy.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None
+        self.curriculum.clf_curriculum.params["min_val"] = 5.0
         # self.curriculum.clf_curriculum = None
 
 

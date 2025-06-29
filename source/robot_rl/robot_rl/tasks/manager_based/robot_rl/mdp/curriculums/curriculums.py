@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100
+    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100,min_val: float = 20.0
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
@@ -46,7 +46,7 @@ def clf_curriculum(
             # env.reward_manager.set_term_cfg("clf_reward", term_cfg)
 
             # increase clf decreasing condition weight?
-            new_clf = max(new_clf -2,20.0)
+            new_clf = max(new_clf -2,min_val)
             term_cfg.params["max_clf_decreasing"] = new_clf
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
     return new_clf
