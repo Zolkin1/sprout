@@ -98,14 +98,9 @@ class G1StairObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(
-            func=mdp.stair_sin_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        cos_phase = ObsTerm(
-            func=mdp.stair_cos_phase,
-            params={"command_name": "hlip_ref"},
-        )
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
         step_duration = ObsTerm(
             func=mdp.step_duration,
             params={"command_name": "hlip_ref"},
@@ -132,14 +127,9 @@ class G1StairObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(
-            func=mdp.stair_sin_phase,
-            params={"command_name": "hlip_ref"},
-        )
-        cos_phase = ObsTerm(
-            func=mdp.stair_cos_phase,
-            params={"command_name": "hlip_ref"},
-        )
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
         step_duration = ObsTerm(
             func=mdp.step_duration,
             params={"command_name": "hlip_ref"},

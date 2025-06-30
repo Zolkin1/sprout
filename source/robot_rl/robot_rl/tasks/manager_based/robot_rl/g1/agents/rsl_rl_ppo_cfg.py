@@ -84,8 +84,8 @@ class StairPPOCfg(PPORunnerCfg):
 
 @configclass
 class StairCNNPPOCfg(PPORunnerCfg):
-    resume = False
-    resume_path = None
+    resume = True
+    resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/stair-hzd/g1/2025-06-29_20-46-54/model_3999.pt"
     policy = None
     policy = CustomPPOActorCriticCfg(
         class_name="ActorCriticCNN",

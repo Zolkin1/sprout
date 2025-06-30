@@ -226,9 +226,6 @@ class HZDCommandTerm(CommandTerm):
 
         self.metrics = {}
      
-        self.y_out = torch.zeros((self.num_envs, 18), device=self.device)
-        self.dy_out = torch.zeros((self.num_envs, 18), device=self.device)
-
         # self.com_z = torch.ones((self.num_envs), device=self.device)*self.z0
 
         # load joint trajectory config from YAML

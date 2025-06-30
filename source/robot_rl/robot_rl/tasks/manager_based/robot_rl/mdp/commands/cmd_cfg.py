@@ -1,5 +1,6 @@
 from .hlip_cmd import HLIPCommandTerm
 from .hzd_cmd import HZDCommandTerm
+from .hzd_stair_cmd import HZDStairCommandTerm
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -161,5 +162,21 @@ class HZDCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
     debug_vis: bool = False
     trajectory_tracking_visualizer_cfg: dict = {}
+    Q_weights = HZD_Q_weights
+    R_weights = HZD_R_weights
+
+
+@configclass
+class HZDStairCommandCfg(CommandTermCfg):
+    """
+    Configuration for the HZDStairCommandTerm.
+    """
+    class_type: type = HZDStairCommandTerm
+    asset_name: str = "robot"
+    foot_body_name: str = ".*_ankle_roll_link"
+    num_outputs: int = 21
+    bez_deg: int = 5
+    resampling_time_range: tuple[float, float] = (5.0, 15.0)
+    debug_vis: bool = False
     Q_weights = HZD_Q_weights
     R_weights = HZD_R_weights

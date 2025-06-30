@@ -31,7 +31,8 @@ EXPERIMENT_NAMES = {
     "stair": "g1",
     "clf_vdot": "g1",
     "height-scan-flat": "g1",
-    "flat-hzd": "g1"
+    "flat-hzd": "g1",
+    "stair-hzd": "g1"
 }
 
 SIM_ENVIRONMENTS = {
@@ -43,6 +44,7 @@ SIM_ENVIRONMENTS = {
     "stair": "G1-stair-play",
     "height-scan-flat": "G1-height-scan-flat-play",
     "flat-hzd": "G1-flat-hzd-play",
+    "stair-hzd": "G1-stair-hzd-play",
 }
 
 class DataLogger:
@@ -397,7 +399,7 @@ def main():
         timestep = 0
         print("[DEBUG] Starting simulation loop")
 
-        if args_cli.env_type == "flat-hzd":
+        if args_cli.env_type == "flat-hzd" or args_cli.env_type == "stair-hzd":
             command_name = "hzd_ref"
         else:
             command_name = "hlip_ref"

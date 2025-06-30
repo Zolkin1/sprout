@@ -29,12 +29,16 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stair_cfg import StairHL
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 from source.robot_rl.robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 #
-
-
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDCommandsCfg
 @configclass
 class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     hlip_ref = StairHLIPCommandCfg()
+    def __post_init__(self):
+        super().__post_init__()
+        self.step_period.period_range = (1.0,1.0)
 
 
 @configclass
@@ -171,6 +175,69 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.height_torso = None
         
+@configclass
+class G1HZD_StairCommandsCfg(HumanoidCommandsCfg):
+    """Commands for the G1 Flat environment."""   
+    hzd_ref = HZDStairCommandCfg()
+
+@configclass
+class G1HZDEnvCfg(G1StairEnvCfg):
+    commands: G1HZD_StairCommandsCfg = G1HZD_StairCommandsCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.step_duration = None
+        self.observations.critic.step_duration = None
+ 
+
+        self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj_vel.params["command_name"] = "hzd_ref"
+
+        # change the reward command name to hzd_ref
+        self.rewards.holonomic_constraint_stair.params["command_name"] = "hzd_ref"
+        self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
+        self.rewards.clf_reward.params["command_name"] = "hzd_ref"
+        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
+        
+
+        self.rewards.clf_reward.params["max_clf"] = 20.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_decreasing_condition.params["alpha"] = 10.0
+        
+        self.commands.base_velocity.ranges.lin_vel_x = (0.3,0.3)
+        self.commands.base_velocity.ranges.lin_vel_y = (0,0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
+
+        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator.sub_terrains["stairs_inv_w_hole"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator.sub_terrains["stairs_w_hole"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator.sub_terrains["flat"].step_height_range = (0.0,0.0)
+        
+        # self.scene.terrain.terrain_type = "plane"
+        # self.scene.terrain.terrain_generator = None
+        # self.curriculum.terrain_levels = None
+
+        # self.curriculum.terrain_levels = None
+        clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
+        self.curriculum.clf_curriculum = clf_curriculum
+
+
+@configclass
+class G1HZDEnvPlay(G1HZDEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+        self.events.reset_base.params["pose_range"] = {"x": (0,0), "y": (0,0), "yaw": (0,0)}
+        self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 2
 
 @configclass
 class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
