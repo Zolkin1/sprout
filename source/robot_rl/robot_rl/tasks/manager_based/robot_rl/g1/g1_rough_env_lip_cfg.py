@@ -1,7 +1,3 @@
-import math
-import torch
-
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -87,6 +83,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
 @configclass
 class G1RoughLipEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     rewards: G1RoughLipRewards = G1RoughLipRewards()
     # events: G1RoughLipEventsCfg = G1RoughLipEventsCfg()
     observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
@@ -107,13 +104,17 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         # No height scanner for now
         self.scene.height_scanner = None
 
-
         ##
         # Randomization
         ##
         # self.events.push_robot = None
-        self.events.push_robot.params["velocity_range"] = {"x": (-1, 1), "y": (-1, 1), "roll": (-0.4, 0.4),
-                                                           "pitch": (-0.4, 0.4), "yaw": (-0.4, 0.4)}
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-1, 1),
+            "y": (-1, 1),
+            "roll": (-0.4, 0.4),
+            "pitch": (-0.4, 0.4),
+            "yaw": (-0.4, 0.4),
+        }
         # self.events.push_robot.params["velocity_range"] = {"x": (-0, 0), "y": (-0, 0), "roll": (-0.0, 0.0),
         #                                                    "pitch": (-0., 0.), "yaw": (-0.0, 0.0)}
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]

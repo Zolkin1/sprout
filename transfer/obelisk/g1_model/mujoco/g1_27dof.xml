@@ -633,7 +633,7 @@ Position and velocity actuators added. -->
     <velocity name="right_wrist_roll_joint_vel" class="wrist_roll_vel" joint="right_wrist_roll_joint"/>
     <velocity name="right_wrist_pitch_joint_vel" class="wrist_pitch_vel" joint="right_wrist_pitch_joint"/>
     <velocity name="right_wrist_yaw_joint_vel" class="wrist_yaw_vel" joint="right_wrist_yaw_joint"/>
-    
+
     <!-- ################ -->
     <!-- Torque Actuation -->
     <!-- ################ -->
@@ -783,7 +783,7 @@ Position and velocity actuators added. -->
   </sensor>
 
   <keyframe>
-    <!-- <key name="standing" 
+    <!-- <key name="standing"
       qpos="0 0 0.74
             0 0 0 0
             -0.42 0 0 0.81 -0.4 0
@@ -796,19 +796,19 @@ Position and velocity actuators added. -->
             0
             0 0.27 0 0.5 0 0 0
             0 -0.27 0 0.5 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0"/> -->
-    <key name="standing" 
+    <key name="standing"
       qpos="0 0 0.74
             0 0 0 1
             -0.42 0 0 0.81 -0.4 0
@@ -821,19 +821,19 @@ Position and velocity actuators added. -->
             0
             0 0.27 0 0.5 0 0 0
             0 -0.27 0 0.5 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0"/>
-    <key name="hw_ic" 
+    <key name="hw_ic"
       qpos="-0.093908   0.00493662     0.714384
             1 -9.12856e-06 -0.000156081 -5.04031e-05
             -0.445448  -0.00247192   0.00147438     0.842343     -0.47654  0
@@ -853,19 +853,19 @@ Position and velocity actuators added. -->
             0
             0 0.27 0 0.5 0 0 0
             0 -0.27 0 0.5 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0"/>
-      <!-- <key name="standing" 
+      <!-- <key name="standing"
       qpos="0 0 0.75
             0.707106781 0 0 -0.707106781
             -0.42 0 0 0.81 -0.3 0
@@ -878,13 +878,13 @@ Position and velocity actuators added. -->
             0
             0 0.27 0 0.5 0 0 0
             0 -0.27 0 0.5 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0
             0 0 0 0 0 0 0
             0 0 0 0 0 0 0
-            
+
             0 0 0 0 0 0
             0 0 0 0 0 0
             0

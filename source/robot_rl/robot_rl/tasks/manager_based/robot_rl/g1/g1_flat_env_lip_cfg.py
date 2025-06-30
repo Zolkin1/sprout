@@ -1,21 +1,9 @@
-import math
-import torch
-
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 
-##
-# Pre-defined configs
-##
-from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 
 ##
 # Environment configuration
@@ -23,6 +11,7 @@ from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 @configclass
 class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()

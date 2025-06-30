@@ -48,20 +48,24 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import os
+import time
+
 import gymnasium as gym
+import isaaclab_tasks  # noqa: F401
 import torch
-
-from rsl_rl.runners import OnPolicyRunner
-
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
-
-import isaaclab_tasks  # noqa: F401
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+)
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
+from rsl_rl.runners import OnPolicyRunner
 
 import robot_rl.tasks  # noqa: F401
 
@@ -91,8 +95,6 @@ def main():
     log_dir = os.path.dirname(resume_path)
 
     # create isaac environment
-    if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
-        env_cfg.__prepare_tensors__()
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # convert to single-agent instance if required by the RL algorithm

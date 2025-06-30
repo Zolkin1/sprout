@@ -1,14 +1,4 @@
-import math
-import torch
-
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from isaaclab.managers import RewardTermCfg as RewTerm
 
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCfg
 
@@ -39,20 +29,24 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         # No height scanner for now
         self.scene.height_scanner = None
 
-
         ##
         # Randomization
         ##
-        # self.events.push_robot = None
-        self.events.push_robot.params["velocity_range"] = {"x": (-1, 1), "y": (-1, 1), "roll": (-0.4, 0.4),
-                                                           "pitch": (-0.4, 0.4), "yaw": (-0.4, 0.4)}
+        # -- Push Params -- #
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-1, 1),
+            "y": (-1, 1),
+            "roll": (-0.4, 0.4),
+            "pitch": (-0.4, 0.4),
+            "yaw": (-0.4, 0.4),
+        }
+        # -- Base Mass Params -- #
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
-        # self.events.randomize_ground_contact_friction.params["static_friction_range"] = (0.1, 1.25)
-        # self.events.randomize_ground_contact_friction.params["dynamic_friction_range"] = (0.1, 1.25)
+
+        # -- Reset Params -- #
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
-        self.events.base_external_force_torque.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
@@ -100,12 +94,8 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         self.rewards.feet_clearance.weight = -20.0
         self.rewards.phase_contact.weight = 0.25
 
-        self.rewards.joint_deviation_arms.weight = -0.5             # Arms regularization
+        self.rewards.joint_deviation_arms.weight = -0.5  # Arms regularization
         self.rewards.joint_deviation_torso.weight = -1.0
 
         self.rewards.height_torso.params["target_height"] = 0.75
         self.rewards.feet_clearance.params["target_height"] = 0.12
-
-
-
-     
