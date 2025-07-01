@@ -487,9 +487,6 @@ class StairCmd(HLIPCommandTerm):
         self.stance_foot_ori = self.get_euler_from_quat(foot_ori_w[batch_idx, self.stance_idx, :])
 
         # Convert foot positions to the robot's yaw-aligned local frame
-        # stance_pos_local = _transfer_to_local_frame(
-        #     foot_pos_w[:, self.stance_idx, :], root_quat
-        # )
         swing2stance_local = _transfer_to_local_frame(
             foot_pos_w[batch_idx, self.swing_idx, :]-self.stance_foot_pos_0, self.stance_foot_ori_quat_0
         )

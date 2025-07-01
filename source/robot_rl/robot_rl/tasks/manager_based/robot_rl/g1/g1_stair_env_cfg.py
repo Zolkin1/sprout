@@ -12,13 +12,12 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import TerminationsCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
                                                                     
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG
 
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg  #Inherit from the base envs
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
@@ -31,7 +30,7 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObser
 #
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDCommandsCfg
+
 @configclass
 class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
@@ -187,10 +186,16 @@ class G1HZDEnvCfg(G1StairEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.observations.policy.step_duration = None
-        self.observations.critic.step_duration = None
- 
+        self.observations.policy.step_duration.params["command_name"] = "hzd_ref"
+        self.observations.critic.step_duration.params["command_name"] = "hzd_ref"
 
+        self.observations.policy.sin_phase = ObsTerm(func=mdp.stair_sin_phase, params={"command_name": "hzd_ref"})
+        self.observations.policy.cos_phase = ObsTerm(func=mdp.stair_cos_phase, params={"command_name": "hzd_ref"})
+
+        self.observations.critic.sin_phase = ObsTerm(func=mdp.stair_sin_phase, params={"command_name": "hzd_ref"})
+        self.observations.critic.cos_phase = ObsTerm(func=mdp.stair_cos_phase, params={"command_name": "hzd_ref"})
+
+        self.observations.critic.step_duration = None
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
         self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"
         self.observations.critic.ref_traj.params["command_name"] = "hzd_ref"

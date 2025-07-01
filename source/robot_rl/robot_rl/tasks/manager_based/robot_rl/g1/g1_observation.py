@@ -105,8 +105,7 @@ class G1StairObservationsCfg:
             func=mdp.step_duration,
             params={"command_name": "hlip_ref"},
         )
-        # des_foot_pos = ObsTerm(func=mdp.generated_commands, params={"command_name": "hlip_ref"},history_length=1,scale=(1.0,1.0))
-
+  
     @configclass
     class CriticCfg(ObsGroup):
         """Observations for critic group."""
