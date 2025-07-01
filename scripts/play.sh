@@ -1,7 +1,7 @@
 #!/bin/bash
 export CUDA_VISIBLE_DEVICES=1  # or 1,2,...
 # === Configurable Inputs ===
-env_type="clf"
+env_type="clf_vdot"
 num_env=2
 experiment_name="g1"
 sim_speed="1.0,0,0"

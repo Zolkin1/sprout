@@ -27,7 +27,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stair_cfg import StairHL
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from source.robot_rl.robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 #
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
@@ -205,26 +205,19 @@ class G1HZDEnvCfg(G1StairEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
 
-        self.rewards.clf_reward.params["max_clf"] = 20.0
+        self.rewards.clf_reward.params["max_clf"] = 50.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
-        self.rewards.clf_decreasing_condition.params["alpha"] = 10.0
+        self.rewards.clf_decreasing_condition.params["alpha"] = 2.0
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.3,0.3)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.6,0.6)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
-        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.15)
         self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.0,0.0)
-        # self.scene.terrain.terrain_generator.sub_terrains["stairs_inv_w_hole"].step_height_range = (0.0,0.0)
-        # self.scene.terrain.terrain_generator.sub_terrains["stairs_w_hole"].step_height_range = (0.0,0.0)
         self.scene.terrain.terrain_generator.sub_terrains["flat"].step_height_range = (0.0,0.0)
         
-        # self.scene.terrain.terrain_type = "plane"
-        # self.scene.terrain.terrain_generator = None
-        # self.curriculum.terrain_levels = None
-
-        # self.curriculum.terrain_levels = None
-        clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
+        clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1500, "min_val": 20.0})
         self.curriculum.clf_curriculum = clf_curriculum
 
 
@@ -235,7 +228,8 @@ class G1HZDEnvPlay(G1HZDEnvCfg):
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
         self.events.reset_base.params["pose_range"] = {"x": (0,0), "y": (0,0), "yaw": (0,0)}
-        self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
+        # self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
+        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05,0.05)
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 2
 

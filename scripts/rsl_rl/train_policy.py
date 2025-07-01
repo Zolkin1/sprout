@@ -60,12 +60,6 @@ def main():
 
     sys.argv = [sys.argv[0]] + hydra_args
     
-    # Configure livestream properly
-    # args_cli.livestream = 2
-    # args_cli.headless = True 
-    # clear out sys.argv for Hydra
-    
-
     # launch omniverse app
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
