@@ -1,0 +1,1 @@
+#read the yaml to determine how to remap the ee traj

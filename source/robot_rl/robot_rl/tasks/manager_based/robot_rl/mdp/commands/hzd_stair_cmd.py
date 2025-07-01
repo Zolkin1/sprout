@@ -12,7 +12,7 @@ from robot_rl.assets.robots.g1_21j import build_relabel_matrix
 # from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
 
 from .clf import CLF
-from .hzd_cmd import bezier_deg, JointTrajectoryConfig
+from .traj_config.jt_traj import JointTrajectoryConfig, bezier_deg
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING
