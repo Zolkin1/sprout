@@ -42,7 +42,7 @@ class HZDStairCommandTerm(CommandTerm):
 
         # load joint trajectory config from YAML
         #this is the flat ref trajectory
-        yaml_path = "source/robot_rl/robot_rl/assets/robots/g1_solution.yaml"
+        yaml_path = "source/robot_rl/robot_rl/assets/robots/single_support_config_solution.yaml"
         self.jt_config = JointTrajectoryConfig()
         self.jt_config.load_from_yaml(yaml_path, self.robot)
         self.T = self.env.cfg.commands.step_period.period_range[0]/2

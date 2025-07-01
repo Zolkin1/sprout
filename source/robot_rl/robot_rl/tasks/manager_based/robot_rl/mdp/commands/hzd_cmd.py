@@ -223,7 +223,7 @@ class HZDCommandTerm(CommandTerm):
 
 
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
-
+        self.hip_yaw_idx,_ = self.robot.find_joints(".*_hip_yaw_.*")
         self.metrics = {}
      
         # self.com_z = torch.ones((self.num_envs), device=self.device)*self.z0
@@ -284,15 +284,6 @@ class HZDCommandTerm(CommandTerm):
         return
     
     def _update_metrics(self):
-        # Foot tracking
-        # foot_pos = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :2]  # Only take x,y coordinates
-        # # Contact schedule function
-        # tp = (self.env.sim.current_time % (2 * self.T)) / (2 * self.T)  # Scaled between 0-1
-        # phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + self.T), device=self.env.device)
-
-        # swing_foot_pos = foot_pos[:, int(0.5 + 0.5 * torch.sign(phi_c))]
-        # Only compare x,y coordinates of foot target
-        
         # Update metrics using actual joint names from the YAML file
         for i, joint_name in enumerate(self.robot.joint_names):
             error_key = f"error_{joint_name}"
@@ -300,8 +291,7 @@ class HZDCommandTerm(CommandTerm):
 
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
-        
-        # return self.foot_target  # Return the foot target tensor for observation
+
 
 
     def update_Stance_Swing_idx(self):
@@ -342,8 +332,8 @@ class HZDCommandTerm(CommandTerm):
         else:
             ctrl_points = self.left_coeffs
      
+        
 
-     
         phase_var_tensor = torch.full((N,), self.phase_var, device=self.device)
         des_jt_pos = bezier_deg(
             0, phase_var_tensor, T, ctrl_points, torch.tensor(self.cfg.bez_deg, device=self.device)
@@ -351,9 +341,14 @@ class HZDCommandTerm(CommandTerm):
         
         des_jt_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, self.cfg.bez_deg)
 
+        yaw_offset = base_velocity[:, 2] 
+        des_jt_pos[:, self.hip_yaw_idx[self.stance_idx]] += yaw_offset
+
+
         self.y_out = des_jt_pos
         self.dy_out = des_jt_vel
 
+        
 
     def nom_bezier_curve(self, control_points: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
@@ -396,7 +391,6 @@ class HZDCommandTerm(CommandTerm):
         # Convenience
         data = self.robot.data
 
-        root_quat = data.root_quat_w
 
         # 1. Foot positions and orientations (world frame)
         foot_pos_w = data.body_pos_w[:, self.feet_bodies_idx, :]
@@ -411,14 +405,6 @@ class HZDCommandTerm(CommandTerm):
 
         self.stance_foot_vel = foot_lin_vel_w[:, self.stance_idx, :]
         self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
-
-        # base_pos = data.root_pos_w 
-        # base_pos_stance = base_pos - self.stance_foot_pos_0
-        # base_vel = data.root_lin_vel_w
-        # pelvis_ori = self.get_euler_from_quat(data.root_quat_w)
-        # pelvis_omega_local = _transfer_to_local_frame(data.root_ang_vel_w, self.stance_foot_ori_quat_0)
-
-        # convert to euler rate?
 
         jt_pos = data.joint_pos
         jt_vel = data.joint_vel

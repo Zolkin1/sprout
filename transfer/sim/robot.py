@@ -77,7 +77,7 @@ class Robot:
             des_vel[1] = vy
             des_vel[2] = vyaw
         else:
-            des_vel = np.array([0.75,0.0,0.0])
+            des_vel = np.array([0.4,0.0,0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
         return des_vel
 

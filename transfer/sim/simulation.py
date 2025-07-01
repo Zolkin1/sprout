@@ -142,7 +142,9 @@ class Simulation:
                     site_id = mujoco.mj_name2id(self.robot.mj_model, mujoco.mjtObj.mjOBJ_SITE, "height_sensor_site")
                     sensor_pos = self.robot.mj_data.site_xpos[site_id]
 
-                obs = self.robot.create_observation(self.policy, height_map=height_map, sensor_pos=sensor_pos)
+                    obs = self.robot.create_observation(self.policy, height_map=height_map, sensor_pos=sensor_pos)
+                else:
+                    obs = self.robot.create_observation(self.policy)
                 action = self.policy.get_action(obs)
                 self.robot.apply_action(action)
 

@@ -8,7 +8,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import pygame
-
+from typing import Tuple
 from transfer.sim.robot import Robot
 from transfer.sim.simulation import Simulation
 

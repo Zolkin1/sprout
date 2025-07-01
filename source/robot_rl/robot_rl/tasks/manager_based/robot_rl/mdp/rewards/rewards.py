@@ -19,12 +19,20 @@ from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inv
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def vdot_tanh(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    ref_term = env.command_manager.get_term(command_name)                    # [B]
-    vdot = ref_term.vdot # [B]
+def vdot_tanh(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0) -> torch.Tensor:
+    # Retrieve the CLF-related quantities: V and its time derivative
+    ref_term = env.command_manager.get_term(command_name)  # [B]
+    vdot = ref_term.vdot  # [B]
+    v = ref_term.v        # [B]
 
-    vdot_reward = torch.tanh(-vdot)  # [B]
+    # Compute the CLF decay condition violation
+    clf_decay_violation = vdot + alpha * v  # [B]
+
+    # Reward is higher when this violation is negative (i.e., condition is satisfied)
+    vdot_reward = torch.tanh(-alpha * clf_decay_violation)  # [B]
+
     return vdot_reward
+
     
 def swing_foot_contact_penalty(
     env: ManagerBasedRLEnv,
@@ -359,41 +367,7 @@ def reference_vel_tracking(    env: ManagerBasedRLEnv,
     return reward
 
 
-def track_heading(env: ManagerBasedRLEnv, command_name: str,
-                  std: float,
-                  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
-    """Reward tracking the heading of the robot."""
-    asset = env.scene[asset_cfg.name]
-    # command = env.command_manager.get_command(command_name)[:, :2]
-    #
-    # Get current heading
-    # Get the robot's root quaternion in world frame
-    robot_quat_w = asset.data.root_quat_w  # Shape: [num_environments, 4]
 
-    # Extract the Yaw angle (Heading)
-    heading = euler_xyz_from_quat(robot_quat_w)
-    heading = wrap_to_pi(heading[2])
-    #
-    # # Compute the heading from the commanded velocity
-    # # Compute the command in the global frame
-    # # TODO: Change where I grab command to grab all 3 entries so I don't need this!
-    # command_3 = torch.zeros((command.shape[0], 3), device=command.device)
-    # command_3[:, :2] = command
-    # command_w = quat_rotate_inverse(robot_quat_w, command_3)
-    # # heading_des = torch.atan2(command[:, 1], command[:, 0])
-    # heading_des = torch.atan2(command_w[:, 1], command_w[:, 0])
-    heading_des = wrap_to_pi(env.command_manager.get_command(command_name)[:, 2])
-
-    # print(f"command: {command}")
-    # print(f"heading_des: {heading_des}, heading: {heading}")
-
-    reward = 2.*torch.exp(-torch.abs(wrap_to_pi(heading_des - heading)) / std)
-
-    # print(f"heading: {heading}, heading_des: {heading_des}")
-    # print(f"reward: {reward}")
-    # print(f"heading error: {wrap_to_pi(heading_des - heading)}")
-
-    return reward
 
 def compute_step_location_local(env: ManagerBasedRLEnv, env_ids: torch.Tensor,
                           nom_height: float, Tswing: float, command_name: str, wdes: float,
@@ -465,21 +439,9 @@ def compute_step_location_local(env: ManagerBasedRLEnv, env_ids: torch.Tensor,
 
     p[:, 2] *= 0
 
-    # print(f"icp_f = {icp_f},\n"
-    #       f"icp_0 = {icp_0},\n"
-    #       f"b = {b},\n")
-
     if visualize:
         sw_st_feet = torch.cat((p, foot_pos[:, int(0.5 - 0.5 * torch.sign(phi_c)), :]), dim=0)
-        # env.footprint_visualizer.visualize(
-        #     # TODO: Visualize both the current stance foot and the desired foot
-        #     # translations=foot_pos[:, int(0.5 - 0.5*torch.sign(phi_c)), :], #p,
-        #     # translations=foot_pos[:, (env.cfg.control_count % 2), :],
-        #     translations=sw_st_feet,
-        #     orientations=yaw_quat(asset.data.root_quat_w).repeat_interleave(2, dim=0),
-        #     # repeat 0,1 for num_env
-        #     # marker_indices=torch.tensor([0,1], device=env.device).repeat(env.num_envs),
-        # )
+
 
     env.cfg.current_des_step[env_ids, :] = p[env_ids,:]  # This only works if I compute the new location once per step/on a timer
 

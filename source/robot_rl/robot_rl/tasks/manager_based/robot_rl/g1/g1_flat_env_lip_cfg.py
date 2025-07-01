@@ -50,7 +50,7 @@ class G1FlatLipVdotEnvCfg(G1FlatLipEnvCfg):
         self.rewards.clf_decreasing_condition = None
         self.curriculum.clf_curriculum = None
         self.rewards.clf_vdot_tanh = RewTerm(
-            func=mdp.clf_decreasing_condition,
+            func=mdp.vdot_tanh,
             weight=2.0,
             params={
                 "command_name": "hlip_ref",

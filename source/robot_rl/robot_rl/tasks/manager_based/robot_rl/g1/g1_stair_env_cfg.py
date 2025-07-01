@@ -215,8 +215,8 @@ class G1HZDEnvCfg(G1StairEnvCfg):
 
         self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
         self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.0,0.0)
-        self.scene.terrain.terrain_generator.sub_terrains["stairs_inv_w_hole"].step_height_range = (0.0,0.0)
-        self.scene.terrain.terrain_generator.sub_terrains["stairs_w_hole"].step_height_range = (0.0,0.0)
+        # self.scene.terrain.terrain_generator.sub_terrains["stairs_inv_w_hole"].step_height_range = (0.0,0.0)
+        # self.scene.terrain.terrain_generator.sub_terrains["stairs_w_hole"].step_height_range = (0.0,0.0)
         self.scene.terrain.terrain_generator.sub_terrains["flat"].step_height_range = (0.0,0.0)
         
         # self.scene.terrain.terrain_type = "plane"

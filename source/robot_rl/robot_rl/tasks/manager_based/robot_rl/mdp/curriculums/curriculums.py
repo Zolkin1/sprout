@@ -25,30 +25,25 @@ if TYPE_CHECKING:
 
 
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100,min_val: float = 20.0
+    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100,min_val: float = 20.0, min_clf_val: float = 10.0
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
     new_clf = term_cfg.params["max_clf_decreasing"]
+    clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
+    new_max_clf = clf_cfg.params["max_clf"]
+
     if env.common_step_counter  >= update_interval and env.common_step_counter % update_interval == 0:
         
-            # buf = env.observation_manager._group_obs_term_history_buffer["critic"]["v"].buffer
-
-            # 2) Compute one global average (over envs *and* time), then clamp
-            #    Results in a 0-d tensor; .item() → Python float
-            # scale = env.observation_manager.cfg.critic.v.scale
-            # global_avg = buf.mean() * 1.0/scale
-            # buf = env.command_manager.get_term("hlip_ref").v_buffer
-            # global_avg = buf.mean()
-            # global_avg = torch.clamp(global_avg, min=1.0, max=100.0)
-            # term_cfg = env.reward_manager.get_term_cfg("clf_reward")
-            # term_cfg.params["max_clf"] = global_avg.detach().cpu().item()
-            # env.reward_manager.set_term_cfg("clf_reward", term_cfg)
+            
 
             # increase clf decreasing condition weight?
             new_clf = max(new_clf -2,min_val)
+            new_max_clf = max(new_max_clf -1,min_clf_val)
             term_cfg.params["max_clf_decreasing"] = new_clf
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
+            clf_cfg.params["max_clf"] = new_max_clf
+            env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
     return new_clf
 
 def terrain_levels(

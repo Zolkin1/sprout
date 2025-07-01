@@ -53,13 +53,15 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
 
-        self.rewards.clf_reward.params["max_clf"] = 20.0
+        self.rewards.clf_reward.params["max_clf"] = 30.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
-        self.rewards.clf_decreasing_condition.params["alpha"] = 10.0
+        self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
         
         self.commands.base_velocity.ranges.lin_vel_x = (0.625,0.625)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.2,0.2)
+        self.commands.base_velocity.ranges.heading = (0,0)
+        self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
         ##
         # Scene
         ##
@@ -71,7 +73,10 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.observations.policy.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None
-        self.curriculum.clf_curriculum.params["min_val"] = 5.0
+        self.curriculum.clf_curriculum.params["min_val"] = 10.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
+
+        # self.events.push_robot = None
         # self.curriculum.clf_curriculum = None
 
 
