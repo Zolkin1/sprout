@@ -180,6 +180,12 @@ def extract_reference_trajectory(env, log_vars,command_name):
             results[var] = ref.metrics[var]
         elif var == "base_velocity":
             results[var] = unwrapped_env.command_manager.get_command("base_velocity")
+        elif var == "axis_names":
+            # Extract axis names from end effector config
+            if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+                results[var] = ref.ee_config.axis_names
+            else:
+                results[var] = None
         else:
             results[var] = None  # or raise an error/warning if you prefer
 
@@ -363,7 +369,7 @@ def main():
 
         dt = env.unwrapped.step_dt
 
-
+        # Dynamically generate log variables based on the command type
         log_vars = [
             'y_out',
             'dy_out',
@@ -377,19 +383,28 @@ def main():
             'vdot',
             'stance_foot_pos_0',
             'stance_foot_ori_0',
-            "error_sw_x",
-            "error_sw_y",
-            "error_sw_z",
-            "error_sw_roll",
-            "error_sw_pitch",
-            "error_sw_yaw",
-            "error_com_x",
-            "error_com_y",
-            "error_com_z",
-            "error_pelvis_roll",
-            "error_pelvis_pitch",
-            "error_pelvis_yaw" 
         ]
+        
+        # Get the command term to determine what type of trajectory we're using
+        if args_cli.env_type == "flat-hzd" or args_cli.env_type == "stair-hzd":
+            command_name = "hzd_ref"
+        else:
+            command_name = "hlip_ref"
+            
+        ref = env.unwrapped.command_manager.get_term(command_name)
+        
+        # Add dynamic error metrics based on the command type
+        if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+            # End effector trajectory case - add axis error metrics
+            for axis_info in ref.ee_config.axis_names:
+                log_vars.append(axis_info['name'])
+            # Also log the axis names for plotting
+            log_vars.append('axis_names')
+        elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
+            # Joint trajectory case - add joint error metrics
+            for joint_name in ref.robot.joint_names:
+                log_vars.append(f"error_{joint_name}")
+        
         
         # Setup logging
         logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
@@ -454,7 +469,9 @@ def main():
             print(f"[DEBUG] Generating plots in directory: {plot_dir}")
             
             
-            plot_trajectories(logger.data, save_dir=plot_dir)
+            # Determine trajectory type based on command type
+            trajectory_type = 'end_effector' if command_name == 'hzd_ref' else 'joint'
+            plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type=trajectory_type)
 
     except Exception as e:
         print(f"[ERROR] An error occurred: {str(e)}")

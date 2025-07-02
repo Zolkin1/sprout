@@ -70,6 +70,42 @@ class JointTrajectoryHZDCommandCfg(CommandTermCfg):
     R_weights = HZD_R_weights
 
 
+
+
+HZD_EE_Q_weights = [
+    100.0,   200.0,    # com_x pos, vel
+    300.0,   50.0,   # com_y pos, vel
+    600.0,  20.0,  # com_z pos, vel
+    420.0,    20.0,    # pelvis_roll pos, vel
+    200.0,    10.0,    # pelvis_pitch pos, vel
+    500.0,    30.0,    # pelvis_yaw pos, vel
+    2500.0, 125.0,  # swing_x pos, vel
+    1700.0,  125.0,  # swing_y pos, vel
+    4000.0, 100.0,   # swing_z pos, vel
+    30.0,    1.0,    # swing_ori_roll pos, vel
+    10.0,    1.0,    # swing_ori_pitch pos, vel
+    400.0,    10.0,    # swing_ori_yaw pos, vel
+    500.0,    10.0,    # waist_yaw pos, vel
+    40.0,1.0, #swing hand palm pos x
+    40.0,1.0, #swing hand palm pos y
+    100,1.0, #swing hand palm pos z
+    100,1.0, #swing hand palm yaw
+    50,1.0, #stance hand palm pos x
+    50,1.0, #stance hand palm pos y
+    30.0,1.0, #stance hand palm pos z
+    30.0,1.0, #stance hand palm yaw
+]
+
+
+HZD_EE_R_weights = [
+        0.1, 0.1, 0.1,    # CoM inputs: allow moderate effort
+        0.05,0.05,0.05,   # pelvis inputs: lower torque priority
+        0.05,0.05,0.05,   # swing foot linear inputs
+        0.02,0.02,0.02,    # swing foot orientation inputs: small adjustments
+        0.1,0.01,0.01,
+        0.01,0.01,0.01,
+        0.01,0.01,0.01,
+    ]
 @configclass
 class EndEffectorTrajectoryHZDCommandCfg(CommandTermCfg):
     """
@@ -83,8 +119,8 @@ class EndEffectorTrajectoryHZDCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
     debug_vis: bool = False
     trajectory_tracking_visualizer_cfg: dict = {}
-    Q_weights = HZD_Q_weights
-    R_weights = HZD_R_weights
+    Q_weights = HZD_EE_Q_weights
+    R_weights = HZD_EE_R_weights
 
 
 # Alias for backward compatibility - defaults to joint trajectory

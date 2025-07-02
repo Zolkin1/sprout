@@ -1,31 +1,102 @@
-import math
-import torch
-
-from isaaclab.envs import ManagerBasedEnv, ManagerBasedEnvCfg
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import HZDCommandCfg, EndEffectorTrajectoryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from .g1_observation import G1FlatHZDObservationsCfg
-from isaaclab.sensors import FrameTransformerCfg
-#
-##
-# Pre-defined configs
-##
-from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
+from isaaclab.sensors import FrameTransformerCfg, OffsetCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
+from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import MySceneCfg
+FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy()
+FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.10, 0.10, 0.10)
+
 
 class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
-     hzd_ref = HZDCommandCfg()
+    hzd_ref = HZDCommandCfg()
+
 
 class G1FlatHZDCommandsCfg_EE(HumanoidCommandsCfg):
-     hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
+    hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
+
+
+@configclass
+class G1SceneCfg(MySceneCfg):
+    # Set default number of environments
+    num_envs: int = 4096
+    env_spacing: float = 2.5
+    
+    # Frame transformer for end effector tracking
+    left_foot_sensor = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
+        debug_vis=False,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
+                name="left_foot_middle",
+                offset=OffsetCfg(
+                    pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
+                ),
+            ),
+        ],
+    )
+
+    right_foot_sensor = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
+        debug_vis=False,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
+                name="right_foot_middle",
+                offset=OffsetCfg(
+                    pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
+                ),
+            ),
+        ],
+    )
+
+    left_hand_sensor = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
+        debug_vis=False,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
+                name="left_hand_palm_joint",
+                offset=OffsetCfg(
+                    pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
+                ),
+            ),
+        ],
+    )
+
+    right_hand_sensor = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
+        debug_vis=False,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
+                name="right_hand_palm_joint",
+                offset=OffsetCfg(
+                    pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
+                ),
+            ),
+        ],
+    )
+
+    pelvis_sensor = FrameTransformerCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+        debug_vis=False,
+        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+        target_frames=[
+            FrameTransformerCfg.FrameCfg(
+                prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+                name="pelvis_link",
+            ),
+        ],
+    )
 
 
 ##
@@ -34,26 +105,14 @@ class G1FlatHZDCommandsCfg_EE(HumanoidCommandsCfg):
 @configclass
 class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
+    scene: G1SceneCfg = G1SceneCfg()
     # commands: G1FlatHZDCommandsCfg = G1FlatHZDCommandsCfg()
     commands: G1FlatHZDCommandsCfg_EE = G1FlatHZDCommandsCfg_EE()
     # observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-
-
-        # self.scene.frame_sensor_cfg = FrameTransformerCfg(
-        #     prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
-        #     target_frames=[
-        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link/left_toe"),   # idx 0
-        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link/right_toe"), # idx 1
-        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/right_hand_palm_link"),            # idx 2
-        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/left_hand_palm_link"),             # idx 3
-        #     ]
-        # )
-
-
-
         # change the observation command name to hzd_ref
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
         self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"
@@ -67,17 +126,16 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
-        
 
-        self.rewards.clf_reward.params["max_clf"] = 30.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_reward.params["max_clf"] = 200.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 200.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
-        
-        self.commands.base_velocity.ranges.lin_vel_x = (0.625,0.625)
-        self.commands.base_velocity.ranges.lin_vel_y = (0,0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.2,0.2)
-        self.commands.base_velocity.ranges.heading = (0,0)
-        self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
+
+        self.commands.base_velocity.ranges.lin_vel_x = (0.625, 0.625)
+        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.heading = (0, 0)
+        self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
         ##
         # Scene
         ##
@@ -98,16 +156,19 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
 
 class G1FlatRefTrackingEnvCfg(G1FlatHZDEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-        
+
         # self.rewards.clf_reward = None
         self.rewards.clf_decreasing_condition = None
         self.curriculum.clf_curriculum = None
 
+
 class G1FlatHZDVdotEnvCfg(G1FlatHZDEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -118,9 +179,10 @@ class G1FlatHZDVdotEnvCfg(G1FlatHZDEnvCfg):
             func=mdp.clf_decreasing_condition,
             weight=2.0,
             params={
-                "command_name": "hzd_ref",
+                "command_name": "hzd_ref",  # noqa: E203
             }
         )
+
 
 class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
     def __post_init__(self) -> None:
@@ -136,4 +198,4 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
         # self.events.push_robot.interval_range_s = (5.0,5.0)
-        self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0,0)} #(-3.14, 3.14)},
+        self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0, 0)}  # (-3.14, 3.14)},

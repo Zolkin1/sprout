@@ -57,17 +57,14 @@ class HZDCommandTerm(CommandTerm, ABC):
         return
 
     def _update_metrics(self):
-        # Update metrics using actual joint names from the robot
-        for i, joint_name in enumerate(self.robot.joint_names):
-            error_key = f"error_{joint_name}"
-            self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
-
+        # Base metrics that are common to all HZD commands
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
 
     def update_Stance_Swing_idx(self):
         """Update stance and swing indices based on phase."""
         Tswing = self._get_swing_period()
+
         tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
         phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
 
@@ -162,6 +159,16 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
         self.y_act = jt_pos
         self.dy_act = jt_vel
 
+    def _update_metrics(self):
+        """Update metrics specific to joint trajectory tracking."""
+        # Call parent method for base metrics
+        super()._update_metrics()
+        
+        # Update metrics using actual joint names from the robot
+        for i, joint_name in enumerate(self.robot.joint_names):
+            error_key = f"error_{joint_name}"
+            self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
+
 
 class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses end effector trajectory references."""
@@ -175,17 +182,11 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         # Initialize end effector tracker
         self.ee_tracker = EndEffectorTracker(
             self.ee_config.constraint_specs, 
-            env.scene.env_regex_ns
+            env.scene
         )
         
-        # Store constraint specifications for easy access
-        self.constraint_specs = self.ee_config.constraint_specs
-        
-        # Initialize output tensors for end effector references
-        self.ee_ref_pos = torch.zeros((self.num_envs, 0), device=self.device)
-        self.ee_ref_ori = torch.zeros((self.num_envs, 0), device=self.device)
-        self.ee_act_pos = torch.zeros((self.num_envs, 0), device=self.device)
-        self.ee_act_ori = torch.zeros((self.num_envs, 0), device=self.device)
+        # Reorder and remap end effector coefficients
+        self.ee_config.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
 
     def _get_swing_period(self) -> float:
         """Get the swing period from the end effector configuration."""
@@ -193,94 +194,33 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
 
     def generate_reference_trajectory(self):
         """Generate reference trajectory using end effector trajectories."""
-        # Get base velocity for yaw offset
-        base_velocity = self.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
-        T = torch.full((N,), self.ee_config.T, dtype=torch.float32, device=self.device)
-        
-        # Initialize reference tensors
-        ref_positions = []
-        ref_orientations = []
-        
-        # Generate references for each constraint specification
-        for spec in self.constraint_specs:
-            if "frame" not in spec:
-                continue
-                
-            frame_name = spec["frame"]
-            constraint_type = spec["type"]
-            
-            if constraint_type in ["ee_pos", "com_pos"]:
-                # Position constraint
-                ref_pos = self.ee_config.evaluate_bezier_trajectory(
-                    frame_name, constraint_type, 
-                    torch.full((N,), self.phase_var, device=self.device), 
-                    T, self.cfg.bez_deg
-                )
-                ref_positions.append(ref_pos)
-                
-            elif constraint_type in ["ee_ori"]:
-                # Orientation constraint
-                ref_ori = self.ee_config.evaluate_bezier_trajectory(
-                    frame_name, constraint_type,
-                    torch.full((N,), self.phase_var, device=self.device),
-                    T, self.cfg.bez_deg
-                )
-                ref_orientations.append(ref_ori)
-        
-        # Concatenate all references
-        if ref_positions:
-            self.ee_ref_pos = torch.cat(ref_positions, dim=1)
-        if ref_orientations:
-            self.ee_ref_ori = torch.cat(ref_orientations, dim=1)
-        
-        # For now, we'll use zero joint references as placeholders
-        # In a full implementation, you would convert EE references to joint references
-        self.y_out = torch.zeros((N, self.cfg.num_outputs), device=self.device)
-        self.dy_out = torch.zeros((N, self.cfg.num_outputs), device=self.device)
+        ref_pos, ref_vel = self.ee_config.get_ref_traj(self)
+        self.y_out = ref_pos
+        self.dy_out = ref_vel
 
     def get_actual_state(self):
         """Get actual state for end effector trajectories."""
-        # Get actual joint positions and velocities
-        jt_pos = self.robot.data.joint_pos
-        jt_vel = self.robot.data.joint_vel
-        self.y_act = jt_pos
-        self.dy_act = jt_vel
-        
         # Get stance foot pose data
         self.get_stance_foot_pose()
         
-        # Get actual end effector poses
-        act_positions = []
-        act_orientations = []
+        # Get actual trajectory from end effector tracker
+        act_pos, act_vel = self.ee_config.get_actual_traj(self)
+        self.y_act = act_pos
+        self.dy_act = act_vel
+
+    def _update_metrics(self):
+        """Update metrics specific to end effector trajectory tracking."""
+        # Call parent method for base metrics
+        super()._update_metrics()
         
-        for spec in self.constraint_specs:
-            if "frame" not in spec:
-                continue
-                
-            frame_name = spec["frame"]
-            constraint_type = spec["type"]
-            
-            try:
-                pos, ori = self.ee_tracker.get_pose(frame_name)
-                
-                if constraint_type in ["ee_pos", "com_pos"]:
-                    act_positions.append(pos.unsqueeze(0).expand(self.num_envs, -1))
-                elif constraint_type in ["ee_ori"]:
-                    act_orientations.append(ori.unsqueeze(0).expand(self.num_envs, -1))
-            except Exception as e:
-                print(f"Warning: Could not get pose for frame {frame_name}: {e}")
-                # Add zero tensors as fallback
-                if constraint_type in ["ee_pos", "com_pos"]:
-                    act_positions.append(torch.zeros((self.num_envs, 3), device=self.device))
-                elif constraint_type in ["ee_ori"]:
-                    act_orientations.append(torch.zeros((self.num_envs, 3), device=self.device))
-        
-        # Concatenate all actual poses
-        if act_positions:
-            self.ee_act_pos = torch.cat(act_positions, dim=1)
-        if act_orientations:
-            self.ee_act_ori = torch.cat(act_orientations, dim=1)
+        # Update metrics using pre-generated axis names
+        for axis_info in self.ee_config.axis_names:
+            error_key = axis_info['name']
+            index = axis_info['index']
+            self.metrics[error_key] = torch.abs(
+                self.y_out[:, index] - 
+                self.y_act[:, index]
+            )
 
 
 def create_hzd_command_term(cfg, env):

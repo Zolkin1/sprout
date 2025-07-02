@@ -97,9 +97,7 @@ class JointTrajectoryConfig:
         
         # Store step period
         self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
-        
-        return self
-    
+            
     def remap_jt_symmetric(self):
         """Create symmetric mapping for left/right joints."""
         symmetric_mapping = {}

@@ -1,158 +1,131 @@
 import torch
-from typing import List, Dict, Optional
-from isaacsim.core.prims import XFormPrim
-from isaacsim.core.simulation_manager import SimulationManager
-from pxr import UsdPhysics
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
+import numpy as np
+from typing import List, Dict
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat, bezier_deg
 
+#TODO: need to account for stance foot yaw position
 
-def find_link_path_in_hierarchy(base_path: str, link_chain: str) -> Optional[str]:
-    """
-    Traverse through the link hierarchy to find the proper prim path.
-    
-    Args:
-        base_path: Base path to start searching from (e.g., "/World/envs/env_0/Robot")
-        link_chain: Link chain specification (e.g., "left_ankle_roll_link/left_foot_middle")
-    
-    Returns:
-        Full prim path if found, None otherwise
-    """
-    import omni.usd
-    
-    # Get the USD stage
-    stage = omni.usd.get_context().get_stage()
-    
-    # Split the link chain into individual links
-    links = link_chain.split('/')
-    
-    # Start from the base path
-    current_path = base_path
-    
-    # Traverse through each link in the chain
-    for link in links:
-        # Try to find the link at the current path
-        full_path = f"{current_path}/{link}"
-        prim = stage.GetPrimAtPath(full_path)
-        
-        if prim.IsValid():
-            current_path = full_path
-        else:
-            # If not found, try to find it as a child of the current path
-            parent_prim = stage.GetPrimAtPath(current_path)
-            if not parent_prim.IsValid():
-                print(f"Warning: Parent prim not found at {current_path}")
-                return None
-            
-            # Search through children
-            found = False
-            for child in parent_prim.GetChildren():
-                if child.GetName() == link:
-                    current_path = str(child.GetPath())
-                    found = True
-                    break
-            
-            if not found:
-                # Try to find by partial name match
-                for child in parent_prim.GetChildren():
-                    if link in child.GetName():
-                        current_path = str(child.GetPath())
-                        found = True
-                        break
-                
-                if not found:
-                    print(f"Warning: Link '{link}' not found under {current_path}")
-                    return None
-    
-    return current_path
+def eul_rates_to_omega_XYZ(eul: torch.Tensor, eul_rates: torch.Tensor) -> torch.Tensor:
+    """Convert Z–Y–X Euler angle rates (eul_rates) into body-frame angular velocity (batched)."""
+    # eul: (..., 3) [roll, pitch, yaw]
+    # eul_rates: (..., 3)
+    y = eul[..., 1]
+    z = eul[..., 2]
 
+    cos_y = torch.cos(y)
+    sin_y = torch.sin(y)
+    cos_z = torch.cos(z)
+    sin_z = torch.sin(z)
 
-def resolve_frame_path(frame_name: str, env_ns: str) -> Optional[str]:
-    """
-    Resolve a frame name to its full prim path, handling link chains.
-    
-    Args:
-        frame_name: Frame name (can be a single link or a chain like "link1/link2/link3")
-        env_ns: Environment namespace (e.g., "/World/envs/env_0/Robot")
-    
-    Returns:
-        Full prim path if found, None otherwise
-    """
-    # If the frame name contains slashes, it's a link chain
-    if '/' in frame_name:
-        return find_link_path_in_hierarchy(env_ns, frame_name)
-    else:
-        # Single link, just append to the environment namespace
-        return f"{env_ns}/{frame_name}"
+    # Build the 3x3 mapping matrix for each batch
+    # (..., 3, 3)
+    M = torch.stack([
+        torch.stack([cos_y * cos_z, sin_z, torch.zeros_like(y)], dim=-1),
+        torch.stack([-cos_y * sin_z, cos_z, torch.zeros_like(y)], dim=-1),
+        torch.stack([sin_y, torch.zeros_like(y), torch.ones_like(y)], dim=-1),
+    ], dim=-2)
 
+    # Matrix multiply (..., 3, 3) @ (..., 3, 1) -> (..., 3, 1)
+    omega = torch.matmul(M, eul_rates.unsqueeze(-1)).squeeze(-1)
+    return omega
 
 class EndEffectorTracker:
-    def __init__(self, constraint_specs: List[Dict], env_ns: str = "/World/envs/env_0/Robot"):
-        self.env_ns = env_ns
+    def __init__(self, constraint_specs: List[Dict], scene=None):
+        """
+        Initialize EndEffectorTracker using frame transformer sensors for efficient tracking.
+        
+        Args:
+            constraint_specs: List of constraint specifications containing frame names
+            scene: Scene object containing the frame sensors
+        """
         self.constraint_specs = constraint_specs
-        self._physics_sim_view = SimulationManager.get_physics_sim_view()
-        self.ee_views = {}  # key: frame name, value: prim view (XFormPrim or physics view)
-        self._initialize_views()
+        self.scene = scene
+        
+        # Map frame names to their corresponding sensors
+        self.frame_to_sensor_mapping = {
+            "left_foot_middle": "left_foot_sensor",
+            "right_foot_middle": "right_foot_sensor", 
+            "left_hand_palm_joint": "left_hand_sensor",
+            "right_hand_palm_joint": "right_hand_sensor",
+            "pelvis_link": "pelvis_sensor",
+        }
+        
+        # Map frame names to body names for velocity data
+        self.frame_to_body_mapping = {
+            "left_foot_middle": "left_ankle_roll_link",
+            "right_foot_middle": "right_ankle_roll_link", 
+            "left_hand_palm_joint": "left_elbow_link",
+            "right_hand_palm_joint": "right_elbow_link",
+            "pelvis_link": "pelvis_link",
+        }
+        
+        # Will be populated when robot data is first available
+        self.frame_to_body_idx_mapping = {}
+        self.body_idx_mapping_initialized = False
+        
+        print("EndEffectorTracker initialized with frame transformer sensors")
 
-    def _initialize_views(self):
-        import omni.usd
-
-        # Get the USD stage
-        stage = omni.usd.get_context().get_stage()
-
-        # Debug: Traverse all prims in the scene
-        print("Available prims in scene:")
-        for prim in stage.Traverse():
-            print(f"  {prim.GetPath()}")
-
-        for spec in self.constraint_specs:
-            if "frame" not in spec:
+    def _initialize_body_idx_mapping(self, robot_data):
+        """Initialize the body index mapping once when robot data is available."""
+        if self.body_idx_mapping_initialized:
+            return
+            
+        for frame_name, body_name in self.frame_to_body_mapping.items():
+            # Find body index by name
+            body_idx = None
+            for i, name in enumerate(robot_data.body_names):
+                if body_name in name:
+                    body_idx = i
+                    break
+                    
+            if body_idx is None:
+                print(f"Warning: Body '{body_name}' not found in robot data for frame '{frame_name}'")
                 continue
-
-            frame_name = spec["frame"]
-            
-            # Resolve the frame path using the new function
-            full_path = resolve_frame_path(frame_name, self.env_ns)
-            
-            if full_path is None:
-                print(f"Warning: Could not resolve frame path for '{frame_name}'")
-                continue
-            
-            print(f"Resolved '{frame_name}' to '{full_path}'")
-            
-            # Try to find the prim
-            prim = stage.GetPrimAtPath(full_path)
-            
-            if not prim.IsValid():
-                print(f"Warning: Prim not found at {full_path}")
-                continue
-
-            # Create appropriate view based on prim type
-            if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
-                view = self._physics_sim_view.create_articulation_view(full_path)
-            elif prim.HasAPI(UsdPhysics.RigidBodyAPI):
-                view = self._physics_sim_view.create_rigid_body_view(full_path)
-            else:
-                view = XFormPrim(full_path, reset_xform_properties=False)
-            
-            self.ee_views[frame_name] = view
-            print(f"Successfully created view for '{frame_name}' at '{full_path}'")
+                
+            self.frame_to_body_idx_mapping[frame_name] = body_idx
+        
+        self.body_idx_mapping_initialized = True
+        print(f"Body index mapping initialized: {self.frame_to_body_idx_mapping}")
 
     def get_pose(self, frame_name: str):
         """Returns (position, euler_orientation) for a given EE frame."""
-        if frame_name not in self.ee_views:
-            raise ValueError(f"No view found for frame '{frame_name}'")
+        if self.scene is None:
+            raise ValueError("Scene not available")
+            
+        if frame_name not in self.frame_to_sensor_mapping:
+            raise ValueError(f"Frame '{frame_name}' not found in frame sensor mapping")
+            
+        sensor_name = self.frame_to_sensor_mapping[frame_name]
+
+        frame_sensor = self.scene.sensors.get(sensor_name, None)
         
-        view = self.ee_views[frame_name]
-
-        if isinstance(view, XFormPrim):
-            pos, quat = view.get_world_pose()
-        else:  # physics views
-            poses = view.get_transforms()
-            pos, quat = poses[0][:3], poses[0][3:]
-
-        pos = torch.tensor(pos)
-        euler = get_euler_from_quat(torch.tensor(quat))
+        if frame_sensor is None:
+            raise ValueError(f"Frame sensor '{sensor_name}' not found in scene")
+        
+        # Get position and orientation from frame sensor
+        # Each sensor has only one target frame at index 0
+        pos = frame_sensor.data.target_pos_w[:, 0, :]  # Shape: (num_envs, 3)
+        quat = frame_sensor.data.target_quat_w[:, 0, :]  # Shape: (num_envs, 4)
+        
+        # Convert quaternions to euler angles for all environments
+        euler = get_euler_from_quat(quat)  # Shape: (num_envs, 3)
         return pos, euler
+
+    def get_velocity(self, frame_name: str, robot_data):
+        """Returns (linear_velocity, angular_velocity) for a given EE frame from robot body data."""
+        # Initialize body index mapping if not done yet
+        self._initialize_body_idx_mapping(robot_data)
+        
+        if frame_name not in self.frame_to_body_idx_mapping:
+            raise ValueError(f"Frame '{frame_name}' not found in body index mapping")
+            
+        body_idx = self.frame_to_body_idx_mapping[frame_name]
+        
+        # Get linear and angular velocity from robot body data
+        lin_vel = robot_data.body_lin_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
+        ang_vel = robot_data.body_ang_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
+        
+        return lin_vel, ang_vel
 
     def get_relabel_matrix(self, frame_name: str, is_orientation: bool) -> torch.Tensor:
         """Returns the relabel matrix for mirroring."""
@@ -167,6 +140,53 @@ class EndEffectorTracker:
         raw = ori if is_orientation else pos
         remap = self.get_relabel_matrix(frame_name, is_orientation)
         return remap @ raw
+
+    def get_all_poses(self) -> Dict[str, tuple]:
+        """Get poses for all tracked frames."""
+        poses = {}
+        for frame_name in self.frame_to_sensor_mapping.keys():
+            try:
+                poses[frame_name] = self.get_pose(frame_name)
+            except Exception as e:
+                print(f"Warning: Could not get pose for frame {frame_name}: {e}")
+        return poses
+
+
+def relable_ee_coeffs():
+    """Build relabel matrix for end effector coefficients."""
+    R = np.eye(21)
+    
+    # only need to swap left and right palm coeffs
+    # com pos: [1,-1,1]
+    R[1, 1] = -1
+    # pelvis: [-1,1,-1]
+    R[3, 3] = -1
+    R[5, 5] = -1
+    # swing_foot_pos:[1,-1,1]
+    R[7, 7] = -1
+    # swing_foot_or: [-1,1,-1]
+    R[9, 9] = -1
+    R[11, 11] = -1
+    # waist yaw
+    R[12, 12] = -1
+    # swing_hand_pos: [1,-1,1]
+    R[14, 14] = -1
+    # swing_hand_ori: [-1,1,-1]
+    R[16, 16] = -1
+    # stance_hand_pos: [1,-1,1]
+    R[18, 18] = -1
+    # stance_hand_ori: [-1,1,-1]
+    R[20, 20] = -1
+
+    # the traj is in right stance, so swing foot is left foot
+    # need to swap left and right palm coeffs
+    left_palm = 13 + np.array([0, 1, 2, 3])
+    right_palm = 13 + np.array([4, 5, 6, 7])
+    tmp = R[left_palm, :].copy()
+    R[left_palm, :] = R[right_palm, :]
+    R[right_palm, :] = tmp
+
+    return R
 
 
 class EndEffectorTrajectoryConfig:
@@ -189,13 +209,19 @@ class EndEffectorTrajectoryConfig:
         # Load constraint specifications
         self.constraint_specs = data.get('constraint_specs', [])
         
-        # Load bezier coefficients for each constraint
-        self.bezier_coeffs = data.get('bezier_coeffs', {})
+        # Reshape bezier coefficients to [num_joints, num_control_points]
+        # TODO: need to get num_output from constraint_specs
+        num_output = 21
+        bezier_coeffs = data['bezier_coeffs']
+        num_control_points = data['spline_order'] + 1
+        bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_output, num_control_points)
+        
+        self.bezier_coeffs = bezier_coeffs_reshaped
         
         # Load step period
-        self.T = data.get('T', 0.5)
+        self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
         
-        return self
+        return
     
     def get_constraint_frames(self) -> List[str]:
         """Extract frame names from constraint specs."""
@@ -204,42 +230,232 @@ class EndEffectorTrajectoryConfig:
             if "frame" in spec:
                 frames.append(spec["frame"])
         return frames
-    
-    def get_bezier_coeffs_for_frame(self, frame_name: str, constraint_type: str, device: torch.device = None) -> torch.Tensor:
-        """Get bezier coefficients for a specific frame and constraint type."""
-        key = f"{frame_name}_{constraint_type}"
-        if key in self.bezier_coeffs:
-            coeffs = torch.tensor(self.bezier_coeffs[key], dtype=torch.float32)
-            if device is not None:
-                coeffs = coeffs.to(device)
-            return coeffs
+
+    def reorder_and_remap_ee(self, cfg, ee_tracker, device):
+        """Reorder and remap end effector coefficients using hardcoded relabeling matrix."""
+        # Load all bezier coefficients from YAML
+        
+        self.right_coeffs = torch.tensor(self.bezier_coeffs, dtype=torch.float32, device=device)
+
+        # Apply relabeling matrix to get left coefficients
+        R = relable_ee_coeffs()
+
+        # Apply relabeling: left_coeffs = R @ right_coeffs
+        left_coeffs = R @ self.bezier_coeffs
+
+        self.left_coeffs = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
+        
+        # Generate axis names for metrics
+        self.generate_axis_names()
+        
+        return
+
+    def generate_axis_names(self):
+        """Generate axis names for each constraint specification."""
+        self.axis_names = []
+        current_idx = 0
+        
+        for spec in self.constraint_specs:
+            constraint_type = spec["type"]
+            
+            if constraint_type == "com_pos":
+                axes = spec.get("axes", [0, 1, 2])
+                axis_names = ["x", "y", "z"]
+                # Generate metric names for COM position (only specified axes)
+                for i, axis_idx in enumerate(axes):
+                    metric_name = f"com_pos_{axis_names[axis_idx]}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx + i
+                    })
+                current_idx += len(axes)
+                
+            elif constraint_type == "joint":
+                output_dim = 1
+                joint_name = spec["joint_name"]
+                # Generate metric name for joint
+                metric_name = f"joint_{joint_name}"
+                self.axis_names.append({
+                    'name': metric_name,
+                    'index': current_idx
+                })
+                current_idx += output_dim
+                
+            elif "frame" in spec:
+                frame_name = spec["frame"]
+                
+                # Determine output dimension and axis names
+                axes = spec.get("axes", [0, 1, 2])
+                if constraint_type in ["ee_pos"]:
+                    axis_names = ["x", "y", "z"]
+                elif constraint_type in ["ee_ori"]:
+                    axis_names = ["roll", "pitch", "yaw"]
+                else:
+                    axis_names = ["x", "y", "z"]
+                
+                # Generate metric names for each axis (only specified axes)
+                for i, axis_idx in enumerate(axes):
+                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx + i
+                    })
+                
+                current_idx += len(axes)
+
+    def get_ref_traj(self, ee_hzd_cmd):
+        """Get reference trajectory similar to joint trajectory approach."""
+        base_velocity = ee_hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        T = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)
+
+
+# based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
+        delta_psi = base_velocity[:,2] * self.cur_swing_time
+        q_delta_yaw = quat_from_euler_xyz(
+            torch.zeros_like(delta_psi),               # roll=0
+            torch.zeros_like(delta_psi),               # pitch=0
+            delta_psi                                  # yaw=Δψ
+        ) 
+
+        # Choose coefficients based on stance
+        if ee_hzd_cmd.stance_idx == 1:
+            ctrl_points = self.right_coeffs
         else:
-            # Return zero coefficients if not found
-            zero_coeffs = torch.zeros(6, dtype=torch.float32)  # Assuming 5th degree bezier + 1
-            if device is not None:
-                zero_coeffs = zero_coeffs.to(device)
-            return zero_coeffs
-    
-    def evaluate_bezier_trajectory(
-        self, frame_name: str, constraint_type: str,
-        phase_var: torch.Tensor, T: torch.Tensor,
-        bezier_deg: int = 5
-    ) -> torch.Tensor:
-        """Evaluate bezier trajectory for a specific frame and constraint type."""
-        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg as bezier_eval
+            ctrl_points = self.left_coeffs
+     
+        phase_var_tensor = torch.full((N,), ee_hzd_cmd.phase_var, device=ee_hzd_cmd.device)
+        des_ee_pos = bezier_deg(
+            0, phase_var_tensor, T, ctrl_points, torch.tensor(ee_hzd_cmd.cfg.bez_deg, device=ee_hzd_cmd.device)
+        )
         
-        # Get device from input tensors
-        device = phase_var.device
+        des_ee_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, ee_hzd_cmd.cfg.bez_deg)
+
+        #TODO:convert some of the desire value to omega from euler rates
+
+        return des_ee_pos, des_ee_vel
+
+    def get_actual_traj(self, ee_hzd_cmd):
+        """Get actual trajectory from end effector tracker."""
+        ee_tracker = ee_hzd_cmd.ee_tracker
         
-        coeffs = self.get_bezier_coeffs_for_frame(frame_name, constraint_type, device)
-        if coeffs.numel() == 0:
-            return torch.zeros_like(phase_var)
+        # Initialize actual state tensors
+        act_values = []
+        act_vel_values = []
         
-        # Reshape coefficients for bezier evaluation
-        # Assuming coeffs is [num_axes * (degree + 1)]
-        num_axes = coeffs.shape[0] // (bezier_deg + 1)
-        coeffs_reshaped = coeffs.view(num_axes, bezier_deg + 1)
+        # Determine swing foot frame name based on stance
+        # If stance_idx == 0 (left stance), then right foot is swing foot
+        # If stance_idx == 1 (right stance), then left foot is swing foot
+        swing_foot_frame = "right_foot_middle" if ee_hzd_cmd.stance_idx == 0 else "left_foot_middle"
+        stance_foot_frame = "left_foot_middle" if ee_hzd_cmd.stance_idx == 0 else "right_foot_middle"
         
-        # Evaluate bezier curve
-        result = bezier_eval(0, phase_var, T, coeffs_reshaped, bezier_deg)
-        return result
+        # Get stance foot pos and velocity for relative positioning
+        #TODO: update this with offset or something
+        stance_foot_pos = ee_hzd_cmd.stance_foot_pos_0 
+        
+        # Get actual values for each constraint specification in order
+        for spec in self.constraint_specs:
+            constraint_type = spec["type"]
+            
+            if constraint_type == "com_pos":
+                # Get COM position from robot state
+                act_val = ee_hzd_cmd.robot.data.root_com_pos_w
+                # Make COM position relative to stance foot
+                act_val -= stance_foot_pos
+                # Select only specified axes
+                axes = spec.get("axes", [0, 1, 2])
+                act_val = act_val[:, axes]
+                act_values.append(act_val)
+                
+                # Get COM velocity and make it relative to stance foot
+                act_val_vel = ee_hzd_cmd.robot.data.root_com_vel_w[:, axes]
+                act_vel_values.append(act_val_vel)
+                
+            elif constraint_type == "joint":
+                # Get joint position from robot state
+                joint_name = spec["joint_name"]
+                joint_pos = ee_hzd_cmd.robot.data.joint_pos
+                # Find joint index by name
+                joint_idx = ee_hzd_cmd.robot.find_joints(joint_name)[0]
+                
+                act_val = joint_pos[:, joint_idx]  # Single joint value
+                act_values.append(act_val)
+                
+                # Get joint velocity
+                act_val_vel = ee_hzd_cmd.robot.data.joint_vel[:, joint_idx]
+                act_vel_values.append(act_val_vel)
+                
+            elif "frame" in spec:
+                frame_name = spec["frame"]
+                constraint_type = spec["type"]
+                
+                # Replace hardcoded left_foot_middle with dynamic swing foot
+                if frame_name == "left_foot_middle":
+                    frame_name = swing_foot_frame
+
+                try:
+                    pos, ori = ee_tracker.get_pose(frame_name)
+                    
+                    if constraint_type in ["ee_pos"]:
+                        # Use position values - already batched
+                        act_val = pos.clone()
+                        # Make positions relative to stance foot
+                        act_val -= stance_foot_pos
+                        # Select only specified axes
+                        axes = spec.get("axes", [0, 1, 2])
+                        act_val = act_val[:, axes]
+                        
+                        # Get linear velocity from robot body data
+                        try:
+                            act_val_vel, _ = ee_tracker.get_velocity(frame_name, ee_hzd_cmd.robot.data)
+                            # Make velocities relative to stance foot
+                            
+                            act_val_vel = act_val_vel[:, axes]
+                        except Exception as e:
+                            print(f"Warning: Could not get velocity for frame {frame_name}: {e}")
+                            act_val_vel = torch.zeros_like(act_val)
+                        
+                    elif constraint_type in ["ee_ori"]:
+                        # Use orientation values - already batched
+                        act_val = ori.clone()
+                        # Select only specified axes
+                        axes = spec.get("axes", [0, 1, 2])
+                        act_val = act_val[:, axes]
+                        
+                        # Get angular velocity from robot body data
+                        try:
+                            _, act_val_vel = ee_tracker.get_velocity(frame_name, ee_hzd_cmd.robot.data)
+                            # Make angular velocities relative to stance foot
+                          
+                            act_val_vel = act_val_vel[:, axes]
+                        except Exception as e:
+                            print(f"Warning: Could not get angular velocity for frame {frame_name}: {e}")
+                            act_val_vel = torch.zeros_like(act_val)
+                    else:
+                        # Unknown constraint type, use zeros
+                        act_val = torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device)
+                        act_val_vel = torch.zeros_like(act_val)
+                        
+                    act_values.append(act_val)
+                    act_vel_values.append(act_val_vel)
+                    
+                except Exception as e:
+                    print(f"Warning: Could not get pose for frame {frame_name}: {e}")
+                    # Add zero tensors as fallback
+                    act_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
+                    act_vel_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
+            else:
+                # Unknown constraint type, use zeros
+                print(f"Warning: Unknown constraint type '{constraint_type}'")
+                act_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
+                act_vel_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
+        
+        # Concatenate all actual values in constraint_spec order
+        if act_values:
+            y_act = torch.cat(act_values, dim=1)
+            dy_act = torch.cat(act_vel_values, dim=1)
+        else:
+            y_act = torch.zeros((ee_hzd_cmd.num_envs, 0), device=ee_hzd_cmd.device)
+            dy_act = torch.zeros((ee_hzd_cmd.num_envs, 0), device=ee_hzd_cmd.device)
+        
+        return y_act, dy_act
