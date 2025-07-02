@@ -6,17 +6,17 @@ from isaaclab.managers import CommandTerm
 
 
 
-from .clf import CLF
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
 
 
 from typing import TYPE_CHECKING
-from .traj_config.jt_traj import JointTrajectoryConfig, get_euler_from_quat
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import JointTrajectoryConfig, get_euler_from_quat
 
 
 
 
 if TYPE_CHECKING:
-    from .cmd_cfg import HZDCommandCfg
+    from ..cmd_cfg import HZDCommandCfg
 
 
 class HZDCommandTerm(CommandTerm):
@@ -36,12 +36,11 @@ class HZDCommandTerm(CommandTerm):
         # load joint trajectory config from YAML
 
         self.ref_config = JointTrajectoryConfig()
-        self.ref_config.load_from_yaml()
 
         
         self.ref_config.reorder_and_remap_jt(cfg,self.robot,self.device)
 
-
+    
         self.mass = sum(self.robot.data.default_mass.T)[0]
         
         self.clf = CLF(
@@ -113,11 +112,10 @@ class HZDCommandTerm(CommandTerm):
         
 
     def generate_reference_trajectory(self):
-        
-        des_jt_pos, des_jt_vel = self.ref_config.get_ref_traj(self)
+        ref_pos, ref_vel = self.ref_config.get_ref_traj(self)
 
-        self.y_out = des_jt_pos
-        self.dy_out = des_jt_vel
+        self.y_out = ref_pos
+        self.dy_out = ref_vel
 
 
     def get_actual_state(self):
@@ -136,8 +134,6 @@ class HZDCommandTerm(CommandTerm):
         self.generate_reference_trajectory()
         self.get_actual_state()
         
-        # how to handle for the first step?
-        # i.e. v is not defined
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, [])
         self.vdot = vdot
         self.v = vcur

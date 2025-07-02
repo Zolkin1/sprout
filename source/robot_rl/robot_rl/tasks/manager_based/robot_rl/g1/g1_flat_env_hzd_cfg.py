@@ -11,9 +11,10 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import HZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from .g1_observation import G1FlatHZDObservationsCfg
+from isaaclab.sensors import FrameTransformerCfg
 #
 ##
 # Pre-defined configs
@@ -21,8 +22,8 @@ from .g1_observation import G1FlatHZDObservationsCfg
 from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 
 class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
-
      hzd_ref = HZDCommandCfg()
+
 
 
 ##
@@ -36,6 +37,18 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
+
+
+        # self.scene.frame_sensor_cfg = FrameTransformerCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+        #     target_frames=[
+        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link/left_toe"),   # idx 0
+        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link/right_toe"), # idx 1
+        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/right_hand_palm_link"),            # idx 2
+        #         FrameTransformerCfg.FrameCfg(prim_path="{ENV_REGEX_NS}/Robot/left_hand_palm_link"),             # idx 3
+        #     ]
+        # )
+
 
 
         # change the observation command name to hzd_ref

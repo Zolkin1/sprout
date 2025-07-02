@@ -8,8 +8,8 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_from_euler_xyz,quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv, quat_apply
 
-from .ref_gen import bezier_deg, calculate_cur_swing_foot_pos, HLIP
-from .clf import CLF
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import bezier_deg, calculate_cur_swing_foot_pos, HLIP
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING

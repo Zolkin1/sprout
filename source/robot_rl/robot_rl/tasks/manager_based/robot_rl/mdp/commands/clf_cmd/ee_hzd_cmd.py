@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from .cmd_cfg import HZDCommandCfg
+    from ..cmd_cfg import HZDCommandCfg
 
 
 class HZDCommandTerm(CommandTerm):

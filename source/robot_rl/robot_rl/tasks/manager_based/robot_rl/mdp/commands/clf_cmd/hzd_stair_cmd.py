@@ -1,27 +1,16 @@
 import torch
-import math
-import yaml
-from isaaclab.utils import configclass
 import numpy as np
 
-from isaaclab.managers import CommandTermCfg, CommandTerm
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-import isaaclab.sim as sim_utils
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
-from robot_rl.assets.robots.g1_21j import build_relabel_matrix
-# from robot_rl.assets.robots.exo_cfg import JointTrajectoryConfig
+from isaaclab.managers import CommandTerm
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import JointTrajectoryConfig, bezier_deg
 
-from .clf import CLF
-from .traj_config.jt_traj import JointTrajectoryConfig, bezier_deg
-# from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 from typing import TYPE_CHECKING
 
-
-
-
 if TYPE_CHECKING:
-    from .cmd_cfg import HZDStairCommandCfg
+    from ..cmd_cfg import HZDStairCommandCfg
 
 
 class HZDStairCommandTerm(CommandTerm):
@@ -49,20 +38,22 @@ class HZDStairCommandTerm(CommandTerm):
         # load joint trajectory config from YAML
         #this is the flat ref trajectory
         yaml_path = "source/robot_rl/robot_rl/assets/robots/single_support_config_solution.yaml"
-        self.jt_config = JointTrajectoryConfig()
-        self.jt_config.load_from_yaml(yaml_path, self.robot)
+        self.jt_config = JointTrajectoryConfig(yaml_path)
+        self.jt_config.reorder_and_remap_jt(cfg,self.robot,self.device)
         self.T_flat = self.jt_config.T
         
+
+
         #this is the stair ref trajectory
         yaml_path = "source/robot_rl/robot_rl/assets/robots/stair_config_solution.yaml"
-        self.jt_config_stair = JointTrajectoryConfig()
-        self.jt_config_stair.load_from_yaml(yaml_path, self.robot)
+        self.jt_config_stair = JointTrajectoryConfig(yaml_path)
+        self.jt_config_stair.reorder_and_remap_jt(cfg,self.robot,self.device)
         self.T_upstair = self.jt_config_stair.T
 
         #load the downstair ref trajectory
         yaml_path = "source/robot_rl/robot_rl/assets/robots/downstair_config_solution.yaml"
-        self.jt_config_downstair = JointTrajectoryConfig()
-        self.jt_config_downstair.load_from_yaml(yaml_path, self.robot)
+        self.jt_config_downstair = JointTrajectoryConfig(yaml_path)
+        self.jt_config_downstair.reorder_and_remap_jt(cfg,self.robot,self.device)
         self.T_downstair = self.jt_config_downstair.T
 
         right_jt_coeffs = self.jt_config.joint_trajectories
