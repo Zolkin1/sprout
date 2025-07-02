@@ -1,0 +1,105 @@
+# End Effector Trajectory Configuration
+# This file demonstrates how to specify end effector trajectories with link chains
+
+# Step period
+T: 0.5
+
+# Constraint specifications
+constraint_specs:
+  # Pelvis orientation constraint
+  - type: "ee_ori"
+    frame: "pelvis_link"
+    axes: [0, 1, 2]
+  
+  # Center of mass position constraint
+  - type: "com_pos"
+    axes: [0, 1, 2]
+  
+  # Left foot position and orientation (using link chain)
+  - type: "ee_pos"
+    frame: "left_ankle_roll_link/left_foot_middle"
+    axes: [0, 1, 2]
+  
+  - type: "ee_ori"
+    frame: "left_ankle_roll_link/left_foot_middle"
+    axes: [0, 1, 2]
+  
+  # Right foot position and orientation (using link chain)
+  - type: "ee_pos"
+    frame: "right_ankle_roll_link/right_foot_middle"
+    axes: [0, 1, 2]
+  
+  - type: "ee_ori"
+    frame: "right_ankle_roll_link/right_foot_middle"
+    axes: [0, 1, 2]
+  
+  # Left hand position and orientation (using long link chain)
+  - type: "ee_pos"
+    frame: "left_elbow_link/left_wrist_roll_link/left_wrist_pitch_link/left_wrist_yaw_link/left_hand_palm_link"
+    axes: [0, 1, 2]
+  
+  - type: "ee_ori"
+    frame: "left_elbow_link/left_wrist_roll_link/left_wrist_pitch_link/left_wrist_yaw_link/left_hand_palm_link"
+    axes: [2]  # Only yaw orientation
+  
+  # Right hand position and orientation (using long link chain)
+  - type: "ee_pos"
+    frame: "right_elbow_link/right_wrist_roll_link/right_wrist_pitch_link/right_wrist_yaw_link/right_hand_palm_link"
+    axes: [0, 1, 2]
+  
+  - type: "ee_ori"
+    frame: "right_elbow_link/right_wrist_roll_link/right_wrist_pitch_link/right_wrist_yaw_link/right_hand_palm_link"
+    axes: [2]  # Only yaw orientation
+  
+  # Joint-specific constraint (waist yaw)
+  - type: "joint"
+    indices: [12]
+
+# Bezier coefficients for each constraint
+# Format: "frame_name_constraint_type": [coefficients]
+bezier_coeffs:
+  # Pelvis orientation (3 axes, 6 coefficients each = 18 total)
+  "pelvis_link_ee_ori": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # roll
+                         0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # pitch
+                         0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # yaw
+  
+  # Center of mass position (3 axes, 6 coefficients each = 18 total)
+  "com_pos": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # x
+              0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # y
+              0.65, 0.65, 0.65, 0.65, 0.65, 0.65] # z (constant height)
+  
+  # Left foot position (3 axes, 6 coefficients each = 18 total)
+  "left_ankle_roll_link/left_foot_middle_ee_pos": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # x
+                                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # y
+                                                   0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # z
+  
+  # Left foot orientation (3 axes, 6 coefficients each = 18 total)
+  "left_ankle_roll_link/left_foot_middle_ee_ori": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # roll
+                                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # pitch
+                                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # yaw
+  
+  # Right foot position (3 axes, 6 coefficients each = 18 total)
+  "right_ankle_roll_link/right_foot_middle_ee_pos": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # x
+                                                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # y
+                                                     0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # z
+  
+  # Right foot orientation (3 axes, 6 coefficients each = 18 total)
+  "right_ankle_roll_link/right_foot_middle_ee_ori": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # roll
+                                                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # pitch
+                                                     0.0, 0.0, 0.0, 0.0, 0.0, 0.0] # yaw
+  
+  # Left hand position (3 axes, 6 coefficients each = 18 total)
+  "left_elbow_link/left_wrist_roll_link/left_wrist_pitch_link/left_wrist_yaw_link/left_hand_palm_link_ee_pos": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # x
+                                                                                                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # y
+                                                                                                                0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # z
+  
+  # Left hand orientation (1 axis, 6 coefficients = 6 total)
+  "left_elbow_link/left_wrist_roll_link/left_wrist_pitch_link/left_wrist_yaw_link/left_hand_palm_link_ee_ori": [0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # yaw only
+  
+  # Right hand position (3 axes, 6 coefficients each = 18 total)
+  "right_elbow_link/right_wrist_roll_link/right_wrist_pitch_link/right_wrist_yaw_link/right_hand_palm_link_ee_pos": [0.0, 0.1, 0.2, 0.1, 0.0, 0.0,  # x
+                                                                                                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # y
+                                                                                                                    0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # z
+  
+  # Right hand orientation (1 axis, 6 coefficients = 6 total)
+  "right_elbow_link/right_wrist_roll_link/right_wrist_pitch_link/right_wrist_yaw_link/right_hand_palm_link_ee_ori": [0.0, 0.05, 0.1, 0.05, 0.0, 0.0] # yaw only

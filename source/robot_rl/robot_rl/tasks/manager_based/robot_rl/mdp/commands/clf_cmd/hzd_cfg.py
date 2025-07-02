@@ -1,4 +1,4 @@
-from .hzd_cmd import JointTrajectoryHZDCommandTerm, BaseTrajectoryHZDCommandTerm
+from .hzd_cmd import JointTrajectoryHZDCommandTerm, EndEffectorTrajectoryHZDCommandTerm
 from .hzd_stair_cmd import HZDStairCommandTerm
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
@@ -71,11 +71,11 @@ class JointTrajectoryHZDCommandCfg(CommandTermCfg):
 
 
 @configclass
-class BaseTrajectoryHZDCommandCfg(CommandTermCfg):
+class EndEffectorTrajectoryHZDCommandCfg(CommandTermCfg):
     """
-    Configuration for the BaseTrajectoryHZDCommandTerm.
+    Configuration for the EndEffectorTrajectoryHZDCommandTerm.
     """
-    class_type: type = BaseTrajectoryHZDCommandTerm
+    class_type: type = EndEffectorTrajectoryHZDCommandTerm
     asset_name: str = "robot"
     foot_body_name: str = ".*_ankle_roll_link"
     num_outputs: int = 21

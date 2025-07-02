@@ -11,7 +11,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import HZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import HZDCommandCfg, EndEffectorTrajectoryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from .g1_observation import G1FlatHZDObservationsCfg
 from isaaclab.sensors import FrameTransformerCfg
@@ -24,6 +24,8 @@ from isaaclab_assets import G1_MINIMAL_CFG  # isort: skip
 class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
      hzd_ref = HZDCommandCfg()
 
+class G1FlatHZDCommandsCfg_EE(HumanoidCommandsCfg):
+     hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
 
 
 ##
@@ -32,7 +34,8 @@ class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
 @configclass
 class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
-    commands: G1FlatHZDCommandsCfg = G1FlatHZDCommandsCfg()
+    # commands: G1FlatHZDCommandsCfg = G1FlatHZDCommandsCfg()
+    commands: G1FlatHZDCommandsCfg_EE = G1FlatHZDCommandsCfg_EE()
     # observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
     def __post_init__(self):
         # post init of parent
