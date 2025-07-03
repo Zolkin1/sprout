@@ -30,7 +30,7 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObser
 #
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
-
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_cfg import HZDStairEECommandCfg
 @configclass
 class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
@@ -177,8 +177,8 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
 @configclass
 class G1HZD_StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
-    hzd_ref = HZDStairCommandCfg()
-
+    # hzd_ref = HZDStairCommandCfg()
+    hzd_ref = HZDStairEECommandCfg()
 @configclass
 class G1HZDEnvCfg(G1StairEnvCfg):
     commands: G1HZD_StairCommandsCfg = G1HZD_StairCommandsCfg()
