@@ -104,17 +104,18 @@ def extract_data(filepath, config):
 
 # Make plots
 def plot_joints_and_actions(data):
-    fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(10, 10))
+    fig, axes = plt.subplots(nrows=7, ncols=3, figsize=(10, 10))
 
     FLOATING_BASE = 7
 
-    for i in range(6):
-        for j in range(2):
-            axes[i, j].plot(data["time"], data["qpos"][:, i + 6 * j + FLOATING_BASE])
-            axes[i, j].plot(data["time"], data["action"][:, i + 6 * j])
+    for i in range(7):
+        for j in range(3):
+            axes[i, j].plot(data["time"], data["qpos"][:, i + 7 * j + FLOATING_BASE],label="qpos")
+            axes[i, j].plot(data["time"], data["action"][:, i + 7 * j],label="action")
             axes[i, j].set_xlabel("time")
-            axes[i, j].set_ylabel(f"qpos {i + 6*j + FLOATING_BASE} (rad)")
+            axes[i, j].set_ylabel(f"qpos {i + 7*j + FLOATING_BASE} (rad)")
             axes[i, j].grid()
+            axes[i, j].legend()
 
 
 def plot_torques(data):

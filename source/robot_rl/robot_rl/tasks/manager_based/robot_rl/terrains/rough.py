@@ -9,6 +9,34 @@ import isaaclab.terrains as terrain_gen
 
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 
+ROUGH_FOR_FLAT_HZD_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.0005,  # Reduced from 0.005 in rough terrain
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "boxes": terrain_gen.MeshRandomGridTerrainCfg(
+            proportion=1.0, grid_width=0.45, grid_height_range=(0.0, 0.04), platform_width=2.0
+        ),
+
+        # "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+        #     noise_range=(0.0, 0.03), 
+        #     noise_step=0.001,
+        #     proportion=0.5,
+        #     horizontal_scale=0.01,
+        # ),
+        # "flat_terrain": terrain_gen.MeshPlaneTerrainCfg(
+        #     proportion=0.4,
+        # ),
+    },
+)
+
+
+
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     size=(8.0, 8.0),
     border_width=20.0,
