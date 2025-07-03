@@ -1,7 +1,7 @@
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_base import HZDStairBaseCommandTerm
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker, bezier_deg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import StairEEtrajConfig, EndEffectorTracker, bezier_deg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import euler_rates_to_omega
 
 from typing import TYPE_CHECKING
@@ -22,17 +22,17 @@ class HZDStairEECommandTerm(HZDStairBaseCommandTerm):
         # Load three separate end effector trajectory configs from YAML files
         # Flat terrain reference trajectory
         flat_yaml_path = "source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"
-        self.ee_config_flat = EndEffectorTrajectoryConfig(flat_yaml_path)
+        self.ee_config_flat = StairEEtrajConfig(flat_yaml_path)
         self.ee_config_flat.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
         
         # Stair up reference trajectory
         stair_up_yaml_path = "source/robot_rl/robot_rl/assets/robots/stair_config_solution_ee.yaml"
-        self.ee_config_stair_up = EndEffectorTrajectoryConfig(stair_up_yaml_path)
+        self.ee_config_stair_up = StairEEtrajConfig(stair_up_yaml_path)
         self.ee_config_stair_up.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
         
         # Stair down reference trajectory
         stair_down_yaml_path = "source/robot_rl/robot_rl/assets/robots/downstair_config_solution_ee.yaml"
-        self.ee_config_stair_down = EndEffectorTrajectoryConfig(stair_down_yaml_path)
+        self.ee_config_stair_down = StairEEtrajConfig(stair_down_yaml_path)
         self.ee_config_stair_down.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
         
         # Initialize end effector specific variables

@@ -211,17 +211,23 @@ class G1HZDEnvCfg(G1StairEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
 
-        self.rewards.clf_reward.params["max_clf"] = 50.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_reward.params["max_clf"] = 300.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 300.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 2.0
         
         self.commands.base_velocity.ranges.lin_vel_x = (0.6,0.6)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
-        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.15)
+        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
         self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.0,0.0)
         self.scene.terrain.terrain_generator.sub_terrains["flat"].step_height_range = (0.0,0.0)
+
+        self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None
+        self.events.add_base_mass = None
+        self.events.base_com = None
+
         
         clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1500, "min_val": 20.0})
         self.curriculum.clf_curriculum = clf_curriculum

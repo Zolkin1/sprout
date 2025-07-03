@@ -91,8 +91,10 @@ class StairPPOCfg(PPORunnerCfg):
 
 @configclass
 class StairCNNPPOCfg(PPORunnerCfg):
-    resume = True
-    resume_path = "/home/kli5/robot_rl/logs/g1_policies/stair-hzd/g1/2025-07-01_09-13-31/model_7800.pt"
+    # resume = True
+    # resume_path = "/home/kli5/robot_rl/logs/g1_policies/stair-hzd/g1/2025-07-01_09-13-31/model_7800.pt"
+    resume = False
+    resume_path = None
     policy = None
     policy = CustomPPOActorCriticCfg(
         class_name="ActorCriticCNN",

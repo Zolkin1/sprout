@@ -389,3 +389,117 @@ class EndEffectorTrajectoryConfig:
      
         
         return y_act, dy_act
+
+
+class StairEEtrajConfig(EndEffectorTrajectoryConfig):
+    def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
+        super().__init__(yaml_path)
+
+    def get_actual_traj(self, ee_hzd_cmd):
+        """Get actual trajectory from end effector tracker."""
+        ee_tracker = ee_hzd_cmd.ee_tracker
+        
+
+        # Determine swing foot frame name based on stance
+        stance_foot_pos = ee_hzd_cmd.stance_foot_pos_0 
+        
+        # Get actual values for each constraint specification in order
+        com2stance_foot = ee_hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
+        com2stance_local = _transfer_to_local_frame(com2stance_foot, ee_hzd_cmd.stance_foot_ori_quat_0)
+       
+        com_vel_w = ee_hzd_cmd.robot.data.root_com_vel_w[:,0:3]
+        com_vel_local = _transfer_to_local_frame(com_vel_w, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        pelvis_ori = get_euler_from_quat(ee_hzd_cmd.robot.data.root_quat_w)
+        pelvis_ori[:,2] = wrap_to_pi(pelvis_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        pelvis_omega = ee_hzd_cmd.robot.data.root_ang_vel_b
+
+
+        left_foot_pos, left_foot_ori,left_foot_quat = ee_tracker.get_pose("left_foot_middle")
+        right_foot_pos, right_foot_ori,right_foot_quat = ee_tracker.get_pose("right_foot_middle")
+
+
+        left2st_ft_pos =  left_foot_pos - stance_foot_pos
+        left2st_ft_ori = left_foot_ori - ee_hzd_cmd.stance_foot_ori_0
+        left2st_ft_ori[:,2] = wrap_to_pi(left2st_ft_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+
+        right2st_ft_pos =  right_foot_pos - stance_foot_pos
+        right2st_ft_ori = right_foot_ori - ee_hzd_cmd.stance_foot_ori_0
+        right2st_ft_ori[:,2] = wrap_to_pi(right2st_ft_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+
+       
+        sw2st_foot_pos = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
+        sw2st_foot_ori = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
+
+
+   
+        foot_lin_vel_w = ee_hzd_cmd.robot.data.body_lin_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
+        foot_ang_vel_w = ee_hzd_cmd.robot.data.body_ang_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
+
+        batched_idx = torch.arange(foot_lin_vel_w.shape[0])
+        sw2st_foot_vel = foot_lin_vel_w[batched_idx,1-ee_hzd_cmd.stance_idx]
+        sw2st_foot_ang_vel = foot_ang_vel_w[batched_idx,1-ee_hzd_cmd.stance_idx]
+
+        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        waist_joint_pos = ee_hzd_cmd.robot.data.joint_pos[:, ee_hzd_cmd.waist_joint_idx]
+        waist_joint_vel = ee_hzd_cmd.robot.data.joint_vel[:, ee_hzd_cmd.waist_joint_idx]
+
+        #palm position
+        left_hand_pos, left_hand_ori,left_hand_quat = ee_tracker.get_pose("left_hand_palm_joint")
+        right_hand_pos, right_hand_ori,right_hand_quat = ee_tracker.get_pose("right_hand_palm_joint")
+
+        left2st_ft_pos =  left_hand_pos - stance_foot_pos
+        left2st_ft_ori = left_hand_ori - ee_hzd_cmd.stance_foot_ori_0
+        left2st_ft_ori[:,2] = wrap_to_pi(left2st_ft_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+
+        right2st_ft_pos =  right_hand_pos - stance_foot_pos
+        right2st_ft_ori = right_hand_ori - ee_hzd_cmd.stance_foot_ori_0
+        right2st_ft_ori[:,2] = wrap_to_pi(right2st_ft_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        
+        
+    
+        left_hand_vel, left_hand_omega = ee_tracker.get_velocity("left_hand_palm_joint", ee_hzd_cmd.robot.data)
+        right_hand_vel, right_hand_omega = ee_tracker.get_velocity("right_hand_palm_joint", ee_hzd_cmd.robot.data)
+
+        stance_hand_pos = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_pos, left2st_ft_pos)
+        stance_hand_ori = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_ori, left2st_ft_ori)
+        swing_hand_pos = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
+        swing_hand_ori = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
+
+        swing_hand_vel = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_vel, right_hand_vel)
+        swing_hand_omega = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_omega, right_hand_omega)
+        stance_hand_vel = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_vel, left_hand_vel)
+        stance_hand_omega = torch.where(ee_hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_omega, left_hand_omega)
+
+
+        swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, ee_hzd_cmd.stance_foot_ori_quat_0)
+        stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        stance_hand_pos = stance_hand_pos - stance_foot_pos
+        stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_pos = swing_hand_pos - stance_foot_pos
+
+        swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ori[:,2] = wrap_to_pi(swing_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        stance_hand_ori[:,2] = wrap_to_pi(stance_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+
+        #concatenate all the position values
+        y_act = torch.cat([com2stance_local,pelvis_ori,sw2st_foot_pos,sw2st_foot_ori,
+                      waist_joint_pos,
+                      swing_hand_pos,swing_hand_ori[:,2].unsqueeze(-1),stance_hand_pos,stance_hand_ori[:,2].unsqueeze(-1)], dim=-1)
+
+
+        #concatenate all the velocity values
+        dy_act = torch.cat([com_vel_local,pelvis_omega,sw2st_foot_vel_local,sw2st_foot_ang_vel_local,
+                          waist_joint_vel,
+                          swing_hand_vel_local,swing_hand_ang_vel_local[:,2].unsqueeze(-1),stance_hand_vel_local,stance_hand_ang_vel_local[:,2].unsqueeze(-1)], dim=-1)
+
+     
+        
+        return y_act, dy_act
+        
+
