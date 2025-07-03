@@ -56,6 +56,12 @@ class HZDStairEECommandTerm(HZDStairBaseCommandTerm):
         """Get the swing period for stair down terrain."""
         return self.ee_config_stair_down.T
 
+    def _get_swing_period(self) -> float:
+        """Get the swing period - required by base HZDCommandTerm."""
+        # This method is required by the base class but not used in stair logic
+        # Return the flat terrain period as default
+        return self.ee_config_flat.T
+
     def generate_reference_trajectory(self):
         """Generate reference trajectory based on terrain type and stance."""
         base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)
@@ -174,6 +180,11 @@ class HZDStairEECommandTerm(HZDStairBaseCommandTerm):
         # Get stance foot pose data
         self.get_stance_foot_pose()
         
+        # Set the stance foot data that the base class expects
+        self.stance_foot_pos_0 = self.stance_foot_pos
+        self.stance_foot_ori_quat_0 = self.stance_foot_ori_quat
+        self.stance_foot_ori_0 = self.stance_foot_ori
+        
         # Get actual trajectory from end effector tracker
         act_pos, act_vel = self.ee_config_flat.get_actual_traj(self)
         self.y_act = act_pos
@@ -181,11 +192,46 @@ class HZDStairEECommandTerm(HZDStairBaseCommandTerm):
 
     def get_stance_foot_pose(self):
         """Get stance foot pose data using end effector tracker."""
-        stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
-        stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
+        # Handle stance index as a tensor with batch dimension
+        N = self.stance_idx.shape[0]
+        
+        # Get stance foot poses for all environments
+        left_stance_mask = (self.stance_idx == 0)
+        right_stance_mask = (self.stance_idx == 1)
+        
+        # Initialize stance foot data tensors
+        stance_foot_pos = torch.zeros((N, 3), device=self.device)
+        stance_foot_ori = torch.zeros((N, 3), device=self.device)
+        stance_foot_quat = torch.zeros((N, 4), device=self.device)
+        stance_foot_vel = torch.zeros((N, 3), device=self.device)
+        stance_foot_ang_vel = torch.zeros((N, 3), device=self.device)
+        
+        # Get left foot data for left stance environments
+        if torch.any(left_stance_mask):
+            left_pos, left_ori, left_quat = self.ee_tracker.get_pose("left_foot_middle")
+            left_vel, left_ang_vel = self.ee_tracker.get_velocity("left_foot_middle", self.robot.data)
+            
+            stance_foot_pos[left_stance_mask] = left_pos[left_stance_mask]
+            stance_foot_ori[left_stance_mask] = left_ori[left_stance_mask]
+            stance_foot_quat[left_stance_mask] = left_quat[left_stance_mask]
+            stance_foot_vel[left_stance_mask] = left_vel[left_stance_mask]
+            stance_foot_ang_vel[left_stance_mask] = left_ang_vel[left_stance_mask]
+        
+        # Get right foot data for right stance environments
+        if torch.any(right_stance_mask):
+            right_pos, right_ori, right_quat = self.ee_tracker.get_pose("right_foot_middle")
+            right_vel, right_ang_vel = self.ee_tracker.get_velocity("right_foot_middle", self.robot.data)
+            
+            stance_foot_pos[right_stance_mask] = right_pos[right_stance_mask]
+            stance_foot_ori[right_stance_mask] = right_ori[right_stance_mask]
+            stance_foot_quat[right_stance_mask] = right_quat[right_stance_mask]
+            stance_foot_vel[right_stance_mask] = right_vel[right_stance_mask]
+            stance_foot_ang_vel[right_stance_mask] = right_ang_vel[right_stance_mask]
+        
+        # Store stance foot data
         self.stance_foot_pos = stance_foot_pos
         self.stance_foot_ori = stance_foot_ori
-        stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
+        self.stance_foot_ori_quat = stance_foot_quat
         self.stance_foot_vel = stance_foot_vel
         self.stance_foot_ang_vel = stance_foot_ang_vel
 

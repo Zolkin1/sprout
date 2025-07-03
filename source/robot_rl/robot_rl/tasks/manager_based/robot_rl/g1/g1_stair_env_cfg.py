@@ -28,7 +28,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stair_cfg import StairHL
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 #
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
+# from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_cfg import HZDStairEECommandCfg
 @configclass

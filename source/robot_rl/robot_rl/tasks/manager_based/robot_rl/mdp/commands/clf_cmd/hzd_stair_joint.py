@@ -43,6 +43,12 @@ class HZDStairJointCommandTerm(HZDStairBaseCommandTerm):
         """Get the swing period for stair down terrain."""
         return self.jt_config_stair_down.T
 
+    def _get_swing_period(self) -> float:
+        """Get the swing period - required by base HZDCommandTerm."""
+        # This method is required by the base class but not used in stair logic
+        # Return the flat terrain period as default
+        return self.jt_config_flat.T
+
     def generate_reference_trajectory(self):
         """Generate reference trajectory based on terrain type and stance."""
         base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)

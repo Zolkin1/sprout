@@ -29,7 +29,7 @@ class HZDStairBaseCommandTerm(HZDCommandTerm, ABC):
         # Height checking variables
         self.z_height = torch.zeros((self.num_envs), device=self.device)
         self.T = torch.zeros((self.num_envs), device=self.device)
-        
+        self.tp = torch.zeros((self.num_envs), device=self.device)
         # Initialize stance_idx as tensor for per-environment tracking
         self.stance_idx = None
 
@@ -76,9 +76,9 @@ class HZDStairBaseCommandTerm(HZDCommandTerm, ABC):
         Tswing = self.T
         # Current time for each env (broadcast scalar to tensor)
         current_time = torch.full((N,), float(self.env.sim.current_time), device=device)
-        tp = (current_time % (2 * Tswing)) / (2 * Tswing)
+        self.tp = (current_time % (2 * Tswing)) / (2 * Tswing)
         # Compute phi_c per env
-        phi_c = torch.sin(2 * torch.pi * tp) / torch.sqrt(torch.sin(2 * torch.pi * tp) ** 2 + Tswing)
+        phi_c = torch.sin(2 * torch.pi * self.tp) / torch.sqrt(torch.sin(2 * torch.pi * self.tp) ** 2 + Tswing)
         new_stance_idx = (0.5 - 0.5 * torch.sign(phi_c)).long()  # shape (N,)
         self.swing_idx = 1 - new_stance_idx
 
@@ -94,7 +94,7 @@ class HZDStairBaseCommandTerm(HZDCommandTerm, ABC):
         self.stance_idx = new_stance_idx
 
         # Compute phase_var and cur_swing_time per env
-        phase_var = torch.where(tp < 0.5, 2 * tp, 2 * tp - 1)
+        phase_var = torch.where(self.tp < 0.5, 2 * self.tp, 2 * self.tp - 1)
         self.phase_var = phase_var
         self.cur_swing_time = self.phase_var * Tswing
 

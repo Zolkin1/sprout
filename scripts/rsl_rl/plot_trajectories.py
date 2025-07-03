@@ -434,7 +434,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
         alpha = 1.0
         decay = alpha * v_data[:, env_ids] + vdot_data[:, env_ids]
         axs[2].plot(time_steps, decay, label='CLF Decay', color='orange', linewidth=2)
-        axs[2].set_title('CLF Decay (αv + v̇)')
+        axs[2].set_title('CLF Decay (v + αv̇)')
         axs[2].set_xlabel('Time Steps')
         axs[2].set_ylabel('Decay Rate')
         axs[2].grid(True, alpha=0.3)
