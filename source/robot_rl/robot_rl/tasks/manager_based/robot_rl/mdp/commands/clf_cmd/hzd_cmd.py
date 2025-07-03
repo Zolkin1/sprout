@@ -189,6 +189,11 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
 
         
         self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
+        self.foot_yaw_output_idx = 11
+        self.ori_idx_list = [
+            [3,4,5],
+            [9,10,11],
+        ]
 
         # new_joint_idx = []
         # for joint_idx in self.ee_config.constraint_specs[-1]['indices']:

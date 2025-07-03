@@ -287,12 +287,7 @@ class EndEffectorTrajectoryConfig:
 
 
 # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
-     #    delta_psi = base_velocity[:,2] * self.cur_swing_time
-     #    q_delta_yaw = quat_from_euler_xyz(
-     #        torch.zeros_like(delta_psi),               # roll=0
-     #        torch.zeros_like(delta_psi),               # pitch=0
-     #        delta_psi                                  # yaw=Δψ
-     #    ) 
+        delta_psi = base_velocity[:,2] * ee_hzd_cmd.cur_swing_time
 
         # Choose coefficients based on stance
         if ee_hzd_cmd.stance_idx == 1:
@@ -307,8 +302,11 @@ class EndEffectorTrajectoryConfig:
         
         des_ee_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, ee_hzd_cmd.cfg.bez_deg)
 
-        #TODO:convert some of the desire value to omega from euler rates
+        des_ee_pos[:,ee_hzd_cmd.foot_yaw_output_idx] += delta_psi
+        des_ee_vel[:,ee_hzd_cmd.foot_yaw_output_idx] += base_velocity[:,2]
 
+        for i in ee_hzd_cmd.ori_idx_list:
+               des_ee_vel[:,i] = euler_rates_to_omega(des_ee_pos[:,i], des_ee_vel[:,i])
         return des_ee_pos, des_ee_vel
 
     def get_actual_traj(self, ee_hzd_cmd):
@@ -338,9 +336,12 @@ class EndEffectorTrajectoryConfig:
         pelvis_omega = ee_hzd_cmd.robot.data.root_ang_vel_b
 
 
-        sw2st_foot_pos, sw2st_foot_ori,sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
-        sw2st_foot_pos = sw2st_foot_pos - stance_foot_pos
-
+        swing_foot_pos, swing_foot_ori,sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
+        sw2st_foot_pos = swing_foot_pos - stance_foot_pos
+        
+        sw2st_foot_ori = swing_foot_ori 
+        sw2st_foot_ori[:,2] = wrap_to_pi(swing_foot_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+   
         foot_lin_vel_w = ee_hzd_cmd.robot.data.body_lin_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
         foot_ang_vel_w = ee_hzd_cmd.robot.data.body_ang_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
 
@@ -371,8 +372,8 @@ class EndEffectorTrajectoryConfig:
         swing_hand_pos = swing_hand_pos - stance_foot_pos
 
         swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ori = _transfer_to_local_frame(swing_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_ori = _transfer_to_local_frame(stance_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ori[:,2] = wrap_to_pi(swing_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        stance_hand_ori[:,2] = wrap_to_pi(stance_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
 
         #concatenate all the position values
         y_act = torch.cat([com2stance_local,pelvis_ori,sw2st_foot_pos,sw2st_foot_ori,
