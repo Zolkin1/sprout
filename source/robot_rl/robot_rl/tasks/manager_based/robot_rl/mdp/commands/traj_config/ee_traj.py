@@ -1,33 +1,13 @@
 import torch
 import numpy as np
 from typing import List, Dict
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_from_euler_xyz,quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv, quat_apply
+
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat, bezier_deg
 
-#TODO: need to account for stance foot yaw position
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame,euler_rates_to_omega
 
-def eul_rates_to_omega_XYZ(eul: torch.Tensor, eul_rates: torch.Tensor) -> torch.Tensor:
-    """Convert Z–Y–X Euler angle rates (eul_rates) into body-frame angular velocity (batched)."""
-    # eul: (..., 3) [roll, pitch, yaw]
-    # eul_rates: (..., 3)
-    y = eul[..., 1]
-    z = eul[..., 2]
 
-    cos_y = torch.cos(y)
-    sin_y = torch.sin(y)
-    cos_z = torch.cos(z)
-    sin_z = torch.sin(z)
-
-    # Build the 3x3 mapping matrix for each batch
-    # (..., 3, 3)
-    M = torch.stack([
-        torch.stack([cos_y * cos_z, sin_z, torch.zeros_like(y)], dim=-1),
-        torch.stack([-cos_y * sin_z, cos_z, torch.zeros_like(y)], dim=-1),
-        torch.stack([sin_y, torch.zeros_like(y), torch.ones_like(y)], dim=-1),
-    ], dim=-2)
-
-    # Matrix multiply (..., 3, 3) @ (..., 3, 1) -> (..., 3, 1)
-    omega = torch.matmul(M, eul_rates.unsqueeze(-1)).squeeze(-1)
-    return omega
 
 class EndEffectorTracker:
     def __init__(self, constraint_specs: List[Dict], scene=None):
@@ -109,7 +89,7 @@ class EndEffectorTracker:
         
         # Convert quaternions to euler angles for all environments
         euler = get_euler_from_quat(quat)  # Shape: (num_envs, 3)
-        return pos, euler
+        return pos, euler,quat
 
     def get_velocity(self, frame_name: str, robot_data):
         """Returns (linear_velocity, angular_velocity) for a given EE frame from robot body data."""
@@ -180,11 +160,6 @@ def relable_ee_coeffs():
 
     # the traj is in right stance, so swing foot is left foot
     # need to swap left and right palm coeffs
-    left_palm = 13 + np.array([0, 1, 2, 3])
-    right_palm = 13 + np.array([4, 5, 6, 7])
-    tmp = R[left_palm, :].copy()
-    R[left_palm, :] = R[right_palm, :]
-    R[right_palm, :] = tmp
 
     return R
 
@@ -220,6 +195,7 @@ class EndEffectorTrajectoryConfig:
         
         # Load step period
         self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
+        self.joint_order = data['joint_order']
         
         return
     
@@ -311,12 +287,12 @@ class EndEffectorTrajectoryConfig:
 
 
 # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
-        delta_psi = base_velocity[:,2] * self.cur_swing_time
-        q_delta_yaw = quat_from_euler_xyz(
-            torch.zeros_like(delta_psi),               # roll=0
-            torch.zeros_like(delta_psi),               # pitch=0
-            delta_psi                                  # yaw=Δψ
-        ) 
+     #    delta_psi = base_velocity[:,2] * self.cur_swing_time
+     #    q_delta_yaw = quat_from_euler_xyz(
+     #        torch.zeros_like(delta_psi),               # roll=0
+     #        torch.zeros_like(delta_psi),               # pitch=0
+     #        delta_psi                                  # yaw=Δψ
+     #    ) 
 
         # Choose coefficients based on stance
         if ee_hzd_cmd.stance_idx == 1:
@@ -339,123 +315,76 @@ class EndEffectorTrajectoryConfig:
         """Get actual trajectory from end effector tracker."""
         ee_tracker = ee_hzd_cmd.ee_tracker
         
-        # Initialize actual state tensors
-        act_values = []
-        act_vel_values = []
+
         
         # Determine swing foot frame name based on stance
         # If stance_idx == 0 (left stance), then right foot is swing foot
         # If stance_idx == 1 (right stance), then left foot is swing foot
         swing_foot_frame = "right_foot_middle" if ee_hzd_cmd.stance_idx == 0 else "left_foot_middle"
-        stance_foot_frame = "left_foot_middle" if ee_hzd_cmd.stance_idx == 0 else "right_foot_middle"
-        
+        swing_hand_frame = "right_hand_palm_joint" if ee_hzd_cmd.stance_idx == 0 else "left_hand_palm_joint"
+        stance_hand_frame = "left_hand_palm_joint" if ee_hzd_cmd.stance_idx == 0 else "right_hand_palm_joint"
         # Get stance foot pos and velocity for relative positioning
-        #TODO: update this with offset or something
         stance_foot_pos = ee_hzd_cmd.stance_foot_pos_0 
         
         # Get actual values for each constraint specification in order
-        for spec in self.constraint_specs:
-            constraint_type = spec["type"]
-            
-            if constraint_type == "com_pos":
-                # Get COM position from robot state
-                act_val = ee_hzd_cmd.robot.data.root_com_pos_w
-                # Make COM position relative to stance foot
-                act_val -= stance_foot_pos
-                # Select only specified axes
-                axes = spec.get("axes", [0, 1, 2])
-                act_val = act_val[:, axes]
-                act_values.append(act_val)
-                
-                # Get COM velocity and make it relative to stance foot
-                act_val_vel = ee_hzd_cmd.robot.data.root_com_vel_w[:, axes]
-                act_vel_values.append(act_val_vel)
-                
-            elif constraint_type == "joint":
-                # Get joint position from robot state
-                joint_name = spec["joint_name"]
-                joint_pos = ee_hzd_cmd.robot.data.joint_pos
-                # Find joint index by name
-                joint_idx = ee_hzd_cmd.robot.find_joints(joint_name)[0]
-                
-                act_val = joint_pos[:, joint_idx]  # Single joint value
-                act_values.append(act_val)
-                
-                # Get joint velocity
-                act_val_vel = ee_hzd_cmd.robot.data.joint_vel[:, joint_idx]
-                act_vel_values.append(act_val_vel)
-                
-            elif "frame" in spec:
-                frame_name = spec["frame"]
-                constraint_type = spec["type"]
-                
-                # Replace hardcoded left_foot_middle with dynamic swing foot
-                if frame_name == "left_foot_middle":
-                    frame_name = swing_foot_frame
+        com2stance_foot = ee_hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
+        com2stance_local = _transfer_to_local_frame(com2stance_foot, ee_hzd_cmd.stance_foot_ori_quat_0)
+       
+        com_vel_w = ee_hzd_cmd.robot.data.root_com_vel_w[:,0:3]
+        com_vel_local = _transfer_to_local_frame(com_vel_w, ee_hzd_cmd.stance_foot_ori_quat_0)
 
-                try:
-                    pos, ori = ee_tracker.get_pose(frame_name)
-                    
-                    if constraint_type in ["ee_pos"]:
-                        # Use position values - already batched
-                        act_val = pos.clone()
-                        # Make positions relative to stance foot
-                        act_val -= stance_foot_pos
-                        # Select only specified axes
-                        axes = spec.get("axes", [0, 1, 2])
-                        act_val = act_val[:, axes]
-                        
-                        # Get linear velocity from robot body data
-                        try:
-                            act_val_vel, _ = ee_tracker.get_velocity(frame_name, ee_hzd_cmd.robot.data)
-                            # Make velocities relative to stance foot
-                            
-                            act_val_vel = act_val_vel[:, axes]
-                        except Exception as e:
-                            print(f"Warning: Could not get velocity for frame {frame_name}: {e}")
-                            act_val_vel = torch.zeros_like(act_val)
-                        
-                    elif constraint_type in ["ee_ori"]:
-                        # Use orientation values - already batched
-                        act_val = ori.clone()
-                        # Select only specified axes
-                        axes = spec.get("axes", [0, 1, 2])
-                        act_val = act_val[:, axes]
-                        
-                        # Get angular velocity from robot body data
-                        try:
-                            _, act_val_vel = ee_tracker.get_velocity(frame_name, ee_hzd_cmd.robot.data)
-                            # Make angular velocities relative to stance foot
-                          
-                            act_val_vel = act_val_vel[:, axes]
-                        except Exception as e:
-                            print(f"Warning: Could not get angular velocity for frame {frame_name}: {e}")
-                            act_val_vel = torch.zeros_like(act_val)
-                    else:
-                        # Unknown constraint type, use zeros
-                        act_val = torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device)
-                        act_val_vel = torch.zeros_like(act_val)
-                        
-                    act_values.append(act_val)
-                    act_vel_values.append(act_val_vel)
-                    
-                except Exception as e:
-                    print(f"Warning: Could not get pose for frame {frame_name}: {e}")
-                    # Add zero tensors as fallback
-                    act_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
-                    act_vel_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
-            else:
-                # Unknown constraint type, use zeros
-                print(f"Warning: Unknown constraint type '{constraint_type}'")
-                act_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
-                act_vel_values.append(torch.zeros((ee_hzd_cmd.num_envs, 3), device=ee_hzd_cmd.device))
-        
-        # Concatenate all actual values in constraint_spec order
-        if act_values:
-            y_act = torch.cat(act_values, dim=1)
-            dy_act = torch.cat(act_vel_values, dim=1)
-        else:
-            y_act = torch.zeros((ee_hzd_cmd.num_envs, 0), device=ee_hzd_cmd.device)
-            dy_act = torch.zeros((ee_hzd_cmd.num_envs, 0), device=ee_hzd_cmd.device)
+        pelvis_ori = get_euler_from_quat(ee_hzd_cmd.robot.data.root_quat_w)
+        pelvis_ori[:,2] = wrap_to_pi(pelvis_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        pelvis_omega = ee_hzd_cmd.robot.data.root_ang_vel_b
+
+
+        sw2st_foot_pos, sw2st_foot_ori,sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
+        sw2st_foot_pos = sw2st_foot_pos - stance_foot_pos
+
+        foot_lin_vel_w = ee_hzd_cmd.robot.data.body_lin_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
+        foot_ang_vel_w = ee_hzd_cmd.robot.data.body_ang_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
+
+        sw2st_foot_vel = foot_lin_vel_w[:,1-ee_hzd_cmd.stance_idx]
+        sw2st_foot_ang_vel = foot_ang_vel_w[:,1-ee_hzd_cmd.stance_idx]
+
+        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        waist_joint_pos = ee_hzd_cmd.robot.data.joint_pos[:, ee_hzd_cmd.waist_joint_idx]
+        waist_joint_vel = ee_hzd_cmd.robot.data.joint_vel[:, ee_hzd_cmd.waist_joint_idx]
+
+        #palm position
+        swing_hand_pos, swing_hand_ori,swing_hand_quat = ee_tracker.get_pose(swing_hand_frame)
+        swing_hand_vel, swing_hand_omega = ee_tracker.get_velocity(swing_hand_frame, ee_hzd_cmd.robot.data)
+
+        #stance hand position
+        stance_hand_pos, stance_hand_ori,stance_hand_quat = ee_tracker.get_pose(stance_hand_frame)
+        stance_hand_vel, stance_hand_omega = ee_tracker.get_velocity(stance_hand_frame, ee_hzd_cmd.robot.data)
+
+        swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, ee_hzd_cmd.stance_foot_ori_quat_0)
+        stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, ee_hzd_cmd.stance_foot_ori_quat_0)
+        stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        stance_hand_pos = stance_hand_pos - stance_foot_pos
+        stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_pos = swing_hand_pos - stance_foot_pos
+
+        swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ori = _transfer_to_local_frame(swing_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
+        stance_hand_ori = _transfer_to_local_frame(stance_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
+
+        #concatenate all the position values
+        y_act = torch.cat([com2stance_local,pelvis_ori,sw2st_foot_pos,sw2st_foot_ori,
+                      waist_joint_pos,
+                      swing_hand_pos,swing_hand_ori[:,2].unsqueeze(-1),stance_hand_pos,stance_hand_ori[:,2].unsqueeze(-1)], dim=-1)
+
+
+        #concatenate all the velocity values
+        dy_act = torch.cat([com_vel_local,pelvis_omega,sw2st_foot_vel_local,sw2st_foot_ang_vel_local,
+                          waist_joint_vel,
+                          swing_hand_vel_local,swing_hand_ang_vel_local[:,2].unsqueeze(-1),stance_hand_vel_local,stance_hand_ang_vel_local[:,2].unsqueeze(-1)], dim=-1)
+
+     
         
         return y_act, dy_act

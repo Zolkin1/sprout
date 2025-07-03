@@ -86,18 +86,6 @@ class G1SceneCfg(MySceneCfg):
         ],
     )
 
-    pelvis_sensor = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
-                name="pelvis_link",
-            ),
-        ],
-    )
-
 
 ##
 # Environment configuration
@@ -127,13 +115,13 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
-        self.rewards.clf_reward.params["max_clf"] = 200.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 200.0
+        self.rewards.clf_reward.params["max_clf"] = 100.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
         self.commands.base_velocity.ranges.lin_vel_x = (0.625, 0.625)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.ranges.heading = (0, 0)
         self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
         ##

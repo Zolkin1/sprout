@@ -65,7 +65,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+    resume = False
     resume_path = None
+    # resume = True
+    # resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd/g1/2025-07-02_12-04-33/model_8000.pt"
 
 
 @configclass

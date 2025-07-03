@@ -52,13 +52,19 @@ def euler_rates_to_omega(eul: torch.Tensor,
     omega = torch.einsum('...ij,...j->...i', M, eul_rates)
     return omega
 
+def get_euler_from_quat(quat):
 
+    euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
+    euler_x = wrap_to_pi(euler_x)
+    euler_y = wrap_to_pi(euler_y)
+    euler_z = wrap_to_pi(euler_z)
+    return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
 def _transfer_to_global_frame(vec, root_quat):
-    return quat_rotate(yaw_quat(root_quat), vec)
+    return quat_apply(yaw_quat(root_quat), vec)
 
 def _transfer_to_local_frame(vec, root_quat):
-    return quat_rotate(yaw_quat(quat_inv(root_quat)), vec)  
+    return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
 class HLIPCommandTerm(CommandTerm):
     def __init__(self, cfg: "HLIPCommandCfg", env):
@@ -175,7 +181,7 @@ class HLIPCommandTerm(CommandTerm):
             foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
             self.stance_foot_pos_0 = foot_pos_w[:, new_stance_idx, :]
             self.stance_foot_ori_quat_0 = foot_ori_w[:,new_stance_idx,:]
-            self.stance_foot_ori_0 = self.get_euler_from_quat(foot_ori_w[:,new_stance_idx,:])
+            self.stance_foot_ori_0 = get_euler_from_quat(foot_ori_w[:,new_stance_idx,:])
             self.swing2stance_foot_pos_0 = _transfer_to_local_frame(
                 foot_pos_w[:, self.swing_idx, :]-self.stance_foot_pos_0, self.stance_foot_ori_quat_0
             )
@@ -402,13 +408,7 @@ class HLIPCommandTerm(CommandTerm):
 
 
 
-    def get_euler_from_quat(self, quat):
 
-        euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
-        euler_x = wrap_to_pi(euler_x)
-        euler_y = wrap_to_pi(euler_y)
-        euler_z = wrap_to_pi(euler_z)
-        return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
     def get_actual_state(self):
         """Populate actual state and its time derivative in the robot's local (yaw-aligned) frame."""
@@ -423,7 +423,7 @@ class HLIPCommandTerm(CommandTerm):
 
         # Store raw foot positions
         self.stance_foot_pos = foot_pos_w[:, self.stance_idx, :]
-        self.stance_foot_ori = self.get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
+        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
 
         # Convert foot positions to the robot's yaw-aligned local frame
         # stance_pos_local = _transfer_to_local_frame(
@@ -441,10 +441,10 @@ class HLIPCommandTerm(CommandTerm):
 
 
         # Pelvis orientation (Euler XYZ)
-        pelvis_ori = self.get_euler_from_quat(root_quat)
+        pelvis_ori = get_euler_from_quat(root_quat)
 
         # Foot orientations (Euler XYZ)
-        swing_foot_ori = self.get_euler_from_quat(foot_ori_w[:,self.swing_idx,:])
+        swing_foot_ori = get_euler_from_quat(foot_ori_w[:,self.swing_idx,:])
 
         # 2. Velocities (world frame)
         com_vel_w = data.root_com_vel_w[:,0:3]

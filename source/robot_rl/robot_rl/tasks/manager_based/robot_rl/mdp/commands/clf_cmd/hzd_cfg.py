@@ -81,19 +81,19 @@ HZD_EE_Q_weights = [
     500.0,    30.0,    # pelvis_yaw pos, vel
     2500.0, 125.0,  # swing_x pos, vel
     1700.0,  125.0,  # swing_y pos, vel
-    4000.0, 100.0,   # swing_z pos, vel
+    6000.0, 120.0,   # swing_z pos, vel
     30.0,    1.0,    # swing_ori_roll pos, vel
-    10.0,    1.0,    # swing_ori_pitch pos, vel
+    200.0,    1.0,    # swing_ori_pitch pos, vel
     400.0,    10.0,    # swing_ori_yaw pos, vel
-    500.0,    10.0,    # waist_yaw pos, vel
-    40.0,1.0, #swing hand palm pos x
-    40.0,1.0, #swing hand palm pos y
-    100,1.0, #swing hand palm pos z
-    100,1.0, #swing hand palm yaw
-    50,1.0, #stance hand palm pos x
-    50,1.0, #stance hand palm pos y
-    30.0,1.0, #stance hand palm pos z
-    30.0,1.0, #stance hand palm yaw
+    300.0,    10.0,    # waist_yaw pos, vel
+    80.0,1.0, #swing hand palm pos x
+    80.0,1.0, #swing hand palm pos y
+    80.0,1.0, #swing hand palm pos z
+    80.0,1.0, #swing hand palm yaw
+    80.0,1.0, #stance hand palm pos x
+    80.0,1.0, #stance hand palm pos y
+    80.0,1.0, #stance hand palm pos z
+    80.0,1.0, #stance hand palm yaw
 ]
 
 
