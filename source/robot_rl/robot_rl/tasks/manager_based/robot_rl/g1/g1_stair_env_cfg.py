@@ -14,7 +14,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import Te
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-                                                                    
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1SceneCfg
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG
 
@@ -62,6 +62,7 @@ class G1StairsTerminationCfg(TerminationsCfg):
 @configclass
 class G1StairEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
+    scene: G1SceneCfg = G1SceneCfg()
     commands: G1StairCommandsCfg = G1StairCommandsCfg()
     rewards: G1StairRewardsCfg = G1StairRewardsCfg()
     terminations: G1StairsTerminationCfg = G1StairsTerminationCfg()
