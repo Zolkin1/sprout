@@ -338,9 +338,12 @@ class EndEffectorTrajectoryConfig:
         pelvis_omega = ee_hzd_cmd.robot.data.root_ang_vel_b
 
 
-        sw2st_foot_pos, sw2st_foot_ori,sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
-        sw2st_foot_pos = sw2st_foot_pos - stance_foot_pos
-
+        swing_foot_pos, swing_foot_ori,sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
+        sw2st_foot_pos = swing_foot_pos - stance_foot_pos
+        
+        sw2st_foot_ori = swing_foot_ori 
+        sw2st_foot_ori[:,2] = wrap_to_pi(swing_foot_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+   
         foot_lin_vel_w = ee_hzd_cmd.robot.data.body_lin_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
         foot_ang_vel_w = ee_hzd_cmd.robot.data.body_ang_vel_w[:, ee_hzd_cmd.feet_bodies_idx, :]
 
@@ -371,8 +374,8 @@ class EndEffectorTrajectoryConfig:
         swing_hand_pos = swing_hand_pos - stance_foot_pos
 
         swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, ee_hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ori = _transfer_to_local_frame(swing_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_ori = _transfer_to_local_frame(stance_hand_ori, ee_hzd_cmd.stance_foot_ori_quat_0)
+        swing_hand_ori[:,2] = wrap_to_pi(swing_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
+        stance_hand_ori[:,2] = wrap_to_pi(stance_hand_ori[:,2] - ee_hzd_cmd.stance_foot_ori_0[:,2])
 
         #concatenate all the position values
         y_act = torch.cat([com2stance_local,pelvis_ori,sw2st_foot_pos,sw2st_foot_ori,
