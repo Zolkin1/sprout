@@ -42,7 +42,8 @@ def log_row_to_csv(filename, data):
 
 
 class Simulation:
-    def __init__(self, policy, robot: Robot, log: bool = False, log_dir: str = None, use_height_sensor: bool = False):
+    def __init__(self, policy, robot: Robot, log: bool = False, log_dir: str = None, use_height_sensor: bool = False,
+                 tracking_body_name: str = ""):
         """Initialize the simulation.
         
         Args:
@@ -63,7 +64,10 @@ class Simulation:
         self.sim_steps_per_policy_update = int(policy.dt / robot.mj_model.opt.timestep)
         self.sim_loop_rate = self.sim_steps_per_policy_update * robot.mj_model.opt.timestep
         self.viewer_rate = math.ceil((1 / 50) / robot.mj_model.opt.timestep)
-        
+
+        # Tracking body
+        self.tracking_body_name = tracking_body_name
+
         # Setup logging if enabled
         if self.log:
             self._setup_logging()
@@ -116,6 +120,12 @@ class Simulation:
               f"Height sensor enabled: {self.use_height_sensor}\n")
 
         with mujoco.viewer.launch_passive(self.robot.mj_model, self.robot.mj_data) as viewer:
+            if self.tracking_body_name != "":
+                viewer.cam.trackbodyid = mujoco.mj_name2id(self.robot.mj_model, mujoco.mjtObj.mjOBJ_BODY,
+                                                         self.tracking_body_name)
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                print(f"Camera tracking body: {self.tracking_body_name}")
+
             # Setup height sensor visualization if enabled
             if self.use_height_sensor:
                 grid_size = (1.5,1.5)
@@ -152,13 +162,13 @@ class Simulation:
                 for i in range(self.sim_steps_per_policy_update):
                     # Update scene
                     scene = mujoco.MjvScene(self.robot.mj_model, maxgeom=1000)
-                    cam = mujoco.MjvCamera()
+                    # cam = mujoco.MjvCamera()
                     opt = mujoco.MjvOption()
                     mujoco.mjv_updateScene(
-                        self.robot.mj_model, self.robot.mj_data, opt, None, cam,
+                        self.robot.mj_model, self.robot.mj_data, opt, None, viewer.cam,
                         mujoco.mjtCatBit.mjCAT_ALL, scene
                     )
-                    
+
                     # Update height sensor visualization if enabled
                     if self.use_height_sensor:
                         height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays)
@@ -176,8 +186,8 @@ class Simulation:
                     if i % self.viewer_rate == 0:
                         if self.log:
                             log_data = self.robot.get_log_data(self.policy, obs, action)
-                            if any(abs(v) > 1e-6 for v in log_data[-3:]):  # Only print if commanded velocity is non-zero
-                                print(f"Commanded velocity: {log_data[-3:]}")
+                            # if any(abs(v) > 1e-6 for v in log_data[-3:]):  # Only print if commanded velocity is non-zero
+                                # print(f"Commanded velocity: {log_data[-3:]}")
                             log_row_to_csv(self.log_file, log_data)
                         viewer.sync()
 
