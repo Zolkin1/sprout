@@ -154,7 +154,7 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-flat-hzd-no-domain-randomization",
+        id="G1-flat-hzd-no-dr",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={

@@ -147,11 +147,12 @@ class G1NoDomainRandomizationEnvCfg(G1FlatHZDEnvCfg):
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
         self.events.base_com = None
-        self.rewards.clf_reward.params["max_clf"] = 5.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 5.0
-        self.curriculum.clf_curriculum.params["min_val"] = 2.0
+        self.rewards.clf_reward.params["max_clf"] = 50.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
+        self.curriculum.clf_curriculum.params["min_val"] = 5.0
         self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.scene.terrain.terrain_type = "plane"
         self.curriculum.terrain_levels = None
 
 
