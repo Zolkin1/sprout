@@ -23,15 +23,6 @@ ROUGH_FOR_FLAT_HZD_CFG = TerrainGeneratorCfg(
             proportion=1.0, grid_width=0.45, grid_height_range=(0.0, 0.04), platform_width=2.0
         ),
 
-        # "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-        #     noise_range=(0.0, 0.03), 
-        #     noise_step=0.001,
-        #     proportion=0.5,
-        #     horizontal_scale=0.01,
-        # ),
-        # "flat_terrain": terrain_gen.MeshPlaneTerrainCfg(
-        #     proportion=0.4,
-        # ),
     },
 )
 

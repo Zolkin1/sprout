@@ -1,81 +1,78 @@
 import numpy as np
-import yaml
 import torch
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import _ncr
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
+from .base_traj import BaseTrajectoryConfig
+
 
 def get_euler_from_quat(quat):
+    euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
+    euler_x = wrap_to_pi(euler_x)
+    euler_y = wrap_to_pi(euler_y)
+    euler_z = wrap_to_pi(euler_z)
+    return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
-     euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
-     euler_x = wrap_to_pi(euler_x)
-     euler_y = wrap_to_pi(euler_y)
-     euler_z = wrap_to_pi(euler_z)
-     return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
 def build_relabel_matrix() -> np.ndarray:
-        """
-        Build a relabel (mirror symmetry) matrix R for the G1 humanoid model.
-        Applies left/right swaps and sign flips to roll/yaw joints.
+    """
+    Build a relabel (mirror symmetry) matrix R for the G1 humanoid model.
+    Applies left/right swaps and sign flips to roll/yaw joints.
 
-        Returns
-        -------
-        R : (nq, nq) numpy.ndarray
-            Orthogonal permutation matrix such that q_mirrored = R @ q
-        """
+    Returns
+    -------
+    R : (nq, nq) numpy.ndarray
+        Orthogonal permutation matrix such that q_mirrored = R @ q
+    """
 
-        R = np.eye(21)
-        # ----------------------------
-        # LEG relabeling
-        # ----------------------------
-        # Joint ordering in legs (6 DOF each)
-        # [hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll]
-        left_leg = np.array([0, 1, 2, 3, 4, 5])
-        right_leg = np.array([6, 7, 8, 9, 10, 11])
+    R = np.eye(21)
+    # ----------------------------
+    # LEG relabeling
+    # ----------------------------
+    # Joint ordering in legs (6 DOF each)
+    # [hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll]
+    left_leg = np.array([0, 1, 2, 3, 4, 5])
+    right_leg = np.array([6, 7, 8, 9, 10, 11])
 
-        tmp = R[left_leg, :].copy()
-        R[left_leg, :] = R[right_leg, :]
-        R[right_leg, :] = tmp
+    tmp = R[left_leg, :].copy()
+    R[left_leg, :] = R[right_leg, :]
+    R[right_leg, :] = tmp
 
-        # Sign flips: hip_roll, hip_yaw, ankle_roll
-        # left and right roll/yaw
-        flip_leg = np.array([1, 2, 5, 7, 8, 11])
-        R[flip_leg, :] *= -1
+    # Sign flips: hip_roll, hip_yaw, ankle_roll
+    # left and right roll/yaw
+    flip_leg = np.array([1, 2, 5, 7, 8, 11])
+    R[flip_leg, :] *= -1
 
-        # flip waist yaw
-        R[12, :] *= -1
+    # flip waist yaw
+    R[12, :] *= -1
 
-        # ----------------------------
-        # ARM relabeling
-        # ----------------------------
-        # Starts after 12 leg joints + waist_yaw (1)
-        arm_offset =  12 + 1
-        left_arm = arm_offset + np.array([0, 1, 2, 3])
-        right_arm = arm_offset + np.array([4, 5, 6, 7])
+    # ----------------------------
+    # ARM relabeling
+    # ----------------------------
+    # Starts after 12 leg joints + waist_yaw (1)
+    arm_offset = 12 + 1
+    left_arm = arm_offset + np.array([0, 1, 2, 3])
+    right_arm = arm_offset + np.array([4, 5, 6, 7])
 
-        tmp = R[left_arm, :].copy()
-        R[left_arm, :] = R[right_arm, :]
-        R[right_arm, :] = tmp
+    tmp = R[left_arm, :].copy()
+    R[left_arm, :] = R[right_arm, :]
+    R[right_arm, :] = tmp
 
-        # Sign flips: shoulder_roll, shoulder_yaw
-        flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
-        R[flip_arm, :] *= -1
+    # Sign flips: shoulder_roll, shoulder_yaw
+    flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
+    R[flip_arm, :] *= -1
 
-        return R
+    return R
 
-class JointTrajectoryConfig:
+
+class JointTrajectoryConfig(BaseTrajectoryConfig):
     def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_jt.yaml"):
         self.joint_trajectories = {}
         self.base_trajectories = {}
         self.isaac_joint_indices = []  # Store Isaac indices in YAML order
-        self.yaml_path = yaml_path
-        self.load_from_yaml()
+        super().__init__(yaml_path)
 
-    
-    def load_from_yaml(self):
-        """Load bezier coefficients from YAML file and find corresponding Isaac joint indices."""
-        with open(self.yaml_path, 'r') as file:
-            data = yaml.safe_load(file)
-        
+    def _load_specific_data(self, data):
+        """Load joint-specific data from YAML."""
         # Extract bezier coefficients and joint order
         bezier_coeffs = data['bezier_coeffs']
         yaml_joint_order = data['joint_order']
@@ -90,18 +87,15 @@ class JointTrajectoryConfig:
         
         self.bezier_coeffs = bezier_coeffs_reshaped
         self.joint_order = yaml_joint_order
+        
         # Store coefficients in YAML order
         for i, joint_name in enumerate(yaml_joint_order):
             self.joint_trajectories[joint_name] = bezier_coeffs_reshaped[i].tolist()
-        
-        
-        # Store step period
-        self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
-            
+
     def remap_jt_symmetric(self):
         """Create symmetric mapping for left/right joints."""
         symmetric_mapping = {}
-        #grab R from g1_r
+        # grab R from g1_r
         R = build_relabel_matrix()
         traj = R @ self.bezier_coeffs
         
@@ -110,18 +104,15 @@ class JointTrajectoryConfig:
             symmetric_mapping[joint_name] = traj[i].tolist()
         
         return symmetric_mapping
-    
 
-    def reorder_and_remap_jt(self,cfg,robot,device):
+    def reorder_and_remap(self, cfg, robot, device):
+        """Reorder and remap joint coefficients for left/right stance."""
         right_jt_coeffs = self.joint_trajectories
-    
         left_jt_coeffs = self.remap_jt_symmetric()
 
+        left_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg + 1), device=device)
+        right_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg + 1), device=device)
 
-        left_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg+1), device=device)
-        right_coeffs = torch.zeros((cfg.num_outputs, cfg.bez_deg+1), device=device)
-
-        
         for key in self.joint_trajectories.keys():
             joint_idx = robot.find_joints(key)[0]
             right_coeffs[joint_idx] = torch.tensor(right_jt_coeffs[key], device=device)
@@ -129,60 +120,53 @@ class JointTrajectoryConfig:
 
         self.right_coeffs = right_coeffs
         self.left_coeffs = left_coeffs
-        return 
 
-    def get_ref_traj(self,jt_hzd_cmf):
-        base_velocity = jt_hzd_cmf.env.command_manager.get_command("base_velocity")  # (N,2)
-        N = base_velocity.shape[0]
-        T = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)
-
-        if jt_hzd_cmf.stance_idx == 1:
-            ctrl_points = self.right_coeffs
-        else:
-            ctrl_points = self.left_coeffs
-     
-        phase_var_tensor = torch.full((N,), jt_hzd_cmf.phase_var, device=jt_hzd_cmf.device)
-        des_jt_pos = bezier_deg(
-            0, phase_var_tensor, T, ctrl_points, torch.tensor(jt_hzd_cmf.cfg.bez_deg, device=jt_hzd_cmf.device)
-        )
-        
-        des_jt_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, jt_hzd_cmf.cfg.bez_deg)
-
+    def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
+        """Apply joint-specific stance modifications."""
         yaw_offset = base_velocity[:, 2]
-        des_jt_pos[:, jt_hzd_cmf.hip_yaw_idx[jt_hzd_cmf.stance_idx]] += yaw_offset
+        des_pos[:, hzd_cmd.hip_yaw_idx[1-hzd_cmd.stance_idx]] += yaw_offset
 
-        return des_jt_pos, des_jt_vel
-
-
-    def get_stance_foot_pose(self,jt_hzd_cmf):
-        data = jt_hzd_cmf.robot.data
-          # 1. Foot positions and orientations (world frame)
-        foot_pos_w = data.body_pos_w[:, jt_hzd_cmf.feet_bodies_idx, :]
-        foot_ori_w = data.body_quat_w[:, jt_hzd_cmf.feet_bodies_idx, :]
-
-        # Store raw foot positions
-        foot_lin_vel_w = data.body_lin_vel_w[:, jt_hzd_cmf.feet_bodies_idx, :]
-        foot_ang_vel_w = data.body_ang_vel_w[:, jt_hzd_cmf.feet_bodies_idx, :]
-        jt_hzd_cmf.stance_foot_pos = foot_pos_w[:, jt_hzd_cmf.stance_idx, :]
-        jt_hzd_cmf.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, jt_hzd_cmf.stance_idx, :])
-        jt_hzd_cmf.stance_foot_vel = foot_lin_vel_w[:, jt_hzd_cmf.stance_idx, :]
-        jt_hzd_cmf.stance_foot_ang_vel = foot_ang_vel_w[:, jt_hzd_cmf.stance_idx, :]  
-
-
-    def get_actul_traj(self,jt_hzd_cmf):
-        data = jt_hzd_cmf.robot.data
-
+    def get_actual_traj(self, hzd_cmd):
+        """Get actual joint trajectory from robot data."""
+        data = hzd_cmd.robot.data
         jt_pos = data.joint_pos
         jt_vel = data.joint_vel
-        # 4. Assemble state vectors
         return jt_pos, jt_vel
-        
+
+    def get_stance_foot_pose(self, hzd_cmd):
+        """Get stance foot pose data."""
+        data = hzd_cmd.robot.data
+        # 1. Foot positions and orientations (world frame)
+        foot_pos_w = data.body_pos_w[:, hzd_cmd.feet_bodies_idx, :]
+        foot_ori_w = data.body_quat_w[:, hzd_cmd.feet_bodies_idx, :]
+
+        # Store raw foot positions
+        foot_lin_vel_w = data.body_lin_vel_w[:, hzd_cmd.feet_bodies_idx, :]
+        foot_ang_vel_w = data.body_ang_vel_w[:, hzd_cmd.feet_bodies_idx, :]
+        hzd_cmd.stance_foot_pos = foot_pos_w[:, hzd_cmd.stance_idx, :]
+        hzd_cmd.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, hzd_cmd.stance_idx, :])
+        hzd_cmd.stance_foot_vel = foot_lin_vel_w[:, hzd_cmd.stance_idx, :]
+        hzd_cmd.stance_foot_ang_vel = foot_ang_vel_w[:, hzd_cmd.stance_idx, :]
+
+    # Legacy method for backward compatibility
+    def reorder_and_remap_jt(self, cfg, robot, device):
+        """Legacy method - now calls reorder_and_remap."""
+        self.reorder_and_remap(cfg, robot, device)
+
+    def get_ref_traj(self, jt_hzd_cmd):
+        """Legacy method - now calls parent get_ref_traj."""
+        return super().get_ref_traj(jt_hzd_cmd)
+
+    def get_actul_traj(self, jt_hzd_cmd):
+        """Legacy method - now calls get_actual_traj."""
+        return self.get_actual_traj(jt_hzd_cmd)
+
 
 def bezier_deg(
     order: int,
-    tau: torch.Tensor,            # [batch], each in [0,1]
-    step_dur: torch.Tensor,       # [batch]
-    control_points: torch.Tensor, # [n_dim, degree+1]
+    tau: torch.Tensor,  # [batch], each in [0,1]
+    step_dur: torch.Tensor,  # [batch]
+    control_points: torch.Tensor,  # [n_dim, degree+1]
     degree: int,
 ) -> torch.Tensor:
     """
@@ -204,12 +188,10 @@ def bezier_deg(
       If order==1: a tensor of shape [batch, n_dim], the time‐derivative at each τ[i].
     """
     # 1) Clamp tau into [0,1]
-    tau = torch.clamp(tau, 0.0, 1.0)         # [batch]
-    batch = tau.size(0)
+    tau = torch.clamp(tau, 0.0, 1.0)  # [batch]
 
     # 2) Extract n_dim from control_points
     #    control_points: [n_dim, degree+1]
-    n_dim = control_points.shape[0]
 
     if order == 1:
         # ─── DERIVATIVE CASE ────────────────────────────────────────────────────
@@ -259,7 +241,6 @@ def bezier_deg(
 
         # 8) Finally divide by step_dur:
         return Bdot / step_dur.unsqueeze(1)  # [batch, n_dim]
-
 
     else:
         # ─── POSITION CASE ────────────────────────────────────────────────────────
