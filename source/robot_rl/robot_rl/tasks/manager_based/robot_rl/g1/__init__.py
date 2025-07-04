@@ -136,7 +136,7 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDStairEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
@@ -147,7 +147,7 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDEnvPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDStairEnvPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },

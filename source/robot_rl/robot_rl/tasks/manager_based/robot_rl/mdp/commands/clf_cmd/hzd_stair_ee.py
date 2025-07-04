@@ -1,9 +1,9 @@
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_base import HZDStairBaseCommandTerm
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import StairEEtrajConfig, EndEffectorTracker, bezier_deg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import StairEEtrajConfig, EndEffectorTracker
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import euler_rates_to_omega
-
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:

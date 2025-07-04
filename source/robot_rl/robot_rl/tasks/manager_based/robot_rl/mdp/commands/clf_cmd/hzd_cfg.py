@@ -114,6 +114,7 @@ class EndEffectorTrajectoryHZDCommandCfg(CommandTermCfg):
     Configuration for the EndEffectorTrajectoryHZDCommandTerm.
     """
     class_type: type = EndEffectorTrajectoryHZDCommandTerm
+    yaml_path: str = "source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"
     asset_name: str = "robot"
     foot_body_name: str = ".*_ankle_roll_link"
     num_outputs: int = 21

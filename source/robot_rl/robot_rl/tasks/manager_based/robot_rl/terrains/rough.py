@@ -77,6 +77,37 @@ ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
         ),
     },
 )
+
+UP_STAIR_CFG = STAIR_CFG = TerrainGeneratorCfg(
+    curriculum=True,
+    size=(6.0, 6.0),
+    border_width=5.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        # "pyramid_stairs": terrain_gen.MeshPyramidStairsTerrainCfg(
+        #     proportion=0.2,
+        #     step_height_range=(0.0, 0.15),
+        #     step_width=0.25,
+        #     platform_width=0.6,
+        #     border_width=0.0,
+        #     holes=False,
+        # ),
+        "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.2,
+            step_height_range=(0.15, 0.15),
+            step_width=0.25,
+            platform_width=0.6,
+            border_width=0.0,
+            holes=False,
+        ),
+    },
+)
+
 """Rough terrains configuration."""
 
 STAIR_CFG = TerrainGeneratorCfg(

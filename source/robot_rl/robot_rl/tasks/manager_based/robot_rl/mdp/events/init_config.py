@@ -22,7 +22,8 @@ def reset_init_config(
     # replicate the init config so the shape is env_ids x dof 
     cmd = env.command_manager.get_term(command_name)
     num_env = len(env_ids)
-    base_pos = cmd.init_root_state.unsqueeze(0).expand(num_env, -1)
+    base_pos = cmd.init_root_state.unsqueeze(0).expand(num_env, -1).clone()
+    base_pos[:,0:3] += env.scene.env_origins[env_ids]
     base_vel = cmd.init_root_vel.unsqueeze(0).expand(num_env, -1)
     joint_pos = cmd.init_joint_pos.unsqueeze(0).expand(num_env, -1)
     joint_vel = cmd.init_joint_vel.unsqueeze(0).expand(num_env, -1)

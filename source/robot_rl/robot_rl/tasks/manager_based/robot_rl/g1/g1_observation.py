@@ -26,6 +26,10 @@ class G1RoughLipObservationsCfg():
         sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
         cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
 
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
     @configclass
     class CriticCfg(ObsGroup):
         """Observations for critic group."""
@@ -105,6 +109,10 @@ class G1StairObservationsCfg:
             func=mdp.step_duration,
             params={"command_name": "hlip_ref"},
         )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
   
     @configclass
     class CriticCfg(ObsGroup):

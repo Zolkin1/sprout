@@ -179,8 +179,17 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         super().__init__(cfg, env)
         
         # Load end effector trajectory config from YAML
-        self.ee_config = EndEffectorTrajectoryConfig()
+        self.ee_config = EndEffectorTrajectoryConfig(yaml_path=cfg.yaml_path)
         
+
+        self.init_root_state = torch.tensor(self.ee_config.init_root_state, dtype=torch.float32,device=self.device)
+
+
+        self.init_root_vel = torch.tensor(self.ee_config.init_root_vel, dtype=torch.float32,device=self.device)
+        
+
+        #nered to reorder the joint based on joitn order
+
         # Initialize end effector tracker
         self.ee_tracker = EndEffectorTracker(
             self.ee_config.constraint_specs, 
@@ -195,12 +204,25 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
             [9,10,11],
         ]
 
-        # new_joint_idx = []
-        # for joint_idx in self.ee_config.constraint_specs[-1]['indices']:
-        #     joint_name = self.ee_config.joint_order[joint_idx]
-        #     new_joint_idx.extend(self.robot.find_joints(joint_name)[0])
-        # self.joint_idx = new_joint_idx
+        num_jt = len(self.ee_config.joint_order)
+        init_joint_pos = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
+        init_joint_vel = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
+        for i in range(num_jt):
+            joint_name = self.ee_config.joint_order[i]
+            new_joint_idx = self.robot.find_joints(joint_name)[0]
+            init_joint_pos[new_joint_idx] = self.ee_config.init_joint_pos[i]
+            init_joint_vel[new_joint_idx] = self.ee_config.init_joint_vel[i]
         
+        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import build_relabel_matrix
+        R = build_relabel_matrix()
+        init_joint_pos = R @ init_joint_pos
+        init_joint_vel = R @ init_joint_vel
+        self.init_joint_pos = init_joint_pos
+        self.init_joint_vel = init_joint_vel
+
+        self.tp = torch.zeros((self.num_envs), device=self.device)
+
+        self.T = torch.full((self.num_envs,), self.ee_config.T, device=self.device)
         
         # Reorder and remap end effector coefficients
         self.ee_config.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
@@ -225,6 +247,7 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         act_pos, act_vel = self.ee_config.get_actual_traj(self)
         self.y_act = act_pos
         self.dy_act = act_vel
+        # import pdb; pdb.set_trace()
 
     def _update_metrics(self):
         """Update metrics specific to end effector trajectory tracking."""
@@ -280,6 +303,7 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
             else:
                 self.phase_var = 2 * tp - 1
             self.cur_swing_time = self.phase_var * Tswing
+            self.tp = torch.full((self.num_envs,), tp, device=self.device)
 
 def create_hzd_command_term(cfg, env):
     """

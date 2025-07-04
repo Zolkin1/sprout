@@ -16,7 +16,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1SceneCfg
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipRewards
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG
+from robot_rl.tasks.manager_based.robot_rl.terrains.rough import STAIR_CFG, UP_STAIR_CFG
 
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
@@ -31,6 +31,7 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObser
 # from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HZDStairCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_cfg import HZDStairEECommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import EndEffectorTrajectoryHZDCommandCfg
 @configclass
 class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
@@ -106,15 +107,10 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
         # self.events.push_robot = None
         self.events.push_robot.params["velocity_range"] = {"x": (-1, 1.0), "y": (-1, 1.0), "roll": (-0.4, 0.4),
                                                            "pitch": (-0.4, 0.4), "yaw": (-0.4, 0.4)}
-        # self.events.push_robot.params["velocity_range"] = {"x": (-0, 0), "y": (-0, 0), "roll": (-0.0, 0.0),
-        #                                                    "pitch": (-0., 0.), "yaw": (-0.0, 0.0)}
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
-        # self.events.randomize_ground_contact_friction.params["static_friction_range"] = (0.1, 1.25)
-        # self.events.randomize_ground_contact_friction.params["dynamic_friction_range"] = (0.1, 1.25)
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
-        # self.events.base_external_force_torque.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.reset_base.params = {
             
             "pose_range": {"x": (0.0,0.0), "y": (0.0,0.0), "yaw": (0,0)},
@@ -179,9 +175,11 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
 class G1HZD_StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     # hzd_ref = HZDStairCommandCfg()
-    hzd_ref = HZDStairEECommandCfg()
+    # hzd_ref = HZDStairEECommandCfg()
+    hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
+    #TODO cha
 @configclass
-class G1HZDEnvCfg(G1StairEnvCfg):
+class G1HZDStairEnvCfg(G1StairEnvCfg):
     commands: G1HZD_StairCommandsCfg = G1HZD_StairCommandsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
     def __post_init__(self):
@@ -219,29 +217,37 @@ class G1HZDEnvCfg(G1StairEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
-        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
-        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.0,0.0)
-        self.scene.terrain.terrain_generator.sub_terrains["flat"].step_height_range = (0.0,0.0)
+        self.scene.terrain.terrain_generator = UP_STAIR_CFG
 
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
+        self.events.base_external_force_torque = None
         self.events.add_base_mass = None
         self.events.base_com = None
 
-        
+        self.events.reset_base = None
+        self.events.reset_robot_joints = None
+
+        self.events.reset_init_config = EventTerm(
+            func=mdp.reset_init_config,
+            params={"command_name": "hzd_ref"},
+            mode="reset",
+        )
+
+        self.commands.hzd_ref.yaml_path = "source/robot_rl/robot_rl/assets/robots/stair_config_solution_ee.yaml"
         clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1500, "min_val": 20.0})
         self.curriculum.clf_curriculum = clf_curriculum
 
 
 @configclass
-class G1HZDEnvPlay(G1HZDEnvCfg):
+class G1HZDStairEnvPlay(G1HZDStairEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
-        self.events.reset_base.params["pose_range"] = {"x": (0,0), "y": (0,0), "yaw": (0,0)}
+        # self.events.reset_base.params["pose_range"] = {"x": (0,0), "y": (0,0), "yaw": (0,0)
         # self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
-        self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05,0.05)
+        # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05,0.05)
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 2
 

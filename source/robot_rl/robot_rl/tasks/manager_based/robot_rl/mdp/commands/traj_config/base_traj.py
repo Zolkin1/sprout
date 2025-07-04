@@ -51,11 +51,6 @@ class BaseTrajectoryConfig(ABC):
         self.init_joint_pos = init_config[7:]
         self.init_joint_vel = init_vel[6:]
 
-        self.init_root_state = torch.tensor(self.init_root_state, dtype=torch.float32)
-        self.init_root_vel = torch.tensor(self.init_root_vel, dtype=torch.float32)
-        self.init_joint_pos = torch.tensor(self.init_joint_pos, dtype=torch.float32)
-        self.init_joint_vel = torch.tensor(self.init_joint_vel, dtype=torch.float32)
-
         # Load subclass-specific data
         self._load_specific_data(data)
     
