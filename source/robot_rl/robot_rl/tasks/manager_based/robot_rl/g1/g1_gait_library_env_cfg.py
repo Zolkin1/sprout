@@ -9,8 +9,8 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
         gait_library_path="source/robot_rl/robot_rl/assets/robots/gait_library",
-        config_name="single_support",
-        gait_velocity_ranges=(0.0, 0.5, 0.1)
+        config_name="single_support_config",
+        gait_velocity_ranges=(-0.5, 0.5, 0.1)
     )
 
 
@@ -24,7 +24,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         super().__post_init__()
         
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 2.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.55, 0.55)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.ranges.heading = (0, 0)
@@ -40,4 +40,4 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
-        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref" 
+        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"

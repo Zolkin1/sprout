@@ -125,41 +125,37 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         self._preload_gaits()
     
     def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Dict[str, tuple]:
-        """Generate gait velocity ranges from discretization parameters."""
-        gait_ranges = {}
-        
-        # Generate velocity points
-        velocities = []
-        current_vel = min_vel
-        while current_vel <= max_vel:
-            velocities.append(current_vel)
-            current_vel += step
-        
-        # Create ranges for each velocity point
-        for i, vel in enumerate(velocities):
-            if i == 0:
-                # First gait: from 0 to midpoint with next gait
-                next_vel = velocities[i + 1] if i + 1 < len(velocities) else vel + step
-                min_range = 0.0
-                max_range = (vel + next_vel) / 2
-            elif i == len(velocities) - 1:
-                # Last gait: from midpoint with previous gait to infinity
-                prev_vel = velocities[i - 1]
-                min_range = (prev_vel + vel) / 2
-                max_range = vel + step  # Add some buffer
-            else:
-                # Middle gaits: from midpoint with previous to midpoint with next
-                prev_vel = velocities[i - 1]
-                next_vel = velocities[i + 1]
-                min_range = (prev_vel + vel) / 2
-                max_range = (vel + next_vel) / 2
-            
-            # Create gait name based on speed in cm/s
-            speed_cms = int(vel * 100)
-            gait_name = f"gait_{speed_cms}cms"
-            gait_ranges[gait_name] = (min_range, max_range)
-        
-        return gait_ranges
+          """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
+          if step <= 0:
+               raise ValueError("Step must be positive")
+
+          # Create inclusive list of center velocities and sort them
+          velocities = torch.arange(min_vel, max_vel + step * 0.5, step).tolist()
+          velocities = sorted(velocities)
+
+          gait_ranges = {}
+          for i, vel in enumerate(velocities):
+               if i == 0:
+                    next_vel = velocities[i + 1]
+                    min_range = vel - step / 2
+                    max_range = (vel + next_vel) / 2
+               elif i == len(velocities) - 1:
+                    prev_vel = velocities[i - 1]
+                    min_range = (prev_vel + vel) / 2
+                    max_range = vel + step / 2
+               else:
+                    prev_vel = velocities[i - 1]
+                    next_vel = velocities[i + 1]
+                    min_range = (prev_vel + vel) / 2
+                    max_range = (vel + next_vel) / 2
+
+               # Use velocity in cm/s as gait name
+               speed_cms = int(round(vel * 100))
+               gait_name = f"gait_{speed_cms}cms"
+               gait_ranges[gait_name] = (min_range, max_range)
+
+          return gait_ranges
+
     
     def _get_gait_path(self, gait_name: str) -> str:
         """Get the full path to a gait YAML file based on naming convention."""
@@ -196,7 +192,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
             return available_gaits
         
         # Pattern to match: {config_name}_solution_{speed}.yaml
-        pattern = re.compile(f"{self.config_name}_solution_(\\d+)\\.yaml")
+        pattern = re.compile(f"{self.config_name}_solution_(-?\\d+)\\.yaml")
         
         for yaml_file in self.gait_library_path.glob("*.yaml"):
             match = pattern.match(yaml_file.name)
@@ -217,8 +213,6 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
             if gait_name not in self._gait_cache:
                 self._load_gait_config(gait_name, speed_cms)
         
-        # Precompute control points for all velocities
-        self._precompute_control_points()
     
     def _precompute_control_points(self):
         """Precompute control points for all velocities in batched tensors."""
@@ -230,17 +224,17 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         first_config = self._gait_cache[first_gait]
         
         # Get dimensions
-        jt_dim = first_config.left_coeffs.shape[0]  # num_outputs
+        output_dim = first_config.left_coeffs.shape[0]  # num_outputs
         degree_plus_1 = first_config.left_coeffs.shape[1]  # degree + 1
         device = first_config.left_coeffs.device
         dtype = first_config.left_coeffs.dtype
         
         # Initialize batched control point tensors
         self.left_coeffs_batched = torch.zeros(
-            (num_vel, jt_dim, degree_plus_1), device=device, dtype=dtype
+            (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
         )
         self.right_coeffs_batched = torch.zeros(
-            (num_vel, jt_dim, degree_plus_1), device=device, dtype=dtype
+            (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
         )
         
         # Fill the batched tensors
@@ -274,35 +268,31 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         return str(self.gait_library_path / filename)
     
     def select_gaits_by_velocity(self, desired_velocities: torch.Tensor) -> torch.Tensor:
-        """
-        Select appropriate gaits based on desired velocities.
-        
-        Args:
-            desired_velocities: Tensor of shape (num_envs, 2) with [lin_vel_x, lin_vel_y]
-            
-        Returns:
-            Tensor of gait indices for each environment
-        """
-        num_envs = desired_velocities.shape[0]
-        gait_names = list(self.gait_velocity_ranges.keys())
-        gait_indices = torch.zeros(num_envs, dtype=torch.long, device=desired_velocities.device)
-        
-        # Calculate velocity magnitude for each environment
-        vel_magnitudes = torch.norm(desired_velocities, dim=1)
-        
-        # Assign gaits based on velocity ranges
-        for i, gait_name in enumerate(gait_names):
-            min_vel, max_vel = self.gait_velocity_ranges[gait_name]
-            
-            # Create mask for environments that should use this gait
-            if i == len(gait_names) - 1:  # Last gait (catch-all)
-                mask = vel_magnitudes >= min_vel
-            else:
-                mask = (vel_magnitudes >= min_vel) & (vel_magnitudes < max_vel)
-            
-            gait_indices[mask] = i
-        
-        return gait_indices
+          """
+          Vectorized selection of gaits based on desired velocity magnitude.
+
+          Args:
+               desired_velocities: Tensor of shape (num_envs, 2) with [lin_vel_x, lin_vel_y]
+
+          Returns:
+               Tensor of gait indices (shape: [num_envs])
+          """
+          # Compute velocity magnitudes
+          # vel_magnitudes = torch.norm(desired_velocities, dim=1)
+          vel_magnitudes = desired_velocities[:, 0]
+          # Create sorted list of gait range boundaries (only upper bounds)
+          gait_names = list(self.gait_velocity_ranges.keys())
+          boundaries = torch.tensor(
+               [self.gait_velocity_ranges[name][1] for name in gait_names[:-1]],  # exclude max of last gait
+               device=desired_velocities.device,
+               dtype=vel_magnitudes.dtype,
+          )
+
+          # Bucketize assigns each velocity to a bin based on upper boundaries
+          gait_indices = torch.bucketize(vel_magnitudes, boundaries, right=False)
+
+          return gait_indices
+
     
     def _load_specific_data(self, data):
         """Load gait library specific data from YAML."""
@@ -312,12 +302,6 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
     def reorder_and_remap(self, cfg, device):
         """Reorder and remap coefficients for all gaits and select based on velocity."""
         # Get desired velocities from the environment
-        base_velocity = cfg.env.command_manager.get_command("base_velocity")
-        desired_velocities = base_velocity[:, :2]  # [lin_vel_x, lin_vel_y]
-        
-        # Select gaits for each environment
-        self.current_gaits = self.select_gaits_by_velocity(desired_velocities)
-        self.num_envs = desired_velocities.shape[0]
         
         # Reorder and remap all gaits
         gait_names = list(self.gait_velocity_ranges.keys())
@@ -339,11 +323,12 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
     
     def get_ref_traj(self, hzd_cmd) -> tuple[torch.Tensor, torch.Tensor]:
         """Get reference trajectory using precomputed batched control points."""
-        N = self.num_envs
-        
         # Get current phase and step duration
-        tau = torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)  # [N]
-        step_dur = torch.full((N,), self.T, dtype=torch.float32, device=hzd_cmd.device)  # [N]
+
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        tau = torch.full((N,), hzd_cmd.phase_var, device=base_velocity.device)  # [N]
+        step_dur = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)  # [N]
         
         # Select control points based on stance
         if hzd_cmd.stance_idx == 1:
@@ -395,7 +380,10 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         
         # Select the appropriate gait for each environment
         batch_indices = torch.arange(N, device=hzd_cmd.device)
-        gait_indices = self.current_gaits
+        
+
+        #need to select the correct gait based on the velocity
+        gait_indices = self.select_gaits_by_velocity(base_velocity[:, :2])
         
         # Gather the selected trajectories
         des_pos = ref_pos[gait_indices, batch_indices]  # [N, jt_dim]
@@ -427,11 +415,6 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         config = self._gait_cache[first_gait]
         return config.get_actual_traj(hzd_cmd)
     
-    def get_stance_foot_pose(self, hzd_cmd):
-        """Get stance foot pose - use the first gait's method."""
-        first_gait = list(self.gait_velocity_ranges.keys())[0]
-        config = self._gait_cache[first_gait]
-        config.get_stance_foot_pose(hzd_cmd)
     
     def get_available_gaits(self) -> List[str]:
         """Get list of available gait names."""

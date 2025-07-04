@@ -164,5 +164,5 @@ class GaitLibraryHZDCommandCfg(CommandTermCfg):
     # Gait library specific parameters
     trajectory_type: str = "end_effector"  # "joint" or "end_effector"
     gait_library_path: str = "source/robot_rl/robot_rl/assets/robots/gait_library/"
-    config_name: str = "single_support"  # Base name for configuration files
+    config_name: str = "single_support_config"  # Base name for configuration files
     gait_velocity_ranges: Union[dict, tuple] = (0.1, 0.2, 0.1)  # (min_vel, max_vel, step) in m/s

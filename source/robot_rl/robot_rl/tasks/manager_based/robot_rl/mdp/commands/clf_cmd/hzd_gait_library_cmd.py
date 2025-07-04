@@ -3,7 +3,7 @@ import math
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cmd import HZDCommandTerm
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library_traj import GaitLibraryEndEffectorConfig, GaitLibraryJointConfig
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
-
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
 
 class GaitLibraryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses a gait library with velocity-based selection."""
@@ -22,7 +22,10 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
                     config_name
                 )
                 # Initialize end effector tracker
-                self.ee_tracker = self.gait_config._gait_cache[list(cfg.gait_velocity_ranges.keys())[0]].ee_tracker
+                self.ee_tracker = EndEffectorTracker(
+                    self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].constraint_specs,
+                    env.scene
+                )
             else:
                 self.gait_config = GaitLibraryJointConfig(
                     cfg.gait_library_path, 
@@ -84,8 +87,14 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
                 self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
 
     def get_stance_foot_pose(self):
-        """Get stance foot pose data."""
-        self.gait_config.get_stance_foot_pose(self)
+            """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+            stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
+            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
+            self.stance_foot_pos = stance_foot_pos
+            self.stance_foot_ori = stance_foot_ori
+            stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
+            self.stance_foot_vel = stance_foot_vel
+            self.stance_foot_ang_vel = stance_foot_ang_vel
 
     def update_Stance_Swing_idx(self):
         """Update stance and swing indices based on phase."""

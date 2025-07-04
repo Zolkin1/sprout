@@ -178,7 +178,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # Reshape bezier coefficients to [num_joints, num_control_points]
         # TODO: need to get num_output from constraint_specs
         num_output = 21
-        bezier_coeffs = data['bezier_coeffs']
+        domain_name = next(iter(data.keys()))
+        bezier_coeffs = data[domain_name]['bezier_coeffs']
         num_control_points = data['spline_order'] + 1
         bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_output, num_control_points)
         

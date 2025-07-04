@@ -35,15 +35,17 @@ class BaseTrajectoryConfig(ABC):
         """
         with open(self.yaml_path, 'r') as file:
             data = yaml.safe_load(file)
+            domain_name = next(iter(data.keys()))
+            
         
         # Load common data
-        self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
+        self.T = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
         
         # Load initial config
-        init_config = data['q'][0]
+        init_config = data[domain_name]['q'][0]
         # Need to reorder xyzw to wxyz
 
-        init_vel = data['v'][0]
+        init_vel = data[domain_name]['v'][0]
         self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
         self.init_root_vel = init_vel[:6]
         self.init_joint_pos = init_config[7:]
