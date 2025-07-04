@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Tuple
 import numpy as np
 
+
 class BaseTrajectoryConfig(ABC):
     """Abstract base class for trajectory configurations.
     
@@ -23,6 +24,7 @@ class BaseTrajectoryConfig(ABC):
         self.T = 0.0
         self.left_coeffs = None
         self.right_coeffs = None
+        self.bez_deg = 5  # Default Bezier degree
         self.load_from_yaml()
     
     def load_from_yaml(self):
@@ -37,9 +39,9 @@ class BaseTrajectoryConfig(ABC):
         # Load common data
         self.T = data['T'][0] if isinstance(data['T'], list) else data['T']
         
-        #load initial config
+        # Load initial config
         init_config = data['q'][0]
-        #need to reorder xyzw to wxyz
+        # Need to reorder xyzw to wxyz
 
         init_vel = data['v'][0]
         self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
@@ -145,4 +147,51 @@ class BaseTrajectoryConfig(ABC):
             hzd_cmd: HZD command object
         """
         # Default implementation - can be overridden
-        pass 
+        pass
+    
+    def get_control_points(self, hzd_cmd) -> torch.Tensor:
+        """Get control points for the current stance.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Control points tensor of shape [num_env, num_outputs, degree+1]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        
+        # Choose coefficients based on stance
+        if hzd_cmd.stance_idx == 1:
+            ctrl_points = self.right_coeffs
+        else:
+            ctrl_points = self.left_coeffs
+        
+        # Expand to batch size: [num_outputs, degree+1] -> [N, num_outputs, degree+1]
+        return ctrl_points.unsqueeze(0).expand(N, -1, -1)
+    
+    def get_phase(self, hzd_cmd) -> torch.Tensor:
+        """Get current phase variable.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Phase tensor of shape [num_env]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        return torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)
+    
+    def get_step_duration(self, hzd_cmd) -> torch.Tensor:
+        """Get step duration.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Step duration tensor of shape [num_env]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        return torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device) 

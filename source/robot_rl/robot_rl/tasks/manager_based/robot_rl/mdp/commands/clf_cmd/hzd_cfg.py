@@ -1,7 +1,9 @@
 from .hzd_cmd import JointTrajectoryHZDCommandTerm, EndEffectorTrajectoryHZDCommandTerm
 from .hzd_stair_cmd import HZDStairCommandTerm
+from .hzd_gait_library_cmd import GaitLibraryHZDCommandTerm
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
+from typing import Union
 
 HZD_Q_weights = [
     500.0, 1.0,  # left_hip_pitch_joint
@@ -141,3 +143,26 @@ class HZDStairCommandCfg(CommandTermCfg):
     debug_vis: bool = False
     Q_weights = HZD_Q_weights
     R_weights = HZD_R_weights
+
+
+@configclass
+class GaitLibraryHZDCommandCfg(CommandTermCfg):
+    """
+    Configuration for the GaitLibraryHZDCommandTerm.
+    """
+    class_type: type = GaitLibraryHZDCommandTerm
+    asset_name: str = "robot"
+    foot_body_name: str = ".*_ankle_roll_link"
+    num_outputs: int = 21
+    bez_deg: int = 5
+    resampling_time_range: tuple[float, float] = (5.0, 15.0)
+    debug_vis: bool = False
+    trajectory_tracking_visualizer_cfg: dict = {}
+    Q_weights = HZD_Q_weights
+    R_weights = HZD_R_weights
+
+    # Gait library specific parameters
+    trajectory_type: str = "end_effector"  # "joint" or "end_effector"
+    gait_library_path: str = "source/robot_rl/robot_rl/assets/robots/gait_library/"
+    config_name: str = "single_support"  # Base name for configuration files
+    gait_velocity_ranges: Union[dict, tuple] = (0.1, 0.2, 0.1)  # (min_vel, max_vel, step) in m/s

@@ -116,13 +116,13 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
-        self.rewards.clf_reward.params["max_clf"] = 5.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 5.0
+        self.rewards.clf_reward.params["max_clf"] = 100.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
         self.commands.base_velocity.ranges.lin_vel_x = (0.625, 0.625)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.3, 0.3)
         self.commands.base_velocity.ranges.heading = (0, 0)
         self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
         ##
@@ -134,16 +134,25 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         # no height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
-        # no terrain curriculum
-        # self.curriculum.terrain_levels = None
-        self.curriculum.clf_curriculum.params["min_val"] = 2.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
 
+        self.curriculum.clf_curriculum.params["min_val"] = 10.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
+        # no terrain curriculum
+
+
+class G1NoDomainRandomizationEnvCfg(G1FlatHZDEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
         self.events.base_com = None
-        # self.curriculum.clf_curriculum = None
+        self.rewards.clf_reward.params["max_clf"] = 5.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 5.0
+        self.curriculum.clf_curriculum.params["min_val"] = 2.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.curriculum.terrain_levels = None
 
 
 class G1FlatRefTrackingEnvCfg(G1FlatHZDEnvCfg):
@@ -187,8 +196,10 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
         # disable randomization for play
         self.observations.policy.enable_corruption = False
         # remove random pushing
-        self.events.base_external_force_torque = None
         self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None
+        self.events.add_base_mass = None
+        self.events.base_com = None
         # if self.scene.terrain.terrain_generator is not None:
         #   self.scene.terrain.terrain_generator.num_rows = 1
         #   self.scene.terrain.terrain_generator.num_cols = 2
