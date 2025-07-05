@@ -60,7 +60,8 @@ def log_row_to_csv(filename, data):
     except Exception as e:
         print(f"Error appending row to {filename}: {e}")
 
-def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str, use_height_sensor: bool = False):
+def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str, use_height_sensor: bool = False,
+                   tracking_body_name: str =""):
     """Run the simulation.
     
     Args:
@@ -75,7 +76,7 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str, use_
     robot_instance = Robot(robot, scene)
     
     # Create and run simulation
-    sim = Simulation(policy, robot_instance, log, log_dir, use_height_sensor=use_height_sensor)
+    sim = Simulation(policy, robot_instance, log, log_dir, use_height_sensor=use_height_sensor, tracking_body_name=tracking_body_name)
     sim.run()
 
 def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_rays: Tuple[int, int], sen_offset: float = 0) -> np.array:

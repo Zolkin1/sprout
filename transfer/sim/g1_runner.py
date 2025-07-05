@@ -60,7 +60,8 @@ def main():
         scene=config.get("scene", "basic_scene"),  # Default to basic_scene if not specified
         log=config.get("log", False),
         log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
-        use_height_sensor=config.get("height_map_scale") is not None  # Enable height sensor if height_map_scale is present
+        use_height_sensor=config.get("height_map_scale") is not None,  # Enable height sensor if height_map_scale is present
+        tracking_body_name="torso_link"
     )
 
 
