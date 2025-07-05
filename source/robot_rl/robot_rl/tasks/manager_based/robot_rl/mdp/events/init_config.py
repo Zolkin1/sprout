@@ -26,7 +26,9 @@ def reset_init_config(
     base_pos[:,0:3] += env.scene.env_origins[env_ids]
     base_vel = cmd.init_root_vel.unsqueeze(0).expand(num_env, -1)
     joint_pos = cmd.init_joint_pos.unsqueeze(0).expand(num_env, -1)
-    joint_vel = cmd.init_joint_vel.unsqueeze(0).expand(num_env, -1)
+    joint_vel = torch.zeros_like(joint_pos)
+    base_vel = 0.0 * base_vel
+#     joint_vel = cmd.init_joint_vel.unsqueeze(0).expand(num_env, -1)
 
      #quat order wxyz
     # set into the physics simulation

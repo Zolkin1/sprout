@@ -10,7 +10,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
 from typing import TYPE_CHECKING
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import JointTrajectoryConfig, get_euler_from_quat
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker
-
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi,quat_from_euler_xyz
 
 if TYPE_CHECKING:
     from ..cmd_cfg import HZDCommandCfg
@@ -69,7 +69,7 @@ class HZDCommandTerm(CommandTerm, ABC):
         tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
         phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
 
-        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
+        new_stance_idx = int(0.5 + 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
         
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
@@ -182,9 +182,16 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         self.ee_config = EndEffectorTrajectoryConfig(yaml_path=cfg.yaml_path)
         
 
+        # also need to remap root state
+        root_quat = torch.tensor(self.ee_config.init_root_state[3:], dtype=torch.float32,device=self.device)
+        init_root_state_eul = get_euler_from_quat(root_quat.unsqueeze(0)).squeeze(0)
+        init_root_state_eul[0] = -init_root_state_eul[0]
+        init_root_state_eul[2] = -init_root_state_eul[2]
+        init_root_state_quat = quat_from_euler_xyz(init_root_state_eul[0].unsqueeze(0),init_root_state_eul[1].unsqueeze(0),init_root_state_eul[2].unsqueeze(0))
+        
         self.init_root_state = torch.tensor(self.ee_config.init_root_state, dtype=torch.float32,device=self.device)
 
-
+        self.init_root_state[3:] = init_root_state_quat
         self.init_root_vel = torch.tensor(self.ee_config.init_root_vel, dtype=torch.float32,device=self.device)
         
 
@@ -207,16 +214,20 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         num_jt = len(self.ee_config.joint_order)
         init_joint_pos = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
         init_joint_vel = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
+
+        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import build_relabel_matrix
+        
+        R = build_relabel_matrix()
+        init_joint_pos_relabel = R @ self.ee_config.init_joint_pos
+        init_joint_vel_relabel = R @ self.ee_config.init_joint_vel
+
         for i in range(num_jt):
             joint_name = self.ee_config.joint_order[i]
             new_joint_idx = self.robot.find_joints(joint_name)[0]
-            init_joint_pos[new_joint_idx] = self.ee_config.init_joint_pos[i]
-            init_joint_vel[new_joint_idx] = self.ee_config.init_joint_vel[i]
+            init_joint_pos[new_joint_idx] = init_joint_pos_relabel[i]
+            init_joint_vel[new_joint_idx] = init_joint_vel_relabel[i]
         
-        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import build_relabel_matrix
-        R = build_relabel_matrix()
-        init_joint_pos = R @ init_joint_pos
-        init_joint_vel = R @ init_joint_vel
+        
         self.init_joint_pos = init_joint_pos
         self.init_joint_vel = init_joint_vel
 

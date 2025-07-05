@@ -183,10 +183,13 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
     commands: G1HZD_StairCommandsCfg = G1HZD_StairCommandsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
     def __post_init__(self):
+
         super().__post_init__()
 
-        self.observations.policy.step_duration.params["command_name"] = "hzd_ref"
-        self.observations.critic.step_duration.params["command_name"] = "hzd_ref"
+        self.observations.policy.step_duration = None
+        self.observations.critic.step_duration = None
+        # self.observations.policy.step_duration.params["command_name"] = "hzd_ref"
+        # self.observations.critic.step_duration.params["command_name"] = "hzd_ref"
 
         self.observations.policy.sin_phase = ObsTerm(func=mdp.stair_sin_phase, params={"command_name": "hzd_ref"})
         self.observations.policy.cos_phase = ObsTerm(func=mdp.stair_cos_phase, params={"command_name": "hzd_ref"})
@@ -269,7 +272,7 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         # Scene
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        
+        self.episode_length_s = 6
         # No height scanner for now
      
         self.scene.terrain.terrain_type = "generator"
