@@ -212,8 +212,8 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
 
-        self.rewards.clf_reward.params["max_clf"] = 300.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 300.0
+        self.rewards.clf_reward.params["max_clf"] = 100.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 2.0
         
         self.commands.base_velocity.ranges.lin_vel_x = (0.6,0.6)
@@ -221,8 +221,9 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
         self.scene.terrain.terrain_generator = UP_STAIR_CFG
+        self.curriculum.terrain_levels = None
 
-        self.events.push_robot = None
+        # self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
         self.events.base_external_force_torque = None
         self.events.add_base_mass = None

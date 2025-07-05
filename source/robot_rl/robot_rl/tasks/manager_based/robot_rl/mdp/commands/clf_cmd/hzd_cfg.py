@@ -159,8 +159,8 @@ class GaitLibraryHZDCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
     debug_vis: bool = False
     trajectory_tracking_visualizer_cfg: dict = {}
-    Q_weights = HZD_Q_weights
-    R_weights = HZD_R_weights
+    Q_weights = HZD_EE_Q_weights
+    R_weights = HZD_EE_R_weights
 
     # Gait library specific parameters
     trajectory_type: str = "end_effector"  # "joint" or "end_effector"

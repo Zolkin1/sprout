@@ -32,6 +32,7 @@ EXPERIMENT_NAMES = {
     "clf_vdot": "g1",
     "height-scan-flat": "g1",
     "flat-hzd": "g1",
+    "flat-hzd-GL": "g1",
     "flat-hzd-no-dr": "g1",
     "stair-hzd": "g1"
 }
@@ -45,6 +46,7 @@ SIM_ENVIRONMENTS = {
     "stair": "G1-stair-play",
     "height-scan-flat": "G1-height-scan-flat-play",
     "flat-hzd": "G1-flat-hzd-play",
+    "flat-hzd-GL": "G1-flat-hzd-play",
     "flat-hzd-no-dr": "G1-flat-hzd-play",
     "stair-hzd": "G1-stair-hzd-play",
 }
@@ -385,7 +387,7 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","stair-hzd"]:
+    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","flat-hzd-GL","stair-hzd"]:
         command_name = "hzd_ref"
     else:
         command_name = "hlip_ref"

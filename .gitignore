@@ -75,3 +75,5 @@ transfer/obelisk/build/
 transfer/obelisk/.vscode/
 
 transfer/sim/MUJOCO_LOG.TXT
+
+remote_mount/
