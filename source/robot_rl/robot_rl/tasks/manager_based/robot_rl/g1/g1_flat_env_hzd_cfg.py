@@ -201,6 +201,9 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
         self.events.base_com = None
+
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
         # if self.scene.terrain.terrain_generator is not None:
         #   self.scene.terrain.terrain_generator.num_rows = 1
         #   self.scene.terrain.terrain_generator.num_cols = 2

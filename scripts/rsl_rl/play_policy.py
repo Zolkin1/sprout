@@ -32,6 +32,7 @@ EXPERIMENT_NAMES = {
     "clf_vdot": "g1",
     "height-scan-flat": "g1",
     "flat-hzd": "g1",
+    "flat-hzd-no-dr": "g1",
     "stair-hzd": "g1"
 }
 
@@ -44,6 +45,7 @@ SIM_ENVIRONMENTS = {
     "stair": "G1-stair-play",
     "height-scan-flat": "G1-height-scan-flat-play",
     "flat-hzd": "G1-flat-hzd-play",
+    "flat-hzd-no-dr": "G1-flat-hzd-play",
     "stair-hzd": "G1-stair-hzd-play",
 }
 
@@ -243,245 +245,226 @@ def main():
     # launch omniverse app
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
-    print("[DEBUG] Omniverse app launched")
 
-    try:
-        print("[DEBUG] Importing required modules")
-        # Import necessary modules after app launch
-        import gymnasium as gym
-        import torch
-        # from rsl_rl.runners import OnPolicyRunner
-        from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+    # Import necessary modules after app launch
+    import gymnasium as gym
+    import torch
+    # from rsl_rl.runners import OnPolicyRunner
+    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+
+    from isaaclab.envs import (
+        DirectMARLEnv,
+        multi_agent_to_single_agent,
+    )
+    from isaaclab.utils.dict import print_dict
+    from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+    from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
+    from isaaclab_rl.rsl_rl import export_policy_as_jit, export_policy_as_onnx
+    import robot_rl.tasks  # noqa: F401
+    print("[DEBUG] Modules imported successfully")
+
+    # Configure PyTorch
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+
+    print("[DEBUG] Parsing configurations")
+    # parse configuration
+    env_cfg = parse_env_cfg(
+        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs
+    )
+
+    if args_cli.sim_speed is not None:
+        env_cfg.commands.base_velocity.ranges.lin_vel_x = (args_cli.sim_speed[0], args_cli.sim_speed[0])
+        env_cfg.commands.base_velocity.ranges.lin_vel_y = (args_cli.sim_speed[1], args_cli.sim_speed[1])
+        env_cfg.commands.base_velocity.ranges.ang_vel_z = (args_cli.sim_speed[2], args_cli.sim_speed[2])
+
+    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    print("[DEBUG] Configurations parsed")
+
+    # specify directory for logging experiments
+    if args_cli.env_type == "exo_hzd" or args_cli.env_type == "exo_hlip":
+        log_root_path = os.path.join("logs", "exo_policies", args_cli.env_type, experiment_name)
+    else:
+        log_root_path = os.path.join("logs", "g1_policies", args_cli.env_type, experiment_name)
+    log_root_path = os.path.abspath(log_root_path)
+    print(f"[DEBUG] Log root path: {log_root_path}")
     
-        from isaaclab.envs import (
-            DirectMARLEnv,
-            multi_agent_to_single_agent,
-        )
-        from isaaclab.utils.dict import print_dict
-        from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-        from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
-        from isaaclab_rl.rsl_rl import export_policy_as_jit, export_policy_as_onnx
-        import robot_rl.tasks  # noqa: F401
-        print("[DEBUG] Modules imported successfully")
-
-        # Configure PyTorch
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = False
-
-        print("[DEBUG] Parsing configurations")
-        # parse configuration
-        env_cfg = parse_env_cfg(
-            args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs
-        )
-
-        if args_cli.sim_speed is not None:
-            env_cfg.commands.base_velocity.ranges.lin_vel_x = (args_cli.sim_speed[0], args_cli.sim_speed[0])
-            env_cfg.commands.base_velocity.ranges.lin_vel_y = (args_cli.sim_speed[1], args_cli.sim_speed[1])
-            env_cfg.commands.base_velocity.ranges.ang_vel_z = (args_cli.sim_speed[2], args_cli.sim_speed[2])
-
-        agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
-        print("[DEBUG] Configurations parsed")
-
-        # specify directory for logging experiments
-        if args_cli.env_type == "exo_hzd" or args_cli.env_type == "exo_hlip":
-            log_root_path = os.path.join("logs", "exo_policies", args_cli.env_type, experiment_name)
+    # If no checkpoint is specified, find the latest one
+    if not agent_cfg.load_run or not agent_cfg.load_checkpoint:
+        print("[DEBUG] Finding latest checkpoint")
+        latest_run, latest_checkpoint = find_latest_checkpoint(log_root_path)
+        if latest_run and latest_checkpoint:
+            print(f"[DEBUG] Found latest checkpoint: run={latest_run}, checkpoint={latest_checkpoint}")
+            agent_cfg.load_run = latest_run
+            agent_cfg.load_checkpoint = latest_checkpoint
         else:
-            log_root_path = os.path.join("logs", "g1_policies", args_cli.env_type, experiment_name)
-        log_root_path = os.path.abspath(log_root_path)
-        print(f"[DEBUG] Log root path: {log_root_path}")
-        
-        # If no checkpoint is specified, find the latest one
-        if not agent_cfg.load_run or not agent_cfg.load_checkpoint:
-            print("[DEBUG] Finding latest checkpoint")
-            latest_run, latest_checkpoint = find_latest_checkpoint(log_root_path)
-            if latest_run and latest_checkpoint:
-                print(f"[DEBUG] Found latest checkpoint: run={latest_run}, checkpoint={latest_checkpoint}")
-                agent_cfg.load_run = latest_run
-                agent_cfg.load_checkpoint = latest_checkpoint
-            else:
-                print("[ERROR] No checkpoints found in the specified directory")
-                sys.exit(1)
-        
-        # Get checkpoint path from the training directory
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-        print(f"[DEBUG] Checkpoint path: {resume_path}")
-        
-        # Use the checkpoint directory for saving results
-        if not args_cli.play_log_dir:
-            play_log_dir = os.path.dirname(resume_path)
-        else:
-            play_log_dir = args_cli.play_log_dir
-        
-        print(f"[DEBUG] Play log directory: {play_log_dir}")
+            print("[ERROR] No checkpoints found in the specified directory")
+            sys.exit(1)
+    
+    # Get checkpoint path from the training directory
+    resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    print(f"[DEBUG] Checkpoint path: {resume_path}")
+    
+    # Use the checkpoint directory for saving results
+    if not args_cli.play_log_dir:
+        play_log_dir = os.path.dirname(resume_path)
+    else:
+        play_log_dir = args_cli.play_log_dir
+    
+    print(f"[DEBUG] Play log directory: {play_log_dir}")
 
-        # create isaac environment
-        if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
-            env_cfg.__prepare_tensors__()
-        env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    # create isaac environment
+    if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
+        env_cfg.__prepare_tensors__()
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-        # convert to single-agent instance if required
-        if isinstance(env.unwrapped, DirectMARLEnv):
-            env = multi_agent_to_single_agent(env)
+    # convert to single-agent instance if required
+    if isinstance(env.unwrapped, DirectMARLEnv):
+        env = multi_agent_to_single_agent(env)
 
-        # wrap for video recording
+    # wrap for video recording
+    if args_cli.video:
+        video_kwargs = {
+            "video_folder": os.path.join(play_log_dir, "videos"),
+            "step_trigger": lambda step: step == 0,
+            "video_length": args_cli.video_length,
+            "disable_logger": True,
+        }
+        print("[DEBUG] Setting up video recording")
+        print_dict(video_kwargs, nesting=4)
+        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # wrap around environment for rsl-rl
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    print(f"[DEBUG] Loading model checkpoint from: {resume_path}")
+    # load previously trained model
+    ppo_runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    ppo_runner.load(resume_path)
+
+    # obtain the trained policy for inference
+    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+
+    # Export policy if requested
+    if args_cli.export_policy:
+        print("[DEBUG] Exporting policy to ONNX and JIT formats")
+        try:
+            # version 2.3 onwards
+            policy_nn = ppo_runner.alg.policy
+        except AttributeError:
+            # version 2.2 and below
+            policy_nn = ppo_runner.alg.actor_critic
+
+        # export policy to onnx/jit
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        os.makedirs(export_model_dir, exist_ok=True)
+        export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(
+            policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
+        )
+        print(f"[DEBUG] Policy exported to {export_model_dir}")
+
+    dt = env.unwrapped.step_dt
+
+    # Dynamically generate log variables based on the command type
+    log_vars = [
+        'y_out',
+        'dy_out',
+        'base_velocity',
+        'cur_swing_time',
+        "stance_foot_pos",
+        "stance_foot_ori",
+        'y_act',
+        'dy_act',
+        'v',
+        'vdot',
+        'stance_foot_pos_0',
+        'stance_foot_ori_0',
+    ]
+    
+    # Get the command term to determine what type of trajectory we're using
+    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","stair-hzd"]:
+        command_name = "hzd_ref"
+    else:
+        command_name = "hlip_ref"
+        
+    ref = env.unwrapped.command_manager.get_term(command_name)
+    
+    # Add dynamic error metrics based on the command type
+    trajectory_type = 'end_effector'
+    if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+        # End effector trajectory case - add axis error metrics
+        trajectory_type = 'end_effector'
+        for axis_info in ref.ee_config.axis_names:
+            log_vars.append(axis_info['name'])
+        # Also log the axis names for plotting
+        log_vars.append('axis_names')
+    elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
+        # Joint trajectory case - add joint error metrics
+        trajectory_type = 'joint'
+        for joint_name in ref.robot.joint_names:
+            log_vars.append(f"error_{joint_name}")
+    
+    
+    # Setup logging
+    logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
+
+    # reset environment
+    obs, _ = env.get_observations()
+    timestep = 0
+    print("[DEBUG] Starting simulation loop")
+
+    # simulate environment
+    while simulation_app.is_running():
+        start_time = time.time()
+        # run everything in inference mode
+        with torch.inference_mode():
+            # agent stepping
+            actions = policy(obs)
+            # env stepping
+            obs, reward, _, extra = env.step(actions)
+            
+            # Log data
+            if args_cli.log_data:
+                data = extract_reference_trajectory(env, log_vars,command_name)
+                logger.log_from_dict(data)
+
+        timestep += 1
         if args_cli.video:
-            video_kwargs = {
-                "video_folder": os.path.join(play_log_dir, "videos"),
-                "step_trigger": lambda step: step == 0,
-                "video_length": args_cli.video_length,
-                "disable_logger": True,
-            }
-            print("[DEBUG] Setting up video recording")
-            print_dict(video_kwargs, nesting=4)
-            env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-        # wrap around environment for rsl-rl
-        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-
-        print(f"[DEBUG] Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        ppo_runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        ppo_runner.load(resume_path)
-
-        # obtain the trained policy for inference
-        policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
-  
-        # Export policy if requested
-        if args_cli.export_policy:
-            print("[DEBUG] Exporting policy to ONNX and JIT formats")
-            try:
-                # version 2.3 onwards
-                policy_nn = ppo_runner.alg.policy
-            except AttributeError:
-                # version 2.2 and below
-                policy_nn = ppo_runner.alg.actor_critic
-
-            # export policy to onnx/jit
-            export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-            os.makedirs(export_model_dir, exist_ok=True)
-            export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(
-                policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
-            )
-            print(f"[DEBUG] Policy exported to {export_model_dir}")
-
-        dt = env.unwrapped.step_dt
-
-        # Dynamically generate log variables based on the command type
-        log_vars = [
-            'y_out',
-            'dy_out',
-            'base_velocity',
-            'cur_swing_time',
-            "stance_foot_pos",
-            "stance_foot_ori",
-            'y_act',
-            'dy_act',
-            'v',
-            'vdot',
-            'stance_foot_pos_0',
-            'stance_foot_ori_0',
-        ]
-        
-        # Get the command term to determine what type of trajectory we're using
-        if args_cli.env_type == "flat-hzd" or args_cli.env_type == "stair-hzd":
-            command_name = "hzd_ref"
-        else:
-            command_name = "hlip_ref"
-            
-        ref = env.unwrapped.command_manager.get_term(command_name)
-        
-        # Add dynamic error metrics based on the command type
-        if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
-            # End effector trajectory case - add axis error metrics
-            for axis_info in ref.ee_config.axis_names:
-                log_vars.append(axis_info['name'])
-            # Also log the axis names for plotting
-            log_vars.append('axis_names')
-        elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
-            # Joint trajectory case - add joint error metrics
-            for joint_name in ref.robot.joint_names:
-                log_vars.append(f"error_{joint_name}")
-        
-        
-        # Setup logging
-        logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
-
-        # reset environment
-        obs, _ = env.get_observations()
-        timestep = 0
-        print("[DEBUG] Starting simulation loop")
-
-        if args_cli.env_type == "flat-hzd" or args_cli.env_type == "stair-hzd":
-            command_name = "hzd_ref"
-        else:
-            command_name = "hlip_ref"
-
-        # viewer = env.unwrapped.scene.viewer
-
-        # Choose the robot's prim path
-        # robot_prim_path = "/World/robot"  # Or your robot's actual path
-
-        # Set the camera to follow the robot
-        # viewer.set_camera_follow(robot_prim_path)
-        # simulate environment
-        while simulation_app.is_running():
-            start_time = time.time()
-            # run everything in inference mode
-            with torch.inference_mode():
-                # agent stepping
-                actions = policy(obs)
-                # env stepping
-                obs, reward, _, extra = env.step(actions)
-                
-                # Log data
-                if args_cli.log_data:
-                    data = extract_reference_trajectory(env, log_vars,command_name)
-                    logger.log_from_dict(data)
-
-            timestep += 1
-            if args_cli.video:
-                # Exit the play loop after recording one video
-                if timestep == args_cli.video_length:
-                    break
-            
-            if timestep > max(100, args_cli.video_length):
+            # Exit the play loop after recording one video
+            if timestep == args_cli.video_length:
                 break
+        
+        if timestep > max(100, args_cli.video_length):
+            break
 
-            # time delay for real-time evaluation
-            sleep_time = dt - (time.time() - start_time)
-            if args_cli.real_time and sleep_time > 0:
-                time.sleep(sleep_time)
+        # time delay for real-time evaluation
+        sleep_time = dt - (time.time() - start_time)
+        if args_cli.real_time and sleep_time > 0:
+            time.sleep(sleep_time)
 
-        print("[DEBUG] Simulation loop ended")
-        # close the simulator
-        env.close()
+    print("[DEBUG] Simulation loop ended")
+    # close the simulator
+    env.close()
 
-        # Save all logged data
-        if args_cli.log_data:
-            logger.save()
+    # Save all logged data
+    if args_cli.log_data:
+        logger.save()
 
-            # Create plots directory and generate plots
-            plot_dir = os.path.join(play_log_dir, "plots")
-            os.makedirs(plot_dir, exist_ok=True)
-            print(f"[DEBUG] Generating plots in directory: {plot_dir}")
-            
-            
-            # Determine trajectory type based on command type
-            trajectory_type = 'end_effector' if command_name == 'hzd_ref' else 'joint'
-            plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type=trajectory_type)
+        # Create plots directory and generate plots
+        plot_dir = os.path.join(play_log_dir, "plots")
+        os.makedirs(plot_dir, exist_ok=True)
+        print(f"[DEBUG] Generating plots in directory: {plot_dir}")
+        
+        # Determine trajectory type based on command type
+        plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type=trajectory_type)
 
-    except Exception as e:
-        print(f"[ERROR] An error occurred: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        # Ensure simulation app is closed
-        if simulation_app is not None:
-            simulation_app.close()
-            print("[DEBUG] Simulation app closed")
+    # Ensure simulation app is closed
+    if simulation_app is not None:
+        simulation_app.close()
+        print("[DEBUG] Simulation app closed")
 
 
 if __name__ == "__main__":
