@@ -216,7 +216,10 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
     
     def _precompute_control_points(self):
         """Precompute control points for all velocities in batched tensors."""
-        gait_names = list(self.gait_velocity_ranges.keys())
+        # Use sorted gait names to ensure consistent ordering
+        gait_names = sorted(self.gait_velocity_ranges.keys(), 
+                           key=lambda name: self.gait_velocity_ranges[name][0])
+    
         num_vel = len(gait_names)
         
         # Get dimensions from the first gait
@@ -281,15 +284,22 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
           # vel_magnitudes = torch.norm(desired_velocities, dim=1)
           vel_magnitudes = desired_velocities[:, 0]
           # Create sorted list of gait range boundaries (only upper bounds)
-          gait_names = list(self.gait_velocity_ranges.keys())
+          # Sort gait names by their minimum velocity to ensure proper ordering
+          gait_names = sorted(self.gait_velocity_ranges.keys(), 
+                             key=lambda name: self.gait_velocity_ranges[name][0])
+          # Get upper bounds for all gaits except the last one
           boundaries = torch.tensor(
-               [self.gait_velocity_ranges[name][1] for name in gait_names[:-1]],  # exclude max of last gait
+               [self.gait_velocity_ranges[name][1] for name in gait_names[:-1]],
                device=desired_velocities.device,
                dtype=vel_magnitudes.dtype,
           )
 
           # Bucketize assigns each velocity to a bin based on upper boundaries
           gait_indices = torch.bucketize(vel_magnitudes, boundaries, right=False)
+          
+          # Clamp indices to valid range to handle out-of-bounds velocities
+          # This ensures velocities at or above the maximum gait range use the last gait
+          gait_indices = torch.clamp(gait_indices, 0, len(gait_names) - 1)
 
           return gait_indices
 
@@ -303,7 +313,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         """Reorder and remap coefficients for all gaits and select based on velocity."""
         # Get desired velocities from the environment
         
-        # Reorder and remap all gaits
+        # Reorder and remap all gaits (order doesn't matter for this operation)
         gait_names = list(self.gait_velocity_ranges.keys())
         for gait_name in gait_names:
             if gait_name in self._gait_cache:
@@ -392,22 +402,13 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         return des_pos, des_vel
     
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
-        """Apply swing modifications for each gait type."""
-        # Get unique gaits being used
-        unique_gaits = torch.unique(self.current_gaits)
-        gait_names = list(self.gait_velocity_ranges.keys())
+        """Apply swing modifications for all gaits (same for all gait types)."""
+        # Get the first gait config (all gaits use the same modifications)
+        first_gait = list(self.gait_velocity_ranges.keys())[0]
+        config = self._gait_cache[first_gait]
         
-        # Apply modifications for each gait type
-        for gait_idx in unique_gaits:
-            gait_name = gait_names[gait_idx]
-            config = self._gait_cache[gait_name]
-            
-            # Create mask for environments using this gait
-            mask = self.current_gaits == gait_idx
-            
-            if torch.any(mask):
-                # Apply swing modifications for this subset
-                config._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        # Apply swing modifications for all environments
+        config._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
     
     def get_actual_traj(self, hzd_cmd):
         """Get actual trajectory - use the first gait's method since they're all the same."""
