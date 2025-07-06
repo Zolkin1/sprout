@@ -403,6 +403,13 @@ def main():
             log_vars.append(axis_info['name'])
         # Also log the axis names for plotting
         log_vars.append('axis_names')
+    elif hasattr(ref,'gait_config'):
+        trajectory_type = 'end_effector'
+        key = list(ref.gait_config._gait_cache.keys())[0]
+        for axis_info in ref.gait_config._gait_cache[key].axis_names:
+            log_vars.append(axis_info['name'])
+        # Also log the axis names for plotting
+        log_vars.append('axis_names')
     elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
         # Joint trajectory case - add joint error metrics
         trajectory_type = 'joint'
