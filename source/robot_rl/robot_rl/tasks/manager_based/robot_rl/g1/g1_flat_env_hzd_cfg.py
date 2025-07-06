@@ -120,10 +120,12 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
-        self.commands.base_velocity.ranges.lin_vel_x = (0.625, 0.625)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.5, 0.5)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.3, 0.3)
         self.commands.base_velocity.ranges.heading = (0, 0)
+
+        self.commands.step_period.period_range = (1.0,1.0)
         self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
         ##
         # Scene
@@ -131,12 +133,13 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         # change terrain to flat
         # self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = ROUGH_FOR_FLAT_HZD_CFG
+        self.curriculum.terrain_levels = None
         # no height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
 
         self.curriculum.clf_curriculum.params["min_val"] = 10.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 10.0
         # no terrain curriculum
 
 

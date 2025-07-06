@@ -170,13 +170,52 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
         self.rewards.joint_deviation_torso = None
 
         self.rewards.height_torso = None
-        
+
+
+
+HZD_Stair_Q_weights = [
+    300.0,   200.0,    # com_x pos, vel
+    600.0,   50.0,   # com_y pos, vel
+    600.0,  20.0,  # com_z pos, vel
+    600.0,    20.0,    # pelvis_roll pos, vel
+    450.0,    10.0,    # pelvis_pitch pos, vel
+    500.0,    30.0,    # pelvis_yaw pos, vel
+    2500.0, 125.0,  # swing_x pos, vel
+    1700.0,  125.0,  # swing_y pos, vel
+    8500.0, 120.0,   # swing_z pos, vel
+    200.0,    1.0,    # swing_ori_roll pos, vel
+    400.0,    1.0,    # swing_ori_pitch pos, vel
+    400.0,    10.0,    # swing_ori_yaw pos, vel
+    300.0,    10.0,    # waist_yaw pos, vel
+    400.0,1.0, #swing hand palm pos x
+    50.0,10.0, #swing hand palm pos y
+    50.0,1.0, #swing hand palm pos z
+    50.0,1.0, #swing hand palm yaw
+    400.0,1.0, #stance hand palm pos x
+    50.0,10.0, #stance hand palm pos y
+    50.0,1.0, #stance hand palm pos z
+    50.0,1.0, #stance hand palm yaw
+]
+
+
+HZD_Stair_R_weights = [
+        0.1, 0.1, 0.1,    # CoM inputs: allow moderate effort
+        0.05,0.05,0.05,   # pelvis inputs: lower torque priority
+        0.05,0.05,0.05,   # swing foot linear inputs
+        0.02,0.02,0.02,    # swing foot orientation inputs: small adjustments
+        0.1,0.01,0.01,
+        0.01,0.01,0.01,
+        0.01,0.01,0.01,
+    ]
+
 @configclass
 class G1HZD_StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     # hzd_ref = HZDStairCommandCfg()
     # hzd_ref = HZDStairEECommandCfg()
     hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
+    hzd_ref.Q_weights = HZD_Stair_Q_weights
+    hzd_ref.R_weights = HZD_Stair_R_weights
     #TODO cha
 @configclass
 class G1HZDStairEnvCfg(G1StairEnvCfg):
@@ -212,16 +251,19 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
         
 
-        self.rewards.clf_reward.params["max_clf"] = 100.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_reward.params["max_clf"] = 200.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 200.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 2.0
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.6,0.6)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
         self.scene.terrain.terrain_generator = UP_STAIR_CFG
-        self.curriculum.terrain_levels = None
+        self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
+        # self.curriculum.terrain_levels = None
+        self.episode_length_s = 7
+        self.events.push_robot.interval_range_s = (3,5)
 
         # self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
@@ -239,8 +281,8 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         )
 
         self.commands.hzd_ref.yaml_path = "source/robot_rl/robot_rl/assets/robots/stair_config_solution_ee.yaml"
-        clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1500, "min_val": 20.0})
-        self.curriculum.clf_curriculum = clf_curriculum
+        # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1500, "min_val": 20.0})
+        # self.curriculum.clf_curriculum = clf_curriculum
 
 
 @configclass

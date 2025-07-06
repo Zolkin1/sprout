@@ -303,3 +303,30 @@ joint_order: [left_hip_pitch_joint, left_hip_roll_joint, left_hip_yaw_joint, lef
   left_elbow_joint, right_shoulder_pitch_joint, right_shoulder_roll_joint, right_shoulder_yaw_joint,
   right_elbow_joint]
 spline_order: 5
+constraint_specs:
+    - type: "com_pos"
+      axes: [0, 1,2]
+    - type: "ee_ori"
+      frame: "pelvis_link"
+      axes: [0, 1,2]
+    - type: "ee_pos"
+      frame: "left_foot_middle"
+      axes: [0, 1,2]
+    - type: "ee_ori"
+      frame: "left_foot_middle"
+      axes: [0, 1,2]
+    - type: "joint"
+      joint_name: "waist_yaw_joint"
+    - type: "ee_pos"
+      frame: "left_hand_palm_joint"
+      axes: [0, 1,2]
+    - type: "ee_ori"
+      frame: "left_hand_palm_joint"
+      axes: [2]
+    - type: "ee_pos"
+      frame: "right_hand_palm_joint"
+      axes: [0, 1,2]
+    - type: "ee_ori"
+      frame: "right_hand_palm_joint"
+      axes: [2]
+      bezier_degree: 5

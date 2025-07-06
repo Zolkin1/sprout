@@ -99,7 +99,7 @@ UP_STAIR_CFG = STAIR_CFG = TerrainGeneratorCfg(
         # ),
         "stairs": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.2,
-            step_height_range=(0.15, 0.15),
+            step_height_range=(0.05, 0.15),
             step_width=0.3,
             platform_width=0.6,
             border_width=0.0,
