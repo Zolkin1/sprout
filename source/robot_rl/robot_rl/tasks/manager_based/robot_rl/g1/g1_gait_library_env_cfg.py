@@ -10,7 +10,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         trajectory_type="end_effector",
         gait_library_path="source/robot_rl/robot_rl/assets/robots/gait_library",
         config_name="single_support_config",
-        gait_velocity_ranges=(0.09, 0.5, 0.05)
+        gait_velocity_ranges=(0.09, 0.44, 0.05)
     )
 
 

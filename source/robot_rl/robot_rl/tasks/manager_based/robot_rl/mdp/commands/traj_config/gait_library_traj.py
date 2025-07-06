@@ -334,11 +334,12 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
     def get_ref_traj(self, hzd_cmd) -> tuple[torch.Tensor, torch.Tensor]:
         """Get reference trajectory using precomputed batched control points."""
         # Get current phase and step duration
-
         base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
         N = base_velocity.shape[0]
-        tau = torch.full((N,), hzd_cmd.phase_var, device=base_velocity.device)  # [N]
-        step_dur = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)  # [N]
+        
+        # Use a single tau and step_dur value (same for all gaits)
+        tau = torch.tensor([hzd_cmd.phase_var], device=base_velocity.device)  # [1]
+        step_dur = torch.tensor([self.T], dtype=torch.float32, device=base_velocity.device)  # [1]
         
         # Select control points based on stance
         if hzd_cmd.stance_idx == 1:
@@ -348,57 +349,40 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
             # Left stance: use left coefficients
             control_points = self.left_coeffs_batched  # [num_vel, jt_dim, degree+1]
         
-        # Use batched Bezier evaluation for all velocities at once
+        # Evaluate one trajectory per gait (much more efficient!)
         # control_points: [num_vel, jt_dim, degree+1]
-        # tau: [N] -> expand to [num_vel, N]
-        # step_dur: [N] -> expand to [num_vel, N]
+        # tau: [1] -> expand to [num_vel]
+        # step_dur: [1] -> expand to [num_vel]
         
         # Expand tau and step_dur to match control_points batch dimension
-        tau_expanded = tau.unsqueeze(0).expand(control_points.shape[0], -1)  # [num_vel, N]
-        step_dur_expanded = step_dur.unsqueeze(0).expand(control_points.shape[0], -1)  # [num_vel, N]
-        
-        # Reshape control_points to [num_vel*N, jt_dim, degree+1] for batched evaluation
-        num_vel, jt_dim, degree_plus_1 = control_points.shape
-        control_points_reshaped = control_points.unsqueeze(1).expand(-1, N, -1, -1)  # [num_vel, N, jt_dim, degree+1]
-        control_points_reshaped = control_points_reshaped.reshape(num_vel * N, jt_dim, degree_plus_1)  # [num_vel*N, jt_dim, degree+1]
-        
-        # Reshape tau and step_dur to [num_vel*N]
-        tau_reshaped = tau_expanded.reshape(-1)  # [num_vel*N]
-        step_dur_reshaped = step_dur_expanded.reshape(-1)  # [num_vel*N]
+        tau_expanded = tau.expand(control_points.shape[0])  # [num_vel]
+        step_dur_expanded = step_dur.expand(control_points.shape[0])  # [num_vel]
         
         # Use batched Bezier evaluation for position (order=0)
         ref_pos = bezier_deg_batched(
             order=0,
-            tau=tau_reshaped,
-            step_dur=step_dur_reshaped,
-            control_points=control_points_reshaped,
+            tau=tau_expanded,
+            step_dur=step_dur_expanded,
+            control_points=control_points,
             degree=self.bez_deg
-        )  # [num_vel*N, jt_dim]
+        )  # [num_vel, jt_dim]
         
         # Use batched Bezier evaluation for velocity (order=1)
         ref_vel = bezier_deg_batched(
             order=1,
-            tau=tau_reshaped,
-            step_dur=step_dur_reshaped,
-            control_points=control_points_reshaped,
+            tau=tau_expanded,
+            step_dur=step_dur_expanded,
+            control_points=control_points,
             degree=self.bez_deg
-        )  # [num_vel*N, jt_dim]
-        
-        # Reshape back to [num_vel, N, jt_dim]
-        ref_pos = ref_pos.reshape(num_vel, N, jt_dim)  # [num_vel, N, jt_dim]
-        ref_vel = ref_vel.reshape(num_vel, N, jt_dim)  # [num_vel, N, jt_dim]
+        )  # [num_vel, jt_dim]
         
         # Select the appropriate gait for each environment
-        batch_indices = torch.arange(N, device=hzd_cmd.device)
-        
-
-        #need to select the correct gait based on the velocity
-        gait_indices = self.select_gaits_by_velocity(base_velocity[:, :2])
+        gait_indices = self.select_gaits_by_velocity(base_velocity[:, :2])  # [N]
         
         # Gather the selected trajectories
-        des_pos = ref_pos[gait_indices, batch_indices]  # [N, jt_dim]
-        des_vel = ref_vel[gait_indices, batch_indices]  # [N, jt_dim]
-        
+        des_pos = ref_pos[gait_indices]  # [N, jt_dim]
+        des_vel = ref_vel[gait_indices]  # [N, jt_dim]
+        # import pdb; pdb.set_trace()
         return des_pos, des_vel
     
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):

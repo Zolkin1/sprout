@@ -73,7 +73,6 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         # Update metrics based on trajectory type
         if hasattr(self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]], 'axis_names'):
             # End-effector trajectories
-            # import pdb; pdb.set_trace()
             for axis_info in self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].axis_names:
                 error_key = axis_info['name']
                 index = axis_info['index']
