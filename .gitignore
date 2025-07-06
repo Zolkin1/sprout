@@ -67,3 +67,5 @@ datasets
 transfer/obelisk/install/
 transfer/obelisk/log/
 transfer/obelisk/build/
+
+transfer/sim/MUJOCO_LOG.TXT
