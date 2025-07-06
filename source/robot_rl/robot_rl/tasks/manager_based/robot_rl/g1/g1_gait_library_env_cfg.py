@@ -47,3 +47,18 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.rewards.clf_reward.params["max_clf"] = 50.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
+
+
+class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+    commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
