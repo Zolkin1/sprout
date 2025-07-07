@@ -43,12 +43,14 @@ def foot_ang_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
 
 def ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    ref_traj = cmd.y_out
+    ref_traj = cmd.y_out.clone()
+    ref_traj[:,8] *= 50.0
     return ref_traj
 
 def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    act_traj = cmd.y_act
+    act_traj = cmd.y_act.clone()
+    act_traj[:,8] *= 50.0
     return act_traj
 
 

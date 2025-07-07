@@ -27,7 +27,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (0.1, 0.5)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)
         
         # Update observation and reward command names
@@ -43,10 +43,14 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
-        self.curriculum.clf_curriculum = None
-        self.rewards.clf_reward.params["max_clf"] = 50.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
+        # self.curriculum.clf_curriculum = None
+        self.rewards.clf_reward.params["max_clf"] = 40.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 40.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
+
+        self.curriculum.clf_curriculum.params["min_val"] = 1.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 1.0
+        self.curriculum.clf_curriculum.params["update_interval"] = 4000
 
 
 class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
