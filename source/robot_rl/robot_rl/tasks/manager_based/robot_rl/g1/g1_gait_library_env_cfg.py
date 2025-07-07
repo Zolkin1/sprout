@@ -41,6 +41,8 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)
+
+        self.commands.step_period.period_range = (0.9, 0.9)
         
         # Update observation and reward command names
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"

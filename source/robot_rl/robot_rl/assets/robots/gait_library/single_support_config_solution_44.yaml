@@ -373,7 +373,7 @@ constraint_specs:
 - axes: [0, 1, 2]
   frame: left_foot_middle
   type: ee_ori
-- joint_name: "waist_yaw_joint"
+- joint_names: "waist_yaw_joint"
   type: joint
 - axes: [0, 1, 2]
   frame: left_hand_palm_joint
