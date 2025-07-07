@@ -72,7 +72,7 @@ class G1RoughLipObservationsCfg():
 class G1FlatHZDObservationsCfg(G1RoughLipObservationsCfg):
     class PolicyCfg(G1RoughLipObservationsCfg.PolicyCfg):
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"},scale=1.0)
-
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
     policy: PolicyCfg = PolicyCfg()
 
 

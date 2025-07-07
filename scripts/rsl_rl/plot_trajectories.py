@@ -423,6 +423,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
         axs[0].set_ylabel(units['v'][0] if 'v' in units else '')
         axs[0].grid(True, alpha=0.3)
         axs[0].legend()
+        axs[0].set_ylim(0, 20.0)  # Hard-coded ylim for CLF v
         
         axs[1].plot(time_steps, vdot_data[:, env_ids], label='CLF vdot ', color='magenta', linewidth=2)
         axs[1].set_title('CLF (v̇)')
@@ -430,6 +431,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
         axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
         axs[1].grid(True, alpha=0.3)
         axs[1].legend()
+        axs[1].set_ylim(-100.0, 100.0)  # Hard-coded ylim for CLF vdot
 
         alpha = 1.0
         decay = alpha * v_data[:, env_ids] + vdot_data[:, env_ids]
@@ -439,6 +441,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
         axs[2].set_ylabel('Decay Rate')
         axs[2].grid(True, alpha=0.3)
         axs[2].legend()
+        axs[2].set_ylim(-100.0, 100.0)  # Hard-coded ylim for CLF decay
         
         plt.tight_layout()
         if save_dir:

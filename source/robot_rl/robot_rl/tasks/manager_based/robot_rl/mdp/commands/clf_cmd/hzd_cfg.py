@@ -152,15 +152,15 @@ class HZDStairCommandCfg(CommandTermCfg):
 
 
 HZD_EE_Q_weights_GL = [
-    300.0,   50.0,    # com_x pos, vel
+    600.0,   100.0,    # com_x pos, vel
     600.0,   50.0,   # com_y pos, vel
-    600.0,   20.0,  # com_z pos, vel
+    400.0,   10.0,  # com_z pos, vel
     600.0,    20.0,    # pelvis_roll pos, vel
     450.0,    10.0,    # pelvis_pitch pos, vel
     500.0,    30.0,    # pelvis_yaw pos, vel
     3000.0, 50.0,  # swing_x pos, vel
     1500.0,  50.0,  # swing_y pos, vel
-    8000.0, 50.0,   # swing_z pos, vel
+    10000.0, 1000.0,   # swing_z pos, vel
     200.0,    1.0,    # swing_ori_roll pos, vel
     200.0,    1.0,    # swing_ori_pitch pos, vel
     400.0,    10.0,    # swing_ori_yaw pos, vel
