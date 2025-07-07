@@ -30,49 +30,53 @@ class MeshProgressiveYStairsTerrainCfg(SubTerrainBaseCfg):
     """The width of the border around the terrain (in m)."""
 
 
-import numpy as np
+import torch
 from typing import Union
 
 def get_step_height_at_x(
-    x_vals: Union[np.ndarray, list], cfg: "MeshProgressiveYStairsTerrainCfg"
-) -> np.ndarray:
+    x_vals: torch.Tensor, cfg: "MeshProgressiveYStairsTerrainCfg"
+) -> torch.Tensor:
     """
     Given a batch of x-coordinates, return the cumulative step height at each x
-    for a staircase that increases in +x direction with growing step heights.
+    for a staircase that increases in +x direction with growing step heights (Torch version).
 
     Args:
-        x_vals: Array-like of x positions (shape: [N]).
+        x_vals: Tensor of x positions (shape: [N]).
         cfg: Stair terrain config.
 
     Returns:
-        np.ndarray of terrain heights (shape: [N]).
+        Tensor of terrain heights (shape: [N]).
     """
-    x_vals = np.asarray(x_vals)
     usable_x = x_vals - cfg.border_width
-
     step_depth = cfg.step_width
     terrain_length = cfg.size[0] - 2 * cfg.border_width
     num_steps = int(terrain_length // step_depth)
 
-    # Generate increasing step heights
-    step_heights = np.linspace(cfg.step_height_range[0], cfg.step_height_range[1], num_steps)
-    cum_heights = np.cumsum(step_heights)  # [num_steps]
+    # Create step heights and cumulative sum
+    step_heights = torch.linspace(
+        cfg.step_height_range[0],
+        cfg.step_height_range[1],
+        steps=num_steps,
+        dtype=torch.float32,
+        device=x_vals.device,
+    )
+    cum_heights = torch.cumsum(step_heights, dim=0)  # shape: [num_steps]
 
-    # Initialize output
-    heights = np.zeros_like(x_vals)
+    # Initialize result
+    heights = torch.zeros_like(x_vals)
 
-    # Mask for positions before the stairs
+    # Masks
     mask_below = usable_x < 0
-    heights[mask_below] = 0.0
-
-    # Mask for positions beyond the stairs
     mask_above = usable_x >= terrain_length
+    mask_inside = ~(mask_below | mask_above)
+
+    # Assign heights
+    heights[mask_below] = 0.0
     heights[mask_above] = cum_heights[-1]
 
-    # Mask for positions within stair range
-    mask_inside = ~(mask_below | mask_above)
-    step_indices = (usable_x[mask_inside] // step_depth).astype(int)
-    heights[mask_inside] = cum_heights[step_indices]
+    if mask_inside.any():
+        step_indices = (usable_x[mask_inside] // step_depth).long()
+        heights[mask_inside] = cum_heights[step_indices]
 
     return heights
 

@@ -1,7 +1,9 @@
 import torch
 import math
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cmd import HZDCommandTerm
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library_traj import GaitLibraryEndEffectorConfig, GaitLibraryJointConfig
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library_traj import (
+    GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryTrajectoryConfig
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
 
@@ -12,28 +14,43 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         super().__init__(cfg, env)
         
         # Initialize gait library based on trajectory type
-        if hasattr(cfg, 'gait_library_path') and hasattr(cfg, 'gait_velocity_ranges'):
+        if hasattr(cfg, 'gait_library_path'):
             config_name = getattr(cfg, 'config_name', 'single_support')
             
-            if cfg.trajectory_type == "end_effector":
-                self.gait_config = GaitLibraryEndEffectorConfig(
+            # Check if it's a stair gait library (height-based) or regular gait library (velocity-based)
+            if hasattr(cfg, 'gait_height_ranges'):
+                # Stair gait library
+                self.gait_config = StairGaitLibraryTrajectoryConfig(
                     cfg.gait_library_path, 
-                    cfg.gait_velocity_ranges,
+                    cfg.gait_height_ranges,
+                    cfg.trajectory_type,
                     config_name
                 )
-                # Initialize end effector tracker
+            elif hasattr(cfg, 'gait_velocity_ranges'):
+                # Regular gait library
+                if cfg.trajectory_type == "end_effector":
+                    self.gait_config = GaitLibraryEndEffectorConfig(
+                        cfg.gait_library_path, 
+                        cfg.gait_velocity_ranges,
+                        config_name
+                    )
+                else:
+                    self.gait_config = GaitLibraryJointConfig(
+                        cfg.gait_library_path, 
+                        cfg.gait_velocity_ranges,
+                        config_name
+                    )
+            else:
+                raise ValueError("Gait library configuration missing: either gait_height_ranges or gait_velocity_ranges required")
+            
+            # Initialize end effector tracker if needed
+            if cfg.trajectory_type == "end_effector":
                 self.ee_tracker = EndEffectorTracker(
                     self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].constraint_specs,
                     env.scene
                 )
-            else:
-                self.gait_config = GaitLibraryJointConfig(
-                    cfg.gait_library_path, 
-                    cfg.gait_velocity_ranges,
-                    config_name
-                )
         else:
-            raise ValueError("Gait library configuration missing: gait_library_path and gait_velocity_ranges required")
+            raise ValueError("Gait library configuration missing: gait_library_path required")
         
         # Set up trajectory-specific attributes
         if cfg.trajectory_type == "end_effector":
@@ -44,6 +61,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
+        self.tp = torch.zeros((self.env.num_envs,), device=self.device)
 
     def _get_swing_period(self) -> float:
         """Get the swing period from the gait configuration."""
@@ -129,6 +147,8 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
        
         self.stance_idx = new_stance_idx
 
+        #expand to N envs
+        self.tp = torch.full((self.env.num_envs,), tp, device=self.device)
         if tp < 0.5:
             self.phase_var = 2 * tp
         else:

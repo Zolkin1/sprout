@@ -102,8 +102,8 @@ class G1StairObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
-        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hlip_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hlip_ref"})
 
         step_duration = ObsTerm(
             func=mdp.step_duration,
@@ -134,8 +134,8 @@ class G1StairObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
-        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hlip_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hlip_ref"})
 
         step_duration = ObsTerm(
             func=mdp.step_duration,
@@ -157,3 +157,11 @@ class G1StairObservationsCfg:
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class G1StairHZDObservationsCfg(G1StairObservationsCfg):
+    class PolicyCfg(G1StairObservationsCfg.PolicyCfg):
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"},scale=1.0)
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
+    policy: PolicyCfg = PolicyCfg()

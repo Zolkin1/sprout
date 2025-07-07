@@ -55,24 +55,3 @@ def progressive_x_stairs_terrain(
     return meshes_list, origin
 
 
-
-
-def get_step_height_at_y(y: float, cfg: "MeshProgressiveYStairsTerrainCfg") -> float:
-    """
-    Given a y-coordinate, return the step height at that position.
-    """
-    usable_y = y - cfg.border_width
-    step_depth = cfg.step_width
-    terrain_length = cfg.size[1] - 2 * cfg.border_width
-    num_steps = int(terrain_length // step_depth)
-
-    if usable_y < 0:
-        return cfg.step_height_range[0]
-    elif usable_y >= terrain_length:
-        return cfg.step_height_range[1]
-
-    # Step index along y
-    step_idx = int(usable_y // step_depth)
-    # Interpolate height
-    alpha = step_idx / max(num_steps - 1, 1)
-    return (1 - alpha) * cfg.step_height_range[0] + alpha * cfg.step_height_range[1]

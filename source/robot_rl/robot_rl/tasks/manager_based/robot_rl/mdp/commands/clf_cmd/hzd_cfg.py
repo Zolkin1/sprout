@@ -208,3 +208,26 @@ class GaitLibraryHZDCommandCfg(CommandTermCfg):
     gait_library_path: str = "source/robot_rl/robot_rl/assets/robots/gait_library/"
     config_name: str = "single_support_config"  # Base name for configuration files
     gait_velocity_ranges: Union[dict, tuple] = (0.1, 0.2, 0.1)  # (min_vel, max_vel, step) in m/s
+
+
+@configclass
+class StairGaitLibraryHZDCommandCfg(CommandTermCfg):
+    """
+    Configuration for the StairGaitLibraryHZDCommandTerm (height-based gait selection).
+    """
+    class_type: type = GaitLibraryHZDCommandTerm
+    asset_name: str = "robot"
+    foot_body_name: str = ".*_ankle_roll_link"
+    num_outputs: int = 21
+    bez_deg: int = 5
+    resampling_time_range: tuple[float, float] = (5.0, 15.0)
+    debug_vis: bool = False
+    trajectory_tracking_visualizer_cfg: dict = {}
+    Q_weights = HZD_EE_Q_weights_GL
+    R_weights = HZD_EE_R_weights_GL
+
+    # Gait library specific parameters
+    trajectory_type: str = "end_effector"  # "joint" or "end_effector"
+    gait_library_path: str = "source/robot_rl/robot_rl/assets/robots/gait_library/"
+    config_name: str = "stair_config_solution"  # Base name for configuration files
+    gait_height_ranges: Union[dict, tuple] = (0.01, 0.12, 0.01)  # (min_height, max_height, step) in m

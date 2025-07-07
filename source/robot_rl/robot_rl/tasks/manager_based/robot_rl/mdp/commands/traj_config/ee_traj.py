@@ -232,7 +232,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 
             elif constraint_type == "joint":
                 output_dim = 1
-                joint_name = spec["joint_name"]
+                joint_name = spec["joint_names"]
                 # Generate metric name for joint
                 metric_name = f"joint_{joint_name}"
                 self.axis_names.append({

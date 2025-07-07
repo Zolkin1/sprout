@@ -80,7 +80,7 @@ def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
     return v
         
 
-def stair_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     phase = 2*torch.pi * cmd.tp
     sphase = torch.sin(phase)
@@ -90,7 +90,7 @@ def stair_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     return sphase
 
-def stair_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     phase = 2*torch.pi * cmd.tp
     cphase = torch.cos(phase)

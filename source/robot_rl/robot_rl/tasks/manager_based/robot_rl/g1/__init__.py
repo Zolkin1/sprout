@@ -186,6 +186,19 @@ if not _registered:
         },
     )
 
+    gym.register(
+        id="G1-stair-hzd-GL",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryStairEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        },
+    )
+
+
+
     _registered = True
 
 

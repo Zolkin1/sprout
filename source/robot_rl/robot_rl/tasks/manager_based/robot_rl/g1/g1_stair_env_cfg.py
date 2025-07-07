@@ -233,12 +233,6 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         # self.observations.policy.step_duration.params["command_name"] = "hzd_ref"
         # self.observations.critic.step_duration.params["command_name"] = "hzd_ref"
 
-        self.observations.policy.sin_phase = ObsTerm(func=mdp.stair_sin_phase, params={"command_name": "hzd_ref"})
-        self.observations.policy.cos_phase = ObsTerm(func=mdp.stair_cos_phase, params={"command_name": "hzd_ref"})
-
-        self.observations.critic.sin_phase = ObsTerm(func=mdp.stair_sin_phase, params={"command_name": "hzd_ref"})
-        self.observations.critic.cos_phase = ObsTerm(func=mdp.stair_cos_phase, params={"command_name": "hzd_ref"})
-
         self.observations.critic.step_duration = None
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
         self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"

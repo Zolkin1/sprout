@@ -7,7 +7,7 @@ import math
 from .base_traj import BaseTrajectoryConfig
 from .ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker
 from .jt_traj import JointTrajectoryConfig
-
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x
 
 def _ncr(n, r):
     return math.comb(n, r)
@@ -151,8 +151,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
 
                # Use velocity in cm/s as gait name
                speed_cms = int(round(vel * 100))
-               gait_name = f"gait_{speed_cms}cms"
-               gait_ranges[gait_name] = (min_range, max_range)
+               gait_ranges[f"gait_{speed_cms}cms"] = (min_range, max_range)
 
           return gait_ranges
 
@@ -169,7 +168,8 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         min_vel, max_vel = self.gait_velocity_ranges[gait_name]
         # Use the midpoint of the velocity range and convert to cm/s
         speed_ms = (min_vel + max_vel) / 2
-        speed_cms = int(speed_ms * 100)  # Convert m/s to cm/s
+        speed_cms = round(speed_ms * 100)  # Convert m/s to cm/s
+
         return speed_cms
     
     def _speed_cms_to_gait_name(self, speed_cms: int) -> str:
@@ -400,7 +400,6 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         config = self._gait_cache[first_gait]
         return config.get_actual_traj(hzd_cmd)
     
-    
     def get_available_gaits(self) -> List[str]:
         """Get list of available gait names."""
         return list(self.gait_velocity_ranges.keys())
@@ -426,4 +425,61 @@ class GaitLibraryJointConfig(GaitLibraryTrajectoryConfig):
     def __init__(self, gait_library_path: str, 
                  gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
                  config_name: str = "single_support"):
-        super().__init__(gait_library_path, gait_velocity_ranges, "joint", config_name) 
+        super().__init__(gait_library_path, gait_velocity_ranges, "joint", config_name)
+
+
+class StairGaitLibraryTrajectoryConfig(GaitLibraryTrajectoryConfig):
+    """Gait library for stairs: selects gait based on stair height instead of velocity."""
+    def __init__(self, gait_library_path, gait_height_ranges, trajectory_type="end_effector", config_name="single_support"):
+        
+        # Pass dummy velocity ranges to parent (not used)
+     #    dummy_velocity_ranges = {name: (0, 1) for name in gait_height_ranges}
+
+        min_vel, max_vel, step = gait_height_ranges
+        generated_gait_height_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
+        self.gait_height_ranges = generated_gait_height_ranges
+
+        super().__init__(gait_library_path, generated_gait_height_ranges, trajectory_type, config_name)
+
+    def select_gaits_by_height(self, stair_heights: torch.Tensor) -> torch.Tensor:
+        gait_names = sorted(self.gait_height_ranges.keys(), key=lambda n: self.gait_height_ranges[n][0])
+        boundaries = torch.tensor(
+            [self.gait_height_ranges[name][1] for name in gait_names[:-1]],
+            device=stair_heights.device,
+            dtype=stair_heights.dtype,
+        )
+        gait_indices = torch.bucketize(stair_heights, boundaries, right=False)
+        gait_indices = torch.clamp(gait_indices, 0, len(gait_names) - 1)
+        return gait_indices
+
+#     def _gait_name_to_speed_cms(self, gait_name: str) -> int:
+#         """Convert gait name to speed in cm/s based on velocity ranges."""
+#         min_vel, max_vel = self.gait_velocity_ranges[gait_name]
+#         # Use the midpoint of the velocity range and convert to cm/s
+#         speed_ms = (min_vel + max_vel) / 2
+#         speed_cms = int(speed_ms * 100)  # Convert m/s to cm/s
+#         return speed_cms
+    def get_ref_traj(self, hzd_cmd):
+        # Get stair heights from hzd_cmd (assumes hzd_cmd.z_height exists)
+
+        global_x = hzd_cmd.robot.data.root_pos_w[:, 0]
+        cfg = hzd_cmd.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
+        terrain_importer = hzd_cmd.env.scene.terrain
+        terrain_origins = terrain_importer.terrain_origins   # (rows, cols, 3)
+        cur_x = global_x - terrain_origins[:,:,0]
+        stair_heights = get_step_height_at_x(cur_x,cfg)
+        
+        tau = torch.tensor([hzd_cmd.phase_var], device=stair_heights.device)
+        step_dur = torch.tensor([self.T], dtype=torch.float32, device=stair_heights.device)
+        if hzd_cmd.stance_idx == 1:
+            control_points = self.right_coeffs_batched
+        else:
+            control_points = self.left_coeffs_batched
+        tau_expanded = tau.expand(control_points.shape[0])
+        step_dur_expanded = step_dur.expand(control_points.shape[0])
+        ref_pos = bezier_deg_batched(0, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
+        ref_vel = bezier_deg_batched(1, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
+        gait_indices = self.select_gaits_by_height(stair_heights)
+        des_pos = ref_pos[gait_indices.view(-1)]
+        des_vel = ref_vel[gait_indices.view(-1)]
+        return des_pos, des_vel
