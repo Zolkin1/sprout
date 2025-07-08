@@ -9,13 +9,27 @@ from isaaclab.utils import configclass
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.terrains.trimesh.utils import make_border
-from robot_rl.tasks.manager_based.robot_rl.terrains.stair import progressive_x_stairs_terrain
-
-
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair import progressive_x_stairs_terrain, single_staircase_terrain
 
 
 @configclass
-class MeshProgressiveYStairsTerrainCfg(SubTerrainBaseCfg):
+class MeshUniformXStairsTerrainCfg(SubTerrainBaseCfg):
+    """Configuration for a uniform staircase along +x direction (fixed step height)."""
+
+    function = single_staircase_terrain  # <- make sure this points to your updated function
+
+    step_height_range: tuple[float, float] = (0.03, 0.15)
+    """Range used for selecting step height from difficulty."""
+
+    step_width: float = 0.25
+    """The depth of each step (in x-direction) in meters."""
+
+    border_width: float = 0.0
+    """Border around the terrain in meters."""
+
+
+@configclass
+class MeshProgressiveXStairsTerrainCfg(SubTerrainBaseCfg):
     """Configuration for a long staircase with progressively taller steps along +y."""
 
     function = progressive_x_stairs_terrain
@@ -34,7 +48,7 @@ import torch
 from typing import Union
 
 def get_step_height_at_x(
-    x_vals: torch.Tensor, cfg: "MeshProgressiveYStairsTerrainCfg"
+    x_vals: torch.Tensor, cfg: "MeshProgressiveXStairsTerrainCfg"
 ) -> torch.Tensor:
     """
     Given a batch of x-coordinates, return the cumulative step height at each x
@@ -81,3 +95,11 @@ def get_step_height_at_x(
     return heights
 
 
+def get_uniform_stair_step_height_from_env(terrain_origins, cfg: "MeshUniformXStairsTerrainCfg") -> torch.Tensor:
+    """
+    Estimate step height from terrain origin and known step depth.
+    Assumes uniform stair steps and that terrain origin.z = -total_height.
+    """
+    origin_z = -terrain_origins[:,2]  # negate because origin.z = -cum_z
+    num_steps = int((cfg.size[0] - 2 * cfg.border_width) // cfg.step_width)
+    return (origin_z / num_steps) 

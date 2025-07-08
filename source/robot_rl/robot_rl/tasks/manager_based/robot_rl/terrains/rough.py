@@ -9,16 +9,17 @@ import isaaclab.terrains as terrain_gen
 
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 
-from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import MeshProgressiveYStairsTerrainCfg
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import MeshUniformXStairsTerrainCfg
 
 CUSTOM_STAIR_CFG = TerrainGeneratorCfg(
-    size=(15.0, 10.0),
+    size=(10.0, 10.0),
+    num_rows=10,
     border_width=0.0,
     sub_terrains={
-        "stairs": MeshProgressiveYStairsTerrainCfg(
-            size=(15.0, 10.0),
-            border_width=0.0,
-            step_height_range=(0.0, 0.15),
+        "stairs": MeshUniformXStairsTerrainCfg(
+            size=(5.0, 10.0),
+            border_width=0.5,
+            step_height_range=(0.0, 0.1),
             step_width=0.25,
         ),
     },

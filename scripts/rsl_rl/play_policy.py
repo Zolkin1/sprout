@@ -190,6 +190,8 @@ def extract_reference_trajectory(env, log_vars,command_name):
             # Extract axis names from end effector config
             if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
                 results[var] = ref.ee_config.axis_names
+            elif hasattr(ref, 'gait_config') and hasattr(ref.gait_config, '_gait_cache'):
+                results[var] = ref.gait_config._gait_cache[list(ref.gait_config._gait_cache.keys())[0]].axis_names
             else:
                 results[var] = None
         else:
@@ -398,6 +400,7 @@ def main():
     
     # Add dynamic error metrics based on the command type
     trajectory_type = 'end_effector'
+    
     if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
         # End effector trajectory case - add axis error metrics
         trajectory_type = 'end_effector'
@@ -417,7 +420,6 @@ def main():
         trajectory_type = 'joint'
         for joint_name in ref.robot.joint_names:
             log_vars.append(f"error_{joint_name}")
-    
     
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)

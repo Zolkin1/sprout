@@ -257,8 +257,8 @@ class G1HZDStairEnvCfg(G1StairEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
         self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
-        # self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
-        self.curriculum.terrain_levels = None
+        self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
+        # self.curriculum.terrain_levels = None
 
         self.events.reset_base.params = {
             
@@ -305,7 +305,7 @@ class G1HZDStairEnvPlay(G1HZDStairEnvCfg):
         # self.events.reset_base.params["pose_range"] = {"x": (0,0), "y": (0,0), "yaw": (0,0)
         # self.commands.base_velocity.ranges.lin_vel_x = (0.4,0.4)
         # self.scene.terrain.terrain_generator.sub_terrains["pyramid_stairs"].step_height_range = (0.05,0.05)
-        # self.scene.terrain.terrain_generator.num_rows = 1
+        # self.scene.terrain.terrain_generator.num_rows = 2
         # self.scene.terrain.terrain_generator.num_cols = 2
 
 @configclass

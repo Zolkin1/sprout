@@ -7,7 +7,7 @@ import math
 from .base_traj import BaseTrajectoryConfig
 from .ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker
 from .jt_traj import JointTrajectoryConfig
-from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x, get_uniform_stair_step_height_from_env
 
 def _ncr(n, r):
     return math.comb(n, r)
@@ -462,13 +462,10 @@ class StairGaitLibraryTrajectoryConfig(GaitLibraryTrajectoryConfig):
     def get_ref_traj(self, hzd_cmd):
         # Get stair heights from hzd_cmd (assumes hzd_cmd.z_height exists)
 
-        global_x = hzd_cmd.robot.data.root_pos_w[:, 0]
         cfg = hzd_cmd.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
-        terrain_importer = hzd_cmd.env.scene.terrain
-        terrain_origins = terrain_importer.terrain_origins   # (rows, cols, 3)
-        cur_x = global_x - terrain_origins[:,:,0]
-        stair_heights = get_step_height_at_x(cur_x,cfg)
-        
+        env_origins = hzd_cmd.env.scene.env_origins
+        stair_heights = get_uniform_stair_step_height_from_env(env_origins,cfg)
+     #    import pdb; pdb.set_trace()
         tau = torch.tensor([hzd_cmd.phase_var], device=stair_heights.device)
         step_dur = torch.tensor([self.T], dtype=torch.float32, device=stair_heights.device)
         if hzd_cmd.stance_idx == 1:
@@ -480,6 +477,7 @@ class StairGaitLibraryTrajectoryConfig(GaitLibraryTrajectoryConfig):
         ref_pos = bezier_deg_batched(0, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
         ref_vel = bezier_deg_batched(1, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
         gait_indices = self.select_gaits_by_height(stair_heights)
+
         des_pos = ref_pos[gait_indices.view(-1)]
         des_vel = ref_vel[gait_indices.view(-1)]
         return des_pos, des_vel

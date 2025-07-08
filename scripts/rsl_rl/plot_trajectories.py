@@ -278,244 +278,188 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             return axs[idx]
         return axs[idx // n_cols, idx % n_cols]
 
-    env_ids = 0
+    # Hard code number of envs to plot
+    N_ENVS_TO_PLOT = 2
+    env_ids = list(range(N_ENVS_TO_PLOT))
 
-    if "stance_foot_pos" and "stance_foot_ori" in processed_data:
-        pos_data = processed_data["stance_foot_pos"]
-        ori_data = processed_data["stance_foot_ori"]
-        pos_data_0 = processed_data["stance_foot_pos_0"]
-        ori_data_0 = processed_data["stance_foot_ori_0"]
-        # Assume shape: (timesteps, envs, 3) for both
-        env_ids = 0  # or loop over envs if you want
-
-        fig, axs = plt.subplots(2, 3, figsize=(15, 6))
-        fig.suptitle("Stance Foot Position and Orientation", fontsize=16)
-
-        # Position
-        pos_labels = ["X", "Y", "Z"]
-        for i in range(3):
-            ax = axs[0, i]
-            ax.plot(time_steps, pos_data[:, env_ids, i], label=f"Position {pos_labels[i]}", linewidth=2)
-            ax.plot(time_steps, pos_data_0[:, env_ids, i], label=f"Initial {pos_labels[i]}", linestyle='--', linewidth=2)
-            ax.set_title(f"Position {pos_labels[i]}")
-            ax.set_xlabel("Time Steps")
-            ax.set_ylabel("m")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-
-        # Orientation
-        ori_labels = ["Roll", "Pitch", "Yaw"]
-        for i in range(3):
-            ax = axs[1, i]
-            ax.plot(time_steps, ori_data[:, env_ids, i], label=f"Orientation {ori_labels[i]}", linewidth=2)
-            ax.plot(time_steps, ori_data_0[:, env_ids, i], label=f"Initial {ori_labels[i]}", linestyle='--', linewidth=2)
-            ax.set_title(f"Orientation {ori_labels[i]}")
-            ax.set_xlabel("Time Steps")
-            ax.set_ylabel("rad")
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, "stance_foot_pos_ori.png"), dpi=300, bbox_inches="tight")
-
-    # Plot positions (y_out vs y_act)
-    if 'y_out' in processed_data and 'y_act' in processed_data:
-        n_dims = processed_data['y_out'].shape[2]
-        print(f"Reference dimension: {n_dims}")
-        
-        # Update title based on trajectory type
-        if trajectory_type == 'end_effector':
-            title = 'Reference vs Actual End Effector Positions'
-        else:
-            title = 'Reference vs Actual Joint Positions'
-            if n_dims == 21:
-                print("Reference is 21 dimensions - using G1 joint names")
-            else:
-                print(f"Warning: Reference is {n_dims} dimensions, expected 21")
-        
-        n_cols = 4
-        n_rows = (n_dims + n_cols - 1) // n_cols
-        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
-        fig.suptitle(title, fontsize=16)
-        axs = np.array(axs)
-        for i in range(n_dims):
-            ax = get_ax(axs, i, n_cols)
-            ax.plot(time_steps, processed_data['y_out'][:, env_ids, i], label='Reference', color='blue', linewidth=2)
-            ax.plot(time_steps, processed_data['y_act'][:, env_ids, i], label='Actual', color='red', linestyle='--', linewidth=2)
-            # Use label if available, else fallback
-            label = state_labels['y_out'][i] if i < len(state_labels['y_out']) else f'Dimension {i}'
-            unit = units['y_out'][i] if i < len(units['y_out']) else ''
-            ax.set_title(label, fontsize=10)
-            ax.set_xlabel('Time Steps')
-            ax.set_ylabel(f'Position ({unit})')
-            ax.grid(True, alpha=0.3)
-            if i == 0:
+    for env_id in env_ids:
+        # --- Stance Foot Position and Orientation ---
+        if "stance_foot_pos" and "stance_foot_ori" in processed_data:
+            pos_data = processed_data["stance_foot_pos"]
+            ori_data = processed_data["stance_foot_ori"]
+            pos_data_0 = processed_data["stance_foot_pos_0"]
+            ori_data_0 = processed_data["stance_foot_ori_0"]
+            fig, axs = plt.subplots(2, 3, figsize=(15, 6))
+            fig.suptitle(f"Stance Foot Position and Orientation (Env {env_id})", fontsize=16)
+            pos_labels = ["X", "Y", "Z"]
+            for i in range(3):
+                ax = axs[0, i]
+                ax.plot(time_steps, pos_data[:, env_id, i], label=f"Position {pos_labels[i]}", linewidth=2)
+                ax.plot(time_steps, pos_data_0[:, env_id, i], label=f"Initial {pos_labels[i]}", linestyle='--', linewidth=2)
+                ax.set_title(f"Position {pos_labels[i]}")
+                ax.set_xlabel("Time Steps")
+                ax.set_ylabel("m")
+                ax.grid(True, alpha=0.3)
                 ax.legend()
-        # Hide unused subplots
-        for i in range(n_dims, n_rows * n_cols):
-            ax = get_ax(axs, i, n_cols)
-            ax.set_visible(False)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, 'positions.png'), dpi=300, bbox_inches='tight')
-
-    # Plot velocities (dy_out vs dy_act)
-    if 'dy_out' in processed_data and 'dy_act' in processed_data:
-        n_dims = processed_data['dy_out'].shape[2]
-        
-        # Update title based on trajectory type
-        if trajectory_type == 'end_effector':
-            title = 'Reference vs Actual End Effector Velocities'
-        else:
-            title = 'Reference vs Actual Joint Velocities'
-            
-        n_cols = 4
-        n_rows = (n_dims + n_cols - 1) // n_cols
-        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
-        fig.suptitle(title, fontsize=16)
-        axs = np.array(axs)
-        for i in range(n_dims):
-            ax = get_ax(axs, i, n_cols)
-            ax.plot(time_steps, processed_data['dy_out'][:, env_ids, i], label='Reference', color='blue', linewidth=2)
-            ax.plot(time_steps, processed_data['dy_act'][:, env_ids, i], label='Actual', color='red', linestyle='--', linewidth=2)
-            label = state_labels['dy_out'][i] if i < len(state_labels['dy_out']) else f'Dimension {i}'
-            unit = units['dy_out'][i] if i < len(units['dy_out']) else ''
-            ax.set_title(label, fontsize=10)
-            ax.set_xlabel('Time Steps')
-            ax.set_ylabel(f'Velocity ({unit})')
-            ax.grid(True, alpha=0.3)
-            if i == 0:
+            ori_labels = ["Roll", "Pitch", "Yaw"]
+            for i in range(3):
+                ax = axs[1, i]
+                ax.plot(time_steps, ori_data[:, env_id, i], label=f"Orientation {ori_labels[i]}", linewidth=2)
+                ax.plot(time_steps, ori_data_0[:, env_id, i], label=f"Initial {ori_labels[i]}", linestyle='--', linewidth=2)
+                ax.set_title(f"Orientation {ori_labels[i]}")
+                ax.set_xlabel("Time Steps")
+                ax.set_ylabel("rad")
+                ax.grid(True, alpha=0.3)
                 ax.legend()
-        for i in range(n_dims, n_rows * n_cols):
-            ax = get_ax(axs, i, n_cols)
-            ax.set_visible(False)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, 'velocities.png'), dpi=300, bbox_inches='tight')
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f"stance_foot_pos_ori_env{env_id}.png"), dpi=300, bbox_inches="tight")
+            plt.close(fig)
 
-    # Plot base velocity
-    if 'base_velocity' in processed_data:
-        n_dims = processed_data['base_velocity'].shape[2]
-        fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3))
-        fig.suptitle('Base Velocity', fontsize=16)
-        for i in range(n_dims):
-            ax = axs[i] if n_dims > 1 else axs
-            ax.plot(time_steps, processed_data['base_velocity'][:, env_ids, i], linewidth=2)
-            label = state_labels['base_velocity'][i] if i < len(state_labels['base_velocity']) else f'Component {i}'
-            unit = units['base_velocity'][i] if i < len(units['base_velocity']) else ''
-            ax.set_title(label)
-            ax.set_xlabel('Time Steps')
-            ax.set_ylabel(f'Velocity ({unit})')
-            ax.grid(True, alpha=0.3)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, 'base_velocity.png'), dpi=300, bbox_inches='tight')
-
-    # Plot v and vdot as two subplots in one figure
-    if 'v' in processed_data and 'vdot' in processed_data:
-        v_data = processed_data['v']
-        vdot_data = processed_data['vdot']
-        fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-        
-        axs[0].plot(time_steps, v_data[:, env_ids], label='CLF v', color='green', linewidth=2)
-        axs[0].set_title('CLF (v)')
-        axs[0].set_ylabel(units['v'][0] if 'v' in units else '')
-        axs[0].grid(True, alpha=0.3)
-        axs[0].legend()
-        axs[0].set_ylim(0, 20.0)  # Hard-coded ylim for CLF v
-        
-        axs[1].plot(time_steps, vdot_data[:, env_ids], label='CLF vdot ', color='magenta', linewidth=2)
-        axs[1].set_title('CLF (v̇)')
-        axs[1].set_xlabel('Time Steps')
-        axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
-        axs[1].grid(True, alpha=0.3)
-        axs[1].legend()
-        axs[1].set_ylim(-100.0, 100.0)  # Hard-coded ylim for CLF vdot
-
-        alpha = 1.0
-        decay = alpha * v_data[:, env_ids] + vdot_data[:, env_ids]
-        axs[2].plot(time_steps, decay, label='CLF Decay', color='orange', linewidth=2)
-        axs[2].set_title('CLF Decay (v + αv̇)')
-        axs[2].set_xlabel('Time Steps')
-        axs[2].set_ylabel('Decay Rate')
-        axs[2].grid(True, alpha=0.3)
-        axs[2].legend()
-        axs[2].set_ylim(-100.0, 100.0)  # Hard-coded ylim for CLF decay
-        
-        plt.tight_layout()
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, 'v_and_vdot.png'), dpi=300, bbox_inches='tight')
-
-    # Plot error metrics
-    error_metrics = [key for key in processed_data.keys() if key.startswith('error_')]
-    if error_metrics:
-        n_metrics = len(error_metrics)
-        n_cols = 4
-        n_rows = (n_metrics + n_cols - 1) // n_cols
-        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
-        fig.suptitle('Error Metrics', fontsize=16)
-        axs = np.array(axs)
-        
-        for i, metric in enumerate(error_metrics):
-            ax = get_ax(axs, i, n_cols)
-            data = processed_data[metric]
-            # Handle both 1D and 2D arrays
-            if data.ndim > 1:
-                plot_data = data[:, env_ids]
+        # --- Positions (y_out vs y_act) ---
+        if 'y_out' in processed_data and 'y_act' in processed_data:
+            n_dims = processed_data['y_out'].shape[2]
+            if trajectory_type == 'end_effector':
+                title = f'Reference vs Actual End Effector Positions (Env {env_id})'
             else:
-                plot_data = data
-            ax.plot(time_steps, plot_data, label=error_labels.get(metric, metric), linewidth=2)
-            ax.set_title(error_labels.get(metric, metric), fontsize=10)
-            ax.set_xlabel('Time Steps')
-            ax.set_ylabel(error_units.get(metric, ''))
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-        
-        # Hide unused subplots
-        for i in range(n_metrics, n_rows * n_cols):
-            ax = get_ax(axs, i, n_cols)
-            ax.set_visible(False)
-        
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        if save_dir:
-            plt.savefig(os.path.join(save_dir, 'error_metrics.png'), dpi=300, bbox_inches='tight')
-        # plt.show()
+                title = f'Reference vs Actual Joint Positions (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['y_out'][:, env_id, i], label='Reference', linewidth=2)
+                ax.plot(time_steps, processed_data['y_act'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
+                label = state_labels['y_out'][i] if i < len(state_labels['y_out']) else f'Dimension {i}'
+                unit = units['y_out'][i] if i < len(units['y_out']) else ''
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel(f'Position ({unit})')
+                ax.grid(True, alpha=0.3)
+                if i == 0:
+                    ax.legend()
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'positions_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
 
-    # Plot log_terms.pkl if it exists
-    # if save_dir:
-    #     log_terms_path = os.path.join(save_dir, '..', 'log_terms.pkl')
-    #     log_terms_path = os.path.abspath(log_terms_path)
-    #     if os.path.exists(log_terms_path):
-    #         with open(log_terms_path, 'rb') as f:
-    #             log_terms_list = pickle.load(f)
-    #         if len(log_terms_list) > 0:
-    #             # Get all keys
-    #             keys = list(log_terms_list[0].keys())
-    #             n_keys = len(keys)
-    #             n_cols = 3
-    #             n_rows = (n_keys + n_cols - 1) // n_cols
-    #             fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
-    #             fig.suptitle('Log Terms', fontsize=16)
-    #             axs = np.array(axs)
-    #             for i, key in enumerate(keys):
-    #                 ax = axs[i // n_cols, i % n_cols] if n_rows > 1 or n_cols > 1 else axs
-    #                 # Gather the series for this key
-    #                 series = [entry.get(key, None) for entry in log_terms_list]
-    #                 # Convert to numpy array, handle tensors
-    #                 series = np.array([v.item() if hasattr(v, 'item') else v for v in series])
-    #                 ax.plot(np.arange(len(series)), series, label=key)
-    #                 ax.set_title(key)
-    #                 ax.set_xlabel('Time Steps')
-    #                 ax.grid(True)
-    #                 ax.legend()
-    #             # Hide unused subplots
-    #             for i in range(n_keys, n_rows * n_cols):
-    #                 ax = axs[i // n_cols, i % n_cols]
-    #                 ax.set_visible(False)
-    #             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    #             plt.savefig(os.path.join(save_dir, 'log_terms.png'), dpi=300, bbox_inches='tight')
-    #             plt.show()
+        # --- Velocities (dy_out vs dy_act) ---
+        if 'dy_out' in processed_data and 'dy_act' in processed_data:
+            n_dims = processed_data['dy_out'].shape[2]
+            if trajectory_type == 'end_effector':
+                title = f'Reference vs Actual End Effector Velocities (Env {env_id})'
+            else:
+                title = f'Reference vs Actual Joint Velocities (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['dy_out'][:, env_id, i], label='Reference', linewidth=2)
+                ax.plot(time_steps, processed_data['dy_act'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
+                label = state_labels['dy_out'][i] if i < len(state_labels['dy_out']) else f'Dimension {i}'
+                unit = units['dy_out'][i] if i < len(units['dy_out']) else ''
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel(f'Velocity ({unit})')
+                ax.grid(True, alpha=0.3)
+                if i == 0:
+                    ax.legend()
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'velocities_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- Base Velocity ---
+        if 'base_velocity' in processed_data:
+            n_dims = processed_data['base_velocity'].shape[2]
+            fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3))
+            fig.suptitle(f'Base Velocity (Env {env_id})', fontsize=16)
+            for i in range(n_dims):
+                ax = axs[i] if n_dims > 1 else axs
+                ax.plot(time_steps, processed_data['base_velocity'][:, env_id, i], linewidth=2)
+                label = state_labels['base_velocity'][i] if i < len(state_labels['base_velocity']) else f'Component {i}'
+                unit = units['base_velocity'][i] if i < len(units['base_velocity']) else ''
+                ax.set_title(label)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel(f'Velocity ({unit})')
+                ax.grid(True, alpha=0.3)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'base_velocity_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- v and vdot ---
+        if 'v' in processed_data and 'vdot' in processed_data:
+            v_data = processed_data['v']
+            vdot_data = processed_data['vdot']
+            fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+            axs[0].plot(time_steps, v_data[:, env_id], label='CLF v', linewidth=2)
+            axs[0].set_title('CLF (v)')
+            axs[0].set_ylabel(units['v'][0] if 'v' in units else '')
+            axs[0].grid(True, alpha=0.3)
+            axs[0].legend()
+            axs[0].set_ylim(0, 20.0)
+            axs[1].plot(time_steps, vdot_data[:, env_id], label='CLF vdot', linewidth=2)
+            axs[1].set_title('CLF (v̇)')
+            axs[1].set_xlabel('Time Steps')
+            axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
+            axs[1].grid(True, alpha=0.3)
+            axs[1].legend()
+            axs[1].set_ylim(-100.0, 100.0)
+            alpha = 1.0
+            decay = alpha * v_data[:, env_id] + vdot_data[:, env_id]
+            axs[2].plot(time_steps, decay, label='CLF Decay', linewidth=2)
+            axs[2].set_title('CLF Decay (v + αv̇)')
+            axs[2].set_xlabel('Time Steps')
+            axs[2].set_ylabel('Decay Rate')
+            axs[2].grid(True, alpha=0.3)
+            axs[2].legend()
+            axs[2].set_ylim(-100.0, 100.0)
+            plt.tight_layout()
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'v_and_vdot_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- Error Metrics ---
+        error_metrics = [key for key in processed_data.keys() if key.startswith('error_')]
+        if error_metrics:
+            n_metrics = len(error_metrics)
+            n_cols = 4
+            n_rows = (n_metrics + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(f'Error Metrics (Env {env_id})', fontsize=16)
+            axs = np.array(axs)
+            for i, metric in enumerate(error_metrics):
+                ax = get_ax(axs, i, n_cols)
+                data = processed_data[metric]
+                if data.ndim > 1:
+                    plot_data = data[:, env_id]
+                    ax.plot(time_steps, plot_data, label=error_labels.get(metric, metric), linewidth=2)
+                else:
+                    ax.plot(time_steps, data, label=error_labels.get(metric, metric), linewidth=2)
+                ax.set_title(error_labels.get(metric, metric), fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel(error_units.get(metric, ''))
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+            for i in range(n_metrics, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'error_metrics_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
 
 
 def plot_hzd_trajectories(data, save_dir=None):
