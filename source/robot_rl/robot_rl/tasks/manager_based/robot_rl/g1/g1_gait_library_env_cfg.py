@@ -69,7 +69,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
 class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
     """Configuration for the G1 environment with gait library."""
-    observations: G1StairHZDObservationsCfg = G1StairHZDObservationsCfg()
+    
 
     def __post_init__(self):
         # Post init of parent
@@ -77,6 +77,7 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
         self.episode_length_s = 50.0
 
         self.commands = G1GaitLibraryStairCommandsCfg()
+        self.observations = G1StairHZDObservationsCfg()
         # Update observation and reward command names
         self.observations.policy.step_duration = None
         self.observations.critic.step_duration = None
