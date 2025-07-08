@@ -166,6 +166,6 @@ class G1StairObservationsCfg:
 @configclass
 class G1StairHZDObservationsCfg(G1StairObservationsCfg):
     class PolicyCfg(G1StairObservationsCfg.PolicyCfg):
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"},scale=1.0)
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
+        ref_traj = ObsTerm(func=mdp.foot_ref_traj, params={"command_name": "hzd_ref"},scale=20.0)
+        act_traj = ObsTerm(func=mdp.foot_act_traj, params={"command_name": "hzd_ref"},scale=20.0)
     policy: PolicyCfg = PolicyCfg()
