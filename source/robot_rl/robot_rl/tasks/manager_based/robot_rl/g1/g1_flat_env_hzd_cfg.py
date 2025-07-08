@@ -131,8 +131,8 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         # Scene
         ##
         # change terrain to flat
-        self.scene.terrain.terrain_type = "plane"
-        # self.scene.terrain.terrain_generator = ROUGH_FOR_FLAT_HZD_CFG
+        # self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = ROUGH_FOR_FLAT_HZD_CFG
         self.curriculum.terrain_levels = None
         # no height scan
         self.scene.height_scanner = None

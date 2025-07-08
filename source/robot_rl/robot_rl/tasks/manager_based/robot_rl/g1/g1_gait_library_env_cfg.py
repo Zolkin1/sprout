@@ -42,7 +42,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)
 
-        self.commands.step_period.period_range = (0.9, 0.9)
+        self.commands.step_period.period_range = (1.0, 1.0)
         
         # Update observation and reward command names
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
@@ -112,7 +112,7 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params = {
-            "pose_range": {"x": (0.0, 2.0), "y": (-5.0, 5.0), "yaw": (0, 0)},
+            "pose_range": {"x": (0.0, 10.0), "y": (-5.0, 5.0), "yaw": (0, 0)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),

@@ -49,10 +49,14 @@ class G1RoughLipObservationsCfg():
 
         foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
         foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=1)
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=1)
+        ref_traj = ObsTerm(
+            func=mdp.ref_traj,
+            params={"command_name": "hlip_ref"},
+            scale=tuple([5.0] * 12 + [0.1] * 9)
+        )
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=tuple([5.0] * 12 + [0.1] * 9))
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
         height_scan = None      # Removed - not supported yet
         contact_state = ObsTerm(
             func=mdp.contact_state,
@@ -71,8 +75,8 @@ class G1RoughLipObservationsCfg():
 @configclass
 class G1FlatHZDObservationsCfg(G1RoughLipObservationsCfg):
     class PolicyCfg(G1RoughLipObservationsCfg.PolicyCfg):
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"},scale=1.0)
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
+        ref_traj = ObsTerm(func=mdp.foot_ref_traj, params={"command_name": "hzd_ref"},scale=20.0)
+        act_traj = ObsTerm(func=mdp.foot_act_traj, params={"command_name": "hzd_ref"},scale=20.0)
     policy: PolicyCfg = PolicyCfg()
 
 
@@ -148,10 +152,10 @@ class G1StairObservationsCfg:
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel,scale=1.0)
         foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
         foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=0.1)
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=0.1)
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hlip_ref"},scale=tuple([5.0] * 12 + [0.1] * 9))
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=tuple([5.0] * 12 + [0.1] * 9))
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
        
 
     # observation groups
