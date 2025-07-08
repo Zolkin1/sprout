@@ -23,6 +23,23 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# def gaits_curriculum(
+#     env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 5000,
+#     vel_range: tuple[float, float] = (0.1, 0.5)
+# ) -> float:
+#     """Curriculum based on clf value"""
+#     cmd_term_cfg = env.command_manager.get_term_cfg("base_velocity")
+#     ref_cmd_term = env.command_manager.get_term("hzd_ref")
+#     sw_z_err = ref_cmd_term.metrics["left_foot_middle_ee_pos_z"]
+#     import pdb; pdb.set_trace()
+#     #increase the vel range if 
+
+#     new_vel_range = vel_range
+#     if env.common_step_counter % update_interval == 0:
+#         cmd_term_cfg.ranges.lin_vel_x = new_vel_range
+#         env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
+#     return cmd_term_cfg.ranges.lin_vel_x
+
 
 def clf_curriculum(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100,min_val: float = 20.0, min_clf_val: float = 10.0

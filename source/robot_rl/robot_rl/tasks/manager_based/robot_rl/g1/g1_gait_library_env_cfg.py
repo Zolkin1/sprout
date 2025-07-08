@@ -4,7 +4,8 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidComma
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1FlatHZDObservationsCfg, G1StairHZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_stair_env_cfg import G1StairEnvCfg, CUSTOM_STAIR_CFG
-
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from robot_rl.tasks.manager_based.robot_rl import mdp
 
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
@@ -59,12 +60,16 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         # self.curriculum.clf_curriculum = None
         self.rewards.clf_reward.params["max_clf"] = 40.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 40.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
-        self.curriculum.clf_curriculum.params["min_val"] = 1.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 1.0
-        self.curriculum.clf_curriculum.params["update_interval"] = 4000
+        self.curriculum.clf_curriculum.params["min_val"] = 2.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
+        self.curriculum.clf_curriculum.params["update_interval"] = 10000
+
+     #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
+     #                                          params={"vel_range": (0.1, 0.5),
+     #                                                  "update_interval": 4000})
 
 
 class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
@@ -137,6 +142,8 @@ class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
+        # self.scene.terrain.num_rows = 1
+        # self.scene.terrain.num_cols = 1
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
 
