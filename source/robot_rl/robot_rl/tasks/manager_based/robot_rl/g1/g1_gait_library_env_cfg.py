@@ -74,6 +74,7 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
+        self.episode_length_s = 50.0
 
         self.commands = G1GaitLibraryStairCommandsCfg()
         # Update observation and reward command names
@@ -112,7 +113,7 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params = {
-            "pose_range": {"x": (0.0, 10.0), "y": (-5.0, 5.0), "yaw": (0, 0)},
+            "pose_range": {"x": (0.0, 0.3), "y": (-5.0, 5.0), "yaw": (0, 0)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
@@ -139,3 +140,17 @@ class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
         self.scene.terrain.terrain_generator = None
 
 
+class G1GL_PlayStairEnvCfg(G1GaitLibraryStairEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+    commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+        self.scene.terrain.terrain_generator.size = (10.0, 10.0)
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].size = (10.0, 10.0)
+        self.observations.policy.enable_corruption = False
+        
+        
