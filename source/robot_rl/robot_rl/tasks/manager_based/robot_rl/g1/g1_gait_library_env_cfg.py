@@ -162,9 +162,22 @@ class G1GL_PlayStairEnvCfg(G1GaitLibraryStairEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
-        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.1, 0.1)
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.02, 0.02)
      #    self.scene.terrain.terrain_generator.size = (10.0, 10.0)
-     #    self.scene.terrain.terrain_generator.sub_terrains["stairs"].size = (10.0, 10.0)
+        flat_range = CUSTOM_STAIR_CFG.border_width *0.5
+        self.events.reset_base.params = {
+            "pose_range": {"x": (-flat_range, flat_range), "y": (-1.0, 1.0), "yaw": (0, 0)},
+            "velocity_range": {
+                "x": (0.5, 0.5),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        }
+
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].size = (2.0, 5.0)
         self.observations.policy.enable_corruption = False
         self.scene.terrain.terrain_generator.num_rows = 1
         
