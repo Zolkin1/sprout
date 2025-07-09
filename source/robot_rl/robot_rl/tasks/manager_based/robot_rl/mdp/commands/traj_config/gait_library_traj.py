@@ -382,6 +382,8 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         # Gather the selected trajectories
         des_pos = ref_pos[gait_indices]  # [N, jt_dim]
         des_vel = ref_vel[gait_indices]  # [N, jt_dim]
+
+        des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
         # import pdb; pdb.set_trace()
         return des_pos, des_vel
     
@@ -392,7 +394,8 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         config = self._gait_cache[first_gait]
         
         # Apply swing modifications for all environments
-        config._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        des_pos, des_vel = config._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        return des_pos, des_vel
     
     def get_actual_traj(self, hzd_cmd):
         """Get actual trajectory - use the first gait's method since they're all the same."""

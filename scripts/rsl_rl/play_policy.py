@@ -185,7 +185,7 @@ def extract_reference_trajectory(env, log_vars,command_name):
         elif var in ref.metrics:
             results[var] = ref.metrics[var]
         elif var == "base_velocity":
-            results[var] = unwrapped_env.command_manager.get_command("base_velocity")
+            results[var] = unwrapped_env.command_manager.get_command("base_velocity").clone()
         elif var == "axis_names":
             # Extract axis names from end effector config
             if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):

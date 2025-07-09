@@ -274,6 +274,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         for i in hzd_cmd.ori_idx_list:
             des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
 
+        return des_pos, des_vel
+
     def get_actual_traj(self, hzd_cmd):
         """Get actual trajectory from end effector tracker."""
         ee_tracker = hzd_cmd.ee_tracker
