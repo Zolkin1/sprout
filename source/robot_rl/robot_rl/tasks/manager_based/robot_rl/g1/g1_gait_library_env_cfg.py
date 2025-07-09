@@ -37,6 +37,8 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         # Post init of parent
         super().__post_init__()
         
+        self.observations.policy.ref_traj = None
+        self.observations.policy.act_traj = None
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (0.1, 0.5)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
@@ -60,12 +62,12 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         # self.curriculum.clf_curriculum = None
         self.rewards.clf_reward.params["max_clf"] = 40.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 80.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
         self.curriculum.clf_curriculum.params["min_val"] = 2.0
         self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
-        self.curriculum.clf_curriculum.params["update_interval"] = 10000
+        self.curriculum.clf_curriculum.params["update_interval"] = 8000
 
      #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
      #                                          params={"vel_range": (0.1, 0.5),
@@ -79,10 +81,13 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
-        self.episode_length_s = 50.0
+        self.episode_length_s = 20.0
 
         self.commands = G1GaitLibraryStairCommandsCfg()
         self.observations = G1StairHZDObservationsCfg()
+
+        self.observations.policy.ref_traj = None
+        self.observations.policy.act_traj = None
         # Update observation and reward command names
         self.observations.policy.step_duration = None
         self.observations.critic.step_duration = None
@@ -121,7 +126,7 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
         self.events.reset_base.params = {
             "pose_range": {"x": (-flat_range, flat_range), "y": (-5.0, 5.0), "yaw": (0, 0)},
             "velocity_range": {
-                "x": (0.0, 0.0),
+                "x": (-0.5, 0.5),
                 "y": (0.0, 0.0),
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
