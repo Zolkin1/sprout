@@ -20,6 +20,7 @@ ENVIRONMENTS = {
     "stair-hzd": "G1-stair-hzd",
     "flat-hzd-GL": "G1-flat-hzd-GL",
     "stair-hzd-GL": "G1-stair-hzd-GL",
+    "height-map": "G1-hzd-height-map",
 }
 
 def parse_args():

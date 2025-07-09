@@ -22,6 +22,7 @@ from rsl_rl.modules import (
     StudentTeacherRecurrent,
 )
 from robot_rl.network.actor_critic_cnn import ActorCriticCNN
+from robot_rl.network.actor_critic_transformer import ActorCriticTransformer
 from rsl_rl.utils import store_code_state
 
 
@@ -70,11 +71,12 @@ class CustomOnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        if policy_class.__name__ == "ActorCriticCNN":
+        if policy_class.__name__ == "ActorCriticCNN" or policy_class.__name__ == "ActorCriticTransformer":
             height_map_shape = self.policy_cfg.pop("height_map_shape")
-            policy: ActorCriticCNN = policy_class(
+            policy: ActorCriticCNN | ActorCriticTransformer = policy_class(
                 height_map_shape, num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
+ 
         else:
             policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
                 num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg

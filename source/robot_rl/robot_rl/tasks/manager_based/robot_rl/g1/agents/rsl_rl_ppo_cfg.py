@@ -107,6 +107,19 @@ class StairCNNPPOCfg(PPORunnerCfg):
     )
 
 @configclass
+class RoughTransformerPPOCfg(PPORunnerCfg):
+    policy = None
+    policy = CustomPPOActorCriticCfg(
+        class_name="ActorCriticTransformer",
+        init_noise_std=1.0,
+        activation="elu",
+        actor_hidden_dims=[256, 128],
+        critic_hidden_dims=[256, 128],
+        height_map_shape=(1, 25,25),
+    )
+
+        
+@configclass
 class GaitLibraryPPOCfg(PPORunnerCfg):
     # resume = True
     # resume_path = "/home/kli5/robot_rl/logs/g1_policies/flat-hzd-GL/g1/2025-07-05_07-55-09/model_5200.pt"

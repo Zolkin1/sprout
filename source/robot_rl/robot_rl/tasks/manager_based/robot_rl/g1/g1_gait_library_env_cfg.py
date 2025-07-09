@@ -4,8 +4,10 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidComma
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1FlatHZDObservationsCfg, G1StairHZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_stair_env_cfg import G1StairEnvCfg, CUSTOM_STAIR_CFG
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from isaaclab.sensors import  RayCasterCfg, patterns
 
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
@@ -72,6 +74,50 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
      #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
      #                                          params={"vel_range": (0.1, 0.5),
      #                                                  "update_interval": 4000})
+
+@configclass
+class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+
+        self.observations = G1StairObservationsCfg()
+        self.scene.height_scanner = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/pelvis",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            attach_yaw_only=True,
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.05, size=[1.2, 1.2]),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+
+        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
+       
+        self.observations.policy.ref_traj = None
+        self.observations.policy.act_traj = None
+        # Update observation and reward command names
+        self.observations.policy.step_duration = None
+        self.observations.critic.step_duration = None
+        # self.observations.policy.step_duration.params["command_name"] = "hzd_ref"
+        # self.observations.critic.step_duration.params["command_name"] = "hzd_ref"
+
+        self.observations.policy.sin_phase.params["command_name"] = "hzd_ref"
+        self.observations.policy.cos_phase.params["command_name"] = "hzd_ref"
+        self.observations.critic.sin_phase.params["command_name"] = "hzd_ref"
+        self.observations.critic.cos_phase.params["command_name"] = "hzd_ref"
+
+        self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.foot_ang_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj.params["command_name"] = "hzd_ref"
+        self.observations.critic.ref_traj_vel.params["command_name"] = "hzd_ref"
+        self.observations.critic.act_traj_vel.params["command_name"] = "hzd_ref"
+
+        self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
+        self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
+        self.rewards.clf_reward.params["command_name"] = "hzd_ref"
+        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
 
 class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
