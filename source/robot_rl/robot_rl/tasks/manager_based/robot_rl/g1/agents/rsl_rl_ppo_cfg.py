@@ -110,11 +110,11 @@ class StairCNNPPOCfg(PPORunnerCfg):
 class RoughTransformerPPOCfg(PPORunnerCfg):
     policy = None
     policy = CustomPPOActorCriticCfg(
-        class_name="ActorCriticTransformer",
+        class_name="ActorCriticCNN",
         init_noise_std=1.0,
         activation="elu",
-        actor_hidden_dims=[256, 128],
-        critic_hidden_dims=[256, 128],
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         height_map_shape=(1, 25,25),
     )
 

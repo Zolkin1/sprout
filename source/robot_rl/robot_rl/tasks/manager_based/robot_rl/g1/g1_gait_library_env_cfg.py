@@ -8,14 +8,15 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObser
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.sensors import  RayCasterCfg, patterns
-
+from isaaclab.managers import RewardTermCfg as RewTerm
+import math
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
         gait_library_path="source/robot_rl/robot_rl/assets/robots/gait_library",
         config_name="single_support_config",
-        gait_velocity_ranges=(0.09, 0.44, 0.05)
+        gait_velocity_ranges=(0.0, 0.70, 0.05)
     )
 
 
@@ -42,7 +43,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.observations.policy.ref_traj = None
         self.observations.policy.act_traj = None
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.1, 0.5)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.7)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)
@@ -64,11 +65,11 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         # self.curriculum.clf_curriculum = None
         self.rewards.clf_reward.params["max_clf"] = 40.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 80.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
-        self.curriculum.clf_curriculum.params["min_val"] = 2.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
+        self.curriculum.clf_curriculum.params["min_val"] = 10.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 10.0
         self.curriculum.clf_curriculum.params["update_interval"] = 8000
 
      #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
@@ -161,12 +162,17 @@ class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 200.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 2.0
         
+        self.rewards.track_lin_vel_xy_exp = RewTerm(
+            func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+        )
+
         self.commands.base_velocity.ranges.lin_vel_x = (0.27, 0.27)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
 
         self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
         self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
+        self.curriculum.clf_curriculum = None
      #    self.curriculum.terrain_levels = None
         flat_range = CUSTOM_STAIR_CFG.border_width *0.5
         self.events.reset_base.params = {
