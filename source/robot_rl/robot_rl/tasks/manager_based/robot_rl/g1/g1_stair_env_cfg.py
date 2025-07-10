@@ -87,7 +87,7 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
      
         self.scene.terrain.terrain_type = "generator"
      
-        self.scene.terrain.terrain_generator = STAIR_CFG
+        self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
         # self.scene.terrain.terrain_generator.max_init_terrain_level = 2.0
         # self.curriculum.terrain_levels = None
         self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
@@ -469,11 +469,12 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = (0.1,0.1)
         # STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.1,0.1)
         # self.scene.terrain.terrain_generator = STAIR_CFG
-        stair_range = (0.05,0.05)
-        STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = stair_range
-        STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = stair_range
-        STAIR_CFG.sub_terrains["stairs_inv_w_hole"].step_height_range = stair_range
-        STAIR_CFG.sub_terrains["stairs_w_hole"].step_height_range = stair_range
+        # stair_range = (0.05,0.05)
+
+        # STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = stair_range
+        # STAIR_CFG.sub_terrains["pyramid_stairs_inv"].step_height_range = stair_range
+        # STAIR_CFG.sub_terrains["stairs_inv_w_hole"].step_height_range = stair_range
+        # STAIR_CFG.sub_terrains["stairs_w_hole"].step_height_range = stair_range
         # STAIR_CFG.sub_terrains["pyramid_stairs"].holes = True
         # STAIR_CFG.sub_terrains["pyramid_stairs_inv"].holes = True
         # STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.025,0.025)
@@ -483,7 +484,8 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # STAIR_CFG.sub_terrains["stairs_inv_w_hole"].step_height_range = (0.1,0.1)
         # del STAIR_CFG.sub_terrains["flat_stairs_inv"]
         # del STAIR_CFG.sub_terrains["flat_stairs"]
-        self.scene.terrain.terrain_generator = STAIR_CFG
+        self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.05,0.05)
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 2
 

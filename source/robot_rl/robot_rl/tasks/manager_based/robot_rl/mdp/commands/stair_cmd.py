@@ -4,6 +4,9 @@ from .hlip_cmd import HLIPCommandTerm, euler_rates_to_omega, _transfer_to_global
 from .ref_gen import bezier_deg, calculate_cur_swing_foot_pos_stair, calculate_cur_swing_foot_pos
 from .clf_cmd.clf import CLF
 from .hlip_batch import HLIPBatch
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x, get_uniform_stair_step_height_from_env
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -346,7 +349,7 @@ class StairCmd(HLIPCommandTerm):
     def update_Stance_Swing_idx(self):
           base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
           #check stair width
-          cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['pyramid_stairs']
+          cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
           stair_width = cfg.step_width
 
           # Calculate Tswing only if velocity is high enough, else use default
@@ -376,7 +379,7 @@ class StairCmd(HLIPCommandTerm):
           # 3) pick out the “candidate” new pose/quaternion/euler/swing2stance
           pos      = foot_pos_w[batch, new_stance_idx]             # [B,3]
           quat     = foot_ori_w[batch, new_stance_idx]             # [B,4]
-          euler    = self.get_euler_from_quat(quat)               # [B,3]
+          euler    = get_euler_from_quat(quat)               # [B,3]
           rel      = foot_pos_w[batch, self.swing_idx] - pos      # [B,3]
           s2s      = _transfer_to_local_frame(rel, quat)          # [B,3]
 
@@ -484,7 +487,7 @@ class StairCmd(HLIPCommandTerm):
 
         # Store raw foot positions
         self.stance_foot_pos = foot_pos_w[batch_idx, self.stance_idx, :]
-        self.stance_foot_ori = self.get_euler_from_quat(foot_ori_w[batch_idx, self.stance_idx, :])
+        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[batch_idx, self.stance_idx, :])
 
         # Convert foot positions to the robot's yaw-aligned local frame
         swing2stance_local = _transfer_to_local_frame(
@@ -499,10 +502,10 @@ class StairCmd(HLIPCommandTerm):
 
 
         # Pelvis orientation (Euler XYZ)
-        pelvis_ori = self.get_euler_from_quat(root_quat)
+        pelvis_ori = get_euler_from_quat(root_quat)
 
         # Foot orientations (Euler XYZ)
-        swing_foot_ori = self.get_euler_from_quat(foot_ori_w[batch_idx,self.swing_idx,:])
+        swing_foot_ori = get_euler_from_quat(foot_ori_w[batch_idx,self.swing_idx,:])
 
         # 2. Velocities (world frame)
         com_vel_w = data.root_com_vel_w[:,0:3]
@@ -627,8 +630,11 @@ class StairCmd(HLIPCommandTerm):
           ) 
 
           # foot_target_yaw_adjusted = quat_apply(q_delta_yaw, foot_target)  # [B,3]
-          self.update_z_height(foot_target[:,0], foot_target[:,1])
-          
+          # self.update_z_height(foot_target[:,0], foot_target[:,1])
+          cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
+          env_origins = self.env.scene.env_origins
+          stair_heights = get_uniform_stair_step_height_from_env(env_origins,cfg)
+          self.z_height = stair_heights
           #transform it into the global frame
           # foot_target_global_yaw_frame = _transfer_to_global_frame(foot_target, self.stance_foot_ori_quat_0)
 
@@ -678,12 +684,12 @@ class StairCmd(HLIPCommandTerm):
 
           # clip foot target based on kinematic range
           self.foot_target = foot_target[:,0:2]
-          start_box_center,_,_,_ = self.check_height(self.swing2stance_foot_pos_0)
-          delta_z = start_box_center[:,2] - self.stance_foot_box_z
+          # start_box_center,_,_,_ = self.check_height(self.swing2stance_foot_pos_0)
+          # delta_z = start_box_center[:,2] - self.stance_foot_box_z
  
           # if going down stairs, no need to modify z_sw_max only modify z_sw_neg
           z_sw_max_tensor = torch.where(self.z_height < 0, self.cfg.z_sw_max, self.cfg.z_sw_max +self.z_height)
-          z_sw_max_tensor = torch.where(z_sw_max_tensor<start_box_center[:,2], self.cfg.z_sw_max +delta_z,z_sw_max_tensor)
+          # z_sw_max_tensor = torch.where(z_sw_max_tensor<start_box_center[:,2], self.cfg.z_sw_max +delta_z,z_sw_max_tensor)
           z_sw_neg_tensor = self.cfg.z_sw_min + self.z_height
 
           # Create horizontal control points with batch dimension
@@ -710,17 +716,17 @@ class StairCmd(HLIPCommandTerm):
           
           sign = torch.sign(foot_target[:, 1])
           foot_pos, sw_z = calculate_cur_swing_foot_pos_stair(
-               bht_tensor, delta_z, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
+               bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
                foot_target[:, 0], foot_target[:, 1]
           )
 
-          targ_box_center,_,_,_ = self.check_height(foot_pos)
+          # targ_box_center,_,_,_ = self.check_height(foot_pos)
           # choose clearances (metres)
-          clr_peak = 0.02                # 4 cm at t = 0.5
+          # clr_peak = 0.02                # 4 cm at t = 0.5
           # margin_t = clr_peak * (3 * bht * (1 - bht)**2)   # [B]
-          margin_t = torch.zeros((N), device=self.device)
-          z_req = targ_box_center[:, 2] - self.stance_foot_box_z + margin_t
-          foot_pos[:, 2] = torch.maximum(foot_pos[:, 2], z_req)
+          # margin_t = torch.zeros((N), device=self.device)
+          # z_req = targ_box_center[:, 2] - self.stance_foot_box_z + margin_t
+          # foot_pos[:, 2] = torch.maximum(foot_pos[:, 2], z_req)
 
           flat_foot_pos, flat_sw_z = calculate_cur_swing_foot_pos(
                bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
