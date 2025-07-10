@@ -35,7 +35,8 @@ EXPERIMENT_NAMES = {
     "flat-hzd-GL": "g1",
     "flat-hzd-no-dr": "g1",
     "stair-hzd": "g1",
-    "stair-hzd-GL": "g1"
+    "stair-hzd-GL": "g1",
+    "height-map": "g1"
 }
 
 SIM_ENVIRONMENTS = {
@@ -50,7 +51,8 @@ SIM_ENVIRONMENTS = {
     "flat-hzd-GL": "G1-flat-hzd-GL-play",
     "flat-hzd-no-dr": "G1-flat-hzd-play",
     "stair-hzd": "G1-stair-hzd-play",
-    "stair-hzd-GL": "G1-stair-hzd-GL-play"
+    "stair-hzd-GL": "G1-stair-hzd-GL-play",
+    "height-map": "G1-hzd-height-map-play"
 }
 
 class DataLogger:
@@ -125,7 +127,7 @@ def parse_args():
     parser.add_argument(
         "--num_envs",
         type=int,
-        default=None,
+        default=2,
         help="Number of environments to simulate."
     )
     parser.add_argument(
@@ -391,7 +393,7 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","flat-hzd-GL","stair-hzd","stair-hzd-GL"]:
+    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","flat-hzd-GL","stair-hzd","stair-hzd-GL","height-map"]:
         command_name = "hzd_ref"
     else:
         command_name = "hlip_ref"

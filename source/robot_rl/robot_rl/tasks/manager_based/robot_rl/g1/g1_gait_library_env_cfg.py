@@ -123,6 +123,14 @@ class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
+class G1GaitLibraryHeightMapEnv_PlayEnvCfg(G1GaitLibraryHeightMapEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.scene.num_envs = 2
+        self.scene.terrain.terrain_generator.size = (3.0, 3.0)
 
 class G1GaitLibraryStairEnvCfg(G1StairEnvCfg):
     """Configuration for the G1 environment with gait library."""

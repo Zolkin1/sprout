@@ -23,13 +23,13 @@ G1_CFG = ArticulationCfg(
         collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.01, rest_offset=0.0),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.75),  # TODO: Consider setting this higher if I init issues
+        pos=(0.0, 0.0, 0.785),  # TODO: Consider setting this higher if I init issues
         joint_pos={
-            ".*_hip_pitch_joint": -0.42,
+            ".*_hip_pitch_joint": -0.1,
             ".*_hip_roll_joint": 0.0,
             ".*_hip_yaw_joint": 0.0,
-            ".*_knee_joint": 0.81,
-            ".*_ankle_pitch_joint": -0.4,
+            ".*_knee_joint": 0.3,
+            ".*_ankle_pitch_joint": -0.2,
             ".*_ankle_roll_joint": 0.,
             "waist_yaw_joint": 0.,
             "left_shoulder_yaw_joint": -0.45,

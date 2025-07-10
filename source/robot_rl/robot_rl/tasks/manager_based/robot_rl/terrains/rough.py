@@ -35,12 +35,12 @@ ROUGH_FOR_FLAT_HZD_CFG = TerrainGeneratorCfg(
     num_rows=10,
     num_cols=20,
     horizontal_scale=0.1,
-    vertical_scale=0.0005,  # Reduced from 0.005 in rough terrain
+    vertical_scale=0.0005,  
     slope_threshold=0.75,
     use_cache=False,
     sub_terrains={
         "boxes": terrain_gen.MeshRandomGridTerrainCfg(
-            proportion=1.0, grid_width=0.45, grid_height_range=(0.0, 0.04), platform_width=2.0
+            proportion=1.0, grid_width=0.45, grid_height_range=(0.0, 0.02), platform_width=5.0
         ),
 
     },
