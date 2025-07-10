@@ -73,8 +73,8 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class StairPPOCfg(PPORunnerCfg):
-    # resume = False
-    # resume_path = None
+    resume = False
+    resume_path = None
     policy = None
     policy = CustomPPOActorCriticCfg(
         class_name="ActorCriticCNN",
@@ -84,8 +84,8 @@ class StairPPOCfg(PPORunnerCfg):
         activation="elu",
         height_map_shape=(1, 25,25),
     )
-    resume = True
-    resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/height-scan-flat/g1/2025-06-18_13-27-29/model_3600.pt"
+    # resume = True
+    # resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/height-scan-flat/g1/2025-06-18_13-27-29/model_3600.pt"
 
 
 

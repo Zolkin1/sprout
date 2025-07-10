@@ -19,7 +19,7 @@ CUSTOM_STAIR_CFG = TerrainGeneratorCfg(
         "stairs": MeshUniformXStairsTerrainCfg(
             size=(5.0, 10.0),
             border_width=0.5,
-            step_height_range=(0.0, 0.1),
+            step_height_range=(0.0, 0.20),
             step_width=0.25,
         ),
     },

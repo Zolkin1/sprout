@@ -90,6 +90,7 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
         self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
         # self.scene.terrain.terrain_generator.max_init_terrain_level = 2.0
         # self.curriculum.terrain_levels = None
+        self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = CurrTerm(func=mdp.terrain_levels)
         self.scene.height_scanner = RayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/pelvis",
