@@ -70,7 +70,8 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_clf: float = 200.0
     ref_term = env.command_manager.get_term(command_name)
     v = ref_term.v  # [B] scalar CLF value per env
 
-    # reward = torch.clamp(v, min=0.0, max=max_clf)/max_clf
+    reward = torch.clamp(v, min=0.0, max=max_clf)/max_clf
+    # max_clf =torch.sqrt(torch.norm(ref_term.clf.P))
     reward = torch.exp(-v/max_clf)
     
     return reward

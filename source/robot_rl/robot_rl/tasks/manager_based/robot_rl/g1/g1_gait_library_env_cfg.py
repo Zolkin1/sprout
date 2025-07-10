@@ -48,7 +48,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)
 
-        self.commands.step_period.period_range = (1.0, 1.0)
+        self.commands.step_period.period_range = (0.8,0.8)
         
         # Update observation and reward command names
         self.observations.critic.foot_vel.params["command_name"] = "hzd_ref"
@@ -63,6 +63,9 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
+        self.rewards.track_lin_vel_xy_exp = RewTerm(
+            func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+        )
         # self.curriculum.clf_curriculum = None
         self.rewards.clf_reward.params["max_clf"] = 40.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
@@ -70,7 +73,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         self.curriculum.clf_curriculum.params["min_val"] = 10.0
         self.curriculum.clf_curriculum.params["min_clf_val"] = 10.0
-        self.curriculum.clf_curriculum.params["update_interval"] = 8000
+        self.curriculum.clf_curriculum.params["update_interval"] = 10000
 
      #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
      #                                          params={"vel_range": (0.1, 0.5),

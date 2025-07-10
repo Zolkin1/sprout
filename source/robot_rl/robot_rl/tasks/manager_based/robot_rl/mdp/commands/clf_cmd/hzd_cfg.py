@@ -152,19 +152,19 @@ class HZDStairCommandCfg(CommandTermCfg):
 
 
 HZD_EE_Q_weights_GL = [
-    500.0,   200.0,    # com_x pos, vel
+    1000.0,   200.0,    # com_x pos, vel
     300.0,   50.0,   # com_y pos, vel
     400.0,   10.0,  # com_z pos, vel
     300.0,    20.0,    # pelvis_roll pos, vel
     250.0,    10.0,    # pelvis_pitch pos, vel
-    300.0,    30.0,    # pelvis_yaw pos, vel
-    4500.0, 50.0,  # swing_x pos, vel
+    500.0,    30.0,    # pelvis_yaw pos, vel
+    5000.0, 125.0,  # swing_x pos, vel
     1500.0,  50.0,  # swing_y pos, vel
     8500.0, 100.0,   # swing_z pos, vel
     30.0,    1.0,    # swing_ori_roll pos, vel
     50.0,    1.0,    # swing_ori_pitch pos, vel
     400.0,    10.0,    # swing_ori_yaw pos, vel
-    1.0,    1.0,    # waist_yaw pos, vel
+    100.0,    1.0,    # waist_yaw pos, vel
     30.0,1.0, #swing hand palm pos x
     30.0,1.0, #swing hand palm pos y
     30.0,1.0, #swing hand palm pos z
@@ -181,7 +181,7 @@ HZD_EE_R_weights_GL = [
         0.05,0.05,0.05,   # pelvis inputs: lower torque priority
         0.05,0.05,0.05,   # swing foot linear inputs
         0.02,0.02,0.02,    # swing foot orientation inputs: small adjustments
-        0.02,0.01,0.01,
+        0.1,0.01,0.01,
         0.01,0.01,0.01,
         0.01,0.01,0.01,
     ]
