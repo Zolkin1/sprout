@@ -167,11 +167,11 @@ HZD_EE_Q_weights_GL = [
     100.0,    1.0,    # waist_yaw pos, vel
     40.0,1.0, #swing hand palm pos x
     30.0,1.0, #swing hand palm pos y
-    40.0,1.0, #swing hand palm pos z
+    50.0,1.0, #swing hand palm pos z
     5.0,1.0, #swing hand palm yaw
     40.0,1.0, #stance hand palm pos x
     30.0,1.0, #stance hand palm pos y
-    40.0,1.0, #stance hand palm pos z
+    50.0,1.0, #stance hand palm pos z
     5.0,1.0, #stance hand palm yaw
 ]
 

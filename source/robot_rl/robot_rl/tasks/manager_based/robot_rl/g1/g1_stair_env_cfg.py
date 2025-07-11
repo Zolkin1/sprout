@@ -340,7 +340,7 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         # Scene
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.episode_length_s = 6
+        self.episode_length_s = 20
         # No height scanner for now
      
         self.scene.terrain.terrain_type = "generator"
@@ -395,9 +395,9 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.5,1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0,1.0)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.3,0.3)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.4,0.4)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.3,0.3)
         # self.commands.base_velocity.ranges.heading= (0.0,0.0)
 
         ##
@@ -424,8 +424,8 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         self.rewards.track_lin_vel_xy_exp = None
         self.rewards.track_ang_vel_z_exp = None
 
-        self.rewards.clf_reward.params["max_clf"] = 50.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
+        self.rewards.clf_reward.params["max_clf"] = 100.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
  
         # torque, acc, vel, action rate regularization
 

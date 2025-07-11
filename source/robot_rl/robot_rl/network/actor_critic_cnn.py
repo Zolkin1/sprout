@@ -71,6 +71,13 @@ class ActorCriticCNN(ActorCritic):
             nn.Flatten(),                                       # → (32,)
         )
 
+        self.critic_cnn = nn.Sequential(
+            nn.Conv2d(C, 16, 3, stride=2, padding=1), act_fn,   # (C, 41, 41) → (16, 21, 21)
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), act_fn,  # → (32, 11, 11)
+            nn.Conv2d(32, 32, 3, stride=2, padding=1), act_fn,  # → (32, 6, 6)
+            nn.AdaptiveAvgPool2d(1),                            # → (32, 1, 1)
+            nn.Flatten(),                                       # → (32,)
+        )
 
         
 
@@ -80,6 +87,12 @@ class ActorCriticCNN(ActorCritic):
         hmap = flat_obs[:, : self.hmap_flat].reshape(B, *self.height_map_shape)
         prop = flat_obs[:, self.hmap_flat :]
         return torch.cat([self.cnn(hmap), prop], dim=-1)
+    
+    def critic_features(self, flat_obs: torch.Tensor) -> torch.Tensor:
+        B = flat_obs.shape[0]
+        hmap = flat_obs[:, : self.hmap_flat].reshape(B, *self.height_map_shape)
+        prop = flat_obs[:, self.hmap_flat :]
+        return torch.cat([self.critic_cnn(hmap), prop], dim=-1)
 
     def update_distribution(self, obs):
         feat = self._features(obs)
@@ -92,4 +105,4 @@ class ActorCriticCNN(ActorCritic):
         return self.actor(self._features(obs))
 
     def evaluate(self, critic_obs, **kw):  # value function
-        return self.critic(self._features(critic_obs))
+        return self.critic(self.critic_features(critic_obs))

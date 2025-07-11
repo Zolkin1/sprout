@@ -84,8 +84,8 @@ class StairPPOCfg(PPORunnerCfg):
         activation="elu",
         height_map_shape=(1, 25,25),
     )
-    # resume = True
-    # resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/height-scan-flat/g1/2025-06-18_13-27-29/model_3600.pt"
+    resume = True
+    resume_path = "/home/kli5/robot_rl/logs/g1_policies/stair/g1/2025-07-10_12-14-33/model_19000.pt"
 
 
 
