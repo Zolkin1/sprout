@@ -16,6 +16,11 @@ onboard:
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
         action_scale: 0.25
+        v_x_max: 1.0
+        v_x_min: -0.5
+        v_y_max: -0.2
+        v_y_min: 0.2
+        w_z_max: 0.2
         default_angles: [-0.1, 0, 0, 0.3, -0.2, 0,
                   -0.1, 0, 0, 0.3, -0.2, 0,
                   0,

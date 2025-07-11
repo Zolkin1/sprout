@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "hzd_policy.pt"
+        policy_name: "hzd_policy_placeholder.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
