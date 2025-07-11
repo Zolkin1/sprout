@@ -54,9 +54,9 @@ class G1RoughLipObservationsCfg():
             params={"command_name": "hlip_ref"},
             scale=tuple([5.0] * 12 + [0.1] * 9)
         )
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=tuple([5.0] * 12 + [0.1] * 9))
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=1.0)
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=1.0)
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=1.0)
         height_scan = None      # Removed - not supported yet
         # contact_state = ObsTerm(
         #     func=mdp.contact_state,
@@ -145,10 +145,10 @@ class G1StairObservationsCfg:
             func=mdp.step_duration,
             params={"command_name": "hlip_ref"},
         )
-        # contact_state = ObsTerm(
-        #     func=mdp.contact_state,
-        #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-        # )
+        contact_state = ObsTerm(
+            func=mdp.contact_state,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+        )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel,scale=1.0)
         foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
         foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)

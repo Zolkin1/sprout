@@ -671,7 +671,7 @@ class StairCmd(HLIPCommandTerm):
                Xdesire=y0,
           )
           # Concatenate x and y components
-          com_z = torch.ones((N,), device=self.device) * self.com_z 
+          com_z = torch.ones((N,), device=self.device) * self.com_z + self.z_height * self.phase_var
           com_zd = torch.ones((N), device=self.device) * self.z_height/T
           com_pos_des = torch.stack([com_x, com_y,com_z], dim=-1)  # Shape: (N,2)
           com_vel_des = torch.stack([com_xd, com_yd,com_zd], dim=-1)  # Shape: (N,2)

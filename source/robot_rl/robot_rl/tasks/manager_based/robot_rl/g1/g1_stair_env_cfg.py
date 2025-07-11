@@ -161,7 +161,7 @@ class G1StairEnvCfg(G1RoughLipEnvCfg):
         self.rewards.track_lin_vel_xy_exp = None
         self.rewards.track_ang_vel_z_exp = None
 
-        self.rewards.clf_reward.params["max_clf"] = 100.0
+        self.rewards.clf_reward.params["max_clf"] = 50.0
         self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
 
         self.rewards.dof_pos_limits.weight = -1.0
@@ -331,10 +331,10 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         # No height scanner for now
      
         self.scene.terrain.terrain_type = "generator"
-        STAIR_CFG.sub_terrains["pyramid_stairs"].step_height_range = (0.0,0.0)
-        del STAIR_CFG.sub_terrains["pyramid_stairs_inv"]
         
-        self.scene.terrain.terrain_generator = STAIR_CFG
+        
+        self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.0,0.0)
 
         self.scene.height_scanner = RayCasterCfg(
             prim_path="{ENV_REGEX_NS}/Robot/pelvis",
@@ -382,8 +382,8 @@ class G1HeightScanFlatEnvCfg(G1RoughLipEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (0.3,0.75)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.5,1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.3,0.3)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.4,0.4)
         # self.commands.base_velocity.ranges.heading= (0.0,0.0)
 

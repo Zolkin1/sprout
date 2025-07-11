@@ -7,7 +7,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import generated_commands
 
-def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 5.0) -> torch.Tensor:
+def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     net_forces = contact_sensor.data.net_forces_w_history[:,-1,sensor_cfg.body_ids,:]
     contact_flag = (torch.abs(net_forces) > threshold).float()

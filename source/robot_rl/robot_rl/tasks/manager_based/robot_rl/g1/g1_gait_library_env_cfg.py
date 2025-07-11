@@ -63,16 +63,13 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.rewards.clf_reward.params["command_name"] = "hzd_ref"
         self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
-        self.rewards.track_lin_vel_xy_exp = RewTerm(
-            func=mdp.track_lin_vel_xy_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-        )
         # self.curriculum.clf_curriculum = None
-        self.rewards.clf_reward.params["max_clf"] = 40.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 100.0
+        self.rewards.clf_reward.params["max_clf"] = 20.0
+        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 120.0
         self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
         self.curriculum.clf_curriculum.params["min_val"] = 10.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 10.0
+        self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
         self.curriculum.clf_curriculum.params["update_interval"] = 10000
 
      #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,

@@ -5,7 +5,7 @@ from .stair_cmd import StairCmd
 Q_weights = [
     100.0,   1000.0,    # com_x pos, vel
     400.0,   50.0,   # com_y pos, vel
-    10.0,  10.0,  # com_z pos, vel
+    100.0,  10.0,  # com_z pos, vel
     400.0,    20.0,    # pelvis_roll pos, vel
     200.0,    10.0,    # pelvis_pitch pos, vel
     500.0,    30.0,    # pelvis_yaw pos, vel
