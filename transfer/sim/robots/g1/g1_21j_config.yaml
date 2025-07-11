@@ -1,7 +1,8 @@
 # G1_21j config
 robot_name: "g1_21j"
 #checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-05-23_15-51-34/exported/policy.pt"  # Not LIP, all dir
-checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-06-24_14-53-46/exported/policy.pt"   # After re-factor
+#checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-06-24_14-53-46/exported/policy.pt"   # After re-factor
+checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-06-24_16-40-11/exported/policy.pt"
 #checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-06-18_18-38-52/exported/policy.pt"   # Before re-factor
 num_obs: 74
 num_action: 21
