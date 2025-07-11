@@ -64,7 +64,7 @@ class Robot:
             if abs(vx) < 0.1:
                 vx = 0
             else:
-                vx = np.clip(vx, 0.0, 0.5)
+                vx = np.clip(vx, 0.0, 0.6)
             if abs(vy) < 0.1:
                 vy = 0
             else:
@@ -73,11 +73,11 @@ class Robot:
                 vyaw = 0
             else:
                 vyaw = np.clip(vyaw, -0.1, 0.1)
-            des_vel[0] = vx
+            des_vel[0] = 0.5
             des_vel[1] = vy
             des_vel[2] = vyaw
         else:
-            des_vel = np.array([0.625,0.0,0.0])
+            des_vel = np.array([0.5,0.0,0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
         print(f"Commanded velocity: {des_vel}")
         return des_vel

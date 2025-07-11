@@ -55,6 +55,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         # Set up trajectory-specific attributes
         if cfg.trajectory_type == "end_effector":
             self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
+            self.joint_idx_list = self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].get_joint_idx_list(self)
             self.foot_yaw_output_idx = 11
             self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
             self.yaw_output_idx = [5, 11, 16, 20]

@@ -38,7 +38,7 @@ G1_CFG = ArticulationCfg(
             "right_shoulder_yaw_joint": 0.45,
             "right_shoulder_pitch_joint": 0.15,
             "right_shoulder_roll_joint": -0.7,
-            ".*_elbow_joint": 0.5,
+            ".*_elbow_joint": 1.2,
             # ".*_wrist_roll_joint": 0.,
             # ".*_wrist_pitch_joint": 0.,
             # ".*_wrist_yaw_joint": 0.,

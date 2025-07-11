@@ -500,8 +500,8 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # del STAIR_CFG.sub_terrains["flat_stairs"]
         self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
 
-        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.0,0.05)
-        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.15,0.15)
+        self.scene.terrain.terrain_generator.num_rows = 2
         self.scene.terrain.terrain_generator.num_cols = 2
 
 

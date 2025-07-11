@@ -131,7 +131,7 @@ class EndEffectorTracker:
         return poses
 
 
-def relable_ee_coeffs():
+def relable_ee_hand_coeffs():
     """Build relabel matrix for end effector coefficients."""
     R = np.eye(21)
     
@@ -157,11 +157,40 @@ def relable_ee_coeffs():
     # stance_hand_ori: [-1,1,-1]
     R[20, 20] = -1
 
-    # the traj is in right stance, so swing foot is left foot
-    # need to swap left and right palm coeffs
-
     return R
 
+def relable_ee_coeffs():
+    """Build relabel matrix for end effector coefficients."""
+    R = np.eye(21)
+    
+    # only need to swap left and right palm coeffs
+    # com pos: [1,-1,1]
+    R[1, 1] = -1
+    # pelvis: [-1,1,-1]
+    R[3, 3] = -1
+    R[5, 5] = -1
+    # swing_foot_pos:[1,-1,1]
+    R[7, 7] = -1
+    # swing_foot_or: [-1,1,-1]
+    R[9, 9] = -1
+    R[11, 11] = -1
+    # waist yaw
+    R[12, 12] = -1
+    
+    #swap arm coeffs
+    arm_offset = 12 + 1
+    left_arm = arm_offset + np.array([0, 1, 2, 3])
+    right_arm = arm_offset + np.array([4, 5, 6, 7])
+
+    tmp = R[left_arm, :].copy()
+    R[left_arm, :] = R[right_arm, :]
+    R[right_arm, :] = tmp
+
+    # Sign flips: shoulder_roll, shoulder_yaw
+    flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
+    R[flip_arm, :] *= -1
+
+    return R
 
 class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
     """Configuration class for end effector trajectories."""
@@ -176,7 +205,6 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         self.constraint_specs = data.get('constraint_specs', [])
         
         # Reshape bezier coefficients to [num_joints, num_control_points]
-        # TODO: need to get num_output from constraint_specs
         num_output = 21
         domain_name = next(iter(data.keys()))
         bezier_coeffs = data[domain_name]['bezier_coeffs']
@@ -206,9 +234,18 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         left_coeffs = R @ self.bezier_coeffs
 
         self.left_coeffs = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
-        
+
         # Generate axis names for metrics
         self.generate_axis_names()
+
+    def get_joint_idx_list(self, hzd_cmd):
+        """Get the joint index list for the given command."""
+        joint_idx_list = []
+        
+        for joint_name in self.constraint_specs[-1]["joint_names"]:
+            joint_idx, _ = hzd_cmd.robot.find_joints(joint_name)
+            joint_idx_list.append(joint_idx)
+        return joint_idx_list
 
     def generate_axis_names(self):
         """Generate axis names for each constraint specification."""
@@ -232,14 +269,16 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 
             elif constraint_type == "joint":
                 output_dim = 1
-                joint_name = spec["joint_names"]
-                # Generate metric name for joint
-                metric_name = f"joint_{joint_name}"
-                self.axis_names.append({
-                    'name': metric_name,
-                    'index': current_idx
-                })
-                current_idx += output_dim
+                joint_names = spec["joint_names"]
+
+                for joint_name in joint_names:
+                    # Generate metric name for joint
+                    metric_name = f"joint_{joint_name}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx
+                    })
+                    current_idx += output_dim
                 
             elif "frame" in spec:
                 frame_name = spec["frame"]
@@ -284,8 +323,6 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # If stance_idx == 0 (left stance), then right foot is swing foot
         # If stance_idx == 1 (right stance), then left foot is swing foot
         swing_foot_frame = "right_foot_middle" if hzd_cmd.stance_idx == 0 else "left_foot_middle"
-        swing_hand_frame = "right_hand_palm_joint" if hzd_cmd.stance_idx == 0 else "left_hand_palm_joint"
-        stance_hand_frame = "left_hand_palm_joint" if hzd_cmd.stance_idx == 0 else "right_hand_palm_joint"
         
         # Get stance foot pos and velocity for relative positioning
         stance_foot_pos = hzd_cmd.stance_foot_pos_0 
@@ -316,39 +353,37 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, hzd_cmd.stance_foot_ori_quat_0)
         sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, hzd_cmd.stance_foot_ori_quat_0)
 
-        waist_joint_pos = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.waist_joint_idx]
-        waist_joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.waist_joint_idx]
+        joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
+        joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
 
-        # palm position
-        swing_hand_pos, swing_hand_ori, swing_hand_quat = ee_tracker.get_pose(swing_hand_frame)
-        swing_hand_vel, swing_hand_omega = ee_tracker.get_velocity(swing_hand_frame, hzd_cmd.robot.data)
+        # # palm position
+        # swing_hand_pos, swing_hand_ori, swing_hand_quat = ee_tracker.get_pose(swing_hand_frame)
+        # swing_hand_vel, swing_hand_omega = ee_tracker.get_velocity(swing_hand_frame, hzd_cmd.robot.data)
 
-        # stance hand position
-        stance_hand_pos, stance_hand_ori, stance_hand_quat = ee_tracker.get_pose(stance_hand_frame)
-        stance_hand_vel, stance_hand_omega = ee_tracker.get_velocity(stance_hand_frame, hzd_cmd.robot.data)
+        # # stance hand position
+        # stance_hand_pos, stance_hand_ori, stance_hand_quat = ee_tracker.get_pose(stance_hand_frame)
+        # stance_hand_vel, stance_hand_omega = ee_tracker.get_velocity(stance_hand_frame, hzd_cmd.robot.data)
 
-        swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
+        # swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
+        # swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
+        # stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
+        # stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
 
-        stance_hand_pos = stance_hand_pos - stance_foot_pos
-        stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_pos = swing_hand_pos - stance_foot_pos
+        # stance_hand_pos = stance_hand_pos - stance_foot_pos
+        # stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
+        # swing_hand_pos = swing_hand_pos - stance_foot_pos
 
-        swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ori[:, 2] = wrap_to_pi(swing_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        stance_hand_ori[:, 2] = wrap_to_pi(stance_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
+        # swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
+        # swing_hand_ori[:, 2] = wrap_to_pi(swing_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
+        # stance_hand_ori[:, 2] = wrap_to_pi(stance_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
 
         # concatenate all the position values
         y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos, sw2st_foot_ori,
-                          waist_joint_pos,
-                          swing_hand_pos, swing_hand_ori[:, 2].unsqueeze(-1), stance_hand_pos, stance_hand_ori[:, 2].unsqueeze(-1)], dim=-1)
+                          joint_pos.squeeze(-1)], dim=-1)
 
         # concatenate all the velocity values
         dy_act = torch.cat([com_vel_local, pelvis_omega, sw2st_foot_vel_local, sw2st_foot_ang_vel_local,
-                           waist_joint_vel,
-                           swing_hand_vel_local, swing_hand_ang_vel_local[:, 2].unsqueeze(-1), stance_hand_vel_local, stance_hand_ang_vel_local[:, 2].unsqueeze(-1)], dim=-1)
+                           joint_vel.squeeze(-1)], dim=-1)
         
         return y_act, dy_act
 
