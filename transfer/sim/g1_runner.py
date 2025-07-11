@@ -1,3 +1,4 @@
+from typing import Literal
 import argparse
 import yaml
 import os
@@ -31,6 +32,7 @@ def main():
         "qvel_scale": float,
         "ang_vel_scale": float,
         "command_scale": float,
+        "policy_type": Literal["mlp", "cnn"],
     }
 
     # Check for required fields
@@ -50,7 +52,8 @@ def main():
         default_angles=config["default_angles"],
         qvel_scale=config["qvel_scale"],
         ang_vel_scale=config["ang_vel_scale"],
-        height_map_scale=config.get("height_map_scale", None)
+        height_map_scale=config.get("height_map_scale", None),
+        policy_type=config["policy_type"]
     )
 
     # Run the simulator with default values for optional fields

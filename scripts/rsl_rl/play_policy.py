@@ -357,6 +357,10 @@ def main():
 
     # Export policy if requested
     if args_cli.export_policy:
+        if ppo_runner.alg.policy.__class__.__name__ == "ActorCriticCNN":
+            from robot_rl.network.exporter import export_policy_as_jit, export_policy_as_onnx
+          
+
         print("[DEBUG] Exporting policy to ONNX and JIT formats")
         try:
             # version 2.3 onwards

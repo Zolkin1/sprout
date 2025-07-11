@@ -129,7 +129,7 @@ class Simulation:
             # Setup height sensor visualization if enabled
             if self.use_height_sensor:
                 grid_size = (1.5,1.5)
-                x_y_num_rays = (16 , 16)
+                x_y_num_rays = (25 , 25)
                 height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays)
                 # Add custom debug spheres
                 ii = 0

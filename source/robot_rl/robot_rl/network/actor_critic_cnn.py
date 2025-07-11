@@ -31,6 +31,7 @@ class ActorCriticCNN(ActorCritic):
         C, H, W = height_map_shape
         act_fn = resolve_nn_activation(activation)
         cnn_out = 32 
+        self.cnn_out = cnn_out
 
 
         # ---------- Dimensions for actor / critic -----------------------
