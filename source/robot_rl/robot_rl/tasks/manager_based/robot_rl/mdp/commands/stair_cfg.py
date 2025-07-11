@@ -43,7 +43,7 @@ class StairHLIPCommandCfg(HLIPCommandCfg):
     class_type: type = StairCmd
     Q_weights = Q_weights
     R_weights = R_weights
-    z_sw_max: float = 0.12
+    z_sw_max: float = 0.1
     z0: float = 0.65
     pelv_pitch_ref: float = 0.05
 

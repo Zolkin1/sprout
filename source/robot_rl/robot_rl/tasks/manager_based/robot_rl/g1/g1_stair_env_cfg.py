@@ -32,10 +32,23 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObser
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import CurriculumCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_stair_cfg import HZDStairEECommandCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import EndEffectorTrajectoryHZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.gaitPeriodCfg import CustomUniformVelocityCommandCfg
 @configclass
 class G1StairCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     hlip_ref = StairHLIPCommandCfg()
+    base_velocity = CustomUniformVelocityCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(10.0, 10.0),
+        rel_standing_envs=0.02,
+        rel_heading_envs=1.0,
+        heading_command=True,
+        heading_control_stiffness=0.5,
+        debug_vis=True,
+        ranges=mdp.UniformVelocityCommandCfg.Ranges(
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+        ),
+    )
     def __post_init__(self):
         super().__post_init__()
         self.step_period.period_range = (1.0,1.0)
@@ -486,7 +499,8 @@ class G1StairPlay_EnvCfg(G1StairEnvCfg):
         # del STAIR_CFG.sub_terrains["flat_stairs_inv"]
         # del STAIR_CFG.sub_terrains["flat_stairs"]
         self.scene.terrain.terrain_generator = CUSTOM_STAIR_CFG
-        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.05,0.05)
+
+        self.scene.terrain.terrain_generator.sub_terrains["stairs"].step_height_range = (0.0,0.05)
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 2
 

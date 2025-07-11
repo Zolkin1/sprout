@@ -283,8 +283,8 @@ def holonomic_constraint_stair(
     delta_z  = z_cur - cmd.stance_foot_pos_0[:,2].unsqueeze(-1)
 
     # roll error [B,1]
-    # roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
-    # pitch = cmd.stance_foot_ori[:, 1].unsqueeze(-1)
+    roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
+    pitch = cmd.stance_foot_ori[:, 1].unsqueeze(-1)
 
     # yaw error wrapped to [–π, π] [B,1]
     psi0 = cmd.stance_foot_ori_0[:, 2]
@@ -292,7 +292,7 @@ def holonomic_constraint_stair(
     delta_psi = ((psi - psi0 + torch.pi) % (2 * torch.pi) - torch.pi).unsqueeze(-1)
 
     # stack into [B,5] error vector
-    e_pose = torch.cat([delta_xy, delta_z, delta_psi], dim=-1)
+    e_pose = torch.cat([delta_xy, delta_z, roll, pitch, delta_psi], dim=-1)
 
     # unified Gaussian‐like reward
     return torch.exp(- (e_pose**2).sum(dim=-1) / sigma_pose**2)

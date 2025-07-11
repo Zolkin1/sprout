@@ -28,215 +28,6 @@ class StairCmd(HLIPCommandTerm):
           self.stance_foot_ori_0       = torch.zeros((self.num_envs, 3), device=self.device)
           self.swing2stance_foot_pos_0 = torch.zeros((self.num_envs, 3), device=self.device)
 
-    def find_grid_idx(self, stance_pos_world, terrain_origins):
-          H, W, _ = terrain_origins.shape
-          B = stance_pos_world.shape[0]
-
-          # compute squared XY-distances: [B, H, W]
-          #   broadcast stance_pos_world over the H×W grid
-          dist2 = (
-               stance_pos_world[:, None, None, :2]  # [B,1,1,2]
-               - terrain_origins[None, :, :, :2]    # [1,H,W,2]
-          ).pow(2).sum(dim=-1)                    # [B,H,W]
-
-          # flatten H×W → (H*W), find argmin per batch
-          dist2_flat = dist2.view(B, -1)          # [B, H*W]
-          idx_flat   = dist2_flat.argmin(dim=1)   # [B]
-
-          # unravel flat index to 2D grid coords
-          ix = idx_flat // W                      # rows
-          iy = idx_flat %  W                      # cols
-
-          return ix, iy
-    
-
-    def which_step(
-              self,
-     x: torch.Tensor,
-     y: torch.Tensor,
-     origin: torch.Tensor,
-     cfg
-     ) -> torch.LongTensor:
-          """
-          Batched version: for each (x, y), returns
-               - -1           → outside all steps
-               - 0..num_steps-1 → ring index (0 is outermost ring)
-               - num_steps    → center platform
-          Assumes cfg.holes == False.
-          Shapes:
-               x, y            → (B,) or broadcastable
-               origin          → (2,) or (B, 2)
-          """
-          # 1) recompute num_steps
-          n_x = (cfg.size[0] - 2*cfg.border_width - cfg.platform_width) // (2*cfg.step_width) + 1
-          n_y = (cfg.size[1] - 2*cfg.border_width - cfg.platform_width) // (2*cfg.step_width) + 1
-          num_steps = int(min(n_x, n_y))
-
-          # 2) extract origin coords (broadcastable)
-       
-          ox, oy = origin[..., 0], origin[..., 1]
-
-          # 3) compute local offsets
-          dx = x - ox
-          dy = y - oy
-          abs_dx = dx.abs()
-          abs_dy = dy.abs()
-
-          # 4) half‐sizes of stepped region
-          terrain_w = cfg.size[0] - 2*cfg.border_width
-          terrain_h = cfg.size[1] - 2*cfg.border_width
-          half_w = terrain_w / 2.0
-          half_h = terrain_h / 2.0
-
-          # 5) inward distance from outer edge
-          delta_x = half_w - abs_dx
-          delta_y = half_h - abs_dy
-          delta   = torch.min(delta_x, delta_y)
-
-          # 6) compute raw ring index
-          step_w = torch.tensor(cfg.step_width, dtype=delta.dtype, device=delta.device)
-          raw_k  = torch.floor(delta / step_w).long()
-
-          #check if it's basically at the center, then return num_steps
-          # center_idx = torch.where(delta_x < 0.01, torch.ones_like(raw_k), torch.zeros_like(raw_k))
-         
-          # 7) clamp into [-1, num_steps]
-          return raw_k.clamp(min=0, max=num_steps)
-
-
-    def box_center(
-          self,
-          x: torch.Tensor,
-          y: torch.Tensor,
-          origin: torch.Tensor,
-          cfg
-     ) -> torch.Tensor:
-     """
-     For each (x, y), returns the 3D center of the box it lies in:
-          • outside → (nan, nan, nan)
-          • ring k  → center of that ring’s face
-          • center  → center platform
-     Outputs (B,3). origin may be (3,) or (B,3).
-     """
-     # 1) get step_idx
-     # we need the 2D origin for which_step
-     origin_xy = origin[..., :2]
-     step_idx = self.which_step(x, y, origin_xy, cfg)
-
-     # recompute num_steps & heights
-     n_x = (cfg.size[0] - 2*cfg.border_width - cfg.platform_width) // (2*cfg.step_width) + 1
-     n_y = (cfg.size[1] - 2*cfg.border_width - cfg.platform_width) // (2*cfg.step_width) + 1
-     num_steps = int(min(n_x, n_y))
-
-
-     cx = origin[..., 0]
-     cy = origin[..., 1]
-     oz = origin[..., 2]
-
-     # derive step_height & total_height
-     step_h = -oz / (num_steps + 1)
-     total_h = (num_steps + 1) * step_h
-     cz = oz + total_h  # should be zero
-
-     # half-dims and width tensors
-     half_w = (cfg.size[0] - 2*cfg.border_width) / 2.0
-     half_h = (cfg.size[1] - 2*cfg.border_width) / 2.0
-     half_w = torch.tensor(half_w, device=x.device, dtype=x.dtype)
-     half_h = torch.tensor(half_h, device=y.device, dtype=y.dtype)
-     step_w = torch.tensor(cfg.step_width, device=x.device, dtype=x.dtype)
-
-     # offsets
-     dx = x - cx
-     dy = y - cy
-     adx = dx.abs()
-     ady = dy.abs()
-
-     # compute offset along face
-     offset = (step_idx.float() + 0.5) * step_w
-
-     # masks
-     in_ring   = (step_idx >= 0) & (step_idx < num_steps)
-     on_middle = (step_idx == num_steps)
-     top    = in_ring & (ady >= adx) & (dy >  0)
-     bottom = in_ring & (ady >= adx) & (dy <= 0)
-     right  = in_ring & (adx >  ady) & (dx >  0)
-     left   = in_ring & (adx >  ady) & (dx <= 0)
-
-     # center coordinates
-     cx_r = cx.expand_as(x)
-     cy_r = cy.expand_as(y)
-     center_x = torch.where(right,  cx_r + half_w - offset, cx_r)
-     center_x = torch.where(left,   cx_r - half_w + offset, center_x)
-     center_y = torch.where(top,    cy_r + half_h - offset, cy_r)
-     center_y = torch.where(bottom, cy_r - half_h + offset, center_y)
-
-     # z-centers
-     # ring_z   = cz - total_h/2 + (step_idx.float()+1)*step_h/2
-     # middle_z = oz + step_h/2
-     # center_z = torch.where(in_ring, ring_z, torch.full_like(ring_z, float('nan')))
-     # center_z = torch.where(on_middle, middle_z, center_z)
-
-     effective_k = torch.clamp(step_idx+1, min=0, max=num_steps+1)
-     surface_z   = - effective_k.float() * step_h
-     surface_z   = torch.where(step_idx >= 0, surface_z,
-                              torch.full_like(surface_z, float('nan')))
-
-     centers = torch.stack([center_x, center_y, surface_z], dim=-1)
-
-
-     face_half_x = torch.where(
-          (top|bottom),
-          half_w - offset,              # full ring width in x is 2*(half_w-offset)
-          torch.where((right|left),
-                         step_w / 2,       # face thickness in x
-                         cfg.platform_width / 2)  # center‐platform
-          )
-     face_half_y = torch.where(
-          (top|bottom),
-          step_w / 2,                   # face thickness in y
-          torch.where((right|left),
-                         half_h - offset,  # full ring width in y is 2*(half_h-offset)
-                         cfg.platform_width / 2)
-          )
-
-     # --- now min/max bounds in world frame ---
-     min_x = center_x - face_half_x
-     max_x = center_x + face_half_x
-     min_y = center_y - face_half_y
-     max_y = center_y + face_half_y
-
-     bounds_lo = torch.stack([min_x, min_y],     dim=-1)               # [B,2]
-     bounds_hi = torch.stack([max_x, max_y],     dim=-1)               # [B,2]
-
-     return centers, bounds_lo, bounds_hi
-
-
-    def check_height(self,local_offsets):
-     terrain_importer = self.env.scene.terrain
-     env_origins = terrain_importer.env_origins           # (N, 3) world-space origin per env
-     terrain_origins = terrain_importer.terrain_origins   # (rows, cols, 3)
-     cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['pyramid_stairs']
-     cell_x, cell_y = cfg.size
-
-     # 2) Compute world-frame desired foot positions from stance-foot frame offsets
-     #    Local offset in stance-foot frame (N,3)
-     
-
-     # 3) Map desired XY into terrain grid-local frame
-     # local_xy = desired_world[:, :2] - env_origins[:, :2]       # (N,2)
-
-     # 4) Determine subterrain cell indices
-     desired_world = self.stance_foot_pos_0 + local_offsets           # (N,3)
-     idx_i, idx_j = self.find_grid_idx(self.stance_foot_pos_0, terrain_origins)
-
-     # 5) Fetch each cell's world origin
-     cell_origins = terrain_origins[idx_i, idx_j]               # (N,3)
-
-     box_center, box_bounds_lo, box_bounds_hi = self.box_center(desired_world[:,0], desired_world[:,1], cell_origins, cfg)
-
-     #height change relative to the initial height
-     stance_foot_box_center, stance_foot_box_bounds_lo, stance_foot_box_bounds_hi = self.box_center(self.stance_foot_pos_0[:,0], self.stance_foot_pos_0[:,1], cell_origins, cfg)
-     return box_center, box_bounds_lo, box_bounds_hi, stance_foot_box_center
 
     def update_z_height(self, Ux: torch.Tensor, Uy: torch.Tensor) -> torch.Tensor:
           """
@@ -264,109 +55,42 @@ class StairCmd(HLIPCommandTerm):
 
           desired_world[:, 2] = box_center[:, 2]
 
-          
-          if torch.any(torch.isnan(self.z_height)):
-               import pdb; pdb.set_trace()
 
           if self.cfg.debug_vis:
-               # self.footprint_visualizer.visualize(
-               #      translations=desired_world.detach().cpu().numpy(),
-               #      orientations=yaw_quat(self.robot.data.root_quat_w).detach().cpu().numpy(),
-               # )
                print(f"z_height: {self.z_height}, stance_foot_box_center: {self.stance_foot_box_z}, box_center: {box_center[:, 2]}")
 
 
-    def adjust_foot_target(
-              self,
-          foot_target: torch.Tensor,     # [B,3]
-          toe_offset: float = 0.12,
-          heel_offset: float = -0.05
-          ) -> torch.Tensor:
-          # unpack
-          # 1) get per‐env bounds in yaw frame (assumed precomputed via box_center)
-          #    target_foot_box_bounds_lo: [B,2] = [min_x, min_y]
-          #    target_foot_box_bounds_hi: [B,2] = [max_x, max_y]
-          min_x, min_y = self.target_foot_box_bounds_lo.unbind(-1)  # [B], [B]
-          max_x, max_y = self.target_foot_box_bounds_hi.unbind(-1)
-
-          foot_global = foot_target + self.stance_foot_pos_0
-
-
-          toe_offset_tensor =torch.zeros_like(foot_global)
-          heel_offset_tensor = torch.zeros_like(foot_global)
-
-          toe_offset_tensor[:,0] = toe_offset
-          heel_offset_tensor[:,0] = heel_offset     
-
-          # 4) compute toe & heel positions in that frame
-          toe_yaw  = foot_global + _transfer_to_global_frame(toe_offset_tensor, self.stance_foot_ori_quat_0)
-          heel_yaw = foot_global + _transfer_to_global_frame(heel_offset_tensor, self.stance_foot_ori_quat_0)
-
-          # 5) build the [low, high] intervals for each corner along X
-          low_toe_x,  high_toe_x  = min_x - toe_yaw[:,0],  max_x - toe_yaw[:,0]
-          low_heel_x, high_heel_x = min_x - heel_yaw[:,0], max_x - heel_yaw[:,0]
-
-          # 6) intersect them: Δx ∈ [ max(low_toe, low_heel),  min(high_toe, high_heel) ]
-          low_x, high_x = torch.max(low_toe_x, low_heel_x), torch.min(high_toe_x, high_heel_x)
-
-          # 7) pick the shift closest to zero within that interval
-          #    → if 0∈[low,high], dx=0; if both >0, dx=low; if both <0, dx=high
-          zero = torch.zeros_like(low_x)
-          dx = torch.where(
-               low_x > 0, 
-               low_x,
-               torch.where(high_x < 0, high_x, zero)
-          )
-
-          # 8) same for Y
-          low_toe_y,  high_toe_y  = min_y - toe_yaw[:,1],  max_y - toe_yaw[:,1]
-          low_heel_y, high_heel_y = min_y - heel_yaw[:,1], max_y - heel_yaw[:,1]
-          low_y, high_y = torch.max(low_toe_y, low_heel_y), torch.min(high_toe_y, high_heel_y)
-
-          dy = torch.where(
-               low_y > 0,
-               low_y,
-               torch.where(high_y < 0, high_y, zero)
-          )
-
-          
-          delta_foot_target = torch.stack([dx, dy, torch.zeros_like(dx)], dim=-1)
-          delta_yaw_adjusted = _transfer_to_local_frame(delta_foot_target, self.stance_foot_ori_quat_0)
-          # 9) apply the minimal shift and rotate back
-          foot_yaw = _transfer_to_local_frame(foot_target, self.stance_foot_ori_quat_0)
-          foot_yaw[:,0] += delta_yaw_adjusted[:,0]
-          foot_yaw[:,1] += delta_yaw_adjusted[:,1]
-
-          if self.cfg.debug_vis:
-               if torch.sum(dx) + torch.sum(dy) > 0.01:
-                    print(f"foot_yaw: {foot_yaw}")
-                    print(f"delta_foot_target: {delta_foot_target}")
-                    print(f"delta_yaw_adjusted: {delta_yaw_adjusted}")
-
-          return foot_yaw
-
-
     def update_Stance_Swing_idx(self):
-          base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
-          #check stair width
+          base_velocity = self.env.command_manager.get_command("base_velocity")  # (N, 3)
           cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
           stair_width = cfg.step_width
 
-          # Calculate Tswing only if velocity is high enough, else use default
+          # Get stair step heights per environment
+          env_origins = self.env.scene.env_origins
+          stair_heights = get_uniform_stair_step_height_from_env(env_origins, cfg)
+          self.z_height = stair_heights  # shape: (N,)
+
           default_Tswing = 0.4
-          Tswing = torch.where(
-          base_velocity[:,0] < 0.3,
-               torch.full_like(base_velocity[:,0], default_Tswing),
-               stair_width / base_velocity[:,0]  # add epsilon to avoid div by zero
-               )
-          Tswing = torch.clamp(Tswing, min=0.3, max=1.2)
-          self.T = Tswing
-          #    Tswing = self.T - self.T_ds
-          self.tp = (self.env.sim.current_time % (2*Tswing)) / (2*Tswing)  
+          epsilon = 1e-5
+
+          # Compute Tswing for stair cases
+          Tswing_stair = stair_width / torch.clamp(base_velocity[:, 0], min=epsilon)
+
+          # If no stair height, fallback to default swing time
+          T_swing = torch.where(
+          self.z_height == 0,
+               torch.full_like(base_velocity[:, 0], default_Tswing),
+               Tswing_stair
+          )
+
+          # Clamp to safe range
+          T_swing = torch.clamp(T_swing, min=0.3, max=0.6)
+          self.T = T_swing
+
+          # Compute normalized phase
+          self.tp = (self.env.sim.current_time % (2 * T_swing)) / (2 * T_swing)
           phi_c = torch.sin(2 * torch.pi * self.tp) / torch.sqrt(torch.sin(2 * torch.pi * self.tp)**2 + self.T)
 
-
-          
         # 1) compute new stance & swing indices
           new_stance_idx = (phi_c < 0).long()     # or however you get it
           self.swing_idx = 1 - new_stance_idx
@@ -389,8 +113,6 @@ class StairCmd(HLIPCommandTerm):
           # 5) stash the new stance_idx
           self.stance_idx = new_stance_idx
 
-
-
           # 6) **only** overwrite those entries that changed
           self.stance_foot_pos_0      [changed] = pos      [changed]
           self.stance_foot_ori_quat_0 [changed] = quat     [changed]
@@ -398,13 +120,12 @@ class StairCmd(HLIPCommandTerm):
           self.swing2stance_foot_pos_0[changed] = s2s      [changed]
 
 
-
           self.phase_var = torch.where(
                self.tp < 0.5,
                2.0 * self.tp,
                2.0 * self.tp - 1.0
                )
-          self.cur_swing_time = self.phase_var*Tswing
+          self.cur_swing_time = self.phase_var*T_swing
 
 
     def generate_upper_body_ref(self):
@@ -529,9 +250,6 @@ class StairCmd(HLIPCommandTerm):
 
         foot_ang_vel_local_swing =quat_apply(quat_inv(foot_ori_w[batch_idx,self.swing_idx,:]), foot_ang_vel_w[batch_idx,self.swing_idx,:])
         
-        # _transfer_to_local_frame(
-        #     foot_ang_vel_w[:,self.swing_idx,:], self.stance_foot_ori_quat_0
-        # )
 
         swing2stance_vel = foot_lin_vel_local_swing 
     
@@ -632,24 +350,9 @@ class StairCmd(HLIPCommandTerm):
           # foot_target_yaw_adjusted = quat_apply(q_delta_yaw, foot_target)  # [B,3]
           # self.update_z_height(foot_target[:,0], foot_target[:,1])
           cfg = self.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
-          env_origins = self.env.scene.env_origins
-          stair_heights = get_uniform_stair_step_height_from_env(env_origins,cfg)
-          self.z_height = stair_heights
-          #transform it into the global frame
-          # foot_target_global_yaw_frame = _transfer_to_global_frame(foot_target, self.stance_foot_ori_quat_0)
-
-          
-          # based on the nominal step size, check the stair height
-          # self.update_z_height(foot_target_global_yaw_frame[:,0], foot_target_global_yaw_frame[:,1])
-
          
-          # foot_target_yaw_adjusted = self.adjust_foot_target(foot_target_global_yaw_frame)
-
-
           #clip based on the kinematics range
           foot_target[:,1] = torch.sign(Uy) * torch.clamp(torch.abs(foot_target[:,1]), min=self.cfg.foot_target_range_y[0], max=self.cfg.foot_target_range_y[1])
-
-          
 
           
           # import pdb; pdb.set_trace()
@@ -657,9 +360,6 @@ class StairCmd(HLIPCommandTerm):
           #select init and Xdes, Ux, Ydes, Uy
           x0 = self.hlip_controller.x_init
           y0 = self.hlip_controller.y_init[batch_idx,self.stance_idx]
-
-
-
 
           # import pdb; pdb.set_trace()
           com_x, com_xd = self.hlip_controller._compute_desire_com_trajectory(
@@ -671,21 +371,15 @@ class StairCmd(HLIPCommandTerm):
                Xdesire=y0,
           )
           # Concatenate x and y components
-          com_z = torch.ones((N,), device=self.device) * self.com_z + self.z_height * self.phase_var
+          com_z = self.com_z + self.z_height * (2 * self.phase_var - 1)
           com_zd = torch.ones((N), device=self.device) * self.z_height/T
           com_pos_des = torch.stack([com_x, com_y,com_z], dim=-1)  # Shape: (N,2)
           com_vel_des = torch.stack([com_xd, com_yd,com_zd], dim=-1)  # Shape: (N,2)
 
 
-          
-          # com_pos_des_yaw_adjusted = quat_apply(q_delta_yaw, com_pos_des)  # [B,3]
-          # com_vel_des_yaw_adjusted = quat_apply(q_delta_yaw, com_vel_des)  # [B,3]
-
-
           # clip foot target based on kinematic range
           self.foot_target = foot_target[:,0:2]
-          # start_box_center,_,_,_ = self.check_height(self.swing2stance_foot_pos_0)
-          # delta_z = start_box_center[:,2] - self.stance_foot_box_z
+      
  
           # if going down stairs, no need to modify z_sw_max only modify z_sw_neg
           z_sw_max_tensor = torch.where(self.z_height < 0, self.cfg.z_sw_max, self.cfg.z_sw_max +self.z_height)
@@ -712,33 +406,15 @@ class StairCmd(HLIPCommandTerm):
 
           # check if sw_z is actually above the stair
           
-          
-          
+     
           sign = torch.sign(foot_target[:, 1])
           foot_pos, sw_z = calculate_cur_swing_foot_pos_stair(
                bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
                foot_target[:, 0], foot_target[:, 1]
           )
 
-          # targ_box_center,_,_,_ = self.check_height(foot_pos)
-          # choose clearances (metres)
-          # clr_peak = 0.02                # 4 cm at t = 0.5
-          # margin_t = clr_peak * (3 * bht * (1 - bht)**2)   # [B]
-          # margin_t = torch.zeros((N), device=self.device)
-          # z_req = targ_box_center[:, 2] - self.stance_foot_box_z + margin_t
-          # foot_pos[:, 2] = torch.maximum(foot_pos[:, 2], z_req)
-
-          flat_foot_pos, flat_sw_z = calculate_cur_swing_foot_pos(
-               bht_tensor, z_init, z_sw_max_tensor, phase_var_tensor,-Ux, sign*self.cfg.y_nom,T_tensor, z_sw_neg_tensor,
-               foot_target[:, 0], foot_target[:, 1]
-          )
-
-          #for the envs with self.z_height < 0.01: use flat_foot_pos and flat_sw_z instead of foot_pos and sw_z
-          condition = (torch.abs(self.z_height) < 0.01).unsqueeze(-1)  # shape [B, 1]
-          foot_pos_new = torch.where(condition, flat_foot_pos, foot_pos)
-          sw_z_new = torch.where(condition, flat_sw_z, sw_z)  # sw_z is probably [B], so no unsqueeze needed
-          foot_pos = foot_pos_new
-          sw_z = sw_z_new
+          foot_pos = foot_pos
+          sw_z = sw_z
 
           dbht = bezier_deg(1, phase_var_tensor, T_tensor, horizontal_control_points, five_tensor)
           foot_vel = torch.zeros((N,3), device=self.device)
@@ -757,10 +433,6 @@ class StairCmd(HLIPCommandTerm):
           self.dy_out = torch.cat([com_vel_des, omega_ref, foot_vel, omega_foot_ref,upper_body_joint_vel], dim=-1)
 
 
-#     def _update_command(self):
-    
-#         super()._update_command()
-        
         
         
         
