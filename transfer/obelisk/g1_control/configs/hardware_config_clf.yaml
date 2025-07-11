@@ -33,8 +33,8 @@ onboard:
               2,2,2]
         v_x_max: 1.0
         v_x_min: -0.5
-        v_y_max: -0.2
-        v_y_min: 0.2
+        v_y_max: 0.2
+        v_y_min: -0.2
         w_z_max: 0.2
         default_angles: [-0.1, 0, 0, 0.3, -0.2, 0,
                   -0.1, 0, 0, 0.3, -0.2, 0,
@@ -150,7 +150,7 @@ onboard:
       executable: obelisk_unitree_g1_hardware
       params:
         ic_keyframe: standing
-        network_interface_name: enp4s0 # From ifconfig
+        network_interface_name: enx9cbf0d00b3c9 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle

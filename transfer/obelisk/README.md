@@ -55,6 +55,19 @@ Then finally we can run the stack in sim:
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/rl_policy_config.yaml device_name=onboard bag=false
 ```
 
+## Different Configs/Policies
+LIP:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device_name=onboard bag=false
+```
+
+HZD:
+
+Baseline:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
+```
+
 # Running on hardware
 Follow the above steps to make sure everything work in simulation.
 
