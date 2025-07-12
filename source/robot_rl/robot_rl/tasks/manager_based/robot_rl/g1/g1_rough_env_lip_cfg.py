@@ -73,7 +73,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         params={
             "command_name": "hlip_ref",
             "alpha": 1.0,
-            "max_clf_decreasing": 200.0,
+            "max_clf_decreasing": 100.0,
         }
     )
 
@@ -151,6 +151,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
         # self.terminations.base_contact.params["sensor_cfg"].body_names = ["pelvis_link"]
 
+        self.curriculum.clf_curriculum = None
         ##
         # Rewards
         ##
