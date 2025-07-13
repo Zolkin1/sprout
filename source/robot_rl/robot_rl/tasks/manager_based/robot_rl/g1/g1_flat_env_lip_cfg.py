@@ -20,6 +20,7 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
         # Scene
         ##
         # change terrain to flat
+        self.curriculum.clf_curriculum = None
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         # no height scan
@@ -38,6 +39,7 @@ class G1FlatRefTrackingEnvCfg(G1FlatLipEnvCfg):
         super().__post_init__()
         
         # self.rewards.clf_reward = None
+        self.curriculum.clf_curriculum = None
         self.rewards.clf_decreasing_condition = None
         self.curriculum.clf_curriculum = None
 

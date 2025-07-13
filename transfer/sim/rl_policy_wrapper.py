@@ -135,7 +135,7 @@ class RLPolicy:
         cos_phase = np.cos(2 * np.pi * time / self.period)
 
         obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
-        obs[9 + 3 * nj : 9 + 3 * nj + 2 + 1] = self.period/2
+        # obs[9 + 3 * nj : 9 + 3 * nj + 2 + 1] = self.period/2
 
         final_obs = np.concatenate((height_obs, obs))
 

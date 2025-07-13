@@ -151,7 +151,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
         # self.terminations.base_contact.params["sensor_cfg"].body_names = ["pelvis_link"]
 
-        self.curriculum.clf_curriculum = None
+        
         ##
         # Rewards
         ##
