@@ -317,13 +317,13 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
     def get_actual_traj(self, hzd_cmd):
         """Get actual trajectory from end effector tracker."""
-        ee_tracker = hzd_cmd.ee_tracker
+        data = hzd_cmd.robot.data
         
         # Determine swing foot frame name based on stance
         # If stance_idx == 0 (left stance), then right foot is swing foot
         # If stance_idx == 1 (right stance), then left foot is swing foot
-        swing_foot_frame = "right_foot_middle" if hzd_cmd.stance_idx == 0 else "left_foot_middle"
-        
+        swing_foot_idx = hzd_cmd.feet_bodies_idx[0] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[1]
+
         # Get stance foot pos and velocity for relative positioning
         stance_foot_pos = hzd_cmd.stance_foot_pos_0 
         
@@ -338,7 +338,10 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
         pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
 
-        swing_foot_pos, swing_foot_ori, sw2st_foot_quat = ee_tracker.get_pose(swing_foot_frame) 
+        # TODO: Verify
+        swing_foot_pos = data.body_pos_w[:, swing_foot_idx, :]
+        swing_foot_quat = data.body_quat_w[:, swing_foot_idx, :]
+        swing_foot_ori = get_euler_from_quat(swing_foot_quat)
         sw2st_foot_pos = swing_foot_pos - stance_foot_pos
         
         sw2st_foot_ori = swing_foot_ori 

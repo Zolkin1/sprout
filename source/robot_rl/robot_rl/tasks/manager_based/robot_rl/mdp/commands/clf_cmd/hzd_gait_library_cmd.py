@@ -106,14 +106,25 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
                 self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
 
     def get_stance_foot_pose(self):
-            """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-            stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
-            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-            self.stance_foot_pos = stance_foot_pos
-            self.stance_foot_ori = stance_foot_ori
-            stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
-            self.stance_foot_vel = stance_foot_vel
-            self.stance_foot_ang_vel = stance_foot_ang_vel
+        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+        # TODO: Remove
+        # stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
+        # stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
+        # self.stance_foot_pos = stance_foot_pos
+        # self.stance_foot_ori = stance_foot_ori
+        # stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
+        # self.stance_foot_vel = stance_foot_vel
+        # self.stance_foot_ang_vel = stance_foot_ang_vel
+
+        stance_foot_idx = self.feet_bodies_idx[1] if self.stance_idx == 0 else self.feet_bodies_idx[0]
+        # TODO: Verify
+        self.stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
+        stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
+        self.stance_foot_ori = get_euler_from_quat(stance_foot_quat)
+
+        self.stance_foot_vel = self.robot.data.body_lin_vel_w[:, stance_foot_idx, :]
+        self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
+
 
     def update_Stance_Swing_idx(self):
         """Update stance and swing indices based on phase."""
