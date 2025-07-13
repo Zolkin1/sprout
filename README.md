@@ -10,6 +10,7 @@ This project is a set of tools for end-to-end development of RL for robots. Spec
 interface can be run through a docker/dev-container provided in this repo. See below for more information.
 
 ## Installation
+When you clone this repo, please use Git Large File System (lfs).
 
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
   We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
