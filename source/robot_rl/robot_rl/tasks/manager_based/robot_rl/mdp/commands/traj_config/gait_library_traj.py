@@ -5,7 +5,7 @@ import re
 import math
 
 from .base_traj import BaseTrajectoryConfig
-from .ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker
+from .ee_traj import EndEffectorTrajectoryConfig #, EndEffectorTracker
 from .jt_traj import JointTrajectoryConfig
 from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x, get_uniform_stair_step_height_from_env
 
@@ -323,8 +323,8 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
                     if hasattr(cfg, 'ee_tracker'):
                         config.reorder_and_remap(cfg, cfg.ee_tracker, device)
                     else:
-                        ee_tracker = EndEffectorTracker(config.constraint_specs, None)
-                        config.reorder_and_remap(cfg, ee_tracker, device)
+                        # ee_tracker = EndEffectorTracker(config.constraint_specs, None)
+                        config.reorder_and_remap(cfg, device)
                 else:
                     config.reorder_and_remap(cfg, cfg.robot, device)
         

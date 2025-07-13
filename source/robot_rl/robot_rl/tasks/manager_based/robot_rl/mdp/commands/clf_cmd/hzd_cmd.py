@@ -9,7 +9,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
 
 from typing import TYPE_CHECKING
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import JointTrajectoryConfig, get_euler_from_quat
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTrajectoryConfig, EndEffectorTracker
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTrajectoryConfig #, EndEffectorTracker
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi,quat_from_euler_xyz
 
 if TYPE_CHECKING:

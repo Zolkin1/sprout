@@ -8,133 +8,133 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfe
 from .base_traj import BaseTrajectoryConfig
 
 
-class EndEffectorTracker:
-    def __init__(self, constraint_specs: List[Dict], scene=None):
-        """
-        Initialize EndEffectorTracker using frame transformer sensors for efficient tracking.
-        
-        Args:
-            constraint_specs: List of constraint specifications containing frame names
-            scene: Scene object containing the frame sensors
-        """
-        self.constraint_specs = constraint_specs
-        self.scene = scene
-        
-        # Map frame names to their corresponding sensors
-        self.frame_to_sensor_mapping = {
-            "left_foot_middle": "left_foot_sensor",
-            "right_foot_middle": "right_foot_sensor", 
-            "left_hand_palm_joint": "left_hand_sensor",
-            "right_hand_palm_joint": "right_hand_sensor",
-            "pelvis_link": "pelvis_sensor",
-        }
-        
-        # Map frame names to body names for velocity data
-        self.frame_to_body_mapping = {
-            "left_foot_middle": "left_ankle_roll_link",
-            "right_foot_middle": "right_ankle_roll_link", 
-            "left_hand_palm_joint": "left_elbow_link",
-            "right_hand_palm_joint": "right_elbow_link",
-            "pelvis_link": "pelvis_link",
-        }
-        
-        # Will be populated when robot data is first available
-        self.frame_to_body_idx_mapping = {}
-        self.body_idx_mapping_initialized = False
-        
-        print("EndEffectorTracker initialized with frame transformer sensors")
-
-    def _initialize_body_idx_mapping(self, robot_data):
-        """Initialize the body index mapping once when robot data is available."""
-        if self.body_idx_mapping_initialized:
-            return
-            
-        for frame_name, body_name in self.frame_to_body_mapping.items():
-            # Find body index by name
-            body_idx = None
-            for i, name in enumerate(robot_data.body_names):
-                if body_name in name:
-                    body_idx = i
-                    break
-                    
-            if body_idx is None:
-                print(f"Warning: Body '{body_name}' not found in robot data for frame '{frame_name}'")
-                continue
-                
-            self.frame_to_body_idx_mapping[frame_name] = body_idx
-        
-        self.body_idx_mapping_initialized = True
-        print(f"Body index mapping initialized: {self.frame_to_body_idx_mapping}")
-
-    def get_pose(self, frame_name: str):
-        """Returns (position, euler_orientation) for a given EE frame."""
-        if self.scene is None:
-            raise ValueError("Scene not available")
-            
-        if frame_name not in self.frame_to_sensor_mapping:
-            raise ValueError(f"Frame '{frame_name}' not found in frame sensor mapping")
-            
-        sensor_name = self.frame_to_sensor_mapping[frame_name]
-
-        frame_sensor = self.scene.sensors.get(sensor_name, None)
-        
-        if frame_sensor is None:
-            raise ValueError(f"Frame sensor '{sensor_name}' not found in scene")
-        
-        # Get position and orientation from frame sensor
-        # Each sensor has only one target frame at index 0
-        pos = frame_sensor.data.target_pos_w[:, 0, :]  # Shape: (num_envs, 3)
-        quat = frame_sensor.data.target_quat_w[:, 0, :]  # Shape: (num_envs, 4)
-        
-        # Convert quaternions to euler angles for all environments
-        euler = get_euler_from_quat(quat)  # Shape: (num_envs, 3)
-        return pos, euler, quat
-
-    def get_velocity(self, frame_name: str, robot_data):
-        """Returns (linear_velocity, angular_velocity) for a given EE frame from robot body data."""
-        # Initialize body index mapping if not done yet
-        self._initialize_body_idx_mapping(robot_data)
-        
-        if frame_name not in self.frame_to_body_idx_mapping:
-            raise ValueError(f"Frame '{frame_name}' not found in body index mapping")
-            
-        body_idx = self.frame_to_body_idx_mapping[frame_name]
-        
-        # Get linear and angular velocity from robot body data
-        lin_vel = robot_data.body_lin_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
-        ang_vel = robot_data.body_ang_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
-        
-        return lin_vel, ang_vel
-
-    def get_relabel_matrix(self, frame_name: str, is_orientation: bool) -> torch.Tensor:
-        """Returns the relabel matrix for mirroring."""
-        if is_orientation:
-            mapping = [-1.0, 1.0, 1.0]  # roll flipped
-        else:
-            mapping = [1.0, -1.0, 1.0]  # y flipped
-        return torch.diag(torch.tensor(mapping, dtype=torch.float32))
-
-    def get_remapped_pose(self, frame_name: str, is_orientation: bool) -> torch.Tensor:
-        pos, ori = self.get_pose(frame_name)
-        raw = ori if is_orientation else pos
-        remap = self.get_relabel_matrix(frame_name, is_orientation)
-        return remap @ raw
-
-    def get_all_poses(self) -> Dict[str, tuple]:
-        """Get poses for all tracked frames."""
-        poses = {}
-        for frame_name in self.frame_to_sensor_mapping.keys():
-            try:
-                poses[frame_name] = self.get_pose(frame_name)
-            except Exception as e:
-                print(f"Warning: Could not get pose for frame {frame_name}: {e}")
-        return poses
-
-
+# class EndEffectorTracker:
+#     def __init__(self, constraint_specs: List[Dict], scene=None):
+#         """
+#         Initialize EndEffectorTracker using frame transformer sensors for efficient tracking.
+#
+#         Args:
+#             constraint_specs: List of constraint specifications containing frame names
+#             scene: Scene object containing the frame sensors
+#         """
+#         self.constraint_specs = constraint_specs
+#         self.scene = scene
+#
+#         # Map frame names to their corresponding sensors
+#         self.frame_to_sensor_mapping = {
+#             "left_foot_middle": "left_foot_sensor",
+#             "right_foot_middle": "right_foot_sensor",
+#             "left_hand_palm_joint": "left_hand_sensor",
+#             "right_hand_palm_joint": "right_hand_sensor",
+#             "pelvis_link": "pelvis_sensor",
+#         }
+#
+#         # Map frame names to body names for velocity data
+#         self.frame_to_body_mapping = {
+#             "left_foot_middle": "left_ankle_roll_link",
+#             "right_foot_middle": "right_ankle_roll_link",
+#             "left_hand_palm_joint": "left_elbow_link",
+#             "right_hand_palm_joint": "right_elbow_link",
+#             "pelvis_link": "pelvis_link",
+#         }
+#
+#         # Will be populated when robot data is first available
+#         self.frame_to_body_idx_mapping = {}
+#         self.body_idx_mapping_initialized = False
+#
+#         print("EndEffectorTracker initialized with frame transformer sensors")
+#
+#     def _initialize_body_idx_mapping(self, robot_data):
+#         """Initialize the body index mapping once when robot data is available."""
+#         if self.body_idx_mapping_initialized:
+#             return
+#
+#         for frame_name, body_name in self.frame_to_body_mapping.items():
+#             # Find body index by name
+#             body_idx = None
+#             for i, name in enumerate(robot_data.body_names):
+#                 if body_name in name:
+#                     body_idx = i
+#                     break
+#
+#             if body_idx is None:
+#                 print(f"Warning: Body '{body_name}' not found in robot data for frame '{frame_name}'")
+#                 continue
+#
+#             self.frame_to_body_idx_mapping[frame_name] = body_idx
+#
+#         self.body_idx_mapping_initialized = True
+#         print(f"Body index mapping initialized: {self.frame_to_body_idx_mapping}")
+#
+#     def get_pose(self, frame_name: str):
+#         """Returns (position, euler_orientation) for a given EE frame."""
+#         if self.scene is None:
+#             raise ValueError("Scene not available")
+#
+#         if frame_name not in self.frame_to_sensor_mapping:
+#             raise ValueError(f"Frame '{frame_name}' not found in frame sensor mapping")
+#
+#         sensor_name = self.frame_to_sensor_mapping[frame_name]
+#
+#         frame_sensor = self.scene.sensors.get(sensor_name, None)
+#
+#         if frame_sensor is None:
+#             raise ValueError(f"Frame sensor '{sensor_name}' not found in scene")
+#
+#         # Get position and orientation from frame sensor
+#         # Each sensor has only one target frame at index 0
+#         pos = frame_sensor.data.target_pos_w[:, 0, :]  # Shape: (num_envs, 3)
+#         quat = frame_sensor.data.target_quat_w[:, 0, :]  # Shape: (num_envs, 4)
+#
+#         # Convert quaternions to euler angles for all environments
+#         euler = get_euler_from_quat(quat)  # Shape: (num_envs, 3)
+#         return pos, euler, quat
+#
+#     def get_velocity(self, frame_name: str, robot_data):
+#         """Returns (linear_velocity, angular_velocity) for a given EE frame from robot body data."""
+#         # Initialize body index mapping if not done yet
+#         self._initialize_body_idx_mapping(robot_data)
+#
+#         if frame_name not in self.frame_to_body_idx_mapping:
+#             raise ValueError(f"Frame '{frame_name}' not found in body index mapping")
+#
+#         body_idx = self.frame_to_body_idx_mapping[frame_name]
+#
+#         # Get linear and angular velocity from robot body data
+#         lin_vel = robot_data.body_lin_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
+#         ang_vel = robot_data.body_ang_vel_w[:, body_idx, :]  # Shape: (num_envs, 3)
+#
+#         return lin_vel, ang_vel
+#
+#     def get_relabel_matrix(self, frame_name: str, is_orientation: bool) -> torch.Tensor:
+#         """Returns the relabel matrix for mirroring."""
+#         if is_orientation:
+#             mapping = [-1.0, 1.0, 1.0]  # roll flipped
+#         else:
+#             mapping = [1.0, -1.0, 1.0]  # y flipped
+#         return torch.diag(torch.tensor(mapping, dtype=torch.float32))
+#
+#     def get_remapped_pose(self, frame_name: str, is_orientation: bool) -> torch.Tensor:
+#         pos, ori = self.get_pose(frame_name)
+#         raw = ori if is_orientation else pos
+#         remap = self.get_relabel_matrix(frame_name, is_orientation)
+#         return remap @ raw
+#
+#     def get_all_poses(self) -> Dict[str, tuple]:
+#         """Get poses for all tracked frames."""
+#         poses = {}
+#         for frame_name in self.frame_to_sensor_mapping.keys():
+#             try:
+#                 poses[frame_name] = self.get_pose(frame_name)
+#             except Exception as e:
+#                 print(f"Warning: Could not get pose for frame {frame_name}: {e}")
+#         return poses
+#
+#
 def relable_ee_hand_coeffs():
     """Build relabel matrix for end effector coefficients."""
     R = np.eye(21)
-    
+
     # only need to swap left and right palm coeffs
     # com pos: [1,-1,1]
     R[1, 1] = -1
@@ -162,7 +162,7 @@ def relable_ee_hand_coeffs():
 def relable_ee_coeffs():
     """Build relabel matrix for end effector coefficients."""
     R = np.eye(21)
-    
+
     # only need to swap left and right palm coeffs
     # com pos: [1,-1,1]
     R[1, 1] = -1
@@ -176,7 +176,7 @@ def relable_ee_coeffs():
     R[11, 11] = -1
     # waist yaw
     R[12, 12] = -1
-    
+
     #swap arm coeffs
     arm_offset = 12 + 1
     left_arm = arm_offset + np.array([0, 1, 2, 3])
@@ -222,7 +222,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 frames.append(spec["frame"])
         return frames
 
-    def reorder_and_remap(self, cfg, ee_tracker, device):
+    def reorder_and_remap(self, cfg, device):
         """Reorder and remap end effector coefficients using hardcoded relabeling matrix."""
         # Load all bezier coefficients from YAML
         self.right_coeffs = torch.tensor(self.bezier_coeffs, dtype=torch.float32, device=device)
@@ -322,7 +322,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # Determine swing foot frame name based on stance
         # If stance_idx == 0 (left stance), then right foot is swing foot
         # If stance_idx == 1 (right stance), then left foot is swing foot
-        swing_foot_idx = hzd_cmd.feet_bodies_idx[0] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[1]
+        swing_foot_idx = hzd_cmd.feet_bodies_idx[1] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[0]
 
         # Get stance foot pos and velocity for relative positioning
         stance_foot_pos = hzd_cmd.stance_foot_pos_0 
@@ -390,10 +390,12 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         
         return y_act, dy_act
 
-    # Legacy method for backward compatibility
-    def reorder_and_remap_ee(self, cfg, ee_tracker, device):
-        """Legacy method - now calls reorder_and_remap."""
-        self.reorder_and_remap(cfg, ee_tracker, device)
+    #TODO: Remove
+
+    # # Legacy method for backward compatibility
+    # def reorder_and_remap_ee(self, cfg, ee_tracker, device):
+    #     """Legacy method - now calls reorder_and_remap."""
+    #     self.reorder_and_remap(cfg, ee_tracker, device)
 
     def get_ref_traj(self, ee_hzd_cmd):
         """Legacy method - now calls parent get_ref_traj."""

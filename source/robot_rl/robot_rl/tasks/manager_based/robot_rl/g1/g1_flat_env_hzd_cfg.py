@@ -25,67 +25,68 @@ class G1SceneCfg(MySceneCfg):
     # Set default number of environments
     num_envs: int = 4096
     env_spacing: float = 2.5
-    
-    # Frame transformer for end effector tracking
-    left_foot_sensor = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
-                name="left_foot_middle",
-                offset=OffsetCfg(
-                    pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
-                ),
-            ),
-        ],
-    )
 
-    right_foot_sensor = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
-                name="right_foot_middle",
-                offset=OffsetCfg(
-                    pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
-                ),
-            ),
-        ],
-    )
-
-    left_hand_sensor = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
-                name="left_hand_palm_joint",
-                offset=OffsetCfg(
-                    pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
-                ),
-            ),
-        ],
-    )
-
-    right_hand_sensor = FrameTransformerCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
-        debug_vis=False,
-        visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
-        target_frames=[
-            FrameTransformerCfg.FrameCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
-                name="right_hand_palm_joint",
-                offset=OffsetCfg(
-                    pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
-                ),
-            ),
-        ],
-    )
+    # TODO: Remove
+    # # Frame transformer for end effector tracking
+    # left_foot_sensor = FrameTransformerCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
+    #     debug_vis=False,
+    #     visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+    #     target_frames=[
+    #         FrameTransformerCfg.FrameCfg(
+    #             prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
+    #             name="left_foot_middle",
+    #             offset=OffsetCfg(
+    #                 pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
+    #             ),
+    #         ),
+    #     ],
+    # )
+    #
+    # right_foot_sensor = FrameTransformerCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
+    #     debug_vis=False,
+    #     visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+    #     target_frames=[
+    #         FrameTransformerCfg.FrameCfg(
+    #             prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
+    #             name="right_foot_middle",
+    #             offset=OffsetCfg(
+    #                 pos=(0.035, 0.0, -0.03),  # mid_foot_to_ankle_offset
+    #             ),
+    #         ),
+    #     ],
+    # )
+    #
+    # left_hand_sensor = FrameTransformerCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
+    #     debug_vis=False,
+    #     visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+    #     target_frames=[
+    #         FrameTransformerCfg.FrameCfg(
+    #             prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
+    #             name="left_hand_palm_joint",
+    #             offset=OffsetCfg(
+    #                 pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
+    #             ),
+    #         ),
+    #     ],
+    # )
+    #
+    # right_hand_sensor = FrameTransformerCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
+    #     debug_vis=False,
+    #     visualizer_cfg=FRAME_MARKER_SMALL_CFG.replace(prim_path="/Visuals/EndEffectorFrameTransformer"),
+    #     target_frames=[
+    #         FrameTransformerCfg.FrameCfg(
+    #             prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
+    #             name="right_hand_palm_joint",
+    #             offset=OffsetCfg(
+    #                 pos=(0.22550038, 0.00484531, -0.0100121),  # palm_to_elbow_offset
+    #             ),
+    #         ),
+    #     ],
+    # )
 
 
 ##
