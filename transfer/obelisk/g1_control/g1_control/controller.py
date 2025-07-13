@@ -20,12 +20,11 @@ class VelocityTrackingController(ObeliskController, ABC):
     def __init__(self, node_name: str = "velocity_tracking_controller") -> None:
         """Initialize the example position setpoint controller."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
-        # Note: these are declared in the other node
-        # # Velocity limits
-        # self.declare_parameter("v_x_max", 1.0)
-        # self.declare_parameter("v_x_min", -1.0)
-        # self.declare_parameter("v_y_max", 0.5)
-        # self.declare_parameter("w_z_max", 0.5)
+        # Velocity limits
+        self.declare_parameter("v_x_max", 1.0)
+        self.declare_parameter("v_x_min", -1.0)
+        self.declare_parameter("v_y_max", 0.5)
+        self.declare_parameter("w_z_max", 0.5)
 
         # Load policy
         self.declare_parameter("policy_name", "")
@@ -229,21 +228,15 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.received_xhat = True
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
-        """Callback for velocity command messages.
-        Note that the clipping happens in the `obelisk_unitree_joystick` node. Adjust the parameters in the yaml.
-        """
-        self.cmd_vel[0] = cmd_msg.v_x
-        self.cmd_vel[1] = cmd_msg.v_y
-        self.cmd_vel[2] = cmd_msg.w_z
-
-        # self.cmd_vel[0] = min(
-        #     max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
-        #     self.get_parameter("v_x_max").get_parameter_value().double_value,
-        # )
-        # v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
-        # self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
-        # w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
-        # self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
+        """Callback for velocity command messages."""
+        self.cmd_vel[0] = min(
+            max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
+            self.get_parameter("v_x_max").get_parameter_value().double_value,
+        )
+        v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
+        self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
+        w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
+        self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
 
     @staticmethod
     def project_gravity(quat):
