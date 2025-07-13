@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg, StairGaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1FlatHZDObservationsCfg, G1StairHZDObservationsCfg
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg, G1StairHZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_stair_env_cfg import G1StairEnvCfg, CUSTOM_STAIR_CFG
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1StairObservationsCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -33,15 +33,13 @@ class G1GaitLibraryStairCommandsCfg(HumanoidCommandsCfg):
 @configclass
 class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
     """Configuration for the G1 environment with gait library."""
-    observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
     commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
 
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
-        
-        self.observations.policy.ref_traj = None
-        self.observations.policy.act_traj = None
+        self.observations = G1HZDObservationsCfg()
+
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)

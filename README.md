@@ -77,7 +77,9 @@ RL Task list:
 
 ## Copying checkpoitns from remote server 
 First mount the server to your local desktop
+ 
 ```
+bash scripts/mount_remote.sh
 bash scripts/copy_from_mount.sh <ENV_NAME> g1
 ```
 
