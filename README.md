@@ -46,14 +46,14 @@ This helps in indexing all the python modules for intelligent suggestions while 
 ## Running Tasks
 To train a policy run:
 ```bash
-python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
+python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --headless
 ```
 
 Note that right now the only RL_LIBRARY that is tested in `RSL_RL`.
 
 To play the most recently trained policy for a given task run:
 ```bash
-python scripts/<RL_LIBRARY>/play.py --task=<TASK_NAME>
+python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --headless
 ```
 
 If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<log_dir_checkpoint>`.
@@ -69,7 +69,11 @@ RL Task list:
 | Task          |   Robot    |   Hardware Tested?   | Description                                                      |
 |---------------|:----------:|:--------------------:|------------------------------------------------------------------|
 | `G1-flat-vel` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
-
+| `clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
+| `stair`         |     G1     |  :x:  | LIP CLF on stair terrain. |
+| `flat-hzd`    |     G1     |  :x:  | A single HZD gait; CLF RL walking on the G1 humanoid on flat ground. |
+| `flat-hzd-GL`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+| `height-map`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground with height map observation. |
 
 ## sim2sim Transfer
 This code base has a built in sim2sim transfer (i.e. the policy is trained in IsaacLab and can be run in Mujoco).
