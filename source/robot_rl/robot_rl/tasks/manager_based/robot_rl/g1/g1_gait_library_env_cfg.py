@@ -16,7 +16,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         trajectory_type="end_effector",
         gait_library_path="source/robot_rl/robot_rl/assets/robots/gait_library",
         config_name="single_support_config",
-        gait_velocity_ranges=(0.25, 0.75, 0.05)
+        gait_velocity_ranges=(-0.75, 0.75, 0.05)
     )
 
 
@@ -43,7 +43,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.observations.policy.ref_traj = None
         self.observations.policy.act_traj = None
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.25, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.1, 0.1)
         self.commands.base_velocity.ranges.heading = (0, 0)

@@ -75,6 +75,12 @@ RL Task list:
 | `flat-hzd-GL`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 | `height-map`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground with height map observation. |
 
+## Copying checkpoitns from remote server 
+First mount the server to your local desktop
+```
+bash scripts/copy_from_mount.sh <ENV_NAME> g1
+```
+
 ## sim2sim Transfer
 This code base has a built in sim2sim transfer (i.e. the policy is trained in IsaacLab and can be run in Mujoco).
 Currently, we only support the G1 (as that is the only policy we have right now), but the code is easily extended to other robots.
