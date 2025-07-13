@@ -8,7 +8,7 @@ import isaaclab.sim as sim_utils
 Q_weights = [
     25.0,   200.0,    # com_x pos, vel
     300.0,   50.0,   # com_y pos, vel
-    600.0,  20.0,  # com_z pos, vel
+    400.0,  10.0,  # com_z pos, vel
     420.0,    20.0,    # pelvis_roll pos, vel
     200.0,    10.0,    # pelvis_pitch pos, vel
     300.0,    10.0,    # pelvis_yaw pos, vel
@@ -49,7 +49,7 @@ class HLIPCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     yaw_idx: list[int] = [5,11]
     T_ds: float = 0.0          # double support duration (s)
-    z0: float = 0.65           # CoM height (m)
+    z0: float = 0.61           # CoM height (m)
     y_nom: float = 0.25        # nominal lateral foot offset (m)
     gait_period: float = 0.8   # gait cycle period (s)
     debug_vis: bool = False    # enable debug visualization
