@@ -61,11 +61,14 @@ onboard:
           topic: /obelisk/g1/est_state
           history_depth: 10
           callback_group: None
-        # ----- Joystick subscriber ----- #
+        # ----- High Level Command subscriber ----- #
         - ros_parameter: sub_vel_cmd_setting
           topic: /obelisk/g1/high_level_ctrl
           history_depth: 10
           callback_group: None
+        # ----- Joystick subscriber ----- #
+        - ros_parameter: sub_joystick
+          topic: /obelisk/g1/joy
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.02    # 50 Hz
