@@ -5,7 +5,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library
     GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryTrajectoryConfig
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
+# from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
 
 class GaitLibraryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses a gait library with velocity-based selection."""
@@ -43,12 +43,12 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             else:
                 raise ValueError("Gait library configuration missing: either gait_height_ranges or gait_velocity_ranges required")
             
-            # Initialize end effector tracker if needed
-            if cfg.trajectory_type == "end_effector":
-                self.ee_tracker = EndEffectorTracker(
-                    self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].constraint_specs,
-                    env.scene
-                )
+            # # Initialize end effector tracker if needed
+            # if cfg.trajectory_type == "end_effector":
+            #     self.ee_tracker = EndEffectorTracker(
+            #         self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].constraint_specs,
+            #         env.scene
+            #     )
         else:
             raise ValueError("Gait library configuration missing: gait_library_path required")
         
@@ -106,14 +106,15 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
                 self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
 
     def get_stance_foot_pose(self):
-            """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-            stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
-            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-            self.stance_foot_pos = stance_foot_pos
-            self.stance_foot_ori = stance_foot_ori
-            stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
-            self.stance_foot_vel = stance_foot_vel
-            self.stance_foot_ang_vel = stance_foot_ang_vel
+        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+        stance_foot_idx = self.feet_bodies_idx[0] if self.stance_idx == 0 else self.feet_bodies_idx[1]
+        self.stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
+        stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
+        self.stance_foot_ori = get_euler_from_quat(stance_foot_quat)
+
+        self.stance_foot_vel = self.robot.data.body_lin_vel_w[:, stance_foot_idx, :]
+        self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
+
 
     def update_Stance_Swing_idx(self):
         """Update stance and swing indices based on phase."""
@@ -132,8 +133,10 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             # Update stance foot pose based on trajectory type
             if hasattr(self, 'ee_tracker'):
                 # End-effector trajectories
-                stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-                stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
+                stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
+                stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
+                stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
+                stance_foot_ori = get_euler_from_quat(stance_foot_quat)
                 
                 self.stance_foot_pos_0 = stance_foot_pos
                 self.stance_foot_ori_quat_0 = stance_foot_quat
@@ -149,27 +152,15 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         just_reset = (self.env.episode_length_buf == 0)
         # Handle episode reset: force re-alignment of stance foot
         if just_reset.any():
-          if hasattr(self, 'ee_tracker'):
-               # End-effector mode: assumes single-env, so just do once
-               stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-               stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
+           # End-effector mode: assumes single-env, so just do once
+           stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
+           stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
+           stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
+           stance_foot_ori = get_euler_from_quat(stance_foot_quat)
 
-               self.stance_foot_pos_0[just_reset] = stance_foot_pos[just_reset]
-               self.stance_foot_ori_quat_0[just_reset] = stance_foot_quat[just_reset]
-               self.stance_foot_ori_0[just_reset] = stance_foot_ori[just_reset]
-          else:
-               # Joint trajectory version: selective batched update
-               foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]  # [N, 2, 3]
-               foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]  # [N, 2, 4]
-               idx = new_stance_idx.view(-1, 1, 1)  # [N,1,1]
-
-               updated_pos = foot_pos_w.gather(1, idx.expand(-1, 1, 3)).squeeze(1)
-               updated_quat = foot_ori_w.gather(1, idx.expand(-1, 1, 4)).squeeze(1)
-               updated_ori = get_euler_from_quat(updated_quat)
-
-               self.stance_foot_pos_0[just_reset] = updated_pos[just_reset]
-               self.stance_foot_ori_quat_0[just_reset] = updated_quat[just_reset]
-               self.stance_foot_ori_0[just_reset] = updated_ori[just_reset]
+           self.stance_foot_pos_0[just_reset] = stance_foot_pos[just_reset]
+           self.stance_foot_ori_quat_0[just_reset] = stance_foot_quat[just_reset]
+           self.stance_foot_ori_0[just_reset] = stance_foot_ori[just_reset]
           
 
         self.stance_idx = new_stance_idx
