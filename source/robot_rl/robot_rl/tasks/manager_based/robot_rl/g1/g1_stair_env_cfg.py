@@ -233,7 +233,7 @@ class G1HZD_StairCommandsCfg(HumanoidCommandsCfg):
     hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
     hzd_ref.Q_weights = HZD_Stair_Q_weights
     hzd_ref.R_weights = HZD_Stair_R_weights
-    #TODO cha
+
 @configclass
 class G1HZDStairEnvCfg(G1StairEnvCfg):
     commands: G1HZD_StairCommandsCfg = G1HZD_StairCommandsCfg()

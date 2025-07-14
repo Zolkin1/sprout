@@ -107,9 +107,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
 
     def get_stance_foot_pose(self):
         """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-        # TODO: Verify left vs right
         stance_foot_idx = self.feet_bodies_idx[0] if self.stance_idx == 0 else self.feet_bodies_idx[1]
-        # TODO: Verify
         self.stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
         stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
         self.stance_foot_ori = get_euler_from_quat(stance_foot_quat)
@@ -136,14 +134,9 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             if hasattr(self, 'ee_tracker'):
                 # End-effector trajectories
                 stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
-                # TODO: Verify
                 stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
                 stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
                 stance_foot_ori = get_euler_from_quat(stance_foot_quat)
-
-                # TODO: Remove
-                # stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-                # stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
                 
                 self.stance_foot_pos_0 = stance_foot_pos
                 self.stance_foot_ori_quat_0 = stance_foot_quat
@@ -159,35 +152,15 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         just_reset = (self.env.episode_length_buf == 0)
         # Handle episode reset: force re-alignment of stance foot
         if just_reset.any():
-          # if hasattr(self, 'ee_tracker'):
            # End-effector mode: assumes single-env, so just do once
            stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
-           # TODO: Verify
            stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
            stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
            stance_foot_ori = get_euler_from_quat(stance_foot_quat)
 
-           # TODO: Remove
-           # stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-           # stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
-
            self.stance_foot_pos_0[just_reset] = stance_foot_pos[just_reset]
            self.stance_foot_ori_quat_0[just_reset] = stance_foot_quat[just_reset]
            self.stance_foot_ori_0[just_reset] = stance_foot_ori[just_reset]
-          # TODO: Remove
-          # else:
-          #      # Joint trajectory version: selective batched update
-          #      foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]  # [N, 2, 3]
-          #      foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]  # [N, 2, 4]
-          #      idx = new_stance_idx.view(-1, 1, 1)  # [N,1,1]
-          #
-          #      updated_pos = foot_pos_w.gather(1, idx.expand(-1, 1, 3)).squeeze(1)
-          #      updated_quat = foot_ori_w.gather(1, idx.expand(-1, 1, 4)).squeeze(1)
-          #      updated_ori = get_euler_from_quat(updated_quat)
-          #
-          #      self.stance_foot_pos_0[just_reset] = updated_pos[just_reset]
-          #      self.stance_foot_ori_quat_0[just_reset] = updated_quat[just_reset]
-          #      self.stance_foot_ori_0[just_reset] = updated_ori[just_reset]
           
 
         self.stance_idx = new_stance_idx
