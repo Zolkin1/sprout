@@ -64,7 +64,7 @@ class Robot:
             if abs(vx) < 0.1:
                 vx = 0
             else:
-                vx = np.clip(vx, 0.0, 0.6)
+                vx = np.clip(vx, -0.75, 0.75)
             if abs(vy) < 0.1:
                 vy = 0
             else:
@@ -72,7 +72,7 @@ class Robot:
             if abs(vyaw) < 0.1:
                 vyaw = 0
             else:
-                vyaw = np.clip(vyaw, -0.1, 0.1)
+                vyaw = np.clip(vyaw, -0.2, 0.2)
             des_vel[0] = vx
             des_vel[1] = vy
             des_vel[2] = vyaw
