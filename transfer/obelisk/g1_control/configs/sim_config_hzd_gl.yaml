@@ -51,6 +51,9 @@ onboard:
           "right_shoulder_yaw_joint",
           "right_elbow_joint",
         ]
+        log: true
+        log_decimation: 1 # relative to the control callback
+        config_name: "rl_policy_config.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
