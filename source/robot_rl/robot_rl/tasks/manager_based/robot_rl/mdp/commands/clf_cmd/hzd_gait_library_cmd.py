@@ -58,7 +58,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             self.joint_idx_list = self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].get_joint_idx_list(self)
             self.foot_yaw_output_idx = 11
             self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
-            self.yaw_output_idx = [5, 11, 16, 20]
+            self.yaw_output_idx = [5, 11]
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)

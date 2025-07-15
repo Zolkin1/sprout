@@ -165,14 +165,14 @@ HZD_EE_Q_weights_GL = [
     50.0,    1.0,    # swing_ori_pitch pos, vel
     400.0,    10.0,    # swing_ori_yaw pos, vel
     100.0,    1.0,    # waist_yaw pos, vel
-    40.0,1.0, #swing hand palm pos x
-    30.0,1.0, #swing hand palm pos y
-    50.0,1.0, #swing hand palm pos z
-    5.0,1.0, #swing hand palm yaw
-    40.0,1.0, #stance hand palm pos x
-    30.0,1.0, #stance hand palm pos y
-    50.0,1.0, #stance hand palm pos z
-    5.0,1.0, #stance hand palm yaw
+    40.0,1.0, #left shoulder pitch
+    30.0,1.0, #left shoulder roll
+    50.0,1.0, #left shoulder yaw
+    5.0,1.0, #left elbow
+    40.0,1.0, #right shoulder pitch
+    30.0,1.0, #right shoulder roll
+    50.0,1.0, #right shoulder yaw
+    5.0,1.0, #right elbow
 ]
 
 
