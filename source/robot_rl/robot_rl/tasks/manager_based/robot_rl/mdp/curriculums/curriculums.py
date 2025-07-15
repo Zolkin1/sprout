@@ -23,22 +23,31 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-# def gaits_curriculum(
-#     env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 5000,
-#     vel_range: tuple[float, float] = (0.1, 0.5)
-# ) -> float:
-#     """Curriculum based on clf value"""
-#     cmd_term_cfg = env.command_manager.get_term_cfg("base_velocity")
-#     ref_cmd_term = env.command_manager.get_term("hzd_ref")
-#     sw_z_err = ref_cmd_term.metrics["left_foot_middle_ee_pos_z"]
-#     import pdb; pdb.set_trace()
-#     #increase the vel range if 
+def gaits_curriculum(
+    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 24000,
+    vel_interval: float = 0.1
+) -> float:
+    """Curriculum based on clf value"""
+    cmd_term = env.command_manager.get_term("base_velocity")
+    ref_cmd_term = env.command_manager.get_term("hzd_ref")
 
-#     new_vel_range = vel_range
-#     if env.common_step_counter % update_interval == 0:
-#         cmd_term_cfg.ranges.lin_vel_x = new_vel_range
-#         env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
-#     return cmd_term_cfg.ranges.lin_vel_x
+    max_vel_range = ref_cmd_term.cfg.gait_velocity_ranges
+    cur_vel_range = cmd_term.cfg.ranges.lin_vel_x
+
+    # load the gait library velocity range; 
+    new_min = cur_vel_range[0] - vel_interval
+    new_max = cur_vel_range[1]
+
+    #bound the new vel range
+    new_min = max(new_min,max_vel_range[0])
+    new_max = min(new_max,max_vel_range[1])
+
+    if env.common_step_counter % update_interval == 0:
+        cmd_term.cfg.ranges.lin_vel_x = (new_min,new_max)
+        # env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
+    return cmd_term.cfg.ranges.lin_vel_x[0]
+
+
 
 
 def clf_curriculum(

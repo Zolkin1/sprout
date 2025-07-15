@@ -75,9 +75,10 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
         self.curriculum.clf_curriculum.params["update_interval"] = 12000
 
-     #    self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
-     #                                          params={"vel_range": (0.1, 0.5),
-     #                                                  "update_interval": 4000})
+
+        # self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
+        #                                      params={"vel_interval": 0.1,
+        #                                              "update_interval": 24000})
 
 @configclass
 class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
