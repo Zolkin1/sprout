@@ -62,7 +62,9 @@ obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_cl
 ```
 
 HZD:
-
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device_name=onboard bag=false
+```
 Baseline:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
