@@ -49,28 +49,27 @@ def gaits_curriculum(
 
 
 
-
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 100,min_val: float = 20.0, min_clf_val: float = 10.0
+    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25), scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
-    new_clf = term_cfg.params["max_clf_decreasing"]
+    new_max_eta_err = term_cfg.params["eta_max"]
+    new_max_eta_dot_err = term_cfg.params["eta_dot_max"]
     clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
-    new_max_clf = clf_cfg.params["max_clf"]
 
     if env.common_step_counter  >= update_interval and env.common_step_counter % update_interval == 0:
         
-            
-
-            # increase clf decreasing condition weight?
-            new_clf = max(new_clf -2,min_val)
-            new_max_clf = max(new_max_clf -1,min_clf_val)
-            term_cfg.params["max_clf_decreasing"] = new_clf
+            #the err
+            new_max_eta_err = max(new_max_eta_err - scale[0],min_max_err[0])
+            new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1],min_max_err[1])
+        
+            term_cfg.params["max_eta_err"] = new_max_eta_err
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
-            clf_cfg.params["max_clf"] = new_max_clf
+            clf_cfg.params["eta_max"] = new_max_eta_err
+            clf_cfg.params["eta_dot_max"] = new_max_eta_dot_err
             env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
-    return new_clf
+    return new_max_eta_err
 
 def terrain_levels(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")

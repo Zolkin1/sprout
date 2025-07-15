@@ -63,17 +63,29 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
-        self.rewards.clf_reward.params["command_name"] = "hzd_ref"
-        self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
+        # self.rewards.clf_reward.params["command_name"] = "hzd_ref"
+        # self.rewards.clf_decreasing_condition.params["command_name"] = "hzd_ref"
 
         # self.curriculum.clf_curriculum = None
-        self.rewards.clf_reward.params["max_clf"] = 40.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 150.0
-        self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
+        self.rewards.clf_reward.params = {
+            "command_name": "hzd_ref",
+            "max_eta_err": 0.2,
+        }
+        self.rewards.clf_decreasing_condition.params = {
+            "command_name": "hzd_ref",
+            "alpha": 1.0,
+            "eta_max": 0.2,
+            "eta_dot_max": 0.3,
+        }
+        # self.curriculum.clf_curriculum = None
+        # self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 150.0
+        # self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
 
-        self.curriculum.clf_curriculum.params["min_val"] = 10.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
-        self.curriculum.clf_curriculum.params["update_interval"] = 12000
+        self.curriculum.clf_curriculum.params = {
+            "min_max_err": (0.1,0.1),
+            "scale": (0.001,0.001),
+            "update_interval": 30000
+        }
 
 
         # self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
