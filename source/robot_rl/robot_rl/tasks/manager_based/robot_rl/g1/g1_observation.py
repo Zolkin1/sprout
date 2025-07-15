@@ -126,7 +126,7 @@ class G1HZDObservationsCfg():
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
         act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=tuple([1.0] * 12 + [0.1] * 9))
        
-
+        # base_z = ObsTerm(func=mdp.base_z)
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()

@@ -84,8 +84,8 @@ class HumanoidEventsCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
-            "static_friction_range": (0.1, 1.25),
-            "dynamic_friction_range": (0.1, 1.25),
+            "static_friction_range": (0.25, 1.25),
+            "dynamic_friction_range": (0.25, 1.25),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
             "make_consistent": True,  # ensures dynamic friction <= static friction

@@ -7,6 +7,10 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import generated_commands
 
+def base_z(env: ManagerBasedRLEnv) -> torch.Tensor:
+    base_z = env.scene["robot"].data.root_pos_w[:,2]
+    return base_z.unsqueeze(-1)
+
 def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
     net_forces = contact_sensor.data.net_forces_w_history[:,-1,sensor_cfg.body_ids,:]
