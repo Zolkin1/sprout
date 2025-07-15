@@ -73,6 +73,7 @@ transfer/obelisk/build/
 *.png
 
 transfer/obelisk/.vscode/
+transfer/obelisk/ctrl_logs/
 
 transfer/sim/MUJOCO_LOG.TXT
 
