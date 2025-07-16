@@ -15,7 +15,7 @@ onboard:
         cmd_scale: [2., 2., 2.]
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
-        v_x_min: -0.1
+        v_x_min: -0.75
         v_x_max: 0.75
         v_y_min: 0.0
         v_y_max: 0.0
