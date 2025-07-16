@@ -25,19 +25,36 @@ class VelCmd(UniformVelocityCommand):
             env_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
 
             #select the envs that just enter the swing phase
-            ref_term = self._env.command_manager.get_term("hlip_ref")
-            swing_phase = ref_term.phase_var[env_ids]
-            swing_phase = swing_phase < 0.15
-            env_ids = env_ids[swing_phase]
+            ref_term = self._env.command_manager.get_term(self.cfg.ref_cmd_name)
 
-            # compute angular velocity
-            heading_error = math_utils.wrap_to_pi(self.heading_target[env_ids] - self.robot.data.heading_w[env_ids])
+            if isinstance(ref_term.phase_var, float):
+                swing_phase = ref_term.phase_var
+                swing_phase = swing_phase < self.cfg.phase_threshold
+              
+                if swing_phase:
 
-            self.vel_command_b[env_ids, 2] = torch.clip(
-                self.cfg.heading_control_stiffness * heading_error,
-                min=self.cfg.ranges.ang_vel_z[0],
-                max=self.cfg.ranges.ang_vel_z[1],
-            )
+                    # compute angular velocity
+                    heading_error = math_utils.wrap_to_pi(self.heading_target[env_ids] - self.robot.data.heading_w[env_ids])
+
+                    self.vel_command_b[env_ids, 2] = torch.clip(
+                        self.cfg.heading_control_stiffness * heading_error,
+                        min=self.cfg.ranges.ang_vel_z[0],
+                        max=self.cfg.ranges.ang_vel_z[1],
+                    )
+
+            else:
+                swing_phase = ref_term.phase_var[env_ids]
+                swing_phase = swing_phase < self.cfg.phase_threshold
+                env_ids = env_ids[swing_phase]
+
+                # compute angular velocity
+                heading_error = math_utils.wrap_to_pi(self.heading_target[env_ids] - self.robot.data.heading_w[env_ids])
+
+                self.vel_command_b[env_ids, 2] = torch.clip(
+                    self.cfg.heading_control_stiffness * heading_error,
+                    min=self.cfg.ranges.ang_vel_z[0],
+                    max=self.cfg.ranges.ang_vel_z[1],
+                )
      
         standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
         self.vel_command_b[standing_env_ids, :] = 0.0

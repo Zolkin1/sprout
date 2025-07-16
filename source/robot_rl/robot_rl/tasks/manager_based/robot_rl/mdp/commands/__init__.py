@@ -5,6 +5,6 @@
 
 """Command configurations for the environment."""
 
-from .gaitPeriodCfg import GaitPeriodCfg
+from .gaitPeriodCfg import GaitPeriodCfg, CustomUniformVelocityCommandCfg
 
-__all__ = ["GaitPeriodCfg"] 
+__all__ = ["GaitPeriodCfg", "CustomUniformVelocityCommandCfg"] 
