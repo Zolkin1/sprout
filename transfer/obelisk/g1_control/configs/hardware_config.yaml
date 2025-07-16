@@ -12,7 +12,7 @@ onboard:
         num_actions: 21
         period: 0.8                   # s
         ang_vel_scale: 0.25
-        cmd_scale: [2, 2, 1]
+        cmd_scale: [2., 2, 1]
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
         action_scale: 0.25
@@ -53,12 +53,15 @@ onboard:
           "left_shoulder_pitch_joint",
           "left_shoulder_roll_joint",
           "left_shoulder_yaw_joint",
-          "left_elbow_joint",
+          "left_elbow_jointy Tracking node constructor complete.",
           "right_shoulder_pitch_joint",
           "right_shoulder_roll_joint",
           "right_shoulder_yaw_joint",
           "right_elbow_joint",
         ]
+        log: true
+        log_decimation: 1 # relative to the control callback
+        config_name: "hardware_config.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -71,11 +74,14 @@ onboard:
           topic: /obelisk/g1/est_state
           history_depth: 10
           callback_group: None
-        # ----- Joystick subscriber ----- #
+        # ----- High Level Command subscriber ----- #
         - ros_parameter: sub_vel_cmd_setting
           topic: /obelisk/g1/high_level_ctrl
           history_depth: 10
           callback_group: None
+        # ----- Joystick subscriber ----- #
+        - ros_parameter: sub_joystick
+          topic: /obelisk/g1/joy
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.02    # 50 Hz
@@ -146,7 +152,7 @@ onboard:
       pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_g1_hardware
       params:
-        network_interface_name: enp4s0 # From ifconfig
+        network_interface_name: enx9cbf0d00b3c9 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle
