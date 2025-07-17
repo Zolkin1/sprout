@@ -93,6 +93,20 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         #                                      params={"vel_interval": 0.1,
         #                                              "update_interval": 24000})
 
+
+
+@configclass
+class G1_M4_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.scene.robot.spawn.usd_path = "robot_assets/g1/g1_21j_urdf_v3_min_contacts_M4.usd"
+
+        
+        
+
 @configclass
 class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
 
