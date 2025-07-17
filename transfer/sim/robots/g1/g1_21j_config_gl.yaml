@@ -10,7 +10,6 @@ robot_name: "g1_21j"
 #checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd-GL/g1/2025-07-14_10-03-10/exported/policy.pt"
 checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd-GL/g1/2025-07-15_14-45-50/exported/policy.pt"
 
-
 num_obs: 74
 num_action: 21
 period: 0.8                  # s

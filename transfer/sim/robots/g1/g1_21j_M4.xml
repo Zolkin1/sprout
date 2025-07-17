@@ -338,6 +338,12 @@ Position and velocity actuators added. -->
             <!-- TODO: Verify position -->
             <site name="tracking_camera_site" pos="0.085725 0 0.2413" euler="0.02 -0.08 0" rgba="0 0 1 0" size="0.01"/>
 
+            <!-- M4 -->
+            <body name="M4_link" pos="-0.08 0 0.14">
+              <inertial pos="-0.03171 0 0" mass="3.83" diaginertia="0.0396025592 0.0281 0.0151"/>
+              <geom pos="0 0 0" type="box" size="0.05 0.2 0.2"/>
+            </body>
+
             <!-- Left Arm -->
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
               <inertial pos="0 0.035892 -0.011628" quat="0.654152 0.0130458 -0.326267 0.68225" mass="0.718" diaginertia="0.000465864 0.000432842 0.000406394"/>
@@ -674,11 +680,11 @@ Position and velocity actuators added. -->
     <key name="standing" 
       qpos="0.2 0 0.79
             1 0 0 0
-            -0.1 0 0 0.3 -0.2 0
-            -0.1 0 0 0.3 -0.2 0
+            -0.25 0 0 0.46 -0.25 0
+            -0.25 0 0 0.46 -0.25 0
             0
-            0.15 0.7 -0.45 0.5
-            0.15 -0.7 0.45 0.5"
+            0.07 0.24 0 1.39
+            0.07 -0.24 0 1.39"
       ctrl="-0.1 0 0 0.3 -0.2 0
             -0.1 0 0 0.3 -0.2 0
             0
