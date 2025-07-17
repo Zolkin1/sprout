@@ -186,6 +186,11 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         des_pos[:, hzd_cmd.foot_yaw_output_idx] += delta_psi
         des_vel[:, hzd_cmd.foot_yaw_output_idx] += base_velocity[:, 2]
 
+
+        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
+        des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y
+        des_vel[:, hzd_cmd.foot_y_output_idx] += base_velocity[:, 1]
+
         for i in hzd_cmd.ori_idx_list:
             des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
 
