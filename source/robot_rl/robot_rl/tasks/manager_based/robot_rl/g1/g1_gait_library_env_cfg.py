@@ -41,23 +41,23 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.observations = G1HZDObservationsCfg()
 
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity = mdp.commands.CustomUniformVelocityCommandCfg(
-            asset_name="robot",
-            resampling_time_range=(10.0, 10.0),
-            rel_standing_envs=0.02,
-            rel_heading_envs=1.0,
-            heading_command=True,
-            heading_control_stiffness=0.5,
-            debug_vis=True,
-            ref_cmd_name="hzd_ref",
-            ranges=mdp.UniformVelocityCommandCfg.Ranges(
-                lin_vel_x=(-0.75, 0.75), lin_vel_y=(0, 0), ang_vel_z=(-0.2, 0.2), heading=(0, 0)
-            ),
-        )
-        # self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
-        # self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        # self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
-        # self.commands.base_velocity.ranges.heading = (0, 0)
+        # self.commands.base_velocity = mdp.commands.CustomUniformVelocityCommandCfg(
+        #     asset_name="robot",
+        #     resampling_time_range=(10.0, 10.0),
+        #     rel_standing_envs=0.02,
+        #     rel_heading_envs=1.0,
+        #     heading_command=True,
+        #     heading_control_stiffness=0.5,
+        #     debug_vis=True,
+        #     ref_cmd_name="hzd_ref",
+        #     ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        #         lin_vel_x=(-0.75, 0.75), lin_vel_y=(0, 0), ang_vel_z=(-0.2, 0.2), heading=(0, 0)
+        #     ),
+        # )
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.heading = (0, 0)
 
         self.commands.step_period.period_range = (0.8,0.8)
 
