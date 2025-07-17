@@ -7,7 +7,7 @@ import pygame
 class Robot:
     def __init__(self, robot_name: str, scene_name: str):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j":
+        if robot_name != "g1_21j" and robot_name != "g1_21j_M4":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
 
         self.robot_name = robot_name
