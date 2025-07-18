@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "hzd_gl_policy.pt"
+        policy_name: "hzd_gl_policies_07_17hzd_gl_policies_07_17/old_gait_library.pt" #"hzd_gl_policy.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
