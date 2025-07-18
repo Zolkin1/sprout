@@ -9,6 +9,9 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.sensors import  RayCasterCfg, patterns
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
+
 import math
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
@@ -104,8 +107,43 @@ class G1_M4_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
         super().__post_init__()
         self.scene.robot.spawn.usd_path = "robot_assets/g1/g1_21j_urdf_v3_min_contacts_M4.usd"
 
+@configclass
+class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (1.14,1.14),
+                "operation": "add",
+            }
+        )
         
+
         
+@configclass
+class G1_M4_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.scene.robot.spawn.usd_path = "robot_assets/g1/g1_21j_urdf_v3_min_contacts_M4.usd"
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (1.14,1.14),
+                "operation": "add",
+            }
+        )
+
 
 @configclass
 class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
