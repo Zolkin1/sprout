@@ -5,6 +5,18 @@ from setuptools import find_packages, setup
 
 package_name = "g1_control"
 
+# def package_files(directory, patterns=["**/*"]):
+#     paths = []
+#     for pattern in patterns:
+#         for path in glob(os.path.join(directory, pattern), recursive=True):
+#             if os.path.isfile(path):
+#                 install_path = os.path.join("share", package_name, path.replace(directory + "/", ""))
+#                 paths.append((os.path.dirname(install_path), [path]))
+#     return paths
+
+
+
+
 setup(
     name=package_name,
     version="0.0.0",
@@ -25,6 +37,10 @@ setup(
         (
             os.path.join("share", package_name, "resource/policies/hzd_gl_policies_07_17_night"),
             glob(os.path.join("resource/policies/hzd_gl_policies_07_17_night", "*.pt")),
+        ),
+        (
+            os.path.join("share", package_name, "resource/policies/hzd_gl_policies_07_18"),
+            glob(os.path.join("resource/policies/hzd_gl_policies_07_18", "*.pt")),
         ),
     ],
     install_requires=["setuptools"],
