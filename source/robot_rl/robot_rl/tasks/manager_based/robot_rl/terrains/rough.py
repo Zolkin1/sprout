@@ -54,7 +54,30 @@ ROUGH_FOR_FLAT_HZD_CFG = TerrainGeneratorCfg(
     },
 )
 
-
+ROUGH_SLOPED_FOR_FLAT_HZD_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.0005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "boxes": terrain_gen.MeshRandomGridTerrainCfg(
+            proportion=0.5, grid_width=0.45, grid_height_range=(0.0, 0.02), platform_width=5.0
+        ),
+        "slope_up": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.1, platform_width=1.0, slope_range=(0.0, 0.15),
+        ),
+        "slope_down": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.2, platform_width=1.0, slope_range=(0.0, 0.15), inverted=True,
+        ),
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.2, noise_range=(0, 0.02), noise_step=0.01, border_width=0.25
+        ),
+    },
+)
 
 ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     size=(8.0, 8.0),
