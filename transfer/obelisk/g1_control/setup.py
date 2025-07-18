@@ -22,6 +22,10 @@ setup(
             os.path.join("share", package_name, "resource/policies/hzd_gl_policies_07_17"),
             glob(os.path.join("resource/policies/hzd_gl_policies_07_17", "*.pt")),
         ),
+        (
+            os.path.join("share", package_name, "resource/policies/hzd_gl_policies_07_17_night"),
+            glob(os.path.join("resource/policies/hzd_gl_policies_07_17_night", "*.pt")),
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
