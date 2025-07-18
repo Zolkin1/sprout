@@ -18,6 +18,10 @@ setup(
             os.path.join("share", package_name, "resource/policies"),
             glob(os.path.join("resource/policies", "*.pt")),
         ),  # Get the models..
+        (
+            os.path.join("share", package_name, "resource/policies/hzd_gl_policies_07_17"),
+            glob(os.path.join("resource/policies/hzd_gl_policies_07_17", "*.pt")),
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
