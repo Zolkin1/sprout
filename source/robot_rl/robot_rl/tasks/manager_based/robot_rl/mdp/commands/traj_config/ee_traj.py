@@ -222,6 +222,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         swing_foot_quat = data.body_quat_w[:, swing_foot_idx, :]
         swing_foot_ori = get_euler_from_quat(swing_foot_quat)
         sw2st_foot_pos = swing_foot_pos - stance_foot_pos
+        sw2st_foot_pos_local = _transfer_to_local_frame(sw2st_foot_pos, hzd_cmd.stance_foot_ori_quat_0)
         
         sw2st_foot_ori = swing_foot_ori 
         sw2st_foot_ori[:, 2] = wrap_to_pi(swing_foot_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
@@ -239,7 +240,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
 
         # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos, sw2st_foot_ori,
+        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos_local, sw2st_foot_ori,
                           joint_pos.squeeze(-1)], dim=-1)
 
         # concatenate all the velocity values
