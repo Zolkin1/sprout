@@ -182,9 +182,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         """Apply end effector specific swing modifications."""
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
-
-        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi
-        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2]
+        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
+        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
 
 
         delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
