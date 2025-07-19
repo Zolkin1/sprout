@@ -74,7 +74,8 @@ RL Task list:
 | `flat-hzd`    |     G1     |  :x:  | A single HZD gait; CLF RL walking on the G1 humanoid on flat ground. |
 | `flat-hzd-GL`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 | `height-map`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground with height map observation. |
-
+| `gl-custom-plate`  |     G1     |  :x:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+| `m4-custom-plate`  |     G1     |  :x:  | with M4 and more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 ## Copying checkpoitns from remote server 
 First mount the server to your local desktop
  
