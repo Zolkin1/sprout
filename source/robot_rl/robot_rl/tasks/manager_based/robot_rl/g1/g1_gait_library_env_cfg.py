@@ -11,6 +11,7 @@ from isaaclab.sensors import  RayCasterCfg, patterns
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
 import math
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
@@ -44,19 +45,6 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.observations = G1HZDObservationsCfg()
 
         # Configure velocity ranges for different gaits
-        # self.commands.base_velocity = mdp.commands.CustomUniformVelocityCommandCfg(
-        #     asset_name="robot",
-        #     resampling_time_range=(10.0, 10.0),
-        #     rel_standing_envs=0.02,
-        #     rel_heading_envs=1.0,
-        #     heading_command=True,
-        #     heading_control_stiffness=0.5,
-        #     debug_vis=True,
-        #     ref_cmd_name="hzd_ref",
-        #     ranges=mdp.UniformVelocityCommandCfg.Ranges(
-        #         lin_vel_x=(-0.75, 0.75), lin_vel_y=(0, 0), ang_vel_z=(-0.2, 0.2), heading=(0, 0)
-        #     ),
-        # )
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
@@ -92,6 +80,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.curriculum.clf_curriculum.params["update_interval"] = 12000
 
         self.events.reset_base.params["pose_range"]["heading"] = (-3.14, 3.14)
+        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
         # self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
         #                                      params={"vel_interval": 0.1,
         #                                              "update_interval": 24000})
