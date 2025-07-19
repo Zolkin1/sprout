@@ -56,6 +56,7 @@ To play the most recently trained policy for a given task run:
 python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --headless
 ```
 
+for a speicifc run you can pass in additional config such as `--load_run=<run_dir>`
 If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<log_dir_checkpoint>`.
 
 For both `train` and `play` you can also specify a number of envs with `--num_envs=###`.

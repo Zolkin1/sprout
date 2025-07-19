@@ -183,8 +183,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
 
-        des_pos[:, hzd_cmd.foot_yaw_output_idx] += delta_psi
-        des_vel[:, hzd_cmd.foot_yaw_output_idx] += base_velocity[:, 2]
+        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi
+        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2]
 
 
         delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
@@ -238,27 +238,6 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
         joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
         joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
-
-        # # palm position
-        # swing_hand_pos, swing_hand_ori, swing_hand_quat = ee_tracker.get_pose(swing_hand_frame)
-        # swing_hand_vel, swing_hand_omega = ee_tracker.get_velocity(swing_hand_frame, hzd_cmd.robot.data)
-
-        # # stance hand position
-        # stance_hand_pos, stance_hand_ori, stance_hand_quat = ee_tracker.get_pose(stance_hand_frame)
-        # stance_hand_vel, stance_hand_omega = ee_tracker.get_velocity(stance_hand_frame, hzd_cmd.robot.data)
-
-        # swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        # swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-        # stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        # stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-
-        # stance_hand_pos = stance_hand_pos - stance_foot_pos
-        # stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        # swing_hand_pos = swing_hand_pos - stance_foot_pos
-
-        # swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        # swing_hand_ori[:, 2] = wrap_to_pi(swing_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        # stance_hand_ori[:, 2] = wrap_to_pi(stance_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
 
         # concatenate all the position values
         y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos, sw2st_foot_ori,
