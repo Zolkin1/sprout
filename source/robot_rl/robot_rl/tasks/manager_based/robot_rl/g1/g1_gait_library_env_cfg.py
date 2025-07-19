@@ -47,7 +47,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-3.14, 3.14)
 
         self.commands.step_period.period_range = (0.8,0.8)
