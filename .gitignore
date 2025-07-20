@@ -78,5 +78,6 @@ transfer/obelisk/ctrl_logs/
 transfer/sim/MUJOCO_LOG.TXT
 
 remote_mount/
+vulcan_mount/
 
 transfer/sim/MUJOCO_LOG.TXT

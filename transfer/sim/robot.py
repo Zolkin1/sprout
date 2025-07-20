@@ -72,7 +72,7 @@ class Robot:
             if abs(vyaw) < 0.1:
                 vyaw = 0
             else:
-                vyaw = np.clip(vyaw, -0.2, 0.2)
+                vyaw = np.clip(vyaw, -1.0, 1.0)
             des_vel[0] = vx
             des_vel[1] = vy
             des_vel[2] = vyaw

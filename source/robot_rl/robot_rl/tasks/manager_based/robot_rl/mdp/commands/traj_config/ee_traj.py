@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from typing import List, Dict
-from isaaclab.utils.math import wrap_to_pi
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
@@ -180,11 +180,25 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
         """Apply end effector specific swing modifications."""
-        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
+        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
+
+        #5,11
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
         des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
         des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
 
+        q_delta_yaw = quat_from_euler_xyz(
+            torch.zeros_like(delta_psi),               # roll=0
+            torch.zeros_like(delta_psi),               # pitch=0
+            delta_psi                                  # yaw=Δψ
+        ) 
+
+        #adjust foot target and com pos/vel to account for yaw change
+        des_pos[:,[6,7,8]] = quat_apply(q_delta_yaw, des_pos[:,[6,7,8]])  # [B,3]
+        des_vel[:,[6,7,8]] = quat_apply(q_delta_yaw, des_vel[:,[6,7,8]])  # [B,3]
+
+        des_pos[:,[0,1,2]] = quat_apply(q_delta_yaw, des_pos[:,[0,1,2]])  # [B,3]
+        des_vel[:,[0,1,2]] = quat_apply(q_delta_yaw, des_vel[:,[0,1,2]])  # [B,3]
 
         delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
         des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y

@@ -6,9 +6,10 @@
 set -e
 
 # Configuration
-REMOTE_HOST="talos.caltech.edu"
-REMOTE_PATH="/home/kli5/robot_rl"
-LOCAL_MOUNT_POINT="remote_mount"
+# REMOTE_HOST="talos.caltech.edu"
+REMOTE_HOST="vulcan.amberlab.caltech.edu"
+REMOTE_PATH="/home/kli5/robot_rl/logs"
+LOCAL_MOUNT_POINT="vulcan_mount"
 
 # Colors for output
 GREEN='\033[0;32m'
