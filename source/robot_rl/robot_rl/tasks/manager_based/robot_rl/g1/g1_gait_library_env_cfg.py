@@ -47,8 +47,8 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.heading = (-3.14, 3.14)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.heading = (0.0, 0.0)
 
         self.commands.step_period.period_range = (0.8,0.8)
 
@@ -79,8 +79,8 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.curriculum.clf_curriculum.params["min_clf_val"] = 5.0
         self.curriculum.clf_curriculum.params["update_interval"] = 12000
 
-        self.events.reset_base.params["pose_range"]["heading"] = (-3.14, 3.14)
-        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        self.events.reset_base.params["pose_range"]["heading"] = (0.0, 0.0)
+        # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
         # self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
         #                                      params={"vel_interval": 0.1,
         #                                              "update_interval": 24000})
