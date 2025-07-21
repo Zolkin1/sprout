@@ -152,26 +152,26 @@ class HZDStairCommandCfg(CommandTermCfg):
 
 
 HZD_EE_Q_weights_GL = [
-    25.0,   250.0,    # com_x pos, vel
-    300.0,   50.0,   # com_y pos, vel
-    350.0,   10.0,  # com_z pos, vel
+    300.0,   20.0,    # com_x pos, vel
+    300.0,   20.0,   # com_y pos, vel
+    300.0,   20.0,  # com_z pos, vel
     300.0,    20.0,    # pelvis_roll pos, vel
-    250.0,    10.0,    # pelvis_pitch pos, vel
-    300.0,    30.0,    # pelvis_yaw pos, vel
-    4500.0, 125.0,  # swing_x pos, vel
+    300.0,    20.0,    # pelvis_pitch pos, vel
+    300.0,    20.0,    # pelvis_yaw pos, vel
+    1500.0, 50.0,  # swing_x pos, vel
     1500.0,  50.0,  # swing_y pos, vel
-    5500.0, 100.0,   # swing_z pos, vel
-    30.0,    1.0,    # swing_ori_roll pos, vel
+    1500.0, 50.0,   # swing_z pos, vel
+    50.0,    1.0,    # swing_ori_roll pos, vel
     50.0,    1.0,    # swing_ori_pitch pos, vel
-    400.0,    10.0,    # swing_ori_yaw pos, vel
-    100.0,    1.0,    # waist_yaw pos, vel
-    40.0,1.0, #left shoulder pitch
-    40.0,1.0, #left shoulder roll
-    50.0,1.0, #left shoulder yaw
+    200.0,    10.0,    # swing_ori_yaw pos, vel
+    80.0,    1.0,    # waist_yaw pos, vel
+    30.0,1.0, #left shoulder pitch
+    30.0,1.0, #left shoulder roll
+    30.0,1.0, #left shoulder yaw
     30.0,1.0, #left elbow
-    40.0,1.0, #right shoulder pitch
-    40.0,1.0, #right shoulder roll
-    50.0,1.0, #right shoulder yaw
+    30.0,1.0, #right shoulder pitch
+    30.0,1.0, #right shoulder roll
+    30.0,1.0, #right shoulder yaw
     30.0,1.0, #right elbow
 ]
 
