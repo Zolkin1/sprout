@@ -24,6 +24,7 @@ ENVIRONMENTS = {
     "m4": "G1-m4",
     "gl-custom-plate": "G1-custom-plate",
     "m4-custom-plate": "G1-m4-custom-plate",
+    "saluki-m4-custom-plate": "G1-saluki-m4-custom-plate",
 }
 
 def parse_args():

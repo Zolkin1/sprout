@@ -133,6 +133,32 @@ class G1_M4_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
             }
         )
 
+@configclass
+class G1_saluki_M4_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 environment with gait library."""
+
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.scene.robot.spawn.usd_path = "robot_assets/g1/g1_21j_urdf_v3_min_contacts_M4.usd"
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (1.14,1.14),
+                "operation": "add",
+            }
+        )
+        self.events.add_saluki_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="m4_link"),
+                "mass_distribution_params": (1.17,1.17),
+                "operation": "add",
+            }
+        )
 
 @configclass
 class G1GaitLibraryHeightMapEnvCfg(G1GaitLibraryEnvCfg):
