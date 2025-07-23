@@ -60,6 +60,22 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             self.foot_y_output_idx = 7
             self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
             self.yaw_output_idx = [5, 11]
+
+            self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
+            
+            from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg
+            right_des_pos = bezier_deg(
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
+                    torch.tensor(self.gait_config.bez_deg, device=self.device)
+                )
+            left_des_pos = bezier_deg(
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
+                    torch.tensor(self.gait_config.bez_deg, device=self.device)
+                )
+            self.gait_config.right_standing_pos = right_des_pos
+            self.gait_config.left_standing_pos = left_des_pos
+            self.standing_threshold = 0.03
+            
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
