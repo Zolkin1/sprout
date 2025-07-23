@@ -153,6 +153,7 @@ Position and velocity actuators added. -->
     <mesh name="right_hand_middle_1_link" file="right_hand_middle_1_link.STL"/>
     <mesh name="right_hand_index_0_link" file="right_hand_index_0_link.STL"/>
     <mesh name="right_hand_index_1_link" file="right_hand_index_1_link.STL"/>
+    <mesh name="reduced_m4_rotated" file="reduced_m4_rotated.stl"/>
   </asset>
 
   <worldbody>
@@ -340,8 +341,9 @@ Position and velocity actuators added. -->
 
             <!-- M4 -->
             <body name="M4_link" pos="-0.08 0 0.14">
-              <inertial pos="-0.03171 0 0" mass="3.83" diaginertia="0.0396025592 0.0281 0.0151"/>
-              <geom pos="0 0 0" type="box" size="0.05 0.2 0.2"/>
+              <inertial pos="0.0 0 0" mass="3.83" diaginertia="0.0396025592 0.0281 0.0151"/>
+              <!-- <geom pos="0 0 0" type="box" size="0.05 0.2 0.2"/> -->
+              <geom type="mesh" mesh="reduced_m4_rotated" contype="0" conaffinity="0"/>
             </body>
 
             <!-- Left Arm -->

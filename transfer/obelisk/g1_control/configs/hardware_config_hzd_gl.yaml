@@ -21,7 +21,7 @@ onboard:
         v_x_max: 0.75
         v_y_min: 0.0
         v_y_max: 0.0
-        w_z_max: 0.2
+        w_z_max: 1.0
         height_map_flag: False
         gl_flag: True
         action_scale: 0.25
@@ -101,7 +101,7 @@ onboard:
       params:
         v_x_max: 1.
         v_y_max: 1.
-        w_z_max: 1.
+        w_z_max: 2.
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #
