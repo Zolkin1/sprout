@@ -10,22 +10,25 @@ import cli_args
 ENVIRONMENTS = {
     "vanilla": "custom-Isaac-Velocity-Flat-G1-v0",
     "custom": "G1-flat-vel",
-    "ref_tracking": "G1-flat-ref-tracking",
-    "clf_vdot": "G1-flat-clf-vdot",
-    "clf": "G1-flat-clf",
-    "stair": "G1-stair",
-    "height-scan-flat": "G1-height-scan-flat",
-    "flat-hzd": "G1-flat-hzd",
-    "flat-hzd-no-dr": "G1-flat-hzd-no-dr",
-    "stair-hzd": "G1-stair-hzd",
-    "flat-hzd-GL": "G1-flat-hzd-GL",
-    "stair-hzd-GL": "G1-stair-hzd-GL",
-    "height-map": "G1-hzd-height-map",
-    "m4": "G1-m4",
-    "gl-custom-plate": "G1-custom-plate",
-    "m4-custom-plate": "G1-m4-custom-plate",
-    "saluki-m4-custom-plate": "G1-saluki-m4-custom-plate",
+    "lip_ref_tracking": "G1-flat-ref-tracking",
+    "lip_clf_vdot": "G1-flat-clf-vdot",
+    "lip_clf": "G1-flat-clf",
+    "hzd_clf": "G1-hzd-clf",
+    "hzd_clf_custom": "G1-hzd-clf-custom",
 }
+
+EXPERIMENT_NAMES = {
+    "vanilla": "baseline",
+    "custom": "baseline",
+    "lip_clf": "lip",
+    "lip_ref_tracking": "lip",
+    "lip_clf_vdot": "lip",
+    "lip_ref_play": "lip",
+    "hzd_clf": "hzd",
+    "hzd_clf_play": "hzd",
+    "hzd_clf_custom": "hzd",
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train RL policies for different environments.")
@@ -122,8 +125,8 @@ def main():
 
         # Create organized directory structure for logging
 
-        base_log_path = os.path.join("logs", "g1_policies", args_cli.env_type)
-        log_root_path = os.path.join(base_log_path, agent_cfg.experiment_name)
+        base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
+        log_root_path = os.path.join(base_log_path, args_cli.env_type)
         log_root_path = os.path.abspath(log_root_path)
         print(f"[INFO] Logging experiment in directory: {log_root_path}")
         

@@ -21,46 +21,18 @@ import torch
 
 # Import plot_trajectories functions
 from plot_trajectories import plot_trajectories, plot_hzd_trajectories
-from train_policy import ENVIRONMENTS
+from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
-EXPERIMENT_NAMES = {
-    "vanilla": "g1_isaac",
-    "custom": "g1",
-    "clf": "g1",
-    "ref_tracking": "g1",
-    "stair": "g1",
-    "clf_vdot": "g1",
-    "height-scan-flat": "g1",
-    "flat-hzd": "g1",
-    "flat-hzd-GL": "g1",
-    "flat-hzd-no-dr": "g1",
-    "stair-hzd": "g1",
-    "stair-hzd-GL": "g1",
-    "height-map": "g1",
-    "m4": "g1",
-    "gl-custom-plate": "g1",
-    "m4-custom-plate": "g1",
-    "saluki-m4-custom-plate": "g1",
-}
 
 SIM_ENVIRONMENTS = {
     "vanilla": "custom-Isaac-Velocity-Flat-G1-Play-v0",
     "custom": "custom-Isaac-Velocity-Flat-G1-Play-v0",
-    "clf": "G1-flat-ref-play",
-    "ref_tracking": "G1-flat-ref-play",
-    "clf_vdot": "G1-flat-ref-play",
-    "stair": "G1-stair-play",
-    "height-scan-flat": "G1-height-scan-flat-play",
-    "flat-hzd": "G1-flat-hzd-play",
-    "flat-hzd-GL": "G1-flat-hzd-GL-play",
-    "flat-hzd-no-dr": "G1-flat-hzd-play",
-    "stair-hzd": "G1-stair-hzd-play",
-    "stair-hzd-GL": "G1-stair-hzd-GL-play",
-    "height-map": "G1-hzd-height-map-play",
-    "m4": "G1-m4",
-    "gl-custom-plate": "G1-custom-plate",
-    "m4-custom-plate": "G1-m4-custom-plate",
-    "saluki-m4-custom-plate": "G1-saluki-m4-custom-plate",
+    "lip_clf": "G1-LIP-clf-play",
+    "lip_ref_tracking": "G1-LIP-ref-play",
+    "lip_clf_vdot": "G1-LIP-ref-play",
+    "hzd_clf": "G1-hzd-clf",
+    "hzd_clf_play": "G1-hzd-clf-play",
+    "hzd_clf_custom": "G1-hzd-clf-custom",
 }
 
 class DataLogger:
@@ -300,10 +272,9 @@ def main():
     print("[DEBUG] Configurations parsed")
 
     # specify directory for logging experiments
-    if args_cli.env_type == "exo_hzd" or args_cli.env_type == "exo_hlip":
-        log_root_path = os.path.join("logs", "exo_policies", args_cli.env_type, experiment_name)
-    else:
-        log_root_path = os.path.join("logs", "g1_policies", args_cli.env_type, experiment_name)
+   
+    base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
+    log_root_path = os.path.join(base_log_path, args_cli.env_type)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[DEBUG] Log root path: {log_root_path}")
     
@@ -405,10 +376,12 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if args_cli.env_type in ["flat-hzd", "flat-hzd-no-dr","flat-hzd-GL","stair-hzd","stair-hzd-GL","height-map","m4","gl-custom-plate","m4-custom-plate","saluki-m4-custom-plate"]:
+    if "lip" in args_cli.env_type:
+        command_name = "hlip_ref"
+    elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"
     else:
-        command_name = "hlip_ref"
+        raise ValueError(f"No valid command name for {args_cli.env_type}")
         
     ref = env.unwrapped.command_manager.get_term(command_name)
     

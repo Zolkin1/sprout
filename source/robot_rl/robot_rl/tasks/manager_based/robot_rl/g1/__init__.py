@@ -22,7 +22,7 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-flat-clf",
+        id="G1-LIP-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
@@ -33,7 +33,7 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-flat-ref-tracking",
+        id="G1-LIP-ref-tracking",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
@@ -44,7 +44,7 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-flat-clf-vdot",
+        id="G1-LIP-clf-vdot",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
@@ -55,7 +55,7 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-flat-ref-play",
+        id="G1-LIP-ref-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
@@ -65,118 +65,21 @@ if not _registered:
         },
     )
 
-    gym.register(
-        id="G1-stair",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1StairEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-    gym.register(
-        id='G1-stair-play',
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1StairPlay_EnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
 
 
     gym.register(
-         id='G1-height-scan-flat',
-         entry_point="isaaclab.envs:ManagerBasedRLEnv",
-         disable_env_checker=True,
-         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HeightScanFlatEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-         },
-    )
-
-    gym.register(
-        id='G1-height-scan-flat-play',
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HeightScanPlay_EnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-flat-hzd",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_hzd_cfg:G1FlatHZDEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-flat-hzd-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_hzd_cfg:G1FlatHZDEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-stair-hzd",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDStairEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-stair-hzd-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stair_env_cfg:G1HZDStairEnvPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-flat-hzd-no-dr",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_hzd_cfg:G1NoDomainRandomizationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-flat-hzd-GL",
+        id="G1-hzd-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:GaitLibraryPPOCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
     gym.register(
-        id="G1-flat-hzd-GL-play",
+        id="G1-hzd-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
@@ -187,90 +90,11 @@ if not _registered:
     )
 
     gym.register(
-        id="G1-stair-hzd-GL",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryStairEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-
-    gym.register(
-        id="G1-stair-hzd-GL-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GL_PlayStairEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StairCNNPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-hzd-height-map",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryHeightMapEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RoughTransformerPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-hzd-height-map-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryHeightMapEnv_PlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:RoughTransformerPPOCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-m4",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_M4_GaitLibraryEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-custom-plate",
+        id="G1-hzd-clf-custom",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_custom_plate_GaitLibraryEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-
-    gym.register(
-        id="G1-m4-custom-plate",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_M4_custom_plate_GaitLibraryEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-saluki-m4-custom-plate",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_saluki_M4_custom_plate_GaitLibraryEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
