@@ -207,6 +207,10 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         # Discover available gait files
         available_gaits = self._discover_available_gaits()
         
+        #load standing pose
+        standing_yaml = self.gait_library_path / "standing.yaml"
+        self.standing_config = EndEffectorTrajectoryConfig(standing_yaml)
+    
         # Load each available gait
         for filename, speed_cms in available_gaits.items():
             gait_name = self._speed_cms_to_gait_name(speed_cms)
@@ -327,7 +331,8 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
                         config.reorder_and_remap(cfg, device)
                 else:
                     config.reorder_and_remap(cfg, cfg.robot, device)
-        
+                
+
         # Recompute batched control points after remapping
         self._precompute_control_points()
     
@@ -344,10 +349,12 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         # Select control points based on stance
         if hzd_cmd.stance_idx == 1:
             # Right stance: use right coefficients
-            control_points = self.right_coeffs_batched  # [num_vel, jt_dim, degree+1]
+            control_points = self.right_coeffs_batched  # [num_vel, jt_dim, degree+1]'
+            standing_pose = self.right_standing_pos
         else:
             # Left stance: use left coefficients
             control_points = self.left_coeffs_batched  # [num_vel, jt_dim, degree+1]
+            standing_pose = self.left_standing_pos
         
         # Evaluate one trajectory per gait (much more efficient!)
         # control_points: [num_vel, jt_dim, degree+1]
@@ -383,8 +390,13 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         des_pos = ref_pos[gait_indices]  # [N, jt_dim]
         des_vel = ref_vel[gait_indices]  # [N, jt_dim]
 
+        stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+        if stand_idx.numel() > 0:   
+            des_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
+            des_vel[stand_idx] = torch.zeros_like(des_vel[stand_idx])
+
         des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
-        # import pdb; pdb.set_trace()
+   
         return des_pos, des_vel
     
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):

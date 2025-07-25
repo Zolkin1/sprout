@@ -7,9 +7,14 @@ set -e
 
 # Configuration
 # REMOTE_HOST="talos.caltech.edu"
-REMOTE_HOST="vulcan.amberlab.caltech.edu"
-REMOTE_PATH="/home/kli5/robot_rl/logs"
-LOCAL_MOUNT_POINT="vulcan_mount"
+REMOTE_HOST="10.42.0.1"
+REMOTE_PATH="/home/unitree/robot_rl/transfer/obelisk/ctrl_logs"
+REMOTE_USER="unitree"
+
+# REMOTE_HOST="vulcan.amberlab.caltech.edu"
+# REMOTE_PATH="/home/kli5/robot_rl/logs"
+# LOCAL_MOUNT_POINT="vulcan_mount"
+LOCAL_MOUNT_POINT="g1_mount"
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -87,7 +92,7 @@ mount_remote() {
     
     # Test SSH connection
     print_info "Testing SSH connection..."
-    if ! ssh -o ConnectTimeout=10 "$REMOTE_HOST" "echo 'SSH connection successful'" 2>/dev/null; then
+    if ! ssh -o ConnectTimeout=10 "$REMOTE_USER@$REMOTE_HOST" "echo 'SSH connection successful'" 2>/dev/null; then
         print_error "Failed to connect to $REMOTE_HOST"
         print_info "Please ensure you have SSH access configured."
         exit 1
@@ -95,22 +100,24 @@ mount_remote() {
     
     # Mount using SSHFS
     print_info "Mounting $REMOTE_HOST:$REMOTE_PATH to $LOCAL_MOUNT_POINT"
-    sshfs "$REMOTE_HOST:$REMOTE_PATH" "$LOCAL_MOUNT_POINT" -o follow_symlinks,default_permissions
+    sshfs "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH" "$LOCAL_MOUNT_POINT" -o follow_symlinks,default_permissions
     
     if check_mount_status; then
         print_success "Remote directory mounted successfully!"
         print_info "You can now access remote files at: $LOCAL_MOUNT_POINT"
-        print_info "Training logs are at: $LOCAL_MOUNT_POINT/logs/g1_policies/"
         
-        # Show available training directories
-        if [[ -d "$LOCAL_MOUNT_POINT/logs/g1_policies" ]]; then
-            print_info "Available training environments:"
-            ls -1 "$LOCAL_MOUNT_POINT/logs/g1_policies/" | sed 's/^/  /'
-        fi
+        # List top-level contents of the mounted directory
+        print_info "Top-level contents of $LOCAL_MOUNT_POINT:"
+        ls -1 "$LOCAL_MOUNT_POINT" | sed 's/^/  /'
+
+        # Recursively search and list any directories containing training logs or policies
+        print_info "Searching for available training logs and policy directories..."
+        find "$LOCAL_MOUNT_POINT" -type d \( -iname "*log*" -o -iname "*policy*" \) -maxdepth 3 | sed 's/^/  /'
     else
         print_error "Failed to mount remote directory"
         exit 1
     fi
+
 }
 
 # Unmount the remote directory

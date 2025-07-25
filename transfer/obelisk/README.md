@@ -108,3 +108,34 @@ Then we can verify that ROS2 can see it with:
 ```
 ros2 run joy joy_enumerate_devices
 ```
+
+
+# Running the docker through tmux session (detached)
+#TODO: check if we need --pull always
+
+Start a tmux session
+```tmux```
+
+Check existing tmux sessions
+```tmux ls```
+
+To dettach from a tmux session
+```ctrl +b then d```
+
+To reattach to a tmux session
+```tmux attach -t <id>```
+To create and start the container, run the following command:
+```docker compose -f docker-compose-no-gpu.yml up ```
+Note this would also build the container if necessary.
+
+To check existing docker images
+```docker ps```
+
+To check running containers
+```docker container ls```
+
+To open a new bash terminal for running container
+```docker exec -it <container_id or container_name> /bin/bash```
+
+
+

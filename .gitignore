@@ -66,7 +66,7 @@ datasets
 transfer/obelisk/install/
 transfer/obelisk/log/
 transfer/obelisk/build/
-
+g1_hardware_log/
 
 *.pkl
 
@@ -79,5 +79,6 @@ transfer/sim/MUJOCO_LOG.TXT
 
 remote_mount/
 vulcan_mount/
+g1_mount/
 
 transfer/sim/MUJOCO_LOG.TXT

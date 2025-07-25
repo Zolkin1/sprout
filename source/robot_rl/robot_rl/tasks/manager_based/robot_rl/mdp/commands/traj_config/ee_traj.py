@@ -183,7 +183,14 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
 
         #5,11
+        stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+        #if standing, don't modify yaw
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
+
+        if stand_idx.numel() > 0:
+            delta_psi[stand_idx] = 0
+            base_velocity[stand_idx,2] = 0
+
         des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
         des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
 
