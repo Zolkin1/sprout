@@ -2,9 +2,8 @@ from isaaclab.utils import configclass
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import HZDCommandCfg, EndEffectorTrajectoryHZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import EndEffectorTrajectoryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from isaaclab.sensors import FrameTransformerCfg, OffsetCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import MySceneCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_FOR_FLAT_HZD_CFG
@@ -12,19 +11,8 @@ FRAME_MARKER_SMALL_CFG = FRAME_MARKER_CFG.copy()
 FRAME_MARKER_SMALL_CFG.markers["frame"].scale = (0.10, 0.10, 0.10)
 
 
-class G1FlatHZDCommandsCfg(HumanoidCommandsCfg):
-    hzd_ref = HZDCommandCfg()
-
-
 class G1FlatHZDCommandsCfg_EE(HumanoidCommandsCfg):
     hzd_ref = EndEffectorTrajectoryHZDCommandCfg()
-
-
-@configclass
-class G1SceneCfg(MySceneCfg):
-    # Set default number of environments
-    num_envs: int = 4096
-    env_spacing: float = 2.5
 
 ##
 # Environment configuration
@@ -32,10 +20,7 @@ class G1SceneCfg(MySceneCfg):
 @configclass
 class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 Flat environment."""
-    scene: G1SceneCfg = G1SceneCfg()
-    # commands: G1FlatHZDCommandsCfg = G1FlatHZDCommandsCfg()
     commands: G1FlatHZDCommandsCfg_EE = G1FlatHZDCommandsCfg_EE()
-    # observations: G1FlatHZDObservationsCfg = G1FlatHZDObservationsCfg()
 
     def __post_init__(self):
         # post init of parent

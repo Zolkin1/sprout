@@ -1,5 +1,5 @@
 from isaaclab.utils import configclass
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg, StairGaitLibraryHZDCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
@@ -18,15 +18,6 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         gait_velocity_ranges=(-0.75, 0.75, 0.05)
     )
 
-
-class G1GaitLibraryStairCommandsCfg(HumanoidCommandsCfg):
-    """Configuration for gait library commands."""
-    hzd_ref = StairGaitLibraryHZDCommandCfg(
-        trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/stair_gait_library",
-        config_name="stair_config",
-        gait_height_ranges=(0.01, 0.12, 0.01)
-    )
 
 @configclass
 class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
@@ -75,9 +66,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
 
         self.events.reset_base.params["pose_range"]["heading"] = (-3.14, 3.14)
         self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-        # self.curriculum.gait_speed = CurrTerm(func=mdp.gaits_curriculum,
-        #                                      params={"vel_interval": 0.1,
-        #                                              "update_interval": 24000})
+
 
 
 
