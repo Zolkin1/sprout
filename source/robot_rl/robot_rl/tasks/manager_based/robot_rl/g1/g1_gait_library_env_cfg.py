@@ -154,7 +154,7 @@ class G1_saluki_M4_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
             params={
-                "asset_cfg": SceneEntityCfg("robot", body_names="m4_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names="M4_link"),
                 "mass_distribution_params": (1.17,1.17),
                 "operation": "add",
             }
