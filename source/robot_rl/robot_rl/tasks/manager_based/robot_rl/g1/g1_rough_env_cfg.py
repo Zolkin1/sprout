@@ -66,13 +66,13 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75) #(-1.0, 1.0) # 0 - 1
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0) #(-1.0, 1.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1,1) #(-1.0, 1.0) #(-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-3.14,3.14) #(-1.0, 1.0) #(-1.0, 1.0)
 
         ##
         # Terminations
         ##
         self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
-        # self.terminations.base_contact.params["sensor_cfg"].body_names = ["pelvis_link"]
+
 
         ##
         # Rewards
@@ -85,7 +85,8 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         self.rewards.dof_acc_l2.weight = -2.5e-7
         self.rewards.dof_vel_l2.weight = -1.0e-3
         self.rewards.action_rate_l2.weight = -0.01
-        self.rewards.feet_air_time.weight = 0.0
+        # self.rewards.feet_air_time.weight = 0.0
+        self.rewards.feet_air_time = None
         self.rewards.flat_orientation_l2.weight = -1.0
         self.rewards.dof_pos_limits.weight = -5.0
         self.rewards.alive.weight = 0.15

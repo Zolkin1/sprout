@@ -131,14 +131,7 @@ class HLIPCommandTerm(CommandTerm):
         return
     
     def _update_metrics(self):
-        # Foot tracking
-        # foot_pos = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :2]  # Only take x,y coordinates
-        # # Contact schedule function
-        # tp = (self.env.sim.current_time % (2 * self.T)) / (2 * self.T)  # Scaled between 0-1
-        # phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + self.T), device=self.env.device)
 
-        # swing_foot_pos = foot_pos[:, int(0.5 + 0.5 * torch.sign(phi_c))]
-        # Only compare x,y coordinates of foot target
         self.metrics["error_sw_z"] = torch.abs(self.y_out[:,8] - self.y_act[:,8])
         self.metrics["error_sw_x"] = torch.abs(self.y_out[:,6] - self.y_act[:,6])
         self.metrics["error_sw_y"] = torch.abs(self.y_out[:,7] - self.y_act[:,7])
@@ -158,8 +151,8 @@ class HLIPCommandTerm(CommandTerm):
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
         self.metrics["avg_clf"] =torch.mean(self.v_buffer, dim=-1)
-        max_clf = self.env.reward_manager.get_term_cfg("clf_reward").params["max_clf"]
-        self.metrics["max_clf"] = torch.ones((self.num_envs), device=self.device) * max_clf
+        # max_clf = self.env.reward_manager.get_term_cfg("clf_reward").params["max_clf"]
+        # self.metrics["max_clf"] = torch.ones((self.num_envs), device=self.device) * max_clf
         # return self.foot_target  # Return the foot target tensor for observation
 
 
@@ -346,10 +339,7 @@ class HLIPCommandTerm(CommandTerm):
         forward_vel = self.env.command_manager.get_command("base_velocity")[:, 0]
         N = forward_vel.shape[0]
         phase = 2 * torch.pi * self.tp
-        # make it [B,1] so phase+offset broadcasts to [B,9]
-        # phase = torch.ones((N,1),device=self.device) * phase
 
-        # fetch forward_vel: [B]
         
         # unpack your cfg scalars
         sh_pitch0, sh_roll0, sh_yaw0 = self.cfg.shoulder_ref
@@ -426,9 +416,7 @@ class HLIPCommandTerm(CommandTerm):
         self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
 
         # Convert foot positions to the robot's yaw-aligned local frame
-        # stance_pos_local = _transfer_to_local_frame(
-        #     foot_pos_w[:, self.stance_idx, :], root_quat
-        # )
+   
         swing2stance_local = _transfer_to_local_frame(
             foot_pos_w[:, self.swing_idx, :]-self.stance_foot_pos_0, self.stance_foot_ori_quat_0
         )
@@ -448,29 +436,25 @@ class HLIPCommandTerm(CommandTerm):
 
         # 2. Velocities (world frame)
         com_vel_w = data.root_com_vel_w[:,0:3]
-        # pelvis_omega_w = data.root_ang_vel_w
+
         foot_lin_vel_w = data.body_lin_vel_w[:, self.feet_bodies_idx, :]
         foot_ang_vel_w = data.body_ang_vel_w[:, self.feet_bodies_idx, :]
 
         self.stance_foot_vel = foot_lin_vel_w[:,self.stance_idx,:]
         self.stance_foot_ang_vel = foot_ang_vel_w[:,self.stance_idx,:]
         # Convert velocities to local frame
-        # import pdb; pdb.set_trace()
+
         com_vel_local = _transfer_to_local_frame(com_vel_w, self.stance_foot_ori_quat_0)
       
         pelvis_omega_local = data.root_ang_vel_b
-        # foot_lin_vel_local_stance = _transfer_to_local_frame(
-        #     foot_lin_vel_w[:,self.stance_idx,:], self.stance_foot_ori_quat_0
-        # )
+
         foot_lin_vel_local_swing = _transfer_to_local_frame(
             foot_lin_vel_w[:,self.swing_idx,:], self.stance_foot_ori_quat_0
         )
 
         foot_ang_vel_local_swing =quat_apply(quat_inv(foot_ori_w[:,self.swing_idx,:]), foot_ang_vel_w[:,self.swing_idx,:])
         
-        # _transfer_to_local_frame(
-        #     foot_ang_vel_w[:,self.swing_idx,:], self.stance_foot_ori_quat_0
-        # )
+
 
         swing2stance_vel = foot_lin_vel_local_swing 
     
@@ -514,26 +498,4 @@ class HLIPCommandTerm(CommandTerm):
             self.v_buffer = torch.cat([self.v_buffer[:,1:], self.v.unsqueeze(-1)], dim=-1)
             self.vdot_buffer = torch.cat([self.vdot_buffer[:,1:], self.vdot.unsqueeze(-1)], dim=-1)
        
-        if self.debug_vis:
-            # Visualize foot target in global frame
-            base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,2)
-            N = base_velocity.shape[0]
-            foot_target = torch.cat([self.foot_target, torch.zeros((N, 1), device=self.device)], dim=-1)
-            p_ft_global = _transfer_to_global_frame(foot_target, self.robot.data.root_quat_w) + self.robot.data.root_pos_w
-          
-            self.footprint_visualizer.visualize(
-                translations=p_ft_global,
-                orientations=yaw_quat(self.robot.data.root_quat_w).repeat_interleave(2, dim=0),
-            )
             
-            
-            # Print debug info for first environment
-            # print(f"Base velocity: {base_velocity[0]}")
-            # print(f"y_out reference: {self.y_out}")
-            # print(f"dy_out reference: {self.dy_out}")
-            # print(f"foot_target: {self.foot_target[0]}")
-            # print(f"swing2stance: {self.swing2stance[0]}")
-            # print(f"Com2stance: {self.com2stance[0]}")
-            # # print(f"Current foot position: {self.robot.data.body_pos_w[0, self.feet_bodies.body_ids[0], :2]}")
-            # print("---")
-
