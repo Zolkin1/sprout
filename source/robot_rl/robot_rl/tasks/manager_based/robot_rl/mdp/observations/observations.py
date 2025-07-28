@@ -129,7 +129,3 @@ def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     return cphase
 
-
-def step_location(env: ManagerBasedRLEnv) -> torch.Tensor:
-    foot_pos = env.cfg.current_des_step
-    return foot_pos

@@ -7,7 +7,8 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCf
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1_isaac.rough_env_cfg import G1_Observations
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
+
 ##
 # Environment configuration
 ##
@@ -15,7 +16,7 @@ from robot_rl.tasks.manager_based.robot_rl.g1_isaac.rough_env_cfg import G1_Obse
 class G1RoughEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Rough environment."""
     commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
-    observations: G1_Observations = G1_Observations()
+    observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -63,8 +64,8 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.0,1.0) #(-1.0, 1.0) # 0 - 1
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.3,0.3) #(-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75) #(-1.0, 1.0) # 0 - 1
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0) #(-1.0, 1.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1,1) #(-1.0, 1.0) #(-1.0, 1.0)
 
         ##

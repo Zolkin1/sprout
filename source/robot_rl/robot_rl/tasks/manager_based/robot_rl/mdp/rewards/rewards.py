@@ -33,25 +33,7 @@ def vdot_tanh(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0) -> 
 
     return vdot_reward
 
-    
-def swing_foot_contact_penalty(
-    env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    command_name: str,
-    penalty_cap: float = 5.0,
-) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    swing_foot_indices = cmd.swing_idx.squeeze(-1)  # [num_envs]
-    batch_idx = torch.arange(env.num_envs, device=env.device)
-    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    
-    net_forces = contact_sensor.data.net_forces_w_history  # [N, T, B, 3]
-    latest_forces = net_forces[:, -1, sensor_cfg.body_ids, :]  # [num_envs,2, 3]
-    # get the correct forces
-    latest_forces = latest_forces[batch_idx, swing_foot_indices,0:2]  # [num_envs, 3]
-    force_mags = torch.norm(latest_forces, dim=-1)  # [num_envs]
-    capped_penalty = torch.clamp(force_mags, max=penalty_cap)  # [num_envs]
-    return capped_penalty  # Standard is to return per-env reward/penalty
+
 
 
 
