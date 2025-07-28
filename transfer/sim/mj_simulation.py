@@ -8,7 +8,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import pygame
-from typing import Tuple
+from typing import Tuple, Callable
 from transfer.sim.robot import Robot
 from transfer.sim.simulation import Simulation
 
@@ -60,7 +60,8 @@ def log_row_to_csv(filename, data):
     except Exception as e:
         print(f"Error appending row to {filename}: {e}")
 
-def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str, use_height_sensor: bool = False,
+def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str,
+                   input_function: Callable[[float], np.array] = None, total_time: float = -1, use_height_sensor: bool = False,
                    tracking_body_name: str =""):
     """Run the simulation.
     
@@ -73,11 +74,11 @@ def run_simulation(policy, robot: str, scene: str, log: bool, log_dir: str, use_
         use_height_sensor: Whether to use height sensor (default: False)
     """
     # Create robot instance
-    robot_instance = Robot(robot, scene)
+    robot_instance = Robot(robot, scene, input_function)
     
     # Create and run simulation
     sim = Simulation(policy, robot_instance, log, log_dir, use_height_sensor=use_height_sensor, tracking_body_name=tracking_body_name)
-    sim.run()
+    sim.run(total_time)
 
 def ray_cast_sensor(model, data, site_name, size: Tuple[float, float], x_y_num_rays: Tuple[int, int], sen_offset: float = 0) -> np.array:
     """Using a grid pattern, create a height map using ray casting."""

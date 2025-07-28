@@ -19,3 +19,4 @@ default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
                   0, -0.27, 0, 0.5]
 log: true
 log_dir: "logs"
+policy_type: "mlp"

@@ -1,11 +1,12 @@
 import os
 import numpy as np
 import mujoco
+from typing import Callable
 import pygame
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str):
+    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None):
         """Initialize the robot with its model and data."""
         if robot_name != "g1_21j" and robot_name != "g1_21j_M4":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
@@ -14,18 +15,20 @@ class Robot:
         self.scene_name = scene_name
         self.mj_model, self.mj_data = self._get_model_data()
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
-        
-        # Initialize joystick
-        pygame.init()
-        pygame.joystick.init()
-        joystick_count = pygame.joystick.get_count()
-        if joystick_count < 1:
-            print("No joystick detected, using initial command from config instead.")
-            self.joystick = None
-        else:
-            self.joystick = pygame.joystick.Joystick(0)
-            self.joystick.init()
-            print(f"Using controller: {self.joystick.get_name()}")
+        self.input_function = input_function
+
+        if self.input_function is None:
+            # Initialize joystick
+            pygame.init()
+            pygame.joystick.init()
+            joystick_count = pygame.joystick.get_count()
+            if joystick_count < 1:
+                print("No joystick detected, using initial command from config instead.")
+                self.joystick = None
+            else:
+                self.joystick = pygame.joystick.Joystick(0)
+                self.joystick.init()
+                print(f"Using controller: {self.joystick.get_name()}")
 
 
     def _get_model_data(self):
@@ -89,9 +92,12 @@ class Robot:
         qvel = self.mj_data.qvel
         sim_time = self.mj_data.time
         pg = self.get_projected_gravity(qpos[3:7])
-        des_vel = self.get_joystick_command()
+        if self.input_function is None:
+            self.commanded_vel = self.get_joystick_command()
+        else:
+            self.commanded_vel = self.input_function(sim_time)
         
-        return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, des_vel,
+        return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, self.commanded_vel,
                                height_map=height_map, sensor_pos=sensor_pos)
 
 
