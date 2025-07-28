@@ -1,6 +1,6 @@
 <!-- Pulled from the unitree_ros repo on 10/18/2024 then modified.
 Position and velocity actuators added. -->
-<mujoco model="g1_21j">
+<mujoco model="g1_21j_compute">
   <compiler angle="radian" meshdir="meshes"/>
 
   <option cone="elliptic" impratio="100" integrator="implicitfast" timestep="0.001"/>
@@ -153,7 +153,6 @@ Position and velocity actuators added. -->
     <mesh name="right_hand_middle_1_link" file="right_hand_middle_1_link.STL"/>
     <mesh name="right_hand_index_0_link" file="right_hand_index_0_link.STL"/>
     <mesh name="right_hand_index_1_link" file="right_hand_index_1_link.STL"/>
-    <mesh name="reduced_m4_rotated" file="reduced_m4_rotated.stl"/>
   </asset>
 
   <worldbody>
@@ -318,7 +317,7 @@ Position and velocity actuators added. -->
           <inertial pos="0 -0.000236 0.010111" quat="0.99979 0.020492 0 0" mass="0.047" diaginertia="7.515e-06 6.40206e-06 3.98394e-06"/>
           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="waist_roll_link"/>
           <body name="torso_link" pos="0 0 0.019">
-            <inertial pos="0.00331658 0.000261533 0.179856" quat="0.999831 0.000376204 0.0179895 -0.00377704" mass="9.598" diaginertia="0.12407 0.111951 0.0325382"/>
+            <inertial pos="0.00331658 0.000261533 0.179856" quat="0.999831 0.000376204 0.0179895 -0.00377704" mass="10.214" diaginertia="0.12407 0.111951 0.0325382"/>
             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="torso_link"/>
             <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="torso_link"/>
             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.2 0.2 0.2 1" mesh="logo_link"/>
@@ -338,13 +337,6 @@ Position and velocity actuators added. -->
 
             <!-- TODO: Verify position -->
             <site name="tracking_camera_site" pos="0.085725 0 0.2413" euler="0.02 -0.08 0" rgba="0 0 1 0" size="0.01"/>
-
-            <!-- M4 -->
-            <body name="M4_link" pos="-0.08 0 0.14">
-              <inertial pos="0.0 0 0" mass="3.83" diaginertia="0.0396025592 0.0281 0.0151"/>
-              <!-- <geom pos="0 0 0" type="box" size="0.05 0.2 0.2"/> -->
-              <geom type="mesh" mesh="reduced_m4_rotated" contype="0" conaffinity="0"/>
-            </body>
 
             <!-- Left Arm -->
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">

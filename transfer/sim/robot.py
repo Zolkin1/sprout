@@ -1,31 +1,35 @@
 import os
 import numpy as np
 import mujoco
+from typing import Callable
 import pygame
+from scipy.spatial.transform import Rotation
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str):
+    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4":
+        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
 
         self.robot_name = robot_name
         self.scene_name = scene_name
         self.mj_model, self.mj_data = self._get_model_data()
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
-        
-        # Initialize joystick
-        pygame.init()
-        pygame.joystick.init()
-        joystick_count = pygame.joystick.get_count()
-        if joystick_count < 1:
-            print("No joystick detected, using initial command from config instead.")
-            self.joystick = None
-        else:
-            self.joystick = pygame.joystick.Joystick(0)
-            self.joystick.init()
-            print(f"Using controller: {self.joystick.get_name()}")
+        self.input_function = input_function
+
+        if self.input_function is None:
+            # Initialize joystick
+            pygame.init()
+            pygame.joystick.init()
+            joystick_count = pygame.joystick.get_count()
+            if joystick_count < 1:
+                print("No joystick detected, using initial command from config instead.")
+                self.joystick = None
+            else:
+                self.joystick = pygame.joystick.Joystick(0)
+                self.joystick.init()
+                print(f"Using controller: {self.joystick.get_name()}")
 
 
     def _get_model_data(self):
@@ -38,6 +42,21 @@ class Robot:
         mj_data = mujoco.MjData(mj_model)
         return mj_model, mj_data
 
+    def add_base_mass(self, added_mass):
+        """Add mass to the robot base."""
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+
+        self.mj_model.body_mass[body_id] += added_mass
+
+        print(f"Adjust the mass of the {body_name} by adding {added_mass}.")
+
+    def apply_force_disturbance(self, force_disturbance):
+        """Apply the force_disturbance to the robot base."""
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+
+        self.mj_data.xfrc_applied[body_id] = force_disturbance
 
     def get_projected_gravity(self, quat):
         """Calculate projected gravity from quaternion."""
@@ -89,9 +108,12 @@ class Robot:
         qvel = self.mj_data.qvel
         sim_time = self.mj_data.time
         pg = self.get_projected_gravity(qpos[3:7])
-        des_vel = self.get_joystick_command()
+        if self.input_function is None:
+            self.commanded_vel = self.get_joystick_command()
+        else:
+            self.commanded_vel = self.input_function(sim_time)
         
-        return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, des_vel,
+        return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, self.commanded_vel,
                                height_map=height_map, sensor_pos=sensor_pos)
 
 
@@ -107,7 +129,8 @@ class Robot:
         log =  [
             self.mj_data.time,
             *self.mj_data.qpos.tolist(),
-            *self.mj_data.qvel.tolist(),
+            *self.get_local_vel().tolist(),
+            *self.mj_data.qvel[3:].tolist(),
             *obs[0, :].numpy().tolist(),
             *action.tolist(),
             *torques,
@@ -117,6 +140,18 @@ class Robot:
         ]
         return log
 
+    def get_local_vel(self):
+        """Convert the global floating base velocity to the local frame."""
+        # Convert to scipy format [x, y, z, w]
+        q_scipy = np.array([self.mj_data.qpos[4], self.mj_data.qpos[5], self.mj_data.qpos[6], self.mj_data.qpos[3]])
+
+        # Create rotation object
+        r = Rotation.from_quat(q_scipy)
+
+        # Inverse rotate to get local velocity
+        v_local = r.inv().apply(self.mj_data.qvel[:3])
+
+        return v_local
 
     def apply_action(self, action):
         """Apply control action to the robot."""

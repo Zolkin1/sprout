@@ -1,109 +1,14 @@
-import csv
 import os
-import re
-from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
-
-def find_most_recent_timestamped_folder(base_path):
-    """
-    Finds the path of the most recent folder named with a YYYY-MM-DD-HH-MM-SS timestamp
-    within a specified base path.
-
-    Args:
-      base_path (str): The directory to search within.
-
-    Returns:
-      str: The full path to the most recent timestamped folder, or None if none found.
-    """
-    most_recent_folder = None
-    latest_timestamp = None
-
-    # Regular expression to match the YYYY-MM-DD-HH-MM-SS format
-    timestamp_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$")
-
-    try:
-        # List all entries in the base directory
-        entries = os.listdir(base_path)
-
-        for entry in entries:
-            entry_path = os.path.join(base_path, entry)
-
-            # Check if the entry is a directory and matches the timestamp pattern
-            if os.path.isdir(entry_path) and timestamp_pattern.match(entry):
-                try:
-                    # Parse the timestamp from the folder name
-                    folder_timestamp = datetime.strptime(entry, "%Y-%m-%d-%H-%M-%S")
-
-                    # If this is the first timestamped folder found, or if it's more recent
-                    if latest_timestamp is None or folder_timestamp > latest_timestamp:
-                        latest_timestamp = folder_timestamp
-                        most_recent_folder = entry_path
-
-                except ValueError:
-                    # This handles cases where a folder name matches the pattern but isn't
-                    # a valid date/time string (unlikely with the previous script, but good practice)
-                    print(f"Warning: Directory '{entry}' matches pattern but has invalid timestamp.")
-                    pass  # Skip this directory
-
-    except FileNotFoundError:
-        print(f"Error: Base path '{base_path}' not found.")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return None
-
-    return most_recent_folder
-
-
-def extract_data(filepath, config):
-    data_structure = config.get('data_structure')
-    print("\nData structure from config:")
-    for item in data_structure:
-        print(f"  {item['name']}: length {item['length']}")
-    
-    extracted_data_lists = {item['name']: [] for item in data_structure if 'name' in item}
-    print("\nInitialized data lists:")
-    for name in extracted_data_lists:
-        print(f"  {name}")
-
-    with open(filepath) as f:
-        csv_reader = csv.reader(f)
-
-        for row_count, row in enumerate(csv_reader):
-            numeric_row = []
-            for item in row:
-                numeric_row.append(float(item))
-
-            current_index = 0
-            for item in data_structure:
-                name = item.get("name")
-                length = item.get("length")
-                component_data = numeric_row[current_index : current_index + length]
-                extracted_data_lists[name].append(component_data)
-                current_index += length
-
-        # Convert lists of data to NumPy arrays
-        extracted_data_arrays = {}
-        for name, data_list in extracted_data_lists.items():
-            if data_list:  # Only create array if there is data
-                extracted_data_arrays[name] = np.array(data_list)
-                print(f"\nLoaded data for {name}:")
-                print(f"  Shape: {extracted_data_arrays[name].shape}")
-            else:  # Create empty array if no data was collected for this component
-                # Determine the shape based on the config length
-                component_length = next((item["length"] for item in data_structure if item.get("name") == name), 0)
-                extracted_data_arrays[name] = np.empty((0, component_length))
-                print(f"\nNo data found for {name}, created empty array with shape (0, {component_length})")
-
-        return extracted_data_arrays
+from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_data
 
 
 # Make plots
-def plot_joints_and_actions(data):
+def plot_joints_and_actions(data, save_dir):
     fig, axes = plt.subplots(nrows=7, ncols=3, figsize=(10, 10))
 
     FLOATING_BASE = 7
@@ -117,8 +22,9 @@ def plot_joints_and_actions(data):
             axes[i, j].grid()
             axes[i, j].legend()
 
+    plt.savefig(os.path.join(save_dir, "joints_and_actions.png"))
 
-def plot_torques(data):
+def plot_torques(data, save_dir):
     fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(10, 10))
 
     for i in range(6):
@@ -128,8 +34,9 @@ def plot_torques(data):
             axes[i, j].set_ylabel(f"torque {i + 6*j} (Nm)")
             axes[i, j].grid()
 
+    plt.savefig(os.path.join(save_dir, "torques.png"))
 
-def plot_vels(data):
+def plot_vels(data, save_dir):
     fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(10, 10))
 
     FLOATING_BASE = 6
@@ -141,8 +48,9 @@ def plot_vels(data):
             axes[i, j].set_ylabel(f"qvel {i + 6*j + FLOATING_BASE} (rad/s)")
             axes[i, j].grid()
 
+    plt.savefig(os.path.join(save_dir, "vels.png"))
 
-def plot_base(data):
+def plot_base(data, save_dir):
     fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(10, 10))
 
     for i in range(3):
@@ -151,10 +59,15 @@ def plot_base(data):
                 axes[i, j].plot(data["time"], data["qpos"][:, i])
                 axes[i, j].set_xlabel("time")
                 axes[i, j].set_ylabel(f"qpos {i} (m)")
+                axes[i, j].grid()
             else:
                 axes[i, j].plot(data["time"], data["qvel"][:, i])
                 axes[i, j].set_xlabel("time")
                 axes[i, j].set_ylabel(f"qvel {i} (m/s)")
+                axes[i, j].grid()
+
+    plt.savefig(os.path.join(save_dir, "floating_base.png"))
+
 
 def plot_ankles(data):
     fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(10, 10))
@@ -179,7 +92,7 @@ def plot_ankles(data):
     axes[1, 2].set_xlabel("time")
     axes[1, 2].set_ylabel(f"right_ankle_pos z (m)")
 
-def plot_velocity_comparison(data):
+def plot_velocity_comparison(data, save_dir):
     """Plot comparison between commanded and actual velocities."""
     time = data['time']
     qvel = data['qvel']
@@ -214,7 +127,9 @@ def plot_velocity_comparison(data):
     axes[2].legend()
     axes[2].grid(True)
 
-def plot_position_comparison(data):
+    plt.savefig(os.path.join(save_dir, "velocity_comparison.png"))
+
+def plot_position_comparison(data, save_dir):
     """Plot comparison between desired and actual positions."""
     time = data['time']
     qpos = data['qpos']
@@ -263,7 +178,9 @@ def plot_position_comparison(data):
     axes[2].legend()
     axes[2].grid(True)
 
-if __name__ == "__main__":
+    plt.savefig(os.path.join(save_dir, "position_comparison.png"))
+
+def create_plots_for_newest():
     # Load in the data from rerun
     log_dir = os.getcwd() + "/logs"
     print(f"Looking for logs in {log_dir}.")
@@ -296,15 +213,17 @@ if __name__ == "__main__":
     print(f"commanded_vel shape: {data['commanded_vel'].shape}")
 
     # Make a plot
-    plot_joints_and_actions(data)
+    plot_joints_and_actions(data, newest)
     # plot_torques(data)
     # plot_vels(data)
-    plot_base(data)
+    plot_base(data, newest)
     # import pdb; pdb.set_trace()
     # plot_ankles(data)
 
     # Plot velocity and position comparisons
-    plot_velocity_comparison(data)
-    plot_position_comparison(data)
+    plot_velocity_comparison(data, newest)
+    plot_position_comparison(data, newest)
 
+if __name__ == "__main__":
+    create_plots_for_newest()
     plt.show()

@@ -3,6 +3,7 @@ import time
 import math
 import csv
 import yaml
+from typing import Callable
 import mujoco
 import mujoco.viewer
 from datetime import datetime
@@ -112,7 +113,7 @@ class Simulation:
         with open(config_path, 'w') as f:
             yaml.dump(sim_config, f)
 
-    def run(self):
+    def run(self, total_time: float, force_disturbance: Callable[[float], np.array] = None,):
         """Run the simulation."""
         print(f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
               f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
@@ -146,6 +147,8 @@ class Simulation:
                     ii += 1
 
             while viewer.is_running():
+                if total_time > 0 and self.robot.mj_data.time > total_time:
+                        break
                 # Get observation and compute action
                 if self.use_height_sensor:
                     height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays)
@@ -177,9 +180,11 @@ class Simulation:
                         for pos in height_map.reshape(-1, 3):
                             viewer.user_scn.geoms[ii].pos = pos
                             ii += 1
-                    
-                    # Get latest joystick command before stepping
-                    self.robot.get_joystick_command()
+
+                    if force_disturbance is not None:
+                        self.robot.apply_force_disturbance(force_disturbance(self.robot.mj_data.time))
+
+                    # Step the sim
                     self.robot.step()
                     
                     # Only log and sync viewer at viewer_rate intervals

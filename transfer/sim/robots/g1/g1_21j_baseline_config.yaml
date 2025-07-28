@@ -1,6 +1,6 @@
 # G1_21j config
-robot_name: "g1_21j"
-checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-06-24_16-40-11/exported/policy.pt"
+robot_name: "g1_21j_compute"
+checkpoint_path: "rsl_rl/g1/2025-06-24_16-40-11/exported/policy.pt"
 
 num_obs: 74
 num_action: 21
@@ -19,3 +19,4 @@ default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
                   0, -0.27, 0, 0.5]
 log: true
 log_dir: "logs"
+policy_type: "mlp"
