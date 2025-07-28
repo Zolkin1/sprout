@@ -26,8 +26,8 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 
 SIM_ENVIRONMENTS = {
     "vanilla": "custom-Isaac-Velocity-Flat-G1-Play-v0",
-    "custom": "G1-LIP-ref-play",
-    "lip_clf": "G1-LIP-clf-play",
+    "custom": "G1-flat-vel",
+    "lip_clf": "G1-LIP-ref-play",
     "lip_ref_tracking": "G1-LIP-ref-play",
     "lip_clf_vdot": "G1-LIP-ref-play",
     "hzd_clf": "G1-hzd-clf",
