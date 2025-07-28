@@ -71,12 +71,9 @@ RL Task list:
 |---------------|:----------:|:--------------------:|------------------------------------------------------------------|
 | `G1-flat-vel` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
 | `clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
-| `stair`         |     G1     |  :x:  | LIP CLF on stair terrain. |
-| `flat-hzd`    |     G1     |  :x:  | A single HZD gait; CLF RL walking on the G1 humanoid on flat ground. |
-| `flat-hzd-GL`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
-| `height-map`  |     G1     |  :x:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground with height map observation. |
-| `gl-custom-plate`  |     G1     |  :x:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
-| `m4-custom-plate`  |     G1     |  :x:  | with M4 and more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+| `hzd_clf`  |     G1     |  :white_check_mark:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+| `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+
 ## Copying checkpoitns from remote server 
 First mount the server to your local desktop
  

@@ -67,9 +67,28 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         self.events.reset_base.params["pose_range"]["heading"] = (-3.14, 3.14)
         self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
+@configclass
+class G1FlatRefTrackingEnvCfg(G1GaitLibraryEnvCfg):
+    """Configuration for the G1 Flat environment."""
+
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        # self.rewards.clf_reward = None
+        self.rewards.clf_decreasing_condition = None
+        self.curriculum.clf_curriculum = None
 
 
+@configclass
+class G1_clf_rl_minimum_rewards(G1GaitLibraryEnvCfg):
+    """Minimum reward terms env cfg."""
 
+    def __post_init__(self):
+        super().__post_init__()
+        #keeping action rate l2 and dof pos limits and torque cost?
+        self.rewards.dof_acc_l2 = None
+        self.rewards.dof_vel_l2 = None
 
 @configclass
 class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
@@ -78,12 +97,14 @@ class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
+        #both front and back 1.14
+        #just front: 0.616
         self.events.add_plate_mass = EventTerm(
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_distribution_params": (1.14,1.14),
+                "mass_distribution_params": (0.616,0.616),
                 "operation": "add",
             }
         )

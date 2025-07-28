@@ -4,7 +4,7 @@ import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from isaaclab.utils import configclass
 
 from .gaitPeriod import GaitPeriodCommand
-from .vel_cmd import VelCmd
+
 
 @configclass
 class GaitPeriodCfg(CommandTermCfg):
@@ -15,9 +15,3 @@ class GaitPeriodCfg(CommandTermCfg):
     period_range: tuple[float, float] = MISSING
 
 
-
-@configclass
-class CustomUniformVelocityCommandCfg(mdp.UniformVelocityCommandCfg):
-    class_type: type = VelCmd
-    ref_cmd_name: str = "hlip_ref"
-    phase_threshold: float = 0.1
