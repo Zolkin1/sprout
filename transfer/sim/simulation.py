@@ -113,7 +113,7 @@ class Simulation:
         with open(config_path, 'w') as f:
             yaml.dump(sim_config, f)
 
-    def run(self, total_time: float, added_mass: float = 0):
+    def run(self, total_time: float, force_disturbance: Callable[[float], np.array] = None,):
         """Run the simulation."""
         print(f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
               f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
@@ -180,7 +180,10 @@ class Simulation:
                         for pos in height_map.reshape(-1, 3):
                             viewer.user_scn.geoms[ii].pos = pos
                             ii += 1
-                    
+
+                    if force_disturbance is not None:
+                        self.robot.apply_force_disturbance(force_disturbance(self.robot.mj_data.time))
+
                     # Step the sim
                     self.robot.step()
                     
