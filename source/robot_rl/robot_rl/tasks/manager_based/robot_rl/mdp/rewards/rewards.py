@@ -34,33 +34,52 @@ def vdot_tanh(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0) -> 
     return vdot_reward
 
 
-def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_clf: float = 200.0) -> torch.Tensor:
-    """Negative CLF value as a reward (i.e., -V(η)), clipped to [-1, 0]."""
+def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0.15, eps: float = 1e-6) -> torch.Tensor:
+    """CLF-based reward: r = exp(-V(η) / V_max), clipped to [0, 1]."""
+
     ref_term = env.command_manager.get_term(command_name)
     v = ref_term.v  # [B] scalar CLF value per env
-
-    reward = torch.clamp(v, min=0.0, max=max_clf)/max_clf
-    # max_clf =torch.sqrt(torch.norm(ref_term.clf.P))
-    reward = torch.exp(-v/max_clf)
-    
+    eigvals = torch.linalg.eigvalsh(ref_term.clf.P)
+    lambda_max = eigvals[-1]
+    max_clf = lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
+    reward = torch.exp(-v / max_clf)
+    reward = torch.clamp(reward, min=0.0, max=1.0)
     return reward
 
 
-def clf_decreasing_condition(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0, max_clf_decreasing: float = 200.0) -> torch.Tensor:
-    """Penalty for violating the CLF decrease condition, clipped to [-1, 0]."""
+def clf_decreasing_condition(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    alpha: float = 1.0,
+    eta_max: float = 0.15,
+    eta_dot_max: float = 0.5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Penalty for violating CLF decrease condition: 𝑟 = clip((ΔV + αV) / max_violation, [0, 1])
+    where:
+        max_violation ≈ 2‖P‖ η_max η̇_max + α λ_max(P) η_max²
+    """
+
     ref_term = env.command_manager.get_term(command_name)
-    v = ref_term.v                     # [B]
-    vdot = ref_term.vdot # [B]
+    v = ref_term.v        # [B]
+    vdot = ref_term.vdot  # [B]
 
-    # Compute violation: ΔV + αV
-    clf_violation = vdot + alpha * v   # [B]
+    P = ref_term.clf.P
+    lambda_max = torch.linalg.eigvalsh(P)[-1]
+    norm_P = torch.linalg.norm(P, ord=2)  # 2-norm == spectral norm
 
-    #also normalize by max_clf violation
-    clf_violation = clf_violation/max_clf_decreasing
-    penalty = torch.clamp(clf_violation, min=0.0)  # only penalize violations
-  
-    reward = torch.clamp(penalty, max=1.0) 
-    return reward
+    # Theoretical upper bound on violation
+    max_violation = (
+        2.0 * norm_P * eta_max * eta_dot_max + alpha * lambda_max * eta_max ** 2 + eps
+    )
+
+    # Only penalize when violation is positive
+    violation = torch.clamp(vdot + alpha * v, min=0.0)
+    penalty = violation / max_violation
+    penalty = torch.clamp(penalty, min=0.0, max=1.0)
+    return penalty
+
 
 def v_dot_penalty(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     ref_term = env.command_manager.get_term(command_name)                    # [B]
