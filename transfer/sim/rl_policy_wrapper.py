@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Literal
 import numpy as np
 import torch
@@ -71,7 +73,14 @@ class RLPolicy:
 
     def load(self):
         """Load RL Policy"""
-        self.policy = torch.jit.load(self.checkpoint_path)
+        # Get the cwd and get the logs dir relative to this.
+        # NOTE: Assuming we are running from transfer/sim
+        two_up = Path.cwd().parent.parent
+        policy_logs = os.path.join(two_up, "logs")
+        full_path = os.path.join(policy_logs, self.checkpoint_path)
+        print(f"Attempting to load {full_path}")
+
+        self.policy = torch.jit.load(full_path)
         # load to cuda
         if torch.cuda.is_available():
             self.policy = self.policy.cuda()
