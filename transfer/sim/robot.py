@@ -3,12 +3,13 @@ import numpy as np
 import mujoco
 from typing import Callable
 import pygame
+from scipy.spatial.transform import Rotation
 
 
 class Robot:
     def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4":
+        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
 
         self.robot_name = robot_name
@@ -113,7 +114,8 @@ class Robot:
         log =  [
             self.mj_data.time,
             *self.mj_data.qpos.tolist(),
-            *self.mj_data.qvel.tolist(),
+            *self.get_local_vel().tolist(),
+            *self.mj_data.qvel[3:].tolist(),
             *obs[0, :].numpy().tolist(),
             *action.tolist(),
             *torques,
@@ -123,6 +125,18 @@ class Robot:
         ]
         return log
 
+    def get_local_vel(self):
+        """Convert the global floating base velocity to the local frame."""
+        # Convert to scipy format [x, y, z, w]
+        q_scipy = np.array([self.mj_data.qpos[4], self.mj_data.qpos[5], self.mj_data.qpos[6], self.mj_data.qpos[3]])
+
+        # Create rotation object
+        r = Rotation.from_quat(q_scipy)
+
+        # Inverse rotate to get local velocity
+        v_local = r.inv().apply(self.mj_data.qvel[:3])
+
+        return v_local
 
     def apply_action(self, action):
         """Apply control action to the robot."""

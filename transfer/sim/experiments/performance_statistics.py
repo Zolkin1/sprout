@@ -20,7 +20,6 @@ def compute_stats(start_time = 0):
 
     print(f"Loading data from {newest}.")
 
-    # TODO: Load in pkl or csv
     # Parse the config file
     with open(os.path.join(newest, "sim_config.yaml")) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)

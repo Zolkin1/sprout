@@ -1,5 +1,5 @@
 # G1_21j config
-robot_name: "g1_21j"
+robot_name: "g1_21j_compute"
 checkpoint_path: "rsl_rl/g1/2025-06-24_16-40-11/exported/policy.pt"
 
 num_obs: 74
