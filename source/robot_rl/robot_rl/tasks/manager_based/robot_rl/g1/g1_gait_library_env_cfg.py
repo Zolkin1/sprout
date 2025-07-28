@@ -58,7 +58,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
         # self.curriculum.clf_curriculum = None
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.2,
+            "max_eta_err": 0.3,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
@@ -66,15 +66,7 @@ class G1GaitLibraryEnvCfg(G1FlatHZDEnvCfg):
             "eta_max": 0.2,
             "eta_dot_max": 0.3,
         }
-        # self.curriculum.clf_curriculum = None
-        # self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 150.0
-        # self.rewards.clf_decreasing_condition.params["alpha"] = 1.0
-
-        self.curriculum.clf_curriculum.params = {
-            "min_max_err": (0.1,0.1),
-            "scale": (0.001,0.001),
-            "update_interval": 30000
-        }
+        self.curriculum.clf_curriculum = None
 
         self.events.reset_base.params["pose_range"]["heading"] = (-3.14, 3.14)
         self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG

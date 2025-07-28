@@ -39,11 +39,9 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
 
     ref_term = env.command_manager.get_term(command_name)
     v = ref_term.v  # [B] scalar CLF value per env
-    eigvals = torch.linalg.eigvalsh(ref_term.clf.P)
-    lambda_max = eigvals[-1]
-    max_clf = lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
-    reward = torch.exp(-v / max_clf)
-    reward = torch.clamp(reward, min=0.0, max=1.0)
+    max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
+
+    reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
     return reward
 
 
@@ -65,15 +63,13 @@ def clf_decreasing_condition(
     v = ref_term.v        # [B]
     vdot = ref_term.vdot  # [B]
 
-    P = ref_term.clf.P
-    lambda_max = torch.linalg.eigvalsh(P)[-1]
-    norm_P = torch.linalg.norm(P, ord=2)  # 2-norm == spectral norm
+    lambda_max = ref_term.clf.lambda_max
+    norm_P = ref_term.clf.norm_P
 
     # Theoretical upper bound on violation
     max_violation = (
         2.0 * norm_P * eta_max * eta_dot_max + alpha * lambda_max * eta_max ** 2 + eps
     )
-
     # Only penalize when violation is positive
     violation = torch.clamp(vdot + alpha * v, min=0.0)
     penalty = violation / max_violation
@@ -99,7 +95,6 @@ def contact_no_vel(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = 
     # shape [B, num_feet, 3]
     penalize = torch.square(body_vel[:,:,:3])
     return torch.sum(penalize, dim=(1,2))
-
 
 
 def holonomic_constraint_vel(

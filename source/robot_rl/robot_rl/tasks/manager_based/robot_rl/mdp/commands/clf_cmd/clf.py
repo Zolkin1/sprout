@@ -43,7 +43,10 @@ class CLF:
         # Cache as torch tensors
         self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
         # K shape: (n_inputs, n_states)
-        self.K = torch.from_numpy(K_np).to(self.device)
+        self.K = torch.from_numpy(K_np).to(self.device).to(torch.float32)
+
+        self.lambda_max = torch.linalg.eigvalsh(self.P)[-1]
+        self.norm_P = torch.linalg.norm(self.P, ord=2)
 
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0

@@ -376,13 +376,13 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or "custom" in args_cli.env_type:
+    if "lip" in args_cli.env_type or args_cli.env_type == "custom":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
-        
+    
     ref = env.unwrapped.command_manager.get_term(command_name)
     
     # Add dynamic error metrics based on the command type
