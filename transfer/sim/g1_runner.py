@@ -7,7 +7,8 @@ import sys
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from transfer.sim.mj_simulation import run_simulation
+from transfer.sim.simulation import Simulation
+from transfer.sim.robot import Robot
 from rl_policy_wrapper import RLPolicy
 
 def main():
@@ -56,17 +57,15 @@ def main():
         policy_type=config["policy_type"]
     )
 
-    # Run the simulator with default values for optional fields
-    run_simulation(
-        policy=policy,
-        robot=config["robot_name"],
-        scene=config.get("scene", "basic_scene"),  # Default to basic_scene if not specified
-        log=config.get("log", False),
-        log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
-        use_height_sensor=config.get("height_map_scale") is not None,  # Enable height sensor if height_map_scale is present
-        tracking_body_name="torso_link"
-    )
 
+    # Create robot instance
+    robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=None)
+
+    # Create and run simulation
+    sim = Simulation(policy, robot_instance, log=config.get("log", False),
+                     log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+                     use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
+    sim.run(-1) # Run forever
 
 if __name__ == "__main__":
     main()

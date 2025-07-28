@@ -113,7 +113,7 @@ class Simulation:
         with open(config_path, 'w') as f:
             yaml.dump(sim_config, f)
 
-    def run(self, total_time: float):
+    def run(self, total_time: float, added_mass: float = 0):
         """Run the simulation."""
         print(f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
               f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
