@@ -30,6 +30,11 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         # No height scanner for now
         self.scene.height_scanner = None
 
+        #remove lip specific observation
+        self.observations.critic.ref_traj = None
+        self.observations.critic.act_traj = None
+        self.observations.critic.ref_traj_vel = None
+        self.observations.critic.act_traj_vel = None
         ##
         # Randomization
         ##

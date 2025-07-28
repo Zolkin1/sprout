@@ -12,7 +12,7 @@ ENVIRONMENTS = {
     "custom": "G1-flat-vel",
     "lip_ref_tracking": "G1-flat-ref-tracking",
     "lip_clf_vdot": "G1-flat-clf-vdot",
-    "lip_clf": "G1-LIP-clf",
+    "lip_clf": "G1-lip-clf-custom",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
     "hzd_clf_minimum": "G1-hzd-clf-minimum"

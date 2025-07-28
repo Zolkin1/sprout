@@ -106,8 +106,4 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
 
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        # if self.scene.terrain.terrain_generator is not None:
-        #   self.scene.terrain.terrain_generator.num_rows = 1
-        #   self.scene.terrain.terrain_generator.num_cols = 2
-        # self.events.push_robot.interval_range_s = (5.0,5.0)
         self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0, 0)}  # (-3.14, 3.14)},

@@ -47,6 +47,11 @@ class G1RoughLipObservationsCfg():
         sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
         cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
 
+        contact_state = ObsTerm(
+            func=mdp.contact_state,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+        )
+
         foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
         foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
         ref_traj = ObsTerm(
@@ -79,12 +84,12 @@ class G1HZDObservationsCfg():
             noise=Unoise(n_min=-0.05, n_max=0.05),
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},scale=(2.0,2.0,2.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5),scale=0.05)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5),scale=0.05)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hlip_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hlip_ref"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -100,24 +105,24 @@ class G1HZDObservationsCfg():
         )
         # root_quat = ObsTerm(func=mdp.root_quat)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},scale=(2.0,2.0,2.0))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hlip_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hlip_ref"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
 
         contact_state = ObsTerm(
             func=mdp.contact_state,
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
         )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel,scale=1.0)
-        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hlip_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,))
+        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hzd_ref"},scale=1.0)
+        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hzd_ref"},scale=1.0)
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"})
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"})
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,))
        
         # base_z = ObsTerm(func=mdp.base_z)
     # observation groups
