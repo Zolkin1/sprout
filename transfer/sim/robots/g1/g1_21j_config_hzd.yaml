@@ -1,14 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j"
-#checkpoint_path: "/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/logs/rsl_rl/g1/2025-05-23_15-51-34/exported/policy.pt"  # Not LIP, all dir
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/clf/g1/2025-06-10_14-20-56/exported/policy.pt"
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/clf/g1/2025-06-10_15-59-40/exported/policy.pt" #previous_good version
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/clf/g1/2025-06-10_17-33-32/exported/policy.pt" #good
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/transfer/sim/robots/g1/flat_hzd_policy.pt"
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd/g1/2025-07-04_10-12-52/exported/hzd_policy.pt"
-# checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/height-map/g1/2025-07-11_12-53-00/exported/policy.pt"
-#checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd-GL/g1/2025-07-14_10-03-10/exported/policy.pt"
-checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/flat-hzd-GL/g1/2025-07-15_14-45-50/exported/policy.pt"
+checkpoint_path: "ral_paper/hzd_clf_minimum_reward.pt"
 
 num_obs: 74
 num_action: 21

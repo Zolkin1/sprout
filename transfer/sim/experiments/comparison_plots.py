@@ -6,7 +6,8 @@ from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_
 
 def main():
     """Take in multiple pre-run sims and create a single plot that compares it."""
-    logs = ["2025-07-28-15-53-55", "2025-07-28-16-07-40"]
+    logs = ["2025-07-29-10-34-07", "2025-07-29-10-50-18", "2025-07-29-10-40-20"]
+    run_names = ["Basline", "HZD RL", "LIP RL"]
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 12))
     fig.suptitle('Commanded vs Actual Velocities')
@@ -28,20 +29,27 @@ def main():
                 axes[1].plot(time, commanded_vel[:, 1], 'r--', label='Commanded')
                 axes[2].plot(time, commanded_vel[:, 2], 'r--', label='Commanded')
 
+            if i == 0:
+                color = 'blue'
+            elif i == 1:
+                color = 'magenta'
+            else:
+                color = 'green'
+
             # Plot x velocity
-            axes[0].plot(time, actual_vel[:, 0], 'b-', label=f'Actual_{i}')
+            axes[0].plot(time, actual_vel[:, 0], color, label=run_names[i])
             axes[0].set_ylabel('X Velocity (m/s)')
             axes[0].legend()
             axes[0].grid(True)
 
             # Plot y velocity
-            axes[1].plot(time, actual_vel[:, 1], 'b-', label=f'Actual_{i}')
+            axes[1].plot(time, actual_vel[:, 1], color, label=run_names[i])
             axes[1].set_ylabel('Y Velocity (m/s)')
             axes[1].legend()
             axes[1].grid(True)
 
             # Plot angular velocity
-            axes[2].plot(time, actual_vel[:, 2], 'b-', label=f'Actual_{i}')
+            axes[2].plot(time, actual_vel[:, 2], color, label=run_names[i])
             axes[2].set_xlabel('Time (s)')
             axes[2].set_ylabel('Angular Velocity (rad/s)')
             axes[2].legend()
