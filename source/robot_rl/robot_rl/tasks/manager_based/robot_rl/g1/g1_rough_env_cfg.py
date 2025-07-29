@@ -31,7 +31,7 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
             prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
             attach_yaw_only=True,
-            pattern_cfg=patterns.GridPatternCfg(resolution=0.025, size=[0.1,0.1]),
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.03, size=[0.1,0.1]),
             debug_vis=False,
             mesh_prim_paths=["/World/ground"],
         )

@@ -224,7 +224,7 @@ def foot_clearance(env: ManagerBasedRLEnv,
 
     if height_sensor_cfg is not None:
         sensor: RayCaster = env.scene[height_sensor_cfg.name]
-        adjusted_target_height = target_height + torch.mean(sensor.data.ray_hits_w[...,2],dim=1)
+        adjusted_target_height = target_height + torch.mean(sensor.data.ray_hits_w[...,2],dim=1).unsqueeze(-1)
     else:
         adjusted_target_height = target_height
 
