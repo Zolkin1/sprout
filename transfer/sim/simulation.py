@@ -59,6 +59,7 @@ class Simulation:
         self.log = log
         self.log_dir = log_dir
         self.log_file = None
+        self.new_log_folder = ""
         self.use_height_sensor = use_height_sensor
         
         # Setup simulation parameters
@@ -77,15 +78,15 @@ class Simulation:
         """Setup logging directory and files."""
         now = datetime.now()
         timestamp_str = now.strftime("%Y-%m-%d-%H-%M-%S")
-        new_folder_path = os.path.join(self.log_dir, timestamp_str)
+        self.new_log_folder = os.path.join(self.log_dir, timestamp_str)
         try:
-            os.makedirs(new_folder_path, exist_ok=True)
-            print(f"Successfully created folder: {new_folder_path}")
+            os.makedirs(self.new_log_folder, exist_ok=True)
+            print(f"Successfully created folder: {self.new_log_folder}")
         except OSError as e:
-            print(f"Error creating folder {new_folder_path}: {e}")
+            print(f"Error creating folder {self.new_log_folder}: {e}")
         
-        print(f"Saving rerun logs to {new_folder_path}.")
-        self.log_file = os.path.join(new_folder_path, "sim_log.csv")
+        print(f"Saving rerun logs to {self.new_log_folder}.")
+        self.log_file = os.path.join(self.new_log_folder, "sim_log.csv")
         
         # Save simulation configuration
         data_structure = [
@@ -109,9 +110,12 @@ class Simulation:
             'data_structure': data_structure
         }
         
-        config_path = os.path.join(new_folder_path, "sim_config.yaml")
+        config_path = os.path.join(self.new_log_folder, "sim_config.yaml")
         with open(config_path, 'w') as f:
             yaml.dump(sim_config, f)
+
+    def get_logging_folder(self):
+        return self.new_log_folder
 
     def run(self, total_time: float, force_disturbance: Callable[[float], np.array] = None,):
         """Run the simulation."""

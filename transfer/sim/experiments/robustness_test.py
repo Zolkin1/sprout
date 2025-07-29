@@ -16,12 +16,16 @@ from transfer.sim.plot_from_sim import create_plots_for_newest
 from performance_statistics import compute_stats
 from velocity_commands import speed_steps, smooth_ramp
 
+FORCE_START = 3.0
+FORCE_STOP = 3.125
+FORCE_VEC = [100.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+ADDED_MASS = 0.
+
 def force_robustness(sim_time):
     """Provide a force to be applied to the base based on the time."""
 
     if sim_time > 3 and sim_time < 3.125:   #1/8th second force
-        print(f"APPLYING FORCE!!")
-        return np.array([100.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        return np.array(FORCE_VEC)
     else:
         return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
@@ -76,7 +80,6 @@ def main():
                            input_function=smooth_ramp)
 
     # Added mass robustness
-    ADDED_MASS = 0. #8.0    # 2kg additional mass
     robot_instance.add_base_mass(ADDED_MASS)
 
     # Create and run simulation
@@ -88,6 +91,18 @@ def main():
     # Make plots and statistics
     create_plots_for_newest()
     compute_stats(0)
+
+    # Log the robustness constants
+    robustness_data = {
+        'force_start': FORCE_START,
+        'force_stop': FORCE_STOP,
+        'force_vec': FORCE_VEC,
+        'added_mass': ADDED_MASS,
+    }
+
+    with open(os.path.join(sim.get_logging_folder(), 'robustness_data.yaml'), 'w') as f:
+        yaml.dump(robustness_data, f)
+
 
 if __name__ == "__main__":
     main()

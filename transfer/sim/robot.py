@@ -18,6 +18,10 @@ class Robot:
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
         self.input_function = input_function
 
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        self.torso_ipos = self.mj_model.body_ipos[body_id]
+
         if self.input_function is None:
             # Initialize joystick
             pygame.init()
@@ -42,6 +46,10 @@ class Robot:
         mj_data = mujoco.MjData(mj_model)
         return mj_model, mj_data
 
+    def reset_robot(self):
+        """Resets the robot."""
+        self.mj_model, self.mj_data = self._get_model_data()
+
     def add_base_mass(self, added_mass):
         """Add mass to the robot base."""
         body_name = "torso_link"
@@ -49,7 +57,7 @@ class Robot:
 
         self.mj_model.body_mass[body_id] += added_mass
 
-        print(f"Adjust the mass of the {body_name} by adding {added_mass}.")
+        print(f"Adjusting the mass of the {body_name} by adding {added_mass}.")
 
     def apply_force_disturbance(self, force_disturbance):
         """Apply the force_disturbance to the robot base."""
@@ -57,6 +65,25 @@ class Robot:
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
 
         self.mj_data.xfrc_applied[body_id] = force_disturbance
+
+    def randomize_torso_mass_pos(self, max_movement: np.array):
+        """Shift where the torso mass is randomly."""
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+
+        rand_vec = np.random.uniform(low=-max_movement, high=max_movement)
+
+        self.mj_model.body_ipos[body_id] += rand_vec
+
+        print(f"Adjusting ipos of torso by: {rand_vec}.")
+
+        return rand_vec
+
+    def reset_torso_mass_pos(self):
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+
+        self.mj_model.body_ipos[body_id] += self.torso_ipos
 
     def get_projected_gravity(self, quat):
         """Calculate projected gravity from quaternion."""

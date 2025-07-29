@@ -82,3 +82,4 @@ vulcan_mount/
 g1_mount/
 
 transfer/sim/MUJOCO_LOG.TXT
+transfer/sim/experiments/plots
