@@ -3,7 +3,7 @@ import numpy as np
 
 import yaml
 
-from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_data
+from log_utils import find_most_recent_timestamped_folder, extract_data
 
 def get_index(time_vec, time: float):
     """Gets the index associated with a given time."""

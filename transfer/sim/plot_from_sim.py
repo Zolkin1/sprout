@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
-from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_data
+from log_utils import find_most_recent_timestamped_folder, extract_data
 
 
 # Make plots
