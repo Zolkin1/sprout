@@ -8,7 +8,8 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCf
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
-
+from isaaclab.sensors import  RayCasterCfg, patterns
+from isaaclab.managers import SceneEntityCfg
 ##
 # Environment configuration
 ##
@@ -25,10 +26,19 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         # Scene
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
 
-        # No height scanner for now
-        self.scene.height_scanner = None
+        self.scene.height_scanner = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            attach_yaw_only=True,
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.025, size=[0.1,0.1]),
+            debug_vis=False,
+            mesh_prim_paths=["/World/ground"],
+        )
+
+        #pass in height scanner for the z related reward
+        self.rewards.height_torso.params["sensor_cfg"] = SceneEntityCfg("height_scanner") 
+        self.rewards.feet_clearance.params["height_sensor_cfg"] = SceneEntityCfg("height_scanner") 
 
         #remove lip specific observation
         self.observations.critic.ref_traj = None
@@ -82,6 +92,7 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         # Rewards
         ##
+
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
         self.rewards.track_ang_vel_z_exp.weight = 0.5
         self.rewards.lin_vel_z_l2.weight = -2.0 # TODO reduce this maybe?

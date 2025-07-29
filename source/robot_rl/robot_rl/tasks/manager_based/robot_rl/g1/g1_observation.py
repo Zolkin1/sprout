@@ -38,7 +38,6 @@ class G1RoughLipObservationsCfg():
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
         )
-        # root_quat = ObsTerm(func=mdp.root_quat)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},scale=(2.0,2.0,2.0))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
@@ -56,8 +55,7 @@ class G1RoughLipObservationsCfg():
         foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"},scale=1.0)
         ref_traj = ObsTerm(
             func=mdp.ref_traj,
-            params={"command_name": "hlip_ref"},
-            scale=tuple([5.0] * 12 + [0.1] * 9)
+            params={"command_name": "hlip_ref"}
         )
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"},scale=1.0)
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"},clip=(-20.0,20.0,),scale=1.0)
@@ -124,7 +122,6 @@ class G1HZDObservationsCfg():
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,))
         act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,))
        
-        # base_z = ObsTerm(func=mdp.base_z)
     # observation groups
     policy: PolicyCfg = PolicyCfg()
     critic: CriticCfg = CriticCfg()

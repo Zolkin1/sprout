@@ -213,6 +213,7 @@ def reference_vel_tracking(    env: ManagerBasedRLEnv,
 def foot_clearance(env: ManagerBasedRLEnv,
                    target_height: float,
                    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+                   height_sensor_cfg: SceneEntityCfg | None = None,
                    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
     """Reward foot clearance."""
     asset: Articulation = env.scene[asset_cfg.name]
@@ -221,10 +222,15 @@ def foot_clearance(env: ManagerBasedRLEnv,
     # Get contact state
     contacts = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
 
+    if height_sensor_cfg is not None:
+        sensor: RayCaster = env.scene[height_sensor_cfg.name]
+        adjusted_target_height = target_height + torch.mean(sensor.data.ray_hits_w[...,2],dim=1)
+    else:
+        adjusted_target_height = target_height
+
     # Calculate foot heights
-    feet_z_err = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - target_height
+    feet_z_err = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - adjusted_target_height
     pos_error = torch.square(feet_z_err) * ~contacts
-    # print("feet_z:", asset.data.body_pos_w[:, asset_cfg.body_ids, 2]*~contacts)
 
     return torch.sum(pos_error, dim=(1))
 

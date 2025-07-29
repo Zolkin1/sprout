@@ -5,6 +5,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FO
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from robot_rl.tasks.manager_based.robot_rl import mdp
+
 ##
 # Environment configuration
 ##
@@ -30,9 +31,11 @@ class G1FlatEnvCfg(G1RoughEnvCfg):
         # Scene
         ##
         # change terrain to flat
+        # self.scene.terrain.terrain_type = "plane"
+        # self.scene.terrain.terrain_generator = None
         self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
         # no height scan
-        self.scene.height_scanner = None
+        # self.scene.height_scanner = None
         self.observations.policy.height_scan = None
         # no terrain curriculum
         self.curriculum.terrain_levels = None

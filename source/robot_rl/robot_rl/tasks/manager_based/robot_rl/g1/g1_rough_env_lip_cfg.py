@@ -173,19 +173,4 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.rewards.height_torso = None
         
         
-@configclass 
-class G1_custom_lip_clf(G1RoughLipEnvCfg):
-    def __post_init__(self):
-        # Post init of parent
-        super().__post_init__()
-        #both front and back 1.14
-        #just front: 0.616
-        self.events.add_plate_mass = EventTerm(
-            func=mdp.randomize_rigid_body_mass,
-            mode="startup",
-            params={
-                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_distribution_params": (0.616,0.616),
-                "operation": "add",
-            }
-        )
+
