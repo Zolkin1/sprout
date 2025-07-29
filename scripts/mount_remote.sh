@@ -6,15 +6,16 @@
 set -e
 
 # Configuration
-# REMOTE_HOST="talos.caltech.edu"
-REMOTE_HOST="10.42.0.1"
-REMOTE_PATH="/home/unitree/robot_rl/transfer/obelisk/ctrl_logs"
-REMOTE_USER="unitree"
-
+REMOTE_HOST="talos.caltech.edu"
+# REMOTE_HOST="10.42.0.1"
+# REMOTE_PATH="/home/unitree/robot_rl/transfer/obelisk/ctrl_logs"
+# REMOTE_USER="unitree"
+REMOTE_USER="kli5"
 # REMOTE_HOST="vulcan.amberlab.caltech.edu"
-# REMOTE_PATH="/home/kli5/robot_rl/logs"
+REMOTE_PATH="/home/kli5/robot_rl/logs"
+LOCAL_MOUNT_POINT="remote_mount"
 # LOCAL_MOUNT_POINT="vulcan_mount"
-LOCAL_MOUNT_POINT="g1_mount"
+# LOCAL_MOUNT_POINT="g1_mount"
 
 # Colors for output
 GREEN='\033[0;32m'

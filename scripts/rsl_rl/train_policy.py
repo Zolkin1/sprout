@@ -12,9 +12,10 @@ ENVIRONMENTS = {
     "custom": "G1-flat-vel",
     "lip_ref_tracking": "G1-flat-ref-tracking",
     "lip_clf_vdot": "G1-flat-clf-vdot",
-    "lip_clf": "G1-flat-clf",
+    "lip_clf": "G1-lip-clf-custom",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
+    "hzd_clf_minimum": "G1-hzd-clf-minimum"
 }
 
 EXPERIMENT_NAMES = {
@@ -27,6 +28,7 @@ EXPERIMENT_NAMES = {
     "hzd_clf": "hzd",
     "hzd_clf_play": "hzd",
     "hzd_clf_custom": "hzd",
+    "hzd_clf_minimum": "hzd",
 }
 
 
@@ -64,6 +66,8 @@ def main():
 
     # Set the task based on environment type
     args_cli.task = ENVIRONMENTS[args_cli.env_type]
+    args_cli.logger = "wandb"
+    args_cli.log_project_name = "g1_rl"
     
     # always enable cameras to record video
     if args_cli.video:
@@ -147,14 +151,9 @@ def main():
 
 
         # Handle resume path
-        # agent_cfg.resume = True
-        # resume_path = "/home/amy/gitrepo/robot_rl/logs/g1_policies/ref_tracking/g1/2025-06-11_23-28-20/model_7000.pt"
-        # agent_cfg
-
         if agent_cfg.resume_path or agent_cfg.algorithm.class_name == "Distillation":
             resume_path = agent_cfg.resume_path
             agent_cfg.resume = True
-            # resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
         # Setup video recording if enabled
         if args_cli.video:

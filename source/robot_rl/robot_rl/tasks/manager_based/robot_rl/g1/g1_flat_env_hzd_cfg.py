@@ -48,7 +48,7 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-0.3, 0.3)
         self.commands.base_velocity.ranges.heading = (0, 0)
 
-        self.commands.step_period.period_range = (1.0,1.0)
+        self.commands.step_period.period_range = (0.8,0.8)
         self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
         ##
         # Scene
@@ -66,32 +66,8 @@ class G1FlatHZDEnvCfg(G1RoughLipEnvCfg):
         # no terrain curriculum
 
 
-class G1NoDomainRandomizationEnvCfg(G1FlatHZDEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-        self.events.push_robot = None
-        self.events.randomize_ground_contact_friction = None
-        self.events.add_base_mass = None
-        self.events.base_com = None
-        self.rewards.clf_reward.params["max_clf"] = 50.0
-        self.rewards.clf_decreasing_condition.params["max_clf_decreasing"] = 50.0
-        self.curriculum.clf_curriculum.params["min_val"] = 5.0
-        self.curriculum.clf_curriculum.params["min_clf_val"] = 2.0
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
-        self.scene.terrain.terrain_type = "plane"
-        self.curriculum.terrain_levels = None
 
 
-class G1FlatRefTrackingEnvCfg(G1FlatHZDEnvCfg):
-    """Configuration for the G1 Flat environment."""
-
-    def __post_init__(self):
-        # post init of parent
-        super().__post_init__()
-
-        # self.rewards.clf_reward = None
-        self.rewards.clf_decreasing_condition = None
-        self.curriculum.clf_curriculum = None
 
 
 class G1FlatHZDVdotEnvCfg(G1FlatHZDEnvCfg):
@@ -130,8 +106,4 @@ class G1FlatHZDEnvCfg_PLAY(G1FlatHZDEnvCfg):
 
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
-        # if self.scene.terrain.terrain_generator is not None:
-        #   self.scene.terrain.terrain_generator.num_rows = 1
-        #   self.scene.terrain.terrain_generator.num_cols = 2
-        # self.events.push_robot.interval_range_s = (5.0,5.0)
         self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0, 0)}  # (-3.14, 3.14)},

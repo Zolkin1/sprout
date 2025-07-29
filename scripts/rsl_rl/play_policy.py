@@ -26,8 +26,8 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 
 SIM_ENVIRONMENTS = {
     "vanilla": "custom-Isaac-Velocity-Flat-G1-Play-v0",
-    "custom": "custom-Isaac-Velocity-Flat-G1-Play-v0",
-    "lip_clf": "G1-LIP-clf-play",
+    "custom": "G1-flat-vel",
+    "lip_clf": "G1-LIP-ref-play",
     "lip_ref_tracking": "G1-LIP-ref-play",
     "lip_clf_vdot": "G1-LIP-ref-play",
     "hzd_clf": "G1-hzd-clf",
@@ -376,13 +376,13 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type:
+    if "lip" in args_cli.env_type or args_cli.env_type == "custom":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
-        
+    
     ref = env.unwrapped.command_manager.get_term(command_name)
     
     # Add dynamic error metrics based on the command type
