@@ -99,7 +99,7 @@ def plot_velocity_comparison(data, save_dir):
     commanded_vel = data['commanded_vel']
     
     # Extract base velocities (first 3 elements of qvel)
-    actual_vel = qvel[:, :3]
+    base_vel = qvel[:, :3]
     
     # Create figure with 3 subplots for x, y, and angular velocities
     fig, axes = plt.subplots(3, 1, figsize=(10, 12))
@@ -107,21 +107,21 @@ def plot_velocity_comparison(data, save_dir):
     
     # Plot x velocity
     axes[0].plot(time, commanded_vel[:, 0], 'r--', label='Commanded')
-    axes[0].plot(time, actual_vel[:, 0], 'b-', label='Actual')
+    axes[0].plot(time, base_vel[:, 0], 'b-', label='Actual')
     axes[0].set_ylabel('X Velocity (m/s)')
     axes[0].legend()
     axes[0].grid(True)
     
     # Plot y velocity
     axes[1].plot(time, commanded_vel[:, 1], 'r--', label='Commanded')
-    axes[1].plot(time, actual_vel[:, 1], 'b-', label='Actual')
+    axes[1].plot(time, base_vel[:, 1], 'b-', label='Actual')
     axes[1].set_ylabel('Y Velocity (m/s)')
     axes[1].legend()
     axes[1].grid(True)
     
     # Plot angular velocity
     axes[2].plot(time, commanded_vel[:, 2], 'r--', label='Commanded')
-    axes[2].plot(time, actual_vel[:, 2], 'b-', label='Actual')
+    axes[2].plot(time, qvel[:, 5], 'b-', label='Actual')
     axes[2].set_xlabel('Time (s)')
     axes[2].set_ylabel('Angular Velocity (rad/s)')
     axes[2].legend()
