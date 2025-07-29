@@ -33,15 +33,15 @@ def compute_stats(start_time = 0):
 
         time = data['time']
         commanded_vel = data['commanded_vel']
-        act_vel = data['qvel'][:, :3]
+        act_vel = data['qvel'][:, [0, 1, 5]]
 
         start_idx = get_index(time, start_time)
 
         # Floating base velocity mean error
-        mean_error = np.mean(commanded_vel[start_idx:, :] - act_vel[start_idx:, :], axis=0)
+        mean_error = np.mean(np.square(commanded_vel[start_idx:, :] - act_vel[start_idx:, :]), axis=0)
 
         # Std dev
-        std_dev_error = np.std(commanded_vel[start_idx:, :] - act_vel[start_idx:, :], axis=0)
+        std_dev_error = np.std(np.square(commanded_vel[start_idx:, :] - act_vel[start_idx:, :]), axis=0)
 
         # Save
         stats = {
@@ -52,6 +52,7 @@ def compute_stats(start_time = 0):
         with open(os.path.join(newest, 'stats.yaml'), 'w') as f:
             yaml.dump(stats, f)
 
+        return stats
 
 
 

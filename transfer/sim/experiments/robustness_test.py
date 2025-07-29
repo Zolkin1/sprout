@@ -4,6 +4,7 @@ import yaml
 import os
 import sys
 import numpy as np
+import matplotlib.pyplot as plt
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -19,7 +20,8 @@ from velocity_commands import speed_steps, smooth_ramp
 FORCE_START = 3.0
 FORCE_STOP = 3.125
 FORCE_VEC = [100.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-ADDED_MASS = 0.
+START_ADDED_MASS = 0.
+DELTA_MASS = 1.5
 
 def force_robustness(sim_time):
     """Provide a force to be applied to the base based on the time."""
@@ -79,30 +81,74 @@ def main():
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
                            input_function=smooth_ramp)
 
-    # Added mass robustness
-    robot_instance.add_base_mass(ADDED_MASS)
+    # Run all the simulations
+    run_logs = []
+    mean_error = []
+    std_error = []
+    added_masses = []
 
-    # Create and run simulation
-    sim = Simulation(policy, robot_instance, log=config.get("log", False),
-                     log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
-                     use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-    sim.run(total_time=12, force_disturbance=force_robustness)
+    NUM_RUNS = 2
 
-    # Make plots and statistics
-    create_plots_for_newest()
-    compute_stats(0)
+    for i in range(NUM_RUNS):
+        # Added mass robustness
+        robot_instance.add_base_mass(START_ADDED_MASS + i*DELTA_MASS)
 
-    # Log the robustness constants
-    robustness_data = {
-        'force_start': FORCE_START,
-        'force_stop': FORCE_STOP,
-        'force_vec': FORCE_VEC,
-        'added_mass': ADDED_MASS,
-    }
+        # Create and run simulation
+        sim = Simulation(policy, robot_instance, log=True,
+                         log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+                         use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
+        sim.run(total_time=12, force_disturbance=None)  # TODO: Put in the force disturbance
 
-    with open(os.path.join(sim.get_logging_folder(), 'robustness_data.yaml'), 'w') as f:
-        yaml.dump(robustness_data, f)
+        run_logs.append(sim.get_logging_folder())
 
+        # Make plots and statistics
+        # create_plots_for_newest()
+        stats = compute_stats(0)
+        mean_error.append(stats['mean_velocity_error'])
+        std_error.append(stats['std_dev_velocity_error'])
+
+        # Log the robustness constants
+        robustness_data = {
+            'added_mass': START_ADDED_MASS + i*DELTA_MASS,
+        }
+        added_masses.append(robustness_data['added_mass'])
+
+        with open(os.path.join(sim.get_logging_folder(), 'robustness_data.yaml'), 'w') as f:
+            yaml.dump(robustness_data, f)
+
+        robot_instance.reset_robot()
+
+    mean_error = np.array(mean_error)
+    print("Mean error: ", mean_error)
+    std_error = np.array(std_error)
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+    fig.suptitle('Mean Error vs Added Mass')
+
+    # x Axis
+    axes[0].plot(added_masses, mean_error[:, 0], 'b-', marker='o', label='Mean Error')
+    axes[0].fill_between(added_masses, np.maximum(mean_error[:, 0] - std_error[:, 0], 0), mean_error[:, 0] + std_error[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
+    axes[0].grid(True)
+    axes[0].set_ylabel('X Velocity Mean Squared Error (m/s)')
+    axes[0].legend()
+
+    # y Axis
+    axes[1].plot(added_masses, mean_error[:, 1], 'b-', marker='o', label='Mean Error')
+    axes[1].fill_between(added_masses, np.maximum(mean_error[:, 1] - std_error[:, 1], 0), mean_error[:, 1] + std_error[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
+    axes[1].grid(True)
+    axes[1].set_ylabel('Y Velocity Mean Squared Error (m/s)')
+    axes[1].legend()
+
+    # w Axis
+    axes[2].plot(added_masses, mean_error[:, 2], 'b-', marker='o', label='Mean Error')
+    axes[2].fill_between(added_masses, np.maximum(mean_error[:, 2] - std_error[:, 2], 0), mean_error[:, 2] + std_error[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
+    axes[2].grid(True)
+    axes[2].set_ylabel('Angular Velocity Mean Squared Error (m/s)')
+    axes[2].legend()
+
+    plt.savefig("experiments/plots/robustness_test_plot.png")
+
+    plt.show()
 
 if __name__ == "__main__":
     main()
