@@ -63,7 +63,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         weight=10.0,
         params={
             "command_name": "hlip_ref",
-            "max_clf": 100.0,
+            "max_eta_err": 0.3,
         }
     )
 
@@ -73,7 +73,8 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         params={
             "command_name": "hlip_ref",
             "alpha": 1.0,
-            "max_clf_decreasing": 100.0,
+            "eta_max": 0.2,
+            "eta_dot_max":0.3,
         }
     )
 
@@ -136,7 +137,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         ##
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75)
         self.commands.base_velocity.ranges.lin_vel_y = (0,0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-3.14,3.14)
+        self.commands.base_velocity.ranges.ang_vel_z = (-2,2)
 
         ##
         # Terminations
@@ -165,7 +166,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.rewards.dof_pos_limits.weight = -1.0
         self.rewards.dof_acc_l2.weight = -2.5e-7
         self.rewards.dof_vel_l2.weight = -1.0e-5
-        self.rewards.action_rate_l2.weight = -0.01
+        self.rewards.action_rate_l2.weight = -0.001
 
         
         self.rewards.joint_deviation_arms = None

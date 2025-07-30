@@ -27,18 +27,18 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        self.scene.height_scanner = RayCasterCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
-            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-            attach_yaw_only=True,
-            pattern_cfg=patterns.GridPatternCfg(resolution=0.03, size=[0.1,0.1]),
-            debug_vis=False,
-            mesh_prim_paths=["/World/ground"],
-        )
+        # self.scene.height_scanner = RayCasterCfg(
+        #     prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+        #     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        #     attach_yaw_only=True,
+        #     pattern_cfg=patterns.GridPatternCfg(resolution=0.03, size=[0.1,0.1]),
+        #     debug_vis=False,
+        #     mesh_prim_paths=["/World/ground"],
+        # )
 
         #pass in height scanner for the z related reward
-        self.rewards.height_torso.params["sensor_cfg"] = SceneEntityCfg("height_scanner") 
-        self.rewards.feet_clearance.params["height_sensor_cfg"] = SceneEntityCfg("height_scanner") 
+        # self.rewards.height_torso.params["sensor_cfg"] = SceneEntityCfg("height_scanner") 
+        # self.rewards.feet_clearance.params["height_sensor_cfg"] = SceneEntityCfg("height_scanner") 
 
         #remove lip specific observation
         self.observations.critic.ref_traj = None
@@ -81,7 +81,7 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75) #(-1.0, 1.0) # 0 - 1
         self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0) #(-1.0, 1.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-3.14,3.14) #(-1.0, 1.0) #(-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-2,2) #(-1.0, 1.0) #(-1.0, 1.0)
 
         ##
         # Terminations

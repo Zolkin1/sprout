@@ -34,7 +34,9 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
             "eta_dot_max": 0.3,
         }
         
-        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
         # no height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
