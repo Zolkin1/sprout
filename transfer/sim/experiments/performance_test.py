@@ -8,10 +8,10 @@ import numpy as np
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from transfer.sim.simulation import Simulation
-from transfer.sim.robot import Robot
-from transfer.sim.rl_policy_wrapper import RLPolicy
-from transfer.sim.plot_from_sim import create_plots_for_newest
+from simulation import Simulation
+from robot import Robot
+from rl_policy_wrapper import RLPolicy
+from plot_from_sim import create_plots_for_newest
 
 from performance_statistics import compute_stats
 from velocity_commands import speed_steps, smooth_ramp
@@ -46,8 +46,13 @@ def main():
     if missing_fields:
         raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
 
+    from pathlib import Path
+
+    policy_base_dir = Path.cwd().parent.parent / "logs"
+
     # Make the RL policy
     policy = RLPolicy(
+        policy_base_dir=policy_base_dir,
         dt=config["dt"],
         checkpoint_path=config["checkpoint_path"],
         num_obs=config["num_obs"],

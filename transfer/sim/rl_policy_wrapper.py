@@ -10,6 +10,7 @@ class RLPolicy:
 
     def __init__(
         self,
+        policy_base_dir: str,
         dt: float,
         checkpoint_path: str,
         num_obs: int,
@@ -69,15 +70,13 @@ class RLPolicy:
         }
 
         # Load in the policy
-        self.load()
+        self.load(policy_base_dir)
 
-    def load(self):
+    def load(self, policy_base_dir: str):
         """Load RL Policy"""
         # Get the cwd and get the logs dir relative to this.
         # NOTE: Assuming we are running from transfer/sim
-        two_up = Path.cwd().parent.parent
-        policy_logs = os.path.join(two_up, "logs")
-        full_path = os.path.join(policy_logs, self.checkpoint_path)
+        full_path = os.path.join(policy_base_dir, self.checkpoint_path)
         print(f"Attempting to load {full_path}")
 
         self.policy = torch.jit.load(full_path)
@@ -100,12 +99,12 @@ class RLPolicy:
     ):
         """Create the observation vector from the sensor data"""
 
-        if self.policy_type == "mlp":
+        if self.policy_type == "mlp" or self.policy_type == "gl":
             return self.create_mlp_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)   
         elif self.policy_type == "cnn":
             return self.create_cnn_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
-        elif self.policy_type == "gl":
-            return self.create_gl_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
+        else:
+            raise ValueError(f"Invalid policy type: {self.policy_type}")
 
     def create_cnn_obs(
         self,

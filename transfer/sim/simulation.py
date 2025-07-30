@@ -9,8 +9,7 @@ import mujoco.viewer
 from datetime import datetime
 import numpy as np
 
-from transfer.sim import robot
-from transfer.sim.robot import Robot
+from robot import Robot
 
 
 def log_row_to_csv(filename, data):

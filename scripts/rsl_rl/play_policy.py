@@ -33,6 +33,7 @@ SIM_ENVIRONMENTS = {
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_play": "G1-hzd-clf-play",
     "hzd_clf_custom": "G1-hzd-clf-custom",
+    "hzd_clf_minimum": "G1-hzd-clf-minimum",
 }
 
 class DataLogger:
