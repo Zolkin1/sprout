@@ -2,19 +2,17 @@ from typing import Literal
 import argparse
 import yaml
 import os
-import sys
-import numpy as np
+from pathlib import Path
 
-# Add the project root to the Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# Import from the transfer.sim package
+from sim.simulation import Simulation
+from sim.robot import Robot
+from sim.rl_policy_wrapper import RLPolicy
+from sim.plot_from_sim import create_plots_for_newest
 
-from simulation import Simulation
-from robot import Robot
-from rl_policy_wrapper import RLPolicy
-from plot_from_sim import create_plots_for_newest
+from experiments.performance_statistics import compute_stats
+from experiments.velocity_commands import speed_steps
 
-from performance_statistics import compute_stats
-from velocity_commands import speed_steps
 
 def main():
     parser = argparse.ArgumentParser()
@@ -45,8 +43,6 @@ def main():
     missing_fields = [field for field in required_fields if field not in config]
     if missing_fields:
         raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
-
-    from pathlib import Path
 
     policy_base_dir = Path.cwd().parent.parent / "logs"
 
@@ -79,6 +75,7 @@ def main():
     # Make plots and statistics
     create_plots_for_newest()
     compute_stats(0)
+
 
 if __name__ == "__main__":
     main()
