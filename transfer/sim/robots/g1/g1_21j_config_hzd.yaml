@@ -1,6 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j_compute"
-checkpoint_path: "ral_paper/hzd_clf_minimum_reward.pt"
+checkpoint_path: "ral_paper/hzd_dec_2_alpha_0.5.pt"
 
 num_obs: 74
 num_action: 21
@@ -20,4 +20,4 @@ default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
                   0.07, -0.24, 0, 1.39]
 log: true
 log_dir: "logs"
-policy_type: "gl"
+policy_type: "mlp"

@@ -2,14 +2,41 @@ import os
 import yaml
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
 
-from log_utils import find_most_recent_timestamped_folder, extract_data
+from sim.log_utils import find_most_recent_timestamped_folder, extract_data
 
 def main():
     """Take in multiple pre-run sims and create a single plot that compares it."""
-    logs = ["2025-07-29-11-21-01", "2025-07-29-11-21-46", "2025-07-29-11-21-24"]
-    run_names = ["Baseline", "HZD RL", "LIP RL"]
-    run_colors = ['tab:blue', 'tab:orange', 'tab:green']
+    # Loop through every log in the "comparison_logs" folder and use those
+    comp_logs_dir = Path("experiments/comparison_logs")
+
+    policy_names = []
+    if comp_logs_dir.exists() and comp_logs_dir.is_dir():
+        for subfolder in comp_logs_dir.iterdir():
+            if subfolder.is_dir():
+                config_path = subfolder / "sim_config.yaml"
+                if config_path.exists():
+                    with open(config_path, "r") as f:
+                        try:
+                            config = yaml.safe_load(f)
+                            if "policy" in config:
+                                policy_path = config.get("policy", None)
+                                if policy_path is not None:
+                                    policy_file = Path(policy_path).stem
+                                    policy_names.append(policy_file)
+                        except yaml.YAMLError as e:
+                            print(f"YAML error in {config_path}: {e}")
+
+        logs = [f for f in comp_logs_dir.iterdir() if f.is_dir()]
+        print("Using comparison folders:", logs)
+        print("Policy names:", policy_names)
+    else:
+        raise FileNotFoundError("Comparison logs folder not found!")
+
+    run_names = policy_names
+    # run_names = ["hzd_clf_minimum_reward", "hzd_dec_4_alpha_1", "hzd_dec_2_alpha_2", "hzd_dec_2_alpha_0.5", "hzd_dec_0"]
+    run_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
 
@@ -18,7 +45,8 @@ def main():
     labels = []
 
     for i, log in enumerate(logs):
-        log_dir = os.path.join(os.getcwd(), "logs", log)
+        # log_dir = os.path.join(os.getcwd(), "logs", log)
+        log_dir = log
 
         # Load in the data
         with open(os.path.join(log_dir, "sim_config.yaml")) as f:
@@ -68,36 +96,36 @@ def main():
 
 
 
-
-            ## Positions
-            qpos = data['qpos']
-            actual_pos = qpos[:, :3]
-
-            # Calculate desired position by integrating commanded velocity
-            dt = time[1] - time[0]  # Assuming constant time step
-            desired_pos = np.zeros_like(actual_pos)
-            desired_pos[0] = actual_pos[0]  # Start from actual position
-
-            for j in range(1, len(time)):
-                desired_pos[j] = desired_pos[j - 1] + commanded_vel[j - 1] * dt
-
-            if i == 0:
-                axes_p[0].plot(time, desired_pos[:, 0], 'k--', label='Commanded', linewidth=3)
-                axes_p[1].plot(time, desired_pos[:, 1], 'k--', label='Commanded', linewidth=3)
-
-            # Plot x position
-            print(actual_pos)
-            print(time)
-            axes_p[0].plot(time, actual_pos[:, 0], color, label=run_names[i], linewidth=2)
-            axes_p[0].set_ylabel('X Position (m)')
-            axes_p[0].legend()
-            axes_p[0].grid(True)
-
-            # Plot y position
-            axes_p[1].plot(time, actual_pos[:, 1], color, label=run_names[i], linewidth=2)
-            axes_p[1].set_ylabel('Y Position (m)')
-            axes_p[1].legend()
-            axes_p[1].grid(True)
+        # TODO: Fix
+        # ## Positions
+        # qpos = data['qpos']
+        # actual_pos = qpos[:, :3]
+        #
+        # # Calculate desired position by integrating commanded velocity
+        # dt = time[1] - time[0]  # Assuming constant time step
+        # desired_pos = np.zeros_like(actual_pos)
+        # desired_pos[0] = actual_pos[0]  # Start from actual position
+        #
+        # for j in range(1, len(time)):
+        #     desired_pos[j] = desired_pos[j - 1] + commanded_vel[j - 1] * dt
+        #
+        # if i == 0:
+        #     axes_p[0].plot(time, desired_pos[:, 0], 'k--', label='Commanded', linewidth=3)
+        #     axes_p[1].plot(time, desired_pos[:, 1], 'k--', label='Commanded', linewidth=3)
+        #
+        # # Plot x position
+        # print(actual_pos)
+        # print(time)
+        # axes_p[0].plot(time, actual_pos[:, 0], color, label=run_names[i], linewidth=2)
+        # axes_p[0].set_ylabel('X Position (m)')
+        # axes_p[0].legend()
+        # axes_p[0].grid(True)
+        #
+        # # Plot y position
+        # axes_p[1].plot(time, actual_pos[:, 1], color, label=run_names[i], linewidth=2)
+        # axes_p[1].set_ylabel('Y Position (m)')
+        # axes_p[1].legend()
+        # axes_p[1].grid(True)
 
 
 

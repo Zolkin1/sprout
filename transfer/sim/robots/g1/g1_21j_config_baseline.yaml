@@ -1,6 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j_compute"
-checkpoint_path: "g1_policies/baseline/custom/2025-07-28_17-44-44/exported/policy.pt"
+checkpoint_path: "ral_paper/baseline.pt"
 
 num_obs: 74
 num_action: 21

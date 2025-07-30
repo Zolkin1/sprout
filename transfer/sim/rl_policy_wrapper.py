@@ -99,8 +99,10 @@ class RLPolicy:
     ):
         """Create the observation vector from the sensor data"""
 
-        if self.policy_type == "mlp" or self.policy_type == "gl":
-            return self.create_mlp_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)   
+        if self.policy_type == "mlp":
+            return self.create_mlp_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
+        elif self.policy_type == "gl":
+            return self.create_gl_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
         elif self.policy_type == "cnn":
             return self.create_cnn_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
         else:
