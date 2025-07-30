@@ -5,6 +5,7 @@ import os
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
+from functools import partial
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -17,17 +18,21 @@ from transfer.sim.plot_from_sim import create_plots_for_newest
 from performance_statistics import compute_stats
 from velocity_commands import speed_steps, smooth_ramp
 
+from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_data
+
 FORCE_START = 3.0
 FORCE_STOP = 3.125
-FORCE_VEC = [100.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-START_ADDED_MASS = 0.
-DELTA_MASS = 1.5
+FORCE_VEC = np.array([120.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+DELTA_FORCE = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+START_ADDED_MASS = 0. #6.0
+DELTA_MASS = 0. #1.5
 
-def force_robustness(sim_time):
+METRIC = False
+
+def force_robustness(sim_time, force_vec):
     """Provide a force to be applied to the base based on the time."""
-
     if sim_time > 3 and sim_time < 3.125:   #1/8th second force
-        return np.array(FORCE_VEC)
+        return force_vec
     else:
         return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
@@ -61,6 +66,8 @@ def main():
     if missing_fields:
         raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
 
+    config_file_name = os.path.splitext(os.path.basename(args.config_file))[0]
+
     # Make the RL policy
     policy = RLPolicy(
         dt=config["dt"],
@@ -87,7 +94,7 @@ def main():
     std_error = []
     added_masses = []
 
-    NUM_RUNS = 2
+    NUM_RUNS = 1
 
     for i in range(NUM_RUNS):
         # Added mass robustness
@@ -97,12 +104,13 @@ def main():
         sim = Simulation(policy, robot_instance, log=True,
                          log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                          use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-        sim.run(total_time=12, force_disturbance=None)  # TODO: Put in the force disturbance
+        force_partial = partial(force_robustness, force_vec=FORCE_VEC + i*DELTA_FORCE)
+        sim.run_headless(total_time=12, force_disturbance=force_partial)
 
         run_logs.append(sim.get_logging_folder())
 
         # Make plots and statistics
-        # create_plots_for_newest()
+        create_plots_for_newest()
         stats = compute_stats(0)
         mean_error.append(stats['mean_velocity_error'])
         std_error.append(stats['std_dev_velocity_error'])
@@ -110,6 +118,9 @@ def main():
         # Log the robustness constants
         robustness_data = {
             'added_mass': START_ADDED_MASS + i*DELTA_MASS,
+            'force_start': FORCE_START,
+            'force_stop': FORCE_STOP,
+            'force_vector': FORCE_VEC + i*DELTA_FORCE,
         }
         added_masses.append(robustness_data['added_mass'])
 
@@ -118,37 +129,101 @@ def main():
 
         robot_instance.reset_robot()
 
-    mean_error = np.array(mean_error)
-    print("Mean error: ", mean_error)
-    std_error = np.array(std_error)
+    if METRIC:
+        mean_error = np.array(mean_error)
+        print("Mean error: ", mean_error)
+        std_error = np.array(std_error)
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
-    fig.suptitle('Mean Error vs Added Mass')
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+        fig.suptitle('Mean Error vs Added Mass')
 
-    # x Axis
-    axes[0].plot(added_masses, mean_error[:, 0], 'b-', marker='o', label='Mean Error')
-    axes[0].fill_between(added_masses, np.maximum(mean_error[:, 0] - std_error[:, 0], 0), mean_error[:, 0] + std_error[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[0].grid(True)
-    axes[0].set_ylabel('X Velocity Mean Squared Error (m/s)')
-    axes[0].legend()
+        # x Axis
+        axes[0].plot(added_masses, mean_error[:, 0], 'b-', marker='o', label='Mean Error')
+        if NUM_RUNS > 1:
+            axes[0].fill_between(added_masses, np.maximum(mean_error[:, 0] - std_error[:, 0], 0), mean_error[:, 0] + std_error[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[0].grid(True)
+        axes[0].set_ylabel('X Velocity Mean Squared Error (m/s)')
+        axes[0].legend()
 
-    # y Axis
-    axes[1].plot(added_masses, mean_error[:, 1], 'b-', marker='o', label='Mean Error')
-    axes[1].fill_between(added_masses, np.maximum(mean_error[:, 1] - std_error[:, 1], 0), mean_error[:, 1] + std_error[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[1].grid(True)
-    axes[1].set_ylabel('Y Velocity Mean Squared Error (m/s)')
-    axes[1].legend()
+        # y Axis
+        axes[1].plot(added_masses, mean_error[:, 1], 'b-', marker='o', label='Mean Error')
+        if NUM_RUNS > 1:
+            axes[1].fill_between(added_masses, np.maximum(mean_error[:, 1] - std_error[:, 1], 0), mean_error[:, 1] + std_error[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[1].grid(True)
+        axes[1].set_ylabel('Y Velocity Mean Squared Error (m/s)')
+        axes[1].legend()
 
-    # w Axis
-    axes[2].plot(added_masses, mean_error[:, 2], 'b-', marker='o', label='Mean Error')
-    axes[2].fill_between(added_masses, np.maximum(mean_error[:, 2] - std_error[:, 2], 0), mean_error[:, 2] + std_error[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[2].grid(True)
-    axes[2].set_ylabel('Angular Velocity Mean Squared Error (m/s)')
-    axes[2].legend()
+        # w Axis
+        axes[2].plot(added_masses, mean_error[:, 2], 'b-', marker='o', label='Mean Error')
+        if NUM_RUNS > 1:
+            axes[2].fill_between(added_masses, np.maximum(mean_error[:, 2] - std_error[:, 2], 0), mean_error[:, 2] + std_error[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[2].grid(True)
+        axes[2].set_ylabel('Angular Velocity Mean Squared Error (m/s)')
+        axes[2].legend()
 
-    plt.savefig("experiments/plots/robustness_test_plot.png")
+        plt.savefig(f"experiments/plots/metric_robustness_test_{config_file_name}.png")
+    else:
+        plt.close()  # TODO: Is this necessary?
 
-    plt.show()
+        # Load back in all the data
+        actual_vel_list = []
+        commanded_vel_list = []
+        time_list = []
+        for i in range(NUM_RUNS):
+            # Parse the data
+            log_dir = os.path.join(os.getcwd(), run_logs[i])
+
+            # Load in the data
+            with open(os.path.join(log_dir, "sim_config.yaml")) as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+                data = extract_data(os.path.join(log_dir, "sim_log.csv"), config)
+
+                actual_vel_list.append(data["qvel"])
+                commanded_vel_list.append(data["commanded_vel"])
+                time_list.append(data["time"])
+
+        time_np = np.stack(time_list)
+        commanded_vel_np = np.stack(commanded_vel_list)
+        actual_vel_np = np.stack(actual_vel_list)
+
+        mean_actual = np.mean(actual_vel_np, axis=0)
+        std_actual = np.std(actual_vel_np, axis=0)
+
+        # Make some plots
+        fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+        fig.suptitle('Commanded vs Actual Velocities')
+
+        axes[0].plot(time_np[0, :], commanded_vel_np[0, :, 0], 'r--', label='Commanded')
+        axes[1].plot(time_np[0, :], commanded_vel_np[0, :, 1], 'r--', label='Commanded')
+        axes[2].plot(time_np[0, :], commanded_vel_np[0, :, 2], 'r--', label='Commanded')
+
+        # Plot x velocity
+        axes[0].plot(time_np[0], mean_actual[:, 0], 'b-', label=f'Actual_{i}')
+        axes[0].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 0] - std_actual[:, 0],
+                             mean_actual[:, 0] + std_actual[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[0].set_ylabel('X Velocity (m/s)')
+        axes[0].legend()
+        axes[0].grid(True)
+
+        # Plot y velocity
+        axes[1].plot(time_np[0, :], mean_actual[:, 1], 'b-', label=f'Actual_{i}')
+        axes[1].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 1] - std_actual[:, 1],
+                             mean_actual[:, 1] + std_actual[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[1].set_ylabel('Y Velocity (m/s)')
+        axes[1].legend()
+        axes[1].grid(True)
+
+        # Plot angular velocity
+        axes[2].plot(time_np[0, :], mean_actual[:, 2], 'b-', label=f'Actual_{i}')
+        axes[2].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 2] - std_actual[:, 2],
+                             mean_actual[:, 2] + std_actual[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
+        axes[2].set_xlabel('Time (s)')
+        axes[2].set_ylabel('Angular Velocity (rad/s)')
+        axes[2].legend()
+        axes[2].grid(True)
+
+        plt.savefig(f"experiments/plots/velocity_robustness_test_{config_file_name}.png")
+
 
 if __name__ == "__main__":
     main()

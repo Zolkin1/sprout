@@ -14,7 +14,7 @@ from transfer.sim.rl_policy_wrapper import RLPolicy
 from transfer.sim.plot_from_sim import create_plots_for_newest
 
 from performance_statistics import compute_stats
-from velocity_commands import speed_steps
+from velocity_commands import speed_steps, smooth_ramp
 
 def main():
     parser = argparse.ArgumentParser()
@@ -63,13 +63,13 @@ def main():
     )
 
     # Create robot instance
-    robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=speed_steps)
+    robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=smooth_ramp) #speed_steps)
 
     # Create and run simulation
     sim = Simulation(policy, robot_instance, log=config.get("log", False),
                      log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                      use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-    sim.run(total_time=12)
+    sim.run(total_time=12) #24)
 
     # Make plots and statistics
     create_plots_for_newest()

@@ -44,6 +44,9 @@ class Robot:
         print(f"Trying to load the xml at {path}")
         mj_model = mujoco.MjModel.from_xml_path(path)
         mj_data = mujoco.MjData(mj_model)
+
+        mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
+
         return mj_model, mj_data
 
     def reset_robot(self):
@@ -139,7 +142,13 @@ class Robot:
             self.commanded_vel = self.get_joystick_command()
         else:
             self.commanded_vel = self.input_function(sim_time)
-        
+
+        # Apply a PD controller on the y axis through the heading
+        kp = 5.0
+        kd = 2
+        angular_vel = np.sign(self.commanded_vel[0])*max(min(-kp*qpos[1] + -kd*qvel[1], 1), -1)
+        self.commanded_vel[2] = angular_vel
+
         return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, self.commanded_vel,
                                height_map=height_map, sensor_pos=sensor_pos)
 
@@ -189,4 +198,5 @@ class Robot:
         """Step the robot simulation."""
         mujoco.mj_step(self.mj_model, self.mj_data)
 
-   
+    def failed(self):
+        return self.mj_data.qpos[2] < 0.2

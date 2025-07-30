@@ -28,6 +28,8 @@ def main():
     with open(args.config_file, 'r') as f:
         config = yaml.safe_load(f)
 
+    config_file_name = os.path.splitext(os.path.basename(args.config_file))[0]
+
     # Parse the config file with default values
     required_fields = {
         "checkpoint_path": str,
@@ -71,11 +73,11 @@ def main():
 
     run_logs = []
 
-    NUM_RUNS = 20
+    NUM_RUNS = 10
 
     for i in range(NUM_RUNS):
         # Adjust the torso mass position
-        max_movement = np.array([0.05,0.05,0.05])
+        max_movement = np.array([0.02,0.02,0.02])
         pos_movement = robot_instance.randomize_torso_mass_pos(max_movement)
 
         # Create and run simulation
@@ -155,7 +157,7 @@ def main():
     axes[2].legend()
     axes[2].grid(True)
 
-    plt.savefig("experiments/plots/mass_randomization.png")
+    plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.png")
 
 if __name__ == "__main__":
     main()
