@@ -9,7 +9,7 @@ onboard:
       params:
         # new_gait_library_standing was pretty good (around 2:38)
         # Lateral had a lot of drift and not very responsive side to side
-        policy_name: "hzd_gl_policies_07_17/new_gait_library_standing.pt" #"hzd_gl_policy.pt"
+        policy_name: "hzd_clf_minimum.pt" #"hzd_gl_policy.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
@@ -401,7 +401,7 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: True
+    on: False
     viz_tool: foxglove
     viz_nodes:
       - pkg: obelisk_viz_cpp
