@@ -32,8 +32,8 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-3.14, 3.14)
-        self.commands.base_velocity.ranges.heading = (-3.14, 3.14)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.heading = (0,0)
 
         self.commands.step_period.period_range = (0.8,0.8)
 
@@ -42,19 +42,30 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.3,
+            "max_eta_err": 0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
-            "alpha": 1.0,
-            "eta_max": 0.2,
+            "alpha": 0.5,
+            "eta_max": 0.25,
             "eta_dot_max": 0.3,
         }
-        self.curriculum.clf_curriculum = None
+        self.rewards.clf_decreasing_condition.weight = -1
+        # self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = None
 
-        self.events.reset_base.params["pose_range"]["yaw"] = (-3.14, 3.14)
-        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
+        
+
+        self.curriculum.clf_curriculum.params = {
+            "min_max_err": (0.1,0.1),
+            "scale": (0.001,0.001),
+            "update_interval": 60000
+        }
+
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
 @configclass
 class G1FlatRefTrackingEnvCfg(G1GaitLibraryEnvCfg):

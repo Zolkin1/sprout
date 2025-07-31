@@ -56,7 +56,7 @@ def clf_curriculum(
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
     new_max_eta_err = term_cfg.params["eta_max"]
     new_max_eta_dot_err = term_cfg.params["eta_dot_max"]
-    clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
+    # clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
 
     if env.common_step_counter  >= update_interval and env.common_step_counter % update_interval == 0:
         
@@ -64,11 +64,11 @@ def clf_curriculum(
             new_max_eta_err = max(new_max_eta_err - scale[0],min_max_err[0])
             new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1],min_max_err[1])
         
-            term_cfg.params["max_eta_err"] = new_max_eta_err
+            # term_cfg.params["max_eta_err"] = new_max_eta_err
+            # env.reward_manager.set_term_cfg("clf_reward", term_cfg)
+            term_cfg.params["eta_max"] = new_max_eta_err
+            term_cfg.params["eta_dot_max"] = new_max_eta_dot_err
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
-            clf_cfg.params["eta_max"] = new_max_eta_err
-            clf_cfg.params["eta_dot_max"] = new_max_eta_dot_err
-            env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
     return new_max_eta_err
 
 def terrain_levels(
