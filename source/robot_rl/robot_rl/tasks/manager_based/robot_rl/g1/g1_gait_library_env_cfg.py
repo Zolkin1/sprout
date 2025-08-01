@@ -6,9 +6,11 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObserva
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 import math
+
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
@@ -51,21 +53,34 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
-        # self.curriculum.clf_curriculum = None
+        self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
         
+        self.rewards.dof_acc_l2 = None
+        self.rewards.dof_vel_l2 = None
 
-        self.curriculum.clf_curriculum.params = {
-            "min_max_err": (0.1,0.1),
-            "scale": (0.001,0.001),
-            "update_interval": 60000
-        }
+        # self.curriculum.clf_curriculum.params = {
+        #     "min_max_err": (0.1,0.1),
+        #     "scale": (0.001,0.001),
+        #     "update_interval": 20000
+        # }
 
-        self.scene.terrain.terrain_type = "plane"
-        self.scene.terrain.terrain_generator = None
-        # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        self.rewards.vdot_tanh = RewTerm(
+            func=mdp.vdot_tanh,
+            weight= 2.0,
+            params={
+                "command_name": "hzd_ref",
+                "alpha": 1.0,
+            }
+        )
+
+        self.rewards.clf_decreasing_condition = None
+
+        # self.scene.terrain.terrain_type = "plane"
+        # self.scene.terrain.terrain_generator = None
+        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
 @configclass
 class G1FlatRefTrackingEnvCfg(G1GaitLibraryEnvCfg):

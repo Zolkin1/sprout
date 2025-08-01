@@ -29,7 +29,7 @@ def vdot_tanh(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0) -> 
     clf_decay_violation = vdot + alpha * v  # [B]
 
     # Reward is higher when this violation is negative (i.e., condition is satisfied)
-    vdot_reward = torch.tanh(-alpha * clf_decay_violation)  # [B]
+    vdot_reward = torch.tanh(-clf_decay_violation)  # [B]
 
     return vdot_reward
 
@@ -77,12 +77,19 @@ def clf_decreasing_condition(
     return penalty
 
 
-def v_dot_penalty(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+def v_dot_penalty(env: ManagerBasedRLEnv, command_name: str,eta_max: float = 0.15,
+    eta_dot_max: float = 0.5,eps: float = 1e-6) -> torch.Tensor:
     ref_term = env.command_manager.get_term(command_name)                    # [B]
     vdot = ref_term.vdot # [B]
 
-    v_dot_penalty = torch.clamp(vdot,min=0.0)
-    return v_dot_penalty
+    norm_P = ref_term.clf.norm_P
+
+    max_violation = (
+        2.0 * norm_P * eta_max * eta_dot_max + eps
+    )
+
+    vdot_penalty = torch.tanh(torch.clamp(vdot, min=0.0) / max_violation) 
+    return vdot_penalty
 
 
 def contact_no_vel(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
