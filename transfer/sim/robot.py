@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None):
+    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, rng = None):
         """Initialize the robot with its model and data."""
         if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
@@ -17,6 +17,7 @@ class Robot:
         self.mj_model, self.mj_data = self._get_model_data()
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
         self.input_function = input_function
+        self.rng = rng
 
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
@@ -74,7 +75,11 @@ class Robot:
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
 
-        rand_vec = np.random.uniform(low=-max_movement, high=max_movement)
+        if self.rng is not None:
+            rand_vec = self.rng.uniform(low=-max_movement, high=max_movement)
+        else:
+            rand_vec = np.random.uniform(low=-max_movement, high=max_movement)
+
 
         self.mj_model.body_ipos[body_id] += rand_vec
 

@@ -91,7 +91,7 @@ def main():
     NUM_ANGLES = 24
 
     successes = np.empty((NUM_FORCES, NUM_ANGLES))
-    force_mags = np.linspace(175, 600, NUM_FORCES)
+    force_mags = np.linspace(100, 300, NUM_FORCES)
     angles = np.linspace(0, 2*np.pi, NUM_ANGLES)
 
     for i in range(NUM_FORCES):

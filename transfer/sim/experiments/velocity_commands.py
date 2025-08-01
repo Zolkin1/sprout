@@ -18,8 +18,10 @@ def smooth_ramp(sim_time):
     return np.array([min(slope * sim_time, MAX_SPEED),0.0,0.0])
 
 def speed_steps(sim_time):
-    time_steps = np.array([3, 3, 3, 3, 6, 6])
-    speeds = np.array([0, 0.25, -0.25, 0.5, 0.75, -0.5])
+    # time_steps = np.array([3, 3, 3, 3, 6, 6])
+    # speeds = np.array([0, 0.25, -0.25, 0.5, 0.75, -0.5])
+    time_steps = np.array([3, 3, 6, 6, 6])
+    speeds = np.array([0, 0.5, 0.75, -0.75, 0.75])
 
     # Compute start times of each interval
     start_times = np.cumsum(np.insert(time_steps[:-1], 0, 0))

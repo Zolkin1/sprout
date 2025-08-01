@@ -22,9 +22,9 @@ from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_
 
 FORCE_START = 3.0
 FORCE_STOP = 3.125
-FORCE_VEC = np.array([120.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-DELTA_FORCE = np.array([20.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-START_ADDED_MASS = 0. #6.0
+FORCE_VEC = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+DELTA_FORCE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+START_ADDED_MASS = 8.0 #6.0
 DELTA_MASS = 0. #1.5
 
 METRIC = False
@@ -105,7 +105,7 @@ def main():
                          log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                          use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
         force_partial = partial(force_robustness, force_vec=FORCE_VEC + i*DELTA_FORCE)
-        sim.run_headless(total_time=12, force_disturbance=force_partial)
+        sim.run_headless(total_time=8, force_disturbance=force_partial)
 
         run_logs.append(sim.get_logging_folder())
 
@@ -223,7 +223,7 @@ def main():
         axes[2].grid(True)
 
         plt.savefig(f"experiments/plots/velocity_robustness_test_{config_file_name}.png")
-
+        print(f"saving the figure to 'experiments/plots/velocity_robustness_test_{config_file_name}.png'")
 
 if __name__ == "__main__":
     main()
