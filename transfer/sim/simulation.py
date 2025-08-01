@@ -9,7 +9,7 @@ import mujoco.viewer
 from datetime import datetime
 import numpy as np
 
-from .robot import Robot
+from sim.robot import Robot
 
 
 def log_row_to_csv(filename, data):
@@ -117,12 +117,74 @@ class Simulation:
     def get_logging_folder(self):
         return self.new_log_folder
 
+    def run_headless(self, total_time: float, force_disturbance: Callable[[float], np.array] = None,):
+        """Run the simulation without a viewer."""
+        print(f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
+              f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
+              f"Simulation dt set to {self.robot.mj_model.opt.timestep} s. Sim loop rate set to {self.sim_loop_rate} s.\n"
+              f"Height sensor enabled: {self.use_height_sensor}\n")
+
+        # Setup height sensor visualization if enabled
+        if self.use_height_sensor:
+            grid_size = (1.5, 1.5)
+            x_y_num_rays = (25, 25)
+            height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data, "height_sensor_site",
+                                               grid_size, x_y_num_rays)
+
+        if total_time < 0:
+            raise ValueError("Headless simulation must have a positive total time specified!")
+
+        success = True
+
+        while self.robot.mj_data.time < total_time:
+            # Get observation and compute action
+            if self.use_height_sensor:
+                height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data, "height_sensor_site",
+                                                   grid_size, x_y_num_rays)
+                site_id = mujoco.mj_name2id(self.robot.mj_model, mujoco.mjtObj.mjOBJ_SITE, "height_sensor_site")
+                sensor_pos = self.robot.mj_data.site_xpos[site_id]
+
+                obs = self.robot.create_observation(self.policy, height_map=height_map, sensor_pos=sensor_pos)
+            else:
+                obs = self.robot.create_observation(self.policy)
+            action = self.policy.get_action(obs)
+            self.robot.apply_action(action)
+
+            if self.robot.failed():
+                success = False
+                break
+
+            # Step the simulator
+            for i in range(self.sim_steps_per_policy_update):
+                # Update height sensor visualization if enabled
+                if self.use_height_sensor:
+                    height_map = self._ray_cast_sensor(self.robot.mj_model, self.robot.mj_data,
+                                                       "height_sensor_site", grid_size, x_y_num_rays)
+
+                if force_disturbance is not None:
+                    self.robot.apply_force_disturbance(force_disturbance(self.robot.mj_data.time))
+
+                # Step the sim
+                self.robot.step()
+
+                # Only log and sync viewer at viewer_rate intervals
+                if i % self.viewer_rate == 0:
+                    if self.log:
+                        log_data = self.robot.get_log_data(self.policy, obs, action)
+                        # if any(abs(v) > 1e-6 for v in log_data[-3:]):  # Only print if commanded velocity is non-zero
+                        # print(f"Commanded velocity: {log_data[-3:]}")
+                        log_row_to_csv(self.log_file, log_data)
+
+        return success
+
     def run(self, total_time: float, force_disturbance: Callable[[float], np.array] = None,):
         """Run the simulation."""
         print(f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
               f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
               f"Simulation dt set to {self.robot.mj_model.opt.timestep} s. Sim loop rate set to {self.sim_loop_rate} s.\n"
               f"Height sensor enabled: {self.use_height_sensor}\n")
+
+        success = True
 
         with mujoco.viewer.launch_passive(self.robot.mj_model, self.robot.mj_data) as viewer:
             if self.tracking_body_name != "":
@@ -165,6 +227,10 @@ class Simulation:
                 action = self.policy.get_action(obs)
                 self.robot.apply_action(action)
 
+                if self.robot.failed():
+                    success = False
+                    break
+
                 # Step the simulator
                 for i in range(self.sim_steps_per_policy_update):
                     # Update scene
@@ -199,6 +265,8 @@ class Simulation:
                                 # print(f"Commanded velocity: {log_data[-3:]}")
                             log_row_to_csv(self.log_file, log_data)
                         viewer.sync()
+
+        return success
 
     def _ray_cast_sensor(self, model, data, site_name, size, x_y_num_rays, sen_offset=0):
         """Using a grid pattern, create a height map using ray casting."""

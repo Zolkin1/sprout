@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None):
+    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, rng = None):
         """Initialize the robot with its model and data."""
         if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
@@ -17,6 +17,7 @@ class Robot:
         self.mj_model, self.mj_data = self._get_model_data()
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
         self.input_function = input_function
+        self.rng = rng
 
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
@@ -44,6 +45,9 @@ class Robot:
         print(f"Trying to load the xml at {path}")
         mj_model = mujoco.MjModel.from_xml_path(path)
         mj_data = mujoco.MjData(mj_model)
+
+        mujoco.mj_resetDataKeyframe(mj_model, mj_data, 0)
+
         return mj_model, mj_data
 
     def reset_robot(self):
@@ -71,7 +75,11 @@ class Robot:
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
 
-        rand_vec = np.random.uniform(low=-max_movement, high=max_movement)
+        if self.rng is not None:
+            rand_vec = self.rng.uniform(low=-max_movement, high=max_movement)
+        else:
+            rand_vec = np.random.uniform(low=-max_movement, high=max_movement)
+
 
         self.mj_model.body_ipos[body_id] += rand_vec
 
@@ -139,7 +147,13 @@ class Robot:
             self.commanded_vel = self.get_joystick_command()
         else:
             self.commanded_vel = self.input_function(sim_time)
-        
+
+        # Apply a PD controller on the y axis through the heading
+        kp = 5.0
+        kd = 2
+        angular_vel = np.sign(self.commanded_vel[0])*max(min(-kp*qpos[1] + -kd*qvel[1], 1), -1)
+        self.commanded_vel[2] = angular_vel
+
         return policy.create_obs(qpos[7:], qvel[3:6], qvel[6:], sim_time, pg, self.commanded_vel,
                                height_map=height_map, sensor_pos=sensor_pos)
 
@@ -189,4 +203,5 @@ class Robot:
         """Step the robot simulation."""
         mujoco.mj_step(self.mj_model, self.mj_data)
 
-   
+    def failed(self):
+        return self.mj_data.qpos[2] < 0.2

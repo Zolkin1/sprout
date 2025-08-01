@@ -28,6 +28,8 @@ def main():
     with open(args.config_file, 'r') as f:
         config = yaml.safe_load(f)
 
+    config_file_name = os.path.splitext(os.path.basename(args.config_file))[0]
+
     # Parse the config file with default values
     required_fields = {
         "checkpoint_path": str,
@@ -65,24 +67,27 @@ def main():
         policy_type=config["policy_type"]
     )
 
+    seed = 42
+    rng = np.random.default_rng(seed)
+
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=smooth_ramp)
+                           input_function=smooth_ramp, rng=rng)
 
     run_logs = []
 
-    NUM_RUNS = 20
+    NUM_RUNS = 15
 
     for i in range(NUM_RUNS):
         # Adjust the torso mass position
-        max_movement = np.array([0.05,0.05,0.05])
+        max_movement = np.array([0.05,0.05,0.01])
         pos_movement = robot_instance.randomize_torso_mass_pos(max_movement)
 
         # Create and run simulation
         sim = Simulation(policy, robot_instance, log=True,
                          log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                          use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-        sim.run(total_time=12, force_disturbance=None)
+        sim.run_headless(total_time=8, force_disturbance=None)
 
         run_logs.append(sim.get_logging_folder())
 
@@ -126,36 +131,45 @@ def main():
     std_actual = np.std(actual_vel_np, axis=0)
 
     # Make some plots
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
-    fig.suptitle('Commanded vs Actual Velocities')
+    plt.rcParams.update({'font.size': 18})
+    plt.rcParams.update({
+        "text.usetex": True,  # Use LaTeX for all text
+        "font.family": "serif",  # Use serif font (default LaTeX style)
+        "font.serif": ["Computer Modern Roman"],  # LaTeX default font
+    })
+    fig, axes = plt.subplots(1, 1, figsize=(10, 6))
+    # fig.suptitle('Commanded vs Actual Velocities')
 
-    axes[0].plot(time_np[0, :], commanded_vel_np[0, :, 0], 'r--', label='Commanded')
-    axes[1].plot(time_np[0, :], commanded_vel_np[0, :, 1], 'r--', label='Commanded')
-    axes[2].plot(time_np[0, :], commanded_vel_np[0, :, 2], 'r--', label='Commanded')
+    axes.plot(time_np[0, :], commanded_vel_np[0, :, 0], 'k--', linewidth="2", label='Commanded')
+    # axes[1].plot(time_np[0, :], commanded_vel_np[0, :, 1], 'r--', label='Commanded')
+    # axes[2].plot(time_np[0, :], commanded_vel_np[0, :, 2], 'r--', label='Commanded')
 
     # Plot x velocity
-    axes[0].plot(time_np[0], mean_actual[:, 0], 'b-', label=f'Actual_{i}')
-    axes[0].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[0].set_ylabel('X Velocity (m/s)')
-    axes[0].legend()
-    axes[0].grid(True)
+    axes.plot(time_np[0], mean_actual[:, 0], 'tab:blue', label=f'Actual_{i}')
+    axes.fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
+    axes.set_ylabel(r'$v_x$ (m/s)')
+    axes.set_xlabel('Time (s)')
+    axes.legend()
+    axes.grid(True)
+    axes.set_ylim(-0.6, 1.05)
 
-    # Plot y velocity
-    axes[1].plot(time_np[0, :], mean_actual[:, 1], 'b-', label=f'Actual_{i}')
-    axes[1].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 1] - std_actual[:, 1], mean_actual[:, 1] + std_actual[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[1].set_ylabel('Y Velocity (m/s)')
-    axes[1].legend()
-    axes[1].grid(True)
+    # # Plot y velocity
+    # axes[1].plot(time_np[0, :], mean_actual[:, 1], 'b-', label=f'Actual_{i}')
+    # axes[1].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 1] - std_actual[:, 1], mean_actual[:, 1] + std_actual[:, 1], color='blue', alpha=0.3, label='±1 Std Dev')
+    # axes[1].set_ylabel('Y Velocity (m/s)')
+    # axes[1].legend()
+    # axes[1].grid(True)
+    #
+    # # Plot angular velocity
+    # axes[2].plot(time_np[0, :], mean_actual[:, 2], 'b-', label=f'Actual_{i}')
+    # axes[2].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 2] - std_actual[:, 2], mean_actual[:, 2] + std_actual[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
+    # axes[2].set_xlabel('Time (s)')
+    # axes[2].set_ylabel('Angular Velocity (rad/s)')
+    # axes[2].legend()
+    # axes[2].grid(True)
 
-    # Plot angular velocity
-    axes[2].plot(time_np[0, :], mean_actual[:, 2], 'b-', label=f'Actual_{i}')
-    axes[2].fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 2] - std_actual[:, 2], mean_actual[:, 2] + std_actual[:, 2], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes[2].set_xlabel('Time (s)')
-    axes[2].set_ylabel('Angular Velocity (rad/s)')
-    axes[2].legend()
-    axes[2].grid(True)
-
-    plt.savefig("experiments/plots/mass_randomization.png")
+    plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.png")
+    plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.svg", transparent=True)
 
 if __name__ == "__main__":
     main()
