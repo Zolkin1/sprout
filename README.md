@@ -69,9 +69,8 @@ RL Task list:
 
 | Task          |   Robot    |   Hardware Tested?   | Description                                                      |
 |---------------|:----------:|:--------------------:|------------------------------------------------------------------|
-| `G1-flat-vel` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
-| `clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
-| `hzd_clf`  |     G1     |  :white_check_mark:  | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+| `vanilla` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
+| `lip_clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 
 ## Copying checkpoitns from remote server 

@@ -25,8 +25,7 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
 
 SIM_ENVIRONMENTS = {
-    "vanilla": "custom-Isaac-Velocity-Flat-G1-Play-v0",
-    "custom": "G1-flat-vel",
+    "vanilla": "G1-flat-vel",
     "lip_clf": "G1-LIP-ref-play",
     "lip_ref_tracking": "G1-LIP-ref-play",
     "lip_clf_vdot": "G1-LIP-ref-play",
@@ -377,7 +376,7 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "custom":
+    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"

@@ -8,8 +8,7 @@ import cli_args
 
 # Environment names
 ENVIRONMENTS = {
-    "vanilla": "custom-Isaac-Velocity-Flat-G1-v0",
-    "custom": "G1-flat-vel",
+    "vanilla": "G1-flat-vel",
     "lip_ref_tracking": "G1-flat-ref-tracking",
     "lip_clf_vdot": "G1-flat-clf-vdot",
     "lip_clf": "G1-lip-clf-custom",
@@ -20,7 +19,7 @@ ENVIRONMENTS = {
 
 EXPERIMENT_NAMES = {
     "vanilla": "baseline",
-    "custom": "baseline",
+    "basic": "baseline",
     "lip_clf": "lip",
     "lip_ref_tracking": "lip",
     "lip_clf_vdot": "lip",
