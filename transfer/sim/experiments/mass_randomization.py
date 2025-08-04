@@ -72,7 +72,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=smooth_ramp, rng=rng)
+                           input_function=speed_steps, rng=rng)
 
     run_logs = []
 
@@ -87,7 +87,7 @@ def main():
         sim = Simulation(policy, robot_instance, log=True,
                          log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                          use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-        sim.run_headless(total_time=8, force_disturbance=None)
+        sim.run_headless(total_time=24, force_disturbance=None)
 
         run_logs.append(sim.get_logging_folder())
 
@@ -114,6 +114,7 @@ def main():
         # Parse the data
         log_dir = os.path.join(os.getcwd(), run_logs[i])
 
+        print(f"i: {i}")
         # Load in the data
         with open(os.path.join(log_dir, "sim_config.yaml")) as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
@@ -122,6 +123,7 @@ def main():
             actual_vel_list.append(data["qvel"])
             commanded_vel_list.append(data["commanded_vel"])
             time_list.append(data["time"])
+            print(f"data[time] size: {data['time'].size()}")
 
     time_np = np.stack(time_list)
     commanded_vel_np = np.stack(commanded_vel_list)

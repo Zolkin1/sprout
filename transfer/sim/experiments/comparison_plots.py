@@ -96,8 +96,8 @@ def main():
         if PLOT_MEANS:
             ## Mean plots
             # Get the steady state mean
-            ss_idx_start = get_index(time, 3)
-            ss_idx_end = get_index(time, 8) #time.size
+            ss_idx_start = get_index(time, 2)
+            ss_idx_end = get_index(time, 12) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
