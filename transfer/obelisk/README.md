@@ -176,3 +176,8 @@ export XDG_RUNTIME_DIR=/tmp/runtime-$USER
 ```
 
 but I don't know for sure.
+
+To run the optitrack forwarding node:
+```
+ros2 run g1_control optitrack_forwarding
+```
