@@ -139,3 +139,34 @@ To open a new bash terminal for running container
 
 
 
+# Using Optitrack
+We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.
+
+Once you are inside the docker you need to build the package using colcon, but in order to do that you need to activate obelisk so you have ros2. So run:
+
+```
+obk
+```
+
+make sure you are in `~/natnet_ros2` then run
+
+```
+colcon build --symlink-install
+. install/setup.bash
+```
+
+to build it.
+
+Run it with:
+```
+ros2 launch natnet_ros2 gui_natnet_ros2.launch.py
+```
+
+You may need to run
+```
+mkdir -p /tmp/runtime-$USER
+chmod 700 /tmp/runtime-$USER
+export XDG_RUNTIME_DIR=/tmp/runtime-$USER
+```
+
+but I don't know for sure.

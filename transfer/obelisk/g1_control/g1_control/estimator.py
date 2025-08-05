@@ -9,7 +9,7 @@ from rclpy.executors import SingleThreadedExecutor
 
 
 class G1Estimator(ObeliskEstimator):
-    """Example position setpoint controller."""
+    """G1 Rl estimator."""
 
     def __init__(self, node_name: str = "g1_estimator") -> None:
         """Initialize the G1 estimator."""

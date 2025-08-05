@@ -41,6 +41,6 @@ setup(
     license="TODO: License declaration",
     tests_require=["pytest"],
     entry_points={
-        "console_scripts": ["g1_controller = g1_control.controller:main", "g1_estimator = g1_control.estimator:main"],
+        "console_scripts": ["g1_controller = g1_control.controller:main", "g1_estimator = g1_control.estimator:main", "opti_logger = g1_control.opti_logger:main",],
     },
 )

@@ -150,7 +150,20 @@ onboard:
         - ros_parameter: timer_est_setting
           timer_period_sec: 0.001
           callback_group: None
-  # sensing:
+  # --------------------------------- #
+  # ------------ Sensors ------------ #
+  # --------------------------------- #
+  sensing:
+  - pkg: g1_control
+    executable: opti_logger
+    # callback_groups:
+    # publishers:
+    subscribers:
+      - ros_parameter: sub_joint_encoders
+        topic: /g1/pose
+        msg_type: PoseStamped
+        history_depth: 10
+        callback_group: None
   # --------------------------------- #
   # ------------- Robot ------------- #
   # --------------------------------- #
