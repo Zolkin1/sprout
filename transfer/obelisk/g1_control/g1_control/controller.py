@@ -32,10 +32,8 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         # Load policy
         self.declare_parameter("policy_name", "")
-        self.declare_parameter("height_map_flag", False)
-        self.declare_parameter("gl_flag", False)
-        self.height_map_flag = self.get_parameter("height_map_flag").get_parameter_value().bool_value
-        self.gl_flag = self.get_parameter("gl_flag").get_parameter_value().bool_value
+        self.declare_parameter("obs_type", "")
+        self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
         policy_name = self.get_parameter("policy_name").get_parameter_value().string_value
         pkg_path = get_package_share_directory("g1_control")
         policy_path = os.path.join(pkg_path, f"resource/policies/{policy_name}")
@@ -418,6 +416,37 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         return obs_tensor
 
+    def create_mlp_obs(self):
+        """Create the observation vector from the sensor data"""
+        obs = np.zeros(self.num_obs, dtype=np.float32)
+
+        obs[:3] = self.omega*self.ang_vel_scale                                                 # Angular velocity
+        obs[3:6] = self.proj_g                                        # Projected gravity
+        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
+        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
+        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]
+                                     # Command velocity
+
+        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
+        nj = len(joint_pos_isaac)
+
+        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
+        obs[9 : 9 + nj] = joint_pos_isaac  # Joint position
+        obs[9 + nj : 9 + 2 * nj] = joint_vel_isaac* self.qvel_scale # Joint velocity
+
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
+
+        sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+
+        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+
+        # print(obs_tensor)
+
+        return obs_tensor
+    
     def compute_control(self) -> PDFeedForward:
         """Compute the control signal for the dummy 2-link robot.
 
@@ -426,10 +455,12 @@ class VelocityTrackingController(ObeliskController, ABC):
         """
         # Generate input to RL model
         if self.received_xhat:
-            if self.height_map_flag:
+            if self.obs_type == "cnn":
                 obs = self.get_cnn_obs()
-            elif self.gl_flag:
+            elif self.obs_type == "gl":
                 obs = self.get_gl_obs()
+            elif self.obs_type == "mlp":
+                obs = self.create_mlp_obs()
             else:
                 obs = self.get_obs()
 

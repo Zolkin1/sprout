@@ -46,7 +46,6 @@ def main():
     # Make the RL policy
     policy = RLPolicy(
         dt=config["dt"],
-        policy_base_dir=policy_base_dir,
         checkpoint_path=config["checkpoint_path"],
         num_obs=config["num_obs"],
         num_action=config["num_action"],
