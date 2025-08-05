@@ -128,6 +128,8 @@ onboard:
   estimation:
     - pkg: g1_control
       executable: g1_estimator
+      params:
+        opti_track_pos: False
       # callback_groups:
       publishers:
         - ros_parameter: pub_est_setting
@@ -153,17 +155,7 @@ onboard:
   # --------------------------------- #
   # ------------ Sensors ------------ #
   # --------------------------------- #
-  sensing:
-  - pkg: g1_control
-    executable: opti_logger
-    # callback_groups:
-    # publishers:
-    subscribers:
-      - ros_parameter: sub_joint_encoders
-        topic: /g1/pose
-        msg_type: PoseStamped
-        history_depth: 10
-        callback_group: None
+  # sensing:
   # --------------------------------- #
   # ------------- Robot ------------- #
   # --------------------------------- #

@@ -5,7 +5,7 @@ from datetime import datetime
 
 from geometry_msgs.msg import PoseStamped
 
-from obelisk_py.core.estimation import ObeliskSensor
+from obelisk_py.core.sensing import ObeliskSensor
 from obelisk_py.core.utils.ros import spin_obelisk
 from rclpy.executors import SingleThreadedExecutor
 
@@ -13,7 +13,8 @@ class OptiLogger(ObeliskSensor):
     """Logger for optitrack data."""
 
     def __init__(self, node_name: str = "optitrack_logger"):
-        super().__init__(node_name, PoseStamped)
+        super().__init__(node_name)
+        self._has_sensor_publisher = True   # Hack to get around the Obelisk check.
 
         self.register_obk_subscription(
             "sub_optitrack_pose",
@@ -47,9 +48,8 @@ class OptiLogger(ObeliskSensor):
 
         self.get_logger().info(f'Logged Pose at {timestamp_sec}.')
 
-
-    def compute_state_estimate(self):
-        pass
+    # def compute_state_estimate(self):
+    #     pass
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""

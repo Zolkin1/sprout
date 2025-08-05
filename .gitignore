@@ -74,6 +74,7 @@ g1_hardware_log/
 
 transfer/obelisk/.vscode/
 transfer/obelisk/ctrl_logs/
+transfer/obelisk/optitrack_logs/
 
 transfer/sim/MUJOCO_LOG.TXT
 
