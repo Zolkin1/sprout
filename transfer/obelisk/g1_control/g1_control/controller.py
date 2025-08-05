@@ -305,6 +305,10 @@ class VelocityTrackingController(ObeliskController, ABC):
             w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
             self.cmd_vel[2] = 0
 
+            if now - self.joystick_exited > 8:
+                self.joystick_control = True
+                self.get_logger().info("Joystick control re-enabled after timeout.")
+
     @staticmethod
     def project_gravity(quat):
         qx = quat[0]
