@@ -20,7 +20,7 @@ onboard:
         v_x_max: 0.75
         v_y_min: 0.0
         v_y_max: 0.0
-        w_z_max: 1.0
+        w_z_max: 0.5
         # default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
         #           -0.42, 0, 0, 0.81, -0.4, 0,
         #           0,

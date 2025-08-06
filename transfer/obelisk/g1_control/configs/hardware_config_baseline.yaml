@@ -12,10 +12,15 @@ onboard:
         num_actions: 21
         period: 0.8                   # s
         ang_vel_scale: 1.0 #0.25
-        cmd_scale: [2., 2, 1] #[2., 2, 1]
+        cmd_scale: [2., 2, 2] #[2., 2, 1]
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
         action_scale: 0.25
+        v_x_min: -0.75
+        v_x_max: 0.75
+        v_y_min: 0.0
+        v_y_max: 0.0
+        w_z_max: 0.5
         kps: [100.0,100,100,150,40,40,
               100.0,100,100,150,40,40,
               100,
@@ -58,7 +63,7 @@ onboard:
           "left_shoulder_pitch_joint",
           "left_shoulder_roll_joint",
           "left_shoulder_yaw_joint",
-          "left_elbow_jointy Tracking node constructor complete.",
+          "left_elbow_joint",
           "right_shoulder_pitch_joint",
           "right_shoulder_roll_joint",
           "right_shoulder_yaw_joint",
@@ -96,8 +101,8 @@ onboard:
       executable: obelisk_unitree_joystick
       params:
         v_x_max: 1.
-        v_y_max: 0.4
-        w_z_max: 0.5
+        v_y_max: 0.0
+        w_z_max: 1.0
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #
@@ -157,7 +162,7 @@ onboard:
       pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_g1_hardware
       params:
-        network_interface_name: enx9cbf0d00b3c9 #enp4s0 # From ifconfig
+        network_interface_name: enx6c1ff7250373 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle

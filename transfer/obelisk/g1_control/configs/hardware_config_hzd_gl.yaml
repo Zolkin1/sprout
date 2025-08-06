@@ -163,7 +163,7 @@ onboard:
       executable: obelisk_unitree_g1_hardware
       params:
         ic_keyframe: standing
-        network_interface_name: enp0s31f6 #enp4s0 # From ifconfig
+        network_interface_name: enx6c1ff7250373 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle
