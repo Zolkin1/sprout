@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "hzd_gl_policies_07_17hzd_gl_policies_07_17/old_gait_library.pt" #"hzd_gl_policy.pt"
+        policy_name: "RA-L_paper/hzd_clf_minimum_reward.pt" #"hzd_gl_policies_07_17hzd_gl_policies_07_17/old_gait_library.pt" #"hzd_gl_policy.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
@@ -20,9 +20,9 @@ onboard:
         v_x_max: 0.75
         v_y_min: 0.0
         v_y_max: 0.0
-        w_z_max: 0.2
+        w_z_max: 1.0
+        obs_type: "gl"
         height_map_flag: False
-        gl_flag: True
         default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
                   -0.25, 0, 0, 0.46, -0.25, 0,
                   0,
@@ -53,7 +53,7 @@ onboard:
         ]
         log: true
         log_decimation: 1 # relative to the control callback
-        config_name: "rl_policy_config.yaml"
+        config_name: "sim_config_hzd_gl.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -82,9 +82,9 @@ onboard:
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_max: 0.75
-        v_y_max: 0.0
-        w_z_max: 0.2
+        v_x_max: 1.0
+        v_y_max: 1.0
+        w_z_max: 1.0
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #

@@ -7,12 +7,12 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "policy_baseline.pt"
+        policy_name: "RA-L_paper/baseline_policy.pt" #"policy_baseline.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
-        ang_vel_scale: 0.25
-        cmd_scale: [2., 2, 1]
+        ang_vel_scale: 1.0 #0.25
+        cmd_scale: [2., 2, 1] #[2., 2, 1]
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
         action_scale: 0.25
@@ -31,11 +31,16 @@ onboard:
               2,2,2,
               2,2,2,2,
               2,2,2]
-        default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
-                  -0.42, 0, 0, 0.81, -0.4, 0,
+        # default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
+        #           -0.42, 0, 0, 0.81, -0.4, 0,
+        #           0,
+        #           0, 0.27, 0, 0.5,
+        #           0, -0.27, 0, 0.5]
+        default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
+                  -0.25, 0, 0, 0.46, -0.25, 0,
                   0,
-                  0, 0.27, 0, 0.5,
-                  0, -0.27, 0, 0.5]
+                  0.07, 0.24, 0, 1.39,
+                  0.07, -0.24, 0, 1.39]
         default_angles_names: [
           "left_hip_pitch_joint",
           "left_hip_roll_joint",
@@ -61,7 +66,7 @@ onboard:
         ]
         log: true
         log_decimation: 1 # relative to the control callback
-        config_name: "hardware_config.yaml"
+        config_name: "hardware_config_baseline.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -175,11 +180,11 @@ onboard:
           1., 1., 1.,       # R shoulder
           1., 1., 1., 1.,   # R elbow, wrist
         ]
-        user_pose: [ -0.42, 0, 0, 0.81, -0.4, 0,
-                     -0.42, 0, 0, 0.81, -0.4, 0,
-                     0, 0, 0,
-                     0, 0.27, 0, 0.5, 0, 0, 0,
-                     0, -0.27, 0, 0.5, 0, 0, 0 ]
+        user_pose: [-0.25, 0, 0, 0.46, -0.25, 0,
+                  -0.25, 0, 0, 0.46, -0.25, 0,
+                  0, 0, 0,
+                  0.07, 0.24, 0, 1.39, 0, 0, 0,
+                  0.07, -0.24, 0, 1.39, 0, 0, 0]
     # - is_simulated: True
     #   pkg: robot_sim
     #   executable: simulation
@@ -393,7 +398,7 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: True
+    on: False
     viz_tool: foxglove
     viz_nodes:
       - pkg: obelisk_viz_cpp

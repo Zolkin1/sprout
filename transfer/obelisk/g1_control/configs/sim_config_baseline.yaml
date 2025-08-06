@@ -1,4 +1,4 @@
-config: clf_rl_policy
+config: rl_policy
 onboard:
   # --------------------------------- #
   # ----------- Controller ---------- #
@@ -7,25 +7,30 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "clf_policy.pt"
+        policy_name: "RA-L_paper/baseline_policy.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
-        ang_vel_scale: 0.25
-        cmd_scale: [2., 2., 2.]
+        ang_vel_scale: 1.0 #0.25
+        cmd_scale: [2., 2, 2] #[2., 2, 1]
         qpos_scale: 1
         qvel_scale: 0.05 #0.1
         action_scale: 0.25
-        v_x_max: 1.0
-        v_x_min: -0.5
-        v_y_max: -0.2
-        v_y_min: 0.2
-        w_z_max: 0.2
-        default_angles: [-0.1, 0, 0, 0.3, -0.2, 0,
-                  -0.1, 0, 0, 0.3, -0.2, 0,
+        v_x_min: -0.75
+        v_x_max: 0.75
+        v_y_min: 0.0
+        v_y_max: 0.0
+        w_z_max: 1.0
+        # default_angles: [-0.42, 0, 0, 0.81, -0.4, 0,
+        #           -0.42, 0, 0, 0.81, -0.4, 0,
+        #           0,
+        #           0, 0.27, 0, 0.5,
+        #           0, -0.27, 0, 0.5]
+        default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
+                  -0.25, 0, 0, 0.46, -0.25, 0,
                   0,
-                  0.1, 0.27, 0, 1.2,
-                  0.1, -0.27, 0, 1.2]
+                  0.07, 0.24, 0, 1.39,
+                  0.07, -0.24, 0, 1.39]
         default_angles_names: [
           "left_hip_pitch_joint",
           "left_hip_roll_joint",
@@ -49,6 +54,9 @@ onboard:
           "right_shoulder_yaw_joint",
           "right_elbow_joint",
         ]
+        log: true
+        log_decimation: 1 # relative to the control callback
+        config_name: "sim_config_baseline.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -78,8 +86,8 @@ onboard:
       executable: obelisk_unitree_joystick
       params:
         v_x_max: 1.
-        v_y_max: 0.4
-        w_z_max: 0.3
+        v_y_max: 0.0
+        w_z_max: 1.0
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #

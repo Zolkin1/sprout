@@ -66,6 +66,7 @@ datasets
 transfer/obelisk/install/
 transfer/obelisk/log/
 transfer/obelisk/build/
+transfer/obelisk/MUJOCO_LOG.TXT
 g1_hardware_log/
 
 *.pkl
