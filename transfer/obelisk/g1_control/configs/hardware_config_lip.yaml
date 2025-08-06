@@ -65,6 +65,9 @@ onboard:
           "right_shoulder_yaw_joint",
           "right_elbow_joint",
         ]
+        log: true
+        log_decimation: 1 # relative to the control callback
+        config_name: "hardware_config_lip.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -77,11 +80,14 @@ onboard:
           topic: /obelisk/g1/est_state
           history_depth: 10
           callback_group: None
-        # ----- Joystick subscriber ----- #
+        # ----- High Level Command subscriber ----- #
         - ros_parameter: sub_vel_cmd_setting
           topic: /obelisk/g1/high_level_ctrl
           history_depth: 10
           callback_group: None
+        # ----- Joystick subscriber ----- #
+        - ros_parameter: sub_joystick
+          topic: /obelisk/g1/joy
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.02    # 50 Hz
@@ -151,7 +157,7 @@ onboard:
       executable: obelisk_unitree_g1_hardware
       params:
         ic_keyframe: standing
-        network_interface_name: enx9cbf0d00b3c9 #enp4s0 # From ifconfig
+        network_interface_name: enx6c1ff7250373 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle
