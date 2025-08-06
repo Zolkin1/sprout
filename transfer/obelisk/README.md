@@ -52,7 +52,7 @@ source install/setup.bash
 
 Then finally we can run the stack in sim:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/rl_policy_config.yaml device_name=onboard bag=false
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device_name=onboard bag=false
 ```
 
 ## Different Configs/Policies
@@ -65,10 +65,16 @@ HZD:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device_name=onboard bag=false
 ```
+
 Baseline:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
 ```
+
+<!-- HZD with optitrack logging:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false
+``` -->
 
 # Running on hardware
 Follow the above steps to make sure everything work in simulation.
@@ -139,3 +145,39 @@ To open a new bash terminal for running container
 
 
 
+# Using Optitrack
+We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.
+
+Once you are inside the docker you need to build the package using colcon, but in order to do that you need to activate obelisk so you have ros2. So run:
+
+```
+obk
+```
+
+make sure you are in `~/natnet_ros2` then run
+
+```
+colcon build --symlink-install
+. install/setup.bash
+```
+
+to build it.
+
+Run it with:
+```
+ros2 launch natnet_ros2 gui_natnet_ros2.launch.py
+```
+
+You may need to run
+```
+mkdir -p /tmp/runtime-$USER
+chmod 700 /tmp/runtime-$USER
+export XDG_RUNTIME_DIR=/tmp/runtime-$USER
+```
+
+but I don't know for sure.
+
+To run the optitrack forwarding node:
+```
+ros2 run g1_control optitrack_forwarding
+```
