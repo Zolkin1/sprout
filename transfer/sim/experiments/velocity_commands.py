@@ -36,3 +36,41 @@ def speed_steps(sim_time):
         return speeds[idx]
 
     return np.array([_get_velocity_at_time(sim_time), 0, 0])
+
+
+
+
+def ramped_speed_steps(sim_time):
+    time_steps = np.array([3, 3, 3, 3])
+    speeds = np.array([0.0, 0.5, -0.5, 0.75])
+
+
+    RAMP_TIME = 1.0  # Duration over which to ramp between speeds
+
+    # Compute start times of each interval
+    start_times = np.cumsum(np.insert(time_steps[:-1], 0, 0))
+    end_times = np.cumsum(time_steps)
+
+    total_time = end_times[-1]
+    if sim_time < 0:
+        return np.array([speeds[0], 0.0, 0.0])
+    elif sim_time >= total_time:
+        return np.array([speeds[-1], 0.0, 0.0])
+
+    # Find current interval index
+    idx = np.searchsorted(start_times, sim_time, side='right') - 1
+
+    t0 = start_times[idx]
+    t1 = end_times[idx]
+    v0 = speeds[idx]
+    v1 = speeds[idx + 1] if idx + 1 < len(speeds) else speeds[idx]
+
+    # Ramp forward only within the last RAMP_TIME seconds of the interval
+    ramp_start = t1 - RAMP_TIME
+    if sim_time < ramp_start or RAMP_TIME <= 0:
+        vx = v0
+    else:
+        alpha = (sim_time - ramp_start) / RAMP_TIME
+        vx = (1 - alpha) * v0 + alpha * v1
+
+    return np.array([vx, 0.0, 0.0])

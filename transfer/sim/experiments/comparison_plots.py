@@ -7,7 +7,7 @@ import numpy as np
 
 from sim.log_utils import extract_data
 
-PLOT_MEANS = True
+PLOT_MEANS = False
 
 def get_index(time_vec, time: float):
     """Gets the index associated with a given time."""
@@ -44,6 +44,10 @@ def main():
         raise FileNotFoundError("Comparison logs folder not found!")
 
     run_names = policy_names
+
+    run_names = ["HZD tracking","HZD-CLF"]
+
+
     # run_names = ["hzd_clf_minimum_reward", "hzd_dec_4_alpha_1", "hzd_dec_2_alpha_2", "hzd_dec_2_alpha_0.5", "hzd_dec_0"]
     run_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:cyan']
 
@@ -59,6 +63,8 @@ def main():
     handles = []
     labels = []
 
+    num_runs = len(logs)
+
     for i, log in enumerate(logs):
         log_dir = log
 
@@ -73,7 +79,7 @@ def main():
 
         # Plot commanded velocity (only once)
         if i == 0:
-            axes.plot(time, commanded_vel[:, 0], 'k', linewidth="2", label='Commanded')
+            axes.plot(time, commanded_vel[:, 0], 'k', linewidth="2", label='$v_x^d$')
             # h_cmd_y, = axes[1].plot(time, commanded_vel[:, 1], 'k', linewidth="2", label='Commanded')
             # h_cmd_w, = axes[2].plot(time, commanded_vel[:, 2], 'k', linewidth="2", label='Commanded')
             # handles.append(h_cmd_x)
@@ -88,49 +94,87 @@ def main():
         if PLOT_MEANS:
             alpha = 0.25
             linewidth = 3
-        axes.plot(time, actual_vel[:, 0], linewidth=linewidth, color=color, label=run_names[i],
+        axes.plot(time, actual_vel[:, 0], linewidth=linewidth, color=color, label=run_names[i],zorder=num_runs-i,
                             alpha=alpha)
+    
         # h_y, = axes[1].plot(time, actual_vel[:, 1], linewidth="3", color=color, label=run_names[i])
         # h_w, = axes[2].plot(time, actual_vel[:, 2], linewidth="3", color=color, label=run_names[i])
 
         if PLOT_MEANS:
             ## Mean plots
             # Get the steady state mean
-            ss_idx_start = get_index(time, 3)
-            ss_idx_end = get_index(time, 8) #time.size
+            ss_idx_start = get_index(time, 13)
+            ss_idx_end = get_index(time, 17) #time.size
+            ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
+            axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
+                         color=color, linestyle="--", label=f"{run_names[i]}_mean")
+            
+            ss_idx_start = get_index(time, 7)
+            ss_idx_end = get_index(time, 11) #time.size
+            ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
+            axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
+                         color=color, linestyle="--", label=f"{run_names[i]}_mean")
+            
+            ss_idx_start = get_index(time, 20)
+            ss_idx_end = get_index(time, 25) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
 
 
     # Set axis labels
-    axes.set_ylabel(r'$v_x$ (m/s)')
+    axes.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
     # axes[1].set_ylabel(r'$v_y$ (m/s)')
     # axes[2].set_ylabel(r'$\omega_z$ (rad/s)')
 
-    axes.set_xlabel('Time (s)')
-    plt.xticks(fontsize=15)
-    plt.yticks(fontsize=15)
+    axes.set_xlabel('Time (s)',fontsize=20)
+    plt.xticks(fontsize=20)
+    plt.yticks(fontsize=20)
     # axes.legend()
     axes.grid()
 
-    if PLOT_MEANS:
-        # Add manual style key as annotation or secondary legend
-        style_handles = [
-            Line2D([0], [0], color='gray', linestyle='-', lw=2, label='Actual'),
-            Line2D([0], [0], color='gray', linestyle='--', lw=2, label='Mean'),
-        ]
-        style_legend = axes.legend(handles=style_handles, loc="lower right", bbox_to_anchor=(0.6, 0.))
-        axes.add_artist(style_legend)
+    # Construct full unified legend with line styles + policy names
+    run_handles = [
+        Line2D([0], [0], color=run_colors[i], lw=2, linestyle='-', label=run_names[i])
+        for i in range(len(logs))
+    ]
 
-    # Legend for color/run names
-    run_legend = [Line2D([0], [0], color=run_colors[i], lw=2, label=run_names[i])
-                  for i in range(len(logs))]
-    run_legend.append(Line2D([0], [0], color='k', linestyle='-', lw=2, label='Commanded'))
-    axes.legend(handles=run_legend, loc="upper left")
+    style_handles = []
+
+    # Only add the "mean" style explanation if enabled
+    if PLOT_MEANS:
+        style_handles.append(Line2D([0], [0], color='black', linestyle='--', lw=2, label='moving average'))
+
+    # Add reference line entry
+    style_handles.append(Line2D([0], [0], color='black', linestyle='-', lw=2, label=r'$v_x^d$'))
+
+    # Combine into one legend
+    legend_handles = run_handles + style_handles
+
+    axes.legend(handles=legend_handles,  loc="lower center",
+     bbox_to_anchor=(0.5, 0.96),
+     ncol=len(legend_handles),framealpha=0.0,
+     fontsize=20,
+     columnspacing=0.8)  # Puts all legend entries in one row fontsize = 20,
+                # ncol=1, frameon=True)
+
+    # if PLOT_MEANS:
+    #     # Add manual style key as annotation or secondary legend
+    #     style_handles = [
+    #         Line2D([0], [0], color='black', linestyle='-', lw=2, label='actual'),
+    #         Line2D([0], [0], color='black', linestyle='--', lw=2, label='mean'),
+    #     ]
+    #     style_legend = axes.legend(handles=style_handles, loc="lower right")
+    #     axes.add_artist(style_legend)
+
+    # # Legend for color/run names
+    # run_legend = [Line2D([0], [0], color=run_colors[i], lw=2, label=run_names[i])
+    #               for i in range(len(logs))]
+    # run_legend.append(Line2D([0], [0], color='gray', linestyle='-', lw=2, label='$v_x^d$'))
+    # axes.legend(handles=run_legend, loc="lower left")
 
     # Pull plots up tight — no suptitle, no extra padding
-    fig.subplots_adjust(top=0.94)
+    # fig.subplots_adjust(top=0.94)
 
 
 
@@ -172,6 +216,7 @@ def main():
     os.makedirs("experiments/plots", exist_ok=True)
     plt.savefig("experiments/plots/velocity_comparison_plot.svg", bbox_inches='tight', transparent=True)
     plt.savefig("experiments/plots/velocity_comparison_plot.png", bbox_inches='tight', transparent=True)
+    plt.savefig("experiments/plots/velocity_comparison_plot.pdf", bbox_inches='tight', transparent=True)
 
 
 

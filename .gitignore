@@ -77,6 +77,7 @@ transfer/obelisk/ctrl_logs/
 
 transfer/sim/MUJOCO_LOG.TXT
 
+transfer/sim/experiments/mass_randomization_*/
 remote_mount/
 vulcan_mount/
 g1_mount/

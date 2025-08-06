@@ -416,7 +416,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
             axs[1].grid(True, alpha=0.3)
             axs[1].legend()
-            axs[1].set_ylim(-100.0, 100.0)
+            # axs[1].set_ylim(-100.0, 100.0)
             alpha = 1.0
             decay = alpha * v_data[:, env_id] + vdot_data[:, env_id]
             axs[2].plot(time_steps, decay, label='CLF Decay', linewidth=2)
@@ -425,7 +425,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             axs[2].set_ylabel('Decay Rate')
             axs[2].grid(True, alpha=0.3)
             axs[2].legend()
-            axs[2].set_ylim(-100.0, 100.0)
+            # axs[2].set_ylim(-100.0, 100.0)
             plt.tight_layout()
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'v_and_vdot_env{env_id}.png'), dpi=300, bbox_inches='tight')

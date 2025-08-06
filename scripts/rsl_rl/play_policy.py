@@ -29,10 +29,8 @@ SIM_ENVIRONMENTS = {
     "lip_clf": "G1-LIP-ref-play",
     "lip_ref_tracking": "G1-LIP-ref-play",
     "lip_clf_vdot": "G1-LIP-ref-play",
-    "hzd_clf": "G1-hzd-clf",
     "hzd_clf_play": "G1-hzd-clf-play",
-    "hzd_clf_custom": "G1-hzd-clf-custom",
-    "hzd_clf_minimum": "G1-hzd-clf-minimum",
+    "hzd_clf_custom": "G1-hzd-clf-play",
 }
 
 class DataLogger:

@@ -9,14 +9,14 @@ import matplotlib.pyplot as plt
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from transfer.sim.simulation import Simulation
-from transfer.sim.robot import Robot
-from transfer.sim.rl_policy_wrapper import RLPolicy
-from transfer.sim.plot_from_sim import create_plots_for_newest
-from transfer.sim.log_utils import find_most_recent_timestamped_folder, extract_data
+from sim.simulation import Simulation
+from sim.robot import Robot
+from sim.rl_policy_wrapper import RLPolicy
+from sim.plot_from_sim import create_plots_for_newest
+from sim.log_utils import find_most_recent_timestamped_folder, extract_data
 
 from performance_statistics import compute_stats
-from velocity_commands import speed_steps, smooth_ramp
+from velocity_commands import speed_steps, smooth_ramp, ramped_speed_steps
 
 
 def main():
@@ -72,11 +72,14 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=smooth_ramp, rng=rng)
+                           input_function=ramped_speed_steps, rng=rng)
 
-    run_logs = []
+    # run_logs = []
+    base_log_dir = os.path.join("experiments", f"mass_randomization_{config_file_name}")
+    os.makedirs(base_log_dir, exist_ok=True)
 
-    NUM_RUNS = 15
+
+    NUM_RUNS = 50
 
     for i in range(NUM_RUNS):
         # Adjust the torso mass position
@@ -85,11 +88,11 @@ def main():
 
         # Create and run simulation
         sim = Simulation(policy, robot_instance, log=True,
-                         log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+                         log_dir=base_log_dir,
                          use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
-        sim.run_headless(total_time=8, force_disturbance=None)
+        sim.run_headless(total_time=10, force_disturbance=None)
 
-        run_logs.append(sim.get_logging_folder())
+        # run_logs.append(sim.get_logging_folder())
 
         # Make plots and statistics
         # create_plots_for_newest()
@@ -107,51 +110,51 @@ def main():
         robot_instance.reset_torso_mass_pos()
 
     # Load back in all the data
-    actual_vel_list = []
-    commanded_vel_list = []
-    time_list = []
-    for i in range(NUM_RUNS):
-        # Parse the data
-        log_dir = os.path.join(os.getcwd(), run_logs[i])
+    # actual_vel_list = []
+    # commanded_vel_list = []
+    # time_list = []
+    # for i in range(NUM_RUNS):
+    #     # Parse the data
+    #     log_dir = os.path.join(os.getcwd(), run_logs[i])
 
-        # Load in the data
-        with open(os.path.join(log_dir, "sim_config.yaml")) as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
-            data = extract_data(os.path.join(log_dir, "sim_log.csv"), config)
+    #     # Load in the data
+    #     with open(os.path.join(log_dir, "sim_config.yaml")) as f:
+    #         config = yaml.load(f, Loader=yaml.FullLoader)
+    #         data = extract_data(os.path.join(log_dir, "sim_log.csv"), config)
 
-            actual_vel_list.append(data["qvel"])
-            commanded_vel_list.append(data["commanded_vel"])
-            time_list.append(data["time"])
+    #         actual_vel_list.append(data["qvel"])
+    #         commanded_vel_list.append(data["commanded_vel"])
+    #         time_list.append(data["time"])
 
-    time_np = np.stack(time_list)
-    commanded_vel_np = np.stack(commanded_vel_list)
-    actual_vel_np = np.stack(actual_vel_list)
+    # time_np = np.stack(time_list)
+    # commanded_vel_np = np.stack(commanded_vel_list)
+    # actual_vel_np = np.stack(actual_vel_list)
 
-    mean_actual = np.mean(actual_vel_np, axis=0)
-    std_actual = np.std(actual_vel_np, axis=0)
+    # mean_actual = np.mean(actual_vel_np, axis=0)
+    # std_actual = np.std(actual_vel_np, axis=0)
 
-    # Make some plots
-    plt.rcParams.update({'font.size': 18})
-    plt.rcParams.update({
-        "text.usetex": True,  # Use LaTeX for all text
-        "font.family": "serif",  # Use serif font (default LaTeX style)
-        "font.serif": ["Computer Modern Roman"],  # LaTeX default font
-    })
-    fig, axes = plt.subplots(1, 1, figsize=(10, 6))
-    # fig.suptitle('Commanded vs Actual Velocities')
+    # # Make some plots
+    # plt.rcParams.update({'font.size': 18})
+    # plt.rcParams.update({
+    #     "text.usetex": True,  # Use LaTeX for all text
+    #     "font.family": "serif",  # Use serif font (default LaTeX style)
+    #     "font.serif": ["Computer Modern Roman"],  # LaTeX default font
+    # })
+    # fig, axes = plt.subplots(1, 1, figsize=(10, 6))
+    # # fig.suptitle('Commanded vs Actual Velocities')
 
-    axes.plot(time_np[0, :], commanded_vel_np[0, :, 0], 'k--', linewidth="2", label='Commanded')
-    # axes[1].plot(time_np[0, :], commanded_vel_np[0, :, 1], 'r--', label='Commanded')
-    # axes[2].plot(time_np[0, :], commanded_vel_np[0, :, 2], 'r--', label='Commanded')
+    # axes.plot(time_np[0, :], commanded_vel_np[0, :, 0], 'k--', linewidth="2", label='Commanded')
+    # # axes[1].plot(time_np[0, :], commanded_vel_np[0, :, 1], 'r--', label='Commanded')
+    # # axes[2].plot(time_np[0, :], commanded_vel_np[0, :, 2], 'r--', label='Commanded')
 
-    # Plot x velocity
-    axes.plot(time_np[0], mean_actual[:, 0], 'tab:blue', label=f'Actual_{i}')
-    axes.fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
-    axes.set_ylabel(r'$v_x$ (m/s)')
-    axes.set_xlabel('Time (s)')
-    axes.legend()
-    axes.grid(True)
-    axes.set_ylim(-0.6, 1.05)
+    # # Plot x velocity
+    # axes.plot(time_np[0], mean_actual[:, 0], 'tab:blue', label=f'Actual_{i}')
+    # axes.fill_between(np.squeeze(time_np[0, :]), mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0], color='blue', alpha=0.3, label='±1 Std Dev')
+    # axes.set_ylabel(r'$v_x$ (m/s)')
+    # axes.set_xlabel('Time (s)')
+    # axes.legend()
+    # axes.grid(True)
+    # axes.set_ylim(-0.6, 1.05)
 
     # # Plot y velocity
     # axes[1].plot(time_np[0, :], mean_actual[:, 1], 'b-', label=f'Actual_{i}')
@@ -167,13 +170,13 @@ def main():
     # axes[2].set_ylabel('Angular Velocity (rad/s)')
     # axes[2].legend()
     # axes[2].grid(True)
-
-    plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.png")
-    plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.svg", transparent=True)
+    # os.makedirs("experiments/plots", exist_ok=True)
+    # plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.png")
+    # plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.svg", transparent=True)
 
 if __name__ == "__main__":
     main()
-    plt.show()
+    # plt.show()
 
 
 

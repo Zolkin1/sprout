@@ -41,12 +41,10 @@ def main():
     if missing_fields:
         raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
 
-    policy_base_dir = str(Path.cwd().parent.parent / "logs")
 
     # Make the RL policy
     policy = RLPolicy(
         dt=config["dt"],
-        policy_base_dir=policy_base_dir,
         checkpoint_path=config["checkpoint_path"],
         num_obs=config["num_obs"],
         num_action=config["num_action"],

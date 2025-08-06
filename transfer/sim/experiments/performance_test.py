@@ -75,7 +75,7 @@ def main():
                      log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
                      use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
     sim.run_headless(total_time=24)
-
+    # sim.run(total_time=24)
     # Make plots and statistics
     create_plots_for_newest()
     compute_stats(0)

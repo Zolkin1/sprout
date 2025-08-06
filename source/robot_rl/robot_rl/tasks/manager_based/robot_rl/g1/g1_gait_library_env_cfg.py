@@ -96,16 +96,6 @@ class G1FlatRefTrackingEnvCfg(G1GaitLibraryEnvCfg):
 
 
 @configclass
-class G1_clf_rl_minimum_rewards(G1GaitLibraryEnvCfg):
-    """Minimum reward terms env cfg."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        #keeping action rate l2 and dof pos limits and torque cost?
-        self.rewards.dof_acc_l2 = None
-        self.rewards.dof_vel_l2 = None
-
-@configclass
 class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
     """Configuration for the G1 environment with gait library."""
 
@@ -128,9 +118,8 @@ class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
 
 
 
-class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
+class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
     """Configuration for the G1 environment with gait library."""
-    commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
 
     def __post_init__(self):
         # Post init of parent
@@ -143,3 +132,14 @@ class G1GL_PlayEnvCfg(G1GaitLibraryEnvCfg):
         # self.scene.terrain.num_cols = 1
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
+
+        self.events.randomize_ground_contact_friction = None
+        self.events.add_base_mass = None
+        self.events.base_com = None
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        
+        
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
