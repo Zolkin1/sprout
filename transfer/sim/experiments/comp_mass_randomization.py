@@ -26,9 +26,10 @@ class HandlerOverlay(HandlerBase):
         return [p, l]
 
 def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
+    
     experiment_dirs = [
         os.path.join(root_dir, d)
-        for root_dir, _, _ in os.walk("experiments")
+        for root_dir, _, _ in os.walk("experiments/mass_rand_comp")
         for d in os.listdir(root_dir)
         if d.startswith(root_dir_pattern) and os.path.isdir(os.path.join(root_dir, d))
     ]

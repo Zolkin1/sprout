@@ -74,7 +74,9 @@ g1_hardware_log/
 
 transfer/obelisk/.vscode/
 transfer/obelisk/ctrl_logs/
-
+transfer/sim/experiments/mass_rand_comp/
+transfer/sim/experiments/hzd_clf_dec_comp/
+*.csv
 transfer/sim/MUJOCO_LOG.TXT
 
 transfer/sim/experiments/mass_randomization_*/

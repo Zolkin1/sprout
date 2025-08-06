@@ -158,57 +158,6 @@ def main():
      columnspacing=0.8)  # Puts all legend entries in one row fontsize = 20,
                 # ncol=1, frameon=True)
 
-    # if PLOT_MEANS:
-    #     # Add manual style key as annotation or secondary legend
-    #     style_handles = [
-    #         Line2D([0], [0], color='black', linestyle='-', lw=2, label='actual'),
-    #         Line2D([0], [0], color='black', linestyle='--', lw=2, label='mean'),
-    #     ]
-    #     style_legend = axes.legend(handles=style_handles, loc="lower right")
-    #     axes.add_artist(style_legend)
-
-    # # Legend for color/run names
-    # run_legend = [Line2D([0], [0], color=run_colors[i], lw=2, label=run_names[i])
-    #               for i in range(len(logs))]
-    # run_legend.append(Line2D([0], [0], color='gray', linestyle='-', lw=2, label='$v_x^d$'))
-    # axes.legend(handles=run_legend, loc="lower left")
-
-    # Pull plots up tight — no suptitle, no extra padding
-    # fig.subplots_adjust(top=0.94)
-
-
-
-
-        # TODO: Fix
-        # ## Positions
-        # qpos = data['qpos']
-        # actual_pos = qpos[:, :3]
-        #
-        # # Calculate desired position by integrating commanded velocity
-        # dt = time[1] - time[0]  # Assuming constant time step
-        # desired_pos = np.zeros_like(actual_pos)
-        # desired_pos[0] = actual_pos[0]  # Start from actual position
-        #
-        # for j in range(1, len(time)):
-        #     desired_pos[j] = desired_pos[j - 1] + commanded_vel[j - 1] * dt
-        #
-        # if i == 0:
-        #     axes_p[0].plot(time, desired_pos[:, 0], 'k--', label='Commanded', linewidth=3)
-        #     axes_p[1].plot(time, desired_pos[:, 1], 'k--', label='Commanded', linewidth=3)
-        #
-        # # Plot x position
-        # print(actual_pos)
-        # print(time)
-        # axes_p[0].plot(time, actual_pos[:, 0], color, label=run_names[i], linewidth=2)
-        # axes_p[0].set_ylabel('X Position (m)')
-        # axes_p[0].legend()
-        # axes_p[0].grid(True)
-        #
-        # # Plot y position
-        # axes_p[1].plot(time, actual_pos[:, 1], color, label=run_names[i], linewidth=2)
-        # axes_p[1].set_ylabel('Y Position (m)')
-        # axes_p[1].legend()
-        # axes_p[1].grid(True)
 
 
 
