@@ -9,7 +9,6 @@
 **/.thumbs
 
 # No USD files allowed in the repo
-**/*.usd
 **/*.usda
 **/*.usdc
 **/*.usdz
@@ -67,5 +66,28 @@ datasets
 transfer/obelisk/install/
 transfer/obelisk/log/
 transfer/obelisk/build/
+transfer/obelisk/MUJOCO_LOG.TXT
+g1_hardware_log/
+
+*.pkl
+
+*.png
+
+transfer/obelisk/.vscode/
+transfer/obelisk/ctrl_logs/
+transfer/obelisk/optitrack_logs/
+
+transfer/sim/experiments/mass_rand_comp/
+transfer/sim/experiments/hzd_clf_dec_comp/
+*.csv
+transfer/sim/MUJOCO_LOG.TXT
+
+transfer/sim/experiments/mass_randomization_*/
+remote_mount/
+vulcan_mount/
+g1_mount/
 
 transfer/sim/MUJOCO_LOG.TXT
+transfer/sim/experiments/plots
+paper_figures/
+transfer/sim/experiments/comparison_logs

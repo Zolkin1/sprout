@@ -10,6 +10,7 @@ This project is a set of tools for end-to-end development of RL for robots. Spec
 interface can be run through a docker/dev-container provided in this repo. See below for more information.
 
 ## Installation
+When you clone this repo, please use Git Large File System (lfs).
 
 - Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
   We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
@@ -45,16 +46,17 @@ This helps in indexing all the python modules for intelligent suggestions while 
 ## Running Tasks
 To train a policy run:
 ```bash
-python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
+python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --headless
 ```
 
 Note that right now the only RL_LIBRARY that is tested in `RSL_RL`.
 
 To play the most recently trained policy for a given task run:
 ```bash
-python scripts/<RL_LIBRARY>/play.py --task=<TASK_NAME>
+python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --headless
 ```
 
+for a speicifc run you can pass in additional config such as `--load_run=<run_dir>`
 If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<log_dir_checkpoint>`.
 
 For both `train` and `play` you can also specify a number of envs with `--num_envs=###`.
@@ -67,8 +69,17 @@ RL Task list:
 
 | Task          |   Robot    |   Hardware Tested?   | Description                                                      |
 |---------------|:----------:|:--------------------:|------------------------------------------------------------------|
-| `G1-flat-vel` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
+| `vanilla` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
+| `lip_clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
+| `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 
+## Copying checkpoitns from remote server 
+First mount the server to your local desktop
+ 
+```
+bash scripts/mount_remote.sh
+bash scripts/copy_from_mount.sh <ENV_NAME> g1
+```
 
 ## sim2sim Transfer
 This code base has a built in sim2sim transfer (i.e. the policy is trained in IsaacLab and can be run in Mujoco).

@@ -1,0 +1,23 @@
+# G1_21j config
+robot_name: "g1_21j"
+checkpoint_path: "/home/amy/gitrepo/robot_rl/logs/g1_policies/stair/g1/2025-07-10_12-14-33/exported/policy.pt"
+num_obs: 700
+num_action: 21
+period: 1.0                   # s
+dt: 0.02                      # 50 Hz
+ang_vel_scale: 1
+command_scale: [2, 2, 2]
+qpos_scale: 1
+qvel_scale: 0.05 #0.1
+action_scale: 0.25
+height_map_scale: 1.0         # Height sensor enabled for stair scenario
+def_ang_order: "mj"
+default_angles: [-0.1, 0, 0, 0.3, -0.2, 0,
+                  -0.1, 0, 0, 0.3, -0.2, 0,
+                  0,
+                  0.15, 0.7, 0.45, 0.5,
+                  0.15, -0.7, 0.45, 0.5]
+log: true
+log_dir: "logs"
+scene: "stairs_scene"
+policy_type: "cnn"

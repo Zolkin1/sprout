@@ -2,7 +2,8 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-
+from dataclasses import MISSING
+from typing import Literal
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
@@ -12,10 +13,36 @@ from isaaclab_rl.rsl_rl import (
 
 
 @configclass
+class CustomPPOActorCriticCfg:
+    """Configuration for the PPO actor-critic networks."""
+
+    class_name: str = "ActorCriticCNN"
+    """The policy class name. Default is ActorCritic."""
+
+    init_noise_std: float = MISSING
+    """The initial noise standard deviation for the policy."""
+
+    noise_std_type: Literal["scalar", "log"] = "scalar"
+    """The type of noise standard deviation for the policy. Default is scalar."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the actor network."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the critic network."""
+
+    activation: str = MISSING
+    """The activation function for the actor and critic networks."""
+
+    height_map_shape: tuple[int, int, int] = (1, 16,16)
+    """The shape of the height map (C, H, W)."""
+
+
+@configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 6000  # 10000
-    save_interval = 50
+    max_iterations = 2000
+    save_interval = 200
     experiment_name = "g1"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
@@ -38,3 +65,6 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+    resume = False
+    resume_path = None
+

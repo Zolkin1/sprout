@@ -1,3 +1,10 @@
-from .command_cfg import GaitPeriodCfg
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
 
-__all__ = ["GaitPeriodCfg"]
+"""Command configurations for the environment."""
+
+from .gaitPeriodCfg import GaitPeriodCfg
+
+__all__ = ["GaitPeriodCfg"] 

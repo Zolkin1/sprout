@@ -35,7 +35,7 @@ class HumanoidCommandsCfg(CommandsCfg):
     """Command specifications for the MDP."""
 
     # Command for the set period
-    step_period = mdp.GaitPeriodCfg(period_range=(0.8, 0.8), resampling_time_range=(10.0, 10.0))
+    step_period = mdp.commands.GaitPeriodCfg(period_range=(0.8, 0.8), resampling_time_range=(10.0, 10.0))
 
 
 @configclass
@@ -84,8 +84,8 @@ class HumanoidEventsCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
-            "static_friction_range": (0.1, 1.25),
-            "dynamic_friction_range": (0.1, 1.25),
+            "static_friction_range": (0.25, 1.25),
+            "dynamic_friction_range": (0.25, 1.25),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
             "make_consistent": True,  # ensures dynamic friction <= static friction
@@ -110,7 +110,7 @@ class HumanoidEventsCfg:
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis_link"),
             "mass_distribution_params": (-5.0, 5.0),
             "operation": "add",
         },
@@ -121,7 +121,7 @@ class HumanoidEventsCfg:
         func=mdp.randomize_rigid_body_com,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis_link"),
             "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
         },
     )
@@ -131,7 +131,7 @@ class HumanoidEventsCfg:
         func=mdp.apply_external_force_torque,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis_link"),
             "force_range": (0.0, 0.0),
             "torque_range": (-0.0, 0.0),
         },

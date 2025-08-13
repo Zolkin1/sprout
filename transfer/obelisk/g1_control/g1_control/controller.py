@@ -3,6 +3,10 @@ from abc import ABC
 
 import numpy as np
 import torch
+from datetime import datetime
+import time
+import csv
+import shutil
 from ament_index_python.packages import get_package_share_directory
 from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
@@ -11,6 +15,7 @@ from obelisk_py.core.obelisk_typing import ObeliskControlMsg, is_in_bound
 from obelisk_py.core.utils.ros import spin_obelisk
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
+from sensor_msgs.msg import Joy
 
 
 class VelocityTrackingController(ObeliskController, ABC):
@@ -27,14 +32,60 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         # Load policy
         self.declare_parameter("policy_name", "")
+        self.declare_parameter("obs_type", "")
+        self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
         policy_name = self.get_parameter("policy_name").get_parameter_value().string_value
         pkg_path = get_package_share_directory("g1_control")
         policy_path = os.path.join(pkg_path, f"resource/policies/{policy_name}")
         self.policy = torch.jit.load(policy_path)
         self.device = next(self.policy.parameters()).device
 
-        # POlicy information
-        self.num_obs = 74
+        # Logging information
+        self.declare_parameter("log", False)
+        self.declare_parameter("log_decimation", 1)
+        self.log = self.get_parameter("log").get_parameter_value().bool_value
+        self.log_decimation = self.get_parameter("log_decimation").get_parameter_value().integer_value
+        self.ctrl_count = 0
+
+        self.start_time = self.get_clock().now().nanoseconds / 1e9
+
+        if self.log:
+            self.get_logger().info(f"Logging enabled. Decimation: {self.log_decimation}.")
+
+            # Create log directory relative to $ROBOT_RL_ROOT
+            root = os.environ.get("ROBOT_RL_ROOT", "")
+
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_dir = os.path.join(root, "ctrl_logs", timestamp)
+            os.makedirs(log_dir, exist_ok=True)
+
+            self.log_file = os.path.join(log_dir, "g1_control.csv")
+            self.file = open(self.log_file, "w", buffering=8192)
+            self.writer = csv.writer(self.file)
+            self._lines_written = 0
+            self._file_index = 0
+
+            # Copy the config into the log directory
+            self.declare_parameter("config_name", "")
+            config_name = self.get_parameter("config_name").get_parameter_value().string_value
+            if config_name != "":
+                self.get_logger().info(f"Copying the config to the log directory ({config_name})...")
+                config_path = os.path.join(root, "g1_control", "configs", config_name)
+                shutil.copy2(config_path, log_dir)
+
+
+            # Copy the policy into the log directory
+            self.get_logger().info("Copying the policy to the log directory...")
+            shutil.copy2(policy_path, log_dir)
+
+            # Make a file with the log ordering
+            header_path = os.path.join(log_dir, "fields.csv")
+            with open(header_path, "w") as f:
+                f.write("time,observation,action\n")
+
+        # Policy information
+        self.declare_parameter("num_obs", 74)
+        self.num_obs = self.get_parameter("num_obs").get_parameter_value().integer_value
         self.isaac_to_mujoco = {
             0: 0,  # left_hip_pitch
             1: 6,  # right_hip_pitch
@@ -176,7 +227,21 @@ class VelocityTrackingController(ObeliskController, ABC):
             msg_type=VelocityCommand,
         )
 
+
+        self.last_menu_press = self.get_clock().now().nanoseconds / 1e9
+        self.last_A_press = self.get_clock().now().nanoseconds / 1e9
+
+        self.register_obk_subscription(
+            "sub_joystick",
+            self.joystick_callback,
+            msg_type=Joy,
+            key="sub_joy_key",  # key can be specified here or in the config file
+        )
+
         self.received_xhat = False
+        
+        self.joystick_control = True
+        self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
 
         self.get_logger().info(f"Policy: {policy_path} loaded on {self.device}.")
         self.get_logger().info("RL Velocity Tracking node constructor complete.")
@@ -218,14 +283,31 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.received_xhat = True
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
-        self.cmd_vel[0] = min(
-            max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
-            self.get_parameter("v_x_max").get_parameter_value().double_value,
-        )
-        v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
-        self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
-        w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
-        self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
+        """Callback for velocity command messages."""
+        if self.joystick_control:
+            self.cmd_vel[0] = min(
+                max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
+                self.get_parameter("v_x_max").get_parameter_value().double_value,
+            )
+            v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
+            self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
+            w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
+            self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
+        else:
+            vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
+            RAMP_TIME = 2.0
+            slope = vx_max / RAMP_TIME
+
+            now = self.get_clock().now().nanoseconds / 1e9
+            self.cmd_vel[0] = min(slope * (now - self.joystick_exited), vx_max)
+            v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
+            self.cmd_vel[1] = 0
+            w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
+            self.cmd_vel[2] = 0
+
+            if now - self.joystick_exited > 8:
+                self.joystick_control = True
+                self.get_logger().info("Joystick control re-enabled after timeout.")
 
     @staticmethod
     def project_gravity(quat):
@@ -273,6 +355,102 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         return obs
 
+    def get_gl_obs(self):
+      
+        obs = np.zeros(self.num_obs, dtype=np.float32)
+
+        obs[:3] = self.omega * self.ang_vel_scale                                                 # Angular velocity
+        obs[3:6] = self.proj_g                                        # Projected gravity
+        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
+        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
+        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]     
+                                     # Command velocity
+
+        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
+        nj = len(joint_pos_isaac)
+
+        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
+        obs[9 : 9 + nj] = joint_vel_isaac* self.qvel_scale  # Joint vel
+        obs[9 + nj : 9 + 2 * nj] =  joint_pos_isaac
+     
+
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
+
+        sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+
+        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0).float()
+        return obs_tensor
+
+    def get_cnn_obs(self):
+        """Create the observation vector from the sensor data"""
+        # height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
+
+        height_obs = np.ones(625)*0.2877
+        obs = np.zeros(self.num_obs - height_obs.shape[0], dtype=np.float32)
+
+        obs[:3] = self.omega * self.ang_vel_scale                                                 # Angular velocity
+        obs[3:6] = self.proj_g                                        # Projected gravity
+        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
+        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
+        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]     
+                                     # Command velocity
+
+        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
+        nj = len(joint_pos_isaac)
+
+        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
+        obs[9 : 9 + nj] = joint_vel_isaac* self.qvel_scale  # Joint vel
+        obs[9 + nj : 9 + 2 * nj] =  joint_pos_isaac
+     
+
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
+
+        sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+
+        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+        # obs[9 + 3 * nj : 9 + 3 * nj + 2 + 1] = self.period/2
+
+        final_obs = np.concatenate((height_obs, obs))
+
+        obs_tensor = torch.from_numpy(final_obs).unsqueeze(0).float()
+
+        return obs_tensor
+
+    def create_mlp_obs(self):
+        """Create the observation vector from the sensor data"""
+        obs = np.zeros(self.num_obs, dtype=np.float32)
+
+        obs[:3] = self.omega*self.ang_vel_scale                                                 # Angular velocity
+        obs[3:6] = self.proj_g                                        # Projected gravity
+        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
+        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
+        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]
+                                     # Command velocity
+
+        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
+        nj = len(joint_pos_isaac)
+
+        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
+        obs[9 : 9 + nj] = joint_pos_isaac  # Joint position
+        obs[9 + nj : 9 + 2 * nj] = joint_vel_isaac* self.qvel_scale # Joint velocity
+
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
+
+        sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+
+        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+
+        # print(obs_tensor)
+
+        return obs_tensor
+    
     def compute_control(self) -> PDFeedForward:
         """Compute the control signal for the dummy 2-link robot.
 
@@ -281,10 +459,17 @@ class VelocityTrackingController(ObeliskController, ABC):
         """
         # Generate input to RL model
         if self.received_xhat:
-            obs = self.get_obs()
+            if self.obs_type == "cnn":
+                obs = self.get_cnn_obs()
+            elif self.obs_type == "gl":
+                obs = self.get_gl_obs()
+            elif self.obs_type == "mlp":
+                obs = self.create_mlp_obs()
+            else:
+                obs = self.get_obs()
 
             # Call RL model
-            self.action = self.policy(torch.tensor(obs).to(self.device).float()).detach().cpu().numpy()
+            self.action = self.policy(torch.tensor(obs).to(self.device).float()).detach().cpu().numpy().squeeze()
 
             # setting the message
             pd_ff_msg = PDFeedForward()
@@ -305,11 +490,37 @@ class VelocityTrackingController(ObeliskController, ABC):
             pd_ff_msg.kp = self.kps
             pd_ff_msg.kd = self.kds
             self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
+
+            # Log observation and action
+            if self.log and self.ctrl_count % self.log_decimation == 0:
+                self.log_data(obs, self.action)
+
+            self.ctrl_count += 1
+
             assert is_in_bound(type(pd_ff_msg), ObeliskControlMsg)
             return pd_ff_msg
+    
+    def joystick_callback(self, msg: Joy) -> None:
+        """Joystick callback.
+        This is mostly for an e-stop.
+        """
 
-    def on_shutdown(self, state: LifecycleState) -> TransitionCallbackReturn:
-        return TransitionCallbackReturn.SUCCESS
+        RIGHT_TRIGGER = 5
+        if msg.axes[RIGHT_TRIGGER] <= 0.1:
+            raise RuntimeError("Joystick emergency stop triggered!!")
+
+        MENU = 7
+        now = self.get_clock().now().nanoseconds / 1e9
+        if msg.buttons[MENU] >= 0.9 and now - self.last_menu_press > 0.5:
+            self.last_menu_press = now
+            self.get_logger().info("Button mappings:\n E-STOP: Right Trigger. \n Forward/Backward: Left Stick. \n Turning: Right Stick. \n Damping: Right D-Pad. \n Low Level Ctrl: Bottom D-Pad. \n User Pose: Squares.")
+
+        A = 0
+        if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.5:
+            self.last_A_press = now
+            self.joystick_control = not self.joystick_control
+            self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info(f"Joystick control {'enabled' if self.joystick_control else 'disabled'}.")
 
     def _convert_to_mujoco(self, vec):
         mj_vec = np.zeros(21)
@@ -343,6 +554,13 @@ class VelocityTrackingController(ObeliskController, ABC):
         joint_values.insert(26, 0.0)
 
         return joint_values
+
+    def log_data(self, obs, action):
+        log_time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
+        obsaction = obs.tolist() + action.tolist()
+        row = [log_time] + obsaction
+        self.writer.writerow(row)
+
 
 
 def main(args: list | None = None) -> None:
