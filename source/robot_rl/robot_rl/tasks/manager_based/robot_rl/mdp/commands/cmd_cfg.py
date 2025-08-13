@@ -49,8 +49,8 @@ class HLIPCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     yaw_idx: list[int] = [5,11]
     T_ds: float = 0.0          # double support duration (s)
-    z0: float = 0.68           # CoM height (m)
-    y_nom: float = 0.26        # nominal lateral foot offset (m)
+    z0: float = 0.67           # CoM height (m)
+    y_nom: float = 0.25        # nominal lateral foot offset (m)
     gait_period: float = 0.8   # gait cycle period (s)
     debug_vis: bool = False    # enable debug visualization
     z_sw_max: float = 0.1    # max swing foot z height (m); this is ankle height so different from actual foot position
