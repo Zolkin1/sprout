@@ -131,7 +131,7 @@ def plot_policy_subplot_comparison(hzd_paths, baseline_paths, labels=None,
         "font.family": "serif",
         "font.serif": ["Computer Modern Roman"],
     })
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(6.7, 8), sharex=True)
 
     if labels is None:
         labels = [f"Policy {i+1}" for i in range(len(hzd_paths))]
@@ -184,11 +184,66 @@ def plot_policy_subplot_comparison(hzd_paths, baseline_paths, labels=None,
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path + ".png", bbox_inches='tight')
+        fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
+        fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
+
+    plt.show()
+
+
+def plot_global_position(file_paths, labels=None, time_ranges=None, smooth_window=10, title=None, save_path=None):
+    plt.rcParams.update({'font.size': 18})
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "font.serif": ["Computer Modern Roman"],
+    })
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+    if labels is None:
+        labels = [f"Policy {i+1}" for i in range(len(file_paths))]
+    if time_ranges is None:
+        time_ranges = [(None, None)] * len(file_paths)
+
+    for file_path, label, (t_start, t_end) in zip(file_paths, labels, time_ranges):
+        df = parse_g1_control_csv(file_path)
+
+        if t_start is not None:
+            df = df[df["time"] >= t_start]
+        if t_end is not None:
+            df = df[df["time"] <= t_end]
+        df = df.reset_index(drop=True)
+
+        pos_x = df["pos_x"]
+        pos_y = df["pos_y"]
+     #    pos_x = smooth_signal(df["pos_x"], smooth_window)
+     #    pos_y = smooth_signal(df["pos_y"], smooth_window)
+
+        ax.plot(pos_x, pos_y, label=label, linewidth=1.5)
+
+    ax.set_xlabel(r"$x$ (m)", fontsize=20)
+    ax.set_ylabel(r"$y$ (m)", fontsize=20)
+    ax.grid(True)
+    ax.legend(fontsize=18, loc="best")
+    ax.set_aspect("equal", adjustable="box")
+
+    if title is not None:
+        ax.set_title(title, fontsize=22)
+
+    plt.xticks(fontsize=16)
+    plt.yticks(fontsize=16)
+    plt.tight_layout()
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path + ".png", bbox_inches='tight', transparent=True)
         fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
         fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
 
     plt.show()
+
+
 
 # === Updated Example Usage ===
 if __name__ == "__main__":
@@ -233,6 +288,38 @@ if __name__ == "__main__":
         save_path="experiments/plots/hardware_hzd_vs_baseline"
     )
 
+#     file_paths = [
+#         "experiments/hardware_logs/g1_control_lip_v2.csv",
+#         "experiments/hardware_logs/g1_control_baseline.csv",
+#     ]
+
+#     labels = [
+#         "LIP",
+#         "Baseline",
+#     ]
+    
+#     time_ranges = [
+#         (110, 125),
+#         (124, 139),
+#     ]
+
+#     plot_multiple_policies(
+#           file_paths=file_paths,
+#           labels=labels,
+#           time_ranges=time_ranges,
+#           smooth_window=10,
+#           title=""
+#      )
+
+
+#     plot_global_position(
+#         file_paths=baseline_file_paths,
+#         labels=labels,
+#         time_ranges=baseline_time_ranges,
+#         smooth_window=10,
+#         title="Global Position Trajectory",
+#         save_path="experiments/plots/hardware_global_traj_baseline"
+#     )
 
 
 # # === Example Usage ===

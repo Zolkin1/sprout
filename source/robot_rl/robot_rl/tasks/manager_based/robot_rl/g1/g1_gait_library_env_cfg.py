@@ -128,10 +128,12 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
-        # self.scene.terrain.num_rows = 1
-        # self.scene.terrain.num_cols = 1
-        self.scene.terrain.terrain_type = "plane"
-        self.scene.terrain.terrain_generator = None
+        self.scene.terrain.size = (3,3)
+        self.scene.terrain.border_width = 0.0
+        self.scene.terrain.num_rows = 3
+        self.scene.terrain.num_cols = 2
+        # self.scene.terrain.terrain_type = "plane"
+        # self.scene.terrain.terrain_generator = None
 
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
@@ -143,3 +145,7 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
+
+        self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
+        self.events.reset_base.params["pose_range"]["x"] = (-3,3)
+        self.events.reset_base.params["pose_range"]["y"] = (-3,3)
