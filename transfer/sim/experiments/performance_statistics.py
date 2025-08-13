@@ -27,10 +27,6 @@ def compute_stats(start_time=0):
 
         data = extract_data(os.path.join(newest, "sim_log.csv"), config)
 
-        robot = config["robot"]
-        policy = config["policy"]
-        policy_dt = config["policy_dt"]
-
         time = data["time"]
         commanded_vel = data["commanded_vel"]
         act_vel = data["qvel"][:, [0, 1, 5]]

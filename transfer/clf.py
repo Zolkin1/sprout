@@ -3,8 +3,8 @@ clf_qp_controller.py
 Minimal Control-Lyapunov-Function QP for HZD/virtual-constraint walking
 """
 
-from dataclasses import dataclass
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import casadi as ca
 import numpy as np

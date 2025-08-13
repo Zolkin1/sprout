@@ -1,9 +1,8 @@
 import csv
 import math
 import os
-import time
-from datetime import datetime
 from collections.abc import Callable
+from datetime import datetime
 
 import mujoco
 import mujoco.viewer

@@ -86,7 +86,6 @@ class RLPolicy:
         if torch.cuda.is_available():
             self.policy = self.policy.cuda()
 
-
     def create_obs(
         self,
         qjoints,
@@ -102,11 +101,17 @@ class RLPolicy:
         """Create the observation vector from the sensor data"""
 
         if self.policy_type == "mlp":
-            return self.create_mlp_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
+            return self.create_mlp_obs(
+                qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
+            )
         elif self.policy_type == "gl":
-            return self.create_gl_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
+            return self.create_gl_obs(
+                qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
+            )
         elif self.policy_type == "cnn":
-            return self.create_cnn_obs(qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention)
+            return self.create_cnn_obs(
+                qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
+            )
         else:
             raise ValueError(f"Invalid policy type: {self.policy_type}")
 
@@ -126,18 +131,18 @@ class RLPolicy:
         height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
         obs = np.zeros(self.num_obs - height_obs.shape[0], dtype=np.float32)
 
-        obs[:3] = body_ang_vel*self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = projected_gravity                                        # Projected gravity
-        obs[6] = des_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = des_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = des_vel[2]*self.cmd_scale[2]
-                                     # Command velocity
+        obs[:3] = body_ang_vel * self.ang_vel_scale  # Angular velocity
+        obs[3:6] = projected_gravity  # Projected gravity
+        obs[6] = des_vel[0] * self.cmd_scale[0]  # Command velocity
+        obs[7] = des_vel[1] * self.cmd_scale[1]  # Command velocity
+        obs[8] = des_vel[2] * self.cmd_scale[2]
+        # Command velocity
 
         nj = len(qjoints)
         if convention == "mj":
             qj = qjoints - self.default_angles
             obs[9 : 9 + nj] = self.convert_to_isaac(qvel) * self.qvel_scale  # Joint vel
-            obs[9 + nj : 9 + 2 * nj] =  self.convert_to_isaac(qj)  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = self.convert_to_isaac(qj)  # Joint pos
         else:
             qj = qjoints - self.convert_to_isaac(self.default_angles)
             obs[9 : 9 + nj] = qj  # Joint pos
@@ -173,18 +178,18 @@ class RLPolicy:
 
         obs = np.zeros(self.num_obs, dtype=np.float32)
 
-        obs[:3] = body_ang_vel*self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = projected_gravity                                        # Projected gravity
-        obs[6] = des_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = des_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = des_vel[2]*self.cmd_scale[2]
-                                     # Command velocity
+        obs[:3] = body_ang_vel * self.ang_vel_scale  # Angular velocity
+        obs[3:6] = projected_gravity  # Projected gravity
+        obs[6] = des_vel[0] * self.cmd_scale[0]  # Command velocity
+        obs[7] = des_vel[1] * self.cmd_scale[1]  # Command velocity
+        obs[8] = des_vel[2] * self.cmd_scale[2]
+        # Command velocity
 
         nj = len(qjoints)
         if convention == "mj":
             qj = qjoints - self.default_angles
             obs[9 : 9 + nj] = self.convert_to_isaac(qvel) * self.qvel_scale  # Joint vel
-            obs[9 + nj : 9 + 2 * nj] =  self.convert_to_isaac(qj)  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = self.convert_to_isaac(qj)  # Joint pos
         else:
             qj = qjoints - self.convert_to_isaac(self.default_angles)
             obs[9 : 9 + nj] = qj  # Joint pos
@@ -216,12 +221,12 @@ class RLPolicy:
         """Create the observation vector from the sensor data"""
         obs = np.zeros(self.num_obs, dtype=np.float32)
 
-        obs[:3] = body_ang_vel*self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = projected_gravity                                        # Projected gravity
-        obs[6] = des_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = des_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = des_vel[2]*self.cmd_scale[2]
-                                     # Command velocity
+        obs[:3] = body_ang_vel * self.ang_vel_scale  # Angular velocity
+        obs[3:6] = projected_gravity  # Projected gravity
+        obs[6] = des_vel[0] * self.cmd_scale[0]  # Command velocity
+        obs[7] = des_vel[1] * self.cmd_scale[1]  # Command velocity
+        obs[8] = des_vel[2] * self.cmd_scale[2]
+        # Command velocity
 
         nj = len(qjoints)
         if convention == "mj":
@@ -242,8 +247,10 @@ class RLPolicy:
             height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
             # print(height_obs)
             # height_obs = np.ones(256)*0.25
-            obs[9 + 3 * nj:9 + 3 * nj + height_obs.shape[0]] = height_obs
-            obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array([sin_phase, cos_phase])     # Phases
+            obs[9 + 3 * nj : 9 + 3 * nj + height_obs.shape[0]] = height_obs
+            obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array(
+                [sin_phase, cos_phase]
+            )  # Phases
         else:
             obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 
@@ -262,7 +269,6 @@ class RLPolicy:
             self.action_isaac = self.policy(obs).detach().numpy().squeeze()
 
         return self.convert_to_mujoco(self.action_isaac) * self.action_scale + self.default_angles
-
 
     def get_num_actions(self) -> int:
         return self.num_actions

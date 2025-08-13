@@ -199,10 +199,6 @@ def create_plots_for_newest():
 
         data = extract_data(os.path.join(newest, "sim_log.csv"), config)
 
-        robot = config["robot"]
-        policy = config["policy"]
-        policy_dt = config["policy_dt"]
-
         # print(data)
 
     print("============== Data generated using " + config["simulator"] + " ===============")

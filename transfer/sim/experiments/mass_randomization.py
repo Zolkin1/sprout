@@ -3,20 +3,16 @@ import os
 import sys
 from typing import Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from performance_statistics import compute_stats
-from sim.log_utils import extract_data, find_most_recent_timestamped_folder
-from sim.plot_from_sim import create_plots_for_newest
 from sim.rl_policy_wrapper import RLPolicy
 from sim.robot import Robot
 from sim.simulation import Simulation
-from velocity_commands import ramped_speed_steps, smooth_ramp, speed_steps
+from velocity_commands import ramped_speed_steps
 
 
 def main():

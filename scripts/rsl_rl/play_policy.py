@@ -1,5 +1,5 @@
 # use the same play config,but use different trained policy
-# based on the specific envrionment specified, use the corresponding trained policy
+# based on the specific environment specified, use the corresponding trained policy
 
 
 task = "custom-Isaac-Velocity-Flat-G1-Play-v0"

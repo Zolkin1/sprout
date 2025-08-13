@@ -2,7 +2,6 @@ import ast
 import glob
 import os
 import re
-from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np

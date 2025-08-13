@@ -12,9 +12,9 @@ import yaml
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from performance_statistics import compute_stats
-from velocity_commands import smooth_ramp, speed_steps
+from velocity_commands import smooth_ramp
 
-from transfer.sim.log_utils import extract_data, find_most_recent_timestamped_folder
+from transfer.sim.log_utils import extract_data
 from transfer.sim.plot_from_sim import create_plots_for_newest
 from transfer.sim.rl_policy_wrapper import RLPolicy
 from transfer.sim.robot import Robot
