@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import copy
 import os
-from typing import Optional
 
 import torch
 from torch import nn

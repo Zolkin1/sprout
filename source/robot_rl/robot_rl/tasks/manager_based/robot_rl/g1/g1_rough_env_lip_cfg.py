@@ -1,15 +1,8 @@
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
     CommandsCfg,  # Inherit from the base envs
-)
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
-    ObservationsCfg,
 )
 
 from robot_rl.tasks.manager_based.robot_rl import mdp

@@ -3,7 +3,6 @@ from math import prod
 import torch
 import torch.nn as nn
 from rsl_rl.modules.actor_critic import ActorCritic
-from rsl_rl.utils import resolve_nn_activation
 from torch.distributions import Normal
 
 

@@ -1,12 +1,9 @@
-import math
-
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import (

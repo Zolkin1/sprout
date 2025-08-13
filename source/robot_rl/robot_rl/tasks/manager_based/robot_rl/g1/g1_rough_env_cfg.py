@@ -1,5 +1,3 @@
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import (

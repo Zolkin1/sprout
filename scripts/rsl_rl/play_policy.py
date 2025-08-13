@@ -20,7 +20,7 @@ import torch
 from isaaclab.app import AppLauncher
 
 # Import plot_trajectories functions
-from plot_trajectories import plot_hzd_trajectories, plot_trajectories
+from plot_trajectories import plot_trajectories
 from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 
 # Experiment names mapping for different environments
@@ -119,8 +119,6 @@ def parse_args():
 def extract_reference_trajectory(env, log_vars, command_name):
     # Get the underlying environment by unwrapping
     unwrapped_env = env.unwrapped
-
-    cfg_name = type(env.cfg).__name__
 
     ref = unwrapped_env.command_manager.get_term(command_name)
     results = {}

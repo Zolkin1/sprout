@@ -340,7 +340,6 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         """Get reference trajectory using precomputed batched control points."""
         # Get current phase and step duration
         base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
 
         # Use a single tau and step_dur value (same for all gaits)
         tau = torch.tensor([hzd_cmd.phase_var], device=base_velocity.device)  # [1]
