@@ -85,14 +85,15 @@ def main():
 
         # Upload files
         if os.path.exists(policy_file):
-            # Upload policy with custom name
+            # Upload policy with custom name to env_type folder
+            repo_path = f"{args_cli.env_type}/{args_cli.policy_name}.pt"
             api.upload_file(
                 path_or_fileobj=policy_file,
-                path_in_repo=f"{args_cli.policy_name}.pt",
+                path_in_repo=repo_path,
                 repo_id=args_cli.hf_repo_id,
                 commit_message=f"Upload {args_cli.policy_name}.pt from {args_cli.env_type} training"
             )
-            print(f"[DEBUG] Uploaded {args_cli.policy_name}.pt to {args_cli.hf_repo_id}")
+            print(f"[DEBUG] Uploaded {repo_path} to {args_cli.hf_repo_id}")
 
         print(f"[INFO] Successfully uploaded policy to https://huggingface.co/{args_cli.hf_repo_id}")
 

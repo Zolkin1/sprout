@@ -7,7 +7,9 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "RA-L_paper/8_6_lip_clf_68.pt"
+        local_policy_name: "RA-L_paper/8_6_lip_clf_68.pt"
+        # hf_policy_name: TODO: Fill out!
+        hf_repo_id: "zolkin/robot_rl"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
