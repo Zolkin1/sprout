@@ -49,6 +49,8 @@ To train a policy run:
 python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --headless
 ```
 
+To add a run name add `--run_name "my_run_name"`. This will add the name after the date on the folder with the run name.
+
 Note that right now the only RL_LIBRARY that is tested in `RSL_RL`.
 
 To play the most recently trained policy for a given task run:
@@ -57,11 +59,19 @@ python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_p
 ```
 
 for a speicifc run you can pass in additional config such as `--load_run=<run_dir>`
-If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<log_dir_checkpoint>`.
+If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<checkpoint>` (`<checkpoint>` is something like "model_1800").
 
 For both `train` and `play` you can also specify a number of envs with `--num_envs=###`.
 
-TODO: Discuss custom train and play scripts.
+### Preparing for Hardware/Uploading to Hugging Face
+We suggest uploading the policy to hugging face when you are ready to run it on hardware so that this repo (the code repo) is kept clean.
+You can upload to hugging face automatically with
+```bash
+python scripts/hardware/export_to_hardware.py --env_type=<env-type> --load_run=<run_dir> --hf_repo_id=<username/repo> --policy_name=<policy_name>
+```
+This will load a given (already exported) run and upload the exported policy to hugging face in the specified repo with the specified name.
+
+NOTE: The policy must already be exported (see `play_policy` above).
 
 ## RL Tasks
 
@@ -140,6 +150,7 @@ Obelisk folder for further instructions.
 To run the sim2sim transfer, you will to install these dependencies in your conda environment:
 - `pygame`
 - `mujoco`
+- `huggingface_hub`
 
 ## Updating IsaacLab
 Sometimes you will want to updated the version of IsaacLab you are using. To do this, go to the IsaacLab directory
