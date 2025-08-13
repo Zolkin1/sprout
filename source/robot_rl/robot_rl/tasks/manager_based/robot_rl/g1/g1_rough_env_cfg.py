@@ -1,23 +1,31 @@
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import RayCasterCfg, patterns
 from isaaclab.utils import configclass
 
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import (
+    G1RoughLipObservationsCfg,
+)
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import (
+    G1RoughLipCommandsCfg,
+)
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidEnvCfg
 
 ##
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
-from isaaclab.sensors import  RayCasterCfg, patterns
-from isaaclab.managers import SceneEntityCfg
+
+
 ##
 # Environment configuration
 ##
 @configclass
 class G1RoughEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Rough environment."""
+
     commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
     observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -36,11 +44,11 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         #     mesh_prim_paths=["/World/ground"],
         # )
 
-        #pass in height scanner for the z related reward
-        # self.rewards.height_torso.params["sensor_cfg"] = SceneEntityCfg("height_scanner") 
-        # self.rewards.feet_clearance.params["height_sensor_cfg"] = SceneEntityCfg("height_scanner") 
+        # pass in height scanner for the z related reward
+        # self.rewards.height_torso.params["sensor_cfg"] = SceneEntityCfg("height_scanner")
+        # self.rewards.feet_clearance.params["height_sensor_cfg"] = SceneEntityCfg("height_scanner")
 
-        #remove lip specific observation
+        # remove lip specific observation
         self.observations.critic.ref_traj = None
         self.observations.critic.act_traj = None
         self.observations.critic.ref_traj_vel = None
@@ -79,15 +87,14 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75) #(-1.0, 1.0) # 0 - 1
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0,0.0) #(-1.0, 1.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5,0.5) #(-1.0, 1.0) #(-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # (-1.0, 1.0) # 0 - 1
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)  # (-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)  # (-1.0, 1.0) #(-1.0, 1.0)
 
         ##
         # Terminations
         ##
         self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
-
 
         ##
         # Rewards
@@ -95,7 +102,7 @@ class G1RoughEnvCfg(HumanoidEnvCfg):
 
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
         self.rewards.track_ang_vel_z_exp.weight = 0.5
-        self.rewards.lin_vel_z_l2.weight = -2.0 # TODO reduce this maybe?
+        self.rewards.lin_vel_z_l2.weight = -2.0  # TODO reduce this maybe?
         self.rewards.ang_vel_xy_l2.weight = -0.05
         self.rewards.dof_torques_l2.weight = -1.0e-5
         self.rewards.dof_acc_l2.weight = -2.5e-7

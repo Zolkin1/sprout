@@ -76,8 +76,6 @@ if not _registered:
         },
     )
 
-
-
     gym.register(
         id="G1-hzd-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -123,5 +121,3 @@ if not _registered:
     )
 
     _registered = True
-
-

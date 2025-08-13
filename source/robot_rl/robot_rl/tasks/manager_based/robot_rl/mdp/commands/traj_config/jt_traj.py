@@ -1,7 +1,9 @@
 import numpy as np
 import torch
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import _ncr
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import _ncr
+
 from .base_traj import BaseTrajectoryConfig
 
 
@@ -74,20 +76,20 @@ class JointTrajectoryConfig(BaseTrajectoryConfig):
     def _load_specific_data(self, data):
         """Load joint-specific data from YAML."""
         # Extract bezier coefficients and joint order
-        bezier_coeffs = data['bezier_coeffs']
-        yaml_joint_order = data['joint_order']
-        spline_order = data['spline_order']
-        
+        bezier_coeffs = data["bezier_coeffs"]
+        yaml_joint_order = data["joint_order"]
+        spline_order = data["spline_order"]
+
         # Calculate number of control points per joint
         num_control_points = spline_order + 1
         num_joints = len(yaml_joint_order)
-        
+
         # Reshape bezier coefficients to [num_joints, num_control_points]
         bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_joints, num_control_points)
-        
+
         self.bezier_coeffs = bezier_coeffs_reshaped
         self.joint_order = yaml_joint_order
-        
+
         # Store coefficients in YAML order
         for i, joint_name in enumerate(yaml_joint_order):
             self.joint_trajectories[joint_name] = bezier_coeffs_reshaped[i].tolist()
@@ -98,11 +100,11 @@ class JointTrajectoryConfig(BaseTrajectoryConfig):
         # grab R from g1_r
         R = build_relabel_matrix()
         traj = R @ self.bezier_coeffs
-        
+
         # Create mapping from joint names to their mirrored coefficients
         for i, joint_name in enumerate(self.joint_order):
             symmetric_mapping[joint_name] = traj[i].tolist()
-        
+
         return symmetric_mapping
 
     def reorder_and_remap(self, cfg, robot, device):
@@ -124,7 +126,7 @@ class JointTrajectoryConfig(BaseTrajectoryConfig):
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
         """Apply joint-specific stance modifications."""
         yaw_offset = base_velocity[:, 2]
-        des_pos[:, hzd_cmd.hip_yaw_idx[1-hzd_cmd.stance_idx]] += yaw_offset
+        des_pos[:, hzd_cmd.hip_yaw_idx[1 - hzd_cmd.stance_idx]] += yaw_offset
 
     def get_actual_traj(self, hzd_cmd):
         """Get actual joint trajectory from robot data."""
@@ -209,9 +211,7 @@ def bezier_deg(
         # 4) Binomial coefficients for (degree-1 choose i), i=0..degree-1:
         #    coefs_diff: [degree].
         coefs_diff = torch.tensor(
-            [_ncr(degree - 1, i) for i in range(degree)],
-            dtype=control_points.dtype,
-            device=control_points.device
+            [_ncr(degree - 1, i) for i in range(degree)], dtype=control_points.dtype, device=control_points.device
         )  # [degree]
 
         # 5) Build (τ^i) and ((1-τ)^(degree-1-i)) for i=0..degree-1:
@@ -226,10 +226,9 @@ def bezier_deg(
         # 6) Combine into a single "weight matrix" for the derivative:
         #    weight_deriv[b, i] = degree * C(degree-1, i) * (1-τ[b])^(degree-1-i) * (τ[b])^i
         #    → shape [batch, degree]
-        weight_deriv = (degree
-                        * coefs_diff.unsqueeze(0)        # [1, degree]
-                        * one_minus_pow                 # [batch, degree]
-                        * tau_pow)                       # [batch, degree]
+        weight_deriv = (
+            degree * coefs_diff.unsqueeze(0) * one_minus_pow * tau_pow  # [1, degree]  # [batch, degree]
+        )  # [batch, degree]
         # Now weight_deriv: [batch, degree]
 
         # 7) Multiply these weights by cp_diff to get a [batch, n_dim] result:
@@ -252,9 +251,7 @@ def bezier_deg(
         # 3) Binomial coefficients for (degree choose i), i=0..degree:
         #    coefs_pos: [degree+1]
         coefs_pos = torch.tensor(
-            [_ncr(degree, i) for i in range(degree + 1)],
-            dtype=control_points.dtype,
-            device=control_points.device
+            [_ncr(degree, i) for i in range(degree + 1)], dtype=control_points.dtype, device=control_points.device
         )  # [degree+1]
 
         # 4) Build τ^i and (1-τ)^(degree-i) for i=0..degree:
@@ -269,9 +266,9 @@ def bezier_deg(
         # 5) Combine into a "weight matrix" for position:
         #    weight_pos[b, i] = C(degree, i) * (1-τ[b])^(degree-i) * (τ[b])^i.
         #    → shape [batch, degree+1]
-        weight_pos = (coefs_pos.unsqueeze(0)    # [1, degree+1]
-                      * one_minus_pow          # [batch, degree+1]
-                      * tau_pow)               # [batch, degree+1]
+        weight_pos = (
+            coefs_pos.unsqueeze(0) * one_minus_pow * tau_pow  # [1, degree+1]  # [batch, degree+1]
+        )  # [batch, degree+1]
         # Now weight_pos: [batch, degree+1]
 
         # 6) Multiply by control_points to get [batch, n_dim]:

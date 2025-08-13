@@ -1,10 +1,14 @@
-from isaaclab.utils import configclass
-
-from .g1_rough_env_cfg import G1RoughEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import configclass
+
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from robot_rl.tasks.manager_based.robot_rl.terrains.rough import (
+    ROUGH_SLOPED_FOR_FLAT_HZD_CFG,
+)
+
+from .g1_rough_env_cfg import G1RoughEnvCfg
+
 
 ##
 # Environment configuration
@@ -22,9 +26,9 @@ class G1FlatEnvCfg(G1RoughEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_distribution_params": (0.616,0.616),
+                "mass_distribution_params": (0.616, 0.616),
                 "operation": "add",
-            }
+            },
         )
 
         ##

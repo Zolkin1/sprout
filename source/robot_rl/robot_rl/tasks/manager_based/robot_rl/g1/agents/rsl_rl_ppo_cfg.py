@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 from dataclasses import MISSING
 from typing import Literal
+
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
@@ -34,7 +35,7 @@ class CustomPPOActorCriticCfg:
     activation: str = MISSING
     """The activation function for the actor and critic networks."""
 
-    height_map_shape: tuple[int, int, int] = (1, 16,16)
+    height_map_shape: tuple[int, int, int] = (1, 16, 16)
     """The shape of the height map (C, H, W)."""
 
 
@@ -67,4 +68,3 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     )
     resume = False
     resume_path = None
-

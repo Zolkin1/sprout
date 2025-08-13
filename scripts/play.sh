@@ -47,4 +47,3 @@ for ckpt_path in $checkpoints; do
         --play_log_dir="${play_dir}" \
         --checkpoint="model_${step}.pt"  # full path passed here
 done
-

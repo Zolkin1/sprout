@@ -1,27 +1,28 @@
-#use the same play config,but use different trained policy
-#based on the specific envrionment specifyed, use the corresponding trained policy
+# use the same play config,but use different trained policy
+# based on the specific envrionment specified, use the corresponding trained policy
 
 
 task = "custom-Isaac-Velocity-Flat-G1-Play-v0"
 
-#load different trained policy based on the env
+# load different trained policy based on the env
 
 # "vanilla","custom","clf"
 
 import argparse
+import glob
 import os
+import pickle
 import sys
 import time
-import pickle
-import glob
 
-from isaaclab.app import AppLauncher
 import cli_args
 import torch
+from isaaclab.app import AppLauncher
 
 # Import plot_trajectories functions
-from plot_trajectories import plot_trajectories, plot_hzd_trajectories
+from plot_trajectories import plot_hzd_trajectories, plot_trajectories
 from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
+
 # Experiment names mapping for different environments
 
 SIM_ENVIRONMENTS = {
@@ -33,34 +34,35 @@ SIM_ENVIRONMENTS = {
     "hzd_clf_custom": "G1-hzd-clf-play",
 }
 
+
 class DataLogger:
     def __init__(self, enabled=True, log_dir=None, variables=None):
         self.enabled = enabled
         self.data = {}
         self.log_dir = log_dir
         self.variables = variables or []
-        
+
         if enabled and log_dir:
             os.makedirs(log_dir, exist_ok=True)
             print(f"[INFO] Logging data to directory: {log_dir}")
             # Initialize data storage for each variable
             for var in self.variables:
                 self.data[var] = []
-    
+
     def log_from_dict(self, data_dict):
         """Log data from a dictionary, only logging variables that were specified in initialization"""
         if not self.enabled:
             return
-            
+
         for var in self.variables:
             if var in data_dict:
                 self.data[var].append(data_dict[var])
-    
+
     def save(self):
         """Save all logged data to pickle files"""
         if not self.enabled or not self.log_dir:
             return
-            
+
         for var in self.variables:
             if var in self.data:
                 filepath = os.path.join(self.log_dir, f"{var}.pkl")
@@ -72,9 +74,10 @@ class DataLogger:
 def parse_sim_speed(value):
     try:
         # Split the input string by commas and convert each value to float
-        return [float(x) for x in value.split(',')]
+        return [float(x) for x in value.split(",")]
     except:
         raise argparse.ArgumentTypeError("Sim speed must be comma-separated floats (e.g. '1.0,0.0,0.0')")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Play trained RL policies for different environments.")
@@ -82,66 +85,30 @@ def parse_args():
         "--env_type",
         type=str,
         choices=list(ENVIRONMENTS.keys()),
-        help="Type of environment to play (vanilla/custom/clf)"
+        help="Type of environment to play (vanilla/custom/clf)",
     )
     parser.add_argument(
-        "--exp_name",
-        type=str,
-        default=None,
-        help="Override the default experiment name for the environment type"
+        "--exp_name", type=str, default=None, help="Override the default experiment name for the environment type"
     )
-    parser.add_argument(
-        "--video",
-        action="store_true",
-        default=True,
-        help="Record videos during playback."
-    )
-    parser.add_argument(
-        "--video_length",
-        type=int,
-        default=400,
-        help="Length of the recorded video (in steps)."
-    )
-    parser.add_argument(
-        "--num_envs",
-        type=int,
-        default=2,
-        help="Number of environments to simulate."
-    )
-    parser.add_argument(
-        "--real-time",
-        action="store_true",
-        default=False,
-        help="Run in real-time, if possible."
-    )
+    parser.add_argument("--video", action="store_true", default=True, help="Record videos during playback.")
+    parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
+    parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
+    parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 
     parser.add_argument(
-        "--export_policy",
-        action="store_true",
-        default=False,
-        help="Export the policy to ONNX and JIT formats."
+        "--export_policy", action="store_true", default=False, help="Export the policy to ONNX and JIT formats."
     )
 
     parser.add_argument(
         "--sim_speed",
         type=parse_sim_speed,
         default=None,
-        help="Simulation speed as comma-separated values for x,y,z velocities (e.g. '1.0,0.0,0.0')."
+        help="Simulation speed as comma-separated values for x,y,z velocities (e.g. '1.0,0.0,0.0').",
     )
 
-    parser.add_argument(
-        "--play_log_dir",
-        type=str,
-        default = None,
-        help="export directory "
-    )
+    parser.add_argument("--play_log_dir", type=str, default=None, help="export directory ")
 
-    parser.add_argument(
-        "--log_data",
-        action="store_true",
-        default=False,
-        help="Log data during playback."
-    )
+    parser.add_argument("--log_data", action="store_true", default=False, help="Log data during playback.")
     # append RSL-RL cli arguments
     cli_args.add_rsl_rl_args(parser)
     # append AppLauncher cli args
@@ -149,7 +116,7 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def extract_reference_trajectory(env, log_vars,command_name):
+def extract_reference_trajectory(env, log_vars, command_name):
     # Get the underlying environment by unwrapping
     unwrapped_env = env.unwrapped
 
@@ -168,9 +135,9 @@ def extract_reference_trajectory(env, log_vars,command_name):
             results[var] = unwrapped_env.command_manager.get_command("base_velocity").clone()
         elif var == "axis_names":
             # Extract axis names from end effector config
-            if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+            if hasattr(ref, "ee_config") and hasattr(ref.ee_config, "axis_names"):
                 results[var] = ref.ee_config.axis_names
-            elif hasattr(ref, 'gait_config') and hasattr(ref.gait_config, '_gait_cache'):
+            elif hasattr(ref, "gait_config") and hasattr(ref.gait_config, "_gait_cache"):
                 results[var] = ref.gait_config._gait_cache[list(ref.gait_config._gait_cache.keys())[0]].axis_names
             else:
                 results[var] = None
@@ -186,26 +153,26 @@ def find_latest_checkpoint(log_root_path):
     run_dirs = glob.glob(os.path.join(log_root_path, "*"))
     if not run_dirs:
         return None, None
-    
+
     # Get the latest run directory
     latest_run = max(run_dirs, key=os.path.getmtime)
-    
+
     # Find all checkpoint files in the latest run
     checkpoint_files = glob.glob(os.path.join(latest_run, "model_*.pt"))
     if not checkpoint_files:
         return None, None
-    
+
     # Get the latest checkpoint
     latest_checkpoint = max(checkpoint_files, key=os.path.getmtime)
     checkpoint_num = int(os.path.basename(latest_checkpoint).split("_")[1].split(".")[0])
     run_name = os.path.basename(latest_run)
-    
+
     return run_name, checkpoint_num
 
 
 def main():
     args_cli, hydra_args = parse_args()
-    
+
     if not args_cli.env_type:
         print("Please specify an environment type using --env_type")
         print("Available options:", list(ENVIRONMENTS.keys()))
@@ -215,11 +182,11 @@ def main():
     # Set the task based on environment type
     args_cli.task = SIM_ENVIRONMENTS[args_cli.env_type]
     print(f"[DEBUG] Using task: {args_cli.task}")
-    
+
     # Get experiment name (use override if provided, otherwise use default)
     experiment_name = args_cli.exp_name or EXPERIMENT_NAMES[args_cli.env_type]
     print(f"[DEBUG] Using experiment name: {experiment_name}")
-    
+
     # always enable cameras to record video
     if args_cli.video:
         args_cli.enable_cameras = True
@@ -235,18 +202,21 @@ def main():
     # Import necessary modules after app launch
     import gymnasium as gym
     import torch
+    from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
+    from isaaclab.utils.dict import print_dict
+    from isaaclab_rl.rsl_rl import (
+        RslRlOnPolicyRunnerCfg,
+        RslRlVecEnvWrapper,
+        export_policy_as_jit,
+        export_policy_as_onnx,
+    )
+    from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
+
+    import robot_rl.tasks  # noqa: F401
+
     # from rsl_rl.runners import OnPolicyRunner
     from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
 
-    from isaaclab.envs import (
-        DirectMARLEnv,
-        multi_agent_to_single_agent,
-    )
-    from isaaclab.utils.dict import print_dict
-    from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
-    from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
-    from isaaclab_rl.rsl_rl import export_policy_as_jit, export_policy_as_onnx
-    import robot_rl.tasks  # noqa: F401
     print("[DEBUG] Modules imported successfully")
 
     # Configure PyTorch
@@ -257,9 +227,7 @@ def main():
 
     print("[DEBUG] Parsing configurations")
     # parse configuration
-    env_cfg = parse_env_cfg(
-        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs
-    )
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
 
     if args_cli.sim_speed is not None:
         env_cfg.commands.base_velocity.ranges.lin_vel_x = (args_cli.sim_speed[0], args_cli.sim_speed[0])
@@ -270,12 +238,12 @@ def main():
     print("[DEBUG] Configurations parsed")
 
     # specify directory for logging experiments
-   
+
     base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
     log_root_path = os.path.join(base_log_path, args_cli.env_type)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[DEBUG] Log root path: {log_root_path}")
-    
+
     # If no checkpoint is specified, find the latest one
     if not agent_cfg.load_run or not agent_cfg.load_checkpoint:
         print("[DEBUG] Finding latest checkpoint")
@@ -287,17 +255,17 @@ def main():
         else:
             print("[ERROR] No checkpoints found in the specified directory")
             sys.exit(1)
-    
+
     # Get checkpoint path from the training directory
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     print(f"[DEBUG] Checkpoint path: {resume_path}")
-    
+
     # Use the checkpoint directory for saving results
     if not args_cli.play_log_dir:
         play_log_dir = os.path.dirname(resume_path)
     else:
         play_log_dir = args_cli.play_log_dir
-    
+
     print(f"[DEBUG] Play log directory: {play_log_dir}")
 
     # create isaac environment
@@ -335,8 +303,10 @@ def main():
     # Export policy if requested
     if args_cli.export_policy:
         if ppo_runner.alg.policy.__class__.__name__ == "ActorCriticCNN":
-            from robot_rl.network.exporter import export_policy_as_jit, export_policy_as_onnx
-          
+            from robot_rl.network.exporter import (
+                export_policy_as_jit,
+                export_policy_as_onnx,
+            )
 
         print("[DEBUG] Exporting policy to ONNX and JIT formats")
         try:
@@ -359,20 +329,20 @@ def main():
 
     # Dynamically generate log variables based on the command type
     log_vars = [
-        'y_out',
-        'dy_out',
-        'base_velocity',
-        'cur_swing_time',
+        "y_out",
+        "dy_out",
+        "base_velocity",
+        "cur_swing_time",
         "stance_foot_pos",
         "stance_foot_ori",
-        'y_act',
-        'dy_act',
-        'v',
-        'vdot',
-        'stance_foot_pos_0',
-        'stance_foot_ori_0',
+        "y_act",
+        "dy_act",
+        "v",
+        "vdot",
+        "stance_foot_pos_0",
+        "stance_foot_ori_0",
     ]
-    
+
     # Get the command term to determine what type of trajectory we're using
     if "lip" in args_cli.env_type or args_cli.env_type == "vanilla":
         command_name = "hlip_ref"
@@ -380,32 +350,32 @@ def main():
         command_name = "hzd_ref"
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
-    
+
     ref = env.unwrapped.command_manager.get_term(command_name)
-    
+
     # Add dynamic error metrics based on the command type
-    trajectory_type = 'end_effector'
-    
-    if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+    trajectory_type = "end_effector"
+
+    if hasattr(ref, "ee_config") and hasattr(ref.ee_config, "axis_names"):
         # End effector trajectory case - add axis error metrics
-        trajectory_type = 'end_effector'
+        trajectory_type = "end_effector"
         for axis_info in ref.ee_config.axis_names:
-            log_vars.append(axis_info['name'])
+            log_vars.append(axis_info["name"])
         # Also log the axis names for plotting
-        log_vars.append('axis_names')
-    elif hasattr(ref,'gait_config'):
-        trajectory_type = 'end_effector'
+        log_vars.append("axis_names")
+    elif hasattr(ref, "gait_config"):
+        trajectory_type = "end_effector"
         key = list(ref.gait_config._gait_cache.keys())[0]
         for axis_info in ref.gait_config._gait_cache[key].axis_names:
-            log_vars.append(axis_info['name'])
+            log_vars.append(axis_info["name"])
         # Also log the axis names for plotting
-        log_vars.append('axis_names')
-    elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
+        log_vars.append("axis_names")
+    elif hasattr(ref, "robot") and hasattr(ref.robot, "joint_names"):
         # Joint trajectory case - add joint error metrics
-        trajectory_type = 'joint'
+        trajectory_type = "joint"
         for joint_name in ref.robot.joint_names:
             log_vars.append(f"error_{joint_name}")
-    
+
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
 
@@ -423,10 +393,10 @@ def main():
             actions = policy(obs)
             # env stepping
             obs, reward, _, extra = env.step(actions)
-            
+
             # Log data
             if args_cli.log_data:
-                data = extract_reference_trajectory(env, log_vars,command_name)
+                data = extract_reference_trajectory(env, log_vars, command_name)
                 logger.log_from_dict(data)
 
         timestep += 1
@@ -434,7 +404,7 @@ def main():
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
-        
+
         if timestep > max(100, args_cli.video_length):
             break
 
@@ -455,7 +425,7 @@ def main():
         plot_dir = os.path.join(play_log_dir, "plots")
         os.makedirs(plot_dir, exist_ok=True)
         print(f"[DEBUG] Generating plots in directory: {plot_dir}")
-        
+
         # Determine trajectory type based on command type
         plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type=trajectory_type)
 

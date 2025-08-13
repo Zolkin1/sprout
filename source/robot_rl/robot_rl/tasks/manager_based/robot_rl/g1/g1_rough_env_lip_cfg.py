@@ -1,32 +1,41 @@
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
-
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ObservationsCfg
-
-from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
-                                                                    HumanoidRewardCfg)
-
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg  #Inherit from the base envs
+from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+    CommandsCfg,  # Inherit from the base envs
+)
+from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+    ObservationsCfg,
+)
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import (
+    G1RoughLipObservationsCfg,
+)
+from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (
+    HumanoidCommandsCfg,
+    HumanoidEnvCfg,
+    HumanoidRewardCfg,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HLIPCommandCfg
+
 ##
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
+
 #
+
 
 @configclass
 class G1RoughLipCommandsCfg(HumanoidCommandsCfg):
-    """Commands for the G1 Flat environment."""   
-    hlip_ref = HLIPCommandCfg()
+    """Commands for the G1 Flat environment."""
 
+    hlip_ref = HLIPCommandCfg()
 
 
 @configclass
@@ -34,6 +43,7 @@ class CurriculumCfg:
     """Curriculum terms for the MDP."""
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
+
 
 # Lip specific rewards
 ##
@@ -46,7 +56,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         params={
             "command_name": "hlip_ref",
             "z_offset": 0.036,
-        }
+        },
     )
 
     holonomic_constraint_vel = RewTerm(
@@ -54,9 +64,8 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         weight=2.0,
         params={
             "command_name": "hlip_ref",
-        }
+        },
     )
-
 
     clf_reward = RewTerm(
         func=mdp.clf_reward,
@@ -64,7 +73,7 @@ class G1RoughLipRewards(HumanoidRewardCfg):
         params={
             "command_name": "hlip_ref",
             "max_eta_err": 0.25,
-        }
+        },
     )
 
     clf_decreasing_condition = RewTerm(
@@ -74,11 +83,9 @@ class G1RoughLipRewards(HumanoidRewardCfg):
             "command_name": "hlip_ref",
             "alpha": 0.5,
             "eta_max": 0.2,
-            "eta_dot_max":0.3,
-        }
+            "eta_dot_max": 0.3,
+        },
     )
-
-
 
 
 @configclass
@@ -89,12 +96,11 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
     observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
     commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
 
-
-        
         ##
         # Scene
         ##
@@ -119,7 +125,6 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
-            
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (0.0, 0.0),
@@ -135,16 +140,15 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75,0.75)
-        self.commands.base_velocity.ranges.lin_vel_y = (0,0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5,0.5)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)
+        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 
         ##
         # Terminations
         ##
         self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
 
-        
         ##
         # Rewards
         ##
@@ -160,7 +164,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.rewards.alive = None
         self.rewards.track_lin_vel_xy_exp = None
         self.rewards.track_ang_vel_z_exp = None
- 
+
         # torque, acc, vel, action rate regularization
         self.rewards.dof_torques_l2.weight = -1.0e-5
         self.rewards.dof_pos_limits.weight = -1.0
@@ -173,6 +177,3 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.rewards.joint_deviation_arms = None
         self.rewards.joint_deviation_torso = None
         self.rewards.height_torso = None
-        
-        
-

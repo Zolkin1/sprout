@@ -1,8 +1,9 @@
 import os
+
 import numpy as np
 import yaml
+from sim.log_utils import extract_data, find_most_recent_timestamped_folder
 
-from sim.log_utils import find_most_recent_timestamped_folder, extract_data
 
 def get_index(time_vec, time: float):
     """Gets the index associated with a given time."""
@@ -10,7 +11,8 @@ def get_index(time_vec, time: float):
 
     return closest_idx
 
-def compute_stats(start_time = 0):
+
+def compute_stats(start_time=0):
     """Compute the statistics and save the information to a file in the given directory."""
     # Load in the data from rerun
     log_dir = os.getcwd() + "/logs"
@@ -29,10 +31,9 @@ def compute_stats(start_time = 0):
         policy = config["policy"]
         policy_dt = config["policy_dt"]
 
-
-        time = data['time']
-        commanded_vel = data['commanded_vel']
-        act_vel = data['qvel'][:, [0, 1, 5]]
+        time = data["time"]
+        commanded_vel = data["commanded_vel"]
+        act_vel = data["qvel"][:, [0, 1, 5]]
 
         start_idx = get_index(time, start_time)
 
@@ -44,15 +45,14 @@ def compute_stats(start_time = 0):
 
         # Save
         stats = {
-            'mean_velocity_error': mean_error.tolist(),
-            'std_dev_velocity_error': std_dev_error.tolist(),
+            "mean_velocity_error": mean_error.tolist(),
+            "std_dev_velocity_error": std_dev_error.tolist(),
         }
 
-        with open(os.path.join(newest, 'stats.yaml'), 'w') as f:
+        with open(os.path.join(newest, "stats.yaml"), "w") as f:
             yaml.dump(stats, f)
 
         return stats
-
 
 
 if __name__ == "__main__":

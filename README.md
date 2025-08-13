@@ -73,9 +73,9 @@ RL Task list:
 | `lip_clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 
-## Copying checkpoitns from remote server 
+## Copying checkpoitns from remote server
 First mount the server to your local desktop
- 
+
 ```
 bash scripts/mount_remote.sh
 bash scripts/copy_from_mount.sh <ENV_NAME> g1

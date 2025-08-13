@@ -7,4 +7,4 @@
 
 from .gaitPeriodCfg import GaitPeriodCfg
 
-__all__ = ["GaitPeriodCfg"] 
+__all__ = ["GaitPeriodCfg"]

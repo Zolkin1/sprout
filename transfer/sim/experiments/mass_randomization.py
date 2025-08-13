@@ -1,22 +1,22 @@
-from typing import Literal
 import argparse
-import yaml
 import os
 import sys
-import numpy as np
+from typing import Literal
+
 import matplotlib.pyplot as plt
+import numpy as np
+import yaml
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from sim.simulation import Simulation
-from sim.robot import Robot
-from sim.rl_policy_wrapper import RLPolicy
-from sim.plot_from_sim import create_plots_for_newest
-from sim.log_utils import find_most_recent_timestamped_folder, extract_data
-
 from performance_statistics import compute_stats
-from velocity_commands import speed_steps, smooth_ramp, ramped_speed_steps
+from sim.log_utils import extract_data, find_most_recent_timestamped_folder
+from sim.plot_from_sim import create_plots_for_newest
+from sim.rl_policy_wrapper import RLPolicy
+from sim.robot import Robot
+from sim.simulation import Simulation
+from velocity_commands import ramped_speed_steps, smooth_ramp, speed_steps
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--simulator", type=str, help="Choice of simulator to run (isaac_sim or mujoco)")
     args = parser.parse_args()
 
-    with open(args.config_file, 'r') as f:
+    with open(args.config_file) as f:
         config = yaml.safe_load(f)
 
     config_file_name = os.path.splitext(os.path.basename(args.config_file))[0]
@@ -64,32 +64,40 @@ def main():
         qvel_scale=config["qvel_scale"],
         ang_vel_scale=config["ang_vel_scale"],
         height_map_scale=config.get("height_map_scale", None),
-        policy_type=config["policy_type"]
+        policy_type=config["policy_type"],
     )
 
     seed = 42
     rng = np.random.default_rng(seed)
 
     # Create robot instance
-    robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=ramped_speed_steps, rng=rng)
+    robot_instance = Robot(
+        robot_name=config["robot_name"],
+        scene_name=config.get("scene", "basic_scene"),
+        input_function=ramped_speed_steps,
+        rng=rng,
+    )
 
     # run_logs = []
     base_log_dir = os.path.join("experiments", f"mass_randomization_{config_file_name}")
     os.makedirs(base_log_dir, exist_ok=True)
 
-
     NUM_RUNS = 50
 
     for i in range(NUM_RUNS):
         # Adjust the torso mass position
-        max_movement = np.array([0.05,0.05,0.01])
+        max_movement = np.array([0.05, 0.05, 0.01])
         pos_movement = robot_instance.randomize_torso_mass_pos(max_movement)
 
         # Create and run simulation
-        sim = Simulation(policy, robot_instance, log=True,
-                         log_dir=base_log_dir,
-                         use_height_sensor=config.get("height_map_scale") is not None, tracking_body_name="torso_link")
+        sim = Simulation(
+            policy,
+            robot_instance,
+            log=True,
+            log_dir=base_log_dir,
+            use_height_sensor=config.get("height_map_scale") is not None,
+            tracking_body_name="torso_link",
+        )
         sim.run_headless(total_time=10, force_disturbance=None)
 
         # run_logs.append(sim.get_logging_folder())
@@ -100,10 +108,10 @@ def main():
 
         # Log the robustness constants
         robustness_data = {
-            'torso_mass_pos': pos_movement.tolist(),
+            "torso_mass_pos": pos_movement.tolist(),
         }
 
-        with open(os.path.join(sim.get_logging_folder(), 'robustness_data.yaml'), 'w') as f:
+        with open(os.path.join(sim.get_logging_folder(), "robustness_data.yaml"), "w") as f:
             yaml.dump(robustness_data, f)
 
         robot_instance.reset_robot()
@@ -174,10 +182,7 @@ def main():
     # plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.png")
     # plt.savefig(f"experiments/plots/mass_randomization_{config_file_name}.svg", transparent=True)
 
+
 if __name__ == "__main__":
     main()
     # plt.show()
-
-
-
-

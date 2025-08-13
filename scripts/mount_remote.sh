@@ -78,19 +78,19 @@ check_mount_status() {
 # Mount the remote directory
 mount_remote() {
     print_info "Mounting remote directory..."
-    
+
     # Create mount point if it doesn't exist
     if [[ ! -d "$LOCAL_MOUNT_POINT" ]]; then
         print_info "Creating mount point: $LOCAL_MOUNT_POINT"
         mkdir -p "$LOCAL_MOUNT_POINT"
     fi
-    
+
     # Check if already mounted
     if check_mount_status; then
         print_warning "Directory is already mounted"
         return 0
     fi
-    
+
     # Test SSH connection
     print_info "Testing SSH connection..."
     if ! ssh -o ConnectTimeout=10 "$REMOTE_USER@$REMOTE_HOST" "echo 'SSH connection successful'" 2>/dev/null; then
@@ -98,15 +98,15 @@ mount_remote() {
         print_info "Please ensure you have SSH access configured."
         exit 1
     fi
-    
+
     # Mount using SSHFS
     print_info "Mounting $REMOTE_HOST:$REMOTE_PATH to $LOCAL_MOUNT_POINT"
     sshfs "$REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH" "$LOCAL_MOUNT_POINT" -o follow_symlinks,default_permissions
-    
+
     if check_mount_status; then
         print_success "Remote directory mounted successfully!"
         print_info "You can now access remote files at: $LOCAL_MOUNT_POINT"
-        
+
         # List top-level contents of the mounted directory
         print_info "Top-level contents of $LOCAL_MOUNT_POINT:"
         ls -1 "$LOCAL_MOUNT_POINT" | sed 's/^/  /'
@@ -124,7 +124,7 @@ mount_remote() {
 # Unmount the remote directory
 unmount_remote() {
     print_info "Unmounting remote directory..."
-    
+
     if check_mount_status; then
         fusermount -u "$LOCAL_MOUNT_POINT" 2>/dev/null || umount "$LOCAL_MOUNT_POINT" 2>/dev/null
         print_success "Remote directory unmounted successfully!"
@@ -136,7 +136,7 @@ unmount_remote() {
 # Main script logic
 main() {
     check_sshfs
-    
+
     case "${1:-mount}" in
         "mount")
             mount_remote
@@ -159,4 +159,4 @@ main() {
 }
 
 # Run main function
-main "$@" 
+main "$@"

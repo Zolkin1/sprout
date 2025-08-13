@@ -3,8 +3,8 @@ import os
 import sys
 from datetime import datetime
 
-from isaaclab.app import AppLauncher
 import cli_args
+from isaaclab.app import AppLauncher
 
 # Environment names
 ENVIRONMENTS = {
@@ -14,7 +14,7 @@ ENVIRONMENTS = {
     "lip_clf": "G1-lip-clf-custom",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
-    "hzd_clf_minimum": "G1-hzd-clf-minimum"
+    "hzd_clf_minimum": "G1-hzd-clf-minimum",
 }
 
 EXPERIMENT_NAMES = {
@@ -33,31 +33,33 @@ EXPERIMENT_NAMES = {
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train RL policies for different environments.")
-    parser.add_argument("--env_type", type=str, choices=list(ENVIRONMENTS.keys()), 
-                       help="Type of environment to train on (vanilla/custom/clf)")
-    parser.add_argument("--video", action="store_true", default=False, 
-                       help="Record videos during training.")
-    parser.add_argument("--video_length", type=int, default=200, 
-                       help="Length of the recorded video (in steps).")
-    parser.add_argument("--video_interval", type=int, default=2000, 
-                       help="Interval between video recordings (in steps).")
-    parser.add_argument("--num_envs", type=int, default=None, 
-                       help="Number of environments to simulate.")
-    parser.add_argument("--seed", type=int, default=None, 
-                       help="Seed used for the environment")
-    parser.add_argument("--max_iterations", type=int, default=None, 
-                       help="RL Policy training iterations.")
-    parser.add_argument("--distributed", action="store_true", default=False, 
-                       help="Run training with multiple GPUs or nodes.")
+    parser.add_argument(
+        "--env_type",
+        type=str,
+        choices=list(ENVIRONMENTS.keys()),
+        help="Type of environment to train on (vanilla/custom/clf)",
+    )
+    parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
+    parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
+    parser.add_argument(
+        "--video_interval", type=int, default=2000, help="Interval between video recordings (in steps)."
+    )
+    parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+    parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+    parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+    parser.add_argument(
+        "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+    )
     # append RSL-RL cli arguments
     cli_args.add_rsl_rl_args(parser)
     # append AppLauncher cli args
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_known_args()
 
+
 def main():
     args_cli, hydra_args = parse_args()
-    
+
     if not args_cli.env_type:
         print("Please specify an environment type using --env_type")
         print("Available options:", list(ENVIRONMENTS.keys()))
@@ -67,13 +69,13 @@ def main():
     args_cli.task = ENVIRONMENTS[args_cli.env_type]
     args_cli.logger = "wandb"
     args_cli.log_project_name = "g1_rl"
-    
+
     # always enable cameras to record video
     if args_cli.video:
         args_cli.enable_cameras = True
 
     sys.argv = [sys.argv[0]] + hydra_args
-    
+
     # launch omniverse app
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
@@ -81,8 +83,6 @@ def main():
     # Import necessary modules after app launch
     import gymnasium as gym
     import torch
-    from rsl_rl.runners import OnPolicyRunner
-    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
     from isaaclab.envs import (
         DirectMARLEnv,
         DirectMARLEnvCfg,
@@ -95,7 +95,10 @@ def main():
     from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
     from isaaclab_tasks.utils import get_checkpoint_path
     from isaaclab_tasks.utils.hydra import hydra_task_config
+    from rsl_rl.runners import OnPolicyRunner
+
     import robot_rl.tasks  # noqa: F401
+    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
 
     # Configure PyTorch
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -104,8 +107,7 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-    def train(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, 
-             agent_cfg: RslRlOnPolicyRunnerCfg):
+    def train(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
         """Train with RSL-RL agent."""
         # Override configurations with non-hydra CLI arguments
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -132,7 +134,7 @@ def main():
         log_root_path = os.path.join(base_log_path, args_cli.env_type)
         log_root_path = os.path.abspath(log_root_path)
         print(f"[INFO] Logging experiment in directory: {log_root_path}")
-        
+
         # Create timestamp-based run directory
         log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         if agent_cfg.run_name:
@@ -147,7 +149,6 @@ def main():
         # Convert to single-agent if needed
         if isinstance(env.unwrapped, DirectMARLEnv):
             env = multi_agent_to_single_agent(env)
-
 
         # Handle resume path
         if agent_cfg.resume_path or agent_cfg.algorithm.class_name == "Distillation":
@@ -195,14 +196,6 @@ def main():
     # Close sim app
     simulation_app.close()
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-

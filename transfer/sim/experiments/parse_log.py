@@ -1,20 +1,21 @@
-import pandas as pd
-import numpy as np
+import os
+
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from scipy.spatial.transform import Rotation as R
 from velocity_commands import smooth_ramp
-import os
+
+
 def parse_g1_control_csv(file_path):
     df = pd.read_csv(file_path, header=None)
-    df.columns = [
-        "time", 
-        "pos_x", "pos_y", "pos_z", 
-        "ori_x", "ori_y", "ori_z", "ori_w"
-    ]
+    df.columns = ["time", "pos_x", "pos_y", "pos_z", "ori_x", "ori_y", "ori_z", "ori_w"]
     return df
 
+
 def smooth_signal(signal, window_size):
-    return np.convolve(signal, np.ones(window_size)/window_size, mode='same')
+    return np.convolve(signal, np.ones(window_size) / window_size, mode="same")
+
 
 def estimate_velocity(df, smooth_window=10):
     df["vel_x"] = np.gradient(df["pos_x"], df["time"])
@@ -31,6 +32,7 @@ def estimate_velocity(df, smooth_window=10):
 
     return df
 
+
 def compute_body_frame_vx(df, t_start=None, t_end=None):
     if t_start is not None:
         df = df[df["time"] >= t_start]
@@ -41,14 +43,11 @@ def compute_body_frame_vx(df, t_start=None, t_end=None):
     v_world = np.stack([df["vel_x"], df["vel_y"], df["vel_z"]], axis=1)
     quats = df[["ori_x", "ori_y", "ori_z", "ori_w"]].values
     rot = R.from_quat(quats)
-    yaw = rot.as_euler('xyz', degrees=False)[:, 2]
+    yaw = rot.as_euler("xyz", degrees=False)[:, 2]
 
     cos_yaw = np.cos(-yaw)
     sin_yaw = np.sin(-yaw)
-    rot_mats = np.stack([
-        np.stack([cos_yaw, -sin_yaw], axis=1),
-        np.stack([sin_yaw,  cos_yaw], axis=1)
-    ], axis=1)
+    rot_mats = np.stack([np.stack([cos_yaw, -sin_yaw], axis=1), np.stack([sin_yaw, cos_yaw], axis=1)], axis=1)
 
     v_xy_world = v_world[:, :2][:, :, None]
     v_body = np.matmul(rot_mats, v_xy_world).squeeze(-1)
@@ -56,8 +55,9 @@ def compute_body_frame_vx(df, t_start=None, t_end=None):
 
     return df["time"], vx_body
 
-def plot_multiple_policies(file_paths, labels=None, time_ranges=None, smooth_window=10,title=None,save_path=None):
-    plt.rcParams.update({'font.size': 18})
+
+def plot_multiple_policies(file_paths, labels=None, time_ranges=None, smooth_window=10, title=None, save_path=None):
+    plt.rcParams.update({"font.size": 18})
     plt.rcParams.update({
         "text.usetex": True,  # Use LaTeX for all text
         "font.family": "serif",  # Use serif font (default LaTeX style)
@@ -77,55 +77,58 @@ def plot_multiple_policies(file_paths, labels=None, time_ranges=None, smooth_win
         time = time - time.iloc[0]  # reset to start from 0
         plt.plot(time, vx_body, label=label, linewidth=1.5)
 
-
     # Add reference velocity ramp
     # Segments
-    
-#     t_pad = np.arange(0, 2, 0.01)
-#     vx_pad = np.zeros_like(t_pad)
+
+    #     t_pad = np.arange(0, 2, 0.01)
+    #     vx_pad = np.zeros_like(t_pad)
 
     vx_max = 0.75
     t_ref = np.linspace(0, 8, 500)
     ramp_time = 2.0
     slope = vx_max / ramp_time
     vx_ref = np.minimum(slope * t_ref, vx_max)
-    #add a few more entries so that the first two seconds is 0
-    #at the end just set to 0
+    # add a few more entries so that the first two seconds is 0
+    # at the end just set to 0
     vx_ref[-1] = 0.0
-    t_ref = np.concatenate([np.linspace(0,3.5,100),t_ref+3.5,np.linspace(t_ref[-1]+3.5,t_ref[-1]+7,100)])
-    vx_ref = np.concatenate([np.zeros(100),vx_ref,np.zeros(100)])
+    t_ref = np.concatenate([np.linspace(0, 3.5, 100), t_ref + 3.5, np.linspace(t_ref[-1] + 3.5, t_ref[-1] + 7, 100)])
+    vx_ref = np.concatenate([np.zeros(100), vx_ref, np.zeros(100)])
     axes.plot(t_ref, vx_ref, "k--", label=r"$v_x^d$", linewidth=2)
-
-
 
     axes.set_xlabel("Time (s)", fontsize=20)
     axes.set_ylabel(r"$v_x$ (m/s)", fontsize=20)
     axes.grid(True)
-    axes.legend(fontsize=20,loc="upper left")
-     # bbox_to_anchor=(0.5, 0.96),
-     # ncol=len(labels)+1,  # Puts all legend entries in one row
-     # framealpha=0.0,
-     # columnspacing=0.8,)
+    axes.legend(fontsize=20, loc="upper left")
+    # bbox_to_anchor=(0.5, 0.96),
+    # ncol=len(labels)+1,  # Puts all legend entries in one row
+    # framealpha=0.0,
+    # columnspacing=0.8,)
     plt.xticks(fontsize=20)
     plt.yticks(fontsize=20)
     if title is not None:
-        plt.title(title,fontsize=20)
+        plt.title(title, fontsize=20)
     plt.tight_layout()
 
     if save_path is not None:
-     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-     fig.savefig(save_path + ".png", bbox_inches='tight', transparent=True)
-     fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
-     fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
-
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".svg", bbox_inches="tight", transparent=True)
 
     plt.show()
 
 
-def plot_policy_subplot_comparison(hzd_paths, baseline_paths, labels=None,
-                                   hzd_time_ranges=None, baseline_time_ranges=None,
-                                   smooth_window=10, title=None, save_path=None):
-    plt.rcParams.update({'font.size': 18})
+def plot_policy_subplot_comparison(
+    hzd_paths,
+    baseline_paths,
+    labels=None,
+    hzd_time_ranges=None,
+    baseline_time_ranges=None,
+    smooth_window=10,
+    title=None,
+    save_path=None,
+):
+    plt.rcParams.update({"font.size": 18})
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
@@ -163,19 +166,19 @@ def plot_policy_subplot_comparison(hzd_paths, baseline_paths, labels=None,
     slope = vx_max / ramp_time
     vx_ref = np.minimum(slope * t_ref, vx_max)
     vx_ref[-1] = 0.0
-    t_ref = np.concatenate([np.linspace(0, 3.5, 100), t_ref + 3.5, np.linspace(t_ref[-1]+3.5, t_ref[-1]+7, 100)])
+    t_ref = np.concatenate([np.linspace(0, 3.5, 100), t_ref + 3.5, np.linspace(t_ref[-1] + 3.5, t_ref[-1] + 7, 100)])
     vx_ref = np.concatenate([np.zeros(100), vx_ref, np.zeros(100)])
     for ax in axes:
         ax.plot(t_ref, vx_ref, "k--", label=r"$v_x^d$", linewidth=2)
         ax.set_ylabel(r"$v_x$ (m/s)", fontsize=20)
         ax.grid(True)
         ax.legend(fontsize=14, loc="upper left")
-        ax.tick_params(axis='both', which='major', labelsize=16)
+        ax.tick_params(axis="both", which="major", labelsize=16)
 
     axes[0].set_title("HZD-CLF", fontsize=20)
     axes[1].set_title("Baseline", fontsize=20)
     axes[1].set_xlabel("Time (s)", fontsize=20)
-#     axes[1].text(7.7, 0.38, "Collision", fontsize=20, fontweight='bold',color='red')
+    #     axes[1].text(7.7, 0.38, "Collision", fontsize=20, fontweight='bold',color='red')
 
     if title is not None:
         fig.suptitle(title, fontsize=22)
@@ -184,15 +187,15 @@ def plot_policy_subplot_comparison(hzd_paths, baseline_paths, labels=None,
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path + ".png", bbox_inches='tight')
-        fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
-        fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight")
+        fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".svg", bbox_inches="tight", transparent=True)
 
     plt.show()
 
 
 def plot_global_position(file_paths, labels=None, time_ranges=None, smooth_window=10, title=None, save_path=None):
-    plt.rcParams.update({'font.size': 18})
+    plt.rcParams.update({"font.size": 18})
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
@@ -217,8 +220,8 @@ def plot_global_position(file_paths, labels=None, time_ranges=None, smooth_windo
 
         pos_x = df["pos_x"]
         pos_y = df["pos_y"]
-     #    pos_x = smooth_signal(df["pos_x"], smooth_window)
-     #    pos_y = smooth_signal(df["pos_y"], smooth_window)
+        #    pos_x = smooth_signal(df["pos_x"], smooth_window)
+        #    pos_y = smooth_signal(df["pos_y"], smooth_window)
 
         ax.plot(pos_x, pos_y, label=label, linewidth=1.5)
 
@@ -237,12 +240,11 @@ def plot_global_position(file_paths, labels=None, time_ranges=None, smooth_windo
 
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path + ".png", bbox_inches='tight', transparent=True)
-        fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
-        fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".svg", bbox_inches="tight", transparent=True)
 
     plt.show()
-
 
 
 # === Updated Example Usage ===
@@ -265,11 +267,7 @@ if __name__ == "__main__":
         "3.55 kg",
     ]
 
-    hzd_time_ranges = [
-        (7.5, 22.5),
-        (11, 26),
-        (48, 63)
-    ]
+    hzd_time_ranges = [(7.5, 22.5), (11, 26), (48, 63)]
 
     baseline_time_ranges = [
         (124, 139),
@@ -285,7 +283,7 @@ if __name__ == "__main__":
         baseline_time_ranges=baseline_time_ranges,
         smooth_window=10,
         title="",
-        save_path="experiments/plots/hardware_hzd_vs_baseline"
+        save_path="experiments/plots/hardware_hzd_vs_baseline",
     )
 
 #     file_paths = [
@@ -297,7 +295,7 @@ if __name__ == "__main__":
 #         "LIP",
 #         "Baseline",
 #     ]
-    
+
 #     time_ranges = [
 #         (110, 125),
 #         (124, 139),

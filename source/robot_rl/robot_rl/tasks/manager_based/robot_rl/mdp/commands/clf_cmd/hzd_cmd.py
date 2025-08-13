@@ -1,16 +1,20 @@
-import torch
 import math
-import numpy as np
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
+import numpy as np
+import torch
 from isaaclab.managers import CommandTerm
+from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz, wrap_to_pi
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
-
-from typing import TYPE_CHECKING
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import JointTrajectoryConfig, get_euler_from_quat
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTrajectoryConfig #, EndEffectorTracker
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi,quat_from_euler_xyz
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import (  # , EndEffectorTracker
+    EndEffectorTrajectoryConfig,
+)
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import (
+    JointTrajectoryConfig,
+    get_euler_from_quat,
+)
 
 if TYPE_CHECKING:
     from ..cmd_cfg import HZDCommandCfg
@@ -18,31 +22,32 @@ if TYPE_CHECKING:
 
 class HZDCommandTerm(CommandTerm, ABC):
     """Abstract base class for HZD (Hybrid Zero Dynamics) command terms."""
-    
+
     def __init__(self, cfg: "HZDCommandCfg", env):
         super().__init__(cfg, env)
-        
+
         self.env = env
         self.robot = env.scene[cfg.asset_name]
         self.debug_vis = cfg.debug_vis
-        
+
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
         self.hip_yaw_idx, _ = self.robot.find_joints(".*_hip_yaw_.*")
         self.metrics = {}
-        
+
         self.mass = sum(self.robot.data.default_mass.T)[0]
-        
+
         self.clf = CLF(
-            cfg.num_outputs, self.env.cfg.sim.dt,
+            cfg.num_outputs,
+            self.env.cfg.sim.dt,
             batch_size=self.num_envs,
             Q_weights=np.array(cfg.Q_weights),
             R_weights=np.array(cfg.R_weights),
-            device=self.device
+            device=self.device,
         )
-        
+
         self.v = torch.zeros((self.num_envs), device=self.device)
         self.stance_idx = None
-        
+
         self.y_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.dy_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
@@ -67,11 +72,13 @@ class HZDCommandTerm(CommandTerm, ABC):
         Tswing = self._get_swing_period()
 
         tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-        phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
+        phi_c = torch.tensor(
+            math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp) ** 2 + Tswing), device=self.env.device
+        )
 
         new_stance_idx = int(0.5 + 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
-        
+
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
                 self.stance_idx = new_stance_idx
@@ -82,7 +89,7 @@ class HZDCommandTerm(CommandTerm, ABC):
             self.stance_foot_pos_0 = foot_pos_w[:, new_stance_idx, :]
             self.stance_foot_ori_quat_0 = foot_ori_w[:, new_stance_idx, :]
             self.stance_foot_ori_0 = get_euler_from_quat(foot_ori_w[:, new_stance_idx, :])
-       
+
         self.stance_idx = new_stance_idx
 
         if tp < 0.5:
@@ -96,7 +103,7 @@ class HZDCommandTerm(CommandTerm, ABC):
         self.update_Stance_Swing_idx()
         self.generate_reference_trajectory()
         self.get_actual_state()
-        
+
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
         self.vdot = vdot
         self.v = vcur
@@ -132,13 +139,12 @@ class HZDCommandTerm(CommandTerm, ABC):
         self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
 
 
-
 class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses joint trajectory references."""
-    
+
     def __init__(self, cfg: "HZDCommandCfg", env):
         super().__init__(cfg, env)
-        
+
         # Load joint trajectory config from YAML
         self.ref_config = JointTrajectoryConfig()
         self.ref_config.reorder_and_remap_jt(cfg, self.robot, self.device)
@@ -165,7 +171,7 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
         """Update metrics specific to joint trajectory tracking."""
         # Call parent method for base metrics
         super()._update_metrics()
-        
+
         # Update metrics using actual joint names from the robot
         for i, joint_name in enumerate(self.robot.joint_names):
             error_key = f"error_{joint_name}"
@@ -174,49 +180,49 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
 
 class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses end effector trajectory references."""
-    
+
     def __init__(self, cfg: "HZDCommandCfg", env):
         super().__init__(cfg, env)
-        
+
         # Load end effector trajectory config from YAML
         self.ee_config = EndEffectorTrajectoryConfig(yaml_path=cfg.yaml_path)
-        
 
         # also need to remap root state
-        root_quat = torch.tensor(self.ee_config.init_root_state[3:], dtype=torch.float32,device=self.device)
+        root_quat = torch.tensor(self.ee_config.init_root_state[3:], dtype=torch.float32, device=self.device)
         init_root_state_eul = get_euler_from_quat(root_quat.unsqueeze(0)).squeeze(0)
         init_root_state_eul[0] = -init_root_state_eul[0]
         init_root_state_eul[2] = -init_root_state_eul[2]
-        init_root_state_quat = quat_from_euler_xyz(init_root_state_eul[0].unsqueeze(0),init_root_state_eul[1].unsqueeze(0),init_root_state_eul[2].unsqueeze(0))
-        
-        self.init_root_state = torch.tensor(self.ee_config.init_root_state, dtype=torch.float32,device=self.device)
-
-        self.init_root_state[3:] = init_root_state_quat
-        self.init_root_vel = torch.tensor(self.ee_config.init_root_vel, dtype=torch.float32,device=self.device)
-        
-
-        #nered to reorder the joint based on joitn order
-
-        # Initialize end effector tracker
-        self.ee_tracker = EndEffectorTracker(
-            self.ee_config.constraint_specs, 
-            env.scene
+        init_root_state_quat = quat_from_euler_xyz(
+            init_root_state_eul[0].unsqueeze(0),
+            init_root_state_eul[1].unsqueeze(0),
+            init_root_state_eul[2].unsqueeze(0),
         )
 
-        
+        self.init_root_state = torch.tensor(self.ee_config.init_root_state, dtype=torch.float32, device=self.device)
+
+        self.init_root_state[3:] = init_root_state_quat
+        self.init_root_vel = torch.tensor(self.ee_config.init_root_vel, dtype=torch.float32, device=self.device)
+
+        # nered to reorder the joint based on joitn order
+
+        # Initialize end effector tracker
+        self.ee_tracker = EndEffectorTracker(self.ee_config.constraint_specs, env.scene)
+
         self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
         self.foot_yaw_output_idx = 11
         self.ori_idx_list = [
-            [3,4,5],
-            [9,10,11],
+            [3, 4, 5],
+            [9, 10, 11],
         ]
 
         num_jt = len(self.ee_config.joint_order)
-        init_joint_pos = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
-        init_joint_vel = torch.zeros((num_jt), dtype=torch.float32,device=self.device)
+        init_joint_pos = torch.zeros((num_jt), dtype=torch.float32, device=self.device)
+        init_joint_vel = torch.zeros((num_jt), dtype=torch.float32, device=self.device)
 
-        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import build_relabel_matrix
-        
+        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import (
+            build_relabel_matrix,
+        )
+
         R = build_relabel_matrix()
         init_joint_pos_relabel = R @ self.ee_config.init_joint_pos
         init_joint_vel_relabel = R @ self.ee_config.init_joint_vel
@@ -226,18 +232,17 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
             new_joint_idx = self.robot.find_joints(joint_name)[0]
             init_joint_pos[new_joint_idx] = init_joint_pos_relabel[i]
             init_joint_vel[new_joint_idx] = init_joint_vel_relabel[i]
-        
-        
+
         self.init_joint_pos = init_joint_pos
         self.init_joint_vel = init_joint_vel
 
         self.tp = torch.zeros((self.num_envs), device=self.device)
 
         self.T = torch.full((self.num_envs,), self.ee_config.T, device=self.device)
-        
+
         # Reorder and remap end effector coefficients
         self.ee_config.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
-        self.yaw_output_idx = [5,11,16,20]
+        self.yaw_output_idx = [5, 11, 16, 20]
 
     def _get_swing_period(self) -> float:
         """Get the swing period from the end effector configuration."""
@@ -253,7 +258,7 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         """Get actual state for end effector trajectories."""
         # Get stance foot pose data
         self.get_stance_foot_pose()
-        
+
         # Get actual trajectory from end effector tracker
         act_pos, act_vel = self.ee_config.get_actual_traj(self)
         self.y_act = act_pos
@@ -264,70 +269,66 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         """Update metrics specific to end effector trajectory tracking."""
         # Call parent method for base metrics
         super()._update_metrics()
-        
+
         # Update metrics using pre-generated axis names
         for axis_info in self.ee_config.axis_names:
-            error_key = axis_info['name']
-            index = axis_info['index']
-            self.metrics[error_key] = torch.abs(
-                self.y_out[:, index] - 
-                self.y_act[:, index]
-            )
+            error_key = axis_info["name"]
+            index = axis_info["index"]
+            self.metrics[error_key] = torch.abs(self.y_out[:, index] - self.y_act[:, index])
 
     def get_stance_foot_pose(self):
-            """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-            stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
-            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-            self.stance_foot_pos = stance_foot_pos
-            self.stance_foot_ori = stance_foot_ori
-            stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
-            self.stance_foot_vel = stance_foot_vel
-            self.stance_foot_ang_vel = stance_foot_ang_vel
+        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+        stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
+        stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
+        self.stance_foot_pos = stance_foot_pos
+        self.stance_foot_ori = stance_foot_ori
+        stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
+        self.stance_foot_vel = stance_foot_vel
+        self.stance_foot_ang_vel = stance_foot_ang_vel
 
     def update_Stance_Swing_idx(self):
-            """Update stance and swing indices based on phase."""
-            Tswing = self._get_swing_period()
+        """Update stance and swing indices based on phase."""
+        Tswing = self._get_swing_period()
 
-            tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-            phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
+        tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
+        phi_c = torch.tensor(
+            math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp) ** 2 + Tswing), device=self.env.device
+        )
 
-            new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
-            self.swing_idx = 1 - new_stance_idx
-            
-            if self.stance_idx is None or new_stance_idx != self.stance_idx:
-                if self.stance_idx is None:
-                    self.stance_idx = new_stance_idx
+        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
+        self.swing_idx = 1 - new_stance_idx
 
+        if self.stance_idx is None or new_stance_idx != self.stance_idx:
+            if self.stance_idx is None:
+                self.stance_idx = new_stance_idx
 
-                stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-                stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-                
-             
-                self.stance_foot_pos_0 = stance_foot_pos
-                self.stance_foot_ori_quat_0 = stance_foot_quat
-                self.stance_foot_ori_0 = stance_foot_ori
-        
-            self.stance_idx = new_stance_idx
+            stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
+            stance_foot_pos, stance_foot_ori, stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
 
-            if tp < 0.5:
-                self.phase_var = 2 * tp
-            else:
-                self.phase_var = 2 * tp - 1
-            self.cur_swing_time = self.phase_var * Tswing
-            self.tp = torch.full((self.num_envs,), tp, device=self.device)
+            self.stance_foot_pos_0 = stance_foot_pos
+            self.stance_foot_ori_quat_0 = stance_foot_quat
+            self.stance_foot_ori_0 = stance_foot_ori
+
+        self.stance_idx = new_stance_idx
+
+        if tp < 0.5:
+            self.phase_var = 2 * tp
+        else:
+            self.phase_var = 2 * tp - 1
+        self.cur_swing_time = self.phase_var * Tswing
+        self.tp = torch.full((self.num_envs,), tp, device=self.device)
+
 
 def create_hzd_command_term(cfg, env):
     """
     Factory function to create the appropriate HZD command term based on configuration.
-    
+
     Args:
         cfg: Configuration object (JointTrajectoryHZDCommandCfg, BaseTrajectoryHZDCommandCfg, etc.)
         env: Environment object
-        
+
     Returns:
         Appropriate HZD command term instance
     """
     # The configuration's class_type will determine which command term to create
     return cfg.class_type(cfg, env)
-       
-          

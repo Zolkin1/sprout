@@ -1,10 +1,11 @@
+import argparse
+import glob
 import os
 import pickle
-import numpy as np
+
 import matplotlib.pyplot as plt
-import glob
+import numpy as np
 import torch
-import argparse
 
 
 def find_most_recent_log_dir(base_path="logs/play"):
@@ -36,10 +37,10 @@ def format_joint_name(joint_name):
     """Format joint name for better readability in plots"""
     # Remove '_joint' suffix and replace underscores with spaces
     formatted = joint_name.replace('_joint', '').replace('_', ' ')
-    
+
     # Capitalize first letter of each word
     formatted = ' '.join(word.capitalize() for word in formatted.split())
-    
+
     # Special formatting for common terms
     formatted = formatted.replace('Hip', 'Hip')
     formatted = formatted.replace('Knee', 'Knee')
@@ -47,7 +48,7 @@ def format_joint_name(joint_name):
     formatted = formatted.replace('Shoulder', 'Shoulder')
     formatted = formatted.replace('Elbow', 'Elbow')
     formatted = formatted.replace('Waist', 'Waist')
-    
+
     return formatted
 
 
@@ -60,10 +61,10 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             processed_data[key] = np.array([v.cpu().numpy() for v in values])
         else:
             processed_data[key] = np.array(values)
-    
+
     # Create time array
     time_steps = np.arange(len(processed_data[list(processed_data.keys())[0]]))
-    
+
     # Detect trajectory type if not provided
     if trajectory_type is None:
         # Check if we have end effector style metrics (contains frame names)
@@ -80,9 +81,9 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             else:
                 # Default to joint if we can't determine
                 trajectory_type = 'joint'
-    
+
     print(f"Detected trajectory type: {trajectory_type}")
-    
+
     # Generate dynamic labels and units based on trajectory type
     if trajectory_type == 'joint':
         # Joint trajectory - use G1 joint names
@@ -95,9 +96,9 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             'left_ankle_pitch_joint', 'right_ankle_pitch_joint', 'left_elbow_joint',
             'right_elbow_joint', 'left_ankle_roll_joint', 'right_ankle_roll_joint'
         ]
-        
+
         g1_formatted_labels = [format_joint_name(name) for name in g1_joint_names]
-        
+
         state_labels = {
             'y_out': g1_formatted_labels,
             'dy_out': g1_formatted_labels,
@@ -111,7 +112,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             'vdot': ['vdot'],
             'reward': ['Reward']
         }
-        
+
         units = {
             'y_out': ['rad'] * 21,
             'dy_out': ['rad/s'] * 21,
@@ -125,7 +126,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             'vdot': ['m/s²'],
             'reward': ['']
         }
-        
+
         # Generate error labels dynamically from actual metric names
         error_labels = {}
         error_units = {}
@@ -161,7 +162,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                     # Generic error handling
                     error_labels[key] = key.replace('error_', '').replace('_', ' ').title()
                     error_units[key] = 'mixed'
-    
+
     elif trajectory_type == 'end_effector':
         # End effector trajectory - generate labels from metric names
         # Try to get axis names from the data if available
@@ -183,7 +184,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 # Final fallback: generic names
                 n_dims = processed_data.get('y_out', [[]]).shape[2] if 'y_out' in processed_data else 0
                 axis_names = [f'Dimension {i}' for i in range(n_dims)]
-        
+
         state_labels = {
             'y_out': axis_names,
             'dy_out': [f"{name} Rate" for name in axis_names],
@@ -197,7 +198,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             'vdot': ['vdot'],
             'reward': ['Reward']
         }
-        
+
         # Generate units based on axis names
         def get_unit_for_axis(axis_name):
             if 'pos' in axis_name or 'com_pos' in axis_name:
@@ -208,10 +209,10 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 return 'rad'
             else:
                 return 'mixed'
-        
+
         axis_units = [get_unit_for_axis(name) for name in axis_names]
         rate_units = [f"{unit}/s" for unit in axis_units]
-        
+
         units = {
             'y_out': axis_units,
             'dy_out': rate_units,
@@ -225,7 +226,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             'vdot': ['m/s²'],
             'reward': ['']
         }
-        
+
         # Generate error labels dynamically from end effector metrics
         error_labels = {}
         error_units = {}
@@ -264,7 +265,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                     # Fallback for simple error names
                     error_labels[key] = key.replace('error_', '').replace('_', ' ').title()
                     error_units[key] = 'mixed'
-    
+
     else:
         # Fallback for unknown trajectory types
         state_labels = {}
@@ -471,10 +472,10 @@ def plot_hzd_trajectories(data, save_dir=None):
             processed_data[key] = np.array([v.cpu().numpy() for v in values])
         else:
             processed_data[key] = np.array(values)
-    
+
     # Create time array
     time_steps = np.arange(len(processed_data[list(processed_data.keys())[0]]))
-    
+
     # Define state labels and units for HZD
     state_labels = {
         'y_out': [
@@ -525,7 +526,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         'vdot': ['Acceleration'],
         'reward': ['Reward']
     }
-    
+
     units = {
         'y_out': ['rad'] * 12,  # All joint angles are in radians
         'dy_out': ['rad/s'] * 12,  # All joint velocities are in rad/s
@@ -570,7 +571,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         'error_LeftHenkeAnkleJoint': 'rad',
         'error_RightHenkeAnkleJoint': 'rad'
     }
-    
+
     # Helper for subplot indexing
     def get_ax(axs, idx, n_cols):
         if axs.ndim == 1:
@@ -644,7 +645,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         if save_dir:
             plt.savefig(os.path.join(save_dir, 'positions.png'), dpi=300, bbox_inches='tight')
         plt.show()
-    
+
     # Plot velocities (dy_out vs dy_act)
     if 'dy_out' in processed_data and 'dy_act' in processed_data:
         n_dims = processed_data['dy_out'].shape[2]
@@ -672,7 +673,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         if save_dir:
             plt.savefig(os.path.join(save_dir, 'velocities.png'), dpi=300, bbox_inches='tight')
         plt.show()
-    
+
     # Plot base velocity
     if 'base_velocity' in processed_data:
         n_dims = processed_data['base_velocity'].shape[2]
@@ -697,20 +698,20 @@ def plot_hzd_trajectories(data, save_dir=None):
         v_data = processed_data['v']
         vdot_data = processed_data['vdot']
         fig, axs = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-        
+
         axs[0].plot(time_steps, v_data[:, env_ids], label='v', color='g')
         axs[0].set_title('clf v')
         axs[0].set_ylabel(units['v'][0] if 'v' in units else '')
         axs[0].grid(True)
         axs[0].legend()
-        
+
         axs[1].plot(time_steps, vdot_data[:, env_ids], label='vdot', color='m')
         axs[1].set_title('clf vdot')
         axs[1].set_xlabel('Time Steps')
         axs[1].set_ylabel(units['vdot'][0] if 'vdot' in units else '')
         axs[1].grid(True)
         axs[1].legend()
-        
+
         plt.tight_layout()
         if save_dir:
             plt.savefig(os.path.join(save_dir, 'v_and_vdot.png'), dpi=300, bbox_inches='tight')
@@ -725,7 +726,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
         fig.suptitle('Error Metrics', fontsize=16)
         axs = np.array(axs)
-        
+
         for i, metric in enumerate(error_metrics):
             ax = get_ax(axs, i, n_cols)
             data = processed_data[metric]
@@ -740,12 +741,12 @@ def plot_hzd_trajectories(data, save_dir=None):
             ax.set_ylabel(error_units.get(metric, ''))
             ax.grid(True)
             ax.legend()
-        
+
         # Hide unused subplots
         for i in range(n_metrics, n_rows * n_cols):
             ax = get_ax(axs, i, n_cols)
             ax.set_visible(False)
-        
+
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         if save_dir:
             plt.savefig(os.path.join(save_dir, 'error_metrics.png'), dpi=300, bbox_inches='tight')
@@ -756,14 +757,14 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Plot trajectory data from log files')
     parser.add_argument('--log_dir', type=str, help='Specific log directory to plot (optional)')
-    parser.add_argument('--trajectory_type', type=str, 
-                       choices=['joint', 'end_effector', 'auto'], 
+    parser.add_argument('--trajectory_type', type=str,
+                       choices=['joint', 'end_effector', 'auto'],
                        default='auto', help='Type of trajectory to plot (default: auto-detect)')
-    parser.add_argument('--base_path', type=str, default='logs/play', 
+    parser.add_argument('--base_path', type=str, default='logs/play',
                        help='Base path to search for log directories (default: logs/play)')
-    
+
     args = parser.parse_args()
-    
+
     # Find the log directory
     if args.log_dir:
         log_dir = args.log_dir
@@ -774,20 +775,20 @@ def main():
         log_dir = find_most_recent_log_dir(args.base_path)
         if not log_dir:
             return
-    
+
     print(f"Loading data from {log_dir}")
     # Load the data
     data = load_data(log_dir)
     # Create a directory for plots
     plot_dir = os.path.join(log_dir, "plots")
     os.makedirs(plot_dir, exist_ok=True)
-    
+
     # Determine trajectory type
     trajectory_type = None if args.trajectory_type == 'auto' else args.trajectory_type
-    
+
     # Plot the data with specified or auto-detected trajectory type
     plot_trajectories(data, save_dir=plot_dir, trajectory_type=trajectory_type)
 
 
 if __name__ == "__main__":
-    main() 
+    main()

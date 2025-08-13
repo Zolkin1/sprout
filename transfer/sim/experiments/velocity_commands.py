@@ -1,11 +1,13 @@
 import numpy as np
 
+
 def step_to_max(sim_time):
     """Pass a given input as a function of time."""
-    if sim_time > 1.:
-        return np.array([0.75,0.0,0.0])
+    if sim_time > 1.0:
+        return np.array([0.75, 0.0, 0.0])
     else:
-        return np.array([0.0,0.0,0.0])
+        return np.array([0.0, 0.0, 0.0])
+
 
 def smooth_ramp(sim_time):
     """Compute a ramp input over a few seconds up to max speed."""
@@ -15,7 +17,8 @@ def smooth_ramp(sim_time):
 
     slope = MAX_SPEED / RAMP_TIME
 
-    return np.array([min(slope * sim_time, MAX_SPEED),0.0,0.0])
+    return np.array([min(slope * sim_time, MAX_SPEED), 0.0, 0.0])
+
 
 def speed_steps(sim_time):
     # time_steps = np.array([3, 3, 3, 3, 6, 6])
@@ -32,18 +35,15 @@ def speed_steps(sim_time):
             raise ValueError("Time t is out of bounds.")
 
         # Find the index of the bin t belongs to
-        idx = np.searchsorted(start_times, t, side='right') - 1
+        idx = np.searchsorted(start_times, t, side="right") - 1
         return speeds[idx]
 
     return np.array([_get_velocity_at_time(sim_time), 0, 0])
 
 
-
-
 def ramped_speed_steps(sim_time):
     time_steps = np.array([3, 3, 3, 3])
     speeds = np.array([0.0, 0.5, -0.5, 0.75])
-
 
     RAMP_TIME = 1.0  # Duration over which to ramp between speeds
 
@@ -58,7 +58,7 @@ def ramped_speed_steps(sim_time):
         return np.array([speeds[-1], 0.0, 0.0])
 
     # Find current interval index
-    idx = np.searchsorted(start_times, sim_time, side='right') - 1
+    idx = np.searchsorted(start_times, sim_time, side="right") - 1
 
     t0 = start_times[idx]
     t1 = end_times[idx]

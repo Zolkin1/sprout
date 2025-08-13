@@ -1,22 +1,23 @@
+import glob
 import os
-import glob,re
 import pickle
+import re
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 
-units = {'v': ['m/s'], 'vdot': ['m/s²']}
+units = {"v": ["m/s"], "vdot": ["m/s²"]}
 env_ids = 0
+
 
 def extract_step(folder_name):
     match = re.search(r"play_step_(\d+)", folder_name)
     return int(match.group(1)) if match else -1
 
+
 def aggregate_checkpoints(setup_path):
-    ckpt_dirs = sorted(
-        glob.glob(os.path.join(setup_path, "play_step_*")),
-        key=extract_step
-    )
+    ckpt_dirs = sorted(glob.glob(os.path.join(setup_path, "play_step_*")), key=extract_step)
     step_list = [extract_step(p) for p in ckpt_dirs]
 
     all_data = {}
@@ -29,8 +30,8 @@ def aggregate_checkpoints(setup_path):
     for k in all_data:
         all_data[k] = np.stack(all_data[k], axis=0)  # shape: [N_ckpt, T, ...]
 
-    if 'y_act' in all_data and 'y_out' in all_data:
-        all_data['error_y'] = all_data['y_act'] - all_data['y_out']
+    if "y_act" in all_data and "y_out" in all_data:
+        all_data["error_y"] = all_data["y_act"] - all_data["y_out"]
 
     all_data["step_list"] = np.array(step_list)
     return all_data
@@ -50,8 +51,6 @@ def load_data(log_dir, keys=("v", "vdot", "y_act", "y_out")):
                 val = np.array(val)
             data[key] = val
     return data
-
-
 
 
 def plot_comparison(setup_dict, save_dir=None):
@@ -91,12 +90,12 @@ def plot_comparison(setup_dict, save_dir=None):
 
             chkpt = data["step_list"]
 
-            plt.plot(chkpt, mean, label=f'{name} mean')
+            plt.plot(chkpt, mean, label=f"{name} mean")
             plt.fill_between(chkpt, mean - std, mean + std, alpha=0.3)
 
-        plt.title(f'{key} vs Training Iteration')
+        plt.title(f"{key} vs Training Iteration")
         plt.xlabel("Training Iteration")
-        plt.ylabel(units.get(key, [''])[0])
+        plt.ylabel(units.get(key, [""])[0])
 
         # Apply ylim if specified
         if key in ylims:
@@ -111,12 +110,10 @@ def plot_comparison(setup_dict, save_dir=None):
         plt.show()
 
 
-
-
 if __name__ == "__main__":
     SETUPS = {
         "clf": "intermediate_log/clf",
         # "clf_vdot": "intermediate_log/clf_vdot",
-        "ref_tracking": "intermediate_log/ref_tracking"
+        "ref_tracking": "intermediate_log/ref_tracking",
     }
     plot_comparison(SETUPS, save_dir="intermediate_log/plots")

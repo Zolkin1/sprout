@@ -1,6 +1,7 @@
 from dataclasses import MISSING
-from isaaclab.managers import CommandTermCfg
+
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
+from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 
 from .gaitPeriod import GaitPeriodCommand
@@ -13,5 +14,3 @@ class GaitPeriodCfg(CommandTermCfg):
     class_type: type = GaitPeriodCommand
 
     period_range: tuple[float, float] = MISSING
-
-

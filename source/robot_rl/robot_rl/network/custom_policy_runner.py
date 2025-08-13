@@ -8,10 +8,10 @@ from __future__ import annotations
 import os
 import statistics
 import time
-import torch
 from collections import deque
 
 import rsl_rl
+import torch
 from rsl_rl.algorithms import PPO, Distillation
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import (
@@ -21,9 +21,10 @@ from rsl_rl.modules import (
     StudentTeacher,
     StudentTeacherRecurrent,
 )
+from rsl_rl.utils import store_code_state
+
 from robot_rl.network.actor_critic_cnn import ActorCriticCNN
 from robot_rl.network.actor_critic_transformer import ActorCriticTransformer
-from rsl_rl.utils import store_code_state
 
 
 class CustomOnPolicyRunner:
@@ -76,7 +77,7 @@ class CustomOnPolicyRunner:
             policy: ActorCriticCNN | ActorCriticTransformer = policy_class(
                 height_map_shape, num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
             ).to(self.device)
- 
+
         else:
             policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
                 num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
@@ -102,7 +103,9 @@ class CustomOnPolicyRunner:
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO | Distillation = alg_class(policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        self.alg: PPO | Distillation = alg_class(
+            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+        )
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -522,16 +525,20 @@ class CustomOnPolicyRunner:
 
         # check if user has device specified for local rank
         if self.device != f"cuda:{self.gpu_local_rank}":
-            raise ValueError(f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'.")
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
+            )
         # validate multi-gpu configuration
         if self.gpu_local_rank >= self.gpu_world_size:
-            raise ValueError(f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+            raise ValueError(
+                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
         if self.gpu_global_rank >= self.gpu_world_size:
-            raise ValueError(f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'.")
+            raise ValueError(
+                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
+            )
 
         # initialize torch distributed
-        torch.distributed.init_process_group(
-            backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size
-        )
+        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)

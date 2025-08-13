@@ -4,18 +4,18 @@ Minimal Control-Lyapunov-Function QP for HZD/virtual-constraint walking
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from collections.abc import Sequence
 
-import numpy as np
 import casadi as ca
+import numpy as np
 import pinocchio as pin
 
 
 @dataclass
 class CLFQPParams:
-    kp: float = 100.0          # proportional gain for desired dyn
+    kp: float = 100.0  # proportional gain for desired dyn
     kd: float = 2.0 * np.sqrt(100.0)
-    alpha: float = 20.0            # CLF decay rate  (dotV <= -alpha V)
+    alpha: float = 20.0  # CLF decay rate  (dotV <= -alpha V)
     u_min: Sequence[float] = None
     u_max: Sequence[float] = None
 
@@ -48,13 +48,14 @@ class CLFQPController:
 
         # ----------------------------------------------------------------------
         # Pre-compute Lyapunov matrix P from desired linear error dynamics
-        A = np.block(
-            [[np.zeros((params.kp.shape[0], params.kp.shape[0])), np.eye(params.kp.shape[0])],
-             [-np.diag(params.kp), -np.diag(params.kd)]]
-        )
+        A = np.block([
+            [np.zeros((params.kp.shape[0], params.kp.shape[0])), np.eye(params.kp.shape[0])],
+            [-np.diag(params.kp), -np.diag(params.kd)],
+        ])
         Q = np.eye(A.shape[0])
         # solve Aᵀ P + P A = -Q
         from scipy.linalg import solve_continuous_lyapunov
+
         self.P = solve_continuous_lyapunov(A.T, -Q)
         # ----------------------------------------------------------------------
 
@@ -158,8 +159,7 @@ if __name__ == "__main__":
         model,
         virtual_constraint_fun=joint_virtual_constraint,
         phase_variable_fun=time_phase_variable,
-        params=CLFQPParams(kp=np.array([100.0]), kd=np.array([20.0]), alpha=10.0,
-                          u_min=[-100], u_max=[100]),
+        params=CLFQPParams(kp=np.array([100.0]), kd=np.array([20.0]), alpha=10.0, u_min=[-100], u_max=[100]),
     )
     # dummy state
     q0 = pin.neutral(model)

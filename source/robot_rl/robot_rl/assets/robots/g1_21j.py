@@ -1,5 +1,5 @@
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg, DelayedPDActuatorCfg
+from isaaclab.actuators import DelayedPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 
 ROBOT_ASSETS = "robot_assets/g1"
@@ -142,7 +142,6 @@ This configuration removes most collision meshes to speed up simulation.
 """
 
 
-
 """ G1 Delayed Actuator Cfg"""
 G1_DELAYED_ACTUATOR_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -279,4 +278,3 @@ G1_DELAYED_ACTUATOR_CFG = ArticulationCfg(
         ),
     },
 )
-

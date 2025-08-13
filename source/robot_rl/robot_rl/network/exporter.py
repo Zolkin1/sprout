@@ -11,17 +11,22 @@
 #
 # ------------------------------------------------------------
 from __future__ import annotations
-import copy, os, torch
-from torch import nn
+
+import copy
+import os
 from typing import Optional
+
+import torch
+from torch import nn
 
 # --------------------------------------------------------------------- #
 #                          Public convenience                           #
 # --------------------------------------------------------------------- #
 
+
 def export_policy_as_jit(
     policy: nn.Module,
-    normalizer: Optional[nn.Module],
+    normalizer: nn.Module | None,
     path: str,
     filename: str = "policy.pt",
 ) -> None:
@@ -33,32 +38,34 @@ def export_policy_as_jit(
 def export_policy_as_onnx(
     policy: nn.Module,
     path: str,
-    normalizer: Optional[nn.Module] = None,
+    normalizer: nn.Module | None = None,
     filename: str = "policy.onnx",
     verbose: bool = False,
 ) -> None:
     """Export policy as ONNX (.onnx)."""
     _OnnxExporterCNN(policy, normalizer, verbose).export(path, filename)
 
+
 # --------------------------------------------------------------------- #
 #                             Private bits                              #
 # --------------------------------------------------------------------- #
 
+
 class _BaseExporterCNN(nn.Module):
     """Common logic for JIT / ONNX exporters that unwrap the CNN trunk."""
 
-    def __init__(self, policy: nn.Module, normalizer: Optional[nn.Module]):
+    def __init__(self, policy: nn.Module, normalizer: nn.Module | None):
         super().__init__()
 
         if getattr(policy, "is_recurrent", False):
             raise ValueError("This exporter handles only non-recurrent policies.")
 
         # --------- copy objects we actually need -------------
-        self.hmap_flat        = policy.hmap_flat
-        self.height_map_shape = policy.height_map_shape            # (C, H, W)
+        self.hmap_flat = policy.hmap_flat
+        self.height_map_shape = policy.height_map_shape  # (C, H, W)
 
         # CNN trunk & actor head
-        self.cnn   = copy.deepcopy(policy.cnn)
+        self.cnn = copy.deepcopy(policy.cnn)
         self.actor = copy.deepcopy(policy.actor)
         self.cnn_out = policy.cnn_out
         # optional obs normaliser (copy so the original graph stays untouched)
@@ -100,7 +107,7 @@ class _TorchExporterCNN(_BaseExporterCNN):
         scripted.save(os.path.join(path, filename))
 
     # TorchScript needs a callable object; expose forward explicitly
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:          # noqa: D401,E501
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:  # noqa: D401,E501
         return self._forward_detached(obs)
 
 
@@ -119,15 +126,15 @@ class _OnnxExporterCNN(_BaseExporterCNN):
         obs = torch.zeros(1, self.hmap_flat + self.actor[0].in_features - self.cnn_out)
 
         torch.onnx.export(
-            self,                                                # callable module
-            obs,                                                 # example input
+            self,  # callable module
+            obs,  # example input
             os.path.join(path, filename),
             export_params=True,
             opset_version=11,
             verbose=self.verbose,
             input_names=["obs"],
             output_names=["actions"],
-            dynamic_axes={},                                     # fixed-shape export
+            dynamic_axes={},  # fixed-shape export
         )
 
     # needed by torch.onnx.export

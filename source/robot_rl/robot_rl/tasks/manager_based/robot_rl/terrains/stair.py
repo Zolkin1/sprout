@@ -1,11 +1,14 @@
 from typing import TYPE_CHECKING
 
-import trimesh
 import numpy as np
+import trimesh
 from isaaclab.terrains.trimesh.utils import make_border
 
 if TYPE_CHECKING:
-    from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import MeshProgressiveXStairsTerrainCfg, MeshUniformXStairsTerrainCfg
+    from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import (
+        MeshProgressiveXStairsTerrainCfg,
+        MeshUniformXStairsTerrainCfg,
+    )
 
 
 def progressive_x_stairs_terrain(
@@ -62,7 +65,7 @@ def single_staircase_terrain(
 
     # Unpack usable area
     terrain_width = cfg.size[1]
-    terrain_length = cfg.size[0] - 2 * cfg.border_width 
+    terrain_length = cfg.size[0] - 2 * cfg.border_width
     step_depth = cfg.step_width
 
     # Derive height from difficulty
@@ -74,9 +77,7 @@ def single_staircase_terrain(
 
     # Generate uniform steps
     meshes_list = []
-    init_z = -num_steps * step_height    
-
-    
+    init_z = -num_steps * step_height
 
     cum_z = init_z
 
@@ -99,12 +100,11 @@ def single_staircase_terrain(
 
         cum_z += step_height
 
-#     # Optional border
-#     if cfg.border_width > 0.0:
-#         border_center = [0.5 * cfg.size[0], 0.5 * cfg.size[1], -step_height / 2]
-#         inner = (terrain_length, terrain_width)
-#         meshes_list += make_border(cfg.size, inner, step_height, border_center)
+    #     # Optional border
+    #     if cfg.border_width > 0.0:
+    #         border_center = [0.5 * cfg.size[0], 0.5 * cfg.size[1], -step_height / 2]
+    #         inner = (terrain_length, terrain_width)
+    #         meshes_list += make_border(cfg.size, inner, step_height, border_center)
 
-    origin = np.array([cfg.border_width/2, cfg.size[1] / 2, init_z])
+    origin = np.array([cfg.border_width / 2, cfg.size[1] / 2, init_z])
     return meshes_list, origin
-

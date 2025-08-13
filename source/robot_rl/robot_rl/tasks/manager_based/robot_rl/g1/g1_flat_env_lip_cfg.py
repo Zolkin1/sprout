@@ -1,12 +1,16 @@
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from isaaclab.managers import RewardTermCfg as RewTerm
+
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from robot_rl.tasks.manager_based.robot_rl.terrains.rough import (
+    ROUGH_SLOPED_FOR_FLAT_HZD_CFG,
+)
+
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import SceneEntityCfg
-from robot_rl.tasks.manager_based.robot_rl import mdp
+
 
 ##
 # Environment configuration
@@ -43,7 +47,7 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
             "eta_max": 0.2,
             "eta_dot_max": 0.3,
         }
-        
+
         self.rewards.action_rate_l2.weight = -0.01
 
         self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
@@ -56,37 +60,41 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
         self.curriculum.terrain_levels = None
         self.curriculum.clf_curriculum = None
 
-@configclass 
+
+@configclass
 class G1_custom_lip_clf(G1FlatLipEnvCfg):
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
-        #both front and back 1.14
-        #just front: 0.616
+        # both front and back 1.14
+        # just front: 0.616
         self.events.add_plate_mass = EventTerm(
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_distribution_params": (0.616,0.616),
+                "mass_distribution_params": (0.616, 0.616),
                 "operation": "add",
-            }
+            },
         )
 
 
 class G1FlatRefTrackingEnvCfg(G1FlatLipEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-        
+
         # self.rewards.clf_reward = None
         self.curriculum.clf_curriculum = None
         self.rewards.clf_decreasing_condition = None
         self.curriculum.clf_curriculum = None
 
+
 class G1FlatLipVdotEnvCfg(G1FlatLipEnvCfg):
     """Configuration for the G1 Flat environment."""
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -98,8 +106,9 @@ class G1FlatLipVdotEnvCfg(G1FlatLipEnvCfg):
             weight=2.0,
             params={
                 "command_name": "hlip_ref",
-            }
+            },
         )
+
 
 class G1FlatLipEnvCfg_PLAY(G1FlatLipEnvCfg):
     def __post_init__(self) -> None:
@@ -114,5 +123,9 @@ class G1FlatLipEnvCfg_PLAY(G1FlatLipEnvCfg):
         # remove random pushing
         self.events.base_external_force_torque = None
         # self.events.push_robot = None
-        self.events.push_robot.interval_range_s = (5.0,5.0)
-        self.events.reset_base.params["pose_range"] = {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0,0)} #(-3.14, 3.14)},
+        self.events.push_robot.interval_range_s = (5.0, 5.0)
+        self.events.reset_base.params["pose_range"] = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "yaw": (0, 0),
+        }  # (-3.14, 3.14)},

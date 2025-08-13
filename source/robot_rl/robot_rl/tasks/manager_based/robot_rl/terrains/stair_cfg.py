@@ -1,15 +1,18 @@
 from dataclasses import MISSING
 from typing import Literal
 
-import trimesh
-import numpy as np
 import isaaclab.terrains.trimesh.mesh_terrains as mesh_terrains
 import isaaclab.terrains.trimesh.utils as mesh_utils_terrains
-from isaaclab.utils import configclass
-
+import numpy as np
+import trimesh
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.terrains.trimesh.utils import make_border
-from robot_rl.tasks.manager_based.robot_rl.terrains.stair import progressive_x_stairs_terrain, single_staircase_terrain
+from isaaclab.utils import configclass
+
+from robot_rl.tasks.manager_based.robot_rl.terrains.stair import (
+    progressive_x_stairs_terrain,
+    single_staircase_terrain,
+)
 
 
 @configclass
@@ -44,12 +47,12 @@ class MeshProgressiveXStairsTerrainCfg(SubTerrainBaseCfg):
     """The width of the border around the terrain (in m)."""
 
 
-import torch
 from typing import Union
 
-def get_step_height_at_x(
-    x_vals: torch.Tensor, cfg: "MeshProgressiveXStairsTerrainCfg"
-) -> torch.Tensor:
+import torch
+
+
+def get_step_height_at_x(x_vals: torch.Tensor, cfg: "MeshProgressiveXStairsTerrainCfg") -> torch.Tensor:
     """
     Given a batch of x-coordinates, return the cumulative step height at each x
     for a staircase that increases in +x direction with growing step heights (Torch version).
@@ -100,6 +103,6 @@ def get_uniform_stair_step_height_from_env(terrain_origins, cfg: "MeshUniformXSt
     Estimate step height from terrain origin and known step depth.
     Assumes uniform stair steps and that terrain origin.z = -total_height.
     """
-    origin_z = -terrain_origins[:,2]  # negate because origin.z = -cum_z
+    origin_z = -terrain_origins[:, 2]  # negate because origin.z = -cum_z
     num_steps = int((cfg.size[0] - 2 * cfg.border_width) // cfg.step_width)
-    return (origin_z / num_steps) 
+    return origin_z / num_steps

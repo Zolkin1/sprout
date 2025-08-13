@@ -1,32 +1,37 @@
 import os
-import yaml
-import numpy as np
-import matplotlib.pyplot as plt
-from sim.log_utils import extract_data
 from collections import defaultdict
+
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+from matplotlib.legend_handler import HandlerBase
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
-from matplotlib.legend_handler import HandlerBase
+from sim.log_utils import extract_data
+
 
 class HandlerOverlay(HandlerBase):
     def create_artists(self, legend, orig_handle, xdescent, ydescent, width, height, fontsize, trans):
         line, patch = orig_handle
         # Create patch (shade) first
-        p = plt.Rectangle((xdescent, ydescent), width, height,
-                  facecolor=patch.get_facecolor(),
-                  edgecolor='none',
-                  transform=trans)
+        p = plt.Rectangle(
+            (xdescent, ydescent), width, height, facecolor=patch.get_facecolor(), edgecolor="none", transform=trans
+        )
 
         # Then line on top
-        margin = width*0.05
-        l = Line2D([xdescent +margin, xdescent + width -margin],
-                   [ydescent + height / 2] * 2,
-                   color=line.get_color(), lw=line.get_linewidth(),
-                   transform=trans)
+        margin = width * 0.05
+        l = Line2D(
+            [xdescent + margin, xdescent + width - margin],
+            [ydescent + height / 2] * 2,
+            color=line.get_color(),
+            lw=line.get_linewidth(),
+            transform=trans,
+        )
         return [p, l]
 
+
 def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
-    
+
     experiment_dirs = [
         os.path.join(root_dir, d)
         for root_dir, _, _ in os.walk("experiments/mass_rand_comp")
@@ -50,29 +55,29 @@ def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
                     "config": config,
                     "time": np.squeeze(data["time"]),
                     "commanded_vel": np.squeeze(data["commanded_vel"]),
-                    "actual_vel": np.squeeze(data["qvel"])
+                    "actual_vel": np.squeeze(data["qvel"]),
                 })
             except Exception as e:
                 print(f"[Warning] Skipping {run_dir}: {e}")
 
     return grouped_data
 
+
 def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
-    plt.rcParams.update({'font.size': 18})
+    plt.rcParams.update({"font.size": 18})
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
         "font.serif": ["Computer Modern Roman"],
     })
 
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5),sharex=True)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5), sharex=True)
     colors = plt.cm.tab10.colors
 
     first_label = next(iter(grouped_data))
     time = grouped_data[first_label][0]["time"]
 
-
-    dummy_patch = Patch(facecolor='none', alpha=0.0)  # Transparent dummy patch for handler
+    dummy_patch = Patch(facecolor="none", alpha=0.0)  # Transparent dummy patch for handler
     custom_handles = []
     custom_labels = []
 
@@ -86,54 +91,55 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
         std_actual = np.std(actual_stack, axis=0)
 
         ax.plot(time, mean_actual[:, 0], color=color, linewidth=2.5)
-        ax.fill_between(time, mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0],
-                        color=color, alpha=0.2)
+        ax.fill_between(
+            time, mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0], color=color, alpha=0.2
+        )
 
         line = Line2D([0], [0], color=color, lw=2.5)
         patch = Patch(facecolor=color, alpha=0.15)
         custom_handles.append((line, patch))
-        custom_labels.append(fr"{display_label}")
-
+        custom_labels.append(rf"{display_label}")
 
     commanded = grouped_data[first_label][0]["commanded_vel"][:, 0]
-    ax.plot(time, commanded, 'k--', linewidth=2)
-    custom_handles.append((Line2D([0], [0], color='k', linestyle='--'), dummy_patch))
+    ax.plot(time, commanded, "k--", linewidth=2)
+    custom_handles.append((Line2D([0], [0], color="k", linestyle="--"), dummy_patch))
     custom_labels.append(r"$v_x^d$")
 
-    ax.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
-    ax.set_xlabel('Time (s)',fontsize=20)
+    ax.set_ylabel(r"$v_x$ (m/s)", fontsize=20)
+    ax.set_xlabel("Time (s)", fontsize=20)
     ax.set_ylim(-0.6, 1.05)
     plt.xticks(fontsize=20)
     plt.yticks(fontsize=20)
     ax.grid(True)
 
     ax.legend(
-     custom_handles,
-     custom_labels,
-     loc="lower center",
-     bbox_to_anchor=(0.5, 0.96),
-     ncol=len(custom_labels),  # Puts all legend entries in one row
-     framealpha=0.0,
-     columnspacing=0.8,
-     handler_map={tuple: HandlerOverlay()},
-     fontsize=20
-     )
-
+        custom_handles,
+        custom_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.96),
+        ncol=len(custom_labels),  # Puts all legend entries in one row
+        framealpha=0.0,
+        columnspacing=0.8,
+        handler_map={tuple: HandlerOverlay()},
+        fontsize=20,
+    )
 
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path + ".png", bbox_inches='tight', transparent=True)
-        fig.savefig(save_path + ".pdf", bbox_inches='tight', transparent=True)
-        fig.savefig(save_path + ".svg", bbox_inches='tight', transparent=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
+        fig.savefig(save_path + ".svg", bbox_inches="tight", transparent=True)
 
     plt.show()
+
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prefix", type=str, default="mass_randomization_",
-                        help="Prefix of experiment folders to aggregate")
+    parser.add_argument(
+        "--prefix", type=str, default="mass_randomization_", help="Prefix of experiment folders to aggregate"
+    )
     parser.add_argument("--save_name", type=str, default="experiments/plots/mass_randomization_comparison")
     args = parser.parse_args()
 

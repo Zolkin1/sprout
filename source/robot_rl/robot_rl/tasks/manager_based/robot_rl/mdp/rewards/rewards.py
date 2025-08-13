@@ -5,25 +5,32 @@
 
 from __future__ import annotations
 
-import torch
 import math
 from typing import TYPE_CHECKING
 
+import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import wrap_to_pi
-from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
+from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import (
+    euler_xyz_from_quat,
+    quat_inv,
+    quat_rotate,
+    quat_rotate_inverse,
+    wrap_to_pi,
+    yaw_quat,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
 
 def vdot_tanh(env: ManagerBasedRLEnv, command_name: str, alpha: float = 1.0) -> torch.Tensor:
     # Retrieve the CLF-related quantities: V and its time derivative
     ref_term = env.command_manager.get_term(command_name)  # [B]
     vdot = ref_term.vdot  # [B]
-    v = ref_term.v        # [B]
+    v = ref_term.v  # [B]
 
     # Compute the CLF decay condition violation
     clf_decay_violation = vdot + alpha * v  # [B]
@@ -39,7 +46,7 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
 
     ref_term = env.command_manager.get_term(command_name)
     v = ref_term.v  # [B] scalar CLF value per env
-    max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
+    max_clf = ref_term.clf.lambda_max * max_eta_err**2 + eps  # principled normalization; lambda_max(P) * eta**2
 
     reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
     return reward
@@ -60,16 +67,14 @@ def clf_decreasing_condition(
     """
 
     ref_term = env.command_manager.get_term(command_name)
-    v = ref_term.v        # [B]
+    v = ref_term.v  # [B]
     vdot = ref_term.vdot  # [B]
 
     lambda_max = ref_term.clf.lambda_max
     norm_P = ref_term.clf.norm_P
 
     # Theoretical upper bound on violation
-    max_violation = (
-        2.0 * norm_P * eta_max * eta_dot_max + alpha * lambda_max * eta_max ** 2 + eps
-    )
+    max_violation = 2.0 * norm_P * eta_max * eta_dot_max + alpha * lambda_max * eta_max**2 + eps
     # Only penalize when violation is positive
     violation = torch.clamp(vdot + alpha * v, min=0.0)
     penalty = violation / max_violation
@@ -77,22 +82,23 @@ def clf_decreasing_condition(
     return penalty
 
 
-def v_dot_penalty(env: ManagerBasedRLEnv, command_name: str,eta_max: float = 0.15,
-    eta_dot_max: float = 0.5,eps: float = 1e-6) -> torch.Tensor:
-    ref_term = env.command_manager.get_term(command_name)                    # [B]
-    vdot = ref_term.vdot # [B]
+def v_dot_penalty(
+    env: ManagerBasedRLEnv, command_name: str, eta_max: float = 0.15, eta_dot_max: float = 0.5, eps: float = 1e-6
+) -> torch.Tensor:
+    ref_term = env.command_manager.get_term(command_name)  # [B]
+    vdot = ref_term.vdot  # [B]
 
     norm_P = ref_term.clf.norm_P
 
-    max_violation = (
-        2.0 * norm_P * eta_max * eta_dot_max + eps
-    )
+    max_violation = 2.0 * norm_P * eta_max * eta_dot_max + eps
 
-    vdot_penalty = torch.tanh(torch.clamp(vdot, min=0.0) / max_violation) 
+    vdot_penalty = torch.tanh(torch.clamp(vdot, min=0.0) / max_violation)
     return vdot_penalty
 
 
-def contact_no_vel(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def contact_no_vel(
+    env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """Reward feet contact with zero velocity."""
     # extract the used quantities (to enable type-hinting)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -100,14 +106,12 @@ def contact_no_vel(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = 
     asset = env.scene[asset_cfg.name]
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids] * contacts.unsqueeze(-1)
     # shape [B, num_feet, 3]
-    penalize = torch.square(body_vel[:,:,:3])
-    return torch.sum(penalize, dim=(1,2))
+    penalize = torch.square(body_vel[:, :, :3])
+    return torch.sum(penalize, dim=(1, 2))
 
 
 def holonomic_constraint_vel(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    sigma_vel: float = (0.1)**0.5
+    env: ManagerBasedRLEnv, command_name: str, sigma_vel: float = (0.1) ** 0.5
 ) -> torch.Tensor:
     """
     Unified holonomic‐velocity constraint reward:
@@ -118,20 +122,18 @@ def holonomic_constraint_vel(
     cmd = env.command_manager.get_term(command_name)
 
     # linear velocity [B,3] and yaw rate [B,1]
-    v   = cmd.stance_foot_vel                        # [vx, vy, vz]
-    wz  = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1) # [ω_z]
+    v = cmd.stance_foot_vel  # [vx, vy, vz]
+    wz = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1)  # [ω_z]
 
     # stack into [B,4] error vector
     e_vel = torch.cat([v, wz], dim=-1)
 
     # unified exponential‐norm reward
-    return torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
+    return torch.exp(-(e_vel**2).sum(dim=-1) / sigma_vel**2)
+
 
 def holonomic_constraint(
-    env: ManagerBasedRLEnv,
-    command_name: str,
-    sigma_pose: float = (5 * 0.01) ** 0.5,
-    z_offset: float = 0.036
+    env: ManagerBasedRLEnv, command_name: str, sigma_pose: float = (5 * 0.01) ** 0.5, z_offset: float = 0.036
 ) -> torch.Tensor:
     """
     Unified holonomic‐pose constraint reward:
@@ -147,26 +149,26 @@ def holonomic_constraint(
 
     # planar position error [B,2]
     p0_xy = cmd.stance_foot_pos_0[:, :2]
-    p_xy  = cmd.stance_foot_pos[:, :2]
+    p_xy = cmd.stance_foot_pos[:, :2]
     delta_xy = p_xy - p0_xy
 
     # vertical error to the floor plane [B,1]
-    z_cur    = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
-    delta_z  = z_cur - cmd.stance_foot_pos_0[:,2].unsqueeze(-1)
+    z_cur = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
+    delta_z = z_cur - cmd.stance_foot_pos_0[:, 2].unsqueeze(-1)
 
     # roll error [B,1]
     roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
 
     # yaw error wrapped to [–π, π] [B,1]
     psi0 = cmd.stance_foot_ori_0[:, 2]
-    psi  = cmd.stance_foot_ori[:, 2]
+    psi = cmd.stance_foot_ori[:, 2]
     delta_psi = ((psi - psi0 + torch.pi) % (2 * torch.pi) - torch.pi).unsqueeze(-1)
 
     # stack into [B,5] error vector
     e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
 
     # unified Gaussian‐like reward
-    return torch.exp(- (e_pose**2).sum(dim=-1) / sigma_pose**2)
+    return torch.exp(-(e_pose**2).sum(dim=-1) / sigma_pose**2)
 
 
 def reference_tracking(
@@ -182,19 +184,20 @@ def reference_tracking(
     err = command.y_act - command.y_out  # [B, D]
 
     weight_vec = torch.as_tensor(term_weight, dtype=err.dtype, device=err.device)  # [D]
-    std_vec = torch.as_tensor(term_std, dtype=err.dtype, device=err.device)        # [D]
+    std_vec = torch.as_tensor(term_std, dtype=err.dtype, device=err.device)  # [D]
 
     # [B, D] scaled squared error per dimension
-    err_sq_scaled = (err ** 2) / (std_vec ** 2)
+    err_sq_scaled = (err**2) / (std_vec**2)
 
     # Apply element-wise exp(-error²/std²) and weight
     reward_per_dim = weight_vec * torch.exp(-err_sq_scaled)  # [B, D]
-    reward = reward_per_dim.sum(dim=1)/torch.sum(weight_vec)  # [B]
+    reward = reward_per_dim.sum(dim=1) / torch.sum(weight_vec)  # [B]
 
     return reward
 
 
-def reference_vel_tracking(    env: ManagerBasedRLEnv,
+def reference_vel_tracking(
+    env: ManagerBasedRLEnv,
     command_name: str,
     term_std: Sequence[float],
     term_weight: Sequence[float],
@@ -205,23 +208,24 @@ def reference_vel_tracking(    env: ManagerBasedRLEnv,
     err = command.dy_act - command.dy_out
 
     weight_vec = torch.as_tensor(term_weight, dtype=err.dtype, device=err.device)  # [D]
-    std_vec = torch.as_tensor(term_std, dtype=err.dtype, device=err.device)        # [D]
+    std_vec = torch.as_tensor(term_std, dtype=err.dtype, device=err.device)  # [D]
 
     # [B, D] scaled squared error per dimension
-    err_sq_scaled = (err ** 2) / (std_vec ** 2)
+    err_sq_scaled = (err**2) / (std_vec**2)
 
     # Apply element-wise exp(-error²/std²) and weight
     reward_per_dim = weight_vec * torch.exp(-err_sq_scaled)  # [B, D]
-    reward = reward_per_dim.sum(dim=1)/torch.sum(weight_vec)  # [B]
+    reward = reward_per_dim.sum(dim=1) / torch.sum(weight_vec)  # [B]
     return reward
 
 
-
-def foot_clearance(env: ManagerBasedRLEnv,
-                   target_height: float,
-                   sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
-                   height_sensor_cfg: SceneEntityCfg | None = None,
-                   asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
+def foot_clearance(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    height_sensor_cfg: SceneEntityCfg | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
     """Reward foot clearance."""
     asset: Articulation = env.scene[asset_cfg.name]
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
@@ -231,7 +235,7 @@ def foot_clearance(env: ManagerBasedRLEnv,
 
     if height_sensor_cfg is not None:
         sensor: RayCaster = env.scene[height_sensor_cfg.name]
-        adjusted_target_height = target_height + torch.mean(sensor.data.ray_hits_w[...,2],dim=1).unsqueeze(-1)
+        adjusted_target_height = target_height + torch.mean(sensor.data.ray_hits_w[..., 2], dim=1).unsqueeze(-1)
     else:
         adjusted_target_height = target_height
 
@@ -241,13 +245,14 @@ def foot_clearance(env: ManagerBasedRLEnv,
 
     return torch.sum(pos_error, dim=(1))
 
+
 def phase_contact(
     env: ManagerBasedRLEnv,
-        period: float = 0.8,
-        command_name: str | None = None,
-        Tswing: float =0.4,
+    period: float = 0.8,
+    command_name: str | None = None,
+    Tswing: float = 0.4,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Reward foot contact with regards to phase."""
     asset: Articulation = env.scene[asset_cfg.name]
@@ -256,13 +261,14 @@ def phase_contact(
     res = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
 
     # Contact phase
-    tp = (env.sim.current_time % period) / period     # Scaled between 0-1
-    phi_c = torch.tensor(math.sin(2*torch.pi*tp)/math.sqrt(math.sin(2*torch.pi*tp)**2 + Tswing), device=env.device)
+    tp = (env.sim.current_time % period) / period  # Scaled between 0-1
+    phi_c = torch.tensor(
+        math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp) ** 2 + Tswing), device=env.device
+    )
 
     stance_i = int(0.5 - 0.5 * torch.sign(phi_c))
 
-
-     # check if robot needs to be standing
+    # check if robot needs to be standing
     if command_name is not None:
         command_norm = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
         is_small_command = command_norm < 0.005
@@ -270,13 +276,19 @@ def phase_contact(
             is_stance = stance_i == i
             # set is_stance to be true if the command is small
             is_stance = is_stance | is_small_command
-            contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
+            contact = (
+                contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0]
+                > 1.0
+            )
             res += ~(contact ^ is_stance)
     else:
         for i in range(2):
             is_stance = stance_i == i
             # set is_stance to be true if the command is small
             is_stance = is_stance
-            contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
+            contact = (
+                contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0]
+                > 1.0
+            )
             res += ~(contact ^ is_stance)
     return res

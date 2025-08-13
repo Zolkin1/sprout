@@ -6,4 +6,4 @@
 from .actor_critic_cnn import ActorCriticCNN
 from .actor_critic_transformer import ActorCriticTransformer
 
-__all__ = ["ActorCriticCNN", "ActorCriticTransformer"] 
+__all__ = ["ActorCriticCNN", "ActorCriticTransformer"]
