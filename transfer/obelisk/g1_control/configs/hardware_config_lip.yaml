@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        policy_name: "RA-L_paper/lip_clf.pt"
+        policy_name: "RA-L_paper/8_6_lip_clf_68.pt"
         num_obs: 74
         num_actions: 21
         period: 0.8                   # s
