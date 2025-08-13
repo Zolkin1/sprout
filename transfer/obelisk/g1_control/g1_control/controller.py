@@ -31,12 +31,28 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.declare_parameter("w_z_max", 0.5)
 
         # Load policy
-        self.declare_parameter("policy_name", "")
+        self.declare_parameter("local_policy_name", "")
         self.declare_parameter("obs_type", "")
+        self.declare_parameter("hf_repo_id", "")
+        self.declare_parameter("hf_policy_name", "")
+        
         self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
-        policy_name = self.get_parameter("policy_name").get_parameter_value().string_value
+        policy_name = self.get_parameter("local_policy_name").get_parameter_value().string_value
+        hf_repo_id = self.get_parameter("hf_repo_id").get_parameter_value().string_value
+        hf_policy_name = self.get_parameter("hf_policy_name").get_parameter_value().string_value
+        
         pkg_path = get_package_share_directory("g1_control")
-        policy_path = os.path.join(pkg_path, f"resource/policies/{policy_name}")
+        
+        # Determine policy path and load policy
+        if hf_repo_id and hf_policy_name:
+            # Try to load from Hugging Face
+            policy_path = self._load_policy_from_hf(pkg_path, hf_repo_id, hf_policy_name)
+        else:
+            # Load from local path
+            policy_path = os.path.join(pkg_path, f"resource/policies/{policy_name}")
+            if not os.path.exists(policy_path):
+                raise FileNotFoundError(f"Policy file not found at {policy_path}")
+        
         self.policy = torch.jit.load(policy_path)
         self.device = next(self.policy.parameters()).device
 
@@ -245,6 +261,55 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.get_logger().info(f"Policy: {policy_path} loaded on {self.device}.")
         self.get_logger().info("RL Velocity Tracking node constructor complete.")
+
+    def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_name: str) -> str:
+        """Load policy from Hugging Face with local caching.
+        
+        Args:
+            pkg_path: Package path for local storage
+            hf_repo_id: Hugging Face repository ID (e.g., 'username/repo-name')
+            hf_policy_name: Name of the policy file on Hugging Face (e.g., 'policy_v1.pt')
+        
+        Returns:
+            Local path to the downloaded policy file
+        """
+        # Create cache directory
+        cache_dir = os.path.join(pkg_path, "resource/policies/hf_cache", hf_repo_id.replace("/", "_"))
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Local cache path
+        local_policy_path = os.path.join(cache_dir, hf_policy_name)
+        
+        # Check if policy already exists locally
+        if os.path.exists(local_policy_path):
+            self.get_logger().info(f"Using cached policy from {local_policy_path}")
+            return local_policy_path
+        
+        # Download from Hugging Face
+        try:
+            from huggingface_hub import hf_hub_download
+            
+            self.get_logger().info(f"Downloading policy {hf_policy_name} from {hf_repo_id}...")
+            
+            downloaded_path = hf_hub_download(
+                repo_id=hf_repo_id,
+                filename=hf_policy_name,
+                cache_dir=cache_dir,
+                local_dir=cache_dir,
+            )
+            
+            # If downloaded to a different location, copy to our expected path
+            if downloaded_path != local_policy_path:
+                import shutil
+                shutil.copy2(downloaded_path, local_policy_path)
+            
+            self.get_logger().info(f"Successfully downloaded policy to {local_policy_path}")
+            return local_policy_path
+            
+        except ImportError:
+            raise RuntimeError("huggingface_hub is required for downloading policies. Install with: pip install huggingface_hub")
+        except Exception as e:
+            raise RuntimeError(f"Failed to download policy from Hugging Face: {e}")
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """Configure the controller."""

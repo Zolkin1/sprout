@@ -5,6 +5,7 @@ from datetime import datetime
 
 import numpy as np
 
+
 def find_most_recent_timestamped_folder(base_path):
     """
     Finds the path of the most recent folder named with a YYYY-MM-DD-HH-MM-SS timestamp
@@ -57,12 +58,12 @@ def find_most_recent_timestamped_folder(base_path):
 
 
 def extract_data(filepath, config):
-    data_structure = config.get('data_structure')
+    data_structure = config.get("data_structure")
     print("\nData structure from config:")
     for item in data_structure:
         print(f"  {item['name']}: length {item['length']}")
 
-    extracted_data_lists = {item['name']: [] for item in data_structure if 'name' in item}
+    extracted_data_lists = {item["name"]: [] for item in data_structure if "name" in item}
     print("\nInitialized data lists:")
     for name in extracted_data_lists:
         print(f"  {name}")
@@ -79,7 +80,7 @@ def extract_data(filepath, config):
             for item in data_structure:
                 name = item.get("name")
                 length = item.get("length")
-                component_data = numeric_row[current_index: current_index + length]
+                component_data = numeric_row[current_index : current_index + length]
                 extracted_data_lists[name].append(component_data)
                 current_index += length
 
