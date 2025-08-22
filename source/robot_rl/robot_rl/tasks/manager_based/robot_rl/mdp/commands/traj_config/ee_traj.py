@@ -68,6 +68,62 @@ def relable_ee_coeffs():
 
     return R
 
+def relable_ee_stance_coeffs():
+    """Build a relabelling matrix for end effector coefficients including the stance foot."""
+    R = np.eye(27)
+
+    ##
+    # COM
+    ##
+    # com pos: [1,-1,1]
+    R[1, 1] = -1
+
+    ##
+    # Pelvis
+    ##
+    # pelvis: [-1,1,-1]
+    R[3, 3] = -1
+    R[5, 5] = -1
+
+    ##
+    # Swing foot
+    ##
+    # swing_foot_pos:[1,-1,1]
+    R[7, 7] = -1
+    # swing_foot_or: [-1,1,-1]
+    R[9, 9] = -1
+    R[11, 11] = -1
+
+    ##
+    # Stance Foot
+    ##
+    # stance_foot_pos: [1, -1, 1]
+    R[13, 13] = -1
+    # stance_foot_ori: [-1, 1, -1]
+    R[15, 15] = -1
+    R[17, 17] = -1
+
+    ##
+    # Joints
+    ##
+    # waist yaw
+    R[18, 18] = -1
+
+    #swap arm coeffs
+    arm_offset = 18 + 1
+    left_arm = arm_offset + np.array([0, 1, 2, 3])
+    right_arm = arm_offset + np.array([4, 5, 6, 7])
+
+    tmp = R[left_arm, :].copy()
+    R[left_arm, :] = R[right_arm, :]
+    R[right_arm, :] = tmp
+
+    # Sign flips: shoulder_roll, shoulder_yaw
+    flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
+    R[flip_arm, :] *= -1
+
+    return R
+
 class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
     """Configuration class for end effector trajectories."""
     
@@ -78,18 +134,39 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
     def _load_specific_data(self, data):
         """Load end effector specific data from YAML."""
         # Load constraint specifications
-        self.constraint_specs = data.get('constraint_specs', [])
-        
-        # Reshape bezier coefficients to [num_joints, num_control_points]
-        num_output = 21
-        domain_name = next(iter(data.keys()))
-        bezier_coeffs = data[domain_name]['bezier_coeffs']
-        num_control_points = data['spline_order'] + 1
-        bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_output, num_control_points)
-        
-        self.bezier_coeffs = bezier_coeffs_reshaped
-        self.joint_order = data['joint_order']
-    
+
+        # Read in the domain sequence
+        for domain_name in self.domain_seq:
+            if data[domain_name]['constraint_specs'] is None:
+                raise ValueError("No constraint specs in the solution file!")
+
+            # For now just assuming these are all the same TODO: may want to break this assumption
+            self.constraint_specs = data[domain_name]['constraint_specs']
+
+            # Reshape bezier coefficients to [num_virtual_const, num_control_points]
+
+            ##
+            # Compute the number of virtual constraints
+            ##
+            def count_constraint_entries(data):
+                total_count = 0
+                for spec in data:
+                    if 'axes' in spec:
+                        total_count += len(spec['axes'])
+                    if 'joint_names' in spec:
+                        total_count += len(spec['joint_names'])
+                return total_count
+            
+            num_virtual_const = count_constraint_entries(self.constraint_specs)
+            print("num_virtual_constraints: ", num_virtual_const)
+
+            bezier_coeffs = data[domain_name]['bezier_coeffs']
+            num_control_points = data[domain_name]['spline_order'] + 1
+            bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_virtual_const, num_control_points)
+
+            self.bezier_coeffs[domain_name] = bezier_coeffs_reshaped
+            self.joint_order[domain_name] = data[domain_name]['joint_order']
+
     def get_constraint_frames(self) -> List[str]:
         """Extract frame names from constraint specs."""
         frames = []
@@ -100,19 +177,26 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
     def reorder_and_remap(self, cfg, device):
         """Reorder and remap end effector coefficients using hardcoded relabeling matrix."""
-        # Load all bezier coefficients from YAML
-        self.right_coeffs = torch.tensor(self.bezier_coeffs, dtype=torch.float32, device=device)
+        # reorder for each domain
+        for domain_name in self.domain_seq:
+            # Load all bezier coefficients from YAML
+            self.right_coeffs[domain_name] = torch.tensor(self.bezier_coeffs[domain_name], dtype=torch.float32, device=device)
 
-        # Apply relabeling matrix to get left coefficients
-        R = relable_ee_coeffs()
+            # Apply relabeling matrix to get left coefficients
+            if self.bezier_coeffs[domain_name].shape[0] == 21:
+                R = relable_ee_coeffs()
+            elif self.bezier_coeffs[domain_name].shape[0] == 27:
+                R = relable_ee_stance_coeffs()
+            else:
+                raise ValueError("No hard coded bezier relabelling matrix for these virtual constraints!")
 
-        # Apply relabeling: left_coeffs = R @ right_coeffs
-        left_coeffs = R @ self.bezier_coeffs
+            # Apply relabeling: left_coeffs = R @ right_coeffs
+            left_coeffs = R @ self.bezier_coeffs[domain_name]
 
-        self.left_coeffs = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
+            self.left_coeffs[domain_name] = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
 
-        # Generate axis names for metrics
-        self.generate_axis_names()
+            # Generate axis names for metrics
+            self.generate_axis_names(domain_name)
 
     def get_joint_idx_list(self, hzd_cmd):
         """Get the joint index list for the given command."""
@@ -123,7 +207,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
             joint_idx_list.append(joint_idx)
         return joint_idx_list
 
-    def generate_axis_names(self):
+    def generate_axis_names(self, domain_name):
         """Generate axis names for each constraint specification."""
         self.axis_names = []
         current_idx = 0
@@ -136,10 +220,11 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 axis_names = ["x", "y", "z"]
                 # Generate metric names for COM position (only specified axes)
                 for i, axis_idx in enumerate(axes):
-                    metric_name = f"com_pos_{axis_names[axis_idx]}"
+                    metric_name = f"com_pos_{axis_names[axis_idx]}_{domain_name}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx + i
+                        'index': current_idx + i,
+                        'domain': domain_name,
                     })
                 current_idx += len(axes)
                 
@@ -149,10 +234,11 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
                 for joint_name in joint_names:
                     # Generate metric name for joint
-                    metric_name = f"joint_{joint_name}"
+                    metric_name = f"joint_{joint_name}_{domain_name}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx
+                        'index': current_idx,
+                        'domain': domain_name,
                     })
                     current_idx += output_dim
                 
@@ -170,10 +256,11 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 
                 # Generate metric names for each axis (only specified axes)
                 for i, axis_idx in enumerate(axes):
-                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}"
+                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}_{domain_name}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx + i
+                        'index': current_idx + i,
+                        'domain': domain_name,
                     })
                 
                 current_idx += len(axes)
@@ -182,14 +269,15 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         """Apply end effector specific swing modifications."""
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
 
-        #5,11
-        stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
         #if standing, don't modify yaw
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
 
-        if stand_idx.numel() > 0:
-            delta_psi[stand_idx] = 0
-            base_velocity[stand_idx,2] = 0
+        if hzd_cmd.use_standing:
+            #5,11
+            stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+            if stand_idx.numel() > 0:
+                delta_psi[stand_idx] = 0
+                base_velocity[stand_idx,2] = 0
 
         des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
         des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)

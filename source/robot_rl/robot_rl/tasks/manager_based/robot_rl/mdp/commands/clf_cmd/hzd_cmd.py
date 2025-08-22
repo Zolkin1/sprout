@@ -62,7 +62,7 @@ class HZDCommandTerm(CommandTerm, ABC):
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
 
-    def update_Stance_Swing_idx(self):
+    def update_stance_swing_idx(self):
         """Update stance and swing indices based on phase."""
         Tswing = self._get_swing_period()
 
@@ -93,7 +93,7 @@ class HZDCommandTerm(CommandTerm, ABC):
 
     def _update_command(self):
         """Update the command by generating reference and computing CLF."""
-        self.update_Stance_Swing_idx()
+        self.update_stance_swing_idx()
         self.generate_reference_trajectory()
         self.get_actual_state()
         
@@ -102,7 +102,7 @@ class HZDCommandTerm(CommandTerm, ABC):
         self.v = vcur
 
     @abstractmethod
-    def _get_swing_period(self) -> float:
+    def _get_leg_period(self) -> float:
         """Get the swing period for phase calculation."""
         pass
 
@@ -143,7 +143,7 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
         self.ref_config = JointTrajectoryConfig()
         self.ref_config.reorder_and_remap_jt(cfg, self.robot, self.device)
 
-    def _get_swing_period(self) -> float:
+    def _get_leg_period(self) -> float:
         """Get the swing period from the reference configuration."""
         return self.ref_config.T
 
@@ -157,7 +157,7 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
         """Populate actual state and its time derivative in the robot's local (yaw-aligned) frame."""
         # Convenience
         self.ref_config.get_stance_foot_pose(self)
-        jt_pos, jt_vel = self.ref_config.get_actul_traj(self)
+        jt_pos, jt_vel = self.ref_config.get_actual_traj(self)
         self.y_act = jt_pos
         self.dy_act = jt_vel
 
@@ -239,7 +239,7 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
         self.ee_config.reorder_and_remap_ee(cfg, self.ee_tracker, self.device)
         self.yaw_output_idx = [5,11,16,20]
 
-    def _get_swing_period(self) -> float:
+    def _get_leg_period(self) -> float:
         """Get the swing period from the end effector configuration."""
         return self.ee_config.T
 
@@ -284,9 +284,9 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
             self.stance_foot_vel = stance_foot_vel
             self.stance_foot_ang_vel = stance_foot_ang_vel
 
-    def update_Stance_Swing_idx(self):
+    def update_stance_swing_idx(self):
             """Update stance and swing indices based on phase."""
-            Tswing = self._get_swing_period()
+            Tswing = self._get_leg_period()
 
             tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
             phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)

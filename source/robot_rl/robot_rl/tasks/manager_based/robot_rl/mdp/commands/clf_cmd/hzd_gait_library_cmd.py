@@ -2,7 +2,7 @@ import torch
 import math
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cmd import HZDCommandTerm
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library_traj import (
-    GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryTrajectoryConfig
+    GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryConfig
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
 # from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
@@ -12,7 +12,10 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
     
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
-        
+
+        self.current_domain = ""
+        self.use_standing = cfg.use_standing
+
         # Initialize gait library based on trajectory type
         if hasattr(cfg, 'gait_library_path'):
             config_name = getattr(cfg, 'config_name', 'single_support')
@@ -32,7 +35,8 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
                     self.gait_config = GaitLibraryEndEffectorConfig(
                         cfg.gait_library_path, 
                         cfg.gait_velocity_ranges,
-                        config_name
+                        config_name,
+                        cfg.use_standing,
                     )
                 else:
                     self.gait_config = GaitLibraryJointConfig(
@@ -54,36 +58,40 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         
         # Set up trajectory-specific attributes
         if cfg.trajectory_type == "end_effector":
+            ##
+            # Indexes of the virtual constraint for modification (yaw, euler rate)
+            ##
             self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
             self.joint_idx_list = self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].get_joint_idx_list(self)
-            self.foot_yaw_output_idx = 11
-            self.foot_y_output_idx = 7
+            self.foot_yaw_output_idx = 11   # TODO: Add the stance foot yaw here
+            self.foot_y_output_idx = 7      # Lateral motion    # TODO: Add the stance foot y here
             self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
             self.yaw_output_idx = [5, 11]
 
-            self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
+            if cfg.use_standing:
+                self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
             
-            from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg
-            right_des_pos = bezier_deg(
-                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
-                    torch.tensor(self.gait_config.bez_deg, device=self.device)
-                )
-            left_des_pos = bezier_deg(
-                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
-                    torch.tensor(self.gait_config.bez_deg, device=self.device)
-                )
-            self.gait_config.right_standing_pos = right_des_pos
-            self.gait_config.left_standing_pos = left_des_pos
-            self.standing_threshold = 0.03
+                from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg
+                right_des_pos = bezier_deg(
+                        0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
+                        torch.tensor(self.gait_config.bez_deg, device=self.device)
+                    )
+                left_des_pos = bezier_deg(
+                        0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
+                        torch.tensor(self.gait_config.bez_deg, device=self.device)
+                    )
+                self.gait_config.right_standing_pos = right_des_pos
+                self.gait_config.left_standing_pos = left_des_pos
+                self.standing_threshold = 0.03
             
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
         self.tp = torch.zeros((self.env.num_envs,), device=self.device)
 
-    def _get_swing_period(self) -> float:
+    def _get_leg_period(self) -> float:
         """Get the swing period from the gait configuration."""
-        return self.gait_config.T
+        return sum(self.gait_config.T.values())
 
     def generate_reference_trajectory(self):
         """Generate reference trajectory using gait library."""
@@ -133,16 +141,33 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
 
 
-    def update_Stance_Swing_idx(self):
+    def update_stance_swing_idx(self):
         """Update stance and swing indices based on phase."""
-        Tswing = self._get_swing_period()
+        Tleg = self._get_leg_period()
 
-        tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-        phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
+        tp = (self.env.sim.current_time % (2 * Tleg)) / (2 * Tleg)
+        phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tleg), device=self.env.device)
 
         new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
-        
+
+        ##
+        # Check which domain we are in
+        ##
+        domain_time = 0
+        time_into_leg = self.env.sim.current_time % (2 * Tleg)
+        for domain_name in self.gait_config.domain_seq:
+            if time_into_leg < domain_time + self.gait_config.T[domain_name]:
+                self.current_domain = domain_name
+            else:
+                domain_time += self.gait_config.T[domain_name]
+
+        if self.current_domain == "":
+            raise ValueError("Could not determine the current domain!")
+
+        ##
+        # Check if the stance idx changed
+        ##
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
                 self.stance_idx = new_stance_idx
@@ -188,4 +213,4 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             self.phase_var = 2 * tp
         else:
             self.phase_var = 2 * tp - 1
-        self.cur_swing_time = self.phase_var * Tswing 
+        self.cur_swing_time = self.phase_var * Tleg

@@ -157,10 +157,6 @@ class JointTrajectoryConfig(BaseTrajectoryConfig):
         """Legacy method - now calls parent get_ref_traj."""
         return super().get_ref_traj(jt_hzd_cmd)
 
-    def get_actul_traj(self, jt_hzd_cmd):
-        """Legacy method - now calls get_actual_traj."""
-        return self.get_actual_traj(jt_hzd_cmd)
-
 
 def bezier_deg(
     order: int,

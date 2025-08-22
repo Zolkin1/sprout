@@ -20,11 +20,13 @@ class BaseTrajectoryConfig(ABC):
             yaml_path: Path to the YAML configuration file
         """
         self.yaml_path = yaml_path
+        # Make all the dicts that will hold {domain_name: value}
         self.bezier_coeffs = {}
-        self.T = 0.0
-        self.left_coeffs = None
-        self.right_coeffs = None
-        self.bez_deg = 5  # Default Bezier degree
+        self.T = {}
+        self.left_coeffs = {}
+        self.right_coeffs = {}
+        self.bez_deg = {}  # Default Bezier degree
+        self.joint_order = {}
         self.load_from_yaml()
     
     def load_from_yaml(self):
@@ -35,21 +37,25 @@ class BaseTrajectoryConfig(ABC):
         """
         with open(self.yaml_path, 'r') as file:
             data = yaml.safe_load(file)
-            domain_name = next(iter(data.keys()))
-            
-        
-        # Load common data
-        self.T = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
-        
-        # Load initial config
-        init_config = data[domain_name]['q'][0]
-        # Need to reorder xyzw to wxyz
 
-        init_vel = data[domain_name]['v'][0]
-        self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
-        self.init_root_vel = init_vel[:6]
-        self.init_joint_pos = init_config[7:]
-        self.init_joint_vel = init_vel[6:]
+        if data.get('domain_sequence') is None:
+            raise ValueError("Domain sequence must be specified in the trajectory solution!")
+
+        self.domain_seq = data['domain_sequence']
+        for domain_name in self.domain_seq:
+            # Load common data
+            self.T[domain_name] = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
+            self.bez_deg[domain_name] = data[domain_name]['spline_order']
+
+            if domain_name == self.domain_seq[0]:
+                # Load initial config
+                init_config = data[domain_name]['q'][0]
+                # Need to reorder xyzw to wxyz
+                init_vel = data[domain_name]['v'][0]
+                self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
+                self.init_root_vel = init_vel[:6]
+                self.init_joint_pos = init_config[7:]
+                self.init_joint_vel = init_vel[6:]
 
         # Load subclass-specific data
         self._load_specific_data(data)

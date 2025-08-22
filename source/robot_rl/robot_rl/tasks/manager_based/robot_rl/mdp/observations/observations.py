@@ -27,6 +27,7 @@ def step_location(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     step_location = cmd.foot_target[:,0:2]
     return step_location
+
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     left_foot_vel = cmd.robot.data.body_lin_vel_w[:,cmd.feet_bodies_idx[0],:]
@@ -119,7 +120,6 @@ def sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     sphase = torch.sin(phase).unsqueeze(-1)
 
     return sphase
-
 
 def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     period = env.command_manager.get_command(command_name).clone()

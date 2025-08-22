@@ -85,7 +85,7 @@ RL Task list:
 | `vanilla` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
 | `lip_clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
-
+ | `running_hzd_clf` | G1 | :x: | Running controller using a gait library. |
 ## Copying checkpoitns from remote server 
 First mount the server to your local desktop
  

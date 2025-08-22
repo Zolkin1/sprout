@@ -80,12 +80,13 @@ def bezier_deg_batched(
         raise ValueError("Only order=0 (position) or order=1 (derivative) are supported.")
 
 
-class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
+class GaitLibraryConfig(BaseTrajectoryConfig):
     """Configuration class for gait library with velocity-based gait selection."""
     
     def __init__(self, gait_library_path: str, 
                  gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
-                 trajectory_type: str = "end_effector", config_name: str = "single_support"):
+                 trajectory_type: str = "end_effector", config_name: str = "single_support",
+                 use_standing: bool = True):
         """
         Initialize gait library configuration.
         
@@ -100,6 +101,9 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         self.gait_library_path = Path(gait_library_path)
         self.trajectory_type = trajectory_type
         self.config_name = config_name
+
+        self.left_coeffs_batched = {}
+        self.right_coeffs_batched = {}
         
         # Handle different input types for gait_velocity_ranges
         if isinstance(gait_velocity_ranges, tuple) and len(gait_velocity_ranges) == 3:
@@ -120,21 +124,31 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         # Load the first gait to initialize base class
         first_gait = list(self.gait_velocity_ranges.keys())[0]
         super().__init__(self._get_gait_path(first_gait))
-        
+
+        # Use standing or not
+        self.use_standing = use_standing
+
         # Pre-load all gaits
         self._preload_gaits()
     
     def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Dict[str, tuple]:
-          """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
-          if step <= 0:
-               raise ValueError("Step must be positive")
+        """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
+        if step < 0:
+            raise ValueError("Step must be non-negative!")
+        if step == 0:
+            if min_vel != max_vel:
+                raise ValueError("If step = 0 then the max and min velocities must match!")
+            else:
+                speed_cms = int(round(min_vel * 100))
+                gait_ranges = {}
+                gait_ranges[f"gait_{speed_cms}cms"] = (min_vel, max_vel)
+        else:
+            # Create inclusive list of center velocities and sort them
+            velocities = torch.arange(min_vel, max_vel + step * 0.5, step).tolist()
+            velocities = sorted(velocities)
 
-          # Create inclusive list of center velocities and sort them
-          velocities = torch.arange(min_vel, max_vel + step * 0.5, step).tolist()
-          velocities = sorted(velocities)
-
-          gait_ranges = {}
-          for i, vel in enumerate(velocities):
+            gait_ranges = {}
+            for i, vel in enumerate(velocities):
                if i == 0:
                     next_vel = velocities[i + 1]
                     min_range = vel - step / 2
@@ -153,7 +167,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
                speed_cms = int(round(vel * 100))
                gait_ranges[f"gait_{speed_cms}cms"] = (min_range, max_range)
 
-          return gait_ranges
+        return gait_ranges
 
     
     def _get_gait_path(self, gait_name: str) -> str:
@@ -206,10 +220,11 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         """Pre-load all gaits and precompute control points for all velocities."""
         # Discover available gait files
         available_gaits = self._discover_available_gaits()
-        
-        #load standing pose
-        standing_yaml = self.gait_library_path / "standing.yaml"
-        self.standing_config = EndEffectorTrajectoryConfig(standing_yaml)
+
+        if self.use_standing:
+            #load standing pose
+            standing_yaml = self.gait_library_path / "standing.yaml"
+            self.standing_config = EndEffectorTrajectoryConfig(standing_yaml)
     
         # Load each available gait
         for filename, speed_cms in available_gaits.items():
@@ -220,37 +235,38 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
     
     def _precompute_control_points(self):
         """Precompute control points for all velocities in batched tensors."""
+        # Compute per domain
         # Use sorted gait names to ensure consistent ordering
-        gait_names = sorted(self.gait_velocity_ranges.keys(), 
-                           key=lambda name: self.gait_velocity_ranges[name][0])
-    
+        gait_names = sorted(self.gait_velocity_ranges.keys(),
+                            key=lambda name: self.gait_velocity_ranges[name][0])
         num_vel = len(gait_names)
-        
+
         # Get dimensions from the first gait
         first_gait = gait_names[0]
         first_config = self._gait_cache[first_gait]
-        
-        # Get dimensions
-        output_dim = first_config.left_coeffs.shape[0]  # num_outputs
-        degree_plus_1 = first_config.left_coeffs.shape[1]  # degree + 1
-        device = first_config.left_coeffs.device
-        dtype = first_config.left_coeffs.dtype
-        
-        # Initialize batched control point tensors
-        self.left_coeffs_batched = torch.zeros(
-            (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
-        )
-        self.right_coeffs_batched = torch.zeros(
-            (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
-        )
-        
-        # Fill the batched tensors
-        for i, gait_name in enumerate(gait_names):
-            if gait_name in self._gait_cache:
-                config = self._gait_cache[gait_name]
-                self.left_coeffs_batched[i] = config.left_coeffs
-                self.right_coeffs_batched[i] = config.right_coeffs
-        
+
+        for domain_name in self.domain_seq:
+            # Get dimensions
+            output_dim = first_config.left_coeffs[domain_name].shape[0]  # num_outputs
+            degree_plus_1 = first_config.left_coeffs[domain_name].shape[1]  # degree + 1
+            device = first_config.left_coeffs[domain_name].device
+            dtype = first_config.left_coeffs[domain_name].dtype
+
+            # Initialize batched control point tensors
+            self.left_coeffs_batched[domain_name] = torch.zeros(
+                (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
+            )
+            self.right_coeffs_batched[domain_name] = torch.zeros(
+                (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
+            )
+
+            # Fill the batched tensors
+            for i, gait_name in enumerate(gait_names):
+                if gait_name in self._gait_cache:
+                    config = self._gait_cache[gait_name]
+                    self.left_coeffs_batched[domain_name][i] = config.left_coeffs[domain_name]
+                    self.right_coeffs_batched[domain_name][i] = config.right_coeffs[domain_name]
+
         # Store the Bezier degree
         self.bez_deg = first_config.bez_deg
     
@@ -341,20 +357,24 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         # Get current phase and step duration
         base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
         N = base_velocity.shape[0]
+
+        total_time = sum(self.T.values())
         
         # Use a single tau and step_dur value (same for all gaits)
         tau = torch.tensor([hzd_cmd.phase_var], device=base_velocity.device)  # [1]
-        step_dur = torch.tensor([self.T], dtype=torch.float32, device=base_velocity.device)  # [1]
+        step_dur = torch.tensor([total_time], dtype=torch.float32, device=base_velocity.device)  # [1]
         
         # Select control points based on stance
         if hzd_cmd.stance_idx == 1:
             # Right stance: use right coefficients
-            control_points = self.right_coeffs_batched  # [num_vel, jt_dim, degree+1]'
-            standing_pose = self.right_standing_pos
+            control_points = self.right_coeffs_batched[hzd_cmd.current_domain]  # [num_vel, jt_dim, degree+1]
+            if self.use_standing:
+                standing_pose = self.right_standing_pos
         else:
             # Left stance: use left coefficients
-            control_points = self.left_coeffs_batched  # [num_vel, jt_dim, degree+1]
-            standing_pose = self.left_standing_pos
+            control_points = self.left_coeffs_batched[hzd_cmd.current_domain]   # [num_vel, jt_dim, degree+1]
+            if self.use_standing:
+                standing_pose = self.left_standing_pos
         
         # Evaluate one trajectory per gait (much more efficient!)
         # control_points: [num_vel, jt_dim, degree+1]
@@ -371,7 +391,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
             tau=tau_expanded,
             step_dur=step_dur_expanded,
             control_points=control_points,
-            degree=self.bez_deg
+            degree=self.bez_deg[hzd_cmd.current_domain],
         )  # [num_vel, jt_dim]
         
         # Use batched Bezier evaluation for velocity (order=1)
@@ -380,7 +400,7 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
             tau=tau_expanded,
             step_dur=step_dur_expanded,
             control_points=control_points,
-            degree=self.bez_deg
+            degree=self.bez_deg[hzd_cmd.current_domain],
         )  # [num_vel, jt_dim]
         
         # Select the appropriate gait for each environment
@@ -390,10 +410,11 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         des_pos = ref_pos[gait_indices]  # [N, jt_dim]
         des_vel = ref_vel[gait_indices]  # [N, jt_dim]
 
-        stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
-        if stand_idx.numel() > 0:   
-            des_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
-            des_vel[stand_idx] = torch.zeros_like(des_vel[stand_idx])
+        if self.use_standing:
+            stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+            if stand_idx.numel() > 0:
+                des_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
+                des_vel[stand_idx] = torch.zeros_like(des_vel[stand_idx])
 
         des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
    
@@ -425,16 +446,16 @@ class GaitLibraryTrajectoryConfig(BaseTrajectoryConfig):
         return list(available_gaits.values())
 
 
-class GaitLibraryEndEffectorConfig(GaitLibraryTrajectoryConfig):
+class GaitLibraryEndEffectorConfig(GaitLibraryConfig):
     """Specialized gait library for end-effector trajectories."""
     
     def __init__(self, gait_library_path: str, 
                  gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
-                 config_name: str = "single_support"):
-        super().__init__(gait_library_path, gait_velocity_ranges, "end_effector", config_name)
+                 config_name: str = "single_support", use_standing: bool = True):
+        super().__init__(gait_library_path, gait_velocity_ranges, "end_effector", config_name, use_standing)
 
 
-class GaitLibraryJointConfig(GaitLibraryTrajectoryConfig):
+class GaitLibraryJointConfig(GaitLibraryConfig):
     """Specialized gait library for joint trajectories."""
     
     def __init__(self, gait_library_path: str, 
@@ -443,7 +464,7 @@ class GaitLibraryJointConfig(GaitLibraryTrajectoryConfig):
         super().__init__(gait_library_path, gait_velocity_ranges, "joint", config_name)
 
 
-class StairGaitLibraryTrajectoryConfig(GaitLibraryTrajectoryConfig):
+class StairGaitLibraryConfig(GaitLibraryConfig):
     """Gait library for stairs: selects gait based on stair height instead of velocity."""
     def __init__(self, gait_library_path, gait_height_ranges, trajectory_type="end_effector", config_name="single_support"):
         
