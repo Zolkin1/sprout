@@ -59,7 +59,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         trajectory_type="end_effector",
         gait_library_path="source/robot_rl/robot_rl/assets/robots/running_gait_single",
         config_name="running_config",
-        gait_velocity_ranges=(2.22, 2.22, 0),
+        gait_velocity_ranges=(1.33, 1.33, 0),
         use_standing=False,
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
@@ -76,7 +76,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         super().__post_init__()
 
         # Set all the environment configs
-        self.commands.base_velocity.ranges.lin_vel_x = (2.22, 2.22)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (1.33, 1.33)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.heading = (0, 0)
