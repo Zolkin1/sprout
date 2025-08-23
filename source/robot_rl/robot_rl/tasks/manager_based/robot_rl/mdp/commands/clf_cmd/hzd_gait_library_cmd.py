@@ -13,6 +13,10 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
 
+        self.stance_foot_vel = None
+        self.stance_foot_ang_vel = None
+        self.stance_foot_ori = None
+        self.stance_foot_pos = None
         self.current_domain = ""
         self.use_standing = cfg.use_standing
 
@@ -132,6 +136,8 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
 
     def get_stance_foot_pose(self):
         """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+
+        # Only update the stance foot while in a phase with the foot on the ground
         stance_foot_idx = self.feet_bodies_idx[0] if self.stance_idx == 0 else self.feet_bodies_idx[1]
         self.stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
         stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
@@ -154,19 +160,23 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         ##
         # Check which domain we are in
         ##
-        domain_time = 0
-        time_into_leg = self.env.sim.current_time % (2 * Tleg)
+        domain_start_time = 0
+        time_into_leg = self.env.sim.current_time % Tleg
         for domain_name in self.gait_config.domain_seq:
-            if time_into_leg < domain_time + self.gait_config.T[domain_name]:
+            if time_into_leg < domain_start_time + self.gait_config.T[domain_name]:
                 self.current_domain = domain_name
+                break
             else:
-                domain_time += self.gait_config.T[domain_name]
+                domain_start_time += self.gait_config.T[domain_name]
+
+        # Compute how far into the domain we are on a 0-1 scale
+        self.phase_var = (time_into_leg - domain_start_time)/self.gait_config.T[self.current_domain]
 
         if self.current_domain == "":
             raise ValueError("Could not determine the current domain!")
 
         ##
-        # Check if the stance idx changed
+        # Check if the stance idx changed, only check when we are not in the flight phase
         ##
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
@@ -207,10 +217,5 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
 
         self.stance_idx = new_stance_idx
 
-        #expand to N envs
-        self.tp = torch.full((self.env.num_envs,), tp, device=self.device)
-        if tp < 0.5:
-            self.phase_var = 2 * tp
-        else:
-            self.phase_var = 2 * tp - 1
+        # TODO: Update for multi-domain
         self.cur_swing_time = self.phase_var * Tleg

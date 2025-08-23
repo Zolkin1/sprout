@@ -312,48 +312,84 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         # If stance_idx == 0 (left stance), then right foot is swing foot
         # If stance_idx == 1 (right stance), then left foot is swing foot
         swing_foot_idx = hzd_cmd.feet_bodies_idx[1] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[0]
+        stance_foot_idx = hzd_cmd.feet_bodies_idx[0] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[1]
 
         # Get stance foot pos and velocity for relative positioning
-        stance_foot_pos = hzd_cmd.stance_foot_pos_0 
+        relative_foot_pos = hzd_cmd.stance_foot_pos_0
         
         # Get actual values for each constraint specification in order
-        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
+
+        ##
+        # COM virtual constraint
+        ##
+        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - relative_foot_pos
         com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
        
         com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
         com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
 
+        ##
+        # Pelvis virtual constraint
+        ##
         pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
         pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
         pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
 
-        swing_foot_pos = data.body_pos_w[:, swing_foot_idx, :]
-        swing_foot_quat = data.body_quat_w[:, swing_foot_idx, :]
-        swing_foot_ori = get_euler_from_quat(swing_foot_quat)
-        sw2st_foot_pos = swing_foot_pos - stance_foot_pos
-        sw2st_foot_pos_local = _transfer_to_local_frame(sw2st_foot_pos, hzd_cmd.stance_foot_ori_quat_0)
-        
-        sw2st_foot_ori = swing_foot_ori 
-        sw2st_foot_ori[:, 2] = wrap_to_pi(swing_foot_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-   
-        foot_lin_vel_w = hzd_cmd.robot.data.body_lin_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-        foot_ang_vel_w = hzd_cmd.robot.data.body_ang_vel_w[:, hzd_cmd.feet_bodies_idx, :]
+        def _pos_ori_vel_virtual(idx, frame_rel_pos, frame_rel_quat, frame_rel_ori):
+            """Compute the locations of a given frame relative to another frame."""
+            frame_pos = data.body_pos_w[:, idx, :]
+            frame_quat = data.body_quat_w[:, idx, :]
+            frame_ori = get_euler_from_quat(frame_quat)
 
-        sw2st_foot_vel = foot_lin_vel_w[:, 1 - hzd_cmd.stance_idx]
-        sw2st_foot_ang_vel = foot_ang_vel_w[:, 1 - hzd_cmd.stance_idx]
+            frame_pos_rel = frame_pos - frame_rel_pos
+            frame_pos_rel_local = _transfer_to_local_frame(frame_pos_rel, frame_rel_quat)
 
-        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, hzd_cmd.stance_foot_ori_quat_0)
-        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, hzd_cmd.stance_foot_ori_quat_0)
+            frame_ori_rel = frame_ori
+            frame_ori_rel[:, 2] = wrap_to_pi(frame_ori_rel[:, 2] - frame_rel_ori[:, 2])
 
+            frame_lin_vel_w = data.body_lin_vel_w[:, idx, :]
+            frame_ang_vel_w = data.body_ang_vel_w[:, idx, :]
+
+            frame_vel_local = _transfer_to_local_frame(frame_lin_vel_w, frame_rel_quat)
+            frame_ang_vel_local= _transfer_to_local_frame(frame_ang_vel_w, frame_rel_quat)
+
+            return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
+
+        ##
+        # Swing foot virtual constraints
+        ##
+        swing_pos_rel, swing_ori_rel, swing_vel_rel, swing_ang_vel_rel = _pos_ori_vel_virtual(
+            swing_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
+
+        ##
+        # Joint virtual constraints
+        ##
         joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
         joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
 
+        ##
+        # Stance foot virtual constraints
+        ##
+        if self.bezier_coeffs[self.domain_seq[0]].shape[0] == 27:
+            stance_pos_rel, stance_ori_rel, stance_vel_rel, stance_ang_vel_rel = _pos_ori_vel_virtual(
+                stance_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
+
+            # concatenate all the position values
+            y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
+                               stance_pos_rel, stance_ori_rel, joint_pos.squeeze(-1)], dim=-1)
+
+            # concatenate all the velocity values
+            dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
+                                stance_vel_rel, stance_ang_vel_rel, joint_vel.squeeze(-1)], dim=-1)
+
+            return y_act, dy_act
+
         # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos_local, sw2st_foot_ori,
+        y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
                           joint_pos.squeeze(-1)], dim=-1)
 
         # concatenate all the velocity values
-        dy_act = torch.cat([com_vel_local, pelvis_omega, sw2st_foot_vel_local, sw2st_foot_ang_vel_local,
+        dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
                            joint_vel.squeeze(-1)], dim=-1)
         
         return y_act, dy_act
@@ -369,6 +405,7 @@ class StairEEtrajConfig(EndEffectorTrajectoryConfig):
 
     def get_actual_traj(self, hzd_cmd):
         """Get actual trajectory from end effector tracker."""
+        raise ValueError("[StairEETrajConfig] Not used right now!")
         ee_tracker = hzd_cmd.ee_tracker
 
         # Determine swing foot frame name based on stance

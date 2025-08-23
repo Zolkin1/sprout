@@ -18,6 +18,7 @@ SIM_ENVIRONMENTS = {
     "vanilla": "G1-flat-vel",
     "lip_clf": "G1-LIP-ref-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
+    "running_hzd_clf": "G1-running-hzd-play",
 }
 
 class DataLogger:
@@ -136,7 +137,7 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def extract_reference_trajectory(env, log_vars,command_name):
+def extract_reference_trajectory(env, log_vars, command_name):
     # Get the underlying environment by unwrapping
     unwrapped_env = env.unwrapped
 
@@ -160,9 +161,9 @@ def extract_reference_trajectory(env, log_vars,command_name):
             elif hasattr(ref, 'gait_config') and hasattr(ref.gait_config, '_gait_cache'):
                 results[var] = ref.gait_config._gait_cache[list(ref.gait_config._gait_cache.keys())[0]].axis_names
             else:
-                results[var] = None
+                raise ValueError("[Extract Reference] Could not find the axis name!")
         else:
-            results[var] = None  # or raise an error/warning if you prefer
+            raise ValueError("[Extract Reference] No variable matching the given name found in the command!")
 
     return results
 

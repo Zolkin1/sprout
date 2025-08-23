@@ -282,6 +282,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
     N_ENVS_TO_PLOT = 2
     env_ids = list(range(N_ENVS_TO_PLOT))
 
+    # TODO: Don't plot None data
     for env_id in env_ids:
         # --- Stance Foot Position and Orientation ---
         if "stance_foot_pos" and "stance_foot_ori" in processed_data:

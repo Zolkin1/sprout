@@ -132,7 +132,7 @@ class HZDCommandTerm(CommandTerm, ABC):
         self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
 
 
-
+# TODO: Is this used? Can I delete it?
 class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses joint trajectory references."""
     
@@ -171,7 +171,7 @@ class JointTrajectoryHZDCommandTerm(HZDCommandTerm):
             error_key = f"error_{joint_name}"
             self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
 
-
+# TODO: Is this used? Can I delete it?
 class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses end effector trajectory references."""
     
@@ -275,46 +275,46 @@ class EndEffectorTrajectoryHZDCommandTerm(HZDCommandTerm):
             )
 
     def get_stance_foot_pose(self):
-            """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-            stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
-            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-            self.stance_foot_pos = stance_foot_pos
-            self.stance_foot_ori = stance_foot_ori
-            stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
-            self.stance_foot_vel = stance_foot_vel
-            self.stance_foot_ang_vel = stance_foot_ang_vel
+        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+        stance_foot_frame = "left_foot_middle" if self.stance_idx == 0 else "right_foot_middle"
+        stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
+        self.stance_foot_pos = stance_foot_pos
+        self.stance_foot_ori = stance_foot_ori
+        stance_foot_vel, stance_foot_ang_vel = self.ee_tracker.get_velocity(stance_foot_frame, self.robot.data)
+        self.stance_foot_vel = stance_foot_vel
+        self.stance_foot_ang_vel = stance_foot_ang_vel
 
     def update_stance_swing_idx(self):
-            """Update stance and swing indices based on phase."""
-            Tswing = self._get_leg_period()
+        """Update stance and swing indices based on phase."""
+        Tswing = self._get_leg_period()
 
-            tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-            phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
+        tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
+        phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tswing), device=self.env.device)
 
-            new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
-            self.swing_idx = 1 - new_stance_idx
-            
-            if self.stance_idx is None or new_stance_idx != self.stance_idx:
-                if self.stance_idx is None:
-                    self.stance_idx = new_stance_idx
+        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
+        self.swing_idx = 1 - new_stance_idx
+
+        if self.stance_idx is None or new_stance_idx != self.stance_idx:
+            if self.stance_idx is None:
+                self.stance_idx = new_stance_idx
 
 
-                stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
-                stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame) 
-                
-             
-                self.stance_foot_pos_0 = stance_foot_pos
-                self.stance_foot_ori_quat_0 = stance_foot_quat
-                self.stance_foot_ori_0 = stance_foot_ori
-        
-            self.stance_idx = new_stance_idx
+            stance_foot_frame = "left_foot_middle" if new_stance_idx == 0 else "right_foot_middle"
+            stance_foot_pos, stance_foot_ori,stance_foot_quat = self.ee_tracker.get_pose(stance_foot_frame)
 
-            if tp < 0.5:
-                self.phase_var = 2 * tp
-            else:
-                self.phase_var = 2 * tp - 1
-            self.cur_swing_time = self.phase_var * Tswing
-            self.tp = torch.full((self.num_envs,), tp, device=self.device)
+
+            self.stance_foot_pos_0 = stance_foot_pos
+            self.stance_foot_ori_quat_0 = stance_foot_quat
+            self.stance_foot_ori_0 = stance_foot_ori
+
+        self.stance_idx = new_stance_idx
+
+        if tp < 0.5:
+            self.phase_var = 2 * tp
+        else:
+            self.phase_var = 2 * tp - 1
+        self.cur_swing_time = self.phase_var * Tswing
+        self.tp = torch.full((self.num_envs,), tp, device=self.device)
 
 def create_hzd_command_term(cfg, env):
     """
