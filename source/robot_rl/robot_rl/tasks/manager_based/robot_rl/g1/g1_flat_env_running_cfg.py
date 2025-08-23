@@ -88,13 +88,13 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.75,
+            "max_eta_err": 0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
             "alpha": 0.5,
-            "eta_max": 0.75,
-            "eta_dot_max": 0.9,
+            "eta_max": 0.25,
+            "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
         self.curriculum.clf_curriculum = None
