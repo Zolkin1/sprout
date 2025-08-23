@@ -220,7 +220,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 axis_names = ["x", "y", "z"]
                 # Generate metric names for COM position (only specified axes)
                 for i, axis_idx in enumerate(axes):
-                    metric_name = f"com_pos_{axis_names[axis_idx]}_{domain_name}"
+                    metric_name = f"com_pos_{axis_names[axis_idx]}"
                     self.axis_names.append({
                         'name': metric_name,
                         'index': current_idx + i,
@@ -234,7 +234,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
 
                 for joint_name in joint_names:
                     # Generate metric name for joint
-                    metric_name = f"joint_{joint_name}_{domain_name}"
+                    metric_name = f"joint_{joint_name}"
                     self.axis_names.append({
                         'name': metric_name,
                         'index': current_idx,
@@ -256,7 +256,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 
                 # Generate metric names for each axis (only specified axes)
                 for i, axis_idx in enumerate(axes):
-                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}_{domain_name}"
+                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}"
                     self.axis_names.append({
                         'name': metric_name,
                         'index': current_idx + i,

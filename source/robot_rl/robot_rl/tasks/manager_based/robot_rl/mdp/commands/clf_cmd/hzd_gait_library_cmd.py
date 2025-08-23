@@ -219,3 +219,4 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
 
         # TODO: Update for multi-domain
         self.cur_swing_time = self.phase_var * Tleg
+        self.tp = torch.full((self.num_envs,), tp, device=self.device)  # Used in phase variables
