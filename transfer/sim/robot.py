@@ -109,22 +109,9 @@ class Robot:
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
             vy = -(self.joystick.get_axis(0))
-            vx = -(self.joystick.get_axis(1))
+            vx = -(1.33*self.joystick.get_axis(1))
             vyaw = -(self.joystick.get_axis(3)) * 1
 
-            # Clip or zero out small values
-            if abs(vx) < 0.1:
-                vx = 0
-            else:
-                vx = np.clip(vx, -0.75, 0.75)
-            if abs(vy) < 0.1:
-                vy = 0
-            else:
-                vy = np.clip(vy, -0.0, 0.0)
-            if abs(vyaw) < 0.1:
-                vyaw = 0
-            else:
-                vyaw = np.clip(vyaw, -3.14, 3.14)
             des_vel[0] = vx
             des_vel[1] = vy
             des_vel[2] = vyaw
