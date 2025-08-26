@@ -12,6 +12,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipCurriculumCfg
+from ..humanoid_env_cfg import HumanoidEventsCfg
 
 RUNNING_EE_Q_weights_GL = [
     25.0,   250.0,      # com_x pos, vel
@@ -105,12 +106,23 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
                                                    "update_amnt": 0.1})
 
 @configclass
+class G1RunningEventsCfg(HumanoidEventsCfg):
+    pass
+    # randomize_contact_size = EventTerm(func=mdp.randomize_rigid_body_collider_offsets,
+    #                                    mode="reset",
+    #                                    params={
+    #                                        "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
+    #                                        "rest_offset_distribution_params": (0.02, 0.04)  # TODO tune or remove
+    #                                    })
+
+@configclass
 class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 running gait library environment."""
     commands: G1RunningGaitLibraryCommandsCfg = G1RunningGaitLibraryCommandsCfg()
     observations: G1RunningHZDObservationCfg = G1RunningHZDObservationCfg()
     rewards: G1RunningHZDRewardCfg = G1RunningHZDRewardCfg()
     curriculum: G1RunningCurriculumCfg = G1RunningCurriculumCfg()
+    events: G1RunningEventsCfg = G1RunningEventsCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -186,7 +198,16 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.events.add_base_mass = None
         # self.events.base_com = None
         self.events.base_external_force_torque = None
-        self.events.push_robot = None
+        # self.events.push_robot = None
+
+        # Update the ground restitution range
+        self.events.randomize_ground_contact_friction.params['restitution_range'] = (0.0, 0.2)
+
+        # Update push forces
+        self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.25, 0.25)}
+
+        # Make the COM randomization on the torso rather than the pelvis
+        self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="torso_link")
 
         ##
         # Episode length
@@ -199,6 +220,8 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (2.5, 2.5)
 
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
