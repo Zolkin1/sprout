@@ -6,11 +6,12 @@ from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObserva
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
+from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipCurriculumCfg
 
 RUNNING_EE_Q_weights_GL = [
     25.0,   250.0,      # com_x pos, vel
@@ -90,10 +91,18 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
     flight_contact_penalty = RewTerm(
         func=mdp.flight_contact_penalty,
-        weight=3.0,
+        weight=-3.0,
         params={"command_name": "hzd_ref",
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+                "weight_scalar": 0.0},
     )
+
+@configclass
+class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
+    contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
+                                          params={"update_interval": 20000,
+                                                   "max_weight": 1.0,
+                                                   "update_amnt": 0.1})
 
 @configclass
 class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
@@ -101,6 +110,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
     commands: G1RunningGaitLibraryCommandsCfg = G1RunningGaitLibraryCommandsCfg()
     observations: G1RunningHZDObservationCfg = G1RunningHZDObservationCfg()
     rewards: G1RunningHZDRewardCfg = G1RunningHZDRewardCfg()
+    curriculum: G1RunningCurriculumCfg = G1RunningCurriculumCfg()
 
     def __post_init__(self):
         super().__post_init__()

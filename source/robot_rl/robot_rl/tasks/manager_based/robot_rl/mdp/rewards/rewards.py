@@ -289,14 +289,14 @@ def phase_contact(
             res += ~(contact ^ is_stance)
     return res
 
-def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg, weight_scalar: float) -> torch.Tensor:
     """Penalize contacts while in the flight phase."""
     cmd = env.command_manager.get_term(command_name)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     
     if cmd.current_domain == "flight_phase":
-        contact_forces = contact_sensor.data.net_forces_w[:, :, 2].norm(dim=-1)     # Gets the most recent force only
-        penalty = torch.tanh(contact_forces / 0.5).sum(dim=-1)  # TODO: Think about if this is what I want
+        contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
+        penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
         return penalty
     else:
         return torch.zeros(env.num_envs, dtype=torch.float, device=env.device)

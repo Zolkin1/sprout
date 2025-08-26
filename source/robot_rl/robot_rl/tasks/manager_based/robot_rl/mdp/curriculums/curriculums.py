@@ -71,6 +71,20 @@ def clf_curriculum(
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
     return new_max_eta_err
 
+def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float, update_interval: int = 100) -> float:
+    """Curriculum to adjust the weight on the contact penalty."""
+    term_cfg = env.reward_manager.get_term_cfg("flight_contact_penalty")
+    new_weight = term_cfg.params["weight_scalar"]
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        # Compute new contact weight
+        new_weight = min(new_weight + update_amnt, max_weight)
+
+        term_cfg.params["weight_scalar"] = new_weight
+        env.reward_manager.set_term_cfg("flight_contact_penalty", term_cfg)
+
+
+    return new_weight
+
 def terrain_levels(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

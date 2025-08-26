@@ -30,7 +30,7 @@ class G1RoughLipCommandsCfg(HumanoidCommandsCfg):
 
 
 @configclass
-class CurriculumCfg:
+class G1RoughLipCurriculumCfg:
     """Curriculum terms for the MDP."""
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
@@ -88,7 +88,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
     rewards: G1RoughLipRewards = G1RoughLipRewards()
     observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
     commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: G1RoughLipCurriculumCfg = G1RoughLipCurriculumCfg()
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
