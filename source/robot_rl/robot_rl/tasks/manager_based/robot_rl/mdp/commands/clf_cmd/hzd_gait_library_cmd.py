@@ -5,7 +5,8 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library
     GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryConfig
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
-# from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import EndEffectorTracker
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
+import numpy as np
 
 class GaitLibraryHZDCommandTerm(HZDCommandTerm):
     """HZD command term that uses a gait library with velocity-based selection."""
@@ -27,7 +28,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             # Check if it's a stair gait library (height-based) or regular gait library (velocity-based)
             if hasattr(cfg, 'gait_height_ranges'):
                 # Stair gait library
-                self.gait_config = StairGaitLibraryTrajectoryConfig(
+                self.gait_config = StairGaitLibraryConfig(
                     cfg.gait_library_path, 
                     cfg.gait_height_ranges,
                     cfg.trajectory_type,
@@ -51,12 +52,6 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             else:
                 raise ValueError("Gait library configuration missing: either gait_height_ranges or gait_velocity_ranges required")
             
-            # # Initialize end effector tracker if needed
-            # if cfg.trajectory_type == "end_effector":
-            #     self.ee_tracker = EndEffectorTracker(
-            #         self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].constraint_specs,
-            #         env.scene
-            #     )
         else:
             raise ValueError("Gait library configuration missing: gait_library_path required")
         
@@ -92,6 +87,20 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
         self.tp = torch.zeros((self.env.num_envs,), device=self.device)
+        self.initiate_clf()
+
+    def initiate_clf(self):
+        # import pdb; pdb.set_trace()
+        # num_domain = len(self.gait_config.T)
+        self.clf = CLF(
+            self.cfg.num_outputs, self.env.cfg.sim.dt,
+            batch_size=self.num_envs,
+            Q_weights=np.array(self.cfg.Q_weights),
+            R_weights=np.array(self.cfg.R_weights),
+            device=self.device
+            # num_domain=num_domain,
+            # domain_scalar=self.cfg.clf_domain_scalar
+        )
 
     def _get_leg_period(self) -> float:
         """Get the swing period from the gait configuration."""

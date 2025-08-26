@@ -1,7 +1,6 @@
 from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl import mdp
@@ -72,7 +71,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         use_standing=False,
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
-        R_weights = RUNNING_EE_R_weights_GL,
+        R_weights = RUNNING_EE_R_weights_GL
     )
 
 @configclass
