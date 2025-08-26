@@ -158,7 +158,6 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                 return total_count
             
             num_virtual_const = count_constraint_entries(self.constraint_specs)
-            print("num_virtual_constraints: ", num_virtual_const)
 
             bezier_coeffs = data[domain_name]['bezier_coeffs']
             num_control_points = data[domain_name]['spline_order'] + 1

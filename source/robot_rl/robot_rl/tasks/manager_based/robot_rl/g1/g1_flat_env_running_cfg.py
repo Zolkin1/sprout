@@ -207,8 +207,34 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.25, 0.25)}
 
         # Make the COM randomization on the torso rather than the pelvis
-        self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="torso_link")
+        self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
+        self.events.add_base_mass.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
 
+
+        # randomize joint parameters and actuator gains
+        self.events.actuator_gain = EventTerm(
+            func=mdp.randomize_actuator_gains,
+            mode="startup",
+            params={
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                    "stiffness_distribution_params": (-10, 10.),
+                    "damping_distribution_params": (-2., 2.),
+                    "operation": "add",  
+                    "distribution": "uniform" 
+            },
+        )
+
+        self.events.joint_params = EventTerm(
+            func=mdp.randomize_joint_parameters,
+            mode="startup",
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+                    "lower_limit_distribution_params": (1.0,1.0),
+                    "upper_limit_distribution_params": (1.0,1.0),
+                    "friction_distribution_params": (0.95, 1.05),
+                    "armature_distribution_params":(0.95,1.05),
+                    "operation": "scale"},
+        )
+        
         ##
         # Episode length
         ##
