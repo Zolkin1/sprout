@@ -289,7 +289,7 @@ def phase_contact(
             res += ~(contact ^ is_stance)
     return res
 
-def contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     """Penalize contacts while in the flight phase."""
     cmd = env.command_manager.get_term(command_name)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]

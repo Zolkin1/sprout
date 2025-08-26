@@ -3,7 +3,9 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import G
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipRewards
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -72,10 +74,33 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     )
 
 @configclass
+class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
+    """Configuration for running gait library observations."""
+    @configclass
+    class PolicyCfg(G1HZDObservationsCfg.PolicyCfg):
+        # Add the domain flag
+        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"})
+
+    @configclass
+    class CriticCfg(G1HZDObservationsCfg.CriticCfg):
+        # Add the domain flag
+        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"})
+
+@configclass
+class G1RunningHZDRewardCfg(G1RoughLipRewards):
+    flight_contact_penalty = RewTerm(
+        func=mdp.flight_contact_penalty,
+        weight=3.0,
+        params={"command_name": "hzd_ref",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+    )
+
+@configclass
 class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
     """Configuration for the G1 running gait library environment."""
     commands: G1RunningGaitLibraryCommandsCfg = G1RunningGaitLibraryCommandsCfg()
-    observations: G1HZDObservationsCfg = G1HZDObservationsCfg()
+    observations: G1RunningHZDObservationCfg = G1RunningHZDObservationCfg()
+    rewards: G1RunningHZDRewardCfg = G1RunningHZDRewardCfg()
 
     def __post_init__(self):
         super().__post_init__()
