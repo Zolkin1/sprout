@@ -125,7 +125,7 @@ def holonomic_constraint_vel(
     e_vel = torch.cat([v, wz], dim=-1)
 
     # TODO: Remove after debugging
-    if cmd.current_domain == "single_support":
+    if cmd.current_domain == "flight_phase":
         # unified exponential‐norm reward
         return 0*torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
 
@@ -170,7 +170,7 @@ def holonomic_constraint(
     e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
 
     # TODO: Remove after debugging
-    if cmd.current_domain != "single_support":
+    if cmd.current_domain == "flight_phase":
         # unified Gaussian‐like reward
         return 0 * torch.exp(- (e_pose**2).sum(dim=-1) / sigma_pose**2)
 
@@ -288,3 +288,15 @@ def phase_contact(
             contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
             res += ~(contact ^ is_stance)
     return res
+
+def contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Penalize contacts while in the flight phase."""
+    cmd = env.command_manager.get_term(command_name)
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    
+    if cmd.current_domain == "flight_phase":
+        contact_forces = contact_sensor.data.net_forces_w[:, :, 2].norm(dim=-1)     # Gets the most recent force only
+        penalty = torch.tanh(contact_forces / 0.5).sum(dim=-1)  # TODO: Think about if this is what I want
+        return penalty
+    else:
+        return torch.zeros(env.num_envs, dtype=torch.float, device=env.device)

@@ -13,21 +13,21 @@ from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 RUNNING_EE_Q_weights_GL = [
     25.0,   250.0,      # com_x pos, vel
     300.0,   50.0,      # com_y pos, vel
-    350.0,   10.0,      # com_z pos, vel
+    650.0,   10.0,      # com_z pos, vel
     300.0,    20.0,     # pelvis_roll pos, vel
     250.0,    10.0,     # pelvis_pitch pos, vel
     300.0,    30.0,     # pelvis_yaw pos, vel
     1500.0, 50.0,       # swing_x pos, vel
     1500.0,  50.0,      # swing_y pos, vel
-    1500.0, 50.0,       # swing_z pos, vel
+    2500.0, 50.0,       # swing_z pos, vel
     30.0,    1.0,       # swing_ori_roll pos, vel
-    50.0,    1.0,       # swing_ori_pitch pos, vel
+    150.0,    1.0,       # swing_ori_pitch pos, vel
     400.0,    10.0,     # swing_ori_yaw pos, vel
     1500.0, 50.0,       # stance_x pos, vel
     1500.0,  50.0,      # stance_y pos, vel
-    1500.0, 50.0,       # stance_z pos, vel
+    2500.0, 50.0,       # stance_z pos, vel
     30.0,    1.0,       # stance_ori_roll pos, vel
-    50.0,    1.0,       # stance_ori_pitch pos, vel
+    150.0,    1.0,       # stance_ori_pitch pos, vel
     400.0,    10.0,     # swing_ori_yaw pos, vel
     100.0,    1.0,      # waist_yaw pos, vel
     40.0,1.0, #left shoulder pitch
@@ -57,9 +57,14 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/running_gait_single",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/running_gait_v2",
         config_name="running_config",
-        gait_velocity_ranges=(1.33, 1.33, 0),
+        # Running v1
+        # gait_velocity_ranges=(1.35, 1.98, 0.09),
+
+        # Running v2
+        gait_velocity_ranges=(1.48, 2.88, 0.14),
+
         use_standing=False,
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
@@ -76,12 +81,17 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         super().__post_init__()
 
         # Set all the environment configs
-        self.commands.base_velocity.ranges.lin_vel_x = (1.33, 1.33)  # Allow full range
+        # Running v1
+        # self.commands.base_velocity.ranges.lin_vel_x = (1.31, 2.03)
+
+        # Running v2
+        self.commands.base_velocity.ranges.lin_vel_x = (1.48, 2.88)
+
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.heading = (0, 0)
 
-        self.commands.step_period.period_range = (0.9, 0.9)
+        self.commands.step_period.period_range = (0.75, 0.75)
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
@@ -97,7 +107,13 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
-        self.curriculum.clf_curriculum = None
+        # self.curriculum.clf_curriculum = None
+        self.curriculum.clf_curriculum.params = {
+            "min_max_err": (0.1,0.1),
+            "scale": (0.005,0.005), #0.001
+            "update_interval": 20000
+        }
+
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
@@ -131,9 +147,9 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         ##
         # No Domain randomization to start
         ##
-        self.events.randomize_ground_contact_friction = None
-        self.events.add_base_mass = None
-        self.events.base_com = None
+        # self.events.randomize_ground_contact_friction = None
+        # self.events.add_base_mass = None
+        # self.events.base_com = None
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 

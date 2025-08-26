@@ -315,8 +315,7 @@ class GaitLibraryConfig(BaseTrajectoryConfig):
           )
 
           # Bucketize assigns each velocity to a bin based on upper boundaries
-          # TODO: Fix the warning about not using contiguous memory!
-          gait_indices = torch.bucketize(vel_magnitudes, boundaries, right=False)
+          gait_indices = torch.bucketize(vel_magnitudes.contiguous(), boundaries, right=False)
           
           # Clamp indices to valid range to handle out-of-bounds velocities
           # This ensures velocities at or above the maximum gait range use the last gait

@@ -129,3 +129,15 @@ def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     return cphase
 
+def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Return a domain flag based on which hybrid domain the reference trajectory is in."""
+    cmd = env.command_manager.get_term(command_name)
+
+    if cmd.current_domain == "single_support":
+        return torch.ones(env.num_envs)
+    elif cmd.current_domain == "flight_phase":
+        return 2*torch.ones(env.num_envs)
+    elif cmd.current_domain == "double_support":
+        return 0*torch.ones(env.num_envs)
+    else:
+        raise ValueError(f"Unsupported domain: {cmd.current_domain} for the domain flag observation!")
