@@ -226,7 +226,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         # Get the active domains and phasing vars for each env
         self.current_domains, self.phase_var, self.domain_durations = self.gait_config.determine_domains(gait_indices, self.env.sim.current_time)
 
-        print(f"current_domains: {self.current_domains}, phase_var: {self.phase_var}, time: {self.env.sim.current_time}, domain_durations: {self.domain_durations}")
+        # print(f"current_domains: {self.current_domains}, phase_var: {self.phase_var}, time: {self.env.sim.current_time}, domain_durations: {self.domain_durations}")
 
         # Update the stance and swing legs
         self.update_stance_swing_idx()

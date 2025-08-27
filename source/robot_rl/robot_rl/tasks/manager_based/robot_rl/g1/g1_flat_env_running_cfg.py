@@ -60,13 +60,16 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/running_gait_v2",
-        config_name="running_config",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v1",
+        config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
 
         # Running v2
-        gait_velocity_ranges=(1.48, 2.88, 0.14),
+        # gait_velocity_ranges=(1.48, 2.88, 0.14),
+
+        # Full
+        gait_velocity_ranges=(0, 3.00, 0.1),
 
         use_standing=False,
         num_outputs=27,
@@ -131,13 +134,19 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.base_velocity.ranges.lin_vel_x = (1.31, 2.03)
 
         # Running v2
-        self.commands.base_velocity.ranges.lin_vel_x = (1.48, 2.88)
+        # self.commands.base_velocity.ranges.lin_vel_x = (1.48, 2.88)
+
+        # Full v1
+        self.commands.base_velocity.ranges.lin_vel_x = (0, 3.00)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.heading = (0, 0)
 
-        self.commands.step_period.period_range = (0.75, 0.75)
+        # Running v2
+        # self.commands.step_period.period_range = (0.75, 0.75)
+
+        self.commands.step_period.period_range = (0.71, 0.71)
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
@@ -246,7 +255,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (2.5, 2.5)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.0)
 
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5

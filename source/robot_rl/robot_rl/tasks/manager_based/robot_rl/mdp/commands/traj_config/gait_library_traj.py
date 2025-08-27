@@ -130,7 +130,11 @@ class GaitLibraryEndEffectorConfig:
         self.T = []
         self.domain_seq = []
 
-        for gait in self._gait_cache.values():
+        gait_names = sorted(self.gait_velocity_ranges.keys(),
+                            key=lambda name: self.gait_velocity_ranges[name][0])
+
+        for gait_name in gait_names:
+            gait = self._gait_cache[gait_name]
             self.T.append(gait.T)
             self.domain_seq.append(gait.domain_seq)
             if len(gait.domain_seq) > self.max_domains:
