@@ -112,9 +112,11 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             device=self.device
         )
 
-    def _get_leg_period(self) -> float:
+    def _get_gait_period(self) -> float:
         """Get the swing period from the gait configuration."""
-        return sum(self.gait_config.T.values())
+       
+        first_config = self.gait_config._get_first_gait()
+        return sum(first_config.T.values())
 
     def generate_reference_trajectory(self):
         """Generate reference trajectory using gait library."""
@@ -187,15 +189,17 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         ##
         domain_start_time = 0
         time_into_leg = self.env.sim.current_time % Tgait
-        for domain_name in self.gait_config.domain_seq:
-            if time_into_leg < domain_start_time + self.gait_config.T[domain_name]:
+
+        first_gait = self.gait_config._get_first_gait()
+        for domain_name in first_gait.domain_seq:
+            if time_into_leg < domain_start_time + first_gait.T[domain_name]:
                 self.current_domain = domain_name
                 break
             else:
-                domain_start_time += self.gait_config.T[domain_name]
+                domain_start_time += first_gait.T[domain_name]
 
         # Compute how far into the domain we are on a 0-1 scale
-        self.phase_var = (time_into_leg - domain_start_time)/self.gait_config.T[self.current_domain]
+        self.phase_var = (time_into_leg - domain_start_time)/first_gait.T[self.current_domain]
 
         if self.current_domain == "":
             raise ValueError("Could not determine the current domain!")

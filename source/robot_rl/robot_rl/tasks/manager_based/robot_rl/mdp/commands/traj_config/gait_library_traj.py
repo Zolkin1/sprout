@@ -115,8 +115,8 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         self.num_envs = None
         
         # Load the first gait to initialize base class
-        first_gait = list(self.gait_velocity_ranges.keys())[0]
-        super().__init__(self._get_gait_path(first_gait))
+        # first_gait = list(self.gait_velocity_ranges.keys())[0]
+        # super().__init__(self._get_gait_path(first_gait))
 
         # Use standing or not
         self.use_standing = use_standing
@@ -225,7 +225,16 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
             if gait_name not in self._gait_cache:
                 self._load_gait_config(gait_name, speed_cms)
         
-    
+    def _get_first_gait(self):
+        gait_names = sorted(self.gait_velocity_ranges.keys(),
+                            key=lambda name: self.gait_velocity_ranges[name][0])
+
+        # Get dimensions from the first gait
+        first_gait = gait_names[0]
+        first_config = self._gait_cache[first_gait]
+        return first_config
+
+
     def _precompute_control_points(self):
         """Precompute control points for all velocities in batched tensors."""
         # Compute per domain
@@ -238,7 +247,7 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         first_gait = gait_names[0]
         first_config = self._gait_cache[first_gait]
 
-        for domain_name in self.domain_seq:
+        for domain_name in first_config.domain_seq:
             # Get dimensions
             output_dim = first_config.left_coeffs[domain_name].shape[0]  # num_outputs
             degree_plus_1 = first_config.left_coeffs[domain_name].shape[1]  # degree + 1
@@ -338,7 +347,7 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
         N = base_velocity.shape[0]
 
-        total_time = sum(self.T.values())
+        total_time = hzd_cmd._get_gait_period()
         
         # Use a single tau and step_dur value (same for all gaits)
         tau = torch.tensor([hzd_cmd.phase_var], device=base_velocity.device)  # [1]
@@ -507,7 +516,8 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         ##
         # Stance foot virtual constraints
         ##
-        if self.bezier_coeffs[self.domain_seq[0]].shape[0] == 27:
+        first_gait = self._get_first_gait()
+        if first_gait.bezier_coeffs[first_gait.domain_seq[0]].shape[0] == 27:
             stance_pos_rel, stance_ori_rel, stance_vel_rel, stance_ang_vel_rel = _pos_ori_vel_virtual(
                 stance_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
 
