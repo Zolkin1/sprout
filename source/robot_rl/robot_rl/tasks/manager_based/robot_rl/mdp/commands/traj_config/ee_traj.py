@@ -250,7 +250,7 @@ def relable_ee_stance_coeffs():
 
     return R
 
-class EndEffectorTrajectoryConfig():
+class EndEffectorTrajectory():
     """Configuration class for end effector trajectories."""
     
     def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
@@ -295,10 +295,10 @@ class EndEffectorTrajectoryConfig():
                 self.init_joint_vel = init_vel[6:]
 
         # Load subclass-specific data
-        self._load_specific_data(data)
+        self._load_coeffs(data)
 
 
-    def _load_specific_data(self, data):
+    def _load_coeffs(self, data):
         """Load end effector specific data from YAML."""
         # Load constraint specifications
 
@@ -333,13 +333,6 @@ class EndEffectorTrajectoryConfig():
             self.bezier_coeffs[domain_name] = bezier_coeffs_reshaped
             self.joint_order[domain_name] = data[domain_name]['joint_order']
 
-    def get_constraint_frames(self) -> List[str]:
-        """Extract frame names from constraint specs."""
-        frames = []
-        for spec in self.constraint_specs:
-            if "frame" in spec:
-                frames.append(spec["frame"])
-        return frames
 
     def reorder_and_remap(self, cfg, device):
         """Reorder and remap end effector coefficients using hardcoded relabeling matrix."""
@@ -431,227 +424,4 @@ class EndEffectorTrajectoryConfig():
                 
                 current_idx += len(axes)
 
-    def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
-        """Apply end effector specific swing modifications."""
-        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
-
-        #if standing, don't modify yaw
-        delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
-
-        if hzd_cmd.use_standing:
-            #5,11
-            stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
-            if stand_idx.numel() > 0:
-                delta_psi[stand_idx] = 0
-                base_velocity[stand_idx,2] = 0
-
-        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
-        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
-
-        q_delta_yaw = quat_from_euler_xyz(
-            torch.zeros_like(delta_psi),               # roll=0
-            torch.zeros_like(delta_psi),               # pitch=0
-            delta_psi                                  # yaw=Δψ
-        ) 
-
-        #adjust foot target and com pos/vel to account for yaw change
-        des_pos[:,[6,7,8]] = quat_apply(q_delta_yaw, des_pos[:,[6,7,8]])  # [B,3]
-        des_vel[:,[6,7,8]] = quat_apply(q_delta_yaw, des_vel[:,[6,7,8]])  # [B,3]
-
-        des_pos[:,[0,1,2]] = quat_apply(q_delta_yaw, des_pos[:,[0,1,2]])  # [B,3]
-        des_vel[:,[0,1,2]] = quat_apply(q_delta_yaw, des_vel[:,[0,1,2]])  # [B,3]
-
-        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
-        des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y
-        des_vel[:, hzd_cmd.foot_y_output_idx] += base_velocity[:, 1]
-
-        for i in hzd_cmd.ori_idx_list:
-            des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
-
-        return des_pos, des_vel
-
-    def get_actual_traj(self, hzd_cmd):
-        """Get actual trajectory from end effector tracker."""
-        data = hzd_cmd.robot.data
-        
-        # Determine swing foot frame name based on stance
-        # If stance_idx == 0 (left stance), then right foot is swing foot
-        # If stance_idx == 1 (right stance), then left foot is swing foot
-        swing_foot_idx = hzd_cmd.feet_bodies_idx[1] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[0]
-        stance_foot_idx = hzd_cmd.feet_bodies_idx[0] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[1]
-
-        # Get stance foot pos and velocity for relative positioning
-        relative_foot_pos = hzd_cmd.stance_foot_pos_0
-        
-        # Get actual values for each constraint specification in order
-
-        ##
-        # COM virtual constraint
-        ##
-        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - relative_foot_pos
-        com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
-       
-        com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
-        com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
-
-        ##
-        # Pelvis virtual constraint
-        ##
-        pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
-        pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
-
-        def _pos_ori_vel_virtual(idx, frame_rel_pos, frame_rel_quat, frame_rel_ori):
-            """Compute the locations of a given frame relative to another frame."""
-            frame_pos = data.body_pos_w[:, idx, :]
-            frame_quat = data.body_quat_w[:, idx, :]
-            frame_ori = get_euler_from_quat(frame_quat)
-
-            frame_pos_rel = frame_pos - frame_rel_pos
-            frame_pos_rel_local = _transfer_to_local_frame(frame_pos_rel, frame_rel_quat)
-
-            frame_ori_rel = frame_ori
-            frame_ori_rel[:, 2] = wrap_to_pi(frame_ori_rel[:, 2] - frame_rel_ori[:, 2])
-
-            frame_lin_vel_w = data.body_lin_vel_w[:, idx, :]
-            frame_ang_vel_w = data.body_ang_vel_w[:, idx, :]
-
-            frame_vel_local = _transfer_to_local_frame(frame_lin_vel_w, frame_rel_quat)
-            frame_ang_vel_local= _transfer_to_local_frame(frame_ang_vel_w, frame_rel_quat)
-
-            return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
-
-        ##
-        # Swing foot virtual constraints
-        ##
-        swing_pos_rel, swing_ori_rel, swing_vel_rel, swing_ang_vel_rel = _pos_ori_vel_virtual(
-            swing_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
-
-        ##
-        # Joint virtual constraints
-        ##
-        joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
-        joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
-
-        ##
-        # Stance foot virtual constraints
-        ##
-        if self.bezier_coeffs[self.domain_seq[0]].shape[0] == 27:
-            stance_pos_rel, stance_ori_rel, stance_vel_rel, stance_ang_vel_rel = _pos_ori_vel_virtual(
-                stance_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
-
-            # concatenate all the position values
-            y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
-                               stance_pos_rel, stance_ori_rel, joint_pos.squeeze(-1)], dim=-1)
-
-            # concatenate all the velocity values
-            dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
-                                stance_vel_rel, stance_ang_vel_rel, joint_vel.squeeze(-1)], dim=-1)
-
-            return y_act, dy_act
-
-        # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
-                          joint_pos.squeeze(-1)], dim=-1)
-
-        # concatenate all the velocity values
-        dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
-                           joint_vel.squeeze(-1)], dim=-1)
-        
-        return y_act, dy_act
-
-    def get_ref_traj(self, hzd_cmd) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get reference trajectory based on stance.
-        
-        Args:
-            hzd_cmd: HZD command object containing stance information
-            
-        Returns:
-            Tuple of (reference_position, reference_velocity) tensors
-        """
-        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
-        T = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)
-        
-        # Choose coefficients based on stance
-        if hzd_cmd.stance_idx == 1:
-            ctrl_points = self.right_coeffs
-        else:
-            ctrl_points = self.left_coeffs
-        
-        phase_var_tensor = torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)
-        
-        # Import here to avoid circular imports
-        from .jt_traj import bezier_deg
-        
-        des_pos = bezier_deg(
-            0, phase_var_tensor, T, ctrl_points,
-            torch.tensor(hzd_cmd.cfg.bez_deg, device=hzd_cmd.device)
-        )
-        
-        des_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, hzd_cmd.cfg.bez_deg)
-        
-        # Apply stance-specific modifications
-        self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
-        
-        return des_pos, des_vel
     
-
-    def get_stance_foot_pose(self, hzd_cmd):
-        """Get stance foot pose data.
-        
-        This method can be overridden by subclasses that need different
-        stance foot pose handling.
-        
-        Args:
-            hzd_cmd: HZD command object
-        """
-        # Default implementation - can be overridden
-        pass
-    
-    def get_control_points(self, hzd_cmd) -> torch.Tensor:
-        """Get control points for the current stance.
-        
-        Args:
-            hzd_cmd: HZD command object
-            
-        Returns:
-            Control points tensor of shape [num_env, num_outputs, degree+1]
-        """
-        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
-        
-        # Choose coefficients based on stance
-        if hzd_cmd.stance_idx == 1:
-            ctrl_points = self.right_coeffs
-        else:
-            ctrl_points = self.left_coeffs
-        
-        # Expand to batch size: [num_outputs, degree+1] -> [N, num_outputs, degree+1]
-        return ctrl_points.unsqueeze(0).expand(N, -1, -1)
-    
-    def get_phase(self, hzd_cmd) -> torch.Tensor:
-        """Get current phase variable.
-        
-        Args:
-            hzd_cmd: HZD command object
-            
-        Returns:
-            Phase tensor of shape [num_env]
-        """
-        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
-        return torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)
-    
-    def get_step_duration(self, hzd_cmd) -> torch.Tensor:
-        """Get step duration.
-        
-        Args:
-            hzd_cmd: HZD command object
-            
-        Returns:
-            Step duration tensor of shape [num_env]
-        """
-        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
-        return torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device) 

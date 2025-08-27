@@ -3,9 +3,10 @@ from pathlib import Path
 import torch
 import re
 import math
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
 
-from .ee_traj import EndEffectorTrajectoryConfig #, EndEffectorTracker
-from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x, get_uniform_stair_step_height_from_env
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
+from .ee_traj import EndEffectorTrajectory,get_euler_from_quat #, EndEffectorTracker
 
 def _ncr(n, r):
     return math.comb(n, r)
@@ -78,12 +79,12 @@ def bezier_deg_batched(
         raise ValueError("Only order=0 (position) or order=1 (derivative) are supported.")
 
 
-class GaitLibraryConfig(EndEffectorTrajectoryConfig):
+class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
     """Configuration class for gait library with velocity-based gait selection."""
     
     def __init__(self, gait_library_path: str, 
                  gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
-                 trajectory_type: str = "end_effector", config_name: str = "single_support",
+                 config_name: str = "single_support",
                  use_standing: bool = True):
         """
         Initialize gait library configuration.
@@ -97,21 +98,15 @@ class GaitLibraryConfig(EndEffectorTrajectoryConfig):
             config_name: Base name for the configuration files (e.g., "single_support")
         """
         self.gait_library_path = Path(gait_library_path)
-        self.trajectory_type = trajectory_type
+        self.trajectory_type = "end_effector"
         self.config_name = config_name
 
         self.left_coeffs_batched = {}
         self.right_coeffs_batched = {}
         
-        # Handle different input types for gait_velocity_ranges
-        if isinstance(gait_velocity_ranges, tuple) and len(gait_velocity_ranges) == 3:
-            # Discretization mode: (min_vel, max_vel, step)
-            min_vel, max_vel, step = gait_velocity_ranges
-            self.gait_velocity_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
-        else:
-            # Dictionary mode: explicit gait names and ranges
-            self.gait_velocity_ranges = gait_velocity_ranges
-        
+        min_vel, max_vel, step = gait_velocity_ranges
+        self.gait_velocity_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
+      
         # Cache for loaded gait configs
         self._gait_cache = {}
         
@@ -222,7 +217,7 @@ class GaitLibraryConfig(EndEffectorTrajectoryConfig):
         if self.use_standing:
             #load standing pose
             standing_yaml = self.gait_library_path / "standing.yaml"
-            self.standing_config = EndEffectorTrajectoryConfig(standing_yaml)
+            self.standing_config = EndEffectorTrajectory(standing_yaml)
     
         # Load each available gait
         for filename, speed_cms in available_gaits.items():
@@ -270,17 +265,10 @@ class GaitLibraryConfig(EndEffectorTrajectoryConfig):
     
     def _load_gait_config(self, gait_name: str, speed_cms: int = None):
         """Load a specific gait configuration."""
-        if speed_cms is None:
-            speed_cms = self._gait_name_to_speed_cms(gait_name)
-        
         gait_path = self._get_gait_path_from_speed(speed_cms)
         
         # Create appropriate trajectory config based on type
-        if self.trajectory_type == "end_effector":
-            config = EndEffectorTrajectoryConfig(gait_path)
-        else:  # joint
-            config = JointTrajectoryConfig(gait_path)
-        
+        config = EndEffectorTrajectory(gait_path)
         self._gait_cache[gait_name] = config
     
     def _get_gait_path_from_speed(self, speed_cms: int) -> str:
@@ -321,12 +309,6 @@ class GaitLibraryConfig(EndEffectorTrajectoryConfig):
 
           return gait_indices
 
-    
-    def _load_specific_data(self, data):
-        """Load gait library specific data from YAML."""
-        # This is handled by the individual gait configs
-        pass
-    
     def reorder_and_remap(self, cfg, device):
         """Reorder and remap coefficients for all gaits and select based on velocity."""
         # Get desired velocities from the environment
@@ -418,100 +400,134 @@ class GaitLibraryConfig(EndEffectorTrajectoryConfig):
    
         return des_pos, des_vel
     
+
     def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
-        """Apply swing modifications for all gaits (same for all gait types)."""
-        # Get the first gait config (all gaits use the same modifications)
-        first_gait = list(self.gait_velocity_ranges.keys())[0]
-        config = self._gait_cache[first_gait]
-        
-        # Apply swing modifications for all environments
-        des_pos, des_vel = config._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        """Apply end effector specific swing modifications."""
+        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
+
+        #if standing, don't modify yaw
+        delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
+
+        if hzd_cmd.use_standing:
+            #5,11
+            stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+            if stand_idx.numel() > 0:
+                delta_psi[stand_idx] = 0
+                base_velocity[stand_idx,2] = 0
+
+        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
+        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
+
+        q_delta_yaw = quat_from_euler_xyz(
+            torch.zeros_like(delta_psi),               # roll=0
+            torch.zeros_like(delta_psi),               # pitch=0
+            delta_psi                                  # yaw=Δψ
+        ) 
+
+        #adjust foot target and com pos/vel to account for yaw change
+        des_pos[:,[6,7,8]] = quat_apply(q_delta_yaw, des_pos[:,[6,7,8]])  # [B,3]
+        des_vel[:,[6,7,8]] = quat_apply(q_delta_yaw, des_vel[:,[6,7,8]])  # [B,3]
+
+        des_pos[:,[0,1,2]] = quat_apply(q_delta_yaw, des_pos[:,[0,1,2]])  # [B,3]
+        des_vel[:,[0,1,2]] = quat_apply(q_delta_yaw, des_vel[:,[0,1,2]])  # [B,3]
+
+        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
+        des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y
+        des_vel[:, hzd_cmd.foot_y_output_idx] += base_velocity[:, 1]
+
+        for i in hzd_cmd.ori_idx_list:
+            des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
+
         return des_pos, des_vel
     
+
     def get_actual_traj(self, hzd_cmd):
-        """Get actual trajectory - use the first gait's method since they're all the same."""
-        first_gait = list(self.gait_velocity_ranges.keys())[0]
-        config = self._gait_cache[first_gait]
-        return config.get_actual_traj(hzd_cmd)
-    
-    def get_available_gaits(self) -> List[str]:
-        """Get list of available gait names."""
-        return list(self.gait_velocity_ranges.keys())
-    
-    def get_available_speeds(self) -> List[int]:
-        """Get list of available speeds in cm/s."""
-        available_gaits = self._discover_available_gaits()
-        return list(available_gaits.values())
-
-
-class GaitLibraryEndEffectorConfig(GaitLibraryConfig):
-    """Specialized gait library for end-effector trajectories."""
-    
-    def __init__(self, gait_library_path: str, 
-                 gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
-                 config_name: str = "single_support", use_standing: bool = True):
-        super().__init__(gait_library_path, gait_velocity_ranges, "end_effector", config_name, use_standing)
-
-
-class GaitLibraryJointConfig(GaitLibraryConfig):
-    """Specialized gait library for joint trajectories."""
-    
-    def __init__(self, gait_library_path: str, 
-                 gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
-                 config_name: str = "single_support"):
-        super().__init__(gait_library_path, gait_velocity_ranges, "joint", config_name)
-
-
-class StairGaitLibraryConfig(GaitLibraryConfig):
-    """Gait library for stairs: selects gait based on stair height instead of velocity."""
-    def __init__(self, gait_library_path, gait_height_ranges, trajectory_type="end_effector", config_name="single_support"):
+        """Get actual trajectory from end effector tracker."""
+        data = hzd_cmd.robot.data
         
-        # Pass dummy velocity ranges to parent (not used)
-     #    dummy_velocity_ranges = {name: (0, 1) for name in gait_height_ranges}
+        # Determine swing foot frame name based on stance
+        # If stance_idx == 0 (left stance), then right foot is swing foot
+        # If stance_idx == 1 (right stance), then left foot is swing foot
+        swing_foot_idx = hzd_cmd.feet_bodies_idx[1] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[0]
+        stance_foot_idx = hzd_cmd.feet_bodies_idx[0] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[1]
 
-        min_vel, max_vel, step = gait_height_ranges
-        generated_gait_height_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
-        self.gait_height_ranges = generated_gait_height_ranges
+        # Get stance foot pos and velocity for relative positioning
+        relative_foot_pos = hzd_cmd.stance_foot_pos_0
+        
+        # Get actual values for each constraint specification in order
 
-        super().__init__(gait_library_path, generated_gait_height_ranges, trajectory_type, config_name)
+        ##
+        # COM virtual constraint
+        ##
+        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - relative_foot_pos
+        com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
+       
+        com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
+        com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
 
-    def select_gaits_by_height(self, stair_heights: torch.Tensor) -> torch.Tensor:
-        gait_names = sorted(self.gait_height_ranges.keys(), key=lambda n: self.gait_height_ranges[n][0])
-        boundaries = torch.tensor(
-            [self.gait_height_ranges[name][1] for name in gait_names[:-1]],
-            device=stair_heights.device,
-            dtype=stair_heights.dtype,
-        )
-        gait_indices = torch.bucketize(stair_heights, boundaries, right=False)
-        gait_indices = torch.clamp(gait_indices, 0, len(gait_names) - 1)
-        return gait_indices
+        ##
+        # Pelvis virtual constraint
+        ##
+        pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
+        pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
+        pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
 
-#     def _gait_name_to_speed_cms(self, gait_name: str) -> int:
-#         """Convert gait name to speed in cm/s based on velocity ranges."""
-#         min_vel, max_vel = self.gait_velocity_ranges[gait_name]
-#         # Use the midpoint of the velocity range and convert to cm/s
-#         speed_ms = (min_vel + max_vel) / 2
-#         speed_cms = int(speed_ms * 100)  # Convert m/s to cm/s
-#         return speed_cms
-    def get_ref_traj(self, hzd_cmd):
-        # Get stair heights from hzd_cmd (assumes hzd_cmd.z_height exists)
+        def _pos_ori_vel_virtual(idx, frame_rel_pos, frame_rel_quat, frame_rel_ori):
+            """Compute the locations of a given frame relative to another frame."""
+            frame_pos = data.body_pos_w[:, idx, :]
+            frame_quat = data.body_quat_w[:, idx, :]
+            frame_ori = get_euler_from_quat(frame_quat)
 
-        cfg = hzd_cmd.env.cfg.scene.terrain.terrain_generator.sub_terrains['stairs']
-        env_origins = hzd_cmd.env.scene.env_origins
-        stair_heights = get_uniform_stair_step_height_from_env(env_origins,cfg)
-     #    import pdb; pdb.set_trace()
-        tau = torch.tensor([hzd_cmd.phase_var], device=stair_heights.device)
-        step_dur = torch.tensor([self.T], dtype=torch.float32, device=stair_heights.device)
-        if hzd_cmd.stance_idx == 1:
-            control_points = self.right_coeffs_batched
-        else:
-            control_points = self.left_coeffs_batched
-        tau_expanded = tau.expand(control_points.shape[0])
-        step_dur_expanded = step_dur.expand(control_points.shape[0])
-        ref_pos = bezier_deg_batched(0, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
-        ref_vel = bezier_deg_batched(1, tau_expanded, step_dur_expanded, control_points, self.bez_deg)
-        gait_indices = self.select_gaits_by_height(stair_heights)
+            frame_pos_rel = frame_pos - frame_rel_pos
+            frame_pos_rel_local = _transfer_to_local_frame(frame_pos_rel, frame_rel_quat)
 
-        des_pos = ref_pos[gait_indices.view(-1)]
-        des_vel = ref_vel[gait_indices.view(-1)]
-        return des_pos, des_vel
+            frame_ori_rel = frame_ori
+            frame_ori_rel[:, 2] = wrap_to_pi(frame_ori_rel[:, 2] - frame_rel_ori[:, 2])
+
+            frame_lin_vel_w = data.body_lin_vel_w[:, idx, :]
+            frame_ang_vel_w = data.body_ang_vel_w[:, idx, :]
+
+            frame_vel_local = _transfer_to_local_frame(frame_lin_vel_w, frame_rel_quat)
+            frame_ang_vel_local= _transfer_to_local_frame(frame_ang_vel_w, frame_rel_quat)
+
+            return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
+
+        ##
+        # Swing foot virtual constraints
+        ##
+        swing_pos_rel, swing_ori_rel, swing_vel_rel, swing_ang_vel_rel = _pos_ori_vel_virtual(
+            swing_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
+
+        ##
+        # Joint virtual constraints
+        ##
+        joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
+        joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
+
+        ##
+        # Stance foot virtual constraints
+        ##
+        if self.bezier_coeffs[self.domain_seq[0]].shape[0] == 27:
+            stance_pos_rel, stance_ori_rel, stance_vel_rel, stance_ang_vel_rel = _pos_ori_vel_virtual(
+                stance_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
+
+            # concatenate all the position values
+            y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
+                               stance_pos_rel, stance_ori_rel, joint_pos.squeeze(-1)], dim=-1)
+
+            # concatenate all the velocity values
+            dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
+                                stance_vel_rel, stance_ang_vel_rel, joint_vel.squeeze(-1)], dim=-1)
+
+            return y_act, dy_act
+
+        # concatenate all the position values
+        y_act = torch.cat([com2stance_local, pelvis_ori, swing_pos_rel, swing_ori_rel,
+                          joint_pos.squeeze(-1)], dim=-1)
+
+        # concatenate all the velocity values
+        dy_act = torch.cat([com_vel_local, pelvis_omega, swing_vel_rel, swing_ang_vel_rel,
+                           joint_vel.squeeze(-1)], dim=-1)
+        
+        return y_act, dy_act
+

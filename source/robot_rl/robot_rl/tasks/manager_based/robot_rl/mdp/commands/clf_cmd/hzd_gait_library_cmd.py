@@ -61,34 +61,34 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         else:
             raise ValueError("Gait library configuration missing: gait_library_path required")
         
-        # Set up trajectory-specific attributes
-        if cfg.trajectory_type == "end_effector":
-            ##
-            # Indexes of the virtual constraint for modification (yaw, euler rate)
-            ##
-            self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
-            self.joint_idx_list = self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].get_joint_idx_list(self)
-            self.foot_yaw_output_idx = 11   # TODO: Add the stance foot yaw here
-            self.foot_y_output_idx = 7      # Lateral motion    # TODO: Add the stance foot y here
-            self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
-            self.yaw_output_idx = [5, 11]
 
-            if cfg.use_standing:
-                self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
+     
+        ##
+        # Indexes of the virtual constraint for modification (yaw, euler rate)
+        ##
+        self.waist_joint_idx, _ = self.robot.find_joints(".*waist_yaw.*")
+        self.joint_idx_list = self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].get_joint_idx_list(self)
+        self.foot_yaw_output_idx = 11   # TODO: Add the stance foot yaw here
+        self.foot_y_output_idx = 7      # Lateral motion    # TODO: Add the stance foot y here
+        self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
+        self.yaw_output_idx = [5, 11]
+
+        if cfg.use_standing:
+            self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
+        
             
-                
-                right_des_pos = bezier_deg(
-                        0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
-                        torch.tensor(self.gait_config.bez_deg, device=self.device)
-                    )
-                left_des_pos = bezier_deg(
-                        0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
-                        torch.tensor(self.gait_config.bez_deg, device=self.device)
-                    )
-                self.gait_config.right_standing_pos = right_des_pos
-                self.gait_config.left_standing_pos = left_des_pos
-                self.standing_threshold = 0.03
-            
+            right_des_pos = bezier_deg(
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
+                    torch.tensor(self.gait_config.bez_deg, device=self.device)
+                )
+            left_des_pos = bezier_deg(
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
+                    torch.tensor(self.gait_config.bez_deg, device=self.device)
+                )
+            self.gait_config.right_standing_pos = right_des_pos
+            self.gait_config.left_standing_pos = left_des_pos
+            self.standing_threshold = 0.03
+        
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
@@ -172,6 +172,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.stance_foot_vel = self.robot.data.body_lin_vel_w[:, stance_foot_idx, :]
         self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
 
+    
 
     def update_stance_swing_idx(self):
         """Update stance and swing indices based on phase."""
@@ -259,17 +260,4 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.v = vcur
 
     
-    def get_stance_foot_pose(self):
-        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-        data = self.robot.data
-        # 1. Foot positions and orientations (world frame)
-        foot_pos_w = data.body_pos_w[:, self.feet_bodies_idx, :]
-        foot_ori_w = data.body_quat_w[:, self.feet_bodies_idx, :]
 
-        # Store raw foot positions
-        foot_lin_vel_w = data.body_lin_vel_w[:, self.feet_bodies_idx, :]
-        foot_ang_vel_w = data.body_ang_vel_w[:, self.feet_bodies_idx, :]
-        self.stance_foot_pos = foot_pos_w[:, self.stance_idx, :]
-        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
-        self.stance_foot_vel = foot_lin_vel_w[:, self.stance_idx, :]
-        self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]
