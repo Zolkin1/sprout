@@ -44,7 +44,6 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.stance_foot_ang_vel = None
         self.stance_foot_ori = None
         self.stance_foot_pos = None
-        self.current_domain = ""
         self.use_standing = cfg.use_standing
 
         # Initialize gait library based on trajectory type
@@ -54,6 +53,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             self.gait_config = GaitLibraryEndEffectorConfig(
                 cfg.gait_library_path,
                 cfg.gait_velocity_ranges,
+                self.device,
                 config_name,
                 cfg.use_standing,
                 )
@@ -114,13 +114,11 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
     def _get_gait_period(self) -> float:
         """Get the swing period from the gait configuration."""
-       
-        first_config = self.gait_config._get_first_gait()
-        return sum(first_config.T.values())
+        return self.gait_config.T_gait
 
-    def generate_reference_trajectory(self):
+    def generate_reference_trajectory(self, cmd_vel, gait_indices):
         """Generate reference trajectory using gait library."""
-        ref_pos, ref_vel = self.gait_config.get_ref_traj(self)
+        ref_pos, ref_vel = self.gait_config.get_ref_traj(self, cmd_vel, gait_indices)
         self.y_out = ref_pos
         self.dy_out = ref_vel
 
@@ -162,8 +160,6 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
     def get_stance_foot_pose(self):
         """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
-
-        # Only update the stance foot while in a phase with the foot on the ground
         stance_foot_idx = self.feet_bodies_idx[0] if self.stance_idx == 0 else self.feet_bodies_idx[1]
         self.stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
         stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
@@ -172,39 +168,15 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.stance_foot_vel = self.robot.data.body_lin_vel_w[:, stance_foot_idx, :]
         self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
 
-
-
     def update_stance_swing_idx(self):
         """Update stance and swing indices based on phase."""
         Tgait = self._get_gait_period()
 
         gait_cycle_prop = (self.env.sim.current_time % (2 * Tgait)) / (2 * Tgait)
-        # TODO: Remove phi_c
-        phi_c = torch.tensor(math.sin(2 * torch.pi * gait_cycle_prop) / math.sqrt(math.sin(2 * torch.pi * gait_cycle_prop)**2 + Tgait), device=self.env.device)
+        half_cycle_prop = (self.env.sim.current_time % Tgait) / Tgait
 
-        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
+        new_stance_idx = int(gait_cycle_prop >= 0.5)
         self.swing_idx = 1 - new_stance_idx
-
-        # TODO: Remove the domain checks
-        ##
-        # Check which domain we are in
-        ##
-        domain_start_time = 0
-        time_into_leg = self.env.sim.current_time % Tgait
-
-        first_gait = self.gait_config._get_first_gait()
-        for domain_name in first_gait.domain_seq:
-            if time_into_leg < domain_start_time + first_gait.T[domain_name]:
-                self.current_domain = domain_name
-                break
-            else:
-                domain_start_time += first_gait.T[domain_name]
-
-        # Compute how far into the domain we are on a 0-1 scale
-        self.phase_var = (time_into_leg - domain_start_time)/first_gait.T[self.current_domain]
-
-        if self.current_domain == "":
-            raise ValueError("Could not determine the current domain!")
 
         ##
         # Check if the stance idx changed, only check when we are not in the flight phase
@@ -213,24 +185,15 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             if self.stance_idx is None:
                 self.stance_idx = new_stance_idx
 
-            # Update stance foot pose based on trajectory type
-            if hasattr(self, 'ee_tracker'):
-                # End-effector trajectories
-                stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
-                stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
-                stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
-                stance_foot_ori = get_euler_from_quat(stance_foot_quat)
-                
-                self.stance_foot_pos_0 = stance_foot_pos
-                self.stance_foot_ori_quat_0 = stance_foot_quat
-                self.stance_foot_ori_0 = stance_foot_ori
-            else:
-                # Joint trajectories
-                foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
-                foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
-                self.stance_foot_pos_0 = foot_pos_w[:, new_stance_idx, :]
-                self.stance_foot_ori_quat_0 = foot_ori_w[:, new_stance_idx, :]
-                self.stance_foot_ori_0 = get_euler_from_quat(foot_ori_w[:, new_stance_idx, :])
+            # Update stance foot pose
+            stance_foot_idx = self.feet_bodies_idx[0] if new_stance_idx == 0 else self.feet_bodies_idx[1]
+            stance_foot_pos = self.robot.data.body_pos_w[:, stance_foot_idx, :]
+            stance_foot_quat = self.robot.data.body_quat_w[:, stance_foot_idx, :]
+            stance_foot_ori = get_euler_from_quat(stance_foot_quat)
+
+            self.stance_foot_pos_0 = stance_foot_pos
+            self.stance_foot_ori_quat_0 = stance_foot_quat
+            self.stance_foot_ori_0 = stance_foot_ori
        
         just_reset = (self.env.episode_length_buf == 0)
         # Handle episode reset: force re-alignment of stance foot
@@ -250,10 +213,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         self.gait_cycle_prop = torch.full((self.num_envs,), gait_cycle_prop, device=self.device)  # Used in observation phase variables
 
-        if gait_cycle_prop < 0.5:
-            self.cur_swing_time = gait_cycle_prop*2.0 # Used in swing yaw modification
-        else:
-            self.cur_swing_time = (gait_cycle_prop - 0.5) * 2.0
+        self.cur_swing_time = half_cycle_prop
 
     def _update_command(self):
         """Update the command by generating reference and computing CLF."""
@@ -261,19 +221,43 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         commanded_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
 
         # Get the active gaits for each env
-        gait_indices = self.gait_config.select_gaits_by_velocity(self, commanded_velocity[:, :2])
+        gait_indices = self.gait_config.select_gaits_by_velocity(commanded_velocity[:, :2])
 
-        # Get the active domains for each env
-        domain_indices = self.gait_config.determine_domain(gait_indices, self.env.sim.current_time)
+        # Get the active domains and phasing vars for each env
+        self.current_domains, self.phase_var, self.domain_durations = self.gait_config.determine_domains(gait_indices, self.env.sim.current_time)
 
+        print(f"current_domains: {self.current_domains}, phase_var: {self.phase_var}, time: {self.env.sim.current_time}, domain_durations: {self.domain_durations}")
 
+        # Update the stance and swing legs
         self.update_stance_swing_idx()
-        self.generate_reference_trajectory()
+
+        # Get the reference trajectory
+        self.generate_reference_trajectory(commanded_velocity, gait_indices)
+
+        # Get the state
         self.get_actual_state()
 
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
         self.vdot = vdot
         self.v = vcur
 
+    def get_flight_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase."""
+        # Get flight phase domain index
+        flight_domain_idx = self.gait_config.domain_name_to_idx["flight_phase"]
 
+        # Create boolean mask where current_domains equals flight_phase index
+        flight_mask = (self.current_domains == flight_domain_idx)
+
+        return flight_mask.int()
+
+
+    def get_not_flight_envs(self):
+        # Get flight phase domain index
+        flight_domain_idx = self.gait_config.domain_name_to_idx["flight_phase"]
+
+        # Create boolean mask where current_domains equals flight_phase index
+        flight_mask = (self.current_domains != flight_domain_idx)
+
+        return flight_mask.int()
 

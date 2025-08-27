@@ -124,12 +124,8 @@ def holonomic_constraint_vel(
     # stack into [B,4] error vector
     e_vel = torch.cat([v, wz], dim=-1)
 
-    # TODO: Remove after debugging
-    if cmd.current_domain == "flight_phase":
-        # unified exponential‐norm reward
-        return 0*torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
-
-    return torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
+    not_flight_mask = cmd.get_not_flight_envs()
+    return not_flight_mask * torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
 
 def holonomic_constraint(
     env: ManagerBasedRLEnv,
@@ -169,12 +165,8 @@ def holonomic_constraint(
     # stack into [B,5] error vector
     e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
 
-    # TODO: Remove after debugging
-    if cmd.current_domain == "flight_phase":
-        # unified Gaussian‐like reward
-        return 0 * torch.exp(- (e_pose**2).sum(dim=-1) / sigma_pose**2)
-
-    return torch.exp(- (e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
+    not_flight_mask = cmd.get_not_flight_envs()
+    return not_flight_mask * torch.exp(- (e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
 
 
 def reference_tracking(
@@ -293,10 +285,9 @@ def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, sensor_cfg
     """Penalize contacts while in the flight phase."""
     cmd = env.command_manager.get_term(command_name)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    
-    if cmd.current_domain == "flight_phase":
-        contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
-        penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
-        return penalty
-    else:
-        return torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+
+    flight_mask = cmd.get_flight_envs()
+
+    contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
+    penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
+    return flight_mask * penalty

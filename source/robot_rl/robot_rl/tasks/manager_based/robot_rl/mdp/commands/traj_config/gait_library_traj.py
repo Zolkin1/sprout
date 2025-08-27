@@ -3,6 +3,8 @@ from pathlib import Path
 import torch
 import re
 import math
+
+from hid import device
 from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
@@ -79,11 +81,12 @@ def bezier_deg_batched(
         raise ValueError("Only order=0 (position) or order=1 (derivative) are supported.")
 
 
-class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
+class GaitLibraryEndEffectorConfig:
     """Configuration class for gait library with velocity-based gait selection."""
     
     def __init__(self, gait_library_path: str, 
-                 gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]], 
+                 gait_velocity_ranges: Union[Dict[str, tuple], Tuple[float, float, float]],
+                 device,
                  config_name: str = "single_support",
                  use_standing: bool = True):
         """
@@ -100,23 +103,17 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         self.gait_library_path = Path(gait_library_path)
         self.trajectory_type = "end_effector"
         self.config_name = config_name
-
-        self.left_coeffs_batched = {}
-        self.right_coeffs_batched = {}
+        self.device = device
         
         min_vel, max_vel, step = gait_velocity_ranges
         self.gait_velocity_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
       
         # Cache for loaded gait configs
         self._gait_cache = {}
-        
+
         # Current gait assignments per environment
         self.current_gaits = None
         self.num_envs = None
-        
-        # Load the first gait to initialize base class
-        # first_gait = list(self.gait_velocity_ranges.keys())[0]
-        # super().__init__(self._get_gait_path(first_gait))
 
         # Use standing or not
         self.use_standing = use_standing
@@ -130,8 +127,8 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         self.num_gaits = len(self._gait_cache)
         self.max_domains = 0
 
-        self.T = [{}]
-        self.domain_seq = [{}]
+        self.T = []
+        self.domain_seq = []
 
         for gait in self._gait_cache.values():
             self.T.append(gait.T)
@@ -146,7 +143,7 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         ##
         # Create tensors to store cumulative times and domain indices
         # Shape: [num_gaits, max_domains + 1]
-        self.domain_cumulative_times = torch.zeros((self.num_gaits, self.max_domains + 1))
+        self.domain_cumulative_times = torch.zeros((self.num_gaits, self.max_domains + 1), device=self.device)
 
         # Store domain names as indices for easier batched operations
         # Create a mapping from domain names to indices
@@ -155,17 +152,26 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
             all_domain_names.update(domains)
         self.domain_name_to_idx = {name: idx for idx, name in enumerate(sorted(all_domain_names))}
         self.idx_to_domain_name = {idx: name for name, idx in self.domain_name_to_idx.items()}
+        self.num_unique_domains = len(all_domain_names)
 
         # Shape: [num_gaits, max_domains]
-        self.domain_indices = torch.full((self.num_gaits, self.max_domains), -1, dtype=torch.long)
+        self.domain_indices = torch.full((self.num_gaits, self.max_domains), -1, dtype=torch.long, device=self.device)
 
         # Shape: [num_gaits] - store actual number of domains for each gait
-        self.num_domains_per_gait = torch.zeros(self.num_gaits, dtype=torch.long)
+        self.num_domains_per_gait = torch.zeros(self.num_gaits, dtype=torch.long, device=self.device)
+
+        # Precompute duration matrix for all gait-domain combinations
+        # Shape: [num_gaits, num_unique_domains]
+        self.duration_matrix = torch.zeros((self.num_gaits, self.num_unique_domains), device=self.device)
 
         # Fill the tensors
         for gait_idx in range(self.num_gaits):
             domains = self.domain_seq[gait_idx]
             self.num_domains_per_gait[gait_idx] = len(domains)
+
+            # Fill duration matrix for this gait
+            for domain_name, duration in self.T[gait_idx].items():
+                self.duration_matrix[gait_idx, self.domain_name_to_idx[domain_name]] = duration
 
             cumulative_time = 0.0
             for domain_idx, domain_name in enumerate(domains):
@@ -178,7 +184,6 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
 
             # Set the final boundary (total gait period)
             self.domain_cumulative_times[gait_idx, len(domains)] = cumulative_time
-
 
     def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Dict[str, tuple]:
         """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
@@ -281,14 +286,15 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
             if gait_name not in self._gait_cache:
                 self._load_gait_config(gait_name, speed_cms)
         
-    def _get_first_gait(self):
+    def _get_last_gait(self):
+        # I don't want to return the first gait because the standing gait is often first and has a different length
         gait_names = sorted(self.gait_velocity_ranges.keys(),
                             key=lambda name: self.gait_velocity_ranges[name][0])
 
         # Get dimensions from the first gait
-        first_gait = gait_names[0]
-        first_config = self._gait_cache[first_gait]
-        return first_config
+        last_gait = gait_names[-1]
+        last_config = self._gait_cache[last_gait]
+        return last_config
 
 
     def _precompute_control_points(self):
@@ -297,36 +303,37 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         # Use sorted gait names to ensure consistent ordering
         gait_names = sorted(self.gait_velocity_ranges.keys(),
                             key=lambda name: self.gait_velocity_ranges[name][0])
-        num_vel = len(gait_names)
+        num_gaits = len(gait_names)
 
-        # Get dimensions from the first gait
-        first_gait = gait_names[0]
+        # Get dimensions from the last gait - these values are assumed to be equivalent across gaits and domains
+        first_gait = gait_names[-1]
         first_config = self._gait_cache[first_gait]
 
-        for domain_name in first_config.domain_seq:
-            # Get dimensions
-            output_dim = first_config.left_coeffs[domain_name].shape[0]  # num_outputs
-            degree_plus_1 = first_config.left_coeffs[domain_name].shape[1]  # degree + 1
-            device = first_config.left_coeffs[domain_name].device
-            dtype = first_config.left_coeffs[domain_name].dtype
+        # NOTE: Currently assuming that all gaits & domains have the same output dim and degree across all domains
+        self.bez_deg = first_config.bez_deg[first_config.domain_seq[0]]
+        self.output_dim = first_config.left_coeffs[first_config.domain_seq[0]].shape[0]  # num_outputs
 
-            # Initialize batched control point tensors
-            self.left_coeffs_batched[domain_name] = torch.zeros(
-                (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
-            )
-            self.right_coeffs_batched[domain_name] = torch.zeros(
-                (num_vel, output_dim, degree_plus_1), device=device, dtype=dtype
-            )
+        degree_plus_1 = self.bez_deg + 1
+        dtype = first_config.left_coeffs[first_config.domain_seq[0]].dtype
 
-            # Fill the batched tensors
-            for i, gait_name in enumerate(gait_names):
-                if gait_name in self._gait_cache:
-                    config = self._gait_cache[gait_name]
-                    self.left_coeffs_batched[domain_name][i] = config.left_coeffs[domain_name]
-                    self.right_coeffs_batched[domain_name][i] = config.right_coeffs[domain_name]
+        # Initialize batched control point tensors
+        self.left_coeffs_batched = torch.zeros(
+            (self.num_unique_domains, num_gaits, self.output_dim, degree_plus_1), device=self.device, dtype=dtype
+        )
+        self.right_coeffs_batched = torch.zeros(
+            (self.num_unique_domains, num_gaits, self.output_dim, degree_plus_1), device=self.device, dtype=dtype
+        )
 
-        # Store the Bezier degree
-        self.bez_deg = first_config.bez_deg
+        gait_idx = 0
+        for gait_name in gait_names:
+            gait = self._gait_cache[gait_name]
+            for domain_name in self.domain_seq[gait_idx]:
+                domain_idx = self.domain_name_to_idx[domain_name]
+                # Fill the batched tensors
+                self.left_coeffs_batched[domain_idx][gait_idx] = gait.left_coeffs[domain_name]
+                self.right_coeffs_batched[domain_idx][gait_idx] = gait.right_coeffs[domain_name]
+
+            gait_idx += 1
     
     def _load_gait_config(self, gait_name: str, speed_cms: int = None):
         """Load a specific gait configuration."""
@@ -397,7 +404,7 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         # Recompute batched control points after remapping
         self._precompute_control_points()
 
-    def determine_domains(self, gait_idx: torch.Tensor, time: float) -> torch.Tensor:
+    def determine_domains(self, gait_idx: torch.Tensor, time: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Determine the domain for each environment in a batched manner.
 
@@ -408,7 +415,9 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
             domain_idx: Tensor of shape [num_envs] containing domain index for each env
         """
         # Calculate time into gait for all envs
-        time_into_gait = time % self.T_gait
+        time_into_gait = torch.full((gait_idx.shape[0],),
+                                       time % self.T_gait,
+                                       device=gait_idx.device)
 
         # Get the cumulative times for the selected gaits
         # Shape: [num_envs, max_domains + 1]
@@ -424,12 +433,12 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
 
         # Create a mask for valid domains
         # Shape: [num_envs, max_domains]
-        domain_mask = torch.arange(self.max_domains).unsqueeze(0) < num_domains.unsqueeze(1)
+        domain_mask = torch.arange(self.max_domains, device=self.device).unsqueeze(0) < num_domains.unsqueeze(1)
 
         # Compare time_into_gait with boundaries
         # Shape: [num_envs, max_domains]
-        in_domain = (time_into_gait.unsqueeze(1) >= selected_cumulative_times[:, :-1]) & \
-                    (time_into_gait.unsqueeze(1) < selected_cumulative_times[:, 1:])
+        in_domain = (time_into_gait.unsqueeze(1) > selected_cumulative_times[:, :-1]) & \
+                    (time_into_gait.unsqueeze(1) <= selected_cumulative_times[:, 1:])
 
         # Apply mask to only consider valid domains
         in_domain = in_domain & domain_mask
@@ -443,51 +452,57 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         current_domain_indices = torch.gather(selected_domain_indices, 1,
                                               domain_positions.unsqueeze(1)).squeeze(1)
 
-        return current_domain_indices
+        # --- Phase variable computation --- #
+        # Get domain start times for each env
+        # Shape: [num_envs]
+        domain_start_times = torch.gather(selected_cumulative_times[:, :-1], 1,
+                                          domain_positions.unsqueeze(1)).squeeze(1)
 
-    def get_ref_traj(self, hzd_cmd, cmd_vel, gait_indices, domain_indices) -> tuple[torch.Tensor, torch.Tensor]:
+        # Get domain durations using the precomputed duration matrix
+        # Shape: [num_envs, num_unique_domains]
+        selected_durations = self.duration_matrix[gait_idx]
+
+        # Shape: [num_envs]
+        domain_durations = torch.gather(selected_durations, 1,
+                                        current_domain_indices.unsqueeze(1)).squeeze(1)
+
+        # Compute phase variable
+        # Shape: [num_envs]
+        phase_var = (time_into_gait - domain_start_times) / domain_durations
+
+        # Clamp to [0, 1] to handle any numerical issues
+        phase_var = torch.clamp(phase_var, 0.0, 1.0)
+
+        return current_domain_indices, phase_var, domain_durations
+
+    def get_ref_traj(self, hzd_cmd, cmd_vel, gait_indices) -> tuple[torch.Tensor, torch.Tensor]:
         """Get reference trajectory using precomputed batched control points."""
-        # Loop through all domains
-        ref_pos = {}
-        ref_vel = {}
         stance_coeffs = self.right_coeffs_batched if hzd_cmd.stance_idx == 1 else self.left_coeffs_batched
-        for key in stance_coeffs.keys():
-            # Evaluate one trajectory per gait (much more efficient!)
-            # control_points: [num_vel, jt_dim, degree+1]
-            # domain_dur: [1] -> expand to [num_vel]
 
-            domain_dur = torch.tensor([self.T[key]], dtype=torch.float32, device=cmd_vel.device)  # [1]
-            domain_dur_expanded = domain_dur.expand(stance_coeffs[key].shape[0])  # [num_vel]
+        ref_pos = bezier_deg_batched(order=0,
+                                     tau=hzd_cmd.phase_var,
+                                     domain_dur=hzd_cmd.domain_durations,
+                                     control_points=stance_coeffs[hzd_cmd.current_domains, gait_indices, :, :],
+                                     degree=self.bez_deg,)
 
-            ref_pos[key] = bezier_deg_batched(
-                            order=0,
-                            tau=hzd_cmd.phase_var,
-                            domain_dur=domain_dur_expanded,
-                            control_points=stance_coeffs[key],
-                            degree=self.bez_deg[key],
-                        )
-            ref_vel[key] = bezier_deg_batched(
-                            order=1,
-                            tau=hzd_cmd.phase_var,
-                            domain_dur=domain_dur_expanded,
-                            control_points=stance_coeffs[key],
-                            degree=self.bez_deg[key],
-                        )
-
-        # Gather the selected trajectories
-        # TODO: Generate offset for the gait indexes
-        des_pos = ref_pos[self.domain_idx_to_name[domain_indices]][gait_indices]  # [N, jt_dim]
-        des_vel = ref_vel[self.domain_idx_to_name[domain_indices]][gait_indices]  # [N, jt_dim]
+        ref_vel = bezier_deg_batched(order=1,
+                                     tau=hzd_cmd.phase_var,
+                                     domain_dur=hzd_cmd.domain_durations,
+                                     control_points=stance_coeffs[hzd_cmd.current_domains, gait_indices, :, :],
+                                     degree=self.bez_deg,)
 
         if self.use_standing:
             stand_idx = torch.where(torch.norm(cmd_vel, dim=1) < hzd_cmd.standing_threshold)[0]
             if stand_idx.numel() > 0:
                 standing_pose = self.right_standing_pos if hzd_cmd.stance_idx == 1 else self.left_standing_pos
-                des_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
-                des_vel[stand_idx] = torch.zeros_like(des_vel[stand_idx])
+                ref_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
+                ref_vel[stand_idx] = torch.zeros_like(ref_vel[stand_idx])
 
-        des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, cmd_vel)
-   
+        des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, ref_pos, ref_vel, cmd_vel)
+
+        # print(f"coeffs: {stance_coeffs[hzd_cmd.current_domains, gait_indices, :, :]}")
+        # print(f"des pos: {des_pos}")
+
         return des_pos, des_vel
     
 
@@ -597,8 +612,7 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
         ##
         # Stance foot virtual constraints
         ##
-        first_gait = self._get_first_gait()
-        if first_gait.bezier_coeffs[first_gait.domain_seq[0]].shape[0] == 27:
+        if self.output_dim == 27:
             stance_pos_rel, stance_ori_rel, stance_vel_rel, stance_ang_vel_rel = _pos_ori_vel_virtual(
                 stance_foot_idx, relative_foot_pos, hzd_cmd.stance_foot_ori_quat_0, hzd_cmd.stance_foot_ori_0)
 
