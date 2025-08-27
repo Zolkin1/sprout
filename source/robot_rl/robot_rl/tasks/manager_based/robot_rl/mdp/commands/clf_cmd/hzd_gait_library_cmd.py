@@ -1,18 +1,44 @@
 import torch
 import math
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cmd import HZDCommandTerm
+
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.gait_library_traj import (
-    GaitLibraryEndEffectorConfig, GaitLibraryJointConfig, StairGaitLibraryConfig
+    GaitLibraryEndEffectorConfig
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.ee_traj import (bezier_deg, get_euler_from_quat)
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.clf import CLF
 import numpy as np
+from isaaclab.managers import CommandTerm
 
-class GaitLibraryHZDCommandTerm(HZDCommandTerm):
+
+
+
+class GaitLibraryHZDCommandTerm(CommandTerm):
     """HZD command term that uses a gait library with velocity-based selection."""
     
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
+
+        self.env = env
+        self.robot = env.scene[cfg.asset_name]
+        self.debug_vis = cfg.debug_vis
+        
+        self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
+        self.hip_yaw_idx, _ = self.robot.find_joints(".*_hip_yaw_.*")
+        self.metrics = {}
+        
+        self.mass = sum(self.robot.data.default_mass.T)[0]
+        
+        self.v = torch.zeros((self.num_envs), device=self.device)
+        self.stance_idx = None
+        
+        self.y_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.yaw_output_idx = []
+
+
 
         self.stance_foot_vel = None
         self.stance_foot_ang_vel = None
@@ -25,33 +51,13 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         if hasattr(cfg, 'gait_library_path'):
             config_name = getattr(cfg, 'config_name', 'single_support')
             
-            # Check if it's a stair gait library (height-based) or regular gait library (velocity-based)
-            if hasattr(cfg, 'gait_height_ranges'):
-                # Stair gait library
-                self.gait_config = StairGaitLibraryConfig(
-                    cfg.gait_library_path, 
-                    cfg.gait_height_ranges,
-                    cfg.trajectory_type,
-                    config_name
+            self.gait_config = GaitLibraryEndEffectorConfig(
+                cfg.gait_library_path, 
+                cfg.gait_velocity_ranges,
+                config_name,
+                cfg.use_standing,
                 )
-            elif hasattr(cfg, 'gait_velocity_ranges'):
-                # Regular gait library
-                if cfg.trajectory_type == "end_effector":
-                    self.gait_config = GaitLibraryEndEffectorConfig(
-                        cfg.gait_library_path, 
-                        cfg.gait_velocity_ranges,
-                        config_name,
-                        cfg.use_standing,
-                    )
-                else:
-                    self.gait_config = GaitLibraryJointConfig(
-                        cfg.gait_library_path, 
-                        cfg.gait_velocity_ranges,
-                        config_name
-                    )
-            else:
-                raise ValueError("Gait library configuration missing: either gait_height_ranges or gait_velocity_ranges required")
-            
+              
         else:
             raise ValueError("Gait library configuration missing: gait_library_path required")
         
@@ -70,7 +76,7 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
             if cfg.use_standing:
                 self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
             
-                from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import bezier_deg
+                
                 right_des_pos = bezier_deg(
                         0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
                         torch.tensor(self.gait_config.bez_deg, device=self.device)
@@ -88,6 +94,12 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         self.gait_config.reorder_and_remap(cfg, self.device)
         self.tp = torch.zeros((self.env.num_envs,), device=self.device)
         self.initiate_clf()
+
+
+    @property
+    def command(self):
+        return self.y_out
+    
 
     def initiate_clf(self):
         # import pdb; pdb.set_trace()
@@ -122,10 +134,15 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
         self.y_act = act_pos
         self.dy_act = act_vel
 
+    def _resample_command(self, env_ids):
+        self._update_command()
+        return
+    
     def _update_metrics(self):
         """Update metrics specific to gait library tracking."""
         # Call parent method for base metrics
-        super()._update_metrics()
+        self.metrics["v"] = self.v
+        self.metrics["vdot"] = self.vdot
         
         # Update metrics based on trajectory type
         if hasattr(self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]], 'axis_names'):
@@ -230,3 +247,29 @@ class GaitLibraryHZDCommandTerm(HZDCommandTerm):
 
         # TODO: Update for multi-domain
         self.cur_swing_time = self.phase_var * Tleg # Used in swing yaw modification
+
+    def _update_command(self):
+        """Update the command by generating reference and computing CLF."""
+        self.update_stance_swing_idx()
+        self.generate_reference_trajectory()
+        self.get_actual_state()
+        
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
+        self.vdot = vdot
+        self.v = vcur
+
+    
+    def get_stance_foot_pose(self):
+        """Get stance foot pose data similar to JointTrajectoryConfig.get_stance_foot_pose."""
+        data = self.robot.data
+        # 1. Foot positions and orientations (world frame)
+        foot_pos_w = data.body_pos_w[:, self.feet_bodies_idx, :]
+        foot_ori_w = data.body_quat_w[:, self.feet_bodies_idx, :]
+
+        # Store raw foot positions
+        foot_lin_vel_w = data.body_lin_vel_w[:, self.feet_bodies_idx, :]
+        foot_ang_vel_w = data.body_ang_vel_w[:, self.feet_bodies_idx, :]
+        self.stance_foot_pos = foot_pos_w[:, self.stance_idx, :]
+        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
+        self.stance_foot_vel = foot_lin_vel_w[:, self.stance_idx, :]
+        self.stance_foot_ang_vel = foot_ang_vel_w[:, self.stance_idx, :]

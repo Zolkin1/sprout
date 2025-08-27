@@ -4,9 +4,7 @@ import torch
 import re
 import math
 
-from .base_traj import BaseTrajectoryConfig
 from .ee_traj import EndEffectorTrajectoryConfig #, EndEffectorTracker
-from .jt_traj import JointTrajectoryConfig
 from robot_rl.tasks.manager_based.robot_rl.terrains.stair_cfg import get_step_height_at_x, get_uniform_stair_step_height_from_env
 
 def _ncr(n, r):
@@ -80,7 +78,7 @@ def bezier_deg_batched(
         raise ValueError("Only order=0 (position) or order=1 (derivative) are supported.")
 
 
-class GaitLibraryConfig(BaseTrajectoryConfig):
+class GaitLibraryConfig(EndEffectorTrajectoryConfig):
     """Configuration class for gait library with velocity-based gait selection."""
     
     def __init__(self, gait_library_path: str, 

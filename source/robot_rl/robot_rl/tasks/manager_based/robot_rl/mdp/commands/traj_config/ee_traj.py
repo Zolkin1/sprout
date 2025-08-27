@@ -1,12 +1,138 @@
-import torch
+import torch, yaml
 import numpy as np
-from typing import List, Dict
-from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz
+from typing import List, Dict, Tuple
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
-from .base_traj import BaseTrajectoryConfig
 
+def get_euler_from_quat(quat):
+    euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
+    euler_x = wrap_to_pi(euler_x)
+    euler_y = wrap_to_pi(euler_y)
+    euler_z = wrap_to_pi(euler_z)
+    return torch.stack([euler_x, euler_y, euler_z], dim=-1)
+
+def bezier_deg(
+    order: int,
+    tau: torch.Tensor,  # [batch], each in [0,1]
+    step_dur: torch.Tensor,  # [batch]
+    control_points: torch.Tensor,  # [n_dim, degree+1]
+    degree: int,
+) -> torch.Tensor:
+    """
+    Computes (for each τ in the batch) either
+      • the vector‐valued Bezier position B(τ) ∈ R^{n_dim}, or
+      • its time derivative B'(τ) ∈ R^{n_dim},
+
+    where `control_points` is shared across the whole batch and has shape [n_dim, degree+1].
+
+    Args:
+      order: 0 → position, 1 → time‐derivative.
+      tau:       shape [batch], clipped to [0,1].
+      step_dur:  shape [batch], positive scalars.
+      control_points: shape [n_dim, degree+1].
+      degree:    polynomial degree (so there are `degree+1` control points).
+
+    Returns:
+      If order==0: a tensor of shape [batch, n_dim], the Bezier‐position at each τ[i].
+      If order==1: a tensor of shape [batch, n_dim], the time‐derivative at each τ[i].
+    """
+    # 1) Clamp tau into [0,1]
+    tau = torch.clamp(tau, 0.0, 1.0)  # [batch]
+
+    # 2) Extract n_dim from control_points
+    #    control_points: [n_dim, degree+1]
+
+    if order == 1:
+        # ─── DERIVATIVE CASE ────────────────────────────────────────────────────
+        # We want:
+        #   B'(τ) = degree * sum_{i=0..degree-1} [
+        #             (CP_{i+1} - CP_i) * C(degree-1, i)
+        #             * (1-τ)^(degree-1-i) * τ^i
+        #          ]  / step_dur.
+
+        # 3) Compute CP differences along the "degree+1" axis:
+        #    cp_diff: [n_dim, degree], where
+        #      cp_diff[:, i] = control_points[:, i+1] - control_points[:, i].
+        cp_diff = control_points[:, 1:] - control_points[:, :-1]  # [n_dim, degree]
+
+        # 4) Binomial coefficients for (degree-1 choose i), i=0..degree-1:
+        #    coefs_diff: [degree].
+        coefs_diff = torch.tensor(
+            [_ncr(degree - 1, i) for i in range(degree)],
+            dtype=control_points.dtype,
+            device=control_points.device
+        )  # [degree]
+
+        # 5) Build (τ^i) and ((1-τ)^(degree-1-i)) for i=0..degree-1:
+        i_vec = torch.arange(degree, device=control_points.device)  # [degree]
+
+        #    tau_pow:     [batch, degree],  τ^i
+        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
+
+        #    one_minus_pow: [batch, degree], (1-τ)^(degree-1-i)
+        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - 1 - i_vec).unsqueeze(0))
+
+        # 6) Combine into a single "weight matrix" for the derivative:
+        #    weight_deriv[b, i] = degree * C(degree-1, i) * (1-τ[b])^(degree-1-i) * (τ[b])^i
+        #    → shape [batch, degree]
+        weight_deriv = (degree
+                        * coefs_diff.unsqueeze(0)        # [1, degree]
+                        * one_minus_pow                 # [batch, degree]
+                        * tau_pow)                       # [batch, degree]
+        # Now weight_deriv: [batch, degree]
+
+        # 7) Multiply these weights by cp_diff to get a [batch, n_dim] result:
+        #    For each batch b:  B'_b =  Σ_{i=0..degree-1} weight_deriv[b,i] * cp_diff[:,i],
+        #    which is exactly a mat‐mul:  weight_deriv[b,:] @ (cp_diff^T) → [n_dim].
+        #
+        #    cp_diff^T: [degree, n_dim], so (weight_deriv @ cp_diff^T) → [batch, n_dim].
+        Bdot = torch.matmul(weight_deriv, cp_diff.transpose(0, 1))  # [batch, n_dim]
+
+        # 8) Finally divide by step_dur:
+        return Bdot / step_dur.unsqueeze(1)  # [batch, n_dim]
+
+    else:
+        # ─── POSITION CASE ────────────────────────────────────────────────────────
+        # We want:
+        #   B(τ) = Σ_{i=0..degree} [
+        #            CP_i * C(degree, i) * (1-τ)^(degree-i) * τ^i
+        #         ].
+
+        # 3) Binomial coefficients for (degree choose i), i=0..degree:
+        #    coefs_pos: [degree+1]
+        coefs_pos = torch.tensor(
+            [_ncr(degree, i) for i in range(degree + 1)],
+            dtype=control_points.dtype,
+            device=control_points.device
+        )  # [degree+1]
+
+        # 4) Build τ^i and (1-τ)^(degree-i) for i=0..degree:
+        i_vec = torch.arange(degree + 1, device=control_points.device)  # [degree+1]
+
+        #    tau_pow:        [batch, degree+1]
+        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
+
+        #    one_minus_pow:  [batch, degree+1]
+        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - i_vec).unsqueeze(0))
+
+        # 5) Combine into a "weight matrix" for position:
+        #    weight_pos[b, i] = C(degree, i) * (1-τ[b])^(degree-i) * (τ[b])^i.
+        #    → shape [batch, degree+1]
+        weight_pos = (coefs_pos.unsqueeze(0)    # [1, degree+1]
+                      * one_minus_pow          # [batch, degree+1]
+                      * tau_pow)               # [batch, degree+1]
+        # Now weight_pos: [batch, degree+1]
+
+        # 6) Multiply by control_points to get [batch, n_dim]:
+        #    For each batch b:  B_b = Σ_{i=0..degree} weight_pos[b,i] * control_points[:,i],
+        #    i.e.  weight_pos[b,:]  (shape [degree+1]) @ (control_points^T) ([degree+1, n_dim]) → [n_dim].
+        #
+        #    So:  B = weight_pos @ control_points^T  → [batch, n_dim].
+        B = torch.matmul(weight_pos, control_points.transpose(0, 1))  # [batch, n_dim]
+
+        return B
+    
 def relable_ee_hand_coeffs():
     """Build relabel matrix for end effector coefficients."""
     R = np.eye(21)
@@ -124,13 +250,54 @@ def relable_ee_stance_coeffs():
 
     return R
 
-class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
+class EndEffectorTrajectoryConfig():
     """Configuration class for end effector trajectories."""
     
     def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
         self.constraint_specs = []
-        super().__init__(yaml_path)
+        self.yaml_path = yaml_path
+        # Make all the dicts that will hold {domain_name: value}
+        self.bezier_coeffs = {}
+        self.T = {}
+        self.left_coeffs = {}
+        self.right_coeffs = {}
+        self.bez_deg = {}  # Default Bezier degree
+        self.joint_order = {}
+        self.load_from_yaml()
     
+
+    def load_from_yaml(self):
+        """Load configuration from YAML file.
+        
+        This method loads the step period T and calls the abstract method
+        _load_specific_data() for subclass-specific data loading.
+        """
+        with open(self.yaml_path, 'r') as file:
+            data = yaml.safe_load(file)
+
+        if data.get('domain_sequence') is None:
+            raise ValueError("Domain sequence must be specified in the trajectory solution!")
+
+        self.domain_seq = data['domain_sequence']
+        for domain_name in self.domain_seq:
+            # Load common data
+            self.T[domain_name] = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
+            self.bez_deg[domain_name] = data[domain_name]['spline_order']
+
+            if domain_name == self.domain_seq[0]:
+                # Load initial config
+                init_config = data[domain_name]['q'][0]
+                # Need to reorder xyzw to wxyz
+                init_vel = data[domain_name]['v'][0]
+                self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
+                self.init_root_vel = init_vel[:6]
+                self.init_joint_pos = init_config[7:]
+                self.init_joint_vel = init_vel[6:]
+
+        # Load subclass-specific data
+        self._load_specific_data(data)
+
+
     def _load_specific_data(self, data):
         """Load end effector specific data from YAML."""
         # Load constraint specifications
@@ -393,109 +560,98 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
         
         return y_act, dy_act
 
-    def get_ref_traj(self, ee_hzd_cmd):
-        """Legacy method - now calls parent get_ref_traj."""
-        return super().get_ref_traj(ee_hzd_cmd)
-
-
-class StairEEtrajConfig(EndEffectorTrajectoryConfig):
-    def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
-        super().__init__(yaml_path)
-
-    def get_actual_traj(self, hzd_cmd):
-        """Get actual trajectory from end effector tracker."""
-        raise ValueError("[StairEETrajConfig] Not used right now!")
-        ee_tracker = hzd_cmd.ee_tracker
-
-        # Determine swing foot frame name based on stance
-        stance_foot_pos = hzd_cmd.stance_foot_pos_0 
+    def get_ref_traj(self, hzd_cmd) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get reference trajectory based on stance.
         
-        # Get actual values for each constraint specification in order
-        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
-        com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
-       
-        com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
-        com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
-
-        pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
-        pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
-
-        left_foot_pos, left_foot_ori, left_foot_quat = ee_tracker.get_pose("left_foot_middle")
-        right_foot_pos, right_foot_ori, right_foot_quat = ee_tracker.get_pose("right_foot_middle")
-
-        left2st_ft_pos = left_foot_pos - stance_foot_pos
-        left2st_ft_ori = left_foot_ori - hzd_cmd.stance_foot_ori_0
-        left2st_ft_ori[:, 2] = wrap_to_pi(left2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        right2st_ft_pos = right_foot_pos - stance_foot_pos
-        right2st_ft_ori = right_foot_ori - hzd_cmd.stance_foot_ori_0
-        right2st_ft_ori[:, 2] = wrap_to_pi(right2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        sw2st_foot_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
-        sw2st_foot_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
-
-        foot_lin_vel_w = hzd_cmd.robot.data.body_lin_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-        foot_ang_vel_w = hzd_cmd.robot.data.body_ang_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-
-        batched_idx = torch.arange(foot_lin_vel_w.shape[0])
-        sw2st_foot_vel = foot_lin_vel_w[batched_idx, 1 - hzd_cmd.stance_idx]
-        sw2st_foot_ang_vel = foot_ang_vel_w[batched_idx, 1 - hzd_cmd.stance_idx]
-
-        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, hzd_cmd.stance_foot_ori_quat_0)
-        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, hzd_cmd.stance_foot_ori_quat_0)
-
-        waist_joint_pos = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.waist_joint_idx]
-        waist_joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.waist_joint_idx]
-
-        # palm position
-        left_hand_pos, left_hand_ori, left_hand_quat = ee_tracker.get_pose("left_hand_palm_joint")
-        right_hand_pos, right_hand_ori, right_hand_quat = ee_tracker.get_pose("right_hand_palm_joint")
-
-        left2st_ft_pos = left_hand_pos - stance_foot_pos
-        left2st_ft_ori = left_hand_ori - hzd_cmd.stance_foot_ori_0
-        left2st_ft_ori[:, 2] = wrap_to_pi(left2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        right2st_ft_pos = right_hand_pos - stance_foot_pos
-        right2st_ft_ori = right_hand_ori - hzd_cmd.stance_foot_ori_0
-        right2st_ft_ori[:, 2] = wrap_to_pi(right2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
+        Args:
+            hzd_cmd: HZD command object containing stance information
+            
+        Returns:
+            Tuple of (reference_position, reference_velocity) tensors
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        T = torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device)
         
-        left_hand_vel, left_hand_omega = ee_tracker.get_velocity("left_hand_palm_joint", hzd_cmd.robot.data)
-        right_hand_vel, right_hand_omega = ee_tracker.get_velocity("right_hand_palm_joint", hzd_cmd.robot.data)
-
-        stance_hand_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_pos, left2st_ft_pos)
-        stance_hand_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_ori, left2st_ft_ori)
-        swing_hand_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
-        swing_hand_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
-
-        swing_hand_vel = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_vel, right_hand_vel)
-        swing_hand_omega = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_omega, right_hand_omega)
-        stance_hand_vel = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_vel, left_hand_vel)
-        stance_hand_omega = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_omega, left_hand_omega)
-
-        swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-
-        stance_hand_pos = stance_hand_pos - stance_foot_pos
-        stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_pos = swing_hand_pos - stance_foot_pos
-
-        swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ori[:, 2] = wrap_to_pi(swing_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        stance_hand_ori[:, 2] = wrap_to_pi(stance_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos, sw2st_foot_ori,
-                          waist_joint_pos,
-                          swing_hand_pos, swing_hand_ori[:, 2].unsqueeze(-1), stance_hand_pos, stance_hand_ori[:, 2].unsqueeze(-1)], dim=-1)
-
-        # concatenate all the velocity values
-        dy_act = torch.cat([com_vel_local, pelvis_omega, sw2st_foot_vel_local, sw2st_foot_ang_vel_local,
-                           waist_joint_vel,
-                           swing_hand_vel_local, swing_hand_ang_vel_local[:, 2].unsqueeze(-1), stance_hand_vel_local, stance_hand_ang_vel_local[:, 2].unsqueeze(-1)], dim=-1)
+        # Choose coefficients based on stance
+        if hzd_cmd.stance_idx == 1:
+            ctrl_points = self.right_coeffs
+        else:
+            ctrl_points = self.left_coeffs
         
-        return y_act, dy_act
+        phase_var_tensor = torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)
         
+        # Import here to avoid circular imports
+        from .jt_traj import bezier_deg
+        
+        des_pos = bezier_deg(
+            0, phase_var_tensor, T, ctrl_points,
+            torch.tensor(hzd_cmd.cfg.bez_deg, device=hzd_cmd.device)
+        )
+        
+        des_vel = bezier_deg(1, phase_var_tensor, T, ctrl_points, hzd_cmd.cfg.bez_deg)
+        
+        # Apply stance-specific modifications
+        self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        
+        return des_pos, des_vel
+    
 
+    def get_stance_foot_pose(self, hzd_cmd):
+        """Get stance foot pose data.
+        
+        This method can be overridden by subclasses that need different
+        stance foot pose handling.
+        
+        Args:
+            hzd_cmd: HZD command object
+        """
+        # Default implementation - can be overridden
+        pass
+    
+    def get_control_points(self, hzd_cmd) -> torch.Tensor:
+        """Get control points for the current stance.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Control points tensor of shape [num_env, num_outputs, degree+1]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        
+        # Choose coefficients based on stance
+        if hzd_cmd.stance_idx == 1:
+            ctrl_points = self.right_coeffs
+        else:
+            ctrl_points = self.left_coeffs
+        
+        # Expand to batch size: [num_outputs, degree+1] -> [N, num_outputs, degree+1]
+        return ctrl_points.unsqueeze(0).expand(N, -1, -1)
+    
+    def get_phase(self, hzd_cmd) -> torch.Tensor:
+        """Get current phase variable.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Phase tensor of shape [num_env]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        return torch.full((N,), hzd_cmd.phase_var, device=hzd_cmd.device)
+    
+    def get_step_duration(self, hzd_cmd) -> torch.Tensor:
+        """Get step duration.
+        
+        Args:
+            hzd_cmd: HZD command object
+            
+        Returns:
+            Step duration tensor of shape [num_env]
+        """
+        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
+        N = base_velocity.shape[0]
+        return torch.full((N,), self.T, dtype=torch.float32, device=base_velocity.device) 
