@@ -15,7 +15,7 @@ def _ncr(n, r):
 def bezier_deg_batched(
     order: int,
     tau: torch.Tensor,                # [num_env], each in [0,1]
-    step_dur: torch.Tensor,           # [num_env], positive scalars
+    domain_dur: torch.Tensor,           # [num_env], positive scalars
     control_points: torch.Tensor,     # [num_env, jt_dim, degree+1]
     degree: int
 ) -> torch.Tensor:
@@ -25,7 +25,7 @@ def bezier_deg_batched(
     Args:
         order: 0 → position, 1 → time-derivative.
         tau: [num_env]
-        step_dur: [num_env]
+        domain_dur: [num_env]
         control_points: [num_env, jt_dim, degree+1]
         degree: Polynomial degree (must match control_points.shape[-1] - 1)
 
@@ -73,7 +73,7 @@ def bezier_deg_batched(
         output = torch.einsum("nd,njd->nj", weights, cp_diff)  # [num_env, jt_dim]
 
         # Divide by step duration
-        return output / step_dur.unsqueeze(1)  # [num_env, jt_dim]
+        return output / domain_dur.unsqueeze(1)  # [num_env, jt_dim]
 
     else:
         raise ValueError("Only order=0 (position) or order=1 (derivative) are supported.")
@@ -436,71 +436,48 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
 
         return current_domain_indices
 
-    def get_ref_traj(self, hzd_cmd) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_ref_traj(self, hzd_cmd, cmd_vel, gait_indices, domain_indices) -> tuple[torch.Tensor, torch.Tensor]:
         """Get reference trajectory using precomputed batched control points."""
-        # Get current phase and step duration
-        base_velocity = hzd_cmd.env.command_manager.get_command("base_velocity")
-        N = base_velocity.shape[0]
+        # Loop through all domains
+        ref_pos = {}
+        ref_vel = {}
+        stance_coeffs = self.right_coeffs_batched if hzd_cmd.stance_idx == 1 else self.left_coeffs_batched
+        for key in stance_coeffs.keys():
+            # Evaluate one trajectory per gait (much more efficient!)
+            # control_points: [num_vel, jt_dim, degree+1]
+            # domain_dur: [1] -> expand to [num_vel]
 
-        total_time = sum(self.T.values())
-        
-        # Use a single tau and step_dur value (same for all gaits)
-        tau = torch.tensor([hzd_cmd.phase_var], device=base_velocity.device)  # [1]
-        step_dur = torch.tensor([total_time], dtype=torch.float32, device=base_velocity.device)  # [1]
-        
-        # Select control points based on stance
-        if hzd_cmd.stance_idx == 1:
-            # Right stance: use right coefficients
-            control_points = self.right_coeffs_batched[hzd_cmd.current_domain]  # [num_vel, jt_dim, degree+1]
-            if self.use_standing:
-                standing_pose = self.right_standing_pos
-        else:
-            # Left stance: use left coefficients
-            control_points = self.left_coeffs_batched[hzd_cmd.current_domain]   # [num_vel, jt_dim, degree+1]
-            if self.use_standing:
-                standing_pose = self.left_standing_pos
-        
-        # Evaluate one trajectory per gait (much more efficient!)
-        # control_points: [num_vel, jt_dim, degree+1]
-        # tau: [1] -> expand to [num_vel]
-        # step_dur: [1] -> expand to [num_vel]
-        
-        # Expand tau and step_dur to match control_points batch dimension
-        tau_expanded = tau.expand(control_points.shape[0])  # [num_vel]
-        step_dur_expanded = step_dur.expand(control_points.shape[0])  # [num_vel]
-        
-        # Use batched Bezier evaluation for position (order=0)
-        ref_pos = bezier_deg_batched(
-            order=0,
-            tau=tau_expanded,
-            step_dur=step_dur_expanded,
-            control_points=control_points,
-            degree=self.bez_deg[hzd_cmd.current_domain],
-        )  # [num_vel, jt_dim]
-        
-        # Use batched Bezier evaluation for velocity (order=1)
-        ref_vel = bezier_deg_batched(
-            order=1,
-            tau=tau_expanded,
-            step_dur=step_dur_expanded,
-            control_points=control_points,
-            degree=self.bez_deg[hzd_cmd.current_domain],
-        )  # [num_vel, jt_dim]
-        
-        # Select the appropriate gait for each environment
-        gait_indices = self.select_gaits_by_velocity(base_velocity[:, :2])  # [N]
-        
+            domain_dur = torch.tensor([self.T[key]], dtype=torch.float32, device=cmd_vel.device)  # [1]
+            domain_dur_expanded = domain_dur.expand(stance_coeffs[key].shape[0])  # [num_vel]
+
+            ref_pos[key] = bezier_deg_batched(
+                            order=0,
+                            tau=hzd_cmd.phase_var,
+                            domain_dur=domain_dur_expanded,
+                            control_points=stance_coeffs[key],
+                            degree=self.bez_deg[key],
+                        )
+            ref_vel[key] = bezier_deg_batched(
+                            order=1,
+                            tau=hzd_cmd.phase_var,
+                            domain_dur=domain_dur_expanded,
+                            control_points=stance_coeffs[key],
+                            degree=self.bez_deg[key],
+                        )
+
         # Gather the selected trajectories
-        des_pos = ref_pos[gait_indices]  # [N, jt_dim]
-        des_vel = ref_vel[gait_indices]  # [N, jt_dim]
+        # TODO: Generate offset for the gait indexes
+        des_pos = ref_pos[self.domain_idx_to_name[domain_indices]][gait_indices]  # [N, jt_dim]
+        des_vel = ref_vel[self.domain_idx_to_name[domain_indices]][gait_indices]  # [N, jt_dim]
 
         if self.use_standing:
-            stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
+            stand_idx = torch.where(torch.norm(cmd_vel, dim=1) < hzd_cmd.standing_threshold)[0]
             if stand_idx.numel() > 0:
+                standing_pose = self.right_standing_pos if hzd_cmd.stance_idx == 1 else self.left_standing_pos
                 des_pos[stand_idx] = standing_pose.expand(len(stand_idx), -1)
                 des_vel[stand_idx] = torch.zeros_like(des_vel[stand_idx])
 
-        des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, base_velocity)
+        des_pos, des_vel = self._apply_swing_modifications(hzd_cmd, des_pos, des_vel, cmd_vel)
    
         return des_pos, des_vel
     

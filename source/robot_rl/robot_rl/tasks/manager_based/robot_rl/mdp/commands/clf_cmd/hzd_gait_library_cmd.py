@@ -257,7 +257,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         commanded_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
 
         # Get the active gaits for each env
-        gait_indices = self.gait_config.select_gaits_by_velocity(self, commanded_velocity)
+        gait_indices = self.gait_config.select_gaits_by_velocity(self, commanded_velocity[:, :2])
 
         # Get the active domains for each env
         domain_indices = self.gait_config.determine_domain(gait_indices, self.env.sim.current_time)
