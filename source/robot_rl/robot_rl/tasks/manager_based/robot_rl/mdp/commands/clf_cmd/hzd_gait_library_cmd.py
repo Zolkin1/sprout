@@ -22,16 +22,16 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.env = env
         self.robot = env.scene[cfg.asset_name]
         self.debug_vis = cfg.debug_vis
-        
+
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
         self.hip_yaw_idx, _ = self.robot.find_joints(".*_hip_yaw_.*")
         self.metrics = {}
-        
+
         self.mass = sum(self.robot.data.default_mass.T)[0]
-        
+
         self.v = torch.zeros((self.num_envs), device=self.device)
         self.stance_idx = None
-        
+
         self.y_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.dy_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
@@ -52,17 +52,17 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             config_name = getattr(cfg, 'config_name', 'single_support')
             
             self.gait_config = GaitLibraryEndEffectorConfig(
-                cfg.gait_library_path, 
+                cfg.gait_library_path,
                 cfg.gait_velocity_ranges,
                 config_name,
                 cfg.use_standing,
                 )
-              
+
         else:
             raise ValueError("Gait library configuration missing: gait_library_path required")
         
 
-     
+
         ##
         # Indexes of the virtual constraint for modification (yaw, euler rate)
         ##
@@ -75,7 +75,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         if cfg.use_standing:
             self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
-        
+
             
             right_des_pos = bezier_deg(
                     0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
@@ -88,18 +88,18 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             self.gait_config.right_standing_pos = right_des_pos
             self.gait_config.left_standing_pos = left_des_pos
             self.standing_threshold = 0.03
-        
+
         
         # Reorder and remap coefficients
         self.gait_config.reorder_and_remap(cfg, self.device)
-        self.tp = torch.zeros((self.env.num_envs,), device=self.device)
+        self.gait_cycle_prop = torch.zeros((self.env.num_envs,), device=self.device)
         self.initiate_clf()
 
 
     @property
     def command(self):
         return self.y_out
-    
+
 
     def initiate_clf(self):
         # import pdb; pdb.set_trace()
@@ -110,8 +110,6 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             Q_weights=np.array(self.cfg.Q_weights),
             R_weights=np.array(self.cfg.R_weights),
             device=self.device
-            # num_domain=num_domain,
-            # domain_scalar=self.cfg.clf_domain_scalar
         )
 
     def _get_leg_period(self) -> float:
@@ -137,7 +135,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
     def _resample_command(self, env_ids):
         self._update_command()
         return
-    
+
     def _update_metrics(self):
         """Update metrics specific to gait library tracking."""
         # Call parent method for base metrics
@@ -172,14 +170,14 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.stance_foot_vel = self.robot.data.body_lin_vel_w[:, stance_foot_idx, :]
         self.stance_foot_ang_vel = self.robot.data.body_ang_vel_w[:, stance_foot_idx, :]
 
-    
+
 
     def update_stance_swing_idx(self):
         """Update stance and swing indices based on phase."""
-        Tleg = self._get_leg_period()
+        Tgait = self._get_gait_period()
 
-        tp = (self.env.sim.current_time % (2 * Tleg)) / (2 * Tleg)
-        phi_c = torch.tensor(math.sin(2 * torch.pi * tp) / math.sqrt(math.sin(2 * torch.pi * tp)**2 + Tleg), device=self.env.device)
+        gait_cycle_prop = (self.env.sim.current_time % (2 * Tgait)) / (2 * Tgait)
+        phi_c = torch.tensor(math.sin(2 * torch.pi * gait_cycle_prop) / math.sqrt(math.sin(2 * torch.pi * gait_cycle_prop)**2 + Tgait), device=self.env.device)
 
         new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
@@ -188,7 +186,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         # Check which domain we are in
         ##
         domain_start_time = 0
-        time_into_leg = self.env.sim.current_time % Tleg
+        time_into_leg = self.env.sim.current_time % Tgait
         for domain_name in self.gait_config.domain_seq:
             if time_into_leg < domain_start_time + self.gait_config.T[domain_name]:
                 self.current_domain = domain_name
@@ -244,20 +242,22 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         self.stance_idx = new_stance_idx
 
-        self.tp = torch.full((self.num_envs,), tp, device=self.device)  # Used in observation phase variables
+        self.gait_cycle_prop = torch.full((self.num_envs,), gait_cycle_prop, device=self.device)  # Used in observation phase variables
 
-        # TODO: Update for multi-domain
-        self.cur_swing_time = self.phase_var * Tleg # Used in swing yaw modification
+        if gait_cycle_prop < 0.5:
+            self.cur_swing_time = gait_cycle_prop*2.0 # Used in swing yaw modification
+        else:
+            self.cur_swing_time = (gait_cycle_prop - 0.5) * 2.0
 
     def _update_command(self):
         """Update the command by generating reference and computing CLF."""
         self.update_stance_swing_idx()
         self.generate_reference_trajectory()
         self.get_actual_state()
-        
+
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
         self.vdot = vdot
         self.v = vcur
 
-    
+
 

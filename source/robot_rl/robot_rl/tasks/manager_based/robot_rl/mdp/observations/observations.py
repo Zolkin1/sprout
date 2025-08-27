@@ -96,7 +96,7 @@ def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    phase = 2*torch.pi * cmd.tp
+    phase = 2*torch.pi * cmd.gait_cycle_prop
     sphase = torch.sin(phase)
     if sphase.ndim == 1:
         # [B] → [B, 1]
@@ -106,7 +106,7 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
 def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    phase = 2*torch.pi * cmd.tp
+    phase = 2*torch.pi * cmd.gait_cycle_prop
     cphase = torch.cos(phase)
     if cphase.ndim == 1:
         # [B] → [B, 1]
