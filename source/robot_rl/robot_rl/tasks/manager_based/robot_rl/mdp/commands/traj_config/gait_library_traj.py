@@ -123,7 +123,63 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
 
         # Pre-load all gaits
         self._preload_gaits()
-    
+
+        ##
+        # Load in other values
+        ##
+        self.num_gaits = len(self._gait_cache)
+        self.max_domains = 0
+
+        self.T = [{}]
+        self.domain_seq = [{}]
+
+        for gait in self._gait_cache.values():
+            self.T.append(gait.T)
+            self.domain_seq.append(gait.domain_seq)
+            if len(gait.domain_seq) > self.max_domains:
+                self.max_domains = len(gait.domain_seq)
+
+        self.T_gait = sum(self.T[-1].values())    # Use the last gait for the length of the gaits
+
+        ##
+        # Create information for domain identification
+        ##
+        # Create tensors to store cumulative times and domain indices
+        # Shape: [num_gaits, max_domains + 1]
+        self.domain_cumulative_times = torch.zeros((self.num_gaits, self.max_domains + 1))
+
+        # Store domain names as indices for easier batched operations
+        # Create a mapping from domain names to indices
+        all_domain_names = set()
+        for domains in self.domain_seq:
+            all_domain_names.update(domains)
+        self.domain_name_to_idx = {name: idx for idx, name in enumerate(sorted(all_domain_names))}
+        self.idx_to_domain_name = {idx: name for name, idx in self.domain_name_to_idx.items()}
+
+        # Shape: [num_gaits, max_domains]
+        self.domain_indices = torch.full((self.num_gaits, self.max_domains), -1, dtype=torch.long)
+
+        # Shape: [num_gaits] - store actual number of domains for each gait
+        self.num_domains_per_gait = torch.zeros(self.num_gaits, dtype=torch.long)
+
+        # Fill the tensors
+        for gait_idx in range(self.num_gaits):
+            domains = self.domain_seq[gait_idx]
+            self.num_domains_per_gait[gait_idx] = len(domains)
+
+            cumulative_time = 0.0
+            for domain_idx, domain_name in enumerate(domains):
+                self.domain_cumulative_times[gait_idx, domain_idx] = cumulative_time
+                self.domain_indices[gait_idx, domain_idx] = self.domain_name_to_idx[domain_name]
+
+                # Access T as a list of dicts: T[gait_idx][domain_name]
+                if domain_name in self.T[gait_idx]:
+                    cumulative_time += self.T[gait_idx][domain_name]
+
+            # Set the final boundary (total gait period)
+            self.domain_cumulative_times[gait_idx, len(domains)] = cumulative_time
+
+
     def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Dict[str, tuple]:
         """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
         if step < 0:
@@ -331,7 +387,55 @@ class GaitLibraryEndEffectorConfig(EndEffectorTrajectory):
 
         # Recompute batched control points after remapping
         self._precompute_control_points()
-    
+
+    def determine_domains(self, gait_idx: torch.Tensor, time: float) -> torch.Tensor:
+        """
+        Determine the domain for each environment in a batched manner.
+
+        Args:
+            gait_idx: Tensor of shape [num_envs] containing gait index for each env
+
+        Returns:
+            domain_idx: Tensor of shape [num_envs] containing domain index for each env
+        """
+        # Calculate time into gait for all envs
+        time_into_gait = time % self.T_gait
+
+        # Get the cumulative times for the selected gaits
+        # Shape: [num_envs, max_domains + 1]
+        selected_cumulative_times = self.domain_cumulative_times[gait_idx]
+
+        # Get the domain indices for the selected gaits
+        # Shape: [num_envs, max_domains]
+        selected_domain_indices = self.domain_indices[gait_idx]
+
+        # Get number of domains for each selected gait
+        # Shape: [num_envs]
+        num_domains = self.num_domains_per_gait[gait_idx]
+
+        # Create a mask for valid domains
+        # Shape: [num_envs, max_domains]
+        domain_mask = torch.arange(self.max_domains).unsqueeze(0) < num_domains.unsqueeze(1)
+
+        # Compare time_into_gait with boundaries
+        # Shape: [num_envs, max_domains]
+        in_domain = (time_into_gait.unsqueeze(1) >= selected_cumulative_times[:, :-1]) & \
+                    (time_into_gait.unsqueeze(1) < selected_cumulative_times[:, 1:])
+
+        # Apply mask to only consider valid domains
+        in_domain = in_domain & domain_mask
+
+        # Find which domain each env is in (get the index of True value)
+        # Shape: [num_envs]
+        domain_positions = in_domain.float().argmax(dim=1)
+
+        # Get the actual domain indices
+        # Shape: [num_envs]
+        current_domain_indices = torch.gather(selected_domain_indices, 1,
+                                              domain_positions.unsqueeze(1)).squeeze(1)
+
+        return current_domain_indices
+
     def get_ref_traj(self, hzd_cmd) -> tuple[torch.Tensor, torch.Tensor]:
         """Get reference trajectory using precomputed batched control points."""
         # Get current phase and step duration

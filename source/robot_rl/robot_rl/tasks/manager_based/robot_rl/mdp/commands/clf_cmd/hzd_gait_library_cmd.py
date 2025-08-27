@@ -112,7 +112,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             device=self.device
         )
 
-    def _get_leg_period(self) -> float:
+    def _get_gait_period(self) -> float:
         """Get the swing period from the gait configuration."""
         return sum(self.gait_config.T.values())
 
@@ -177,11 +177,13 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         Tgait = self._get_gait_period()
 
         gait_cycle_prop = (self.env.sim.current_time % (2 * Tgait)) / (2 * Tgait)
+        # TODO: Remove phi_c
         phi_c = torch.tensor(math.sin(2 * torch.pi * gait_cycle_prop) / math.sqrt(math.sin(2 * torch.pi * gait_cycle_prop)**2 + Tgait), device=self.env.device)
 
         new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
 
+        # TODO: Remove the domain checks
         ##
         # Check which domain we are in
         ##
@@ -251,6 +253,16 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
     def _update_command(self):
         """Update the command by generating reference and computing CLF."""
+        # Get the commanded velocity
+        commanded_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
+
+        # Get the active gaits for each env
+        gait_indices = self.gait_config.select_gaits_by_velocity(self, commanded_velocity)
+
+        # Get the active domains for each env
+        domain_indices = self.gait_config.determine_domain(gait_indices, self.env.sim.current_time)
+
+
         self.update_stance_swing_idx()
         self.generate_reference_trajectory()
         self.get_actual_state()
