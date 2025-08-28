@@ -116,6 +116,7 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
     #                                     params={"update_interval": 15000,
     #                                             "max_vel": 3.0,
+    #                                             "first_update": 40000,
     #                                             "step": 0.1})
 
     walk_run_curriculum = CurrTerm(func=mdp.walk_run_curriculum,

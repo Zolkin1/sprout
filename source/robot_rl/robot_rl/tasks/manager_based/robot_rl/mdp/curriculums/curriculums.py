@@ -47,13 +47,14 @@ def gaits_curriculum(
         # env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
     return cmd_term.cfg.ranges.lin_vel_x[0]
 
-def cmd_vel_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_vel: float, step: float, update_interval: int = 100):
+def cmd_vel_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_vel: float, step: float,
+                       update_interval: int = 100, first_update: int = 100):
     """Curriculum to increase the commanded velocity."""
     commanded_velocity = env.command_manager.get_term("base_velocity")
 
     new_vel = commanded_velocity.cfg.ranges.lin_vel_x[1]
 
-    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+    if env.common_step_counter >= first_update and env.common_step_counter % update_interval == 0:
         # Compute new vel
         new_vel = min(new_vel + step, max_vel)
 
@@ -77,7 +78,8 @@ def walk_run_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], update_i
     return top_vel
 
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25), scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
+    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25),
+        scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
@@ -85,8 +87,7 @@ def clf_curriculum(
     new_max_eta_dot_err = term_cfg.params["eta_dot_max"]
     # clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
 
-    if env.common_step_counter  >= update_interval and env.common_step_counter % update_interval == 0:
-        
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
             #the err
             new_max_eta_err = max(new_max_eta_err - scale[0],min_max_err[0])
             new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1],min_max_err[1])
@@ -98,7 +99,8 @@ def clf_curriculum(
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
     return new_max_eta_err
 
-def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float, update_interval: int = 100) -> float:
+def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float,
+                       update_interval: int = 100) -> float:
     """Curriculum to adjust the weight on the contact penalty."""
     term_cfg = env.reward_manager.get_term_cfg("flight_contact_penalty")
     new_weight = term_cfg.params["weight_scalar"]
