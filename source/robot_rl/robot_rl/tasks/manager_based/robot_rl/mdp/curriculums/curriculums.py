@@ -47,7 +47,20 @@ def gaits_curriculum(
         # env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
     return cmd_term.cfg.ranges.lin_vel_x[0]
 
+def cmd_vel_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_vel: float, step: float, update_interval: int = 100):
+    """Curriculum to increase the commanded velocity."""
+    commanded_velocity = env.command_manager.get_term("base_velocity")
 
+    new_vel = commanded_velocity.cfg.ranges.lin_vel_x[1]
+
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        # Compute new vel
+        new_vel = min(new_vel + step, max_vel)
+
+        # Assign vel - create new tuple since tuples are immutable
+        commanded_velocity.cfg.ranges.lin_vel_x = (commanded_velocity.cfg.ranges.lin_vel_x[0], new_vel)
+
+    return new_vel
 
 def clf_curriculum(
     env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25), scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,

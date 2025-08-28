@@ -279,7 +279,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
         return axs[idx // n_cols, idx % n_cols]
 
     # Hard code number of envs to plot
-    N_ENVS_TO_PLOT = 10
+    N_ENVS_TO_PLOT = 2
     env_ids = list(range(N_ENVS_TO_PLOT))
 
     # TODO: Don't plot None data

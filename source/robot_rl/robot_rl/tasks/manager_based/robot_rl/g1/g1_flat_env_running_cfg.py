@@ -67,11 +67,12 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
 
         # Running v2
         # gait_velocity_ranges=(1.48, 2.88, 0.14),
+        # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 2.0, .1), #(0, 3.00, 0.1),
+        use_standing=False, #True,
 
-        use_standing=True,
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
         R_weights = RUNNING_EE_R_weights_GL
@@ -91,8 +92,9 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
         domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
 
     # observation groups
-    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    critic: G1RunningCriticCfg = G1RunningCriticCfg()
+    # TODO: Try putting back
+    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
@@ -110,6 +112,11 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
                                                    "update_amnt": 0.1})
+
+    # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
+    #                                     params={"update_interval": 15000,
+    #                                             "max_vel": 3.0,
+    #                                             "step": 0.1})
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
@@ -139,18 +146,16 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         # Running v2
         # self.commands.base_velocity.ranges.lin_vel_x = (1.48, 2.88)
+        # self.commands.step_period.period_range = (0.75, 0.75)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.00)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 2.00)  # Note the curriculum for increasing
+        self.commands.step_period.period_range = (0.689, 0.689)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.heading = (0, 0)
 
-        # Running v2
-        # self.commands.step_period.period_range = (0.75, 0.75)
-
-        self.commands.step_period.period_range = (0.71, 0.71)
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
@@ -259,7 +264,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 2.0)
 
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
