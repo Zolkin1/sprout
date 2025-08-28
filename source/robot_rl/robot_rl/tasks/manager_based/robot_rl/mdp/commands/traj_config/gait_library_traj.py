@@ -291,7 +291,10 @@ class GaitLibraryEndEffectorConfig:
             gait_name = self._speed_cms_to_gait_name(speed_cms)
             if gait_name not in self._gait_cache:
                 self._load_gait_config(gait_name, speed_cms)
-    
+
+        if len(self._gait_cache) != len(self.gait_speeds):
+            raise ValueError("Error loading the gaits! Number of cached gaits don't match the number of speeds!")
+
     def _print_gait_library_info(self):
         """Print comprehensive information about the loaded gait library."""
         print("\n" + "="*60)

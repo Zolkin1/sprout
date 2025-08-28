@@ -62,6 +62,20 @@ def cmd_vel_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_vel: 
 
     return new_vel
 
+def walk_run_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 80000):
+    """Curriculum to switch between walking and running."""
+    commanded_velocity = env.command_manager.get_term("base_velocity")
+
+    top_vel = commanded_velocity.cfg.ranges.lin_vel_x[1]
+
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        if top_vel == 1.0:
+            commanded_velocity.cfg.ranges.lin_vel_x = (1.1, 3.0)
+        else:
+            commanded_velocity.cfg.ranges.lin_vel_x = (0.0, 1.0)
+
+    return top_vel
+
 def clf_curriculum(
     env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25), scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
 ) -> float:
