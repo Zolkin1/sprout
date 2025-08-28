@@ -60,7 +60,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v1",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v2",
         config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
@@ -70,7 +70,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(1.1, 2.0, .1), #(0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 2.10, .1), #(0, 3.00, 0.1),
         use_standing=False, #True,
 
         num_outputs=27,
@@ -149,8 +149,8 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.step_period.period_range = (0.75, 0.75)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 2.00)  # Note the curriculum for increasing
-        self.commands.step_period.period_range = (0.689, 0.689)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 2.10)  # Note the curriculum for increasing
+        self.commands.step_period.period_range = (0.69, 0.69)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
