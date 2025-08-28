@@ -102,7 +102,7 @@ class GaitLibraryEndEffectorConfig:
         self.device = device
         
         min_vel, max_vel, step = gait_velocity_ranges
-        self.gait_velocity_ranges = self._generate_discretized_ranges(min_vel, max_vel, step)
+        self.gait_velocity_ranges, self.gait_speeds = self._generate_discretized_ranges(min_vel, max_vel, step)
       
         # Cache for loaded gait configs
         self._gait_cache = {}
@@ -185,8 +185,12 @@ class GaitLibraryEndEffectorConfig:
             # Set the final boundary (total gait period)
             self.domain_cumulative_times[gait_idx, len(domains)] = cumulative_time
 
-    def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Dict[str, tuple]:
+        # Print gait library information
+        self._print_gait_library_info()
+
+    def _generate_discretized_ranges(self, min_vel: float, max_vel: float, step: float) -> Tuple[Dict[str, tuple], list]:
         """Generate gait velocity ranges from discretization parameters (supports negative ranges)."""
+        gait_speeds = []
         if step < 0:
             raise ValueError("Step must be non-negative!")
         if step == 0:
@@ -196,6 +200,7 @@ class GaitLibraryEndEffectorConfig:
                 speed_cms = int(round(min_vel * 100))
                 gait_ranges = {}
                 gait_ranges[f"gait_{speed_cms}cms"] = (min_vel, max_vel)
+                gait_speeds.append(speed_cms)
         else:
             # Create inclusive list of center velocities and sort them
             velocities = torch.arange(min_vel, max_vel + step * 0.5, step).tolist()
@@ -220,8 +225,9 @@ class GaitLibraryEndEffectorConfig:
                # Use velocity in cm/s as gait name
                speed_cms = int(round(vel * 100))
                gait_ranges[f"gait_{speed_cms}cms"] = (min_range, max_range)
+               gait_speeds.append(speed_cms)
 
-        return gait_ranges
+        return gait_ranges, gait_speeds
 
     
     def _get_gait_path(self, gait_name: str) -> str:
@@ -249,9 +255,8 @@ class GaitLibraryEndEffectorConfig:
             if min_vel <= speed_ms < max_vel:
                 return gait_name
         
-        # If not found, return the last gait (catch-all)
-        return list(self.gait_velocity_ranges.keys())[-1]
-    
+        raise ValueError(f"Gait at speed {speed_cms} not found!")
+
     def _discover_available_gaits(self) -> Dict[str, int]:
         """Discover available gait files and their speeds."""
         available_gaits = {}
@@ -266,7 +271,8 @@ class GaitLibraryEndEffectorConfig:
             match = pattern.match(yaml_file.name)
             if match:
                 speed_cms = int(match.group(1))
-                available_gaits[yaml_file.stem] = speed_cms
+                if speed_cms in self.gait_speeds:   # Only get gaits that are in the range
+                    available_gaits[yaml_file.stem] = speed_cms
         
         return available_gaits
     
@@ -285,6 +291,59 @@ class GaitLibraryEndEffectorConfig:
             gait_name = self._speed_cms_to_gait_name(speed_cms)
             if gait_name not in self._gait_cache:
                 self._load_gait_config(gait_name, speed_cms)
+    
+    def _print_gait_library_info(self):
+        """Print comprehensive information about the loaded gait library."""
+        print("\n" + "="*60)
+        print("GAIT LIBRARY INFORMATION")
+        print("="*60)
+        
+        print(f"Library Path: {self.gait_library_path}")
+        print(f"Config Name: {self.config_name}")
+        print(f"Use Standing: {self.use_standing}")
+        print(f"Number of Gaits: {len(self._gait_cache)}")
+        
+        # Print velocity ranges
+        print(f"\nVelocity Ranges:")
+        for gait_name, (min_vel, max_vel) in self.gait_velocity_ranges.items():
+            print(f"  {gait_name}: {min_vel:.2f} - {max_vel:.2f} m/s")
+        
+        # Print domain information
+        print(f"\nDomain Information:")
+        print(f"  Unique Domains: {list(self.domain_name_to_idx.keys())}")
+        print(f"  Max Domains per Gait: {self.max_domains}")
+        
+        # Print per-gait details
+        print(f"\nPer-Gait Details:")
+        gait_names = sorted(self.gait_velocity_ranges.keys(),
+                           key=lambda name: self.gait_velocity_ranges[name][0])
+        
+        for i, gait_name in enumerate(gait_names):
+            if gait_name in self._gait_cache:
+                gait = self._gait_cache[gait_name]
+                print(f"\n  {gait_name}:")
+                print(f"    Path: {gait.yaml_path}")
+                print(f"    Domains: {self.domain_seq[i]}")
+
+                # Print domain durations
+                total_period = 0
+                for domain_name in self.domain_seq[i]:
+                    duration = self.T[i][domain_name]
+                    total_period += duration
+                    print(f"      {domain_name}: {duration:.3f}s")
+                
+                print(f"    Total Period: {total_period:.3f}s")
+                print(f"    Frequency: {1/total_period:.2f} Hz")
+            else:
+                raise ValueError(f"Gait {gait_name} not found in the gait cache! Error loading the gaits!")
+
+        # Print standing configuration if available
+        if self.use_standing and hasattr(self, 'standing_config'):
+            print(f"\nStanding Configuration:")
+            print(f"  Available: Yes")
+            print(f"  Domains: {self.standing_config.domain_seq}")
+        
+        print("="*60 + "\n")
         
     def _get_last_gait(self):
         # I don't want to return the first gait because the standing gait is often first and has a different length
