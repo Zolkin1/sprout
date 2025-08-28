@@ -5,7 +5,7 @@ robot_name: "g1_21j"
 
 checkpoint_path: "g1_policies/hzd/running_hzd_clf/2025-08-26_10-04-16/exported/policy.pt"
 
-num_obs: 74
+num_obs: 75 #74
 num_action: 21
 period: 0.8                  # s
 dt: 0.02                      # 50 Hz
@@ -23,4 +23,4 @@ default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
                   0.07, -0.24, 0, 1.39]
 log: true
 log_dir: "logs"
-policy_type: "mlp"
+policy_type: "running" #"mlp"

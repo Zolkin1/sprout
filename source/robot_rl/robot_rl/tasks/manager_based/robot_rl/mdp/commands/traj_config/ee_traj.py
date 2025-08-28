@@ -2,8 +2,11 @@ import torch, yaml
 import numpy as np
 from typing import List, Dict, Tuple
 from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
-
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
+import math
+
+def _ncr(n, r):
+    return math.comb(n, r)
 
 def get_euler_from_quat(quat):
     euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)

@@ -133,11 +133,8 @@ def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     """Return a domain flag based on which hybrid domain the reference trajectory is in."""
     cmd = env.command_manager.get_term(command_name)
 
-    if cmd.current_domain == "single_support":
-        return torch.ones(env.num_envs)
-    elif cmd.current_domain == "flight_phase":
-        return 2*torch.ones(env.num_envs)
-    elif cmd.current_domain == "double_support":
-        return 0*torch.ones(env.num_envs)
-    else:
-        raise ValueError(f"Unsupported domain: {cmd.current_domain} for the domain flag observation!")
+    flt = cmd.get_flight_envs()
+    ssp = cmd.get_ssp_envs()
+    dsp = cmd.get_dsp_envs()
+
+    return (0*flt + 1*ssp + 2*dsp).unsqueeze(-1)

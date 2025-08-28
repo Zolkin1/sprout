@@ -6,12 +6,8 @@ import math
 
 from hid import device
 from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
-
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
-from .ee_traj import EndEffectorTrajectory,get_euler_from_quat #, EndEffectorTracker
-
-def _ncr(n, r):
-    return math.comb(n, r)
+from .ee_traj import EndEffectorTrajectory,get_euler_from_quat, _ncr #, EndEffectorTracker
 
 
 def bezier_deg_batched(
@@ -334,6 +330,10 @@ class GaitLibraryEndEffectorConfig:
             for domain_name in self.domain_seq[gait_idx]:
                 domain_idx = self.domain_name_to_idx[domain_name]
                 # Fill the batched tensors
+                if (torch.abs(gait.left_coeffs[domain_name]) > 100).any():
+                    print(f"{gait_name} domain {domain_name} left coeff > 100")
+                    # raise ValueError("Bad coefficient!")
+
                 self.left_coeffs_batched[domain_idx][gait_idx] = gait.left_coeffs[domain_name]
                 self.right_coeffs_batched[domain_idx][gait_idx] = gait.right_coeffs[domain_name]
 

@@ -71,7 +71,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # Full
         gait_velocity_ranges=(0, 3.00, 0.1),
 
-        use_standing=False,
+        use_standing=True,
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
         R_weights = RUNNING_EE_R_weights_GL
@@ -81,14 +81,18 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
 class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
     """Configuration for running gait library observations."""
     @configclass
-    class PolicyCfg(G1HZDObservationsCfg.PolicyCfg):
+    class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
         # Add the domain flag
-        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"})
+        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
 
     @configclass
-    class CriticCfg(G1HZDObservationsCfg.CriticCfg):
+    class G1RunningCriticCfg(G1HZDObservationsCfg.CriticCfg):
         # Add the domain flag
-        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"})
+        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
+
+    # observation groups
+    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
@@ -137,7 +141,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.base_velocity.ranges.lin_vel_x = (1.48, 2.88)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (0, 3.00)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.00)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)

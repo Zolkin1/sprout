@@ -38,7 +38,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.yaw_output_idx = []
 
-
+        self.current_domains = torch.zeros(self.env.num_envs, device=self.device)
 
         self.stance_foot_vel = None
         self.stance_foot_ang_vel = None
@@ -73,27 +73,26 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.ori_idx_list = [[3, 4, 5], [9, 10, 11]]
         self.yaw_output_idx = [5, 11]
 
+        # Reorder and remap coefficients
+        self.gait_config.reorder_and_remap(cfg, self.device)
+        self.gait_cycle_prop = torch.zeros((self.env.num_envs,), device=self.device)
+        self.initiate_clf()
+
         if cfg.use_standing:
             self.gait_config.standing_config.reorder_and_remap(cfg, self.device)
 
             
             right_des_pos = bezier_deg(
-                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs,
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.right_coeffs["double_support"],
                     torch.tensor(self.gait_config.bez_deg, device=self.device)
                 )
             left_des_pos = bezier_deg(
-                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs,
+                    0, torch.zeros((1,), device=self.device), self.gait_config.T, self.gait_config.standing_config.left_coeffs["double_support"],
                     torch.tensor(self.gait_config.bez_deg, device=self.device)
                 )
             self.gait_config.right_standing_pos = right_des_pos
             self.gait_config.left_standing_pos = left_des_pos
             self.standing_threshold = 0.03
-
-        
-        # Reorder and remap coefficients
-        self.gait_config.reorder_and_remap(cfg, self.device)
-        self.gait_cycle_prop = torch.zeros((self.env.num_envs,), device=self.device)
-        self.initiate_clf()
 
 
     @property
@@ -148,8 +147,8 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
             for axis_info in self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].axis_names:
                 error_key = axis_info['name']
                 index = axis_info['index']
-                self.metrics[error_key] = torch.abs(
-                    self.y_out[:, index] - 
+                self.metrics[error_key] =  torch.abs(
+                    self.y_out[:, index] -
                     self.y_act[:, index]
                 )
         else:
@@ -261,3 +260,23 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         return flight_mask.int()
 
+
+    def get_ssp_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase."""
+        # Get flight phase domain index
+        ssp_domain_idx = self.gait_config.domain_name_to_idx["single_support"]
+
+        # Create boolean mask where current_domains equals flight_phase index
+        ssp_mask = (self.current_domains == ssp_domain_idx)
+
+        return ssp_mask.int()
+
+    def get_dsp_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase."""
+        # Get flight phase domain index
+        dsp_domain_idx = self.gait_config.domain_name_to_idx["double_support"]
+
+        # Create boolean mask where current_domains equals flight_phase index
+        dsp_mask = (self.current_domains == dsp_domain_idx)
+
+        return dsp_mask.int()
