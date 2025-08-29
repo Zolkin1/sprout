@@ -18,15 +18,15 @@ def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -
     #reshape from num_env, num_bodies, 3 to num_env, num_bodies*3
     return contact_flag.reshape(env.num_envs, -1)
 
-def step_duration(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    step_duration = cmd.T
-    return step_duration.unsqueeze(-1)
+# def step_duration(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     step_duration = cmd.T
+#     return step_duration.unsqueeze(-1)
 
-def step_location(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    step_location = cmd.foot_target[:,0:2]
-    return step_location
+# def step_location(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     step_location = cmd.foot_target[:,0:2]
+#     return step_location
 
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
@@ -78,20 +78,20 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
-def joint_pos_des(env: ManagerBasedRLEnv, cmd_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(cmd_name)
-    joint_pos_des = cmd.joint_pos_des
-    return joint_pos_des
+# def joint_pos_des(env: ManagerBasedRLEnv, cmd_name:str) -> torch.Tensor:
+#     cmd = env.command_manager.get_term(cmd_name)
+#     joint_pos_des = cmd.joint_pos_des
+#     return joint_pos_des
 
-def v_dot(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    v_dot = cmd.vdot.unsqueeze(-1)
-    return v_dot
+# def v_dot(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     v_dot = cmd.vdot.unsqueeze(-1)
+#     return v_dot
 
-def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    v = cmd.v.unsqueeze(-1)
-    return v
+# def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     v = cmd.v.unsqueeze(-1)
+#     return v
         
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
