@@ -100,8 +100,8 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
 
     # observation groups
     # TODO: Try putting back
-    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    critic: G1RunningCriticCfg = G1RunningCriticCfg()
+    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
