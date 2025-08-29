@@ -284,7 +284,8 @@ class EndEffectorTrajectory():
         self.domain_seq = data['domain_sequence']
         for domain_name in self.domain_seq:
             # Load common data
-            self.T[domain_name] = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
+            raw_T = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
+            self.T[domain_name] = round(raw_T / 0.005) * 0.005
             self.bez_deg[domain_name] = data[domain_name]['spline_order']
 
             if domain_name == self.domain_seq[0]:

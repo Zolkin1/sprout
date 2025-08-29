@@ -137,6 +137,7 @@ class GaitLibraryEndEffectorConfig:
                 self.max_domains = len(gait.domain_seq)
 
         self.T_gait = sum(self.T[-1].values())    # Use the last gait for the length of the gaits
+        print(f"T_gait: {self.T_gait}")
 
         ##
         # Create information for domain identification
@@ -488,6 +489,9 @@ class GaitLibraryEndEffectorConfig:
         # Get the cumulative times for the selected gaits
         # Shape: [num_envs, max_domains + 1]
         selected_cumulative_times = self.domain_cumulative_times[gait_idx]
+
+        # Get the time into the gait
+        # time_into_gait = time % selected_cumulative_times[:, -1]
 
         # Get the domain indices for the selected gaits
         # Shape: [num_envs, max_domains]

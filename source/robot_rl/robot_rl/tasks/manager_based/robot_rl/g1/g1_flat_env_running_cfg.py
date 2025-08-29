@@ -60,7 +60,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v3",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v4",
         config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
@@ -70,7 +70,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -113,11 +113,11 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
                                                    "max_weight": 1.0,
                                                    "update_amnt": 0.1})
 
-    commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
-                                        params={"update_interval": 20000,
-                                                "max_vel": 3.0,
-                                                "first_update": 40000,
-                                                "step": 0.1})
+    # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
+    #                                     params={"update_interval": 20000,
+    #                                             "max_vel": 3.0,
+    #                                             "first_update": 40000,
+    #                                             "step": 0.1})
 
     # walk_run_curriculum = CurrTerm(func=mdp.walk_run_curriculum,
     #                                params={"update_interval": 40000,})   # TODO: make large after I debug
@@ -153,8 +153,8 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.step_period.period_range = (0.75, 0.75)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (0, 1.00)  # Note the curriculum for increasing
-        self.commands.step_period.period_range = (0.69, 0.69)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.00)  # Note the curriculum for increasing
+        self.commands.step_period.period_range = (0.71, 0.71)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
@@ -268,7 +268,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0, 3.0) #(1.1, 2.0)
 
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
