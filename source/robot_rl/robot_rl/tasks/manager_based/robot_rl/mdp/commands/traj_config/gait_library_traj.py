@@ -186,6 +186,47 @@ class GaitLibraryEndEffectorConfig:
             # Set the final boundary (total gait period)
             self.domain_cumulative_times[gait_idx, len(domains)] = cumulative_time
 
+        # For the yaw modification
+        # self.foot_yaw_output_idx = torch.full((self.num_unique_domains, 2), -1, device=self.device)
+        # self.foot_y_output_idx = torch.full((self.num_unique_domains, 2), -1, device=self.device)
+        # self.ori_idx_list = torch.full((self.num_unique_domains, 9), -1, device=self.device)
+        # self.yaw_output_idx = torch.full((self.num_unique_domains, 3), -1, device=self.device)
+        #
+        # self.foot_yaw_output_idx[self.domain_name_to_idx["single_support"], 0] = 11
+        # self.foot_yaw_output_idx[self.domain_name_to_idx["flight_phase"], :] = torch.tensor([11, 17])
+        # # self.foot_yaw_output_idx[self.domain_name_to_idx["single_support"], 0] = 11
+        #
+        # self.foot_y_output_idx[self.domain_name_to_idx["single_support"], 0] = 7
+        # self.foot_y_output_idx[self.domain_name_to_idx["flight_phase"], :] = torch.tensor([7, 13])
+        # # self.foot_y_output_idx[self.domain_name_to_idx["double_support"], 0] = 7
+        #
+        # self.ori_idx_list[self.domain_name_to_idx["single_support"], :6] = torch.tensor([3, 4, 5, 9, 10, 11])
+        # self.ori_idx_list[self.domain_name_to_idx["flight_phase"], :] = torch.tensor([3, 4, 5, 9, 10, 11, 15, 16, 17])
+        # # self.ori_idx_list[self.domain_name_to_idx["double_support"], :6] = torch.tensor([3, 4, 5, 9, 10, 11])
+        #
+        # self.yaw_output_idx[self.domain_name_to_idx["single_support"], :2] = torch.tensor([5, 11])
+        # self.yaw_output_idx[self.domain_name_to_idx["flight_phase"], :] = torch.tensor([5, 11, 17])
+        # # self.yaw_output_idx[self.domain_name_to_idx["double_support"], :2] = torch.tensor([5, 11])
+
+        self.foot_yaw_output_idx = {self.domain_name_to_idx["single_support"]: [11],
+                                    self.domain_name_to_idx["flight_phase"]:  [11, 17],
+                                    # self.domain_name_to_idx["double_support"]:  [11],    # TODO: Remove/fix
+                                    }
+
+        self.foot_y_output_idx = {self.domain_name_to_idx["single_support"]: [7],
+                                    self.domain_name_to_idx["flight_phase"]:  [7, 13],
+                                    # self.domain_name_to_idx["double_support"]:  [7],    # TODO: Remove/fix
+                                    }
+
+        self.ori_idx_list = {self.domain_name_to_idx["single_support"]:  [[3, 4, 5], [9, 10, 11]],
+                             self.domain_name_to_idx["flight_phase"]:  [[3, 4, 5], [9, 10, 11], [15, 16, 17]],
+                             # self.domain_name_to_idx["double_support"]:  [[3, 4, 5], [9, 10, 11]],    # TODO: Remove/fix
+                            }
+        self.yaw_output_idx = {self.domain_name_to_idx["single_support"]:  [5, 11],
+                               self.domain_name_to_idx["flight_phase"]:  [5, 11, 17],
+                               # self.domain_name_to_idx["double_support"]:  [5, 11],    # TODO: Remove/fix
+                              }
+
         # Print gait library information
         self._print_gait_library_info()
 
@@ -583,6 +624,7 @@ class GaitLibraryEndEffectorConfig:
         #if standing, don't modify yaw
         delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
 
+        # Handle the standing domains
         if hzd_cmd.use_standing:
             #5,11
             stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
@@ -590,28 +632,39 @@ class GaitLibraryEndEffectorConfig:
                 delta_psi[stand_idx] = 0
                 base_velocity[stand_idx,2] = 0
 
-        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
-        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
+        for dom_name, dom_idx in self.domain_name_to_idx.items():
+            yaw_output_idx = self.yaw_output_idx[dom_idx]
+            foot_y_output_idx = self.foot_y_output_idx[dom_idx]
+            ori_idx_list = self.ori_idx_list[dom_idx]
 
-        q_delta_yaw = quat_from_euler_xyz(
-            torch.zeros_like(delta_psi),               # roll=0
-            torch.zeros_like(delta_psi),               # pitch=0
-            delta_psi                                  # yaw=Δψ
-        ) 
+            # Get environment indices that are in this domain
+            env_indexes = torch.where(hzd_cmd.current_domains == dom_idx)[0]
+            
+            if len(env_indexes) == 0:
+                continue  # Skip if no environments are in this domain
 
-        #adjust foot target and com pos/vel to account for yaw change
-        des_pos[:,[6,7,8]] = quat_apply(q_delta_yaw, des_pos[:,[6,7,8]])  # [B,3]
-        des_vel[:,[6,7,8]] = quat_apply(q_delta_yaw, des_vel[:,[6,7,8]])  # [B,3]
+            des_pos[env_indexes, :][:, yaw_output_idx] += delta_psi[env_indexes].unsqueeze(-1)
+            des_vel[env_indexes, :][:, yaw_output_idx] += base_velocity[env_indexes, 2].unsqueeze(-1)
 
-        des_pos[:,[0,1,2]] = quat_apply(q_delta_yaw, des_pos[:,[0,1,2]])  # [B,3]
-        des_vel[:,[0,1,2]] = quat_apply(q_delta_yaw, des_vel[:,[0,1,2]])  # [B,3]
+            q_delta_yaw = quat_from_euler_xyz(
+                torch.zeros_like(delta_psi[env_indexes]),               # roll=0
+                torch.zeros_like(delta_psi[env_indexes]),               # pitch=0
+                delta_psi[env_indexes]                                  # yaw=Δψ
+            )
 
-        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
-        des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y
-        des_vel[:, hzd_cmd.foot_y_output_idx] += base_velocity[:, 1]
+            #adjust foot target and com pos/vel to account for yaw change
+            des_pos[env_indexes,:][:, [6,7,8]] = quat_apply(q_delta_yaw, des_pos[env_indexes,:][:, [6,7,8]])  # [B,3]
+            des_vel[env_indexes,:][:, [6,7,8]] = quat_apply(q_delta_yaw, des_vel[env_indexes,:][:, [6,7,8]])  # [B,3]
 
-        for i in hzd_cmd.ori_idx_list:
-            des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
+            des_pos[env_indexes,:][:, [0,1,2]] = quat_apply(q_delta_yaw, des_pos[env_indexes,:][:, [0,1,2]])  # [B,3]
+            des_vel[env_indexes,:][:, [0,1,2]] = quat_apply(q_delta_yaw, des_vel[env_indexes,:][:, [0,1,2]])  # [B,3]
+
+            delta_y = base_velocity[env_indexes, 1] * hzd_cmd.cur_swing_time
+            des_pos[env_indexes, :][:, foot_y_output_idx] += delta_y.unsqueeze(-1)
+            des_vel[env_indexes, :][:, foot_y_output_idx] += base_velocity[env_indexes, 1].unsqueeze(-1)
+
+            for i in ori_idx_list:
+                des_vel[env_indexes, :][:, i] = euler_rates_to_omega(des_pos[env_indexes, :][:, i], des_vel[env_indexes, :][:, i])
 
         return des_pos, des_vel
     

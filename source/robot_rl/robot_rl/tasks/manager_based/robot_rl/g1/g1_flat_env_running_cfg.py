@@ -164,7 +164,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.commands.step_period.period_range = (0.71, 0.71)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.heading = (0, 0)
 
 
