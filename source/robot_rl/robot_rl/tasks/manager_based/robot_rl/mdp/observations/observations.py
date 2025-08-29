@@ -7,9 +7,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import generated_commands
 
-def base_z(env: ManagerBasedRLEnv) -> torch.Tensor:
-    base_z = env.scene["robot"].data.root_pos_w[:,2]
-    return base_z.unsqueeze(-1)
+# def base_z(env: ManagerBasedRLEnv) -> torch.Tensor:
+#     base_z = env.scene["robot"].data.root_pos_w[:,2]
+#     return base_z.unsqueeze(-1)
 
 def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
@@ -18,15 +18,6 @@ def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -
     #reshape from num_env, num_bodies, 3 to num_env, num_bodies*3
     return contact_flag.reshape(env.num_envs, -1)
 
-# def step_duration(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     step_duration = cmd.T
-#     return step_duration.unsqueeze(-1)
-
-# def step_location(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     step_location = cmd.foot_target[:,0:2]
-#     return step_location
 
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
@@ -58,15 +49,15 @@ def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Ten
     act_traj[:,8] *= 50.0
     return act_traj
 
-def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    ref_traj = cmd.y_out[:,8]
-    return ref_traj.unsqueeze(-1)
+# def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     ref_traj = cmd.y_out[:,8]
+#     return ref_traj.unsqueeze(-1)
 
-def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    act_traj = cmd.y_act[:,8]
-    return act_traj.unsqueeze(-1)
+# def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     act_traj = cmd.y_act[:,8]
+#     return act_traj.unsqueeze(-1)
 
 def ref_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
@@ -78,21 +69,7 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
-# def joint_pos_des(env: ManagerBasedRLEnv, cmd_name:str) -> torch.Tensor:
-#     cmd = env.command_manager.get_term(cmd_name)
-#     joint_pos_des = cmd.joint_pos_des
-#     return joint_pos_des
 
-# def v_dot(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     v_dot = cmd.vdot.unsqueeze(-1)
-#     return v_dot
-
-# def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     v = cmd.v.unsqueeze(-1)
-#     return v
-        
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)

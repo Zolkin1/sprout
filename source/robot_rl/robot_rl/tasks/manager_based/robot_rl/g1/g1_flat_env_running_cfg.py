@@ -84,6 +84,13 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
     @configclass
     class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
         # Add the domain flag
+        ref_traj = ObsTerm(
+            func=mdp.ref_traj,
+            params={"command_name": "hzd_ref"}
+        )
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,),scale=1.0)
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,),scale=1.0)
         domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
 
     @configclass
@@ -93,8 +100,8 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
 
     # observation groups
     # TODO: Try putting back
-    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
+    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
