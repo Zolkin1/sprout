@@ -216,7 +216,6 @@ def reference_vel_tracking(    env: ManagerBasedRLEnv,
     return reward
 
 
-
 def foot_clearance(env: ManagerBasedRLEnv,
                    target_height: float,
                    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
