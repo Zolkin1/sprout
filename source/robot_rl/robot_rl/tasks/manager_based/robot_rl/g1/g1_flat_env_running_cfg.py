@@ -11,6 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipCurriculumCfg
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..humanoid_env_cfg import HumanoidEventsCfg
 
 RUNNING_EE_Q_weights_GL = [
@@ -70,7 +71,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(0.0, 3.0, 0.1), #(0.0, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -84,24 +85,21 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
     @configclass
     class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
         # Add the domain flag
-        ref_traj = ObsTerm(
-            func=mdp.ref_traj,
-            params={"command_name": "hzd_ref"}
-        )
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"},scale=1.0)
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,),scale=1.0)
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"},clip=(-20.0,20.0,),scale=1.0)
         domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
+        root_quat_w = ObsTerm(func=mdp.root_quat_w, noise=Unoise(n_min=-0.2, n_max=0.2))
+        base_z = ObsTerm(func=mdp.base_z, noise=Unoise(n_min=-0.2, n_max=0.2))
+
 
     @configclass
     class G1RunningCriticCfg(G1HZDObservationsCfg.CriticCfg):
         # Add the domain flag
         domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
+        root_quat_w = ObsTerm(func=mdp.root_quat_w)
 
     # observation groups
     # TODO: Try putting back
-    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
+    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
@@ -116,7 +114,7 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
 @configclass
 class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-                                          params={"update_interval": 20000,
+                                          params={"update_interval": 80000,
                                                    "max_weight": 1.0,
                                                    "update_amnt": 0.1})
 
@@ -160,11 +158,11 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.step_period.period_range = (0.75, 0.75)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.00)  # Note the curriculum for increasing
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.00)  # Note the curriculum for increasing
         self.commands.step_period.period_range = (0.71, 0.71)
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.5, 1.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1, 1)
         self.commands.base_velocity.heading = (0, 0)
 
 
@@ -173,7 +171,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.25,
+            "max_eta_err": 0.5,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
@@ -185,7 +183,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.curriculum.clf_curriculum = None
         self.curriculum.clf_curriculum.params = {
             "min_max_err": (0.1,0.1),
-            "scale": (0.005,0.005), #0.001
+            "scale": (0.01,0.01), #0.001
             "update_interval": 20000
         }
 

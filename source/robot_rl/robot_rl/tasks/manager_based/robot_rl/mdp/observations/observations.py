@@ -7,9 +7,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp.observations import generated_commands
 
-# def base_z(env: ManagerBasedRLEnv) -> torch.Tensor:
-#     base_z = env.scene["robot"].data.root_pos_w[:,2]
-#     return base_z.unsqueeze(-1)
+def base_z(env: ManagerBasedRLEnv) -> torch.Tensor:
+    base_z = env.scene["robot"].data.root_pos_w[:,2]
+    return base_z.unsqueeze(-1)
 
 def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -> torch.Tensor:
     contact_sensor = env.scene.sensors[sensor_cfg.name]
@@ -107,11 +107,25 @@ def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     return cphase
 
 def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    """Return a domain flag based on which hybrid domain the reference trajectory is in."""
+    """Return a domain flag based on which hybrid domain the reference trajectory is in.
+    0 = standing, 1 = walking, 2 = running
+    """
     cmd = env.command_manager.get_term(command_name)
+    commanded_velocity = env.command_manager.get_command("base_velocity")
 
-    flt = cmd.get_flight_envs()
-    ssp = cmd.get_ssp_envs()
-    dsp = cmd.get_dsp_envs()
+    # Boolean masks
+    standing = torch.norm(commanded_velocity, dim=1) < cmd.standing_threshold
+    running = commanded_velocity[:, 0] >= 1.05
+    walking = (commanded_velocity[:, 0] > 0.0) & (commanded_velocity[:, 0] < 1.05)
 
-    return (0*flt + 1*ssp + 2*dsp).unsqueeze(-1)
+    # Default to standing (0)
+    domain = torch.zeros_like(commanded_velocity[:, 0], dtype=torch.long)
+
+    # Assign walking and running where applicable
+    domain[walking] = 1
+    domain[running] = 0
+
+    # Standing should override everything else
+    domain[standing] = 2
+
+    return domain.unsqueeze(-1)
