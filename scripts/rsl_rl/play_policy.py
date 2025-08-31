@@ -164,7 +164,6 @@ def extract_reference_trajectory(env, log_vars, command_name):
                 raise ValueError("[Extract Reference] Could not find the axis name!")
         else:
             raise ValueError("[Extract Reference] No variable matching the given name found in the command!")
-
     return results
 
 
@@ -359,6 +358,10 @@ def main():
         'vdot',
         'stance_foot_pos_0',
         'stance_foot_ori_0',
+        'current_domains',
+        'phase_var',
+        'domain_durations',
+        'gait_indices',
     ]
     
     # Get the command term to determine what type of trajectory we're using
@@ -386,13 +389,10 @@ def main():
         key = list(ref.gait_config._gait_cache.keys())[0]
         for axis_info in ref.gait_config._gait_cache[key].axis_names:
             log_vars.append(axis_info['name'])
+        
         # Also log the axis names for plotting
         log_vars.append('axis_names')
-    elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
-        # Joint trajectory case - add joint error metrics
-        trajectory_type = 'joint'
-        for joint_name in ref.robot.joint_names:
-            log_vars.append(f"error_{joint_name}")
+
     
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)

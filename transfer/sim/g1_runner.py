@@ -6,12 +6,12 @@ from typing import Literal
 import yaml
 
 # Add the project root to the Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from rl_policy_wrapper import RLPolicy
 
-from transfer.sim.robot import Robot
-from transfer.sim.simulation import Simulation
+from robot import Robot
+from simulation import Simulation
 
 
 def main():

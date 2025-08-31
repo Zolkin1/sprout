@@ -84,85 +84,8 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
     print(f"Detected trajectory type: {trajectory_type}")
     
     # Generate dynamic labels and units based on trajectory type
-    if trajectory_type == 'joint':
-        # Joint trajectory - use G1 joint names
-        g1_joint_names = [
-            'left_hip_pitch_joint', 'right_hip_pitch_joint', 'waist_yaw_joint',
-            'left_hip_roll_joint', 'right_hip_roll_joint', 'left_shoulder_pitch_joint',
-            'right_shoulder_pitch_joint', 'left_hip_yaw_joint', 'right_hip_yaw_joint',
-            'left_shoulder_roll_joint', 'right_shoulder_roll_joint', 'left_knee_joint',
-            'right_knee_joint', 'left_shoulder_yaw_joint', 'right_shoulder_yaw_joint',
-            'left_ankle_pitch_joint', 'right_ankle_pitch_joint', 'left_elbow_joint',
-            'right_elbow_joint', 'left_ankle_roll_joint', 'right_ankle_roll_joint'
-        ]
-        
-        g1_formatted_labels = [format_joint_name(name) for name in g1_joint_names]
-        
-        state_labels = {
-            'y_out': g1_formatted_labels,
-            'dy_out': g1_formatted_labels,
-            'base_velocity': ['Linear X', 'Linear Y', 'Angular Z'],
-            "stance_foot_pos": ['X', 'Y', 'Z'],
-            "stance_foot_ori": ['Roll', 'Pitch', 'Yaw'],
-            'cur_swing_time': ['Time'],
-            'y_act': g1_formatted_labels,
-            'dy_act': g1_formatted_labels,
-            'v': ['v'],
-            'vdot': ['vdot'],
-            'reward': ['Reward']
-        }
-        
-        units = {
-            'y_out': ['rad'] * 21,
-            'dy_out': ['rad/s'] * 21,
-            'base_velocity': ['m/s', 'm/s', 'rad/s'],
-            'stance_foot_pos': ['m', 'm', 'm'],
-            'stance_foot_ori': ['rad', 'rad', 'rad'],
-            'cur_swing_time': ['s'],
-            'y_act': ['rad'] * 21,
-            'dy_act': ['rad/s'] * 21,
-            'v': ['m/s'],
-            'vdot': ['m/s²'],
-            'reward': ['']
-        }
-        
-        # Generate error labels dynamically from actual metric names
-        error_labels = {}
-        error_units = {}
-        for key in processed_data.keys():
-            if key.startswith('error_'):
-                # Handle different error metric patterns
-                if '_joint' in key:
-                    # Joint error: error_joint_name
-                    joint_name = key.replace('error_', '')
-                    error_labels[key] = f"{format_joint_name(joint_name)} Error"
-                    error_units[key] = 'rad'
-                elif key in ['error_sw_x', 'error_sw_y', 'error_sw_z']:
-                    # Swing foot position errors
-                    axis = key.split('_')[-1].upper()
-                    error_labels[key] = f"Swing Foot Position {axis}"
-                    error_units[key] = 'm'
-                elif key in ['error_sw_roll', 'error_sw_pitch', 'error_sw_yaw']:
-                    # Swing foot orientation errors
-                    axis = key.split('_')[-1].title()
-                    error_labels[key] = f"Swing Foot Orientation {axis}"
-                    error_units[key] = 'rad'
-                elif key in ['error_com_x', 'error_com_y', 'error_com_z']:
-                    # COM position errors
-                    axis = key.split('_')[-1].upper()
-                    error_labels[key] = f"COM Position {axis}"
-                    error_units[key] = 'm'
-                elif key in ['error_pelvis_roll', 'error_pelvis_pitch', 'error_pelvis_yaw']:
-                    # Pelvis orientation errors
-                    axis = key.split('_')[-1].title()
-                    error_labels[key] = f"Pelvis Orientation {axis}"
-                    error_units[key] = 'rad'
-                else:
-                    # Generic error handling
-                    error_labels[key] = key.replace('error_', '').replace('_', ' ').title()
-                    error_units[key] = 'mixed'
-    
-    elif trajectory_type == 'end_effector':
+   
+    if trajectory_type == 'end_effector':
         # End effector trajectory - generate labels from metric names
         # Try to get axis names from the data if available
         axis_names = []
@@ -398,6 +321,28 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'base_velocity_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        if 'phase_var' in processed_data:
+            phase_var = processed_data['phase_var']
+            domain_durations = processed_data['domain_durations']
+            current_domains = processed_data['current_domains']
+            gait_indices = processed_data['gait_indices']
+            vars = [phase_var,domain_durations,current_domains,gait_indices]
+            n_dims = 4
+            labels = ['phase var','domain durations', 'current domains','gait indices']
+            fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3))
+            fig.suptitle(f'Domain Info (Env {env_id})', fontsize=16)
+            for i in range(n_dims):
+                ax = axs[i] if n_dims > 1 else axs
+                ax.plot(time_steps, vars[i][:, env_id], linewidth=2)
+                label = labels[i]
+                ax.set_title(label)
+                ax.set_xlabel('Time Steps')
+                ax.grid(True, alpha=0.3)
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'domain_info_env{env_id}.png'), dpi=300, bbox_inches='tight')
+
             plt.close(fig)
 
         # --- v and vdot ---
@@ -716,6 +661,7 @@ def plot_hzd_trajectories(data, save_dir=None):
         if save_dir:
             plt.savefig(os.path.join(save_dir, 'v_and_vdot.png'), dpi=300, bbox_inches='tight')
         plt.show()
+
 
     # Plot error metrics
     error_metrics = [key for key in processed_data.keys() if key.startswith('error_')]

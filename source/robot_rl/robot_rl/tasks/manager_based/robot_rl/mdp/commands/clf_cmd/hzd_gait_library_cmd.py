@@ -36,16 +36,18 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
         self.dy_out = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
         self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+
         self.yaw_output_idx = []
 
         self.current_domains = torch.zeros(self.env.num_envs, device=self.device)
+        self.gait_indices = torch.zeros(self.num_envs,device=self.device)
 
         self.stance_foot_vel = None
         self.stance_foot_ang_vel = None
         self.stance_foot_ori = None
         self.stance_foot_pos = None
         self.use_standing = cfg.use_standing
-
+        
         # Initialize gait library based on trajectory type
         if hasattr(cfg, 'gait_library_path'):
             config_name = getattr(cfg, 'config_name', 'single_support')
@@ -216,6 +218,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         # Get the active gaits for each env
         gait_indices = self.gait_config.select_gaits_by_velocity(commanded_velocity[:, :2])
+        self.gait_indices = gait_indices
 
         # Get the active domains and phasing vars for each env
         self.current_domains, self.phase_var, self.domain_durations = self.gait_config.determine_domains(gait_indices, self.env.sim.current_time)
