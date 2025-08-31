@@ -642,29 +642,37 @@ class GaitLibraryEndEffectorConfig:
             
             if len(env_indexes) == 0:
                 continue  # Skip if no environments are in this domain
+            
+ 
+            for cur_yaw in yaw_output_idx:
+                des_pos[env_indexes,cur_yaw]+= delta_psi[env_indexes]
+                des_vel[env_indexes,cur_yaw]+= base_velocity[env_indexes,2]
 
-            des_pos[env_indexes, :][:, yaw_output_idx] += delta_psi[env_indexes].unsqueeze(-1)
-            des_vel[env_indexes, :][:, yaw_output_idx] += base_velocity[env_indexes, 2].unsqueeze(-1)
-
-            q_delta_yaw = quat_from_euler_xyz(
-                torch.zeros_like(delta_psi[env_indexes]),               # roll=0
-                torch.zeros_like(delta_psi[env_indexes]),               # pitch=0
-                delta_psi[env_indexes]                                  # yaw=Δψ
-            )
-
-            #adjust foot target and com pos/vel to account for yaw change
-            des_pos[env_indexes,:][:, [6,7,8]] = quat_apply(q_delta_yaw, des_pos[env_indexes,:][:, [6,7,8]])  # [B,3]
-            des_vel[env_indexes,:][:, [6,7,8]] = quat_apply(q_delta_yaw, des_vel[env_indexes,:][:, [6,7,8]])  # [B,3]
-
-            des_pos[env_indexes,:][:, [0,1,2]] = quat_apply(q_delta_yaw, des_pos[env_indexes,:][:, [0,1,2]])  # [B,3]
-            des_vel[env_indexes,:][:, [0,1,2]] = quat_apply(q_delta_yaw, des_vel[env_indexes,:][:, [0,1,2]])  # [B,3]
 
             delta_y = base_velocity[env_indexes, 1] * hzd_cmd.cur_swing_time
-            des_pos[env_indexes, :][:, foot_y_output_idx] += delta_y.unsqueeze(-1)
-            des_vel[env_indexes, :][:, foot_y_output_idx] += base_velocity[env_indexes, 1].unsqueeze(-1)
+            for foot_idx in foot_y_output_idx:
+                des_pos[env_indexes, foot_idx] += delta_y
+                des_vel[env_indexes, foot_idx] += base_velocity[env_indexes, 1]
 
             for i in ori_idx_list:
-                des_vel[env_indexes, :][:, i] = euler_rates_to_omega(des_pos[env_indexes, :][:, i], des_vel[env_indexes, :][:, i])
+                des_vel_temp = euler_rates_to_omega(des_pos[env_indexes, :][:, i], des_vel[env_indexes, :][:, i])
+                for (idx,j) in enumerate(i):                
+                    des_vel[env_indexes, j] = des_vel_temp[:,idx]
+
+
+
+        q_delta_yaw = quat_from_euler_xyz(
+            torch.zeros_like(delta_psi),               # roll=0
+            torch.zeros_like(delta_psi),               # pitch=0
+            delta_psi                                  # yaw=Δψ
+        )
+
+        #adjust foot target and com pos/vel to account for yaw change
+        des_pos[:, [6,7,8]] = quat_apply(q_delta_yaw, des_pos[:, [6,7,8]])  # [B,3]
+        des_vel[:, [6,7,8]] = quat_apply(q_delta_yaw, des_vel[:, [6,7,8]])  # [B,3]
+
+        des_pos[:, [0,1,2]] = quat_apply(q_delta_yaw, des_pos[:, [0,1,2]])  # [B,3]
+        des_vel[:, [0,1,2]] = quat_apply(q_delta_yaw, des_vel[:, [0,1,2]])  # [B,3]
 
         return des_pos, des_vel
     
