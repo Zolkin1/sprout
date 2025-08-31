@@ -209,7 +209,7 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
         self.gait_cycle_prop = torch.full((self.num_envs,), gait_cycle_prop, device=self.device)  # Used in observation phase variables
 
-        self.cur_swing_time = half_cycle_prop
+        self.cur_swing_time = self.env.sim.current_time % Tgait
 
     def _update_command(self):
         """Update the command by generating reference and computing CLF."""

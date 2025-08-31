@@ -133,10 +133,10 @@ class Robot:
             self.commanded_vel = self.input_function(sim_time)
 
         # Apply a PD controller on the y axis through the heading
-        kp = 0.0
-        kd = 0.0
-        angular_vel = np.sign(self.commanded_vel[0]) * max(min(-kp * qpos[1] + -kd * qvel[1], 1), -1)
-        self.commanded_vel[2] = np.clip(angular_vel, -0.5, 0.5)
+        # kp = 0.0
+        # kd = 0.0
+        # angular_vel = np.sign(self.commanded_vel[0]) * max(min(-kp * qpos[1] + -kd * qvel[1], 1), -1)
+        # self.commanded_vel[2] = np.clip(angular_vel, -0.5, 0.5)
 
         return policy.create_obs(
             qpos[7:],
