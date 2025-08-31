@@ -6,7 +6,7 @@ services:
       args:
         USER: $USER
         UID: $UID
-        GID: $UID
+        GID: $GID
         ROBOT_RL_ROOT: $ROBOT_RL_ROOT
       dockerfile: Dockerfile
     network_mode: host
@@ -16,7 +16,7 @@ services:
       DISPLAY: $DISPLAY
       USER: $USER
       UID: $UID
-      GID: $UID
+      GID: $GID
       QT_X11_NO_MITSHM: 1
       ROBOT_RL_ROOT: $ROBOT_RL_ROOT
     security_opt:

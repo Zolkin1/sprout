@@ -12,6 +12,15 @@ Set the `ROBOT_RL_ROOT` environment variable:
 export ROBOT_RL_ROOT=/your/path/to/robot_rl/transfer/obelisk
 ```
 
+## Creating a `.env`
+In the `docker` folder you must make a `.env` file that looks like:
+```
+USER=${USER:-$(id -un)}
+UID=1000
+GID=1000
+```
+But you may need to switch the numbers depending on your user.
+
 ## Running in Docker
 We recommend using VSCode's devcontainer feature to run the Docker environment.
 

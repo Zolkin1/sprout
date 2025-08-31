@@ -65,24 +65,25 @@ RUN source /home/${USER}/obelisk/setup.sh --install-sys-deps --cyclone-perf --ob
 WORKDIR /home/${USER}
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --retries 5 --timeout=1000 -r requirements.txt
+# RUN pip install -r requirements.txt
 RUN rm requirements.txt
 
-# Optitrack
-RUN sudo apt install -y \
-    ros-humble-tf2 \
-    ros-humble-tf2-bullet \
-    ros-humble-tf2-eigen \
-    ros-humble-tf2-eigen-kdl \
-    ros-humble-tf2-geometry-msgs \
-    ros-humble-tf2-kdl \
-    ros-humble-tf2-msgs \
-    ros-humble-tf2-py \
-    ros-humble-tf2-ros \
-    ros-humble-tf2-ros-py \
-    ros-humble-tf2-sensor-msgs \
-    ros-humble-tf2-tools \
-    wget && \
-    cd /home/${USER} && git clone https://github.com/L2S-lab/natnet_ros2
+# # Optitrack
+# RUN sudo apt install -y \
+#     ros-humble-tf2 \
+#     ros-humble-tf2-bullet \
+#     ros-humble-tf2-eigen \
+#     ros-humble-tf2-eigen-kdl \
+#     ros-humble-tf2-geometry-msgs \
+#     ros-humble-tf2-kdl \
+#     ros-humble-tf2-msgs \
+#     ros-humble-tf2-py \
+#     ros-humble-tf2-ros \
+#     ros-humble-tf2-ros-py \
+#     ros-humble-tf2-sensor-msgs \
+#     ros-humble-tf2-tools \
+#     wget && \
+#     cd /home/${USER} && git clone https://github.com/L2S-lab/natnet_ros2
 
-RUN sudo apt update && sudo apt install -y python3-pyqt5 lshw
+# RUN sudo apt update && sudo apt install -y python3-pyqt5 lshw
