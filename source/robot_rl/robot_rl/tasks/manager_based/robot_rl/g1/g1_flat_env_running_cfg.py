@@ -71,7 +71,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(0.0, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -97,8 +97,8 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
         root_quat_w = ObsTerm(func=mdp.root_quat_w)
 
     # observation groups
-    policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    critic: G1RunningCriticCfg = G1RunningCriticCfg()
+    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
+    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
@@ -157,12 +157,24 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.commands.step_period.period_range = (0.75, 0.75)
 
         # Full v1
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 3.0)  # Note the curriculum for increasing
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)  # Note the curriculum for increasing
         self.commands.step_period.period_range = (0.71, 0.71)
+
+        self.events.reset_base.params = {
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        }
 
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
-        self.commands.base_velocity.heading = (0, 0)
+        self.commands.base_velocity.ranges.heading = (0, 0)
 
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
@@ -170,7 +182,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.5, #0.3,
+            "max_eta_err": 0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
@@ -179,12 +191,12 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
-        self.curriculum.clf_curriculum = None
-        # self.curriculum.clf_curriculum.params = {
-        #     "min_max_err": (0.1,0.1),
-        #     "scale": (0.005,0.005), #0.001
-        #     "update_interval": 20000
-        # }
+        # self.curriculum.clf_curriculum = None
+        self.curriculum.clf_curriculum.params = {
+            "min_max_err": (0.1,0.1),
+            "scale": (0.005,0.005), #0.001
+            "update_interval": 20000
+        }
 
         self.curriculum.terrain_levels = None
 

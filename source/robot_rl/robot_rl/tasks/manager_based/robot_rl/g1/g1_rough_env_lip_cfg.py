@@ -119,7 +119,6 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
-            
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (0.0, 0.0),
