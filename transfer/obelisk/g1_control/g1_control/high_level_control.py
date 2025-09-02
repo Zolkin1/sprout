@@ -87,31 +87,33 @@ class HighLevelController(ObeliskController, ABC):
 
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
-        if self.ang_vel_mode == "odom":
-            # P yaw controller:
-            # # Get the yaw from the quaternion
-            # q = msg.pose.pose.orientation
-            # siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-            # cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-            # yaw = np.arctan2(siny_cosp, cosy_cosp)
+        # P yaw controller:
+        # Get the yaw from the quaternion
+        q = msg.pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        self.yaw_cur = yaw
 
-            # # Update the yaw target using a PD controller
-            # yaw_error = yaw - self.yaw_target
-            # if yaw_error > np.pi:
-            #     yaw_error -= 2 * np.pi
-            # elif yaw_error < -np.pi:
-            #     yaw_error += 2 * np.pi
-            # yaw_rate_cmd = -self.kp * yaw_error
+        # Update the yaw target using a PD controller
+        yaw_error = yaw - self.yaw_target
+        if yaw_error > np.pi:
+            yaw_error -= 2 * np.pi
+        elif yaw_error < -np.pi:
+            yaw_error += 2 * np.pi
+        yaw_rate_cmd = -self.kp * yaw_error
 
-            # # Clamp the yaw rate command
-            # self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+        # Clamp the yaw rate command
+        self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
 
-            # PD On y pos into yaw rate:
-            y_pos = msg.pose.pose.position.y
-            y_vel = msg.twist.twist.linear.y
+        # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
+        # PD On y pos into yaw rate:
+        # self.y_pos_cur = msg.pose.pose.position.y
+        # y_vel = msg.twist.twist.linear.y
 
-            angular_vel = np.sign(self.cmd_vel[0]) * (-self.kp * (y_pos - self.y_pos_target) + -self.kd * (y_vel - self.y_vel_target))
-            self.yaw_rate_cmd = np.clip(angular_vel, -self.w_z_max, self.w_z_max)
+        # angular_vel = np.sign(self.cmd_vel[0]) * (-self.kp * (self.y_pos_cur - self.y_pos_target) + -self.kd * (y_vel - self.y_vel_target))
+        # self.yaw_rate_cmd = np.clip(angular_vel, -self.w_z_max, self.w_z_max)
+        # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""

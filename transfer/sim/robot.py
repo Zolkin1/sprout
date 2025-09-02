@@ -110,7 +110,7 @@ class Robot:
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
             vy = -(self.joystick.get_axis(0))
             vx = -(3.0*self.joystick.get_axis(1))
-            vyaw = -(self.joystick.get_axis(3)) * 1
+            vyaw = -(self.joystick.get_axis(3)) * 0.5
 
             des_vel[0] = vx
             des_vel[1] = vy
