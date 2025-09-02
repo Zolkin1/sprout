@@ -233,6 +233,23 @@ def main():
     save_dir = os.path.dirname(csv_path)
     
     # Create plots
+    # import pdb; pdb.set_trace()
+    idx = 1000 #13000
+    time = time[idx:]
+    pos_x = pos_x[idx:]
+    pos_y = pos_y[idx:]
+    pos_z = pos_z[idx:]
+    vel_x = vel_x[idx:]
+    vel_y = vel_y[idx:]
+    vel_z = vel_z[idx:]
+    ang_vel_x = ang_vel_x[idx:]
+    ang_vel_y = ang_vel_y[idx:]
+    ang_vel_z = ang_vel_z[idx:]
+    quat_x = quat_x[idx:]
+    quat_y = quat_y[idx:]
+    quat_z = quat_z[idx:]
+    quat_w = quat_w[idx:]
+    yaw = yaw[idx:]
     plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,
                                      ang_vel_x, ang_vel_y, ang_vel_z, yaw, save_dir)

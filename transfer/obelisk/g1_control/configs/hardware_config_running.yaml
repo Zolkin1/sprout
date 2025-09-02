@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_name: "running_hzd_clf/8_31_yaw_mod_v1.pt"
+        hf_policy_name: "running_hzd_clf/9_1_yaw_mod_gl5-2_no_con_pen.pt"
         hf_repo_id: "zolkin/robot_rl"
         num_obs: 74
         num_actions: 21
@@ -94,14 +94,15 @@ onboard:
       executable: high_level_control
       params:
         v_x_min: 0.0
-        v_x_max: 1.5
+        v_x_max: 2.0
         v_y_min: 0.0
         v_y_max: 0.0
-        w_z_max: 0.5
+        w_z_max: 0.3
         vel_increment: 0.1
         kp: 1.0
         kd: 0.1
         use_odom: True
+        log_odom: True
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -116,7 +117,7 @@ onboard:
           callback_group: None
         # ----- Odom subscriber ----- #
         - ros_parameter: sub_odom_setting
-          topic: /obelisk/g1/pelvis_odom
+          topic: /rs_t265/odom
           history_depth: 10
           callback_group: None
         # ----- Unitree High Level subscriber ----- #
@@ -132,9 +133,9 @@ onboard:
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_max: 1.5
+        v_x_max: 2.0
         v_y_max: 1.0
-        w_z_max: 1.0
+        w_z_max: 0.5
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #
@@ -193,7 +194,7 @@ onboard:
       executable: obelisk_unitree_g1_hardware
       params:
         ic_keyframe: standing
-        network_interface_name: enx6c1ff7250373 #enp4s0 # From ifconfig
+        network_interface_name: enp0s31f6 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle

@@ -69,6 +69,8 @@ class HighLevelController(ObeliskController, ABC):
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
 
+            self.odom_count = 0
+
             # Declare subscriber to odometry
             self.register_obk_subscription(
                 "sub_odom_setting",
@@ -139,7 +141,7 @@ class HighLevelController(ObeliskController, ABC):
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
 
         # Log odometry data if enabled
-        if self.log_odom:
+        if self.log_odom and self.odom_count % 2 == 0:
             current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
             
             # Extract position
@@ -173,6 +175,8 @@ class HighLevelController(ObeliskController, ABC):
         # self.yaw_rate_cmd = np.clip(angular_vel, -self.w_z_max, self.w_z_max)
         # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
 
+        self.odom_count += 1
+
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
         if self.lin_vel_mode == "joystick":
@@ -193,8 +197,9 @@ class HighLevelController(ObeliskController, ABC):
                 self.lin_vel_mode = "joystick"
                 self.get_logger().info("Joystick control re-enabled after timeout.")
         elif self.lin_vel_mode == "incremental":
-            pass
-
+            self.cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
+            self.cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
+            
     def update_x_hat(self, msg):
         """Receive the joystick message."""
         self.rec_joystick = True
@@ -234,7 +239,7 @@ class HighLevelController(ObeliskController, ABC):
             self.last_B_press = now
             self.lin_vel_mode = "incremental"
             self.cmd_vel = np.zeros((3,))
-            self.cmd_vel[0] = 1.1
+            self.cmd_vel[0] = 0.0
             self.get_logger().info("Joystick incremental velocity mode enabled!")
 
         X = 2
