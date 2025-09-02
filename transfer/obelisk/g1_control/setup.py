@@ -42,6 +42,7 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": ["g1_controller = g1_control.controller:main", "g1_estimator = g1_control.estimator:main", "opti_logger = g1_control.opti_logger:main",
-                             "optitrack_forwarding = g1_control.optitrack_forwarding:main",],
+                             "optitrack_forwarding = g1_control.optitrack_forwarding:main",
+                             "high_level_control = g1_control.high_level_control:main"],
     },
 )

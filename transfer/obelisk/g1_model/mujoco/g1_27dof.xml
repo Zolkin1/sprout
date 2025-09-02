@@ -210,6 +210,9 @@ Position and velocity actuators added. -->
       <!-- Pelvis IMU -->
       <site name="pelvis_imu" size="0.01" pos="0.04525 0 -0.08339" rgba="1 0 0 0"/>
 
+      <!-- Pelvis Tracking Camera -->
+      <site name="pelvis_tracking_camera_site" pos="0.02 0 0.0" euler="0.0 0.0 0.0" rgba="0 0 1 0" size="0.01"/>
+
 
       <!-- Left Leg -->
       <body name="left_hip_pitch_link" pos="0 0.064452 -0.1027">
@@ -779,6 +782,12 @@ Position and velocity actuators added. -->
     <framequat name="torso_camera_orientation_sensor" objtype="site" objname="tracking_camera_site" noise="0.01"/>
     <gyro name="torso_camera_gyro" site="tracking_camera_site" noise="0.01"/>
     <velocimeter name="torso_camera_velocimeter" site="tracking_camera_site"/>
+
+    <!-- Pelvis Camera Odometry -->
+    <framepos name="pelvis_camera_pos_sensor" objtype="site" objname="pelvis_tracking_camera_site" noise="0.01"/>
+    <framequat name="pelvis_camera_orientation_sensor" objtype="site" objname="pelvis_tracking_camera_site" noise="0.01"/>
+    <gyro name="pelvis_camera_gyro" site="pelvis_tracking_camera_site" noise="0.01"/>
+    <velocimeter name="pelvis_camera_velocimeter" site="pelvis_tracking_camera_site"/>
 
   </sensor>
 

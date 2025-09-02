@@ -19,17 +19,11 @@ from sensor_msgs.msg import Joy
 
 
 class VelocityTrackingController(ObeliskController, ABC):
-    """Example position setpoint controller."""
+    """Locomotion controller to track a given velocity."""
 
     def __init__(self, node_name: str = "velocity_tracking_controller") -> None:
         """Initialize the example position setpoint controller."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
-        # Velocity limits
-        self.declare_parameter("v_x_max", 1.0)
-        self.declare_parameter("v_x_min", -1.0)
-        self.declare_parameter("v_y_max", 0.5)
-        self.declare_parameter("w_z_max", 0.5)
-
         # Load policy
         self.declare_parameter("local_policy_name", "")
         self.declare_parameter("obs_type", "")
@@ -243,21 +237,15 @@ class VelocityTrackingController(ObeliskController, ABC):
             msg_type=VelocityCommand,
         )
 
-
-        self.last_menu_press = self.get_clock().now().nanoseconds / 1e9
-        self.last_A_press = self.get_clock().now().nanoseconds / 1e9
-
+        # Need the joystick for the E-stop
         self.register_obk_subscription(
-            "sub_joystick",
-            self.joystick_callback,
-            msg_type=Joy,
+            "sub_joy_setting",
+            self.joy_callback,  # type: ignore
             key="sub_joy_key",  # key can be specified here or in the config file
+            msg_type=Joy,
         )
 
         self.received_xhat = False
-        
-        self.joystick_control = True
-        self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
 
         self.get_logger().info(f"Policy: {policy_path} loaded on {self.device}.")
         self.get_logger().info("RL Velocity Tracking node constructor complete.")
@@ -349,30 +337,9 @@ class VelocityTrackingController(ObeliskController, ABC):
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages."""
-        if self.joystick_control:
-            self.cmd_vel[0] = min(
-                max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
-                self.get_parameter("v_x_max").get_parameter_value().double_value,
-            )
-            v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
-            self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
-            w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
-            self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
-        else:
-            vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
-            RAMP_TIME = 2.0
-            slope = vx_max / RAMP_TIME
-
-            now = self.get_clock().now().nanoseconds / 1e9
-            self.cmd_vel[0] = min(slope * (now - self.joystick_exited), vx_max)
-            v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
-            self.cmd_vel[1] = 0
-            w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
-            self.cmd_vel[2] = 0
-
-            if now - self.joystick_exited > 8:
-                self.joystick_control = True
-                self.get_logger().info("Joystick control re-enabled after timeout.")
+        self.cmd_vel[0] = cmd_msg.v_x
+        self.cmd_vel[1] = cmd_msg.v_y
+        self.cmd_vel[2] = cmd_msg.w_z
 
     @staticmethod
     def project_gravity(quat):
@@ -565,28 +532,6 @@ class VelocityTrackingController(ObeliskController, ABC):
             assert is_in_bound(type(pd_ff_msg), ObeliskControlMsg)
             return pd_ff_msg
     
-    def joystick_callback(self, msg: Joy) -> None:
-        """Joystick callback.
-        This is mostly for an e-stop.
-        """
-
-        RIGHT_TRIGGER = 5
-        if msg.axes[RIGHT_TRIGGER] <= 0.1:
-            raise RuntimeError("Joystick emergency stop triggered!!")
-
-        MENU = 7
-        now = self.get_clock().now().nanoseconds / 1e9
-        if msg.buttons[MENU] >= 0.9 and now - self.last_menu_press > 0.5:
-            self.last_menu_press = now
-            self.get_logger().info("Button mappings:\n E-STOP: Right Trigger. \n Forward/Backward: Left Stick. \n Turning: Right Stick. \n Damping: Right D-Pad. \n Low Level Ctrl: Bottom D-Pad. \n User Pose: Squares.")
-
-        A = 0
-        if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.5:
-            self.last_A_press = now
-            self.joystick_control = not self.joystick_control
-            self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
-            self.get_logger().info(f"Joystick control {'enabled' if self.joystick_control else 'disabled'}.")
-
     def _convert_to_mujoco(self, vec):
         mj_vec = np.zeros(21)
         for isaac_index, mujoco_index in self.isaac_to_mujoco.items():
@@ -626,6 +571,11 @@ class VelocityTrackingController(ObeliskController, ABC):
         row = [log_time] + obsaction
         self.writer.writerow(row)
 
+    def joy_callback(self, joy_msg: Joy):
+        """Callback to watch for E-stop from joystick."""
+        RIGHT_TRIGGER = 5
+        if joy_msg.axes[RIGHT_TRIGGER] <= 0.1:
+            raise RuntimeError("[Controller] Joystick emergency stop triggered!!")
 
 
 def main(args: list | None = None) -> None:
