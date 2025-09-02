@@ -46,6 +46,8 @@ class HighLevelController(ObeliskController, ABC):
         self.lin_vel_mode = "joystick"  # joystick, incremental, function
         self.ang_vel_mode = "joystick"  # joystick, odom
 
+        self.rec_joystick = False
+
         # Incremental velocity parameters
         self.declare_parameter("vel_increment", 0.1)
         self.vel_increment = self.get_parameter("vel_increment").get_parameter_value().double_value
@@ -195,6 +197,8 @@ class HighLevelController(ObeliskController, ABC):
 
     def update_x_hat(self, msg):
         """Receive the joystick message."""
+        self.rec_joystick = True
+
         RIGHT_TRIGGER = 5
         if msg.axes[RIGHT_TRIGGER] <= 0.1:
             raise RuntimeError("[High Level] Joystick emergency stop triggered!!")
@@ -277,18 +281,19 @@ class HighLevelController(ObeliskController, ABC):
 
     def compute_control(self):
         """Return the commanded velocity."""
-        msg = VelocityCommand()
-        msg.v_x = float(self.cmd_vel[0])
-        msg.v_y = float(self.cmd_vel[1])
+        if self.rec_joystick:
+            msg = VelocityCommand()
+            msg.v_x = float(self.cmd_vel[0])
+            msg.v_y = float(self.cmd_vel[1])
 
-        if self.ang_vel_mode == "joystick":
             msg.w_z = float(self.cmd_vel[2])
-        elif self.use_odom and self.ang_vel_mode == "odom":
-            msg.w_z = float(self.yaw_rate_cmd)
+            
+            if self.use_odom and self.ang_vel_mode == "odom":
+                msg.w_z = float(self.yaw_rate_cmd)
 
-        self.obk_publishers["pub_ctrl"].publish(msg)
+            self.obk_publishers["pub_ctrl"].publish(msg)
 
-        return msg
+            return msg
     
 def main(args: list | None = None) -> None:
     """Main entrypoint."""
