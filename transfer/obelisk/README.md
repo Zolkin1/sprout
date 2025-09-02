@@ -152,7 +152,15 @@ To check running containers
 To open a new bash terminal for running container
 ```docker exec -it <container_id or container_name> /bin/bash```
 
-
+# Plotting Odomety
+To plot the odometry run
+```
+python plot_odom.py
+```
+or 
+```
+python plot_odom.py /path/to/odom_data.csv
+```
 
 # Using Optitrack
 We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.

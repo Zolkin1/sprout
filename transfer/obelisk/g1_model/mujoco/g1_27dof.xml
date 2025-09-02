@@ -3,7 +3,7 @@ Position and velocity actuators added. -->
 <mujoco model="g1_27dof">
   <compiler angle="radian" meshdir="../meshes" eulerseq="XYZ"/>
 
-  <option cone="elliptic" impratio="100" integrator="implicitfast" timestep="0.0005"/>
+  <option cone="elliptic" impratio="100" integrator="implicitfast" timestep="0.001"/>
 
   <!-- TODO: Pyramidal actual maybe looks a little better in sim -->
   <!-- <option cone="pyramidal" impratio="100" integrator="implicitfast" timestep="0.0005"/> -->
@@ -12,8 +12,8 @@ Position and velocity actuators added. -->
   <default>
     <default class="g1">
       <!-- <joint damping="2" armature="0.01" frictionloss="0.2"/> -->
-      <!-- <joint damping="1" armature="0.01" frictionloss="0.1"/> -->
-      <joint damping="0" armature="0.0" frictionloss="0.0"/>
+      <joint damping="1" armature="0.01" frictionloss="0.1"/>
+      <!-- <joint damping="0" armature="0.0" frictionloss="0.0"/> -->
     </default>
     <!-- ############## -->
     <!--   Leg Gains    -->

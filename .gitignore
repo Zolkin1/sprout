@@ -77,6 +77,7 @@ g1_hardware_log/
 transfer/obelisk/.vscode/
 transfer/obelisk/ctrl_logs/
 transfer/obelisk/optitrack_logs/
+transfer/obelisk/odom_logs/
 
 transfer/sim/experiments/mass_rand_comp/
 transfer/sim/experiments/hzd_clf_dec_comp/

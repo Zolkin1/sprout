@@ -75,6 +75,36 @@ class HighLevelController(ObeliskController, ABC):
                 msg_type=Odometry,
             )
 
+            # Odometry logging setup
+            self.declare_parameter("log_odom", False)
+            self.log_odom = self.get_parameter("log_odom").get_parameter_value().bool_value
+            
+            if self.log_odom:
+                self.get_logger().info("Odometry logging enabled.")
+                
+                # Create odom log directory relative to $ROBOT_RL_ROOT
+                root = os.environ.get("ROBOT_RL_ROOT", "")
+                timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                odom_log_dir = os.path.join(root, "odom_logs", timestamp)
+                os.makedirs(odom_log_dir, exist_ok=True)
+                
+                self.odom_log_file = os.path.join(odom_log_dir, "odom_data.csv")
+                self.odom_file = open(self.odom_log_file, "w", buffering=8192)
+                self.odom_writer = csv.writer(self.odom_file)
+                
+                # Write CSV header
+                self.odom_writer.writerow([
+                    "time", "pos_x", "pos_y", "pos_z", 
+                    "quat_x", "quat_y", "quat_z", "quat_w",
+                    "vel_x", "vel_y", "vel_z",
+                    "ang_vel_x", "ang_vel_y", "ang_vel_z",
+                    "yaw"
+                ])
+                
+                self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
+            else:
+                self.log_odom = False
+
         # Declare subscriber to velocity commands from the Untiree joystick node
         self.register_obk_subscription(
             "sub_vel_cmd_setting",
@@ -105,6 +135,32 @@ class HighLevelController(ObeliskController, ABC):
 
         # Clamp the yaw rate command
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+
+        # Log odometry data if enabled
+        if self.log_odom:
+            current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
+            
+            # Extract position
+            pos = msg.pose.pose.position
+            
+            # Extract orientation (quaternion)
+            orient = msg.pose.pose.orientation
+            
+            # Extract linear velocity
+            lin_vel = msg.twist.twist.linear
+            
+            # Extract angular velocity
+            ang_vel = msg.twist.twist.angular
+            
+            # Write row to CSV
+            self.odom_writer.writerow([
+                current_time,
+                pos.x, pos.y, pos.z,
+                orient.x, orient.y, orient.z, orient.w,
+                lin_vel.x, lin_vel.y, lin_vel.z,
+                ang_vel.x, ang_vel.y, ang_vel.z,
+                yaw
+            ])
 
         # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
         # PD On y pos into yaw rate:
