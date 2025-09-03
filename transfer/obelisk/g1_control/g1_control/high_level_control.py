@@ -102,7 +102,7 @@ class HighLevelController(ObeliskController, ABC):
                     "time", "pos_x", "pos_y", "pos_z", 
                     "quat_x", "quat_y", "quat_z", "quat_w",
                     "vel_x", "vel_y", "vel_z",
-                    "ang_vel_x", "ang_vel_y", "ang_vel_z",
+                    "ang_vel_x", "ang_vel_y", "ang_vel_z", "ang_z_filtered",
                     "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd"
                 ])
                 
@@ -140,7 +140,7 @@ class HighLevelController(ObeliskController, ABC):
 
         # Angular z moving avg:
         self.ang_z_window.append(msg.twist.twist.angular.z)
-        ang_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
+        ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
 
         # Update the yaw target using a PD controller
         yaw_error = yaw - self.yaw_target
@@ -148,7 +148,7 @@ class HighLevelController(ObeliskController, ABC):
             yaw_error -= 2 * np.pi
         elif yaw_error < -np.pi:
             yaw_error += 2 * np.pi
-        yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_filtered
+        yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_z_filtered
 
         # Clamp the yaw rate command
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
@@ -180,7 +180,7 @@ class HighLevelController(ObeliskController, ABC):
                 pos.x, pos.y, pos.z,
                 orient.x, orient.y, orient.z, orient.w,
                 lin_vel.x, lin_vel.y, lin_vel.z,
-                ang_vel.x, ang_vel.y, ang_vel.z,
+                ang_vel.x, ang_vel.y, ang_vel.z, ang_z_filtered,
                 yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd
             ])
 

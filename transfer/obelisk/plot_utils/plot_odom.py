@@ -54,7 +54,7 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
         'time': [], 'pos_x': [], 'pos_y': [], 'pos_z': [],
         'quat_x': [], 'quat_y': [], 'quat_z': [], 'quat_w': [],
         'vel_x': [], 'vel_y': [], 'vel_z': [],
-        'ang_vel_x': [], 'ang_vel_y': [], 'ang_vel_z': [],
+        'ang_vel_x': [], 'ang_vel_y': [], 'ang_vel_z': [], 'ang_z_filtered': [],
         'yaw': [], 'yaw_target': [], 'yaw_error': [], 'yaw_rate_cmd': []
     }
     
@@ -128,8 +128,9 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
 
 def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat_y: np.ndarray,
                                      quat_z: np.ndarray, quat_w: np.ndarray, ang_vel_x: np.ndarray,
-                                     ang_vel_y: np.ndarray, ang_vel_z: np.ndarray, yaw: np.ndarray,
-                                     yaw_target: np.ndarray, yaw_error: np.ndarray, yaw_rate_cmd: np.ndarray, save_dir: str) -> None:
+                                     ang_vel_y: np.ndarray, ang_vel_z: np.ndarray, ang_z_filtered: np.ndarray,
+                                     yaw: np.ndarray, yaw_target: np.ndarray, yaw_error: np.ndarray, 
+                                     yaw_rate_cmd: np.ndarray, save_dir: str) -> None:
     """Create and save orientation and angular velocity plots."""
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     fig.suptitle('Orientation and Angular Velocity Data', fontsize=16)
@@ -166,7 +167,8 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
     axes[1, 1].set_ylabel('ω_y (rad/s)')
     axes[1, 1].grid(True, alpha=0.3)
     
-    axes[1, 2].plot(time, ang_vel_z, 'r-', linewidth=2, label='Actual ω_z')
+    axes[1, 2].plot(time, ang_vel_z, 'r-', linewidth=2, label='Raw ω_z', alpha=0.7)
+    axes[1, 2].plot(time, ang_z_filtered, 'k-', linewidth=2, label='Filtered ω_z')
     axes[1, 2].plot(time, yaw_rate_cmd, 'b--', linewidth=2, label='Commanded ω_z')
     axes[1, 2].set_title('Angular Velocity Z')
     axes[1, 2].set_xlabel('Time (s)')
@@ -228,7 +230,8 @@ def main():
     # Load data
     print(f"Loading data from: {csv_path}")
     (time, pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w,
-     vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, yaw, yaw_target, yaw_error, yaw_rate_cmd) = load_odom_data(csv_path)
+     vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
+     yaw, yaw_target, yaw_error, yaw_rate_cmd) = load_odom_data(csv_path)
     
     print(f"Loaded {len(time)} data points spanning {time[-1] - time[0]:.2f} seconds")
     
@@ -256,6 +259,7 @@ def main():
     ang_vel_x = ang_vel_x[start_idx:]
     ang_vel_y = ang_vel_y[start_idx:]
     ang_vel_z = ang_vel_z[start_idx:]
+    ang_z_filtered = ang_z_filtered[start_idx:]
     quat_x = quat_x[start_idx:]
     quat_y = quat_y[start_idx:]
     quat_z = quat_z[start_idx:]
@@ -266,7 +270,8 @@ def main():
     yaw_rate_cmd = yaw_rate_cmd[start_idx:]
     plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,
-                                     ang_vel_x, ang_vel_y, ang_vel_z, yaw, yaw_target, yaw_error, yaw_rate_cmd, save_dir)
+                                     ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
+                                     yaw, yaw_target, yaw_error, yaw_rate_cmd, save_dir)
     
     print("Plotting complete!")
 
