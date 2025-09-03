@@ -67,6 +67,11 @@ class HighLevelController(ObeliskController, ABC):
             self.kp_x = self.get_parameter("kp_x").get_parameter_value().double_value
             self.kd_x = self.get_parameter("kd_x").get_parameter_value().double_value
 
+            self.declare_parameter("kp_y", 1.0)
+            self.declare_parameter("kd_y", 0.5)
+            self.kp_y = self.get_parameter("kp_y").get_parameter_value().double_value
+            self.kd_y = self.get_parameter("kd_y").get_parameter_value().double_value
+
             self.yaw_target = 0.0
             self.yaw_rate_cmd = 0.0
             self.y_pos_target = 0.0
@@ -74,6 +79,7 @@ class HighLevelController(ObeliskController, ABC):
             self.x_target = 0.0
 
             self.ang_z_window = deque(maxlen=20)
+            self.y_pos_window = deque(maxlen=10)
 
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
@@ -158,6 +164,28 @@ class HighLevelController(ObeliskController, ABC):
         x_vel = msg.twist.twist.linear.x
         self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel)
 
+        # # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
+        # # PD On y pos into yaw rate:
+        # self.y_pos_cur = msg.pose.pose.position.y
+        # self.y_pos_window.append(self.y_pos_cur)
+        # y_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+        # # y_avg = self.y_pos_cur
+
+        # y_vel = msg.twist.twist.linear.y
+        # # y_pos > y_target -> negative yaw
+        # angular_vel_y = (-self.kp_y * (y_avg - self.y_pos_target) + -self.kd_y * (y_vel - self.y_vel_target))
+
+        # if abs(y_avg - self.y_pos_target) > 0.1:
+        #     self.yaw_rate_cmd = np.clip(angular_vel_y, -self.w_z_max, self.w_z_max)
+        #     # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
+        # else:
+        #     self.yaw_rate_cmd += np.clip(angular_vel_y, -self.w_z_max, self.w_z_max)
+        #     # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
+
+        #     self.yaw_rate_cmd = np.clip(self.yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+
+        # print(f"y_pos: {self.y_pos_cur}, y_avg: {y_avg}, y_target: {self.y_pos_target}, yaw: {self.yaw_cur}, yaw_rate_cmd: {self.yaw_rate_cmd}, yaw_target: {self.yaw_target}")
+
         # Log odometry data if enabled
         if self.log_odom and self.odom_count % 2 == 0:
             current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
@@ -183,15 +211,6 @@ class HighLevelController(ObeliskController, ABC):
                 ang_vel.x, ang_vel.y, ang_vel.z, ang_z_filtered,
                 yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd
             ])
-
-        # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
-        # PD On y pos into yaw rate:
-        # self.y_pos_cur = msg.pose.pose.position.y
-        # y_vel = msg.twist.twist.linear.y
-
-        # angular_vel = np.sign(self.cmd_vel[0]) * (-self.kp * (self.y_pos_cur - self.y_pos_target) + -self.kd * (y_vel - self.y_vel_target))
-        # self.yaw_rate_cmd = np.clip(angular_vel, -self.w_z_max, self.w_z_max)
-        # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
 
         self.odom_count += 1
 

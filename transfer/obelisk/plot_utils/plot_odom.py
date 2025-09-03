@@ -175,6 +175,7 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
     axes[1, 2].set_ylabel('ω_z (rad/s)')
     axes[1, 2].grid(True, alpha=0.3)
     axes[1, 2].legend()
+    axes[1, 2].set_ylim([-1, 1])
     
     # Quaternion W and Yaw plots
     axes[2, 0].plot(time, quat_w, 'm-', linewidth=2)
