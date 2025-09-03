@@ -674,6 +674,10 @@ class GaitLibraryEndEffectorConfig:
         des_pos[:, [0,1,2]] = quat_apply(q_delta_yaw, des_pos[:, [0,1,2]])  # [B,3]
         des_vel[:, [0,1,2]] = quat_apply(q_delta_yaw, des_vel[:, [0,1,2]])  # [B,3]
 
+        # Add the y offset to the COM y
+        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
+        des_pos[:, 1] += delta_y
+
         return des_pos, des_vel
     
 

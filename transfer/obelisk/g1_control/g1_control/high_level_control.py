@@ -80,6 +80,7 @@ class HighLevelController(ObeliskController, ABC):
 
             self.ang_z_window = deque(maxlen=20)
             self.y_pos_window = deque(maxlen=10)
+            self.y_vel_window = deque(maxlen=10)
 
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
@@ -109,7 +110,8 @@ class HighLevelController(ObeliskController, ABC):
                     "quat_x", "quat_y", "quat_z", "quat_w",
                     "vel_x", "vel_y", "vel_z",
                     "ang_vel_x", "ang_vel_y", "ang_vel_z", "ang_z_filtered",
-                    "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd"
+                    "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd",
+                    "x_cmd", "y_cmd", "y_vel_avg", "y_pos_target"
                 ])
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
@@ -136,7 +138,9 @@ class HighLevelController(ObeliskController, ABC):
 
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
+        ##
         # P yaw controller:
+        ##
         # Get the yaw from the quaternion
         q = msg.pose.pose.orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -166,9 +170,14 @@ class HighLevelController(ObeliskController, ABC):
 
         # # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
         # # PD On y pos into yaw rate:
-        # self.y_pos_cur = msg.pose.pose.position.y
-        # self.y_pos_window.append(self.y_pos_cur)
-        # y_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+        self.y_pos_cur = msg.pose.pose.position.y
+        self.y_pos_window.append(self.y_pos_cur)
+        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+
+        self.y_vel_window.append(msg.twist.twist.linear.y)
+        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
+
+
         # # y_avg = self.y_pos_cur
 
         # y_vel = msg.twist.twist.linear.y
@@ -186,6 +195,15 @@ class HighLevelController(ObeliskController, ABC):
 
         # print(f"y_pos: {self.y_pos_cur}, y_avg: {y_avg}, y_target: {self.y_pos_target}, yaw: {self.yaw_cur}, yaw_rate_cmd: {self.yaw_rate_cmd}, yaw_target: {self.yaw_target}")
 
+        ##
+        # PD On y position acting on y position
+        ##
+        gain_sign = 1.0 if self.yaw_cur >= -np.pi/2 and self.yaw_cur <= np.pi/2 else -1.0
+        self.y_cmd = -self.kp_y * (self.y_pos_cur - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
+        self.y_cmd *= gain_sign
+        self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
+
+        self.x_cmd = self.cmd_vel[0]
         # Log odometry data if enabled
         if self.log_odom and self.odom_count % 2 == 0:
             current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
@@ -209,7 +227,8 @@ class HighLevelController(ObeliskController, ABC):
                 orient.x, orient.y, orient.z, orient.w,
                 lin_vel.x, lin_vel.y, lin_vel.z,
                 ang_vel.x, ang_vel.y, ang_vel.z, ang_z_filtered,
-                yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd
+                yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd,
+                self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target
             ])
 
         self.odom_count += 1
@@ -335,6 +354,8 @@ class HighLevelController(ObeliskController, ABC):
             
             if self.use_odom and self.ang_vel_mode == "odom":
                 msg.w_z = float(self.yaw_rate_cmd)
+
+                msg.v_y = float(self.y_cmd)
 
                 # TODO: Add option to set cmd vel with the x PD controller
 

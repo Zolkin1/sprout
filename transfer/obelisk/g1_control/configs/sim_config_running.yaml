@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_name: "running_hzd_clf/9_1_yaw_mod_gl5-2_no_con_pen.pt"
+        hf_policy_name: "running_hzd_clf/9_2_y_cmd_no_con_pen_gl5-2.pt"
         hf_repo_id: "zolkin/robot_rl"
         num_obs: 74
         num_actions: 21
@@ -80,12 +80,13 @@ onboard:
       params:
         v_x_min: 0.0
         v_x_max: 3.0
-        v_y_min: 0.0
-        v_y_max: 0.0
+        v_y_max: 0.75
         w_z_max: 0.5
         vel_increment: 0.1
         kp_yaw: 1.0
         kd_yaw: 0.1
+        kp_y: 1.5
+        kd_y: 0.2
         use_odom: True
         log_odom: True
       # callback_groups:

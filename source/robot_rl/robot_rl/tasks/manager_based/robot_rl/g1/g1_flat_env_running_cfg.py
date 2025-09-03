@@ -102,22 +102,22 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
 
 @configclass
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
-    pass
-    # flight_contact_penalty = RewTerm(
-    #     func=mdp.flight_contact_penalty,
-    #     weight=-3.0,
-    #     params={"command_name": "hzd_ref",
-    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-    #             "weight_scalar": 0.0},
-    # )
+    flight_contact_penalty = RewTerm(
+        func=mdp.flight_contact_penalty,
+        weight=-3.0,
+        params={"command_name": "hzd_ref",
+                "base_vel_cmd": "base_velocity",
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+                "weight_scalar": 0.0},
+    )
 
 @configclass
 class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     pass
-    # contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-    #                                       params={"update_interval": 20000,
-    #                                                "max_weight": 1.0,
-    #                                                "update_amnt": 0.1})
+    contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
+                                          params={"update_interval": 20000,
+                                                   "max_weight": 1.0,
+                                                   "update_amnt": 0.1})
 
     # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
     #                                     params={"update_interval": 20000,
@@ -174,7 +174,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
             },
         }
 
-        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0, 0)
 
@@ -184,7 +184,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.25,
+            "max_eta_err": 0.3,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",

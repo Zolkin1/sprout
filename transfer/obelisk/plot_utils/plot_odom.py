@@ -55,7 +55,8 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
         'quat_x': [], 'quat_y': [], 'quat_z': [], 'quat_w': [],
         'vel_x': [], 'vel_y': [], 'vel_z': [],
         'ang_vel_x': [], 'ang_vel_y': [], 'ang_vel_z': [], 'ang_z_filtered': [],
-        'yaw': [], 'yaw_target': [], 'yaw_error': [], 'yaw_rate_cmd': []
+        'yaw': [], 'yaw_target': [], 'yaw_error': [], 'yaw_rate_cmd': [],
+        'x_cmd': [], 'y_cmd': [], 'y_vel_avg': [], 'y_pos_target': []
     }
     
     try:
@@ -74,6 +75,7 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
 
 def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarray, pos_z: np.ndarray,
                           vel_x: np.ndarray, vel_y: np.ndarray, vel_z: np.ndarray,
+                          x_cmd: np.ndarray, y_cmd: np.ndarray, y_vel_avg: np.ndarray, y_pos_target: np.ndarray,
                           save_dir: str) -> None:
     """Create and save position and velocity plots."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -86,11 +88,13 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
     axes[0, 0].set_ylabel('Position (m)')
     axes[0, 0].grid(True, alpha=0.3)
     
-    axes[0, 1].plot(time, pos_y, 'g-', linewidth=2)
+    axes[0, 1].plot(time, pos_y, 'g-', linewidth=2, label='Actual Y')
+    axes[0, 1].plot(time, y_pos_target, 'g--', linewidth=2, label='Target Y')
     axes[0, 1].set_title('Position Y')
     axes[0, 1].set_xlabel('Time (s)')
     axes[0, 1].set_ylabel('Position (m)')
     axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend()
     
     axes[0, 2].plot(time, pos_z, 'r-', linewidth=2)
     axes[0, 2].set_title('Position Z')
@@ -99,17 +103,22 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
     axes[0, 2].grid(True, alpha=0.3)
     
     # Velocity plots
-    axes[1, 0].plot(time, vel_x, 'b-', linewidth=2)
+    axes[1, 0].plot(time, vel_x, 'b-', linewidth=2, label='Actual vel_x')
+    axes[1, 0].plot(time, x_cmd, 'b--', linewidth=2, label='Commanded vel_x')
     axes[1, 0].set_title('Velocity X')
     axes[1, 0].set_xlabel('Time (s)')
     axes[1, 0].set_ylabel('Velocity (m/s)')
     axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
     
-    axes[1, 1].plot(time, vel_y, 'g-', linewidth=2)
+    axes[1, 1].plot(time, vel_y, 'g-', linewidth=2, label='Actual vel_y')
+    axes[1, 1].plot(time, y_vel_avg, 'k-', linewidth=2, label='Filtered vel_y')
+    axes[1, 1].plot(time, y_cmd, 'g--', linewidth=2, label='Commanded vel_y')
     axes[1, 1].set_title('Velocity Y')
     axes[1, 1].set_xlabel('Time (s)')
     axes[1, 1].set_ylabel('Velocity (m/s)')
     axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].legend()
     
     axes[1, 2].plot(time, vel_z, 'r-', linewidth=2)
     axes[1, 2].set_title('Velocity Z')
@@ -232,7 +241,7 @@ def main():
     print(f"Loading data from: {csv_path}")
     (time, pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w,
      vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
-     yaw, yaw_target, yaw_error, yaw_rate_cmd) = load_odom_data(csv_path)
+     yaw, yaw_target, yaw_error, yaw_rate_cmd, x_cmd, y_cmd, y_vel_avg, y_pos_target) = load_odom_data(csv_path)
     
     print(f"Loaded {len(time)} data points spanning {time[-1] - time[0]:.2f} seconds")
     
@@ -269,7 +278,12 @@ def main():
     yaw_target = yaw_target[start_idx:]
     yaw_error = yaw_error[start_idx:]
     yaw_rate_cmd = yaw_rate_cmd[start_idx:]
-    plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, save_dir)
+    x_cmd = x_cmd[start_idx:]
+    y_cmd = y_cmd[start_idx:]
+    y_vel_avg = y_vel_avg[start_idx:]
+    y_pos_target = y_pos_target[start_idx:]
+    plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, 
+                          x_cmd, y_cmd, y_vel_avg, y_pos_target, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,
                                      ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
                                      yaw, yaw_target, yaw_error, yaw_rate_cmd, save_dir)
