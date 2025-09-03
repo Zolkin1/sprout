@@ -7,6 +7,7 @@ from datetime import datetime
 import time
 import csv
 import shutil
+from collections import deque
 from ament_index_python.packages import get_package_share_directory
 from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
@@ -72,6 +73,8 @@ class HighLevelController(ObeliskController, ABC):
             self.y_vel_target = 0.0
             self.x_target = 0.0
 
+            self.ang_z_window = deque(maxlen=20)
+
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
 
@@ -135,13 +138,17 @@ class HighLevelController(ObeliskController, ABC):
         yaw = np.arctan2(siny_cosp, cosy_cosp)
         self.yaw_cur = yaw
 
+        # Angular z moving avg:
+        self.ang_z_window.append(msg.twist.twist.angular.z)
+        ang_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
+
         # Update the yaw target using a PD controller
         yaw_error = yaw - self.yaw_target
         if yaw_error > np.pi:
             yaw_error -= 2 * np.pi
         elif yaw_error < -np.pi:
             yaw_error += 2 * np.pi
-        yaw_rate_cmd = -self.kp_yaw * yaw_error
+        yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_filtered
 
         # Clamp the yaw rate command
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
