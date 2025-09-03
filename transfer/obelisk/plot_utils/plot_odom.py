@@ -55,7 +55,7 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
         'quat_x': [], 'quat_y': [], 'quat_z': [], 'quat_w': [],
         'vel_x': [], 'vel_y': [], 'vel_z': [],
         'ang_vel_x': [], 'ang_vel_y': [], 'ang_vel_z': [],
-        'yaw': []
+        'yaw': [], 'yaw_target': [], 'yaw_error': [], 'yaw_rate_cmd': []
     }
     
     try:
@@ -129,7 +129,7 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
 def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat_y: np.ndarray,
                                      quat_z: np.ndarray, quat_w: np.ndarray, ang_vel_x: np.ndarray,
                                      ang_vel_y: np.ndarray, ang_vel_z: np.ndarray, yaw: np.ndarray,
-                                     save_dir: str) -> None:
+                                     yaw_target: np.ndarray, yaw_error: np.ndarray, yaw_rate_cmd: np.ndarray, save_dir: str) -> None:
     """Create and save orientation and angular velocity plots."""
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
     fig.suptitle('Orientation and Angular Velocity Data', fontsize=16)
@@ -166,11 +166,13 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
     axes[1, 1].set_ylabel('ω_y (rad/s)')
     axes[1, 1].grid(True, alpha=0.3)
     
-    axes[1, 2].plot(time, ang_vel_z, 'r-', linewidth=2)
+    axes[1, 2].plot(time, ang_vel_z, 'r-', linewidth=2, label='Actual ω_z')
+    axes[1, 2].plot(time, yaw_rate_cmd, 'b--', linewidth=2, label='Commanded ω_z')
     axes[1, 2].set_title('Angular Velocity Z')
     axes[1, 2].set_xlabel('Time (s)')
     axes[1, 2].set_ylabel('ω_z (rad/s)')
     axes[1, 2].grid(True, alpha=0.3)
+    axes[1, 2].legend()
     
     # Quaternion W and Yaw plots
     axes[2, 0].plot(time, quat_w, 'm-', linewidth=2)
@@ -181,21 +183,22 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
     
     # Unwrap yaw angle to avoid jumps at ±π
     yaw_unwrapped = np.unwrap(yaw)
-    axes[2, 1].plot(time, yaw_unwrapped, 'k-', linewidth=2)
+    yaw_target_unwrapped = np.unwrap(yaw_target)
+    axes[2, 1].plot(time, yaw_unwrapped, 'k-', linewidth=2, label='Yaw')
+    axes[2, 1].plot(time, yaw_target_unwrapped, 'r--', linewidth=2, label='Yaw Target')
     axes[2, 1].set_title('Yaw Angle (Unwrapped)')
     axes[2, 1].set_xlabel('Time (s)')
     axes[2, 1].set_ylabel('Yaw (rad)')
     axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].legend()
     
-    # Quaternion magnitude check
-    quat_mag = np.sqrt(quat_x**2 + quat_y**2 + quat_z**2 + quat_w**2)
-    axes[2, 2].plot(time, quat_mag, 'c-', linewidth=2)
-    axes[2, 2].axhline(y=1.0, color='r', linestyle='--', alpha=0.7, label='Unit magnitude')
-    axes[2, 2].set_title('Quaternion Magnitude')
+    # Yaw error plot
+    axes[2, 2].plot(time, yaw_error, 'orange', linewidth=2)
+    axes[2, 2].axhline(y=0.0, color='k', linestyle='-', alpha=0.3)
+    axes[2, 2].set_title('Yaw Error')
     axes[2, 2].set_xlabel('Time (s)')
-    axes[2, 2].set_ylabel('|q|')
+    axes[2, 2].set_ylabel('Yaw Error (rad)')
     axes[2, 2].grid(True, alpha=0.3)
-    axes[2, 2].legend()
     
     plt.tight_layout()
     
@@ -225,7 +228,7 @@ def main():
     # Load data
     print(f"Loading data from: {csv_path}")
     (time, pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w,
-     vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, yaw) = load_odom_data(csv_path)
+     vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, yaw, yaw_target, yaw_error, yaw_rate_cmd) = load_odom_data(csv_path)
     
     print(f"Loaded {len(time)} data points spanning {time[-1] - time[0]:.2f} seconds")
     
@@ -233,26 +236,37 @@ def main():
     save_dir = os.path.dirname(csv_path)
     
     # Create plots
-    # import pdb; pdb.set_trace()
-    idx = 1000 #13000
-    time = time[idx:]
-    pos_x = pos_x[idx:]
-    pos_y = pos_y[idx:]
-    pos_z = pos_z[idx:]
-    vel_x = vel_x[idx:]
-    vel_y = vel_y[idx:]
-    vel_z = vel_z[idx:]
-    ang_vel_x = ang_vel_x[idx:]
-    ang_vel_y = ang_vel_y[idx:]
-    ang_vel_z = ang_vel_z[idx:]
-    quat_x = quat_x[idx:]
-    quat_y = quat_y[idx:]
-    quat_z = quat_z[idx:]
-    quat_w = quat_w[idx:]
-    yaw = yaw[idx:]
+    # Set start time (in seconds) - adjust as needed
+    start_time = 6.0  # Start from beginning, change to trim initial data
+    
+    # Find index corresponding to start time
+    start_idx = np.searchsorted(time, start_time)
+    start_idx = max(0, min(start_idx, len(time) - 1))  # Clamp to valid range
+    
+    print(f"Starting plot from time {time[start_idx]:.2f}s (index {start_idx})")
+    
+    # Slice all arrays from start index
+    time = time[start_idx:]
+    pos_x = pos_x[start_idx:]
+    pos_y = pos_y[start_idx:]
+    pos_z = pos_z[start_idx:]
+    vel_x = vel_x[start_idx:]
+    vel_y = vel_y[start_idx:]
+    vel_z = vel_z[start_idx:]
+    ang_vel_x = ang_vel_x[start_idx:]
+    ang_vel_y = ang_vel_y[start_idx:]
+    ang_vel_z = ang_vel_z[start_idx:]
+    quat_x = quat_x[start_idx:]
+    quat_y = quat_y[start_idx:]
+    quat_z = quat_z[start_idx:]
+    quat_w = quat_w[start_idx:]
+    yaw = yaw[start_idx:]
+    yaw_target = yaw_target[start_idx:]
+    yaw_error = yaw_error[start_idx:]
+    yaw_rate_cmd = yaw_rate_cmd[start_idx:]
     plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,
-                                     ang_vel_x, ang_vel_y, ang_vel_z, yaw, save_dir)
+                                     ang_vel_x, ang_vel_y, ang_vel_z, yaw, yaw_target, yaw_error, yaw_rate_cmd, save_dir)
     
     print("Plotting complete!")
 

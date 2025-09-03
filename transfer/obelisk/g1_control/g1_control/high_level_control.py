@@ -56,28 +56,26 @@ class HighLevelController(ObeliskController, ABC):
         self.declare_parameter("use_odom", False)
         self.use_odom = self.get_parameter("use_odom").get_parameter_value().bool_value
         if self.use_odom:
-            self.declare_parameter("kp", 1.0)
-            self.declare_parameter("kd", 0.5)
-            self.kp = self.get_parameter("kp").get_parameter_value().double_value
-            self.kd = self.get_parameter("kd").get_parameter_value().double_value
+            self.declare_parameter("kp_yaw", 1.0)
+            self.declare_parameter("kd_yaw", 0.5)
+            self.kp_yaw = self.get_parameter("kp_yaw").get_parameter_value().double_value
+            self.kd_yaw = self.get_parameter("kd_yaw").get_parameter_value().double_value
+
+            self.declare_parameter("kp_x", 1.0)
+            self.declare_parameter("kd_x", 0.5)
+            self.kp_x = self.get_parameter("kp_x").get_parameter_value().double_value
+            self.kd_x = self.get_parameter("kd_x").get_parameter_value().double_value
 
             self.yaw_target = 0.0
             self.yaw_rate_cmd = 0.0
             self.y_pos_target = 0.0
             self.y_vel_target = 0.0
+            self.x_target = 0.0
 
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
 
             self.odom_count = 0
-
-            # Declare subscriber to odometry
-            self.register_obk_subscription(
-                "sub_odom_setting",
-                self.odom_callback,  # type: ignore
-                key="sub_odom_key",  # key can be specified here or in the config file
-                msg_type=Odometry,
-            )
 
             # Odometry logging setup
             self.declare_parameter("log_odom", False)
@@ -102,10 +100,18 @@ class HighLevelController(ObeliskController, ABC):
                     "quat_x", "quat_y", "quat_z", "quat_w",
                     "vel_x", "vel_y", "vel_z",
                     "ang_vel_x", "ang_vel_y", "ang_vel_z",
-                    "yaw"
+                    "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd"
                 ])
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
+
+                # Declare subscriber to odometry
+                self.register_obk_subscription(
+                    "sub_odom_setting",
+                    self.odom_callback,  # type: ignore
+                    key="sub_odom_key",  # key can be specified here or in the config file
+                    msg_type=Odometry,
+                )
             else:
                 self.log_odom = False
 
@@ -135,10 +141,15 @@ class HighLevelController(ObeliskController, ABC):
             yaw_error -= 2 * np.pi
         elif yaw_error < -np.pi:
             yaw_error += 2 * np.pi
-        yaw_rate_cmd = -self.kp * yaw_error
+        yaw_rate_cmd = -self.kp_yaw * yaw_error
 
         # Clamp the yaw rate command
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+
+        # Compute an X PD controller to adjust the forward velocity based on the X position
+        self.x_pos_cur = msg.pose.pose.position.x
+        x_vel = msg.twist.twist.linear.x
+        self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel)
 
         # Log odometry data if enabled
         if self.log_odom and self.odom_count % 2 == 0:
@@ -163,7 +174,7 @@ class HighLevelController(ObeliskController, ABC):
                 orient.x, orient.y, orient.z, orient.w,
                 lin_vel.x, lin_vel.y, lin_vel.z,
                 ang_vel.x, ang_vel.y, ang_vel.z,
-                yaw
+                yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd
             ])
 
         # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
@@ -271,6 +282,9 @@ class HighLevelController(ObeliskController, ABC):
                 self.yaw_target = self.yaw_cur
                 self.y_pos_target = self.y_pos_cur
                 self.get_logger().info(f"Odom targets zeroed at: Y position: {self.y_pos_target}, yaw target: {self.yaw_target}!")
+
+                self.x_target = self.x_pos_cur
+                self.get_logger().info(f"X position target set to current X position: {self.x_target}.")
             self.last_RB_press = now
 
 
@@ -295,6 +309,8 @@ class HighLevelController(ObeliskController, ABC):
             
             if self.use_odom and self.ang_vel_mode == "odom":
                 msg.w_z = float(self.yaw_rate_cmd)
+
+                # TODO: Add option to set cmd vel with the x PD controller
 
             self.obk_publishers["pub_ctrl"].publish(msg)
 
