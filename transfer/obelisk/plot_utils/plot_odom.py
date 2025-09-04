@@ -104,7 +104,7 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
     
     # Velocity plots
     axes[1, 0].plot(time, vel_x, 'b-', linewidth=2, label='Actual vel_x')
-    axes[1, 0].plot(time, x_cmd, 'b--', linewidth=2, label='Commanded vel_x')
+    axes[1, 0].plot(time, x_cmd, 'k--', linewidth=2, label='Commanded vel_x')
     axes[1, 0].set_title('Velocity X')
     axes[1, 0].set_xlabel('Time (s)')
     axes[1, 0].set_ylabel('Velocity (m/s)')
@@ -113,7 +113,7 @@ def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarra
     
     axes[1, 1].plot(time, vel_y, 'g-', linewidth=2, label='Actual vel_y')
     axes[1, 1].plot(time, y_vel_avg, 'k-', linewidth=2, label='Filtered vel_y')
-    axes[1, 1].plot(time, y_cmd, 'g--', linewidth=2, label='Commanded vel_y')
+    axes[1, 1].plot(time, y_cmd, 'b--', linewidth=2, label='Commanded vel_y')
     axes[1, 1].set_title('Velocity Y')
     axes[1, 1].set_xlabel('Time (s)')
     axes[1, 1].set_ylabel('Velocity (m/s)')
@@ -184,7 +184,7 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
     axes[1, 2].set_ylabel('ω_z (rad/s)')
     axes[1, 2].grid(True, alpha=0.3)
     axes[1, 2].legend()
-    axes[1, 2].set_ylim([-1, 1])
+    # axes[1, 2].set_ylim([-1, 1])
     
     # Quaternion W and Yaw plots
     axes[2, 0].plot(time, quat_w, 'm-', linewidth=2)
@@ -250,7 +250,7 @@ def main():
     
     # Create plots
     # Set start time (in seconds) - adjust as needed
-    start_time = 0.0  # Start from beginning, change to trim initial data
+    start_time = 110.0 #0.0  # Start from beginning, change to trim initial data
     
     # Find index corresponding to start time
     start_idx = np.searchsorted(time, start_time)

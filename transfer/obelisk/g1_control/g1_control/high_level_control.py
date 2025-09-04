@@ -145,12 +145,37 @@ class HighLevelController(ObeliskController, ABC):
         q = msg.pose.pose.orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        yaw = -np.arctan2(siny_cosp, cosy_cosp)
         self.yaw_cur = yaw
 
         # Angular z moving avg:
-        self.ang_z_window.append(msg.twist.twist.angular.z)
+        self.ang_z_vel = -msg.twist.twist.angular.z
+        self.ang_z_window.append(self.ang_z_vel)
         ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
+
+        ##
+        # Position Values
+        ##
+        self.x_pos_cur = msg.pose.pose.position.x
+        self.y_pos_cur = -msg.pose.pose.position.y
+        self.z_pos_cur = -msg.pose.pose.position.z
+
+        self.x_vel_cur = msg.twist.twist.linear.x
+        self.y_vel_cur = -msg.twist.twist.linear.y
+        self.z_vel_cur = -msg.twist.twist.linear.z
+
+        self.y_pos_window.append(self.y_pos_cur)
+        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+
+        self.y_vel_window.append(self.y_vel_cur)
+        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
+
+        ##
+        # Yaw Control
+        ##
+
+        target_dist = 3 # m
+        self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
 
         # Update the yaw target using a PD controller
         yaw_error = yaw - self.yaw_target
@@ -163,70 +188,39 @@ class HighLevelController(ObeliskController, ABC):
         # Clamp the yaw rate command
         self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
 
+        ##
         # Compute an X PD controller to adjust the forward velocity based on the X position
-        self.x_pos_cur = msg.pose.pose.position.x
-        x_vel = msg.twist.twist.linear.x
-        self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel)
-
-        # # TODO: Be careful with this one, seems more unstable than the yaw P control in sim
-        # # PD On y pos into yaw rate:
-        self.y_pos_cur = msg.pose.pose.position.y
-        self.y_pos_window.append(self.y_pos_cur)
-        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
-
-        self.y_vel_window.append(msg.twist.twist.linear.y)
-        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
-
-
-        # # y_avg = self.y_pos_cur
-
-        # y_vel = msg.twist.twist.linear.y
-        # # y_pos > y_target -> negative yaw
-        # angular_vel_y = (-self.kp_y * (y_avg - self.y_pos_target) + -self.kd_y * (y_vel - self.y_vel_target))
-
-        # if abs(y_avg - self.y_pos_target) > 0.1:
-        #     self.yaw_rate_cmd = np.clip(angular_vel_y, -self.w_z_max, self.w_z_max)
-        #     # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
-        # else:
-        #     self.yaw_rate_cmd += np.clip(angular_vel_y, -self.w_z_max, self.w_z_max)
-        #     # print(f"yaw rate cmd: {self.yaw_rate_cmd}, y pos cur: {self.y_pos_cur}, y pos target: {self.y_pos_target}, y vel: {y_vel}")
-
-        #     self.yaw_rate_cmd = np.clip(self.yaw_rate_cmd, -self.w_z_max, self.w_z_max)
-
-        # print(f"y_pos: {self.y_pos_cur}, y_avg: {y_avg}, y_target: {self.y_pos_target}, yaw: {self.yaw_cur}, yaw_rate_cmd: {self.yaw_rate_cmd}, yaw_target: {self.yaw_target}")
+        ##
+        self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (self.x_vel_cur)
 
         ##
         # PD On y position acting on y position
         ##
         gain_sign = 1.0 if self.yaw_cur >= -np.pi/2 and self.yaw_cur <= np.pi/2 else -1.0
-        self.y_cmd = -self.kp_y * (self.y_pos_cur - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
+        self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
         self.y_cmd *= gain_sign
         self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
+
+        # self.get_logger().info(f"y: {self.y_pos_cur}")
 
         self.x_cmd = self.cmd_vel[0]
         # Log odometry data if enabled
         if self.log_odom and self.odom_count % 2 == 0:
             current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
             
-            # Extract position
-            pos = msg.pose.pose.position
-            
             # Extract orientation (quaternion)
             orient = msg.pose.pose.orientation
-            
-            # Extract linear velocity
-            lin_vel = msg.twist.twist.linear
-            
+                        
             # Extract angular velocity
             ang_vel = msg.twist.twist.angular
             
             # Write row to CSV
             self.odom_writer.writerow([
                 current_time,
-                pos.x, pos.y, pos.z,
+                self.x_pos_cur, self.y_pos_cur, self.z_pos_cur,
                 orient.x, orient.y, orient.z, orient.w,
-                lin_vel.x, lin_vel.y, lin_vel.z,
-                ang_vel.x, ang_vel.y, ang_vel.z, ang_z_filtered,
+                self.x_vel_cur, self.y_vel_cur, self.z_vel_cur,
+                ang_vel.x, ang_vel.y, self.ang_z_vel, ang_z_filtered,
                 yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd,
                 self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target
             ])
