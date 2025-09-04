@@ -189,10 +189,10 @@ class HighLevelController(ObeliskController, ABC):
         ##
 
         target_dist = 3 # m
-        self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
+        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
 
         # Update the yaw target using a PD controller
-        yaw_error = yaw - self.yaw_target
+        yaw_error = self.yaw_cur - self.yaw_target
         if yaw_error > np.pi:
             yaw_error -= 2 * np.pi
         elif yaw_error < -np.pi:
@@ -235,7 +235,7 @@ class HighLevelController(ObeliskController, ABC):
                 orient.x, orient.y, orient.z, orient.w,
                 self.x_vel_cur, self.y_vel_cur, self.z_vel_cur,
                 ang_vel.x, ang_vel.y, self.ang_z_vel, ang_z_filtered,
-                yaw, self.yaw_target, yaw_error, self.yaw_rate_cmd,
+                self.yaw_cur, self.yaw_target, yaw_error, self.yaw_rate_cmd,
                 self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target
             ])
 
@@ -303,7 +303,7 @@ class HighLevelController(ObeliskController, ABC):
             self.last_B_press = now
             self.lin_vel_mode = "incremental"
             self.cmd_vel = np.zeros((3,))
-            self.cmd_vel[0] = 0.0
+            self.cmd_vel[0] = 0.7
             self.get_logger().info("Joystick incremental velocity mode enabled!")
 
         X = 2

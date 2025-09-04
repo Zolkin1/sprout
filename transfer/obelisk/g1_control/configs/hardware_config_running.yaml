@@ -95,14 +95,14 @@ onboard:
       params:
         v_x_min: 0.0
         v_x_max: 2.0
-        v_y_max: 0.5
+        v_y_max: 0.3
         w_z_max: 0.35
         vel_increment: 0.1
         kp_yaw: 0.35
         kd_yaw: 0.15
         kp_x: 1.0
         kd_x: 0.1
-        kp_y: 1.5
+        kp_y: 0.8
         kd_y: 0.4
         use_odom: True
         log_odom: True
@@ -113,6 +113,12 @@ onboard:
           history_depth: 10
           callback_group: None
       subscribers:
+        # ----- Joint Encoder subscriber ----- #
+        - ros_parameter: sub_joint_encoders
+          topic: /obelisk/g1/joint_encoders
+          msg_type: ObkJointEncoders
+          history_depth: 10
+          callback_group: None
         # ----- Joystick subscriber ----- #
         - ros_parameter: sub_est_setting
           topic: /obelisk/g1/joy
