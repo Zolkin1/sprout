@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_name: "running_hzd_clf/9_2_y_cmd_no_con_pen_gl5-2.pt"
+        hf_policy_name: "running_hzd_clf/9_4_y_pd_gl5-2.pt"
         hf_repo_id: "zolkin/robot_rl"
         num_obs: 74
         num_actions: 21

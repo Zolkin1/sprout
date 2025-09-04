@@ -13,6 +13,7 @@ from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
 from obelisk_py.core.obelisk_typing import ObeliskControlMsg, is_in_bound
+from obelisk_sensor_msgs.msg import ObkJointEncoders
 from obelisk_py.core.utils.ros import spin_obelisk
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
@@ -116,6 +117,15 @@ class HighLevelController(ObeliskController, ABC):
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
 
+                # Need to get the waist joint
+                self.waist_joint_angle = 0.0
+                self.register_obk_subscription(
+                    "sub_joint_encoders",
+                    self.joint_encoders_callback,  # type: ignore
+                    ObkJointEncoders,
+                    key="sub_joint_encoders",  # key can be specified here or in the config file
+                )
+
                 # Declare subscriber to odometry
                 self.register_obk_subscription(
                     "sub_odom_setting",
@@ -136,6 +146,10 @@ class HighLevelController(ObeliskController, ABC):
 
         self.cmd_vel = np.zeros((3,))
 
+    def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
+        """Callback for the joint encoders."""
+        self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
+
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
         ##
@@ -146,7 +160,7 @@ class HighLevelController(ObeliskController, ABC):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         yaw = -np.arctan2(siny_cosp, cosy_cosp)
-        self.yaw_cur = yaw
+        self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign
 
         # Angular z moving avg:
         self.ang_z_vel = -msg.twist.twist.angular.z

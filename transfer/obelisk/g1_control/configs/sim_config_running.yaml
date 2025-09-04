@@ -7,7 +7,7 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_name: "running_hzd_clf/9_2_y_cmd_no_con_pen_gl5-2.pt"
+        hf_policy_name: "running_hzd_clf/9_2_y_cmd_no_con_pen_gl5-2.pt" #"running_hzd_clf/9_4_y_pd_gl5-2.pt"
         hf_repo_id: "zolkin/robot_rl"
         num_obs: 74
         num_actions: 21
@@ -96,6 +96,12 @@ onboard:
           history_depth: 10
           callback_group: None
       subscribers:
+        # ----- Joint Encoder subscriber ----- #
+        - ros_parameter: sub_joint_encoders
+          topic: /obelisk/g1/joint_encoders
+          msg_type: ObkJointEncoders
+          history_depth: 10
+          callback_group: None
         # ----- Joystick subscriber ----- #
         - ros_parameter: sub_est_setting
           topic: /obelisk/g1/joy
@@ -103,7 +109,7 @@ onboard:
           callback_group: None
         # ----- Odom subscriber ----- #
         - ros_parameter: sub_odom_setting
-          topic: /obelisk/g1/pelvis_odom
+          topic: /obelisk/g1/head_odom
           history_depth: 10
           callback_group: None
         # ----- Unitree High Level subscriber ----- #
@@ -336,15 +342,25 @@ onboard:
             sensor_names:
               torso_mocap_pos_sensor: framepos
               torso_mocap_quat_sensor: framequat
-          # ---------- Pelvis Camera Odometry ---------- #
-          - topic: /obelisk/g1/pelvis_odom
+          # # ---------- Pelvis Camera Odometry ---------- #
+          # - topic: /obelisk/g1/pelvis_odom
+          #   dt: 0.005
+          #   msg_type: Odometry
+          #   sensor_names:
+          #     pelvis_camera_pos_sensor: framepos
+          #     pelvis_camera_orientation_sensor: framequat
+          #     pelvis_camera_velocimeter: velocimeter
+          #     pelvis_camera_gyro: gyro
+          # ---------- Head Lidar Odometry ---------- #
+          - topic: /obelisk/g1/head_odom
             dt: 0.005
             msg_type: Odometry
             sensor_names:
-              pelvis_camera_pos_sensor: framepos
-              pelvis_camera_orientation_sensor: framequat
-              pelvis_camera_velocimeter: velocimeter
-              pelvis_camera_gyro: gyro
+              head_lidar_pos_sensor: framepos
+              head_lidar_orientation_sensor: framequat
+              head_lidar_velocimeter: velocimeter
+              head_lidar_gyro: gyro
+
           # viz_geoms:
           #   dt: 1
           #   # ----- Stair scene ----- #

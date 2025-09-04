@@ -197,6 +197,7 @@ Position and velocity actuators added. -->
   </asset>
 
   <worldbody>
+    <site name="inverted_global" pos="0 0 0" euler="3.14 0 0" rgba="0.2 0.3 0.4 1"/>
     <body name="pelvis" pos="0 0 0.793">
       <inertial pos="0 0 -0.07605" quat="1 0 -0.000399148 0" mass="3.813" diaginertia="0.010549 0.0093089 0.0079184"/>
       <joint name="floating_base_joint" type="free" limited="false" actuatorfrclimited="false"/>
@@ -373,6 +374,8 @@ Position and velocity actuators added. -->
 
             <!-- TODO: Verify position -->
             <site name="tracking_camera_site" pos="0.085725 0 0.2413" euler="0.02 -0.08 0" rgba="0 0 1 0" size="0.01"/>
+
+            <site name="head_lidar_site" pos="0.0039635 0 -0.054" euler="3.14 0 0" rgba="0 0 1 0" size="0.01"/>
 
             <!-- Left Arm -->
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
@@ -788,6 +791,12 @@ Position and velocity actuators added. -->
     <framequat name="pelvis_camera_orientation_sensor" objtype="site" objname="pelvis_tracking_camera_site" noise="0.01"/>
     <gyro name="pelvis_camera_gyro" site="pelvis_tracking_camera_site" noise="0.01"/>
     <velocimeter name="pelvis_camera_velocimeter" site="pelvis_tracking_camera_site"/>
+
+    <!-- Head Lidar Odometry -->
+    <framepos name="head_lidar_pos_sensor" objtype="site" objname="head_lidar_site" noise="0.01" refname="inverted_global" reftype="site"/>
+    <framequat name="head_lidar_orientation_sensor" objtype="site" objname="head_lidar_site" noise="0.01" refname="inverted_global" reftype="site"/>
+    <gyro name="head_lidar_gyro" site="head_lidar_site" noise="0.01"/>
+    <velocimeter name="head_lidar_velocimeter" site="head_lidar_site"/>
 
   </sensor>
 
