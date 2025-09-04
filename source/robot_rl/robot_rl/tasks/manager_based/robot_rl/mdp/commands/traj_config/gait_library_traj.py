@@ -214,7 +214,7 @@ class GaitLibraryEndEffectorConfig:
                                     }
 
         self.foot_y_output_idx = {self.domain_name_to_idx["single_support"]: [7],
-                                    self.domain_name_to_idx["flight_phase"]:  [7, 13],
+                                    self.domain_name_to_idx["flight_phase"]:  [7], #[7, 13],
                                     # self.domain_name_to_idx["double_support"]:  [7],    # TODO: Remove/fix
                                     }
 

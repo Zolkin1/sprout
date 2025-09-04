@@ -86,7 +86,7 @@ onboard:
         kp_yaw: 1.0
         kd_yaw: 0.1
         kp_y: 1.5
-        kd_y: 0.2
+        kd_y: 0.0 #0.2
         use_odom: True
         log_odom: True
       # callback_groups:

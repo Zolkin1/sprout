@@ -9,14 +9,16 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
+import math
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipCurriculumCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..humanoid_env_cfg import HumanoidEventsCfg
+from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
 
 RUNNING_EE_Q_weights_GL = [
     25.0,   250.0,      # com_x pos, vel
-    300.0,   50.0,      # com_y pos, vel
+    500.0,   20.0,      # com_y pos, vel
     650.0,   10.0,      # com_z pos, vel
     300.0,    20.0,     # pelvis_roll pos, vel
     250.0,    10.0,     # pelvis_pitch pos, vel
@@ -57,11 +59,12 @@ RUNNING_EE_R_weights_GL = [
         0.01,0.01,0.01,
     ]
 
-class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
+@configclass
+class G1RunningGaitLibraryCommandsCfg:
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v5",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v6",
         config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
@@ -71,13 +74,27 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(1.1, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(0.6, 2.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
         Q_weights = RUNNING_EE_Q_weights_GL,
         R_weights = RUNNING_EE_R_weights_GL
     )
+
+    base_velocity = TreadmillVelocityCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(10.0, 10.0),
+        rel_standing_envs=0.02,
+        rel_heading_envs=1.0,
+        heading_command=True,
+        heading_control_stiffness=0.5,
+        y_pos_kp=1.5, #0.4,
+        y_pos_kd=0.3,
+        debug_vis=True,
+        ranges=mdp.UniformVelocityCommandCfg.Ranges(
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+        ))
 
 @configclass
 class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
@@ -160,7 +177,6 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         # Full v1
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)  # Note the curriculum for increasing
-        self.commands.step_period.period_range = (0.71, 0.71)
 
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)},
