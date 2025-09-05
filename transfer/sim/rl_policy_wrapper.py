@@ -112,8 +112,8 @@ class RLPolicy:
             return self.create_cnn_obs(
                 qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
             )
-        elif self.policy_type == "running":
-            return self.create_running_obs(
+        elif self.policy_type == "mlp_behavior":
+            return self.create_mlp_behavior_obs(
                 qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
             )
         else:
@@ -269,7 +269,7 @@ class RLPolicy:
 
         return obs_tensor
 
-    def create_running_obs(
+    def create_mlp_behavior_obs(
         self,
         qjoints,
         body_ang_vel,
@@ -317,12 +317,15 @@ class RLPolicy:
         else:
             obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 
-        # Determine the domain flag
-
-
+        if des_vel[0] < 0.05:
+            behavior_flag = 2
+        elif des_vel[0] < 1.05:
+            behavior_flag = 1
+        else:
+            behavior_flag = 0
+        obs[-1] = behavior_flag
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 
-        # print(obs_tensor)
 
         return obs_tensor
 

@@ -289,8 +289,18 @@ def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, base_vel_c
 
     # Only apply penalty when commanded velocity is 2.0 m/s or greater                                                                                                                                                                                                                                                                                                                                           │ │
     command_vel = env.command_manager.get_command(base_vel_cmd)[:, :3]  # Get x,y,z velocity commands                                                                                                                                                                                                                                                                                                            │ │
-    speed_mask = command_vel[:, 0] >= 2.0  # Create mask for high speed commands
+    speed_mask = command_vel[:, 0] >= 0.0  # Create mask for high speed commands
 
     contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
     return flight_mask * speed_mask * penalty
+
+def track_lin_vel_y_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+    # extract the used quantities (to enable type-hinting)
+    asset: RigidObject = env.scene[asset_cfg.name]
+    # compute the error
+    lin_vel_error =  torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
+    return torch.exp(-lin_vel_error / std**2)
