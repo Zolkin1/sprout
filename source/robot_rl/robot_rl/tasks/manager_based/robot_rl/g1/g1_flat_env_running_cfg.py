@@ -64,7 +64,7 @@ class G1RunningGaitLibraryCommandsCfg:
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v5",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v6",
         config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
@@ -74,7 +74,7 @@ class G1RunningGaitLibraryCommandsCfg:
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(1.1, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(0.6, 2.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -301,7 +301,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0) #(1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.6,2.0) #(1.1, 2.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.scene.num_envs = 2
