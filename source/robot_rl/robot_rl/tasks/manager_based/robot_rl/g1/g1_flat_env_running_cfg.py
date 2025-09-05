@@ -130,7 +130,6 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
 
 @configclass
 class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
-    pass
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
@@ -200,7 +199,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.3,
+            "max_eta_err": 0.22,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
