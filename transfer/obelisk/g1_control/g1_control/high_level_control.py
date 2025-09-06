@@ -22,6 +22,7 @@ import rclpy.duration
 from sensor_msgs.msg import Joy
 import tf2_ros
 from tf2_ros import TransformException
+import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
 
 class HighLevelController(ObeliskController, ABC):
@@ -201,15 +202,23 @@ class HighLevelController(ObeliskController, ABC):
         # All positions should be in the z-up world aligned frame
         # velocities are in the inverted body frame
         if self.use_tf2:
-            self.get_logger().info("Using tf2!")
             # Position comes from the tf2 transform
             tf = self.get_transform("camera_init", "odom")
             q = tf.transform.rotation
             pos = tf.transform.translation
+
+            twist_w = tf2_geometry_msgs.do_transform_twist(msg.twist.twist, tf)
         else:
             # Position comes from the odometry message
             q = msg.pose.pose.orientation
             pos = msg.pose.pose.position
+
+            twist_w = msg.twist.twist
+
+            # negate the twist z vels
+            twist_w.angular.z = -msg.twist.twist.angular.z
+            twist_w.linear.z = -msg.twist.twist.linear.z
+
         ##
         # Get Yaw
         ##
@@ -221,7 +230,7 @@ class HighLevelController(ObeliskController, ABC):
 
 
         # Angular z moving avg:
-        self.ang_z_vel = -msg.twist.twist.angular.z     # Put into the correct frame
+        self.ang_z_vel = twist_w.angular.z
         self.ang_z_window.append(self.ang_z_vel)
 
         ##
@@ -236,14 +245,11 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # Get Velocities
         ##
-        # Put them into the world frame
-        x_vel_w, y_vel_w = rotate_into_yaw(self.yaw_cur, msg.twist.twist.linear.x, -msg.twist.twist.linear.y)
-
         # Put them into the track frame
-        self.x_vel_cur, self.y_vel_cur = rotate_into_yaw(self.yaw_init, x_vel_w, y_vel_w)
+        self.x_vel_cur, self.y_vel_cur = rotate_into_yaw(self.yaw_init, twist_w.linear.x, twist_w.linear.y)
 
         # Flip z to the correct frame
-        self.z_vel_cur = -msg.twist.twist.linear.z
+        self.z_vel_cur = twist_w.linear.z
 
         self.y_vel_window.append(self.y_vel_cur)
 
