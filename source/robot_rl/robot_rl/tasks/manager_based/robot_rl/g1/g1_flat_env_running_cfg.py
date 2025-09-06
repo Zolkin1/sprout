@@ -64,7 +64,7 @@ class G1RunningGaitLibraryCommandsCfg:
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v6",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v7",
         config_name="full",
         # Running v1
         # gait_velocity_ranges=(1.35, 1.98, 0.09),
@@ -74,7 +74,7 @@ class G1RunningGaitLibraryCommandsCfg:
         # use_standing=False,
 
         # Full
-        gait_velocity_ranges=(0.6, 2.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -121,26 +121,26 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
 class G1RunningHZDRewardCfg(G1RoughLipRewards):
     flight_contact_penalty = RewTerm(
         func=mdp.flight_contact_penalty,
-        weight=-6.0,
+        weight=-3.0,
         params={"command_name": "hzd_ref",
                 "base_vel_cmd": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
                 "weight_scalar": 0.0},
     )
 
-    track_lin_vel_y_exp = RewTerm(
-        func=mdp.track_lin_vel_y_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-    )
-    track_ang_vel_z_exp_new = RewTerm(
-        func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-    )
+    # track_lin_vel_y_exp = RewTerm(
+    #     func=mdp.track_lin_vel_y_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    # )
+    # track_ang_vel_z_exp_new = RewTerm(
+    #     func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    # )
 
 @configclass
 class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
-                                                   "update_amnt": 0.2})
+                                                   "update_amnt": 0.3})
 
     # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
     #                                     params={"update_interval": 20000,
@@ -172,7 +172,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.commands.base_velocity.ranges.lin_vel_x = (0.6, 2.0)  # Note the curriculum for increasing
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)  # Note the curriculum for increasing
 
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)},
@@ -255,7 +255,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.events.randomize_ground_contact_friction.params['restitution_range'] = (0.0, 0.2)
 
         # Update push forces
-        self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.25, 0.25)}
+        self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.5, 0.5)}
 
         # Make the COM randomization on the torso rather than the pelvis
         self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
