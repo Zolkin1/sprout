@@ -250,7 +250,7 @@ def main():
     
     # Create plots
     # Set start time (in seconds) - adjust as needed
-    start_time = 0.0 #0.0  # Start from beginning, change to trim initial data
+    start_time = 75.0 #0.0  # Start from beginning, change to trim initial data
     
     # Find index corresponding to start time
     start_idx = np.searchsorted(time, start_time)

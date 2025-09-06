@@ -77,6 +77,7 @@ class HighLevelController(ObeliskController, ABC):
             self.yaw_rate_cmd = 0.0
             self.y_pos_target = 0.0
             self.y_vel_target = 0.0
+            self.yaw_init = 0.0
             self.x_target = 0.0
 
             self.ang_z_window = deque(maxlen=20)
@@ -160,7 +161,9 @@ class HighLevelController(ObeliskController, ABC):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         yaw = -np.arctan2(siny_cosp, cosy_cosp)
-        self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign
+        self.yaw_cur = yaw #- self.waist_joint_angle # TODO: Check sign
+
+        # self.get_logger().info(f"yaw_cur: {self.yaw_cur}")
 
         # Angular z moving avg:
         self.ang_z_vel = -msg.twist.twist.angular.z
@@ -170,10 +173,16 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # Position Values
         ##
-        self.x_pos_cur = msg.pose.pose.position.x
-        self.y_pos_cur = -msg.pose.pose.position.y
+        self.x_pos_cur, self.y_pos_cur = self.rotate_into_yaw(msg.pose.pose.position.x, msg.pose.pose.position.y)
+        self.y_pos_cur *= -1
         self.z_pos_cur = -msg.pose.pose.position.z
 
+        # self.get_logger().info(f"x pos: {self.x_pos_cur}, y pos: {self.y_pos_cur}, yaw_cur: {self.yaw_cur}, yaw_init: {self.yaw_init}")
+
+        # self.get_logger().info(f" y pos: {self.y_pos_cur}")
+
+        # raise ValueError("TODO: Convert velocities based on yaw!")
+        # self.x_vel_cur, self.y_pos_cur
         self.x_vel_cur = msg.twist.twist.linear.x
         self.y_vel_cur = -msg.twist.twist.linear.y
         self.z_vel_cur = -msg.twist.twist.linear.z
@@ -210,11 +219,12 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # PD On y position acting on y position
         ##
-        gain_sign = 1.0 if self.yaw_cur >= -np.pi/2 and self.yaw_cur <= np.pi/2 else -1.0
+        gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
         self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
         self.y_cmd *= gain_sign
         self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
 
+        # self.y_cmd = 0.0
         # self.get_logger().info(f"y: {self.y_pos_cur}")
 
         self.x_cmd = self.cmd_vel[0]
@@ -229,6 +239,7 @@ class HighLevelController(ObeliskController, ABC):
             ang_vel = msg.twist.twist.angular
             
             # Write row to CSV
+            # TODO: Make it easier to add stuff to the plots, add y vel to the plots
             self.odom_writer.writerow([
                 current_time,
                 self.x_pos_cur, self.y_pos_cur, self.z_pos_cur,
@@ -303,7 +314,7 @@ class HighLevelController(ObeliskController, ABC):
             self.last_B_press = now
             self.lin_vel_mode = "incremental"
             self.cmd_vel = np.zeros((3,))
-            self.cmd_vel[0] = 0.7
+            self.cmd_vel[0] = 1.0
             self.get_logger().info("Joystick incremental velocity mode enabled!")
 
         X = 2
@@ -332,8 +343,10 @@ class HighLevelController(ObeliskController, ABC):
 
                 self.get_logger().info(f"----- INCREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
             elif self.use_odom:
+                self.yaw_init = self.yaw_cur
                 self.yaw_target = self.yaw_cur
-                self.y_pos_target = self.y_pos_cur
+                x, y = self.rotate_into_yaw(self.x_pos_cur, self.y_pos_cur)
+                self.y_pos_target = y
                 self.get_logger().info(f"Odom targets zeroed at: Y position: {self.y_pos_target}, yaw target: {self.yaw_target}!")
 
                 self.x_target = self.x_pos_cur
@@ -371,6 +384,12 @@ class HighLevelController(ObeliskController, ABC):
 
             return msg
     
+    def rotate_into_yaw(self, x, y) -> tuple[float, float]:
+        x_new = np.cos(self.yaw_init)*x - np.sin(self.yaw_init)*y
+        y_new = np.sin(self.yaw_init)*x + np.cos(self.yaw_init)*y
+
+        return (x_new, y_new)
+
 def main(args: list | None = None) -> None:
     """Main entrypoint."""
     spin_obelisk(args, HighLevelController, SingleThreadedExecutor)
