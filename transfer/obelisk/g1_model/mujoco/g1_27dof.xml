@@ -793,8 +793,9 @@ Position and velocity actuators added. -->
     <velocimeter name="pelvis_camera_velocimeter" site="pelvis_tracking_camera_site"/>
 
     <!-- Head Lidar Odometry -->
-    <framepos name="head_lidar_pos_sensor" objtype="site" objname="head_lidar_site" noise="0.01" refname="inverted_global" reftype="site"/>
-    <framequat name="head_lidar_orientation_sensor" objtype="site" objname="head_lidar_site" noise="0.01" refname="inverted_global" reftype="site"/>
+    <!-- May need to add: refname="inverted_global" reftype="site" if the lidar data is inverted -->
+    <framepos name="head_lidar_pos_sensor" objtype="site" objname="head_lidar_site" noise="0.01"/>
+    <framequat name="head_lidar_orientation_sensor" objtype="site" objname="head_lidar_site" noise="0.01"/>
     <gyro name="head_lidar_gyro" site="head_lidar_site" noise="0.01"/>
     <velocimeter name="head_lidar_velocimeter" site="head_lidar_site"/>
 

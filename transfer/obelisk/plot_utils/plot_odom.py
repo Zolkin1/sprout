@@ -223,12 +223,14 @@ def plot_orientation_angular_velocity(time: np.ndarray, quat_x: np.ndarray, quat
 
 def main():
     parser = argparse.ArgumentParser(description='Plot odometry data from CSV file')
-    parser.add_argument('csv_path', nargs='?', help='Path to CSV file (optional)')
+    parser.add_argument('--data', help='Path to CSV file (if not provided, uses most recent from odom_logs)')
+    parser.add_argument('--start-time', type=float, default=0.0, help='Start time for plotting (seconds, default: 0.0)')
+    parser.add_argument('--end-time', type=float, default=None, help='End time for plotting (seconds, default: None - use all data)')
     args = parser.parse_args()
     
     # Determine CSV file to use
-    if args.csv_path:
-        csv_path = args.csv_path
+    if args.data:
+        csv_path = args.data
         if not os.path.exists(csv_path):
             print(f"Error: CSV file not found: {csv_path}")
             sys.exit(1)
@@ -248,40 +250,47 @@ def main():
     # Determine save directory (same as CSV file)
     save_dir = os.path.dirname(csv_path)
     
-    # Create plots
-    # Set start time (in seconds) - adjust as needed
-    start_time = 0.0  # Start from beginning, change to trim initial data
+    # Get time range from arguments
+    start_time = args.start_time
+    end_time = args.end_time
     
     # Find index corresponding to start time
     start_idx = np.searchsorted(time, start_time)
     start_idx = max(0, min(start_idx, len(time) - 1))  # Clamp to valid range
     
-    print(f"Starting plot from time {time[start_idx]:.2f}s (index {start_idx})")
+    # Find index corresponding to end time
+    if end_time is not None:
+        end_idx = np.searchsorted(time, end_time)
+        end_idx = max(0, min(end_idx, len(time)))  # Clamp to valid range
+        print(f"Plotting data from time {time[start_idx]:.2f}s to {time[min(end_idx-1, len(time)-1)]:.2f}s (indices {start_idx} to {end_idx-1})")
+    else:
+        end_idx = len(time)
+        print(f"Plotting data from time {time[start_idx]:.2f}s to end at {time[-1]:.2f}s (index {start_idx} to end)")
     
-    # Slice all arrays from start index
-    time = time[start_idx:]
-    pos_x = pos_x[start_idx:]
-    pos_y = pos_y[start_idx:]
-    pos_z = pos_z[start_idx:]
-    vel_x = vel_x[start_idx:]
-    vel_y = vel_y[start_idx:]
-    vel_z = vel_z[start_idx:]
-    ang_vel_x = ang_vel_x[start_idx:]
-    ang_vel_y = ang_vel_y[start_idx:]
-    ang_vel_z = ang_vel_z[start_idx:]
-    ang_z_filtered = ang_z_filtered[start_idx:]
-    quat_x = quat_x[start_idx:]
-    quat_y = quat_y[start_idx:]
-    quat_z = quat_z[start_idx:]
-    quat_w = quat_w[start_idx:]
-    yaw = yaw[start_idx:]
-    yaw_target = yaw_target[start_idx:]
-    yaw_error = yaw_error[start_idx:]
-    yaw_rate_cmd = yaw_rate_cmd[start_idx:]
-    x_cmd = x_cmd[start_idx:]
-    y_cmd = y_cmd[start_idx:]
-    y_vel_avg = y_vel_avg[start_idx:]
-    y_pos_target = y_pos_target[start_idx:]
+    # Slice all arrays from start index to end index
+    time = time[start_idx:end_idx]
+    pos_x = pos_x[start_idx:end_idx]
+    pos_y = pos_y[start_idx:end_idx]
+    pos_z = pos_z[start_idx:end_idx]
+    vel_x = vel_x[start_idx:end_idx]
+    vel_y = vel_y[start_idx:end_idx]
+    vel_z = vel_z[start_idx:end_idx]
+    ang_vel_x = ang_vel_x[start_idx:end_idx]
+    ang_vel_y = ang_vel_y[start_idx:end_idx]
+    ang_vel_z = ang_vel_z[start_idx:end_idx]
+    ang_z_filtered = ang_z_filtered[start_idx:end_idx]
+    quat_x = quat_x[start_idx:end_idx]
+    quat_y = quat_y[start_idx:end_idx]
+    quat_z = quat_z[start_idx:end_idx]
+    quat_w = quat_w[start_idx:end_idx]
+    yaw = yaw[start_idx:end_idx]
+    yaw_target = yaw_target[start_idx:end_idx]
+    yaw_error = yaw_error[start_idx:end_idx]
+    yaw_rate_cmd = yaw_rate_cmd[start_idx:end_idx]
+    x_cmd = x_cmd[start_idx:end_idx]
+    y_cmd = y_cmd[start_idx:end_idx]
+    y_vel_avg = y_vel_avg[start_idx:end_idx]
+    y_pos_target = y_pos_target[start_idx:end_idx]
     plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, 
                           x_cmd, y_cmd, y_vel_avg, y_pos_target, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,

@@ -18,13 +18,18 @@ from obelisk_py.core.utils.ros import spin_obelisk
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
+import rclpy.duration
 from sensor_msgs.msg import Joy
+import tf2_ros
+from tf2_ros import TransformException
+from geometry_msgs.msg import TransformStamped
 
 class HighLevelController(ObeliskController, ABC):
     """High level controller. This is responsible for converting input and some sensors into commanded velocities."""
 
     def __init__(self, node_name: str = "high_level_controller"):
         super().__init__(node_name, VelocityCommand, Joy)
+
         # Velocity limits
         self.declare_parameter("v_x_max", 1.0)
         self.declare_parameter("v_x_min", -1.0)
@@ -53,11 +58,21 @@ class HighLevelController(ObeliskController, ABC):
         # Incremental velocity parameters
         self.declare_parameter("vel_increment", 0.1)
         self.vel_increment = self.get_parameter("vel_increment").get_parameter_value().double_value
+        self.declare_parameter("vel_increment_start", 0.0)
+        self.vel_increment_start = self.get_parameter("vel_increment_start").get_parameter_value().double_value
 
         # Straight line walking parameters
         self.declare_parameter("use_odom", False)
         self.use_odom = self.get_parameter("use_odom").get_parameter_value().bool_value
         if self.use_odom:
+            self.declare_parameter("use_tf2", True)
+            self.use_tf2 = self.get_parameter("use_tf2").get_parameter_value().bool_value
+
+            if self.use_tf2:
+                # Initialize tf2 buffer and listener
+                self.tf_buffer = tf2_ros.Buffer()
+                self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
             self.declare_parameter("kp_yaw", 1.0)
             self.declare_parameter("kd_yaw", 0.5)
             self.kp_yaw = self.get_parameter("kp_yaw").get_parameter_value().double_value
@@ -79,6 +94,8 @@ class HighLevelController(ObeliskController, ABC):
             self.y_vel_target = 0.0
             self.yaw_init = 0.0
             self.x_target = 0.0
+            self.x_cmd = 0.0
+            self.y_cmd = 0.0
 
             self.ang_z_window = deque(maxlen=20)
             self.y_pos_window = deque(maxlen=10)
@@ -118,24 +135,25 @@ class HighLevelController(ObeliskController, ABC):
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
 
-                # Need to get the waist joint
-                self.waist_joint_angle = 0.0
-                self.register_obk_subscription(
-                    "sub_joint_encoders",
-                    self.joint_encoders_callback,  # type: ignore
-                    ObkJointEncoders,
-                    key="sub_joint_encoders",  # key can be specified here or in the config file
-                )
-
-                # Declare subscriber to odometry
-                self.register_obk_subscription(
-                    "sub_odom_setting",
-                    self.odom_callback,  # type: ignore
-                    key="sub_odom_key",  # key can be specified here or in the config file
-                    msg_type=Odometry,
-                )
             else:
                 self.log_odom = False
+
+            # Need to get the waist joint
+            self.waist_joint_angle = 0.0
+            self.register_obk_subscription(
+                "sub_joint_encoders",
+                self.joint_encoders_callback,  # type: ignore
+                ObkJointEncoders,
+                key="sub_joint_encoders",  # key can be specified here or in the config file
+            )
+
+            # Declare subscriber to odometry
+            self.register_obk_subscription(
+                "sub_odom_setting",
+                self.odom_callback,  # type: ignore
+                key="sub_odom_key",  # key can be specified here or in the config file
+                msg_type=Odometry,
+            )
 
         # Declare subscriber to velocity commands from the Untiree joystick node
         self.register_obk_subscription(
@@ -147,37 +165,76 @@ class HighLevelController(ObeliskController, ABC):
 
         self.cmd_vel = np.zeros((3,))
 
+    def get_transform(self, target_frame: str, source_frame: str, timeout_sec: float = 1.0) -> TransformStamped:
+        """Get transform from tf2 buffer.
+        
+        Args:
+            target_frame: Target frame name
+            source_frame: Source frame name  
+            timeout_sec: Timeout for transform lookup in seconds
+            
+        Returns:
+            TransformStamped: The requested transform
+            
+        Raises:
+            TransformException: If transform cannot be found
+        """
+        try:
+            # Get the transform at current time
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                self.get_clock().now(),
+                timeout=rclpy.duration.Duration(seconds=timeout_sec)
+            )
+            return transform
+        except TransformException as ex:
+            self.get_logger().warn(f'Could not transform {source_frame} to {target_frame}: {ex}')
+            raise
+
     def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
         """Callback for the joint encoders."""
         self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
 
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
+        # All positions should be in the z-up world aligned frame
+        # velocities are in the inverted body frame
+        if self.use_tf2:
+            self.get_logger().info("Using tf2!")
+            # Position comes from the tf2 transform
+            tf = self.get_transform("camera_init", "odom")
+            q = tf.transform.rotation
+            pos = tf.transform.translation
+        else:
+            # Position comes from the odometry message
+            q = msg.pose.pose.orientation
+            pos = msg.pose.pose.position
         ##
-        # P yaw controller:
+        # Get Yaw
         ##
         # Get the yaw from the quaternion
-        q = msg.pose.pose.orientation
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = -np.arctan2(siny_cosp, cosy_cosp)
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
         self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign/put back
 
 
         # Angular z moving avg:
         self.ang_z_vel = -msg.twist.twist.angular.z     # Put into the correct frame
         self.ang_z_window.append(self.ang_z_vel)
-        ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
 
         ##
-        # Position Values
+        # Get Position Values
         ##
-        self.x_pos_cur, self.y_pos_cur = rotate_into_yaw(self.yaw_init, msg.pose.pose.position.x, msg.pose.pose.position.y)
-        self.y_pos_cur *= -1
-        self.z_pos_cur = -msg.pose.pose.position.z
+        self.x_pos_cur, self.y_pos_cur = rotate_into_yaw(self.yaw_init, pos.x, pos.y)
+        self.z_pos_cur = pos.z
+
+        self.y_pos_window.append(self.y_pos_cur)
+
 
         ##
-        # Put the linear velocities into the correct frame
+        # Get Velocities
         ##
         # Put them into the world frame
         x_vel_w, y_vel_w = rotate_into_yaw(self.yaw_cur, msg.twist.twist.linear.x, -msg.twist.twist.linear.y)
@@ -188,49 +245,10 @@ class HighLevelController(ObeliskController, ABC):
         # Flip z to the correct frame
         self.z_vel_cur = -msg.twist.twist.linear.z
 
-        self.y_pos_window.append(self.y_pos_cur)
-        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
-
         self.y_vel_window.append(self.y_vel_cur)
-        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
 
-        ##
-        # Yaw Control
-        ##
-
-        target_dist = 3 # m
-        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
-
-        # Update the yaw target using a PD controller
-        yaw_error = self.yaw_cur - self.yaw_target
-        if yaw_error > np.pi:
-            yaw_error -= 2 * np.pi
-        elif yaw_error < -np.pi:
-            yaw_error += 2 * np.pi
-        yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_z_filtered
-
-        # Clamp the yaw rate command
-        self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
-
-        ##
-        # Compute an X PD controller to adjust the forward velocity based on the X position
-        ##
-        self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (self.x_vel_cur)
-
-        ##
-        # PD On y position acting on y position
-        ##
-        gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
-        self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
-        self.y_cmd *= gain_sign
-        self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
-
-        # self.y_cmd = 0.0
-        # self.get_logger().info(f"y: {self.y_pos_cur}")
-
-        self.x_cmd = self.cmd_vel[0]
         # Log odometry data if enabled
-        if self.log_odom and self.odom_count % 2 == 0:
+        if self.log_odom and self.odom_count % 1 == 0:
             current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
             
             # Extract orientation (quaternion)
@@ -238,7 +256,11 @@ class HighLevelController(ObeliskController, ABC):
                         
             # Extract angular velocity
             ang_vel = msg.twist.twist.angular
-            
+
+            yaw_error = self.yaw_cur - self.yaw_target
+            y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
+            ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
+
             # Write row to CSV
             # TODO: Make it easier to add stuff to the plots, add y vel to the plots
             self.odom_writer.writerow([
@@ -252,6 +274,47 @@ class HighLevelController(ObeliskController, ABC):
             ])
 
         self.odom_count += 1
+
+    def compute_odom_control(self):
+        ##
+        # Yaw Control
+        ##
+        target_dist = 3 # m
+        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
+
+        ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
+
+        yaw_error = self.yaw_cur - self.yaw_target
+        if yaw_error > np.pi:
+            yaw_error -= 2 * np.pi
+        elif yaw_error < -np.pi:
+            yaw_error += 2 * np.pi
+        yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_z_filtered
+
+        # Clamp the yaw rate command
+        self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+
+        ##
+        # Y Control
+        ##
+        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
+
+
+        gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
+        self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
+        self.y_cmd *= gain_sign
+        self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
+
+        # self.y_cmd = 0.0
+        # self.get_logger().info(f"y: {self.y_pos_cur}")
+
+        ##
+        # X Control
+        ##
+        # self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (self.x_vel_cur)
+        self.x_cmd = self.cmd_vel[0]
+
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
@@ -315,7 +378,7 @@ class HighLevelController(ObeliskController, ABC):
             self.last_B_press = now
             self.lin_vel_mode = "incremental"
             self.cmd_vel = np.zeros((3,))
-            self.cmd_vel[0] = 1.0     
+            self.cmd_vel[0] = self.vel_increment_start     
             self.get_logger().info("Joystick incremental velocity mode enabled!")
 
         X = 2
@@ -375,6 +438,8 @@ class HighLevelController(ObeliskController, ABC):
             msg.w_z = float(self.cmd_vel[2])
             
             if self.use_odom and self.ang_vel_mode == "odom":
+                self.compute_odom_control()
+
                 msg.w_z = float(self.yaw_rate_cmd)
 
                 msg.v_y = float(self.y_cmd)
