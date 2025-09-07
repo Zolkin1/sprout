@@ -78,25 +78,32 @@ def walk_run_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], update_i
     return top_vel
 
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25),
-        scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
+    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25,0.1),
+        scale: tuple[float,float] = (0.01,0.01,0.01), update_interval: int = 100,
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
     new_max_eta_err = term_cfg.params["eta_max"]
     new_max_eta_dot_err = term_cfg.params["eta_dot_max"]
-    # clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
+
+    clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
+    clf_max_eta_err = clf_cfg.params["max_eta_err"]
 
     if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
-            #the err
-            new_max_eta_err = max(new_max_eta_err - scale[0],min_max_err[0])
-            new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1],min_max_err[1])
-        
-            # term_cfg.params["max_eta_err"] = new_max_eta_err
-            # env.reward_manager.set_term_cfg("clf_reward", term_cfg)
+            # Vdot update
+            new_max_eta_err = max(new_max_eta_err - scale[0], min_max_err[0])
+            new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1], min_max_err[1])
+
             term_cfg.params["eta_max"] = new_max_eta_err
             term_cfg.params["eta_dot_max"] = new_max_eta_dot_err
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
+
+            # V update
+            clf_max_eta_err = max(clf_max_eta_err - scale[2], min_max_err[2])
+
+            clf_cfg.params["max_eta_err"] = clf_max_eta_err
+            env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
+
     return new_max_eta_err
 
 def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float,

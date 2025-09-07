@@ -73,7 +73,16 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
+
+    # Get the commanded vel
+    commanded_velocity = env.command_manager.get_command("base_velocity")
+
     phase = 2*torch.pi * cmd.gait_cycle_prop
+
+    # Zero the phase if we are standing (check all environments)
+    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    phase[standing_mask] = 0
+
     sphase = torch.sin(phase)
     if sphase.ndim == 1:
         # [B] → [B, 1]
@@ -83,7 +92,16 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
 def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
+
+    # Get the commanded vel
+    commanded_velocity = env.command_manager.get_command("base_velocity")
+
     phase = 2*torch.pi * cmd.gait_cycle_prop
+
+    # Zero the phase if we are standing (check all environments)
+    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    phase[standing_mask] = 0
+
     cphase = torch.cos(phase)
     if cphase.ndim == 1:
         # [B] → [B, 1]

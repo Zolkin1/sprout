@@ -44,14 +44,20 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
         # -- ang vel yaw - rotation around z
         self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
-        # heading target
-        if self.cfg.heading_command:
-            self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
-            # update heading envs
-            self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
 
         # Determine how many envs are using y PD controllers
         self.is_y_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_y_envs
+
+        # heading target
+        if self.cfg.heading_command:
+            self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
+
+            # all envs should also be heading envs to prevent conflicts
+            self.is_heading_env[env_ids] = self.is_y_env[env_ids]
+
+            # update heading envs
+            # self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
+
 
         # update standing envs
         self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs

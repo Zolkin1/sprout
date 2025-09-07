@@ -208,9 +208,9 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_decreasing_condition.weight = -1
         # self.curriculum.clf_curriculum = None
         self.curriculum.clf_curriculum.params = {
-            "min_max_err": (0.1,0.1),
-            "scale": (0.005,0.005), #0.001
-            "update_interval": 20000
+            "min_max_err": (0.1,0.1,0.1),
+            "scale": (0.005,0.005,0.005), #0.001
+            "update_interval": 200 #20000
         }
 
         self.curriculum.terrain_levels = None
@@ -300,6 +300,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (1.1,3.0) #(1.1, 2.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
+        # self.commands.base_velocity.rel_standing_envs = 1.0
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
