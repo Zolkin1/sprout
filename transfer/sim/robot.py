@@ -108,8 +108,8 @@ class Robot:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(0.75*self.joystick.get_axis(0))
-            vx = -(2.0*self.joystick.get_axis(1))
+            vy = -(0.5*self.joystick.get_axis(0))
+            vx = -(3.0*self.joystick.get_axis(1))
             vyaw = -(self.joystick.get_axis(3)) * 0.5
 
             des_vel[0] = vx

@@ -10,3 +10,5 @@ class TreadmillVelocityCommandCfg(UniformVelocityCommandCfg):
     y_pos_kp: float = 0.0
 
     y_pos_kd: float = 0.0
+
+    rel_y_envs: float = 0.0

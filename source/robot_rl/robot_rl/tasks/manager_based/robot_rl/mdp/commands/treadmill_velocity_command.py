@@ -24,6 +24,8 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
 
         self.cfg.ranges.heading = (0.0, 0.0)    # Never want to sample a heading that causes a y change.
 
+        self.is_y_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
     def __str__(self) -> str:
         """Return a string representation of the command."""
         msg = "NormalVelocityCommand:\n"
@@ -38,6 +40,8 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
         r = torch.empty(len(env_ids), device=self.device)
         # -- linear velocity - x direction
         self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
+        # -- linear velocity - y direction
+        self.vel_command_b[env_ids, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
         # -- ang vel yaw - rotation around z
         self.vel_command_b[env_ids, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
         # heading target
@@ -46,8 +50,8 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
             # update heading envs
             self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
 
-
-        # No y vel update, since we DON'T resample the target position.
+        # Determine how many envs are using y PD controllers
+        self.is_y_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_y_envs
 
         # update standing envs
         self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
@@ -70,10 +74,12 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
                 max=self.cfg.ranges.ang_vel_z[1],
             )
 
+        y_env_ids = self.is_y_env.nonzero(as_tuple=False).flatten()
+
         # Compute Y velocity command
-        y_error = self.y_target - self.robot.data.root_pos_w[:, 1]
-        y_vel_error = -self.robot.data.root_vel_w[:, 1]
-        self.vel_command_b[:, 1] = torch.clip(
+        y_error = self.y_target - self.robot.data.root_pos_w[y_env_ids, 1]
+        y_vel_error = -self.robot.data.root_vel_w[y_env_ids, 1]
+        self.vel_command_b[y_env_ids, 1] = torch.clip(
                 self.cfg.y_pos_kp * y_error + self.cfg.y_pos_kd * y_vel_error,
                 min=self.cfg.ranges.lin_vel_y[0],
                 max=self.cfg.ranges.lin_vel_y[1],

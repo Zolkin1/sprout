@@ -86,7 +86,8 @@ class G1RunningGaitLibraryCommandsCfg:
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
         rel_standing_envs=0.02,
-        rel_heading_envs=1.0,
+        rel_heading_envs=0.6,
+        rel_y_envs=0.6,
         heading_command=True,
         heading_control_stiffness=0.5,
         y_pos_kp=1.5, #0.4,
@@ -140,7 +141,7 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
-                                                   "update_amnt": 0.3})
+                                                   "update_amnt": 0.1})
 
     # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
     #                                     params={"update_interval": 20000,
@@ -175,7 +176,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)  # Note the curriculum for increasing
 
         self.events.reset_base.params = {
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (0.0, 0.0)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
@@ -196,7 +197,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "hzd_ref",
-            "max_eta_err": 0.22,
+            "max_eta_err": 0.3,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "hzd_ref",
@@ -213,8 +214,6 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         }
 
         self.curriculum.terrain_levels = None
-
-        self.events.reset_base.params["pose_range"]["yaw"] = (0, 0)
 
         self.rewards.dof_acc_l2 = None
         self.rewards.dof_vel_l2 = None
@@ -255,7 +254,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.events.randomize_ground_contact_friction.params['restitution_range'] = (0.0, 0.2)
 
         # Update push forces
-        self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.5, 0.5)}
+        self.events.push_robot.params['velocity_range'] = {"x": (-0.75, 0.75), "y": (-0.75, 0.75)}
 
         # Make the COM randomization on the torso rather than the pelvis
         self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
@@ -298,7 +297,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (0.6,2.0) #(1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1,3.0) #(1.1, 2.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.scene.num_envs = 2
