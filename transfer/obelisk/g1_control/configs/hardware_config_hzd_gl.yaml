@@ -126,7 +126,7 @@ onboard:
           callback_group: None
         # ----- Odom subscriber ----- #
         - ros_parameter: sub_odom_setting
-          topic: /obelisk/g1/Odometery
+          topic: /Odometry
           history_depth: 10
           callback_group: None
         # ----- Unitree High Level subscriber ----- #

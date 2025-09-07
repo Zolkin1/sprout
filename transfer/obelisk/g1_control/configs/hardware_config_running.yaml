@@ -101,15 +101,15 @@ onboard:
         v_y_max: 0.2
         w_z_max: 0.35
         vel_increment: 0.1
-        kp_yaw: 0.2 #0.35
-        kd_yaw: 0.0 #0.15
+        kp_yaw: 0.35 #0.2 #0.35
+        kd_yaw: 0.15 #0.0 #0.15
         kp_x: 1.0
         kd_x: 0.1
-        kp_y: 0.5 #1.2
-        kd_y: 0.0 #0.3
+        kp_y: 0.8 #1.2
+        kd_y: 0.3 #0.3
         use_odom: True
         log_odom: True
-        vel_increment_start: 1.0
+        vel_increment_start: 0.7
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting

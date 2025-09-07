@@ -180,7 +180,7 @@ class HighLevelController(ObeliskController, ABC):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         yaw = np.arctan2(siny_cosp, cosy_cosp)
-        self.yaw_cur = yaw #- self.waist_joint_angle # TODO: Check sign/put back
+        self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign/put back
 
 
         # Angular z moving avg:
@@ -236,11 +236,14 @@ class HighLevelController(ObeliskController, ABC):
         self.odom_count += 1
 
     def compute_odom_control(self):
+
+        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+
         ##
         # Yaw Control
         ##
         target_dist = 3 # m
-        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist)
+        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist) + self.yaw_init
 
         ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
 
@@ -257,14 +260,15 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # Y Control
         ##
-        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
         y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
 
-
+        # TODO: Remove/debug the gain sign
         gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
         self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
         self.y_cmd *= gain_sign
         self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
+        # TODO: How can y_cmd be positive when both errors are positive? Gain sign error? Logging error?
+        # TODO: Try moving logging here
 
         # self.y_cmd = 0.0
         # self.get_logger().info(f"y: {self.y_pos_cur}")
