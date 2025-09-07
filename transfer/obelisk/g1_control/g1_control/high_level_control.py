@@ -20,9 +20,6 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
 from sensor_msgs.msg import Joy
-import tf2_ros
-from tf2_ros import TransformException
-import tf2_geometry_msgs
 from geometry_msgs.msg import TransformStamped
 
 class HighLevelController(ObeliskController, ABC):
@@ -66,14 +63,6 @@ class HighLevelController(ObeliskController, ABC):
         self.declare_parameter("use_odom", False)
         self.use_odom = self.get_parameter("use_odom").get_parameter_value().bool_value
         if self.use_odom:
-            self.declare_parameter("use_tf2", True)
-            self.use_tf2 = self.get_parameter("use_tf2").get_parameter_value().bool_value
-
-            if self.use_tf2:
-                # Initialize tf2 buffer and listener
-                self.tf_buffer = tf2_ros.Buffer()
-                self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
             self.declare_parameter("kp_yaw", 1.0)
             self.declare_parameter("kd_yaw", 0.5)
             self.kp_yaw = self.get_parameter("kp_yaw").get_parameter_value().double_value
@@ -166,33 +155,6 @@ class HighLevelController(ObeliskController, ABC):
 
         self.cmd_vel = np.zeros((3,))
 
-    def get_transform(self, target_frame: str, source_frame: str, timeout_sec: float = 1.0) -> TransformStamped:
-        """Get transform from tf2 buffer.
-        
-        Args:
-            target_frame: Target frame name
-            source_frame: Source frame name  
-            timeout_sec: Timeout for transform lookup in seconds
-            
-        Returns:
-            TransformStamped: The requested transform
-            
-        Raises:
-            TransformException: If transform cannot be found
-        """
-        try:
-            # Get the transform at current time
-            transform = self.tf_buffer.lookup_transform(
-                target_frame,
-                source_frame,
-                self.get_clock().now(),
-                timeout=rclpy.duration.Duration(seconds=timeout_sec)
-            )
-            return transform
-        except TransformException as ex:
-            self.get_logger().warn(f'Could not transform {source_frame} to {target_frame}: {ex}')
-            raise
-
     def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
         """Callback for the joint encoders."""
         self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
@@ -201,23 +163,15 @@ class HighLevelController(ObeliskController, ABC):
         """Callback for odometry messages."""
         # All positions should be in the z-up world aligned frame
         # velocities are in the inverted body frame
-        if self.use_tf2:
-            # Position comes from the tf2 transform
-            tf = self.get_transform("camera_init", "odom")
-            q = tf.transform.rotation
-            pos = tf.transform.translation
 
-            twist_w = tf2_geometry_msgs.do_transform_twist(msg.twist.twist, tf)
-        else:
-            # Position comes from the odometry message
-            q = msg.pose.pose.orientation
-            pos = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        pos = msg.pose.pose.position
 
-            twist_w = msg.twist.twist
+        twist_w = msg.twist.twist
 
-            # negate the twist z vels
-            twist_w.angular.z = -msg.twist.twist.angular.z
-            twist_w.linear.z = -msg.twist.twist.linear.z
+        # # negate the twist z vels
+        # twist_w.angular.z = -msg.twist.twist.angular.z
+        # twist_w.linear.z = -msg.twist.twist.linear.z
 
         ##
         # Get Yaw
@@ -226,7 +180,7 @@ class HighLevelController(ObeliskController, ABC):
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
         yaw = np.arctan2(siny_cosp, cosy_cosp)
-        self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign/put back
+        self.yaw_cur = yaw #- self.waist_joint_angle # TODO: Check sign/put back
 
 
         # Angular z moving avg:

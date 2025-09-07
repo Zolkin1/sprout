@@ -91,7 +91,6 @@ onboard:
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
-        use_tf2: False
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
