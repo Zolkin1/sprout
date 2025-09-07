@@ -77,7 +77,7 @@ class TreadmillVelocityCommand(UniformVelocityCommand):
         y_env_ids = self.is_y_env.nonzero(as_tuple=False).flatten()
 
         # Compute Y velocity command
-        y_error = self.y_target - self.robot.data.root_pos_w[y_env_ids, 1]
+        y_error = self.y_target[y_env_ids] - self.robot.data.root_pos_w[y_env_ids, 1]
         y_vel_error = -self.robot.data.root_vel_w[y_env_ids, 1]
         self.vel_command_b[y_env_ids, 1] = torch.clip(
                 self.cfg.y_pos_kp * y_error + self.cfg.y_pos_kd * y_vel_error,
