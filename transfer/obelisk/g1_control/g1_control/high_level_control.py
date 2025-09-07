@@ -263,9 +263,9 @@ class HighLevelController(ObeliskController, ABC):
         y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
 
         # TODO: Remove/debug the gain sign
-        gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
+        # gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
         self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
-        self.y_cmd *= gain_sign
+        # self.y_cmd *= gain_sign
         self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
         # TODO: How can y_cmd be positive when both errors are positive? Gain sign error? Logging error?
         # TODO: Try moving logging here
@@ -415,8 +415,8 @@ class HighLevelController(ObeliskController, ABC):
             return msg
     
 def rotate_into_yaw(yaw, x, y) -> tuple[float, float]:
-    x_new = np.cos(yaw)*x - np.sin(yaw)*y
-    y_new = np.sin(yaw)*x + np.cos(yaw)*y
+    x_new = np.cos(yaw)*x + np.sin(yaw)*y
+    y_new = -np.sin(yaw)*x + np.cos(yaw)*y
 
     return (x_new, y_new)
 

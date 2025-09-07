@@ -98,11 +98,11 @@ onboard:
       params:
         v_x_min: 0.0
         v_x_max: 2.0
-        v_y_max: 0.2
-        w_z_max: 0.35
+        v_y_max: 0.4
+        w_z_max: 0.5
         vel_increment: 0.1
-        kp_yaw: 0.35 #0.2 #0.35
-        kd_yaw: 0.15 #0.0 #0.15
+        kp_yaw: 0.4 #0.2 #0.35
+        kd_yaw: 0.0 #0.0 #0.15
         kp_x: 1.0
         kd_x: 0.1
         kp_y: 0.8 #1.2
