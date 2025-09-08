@@ -126,7 +126,8 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
         params={"command_name": "hzd_ref",
                 "base_vel_cmd": "base_velocity",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-                "weight_scalar": 0.0},
+                "weight_scalar": 0.0,
+                "start_vel": 2.0},
     )
 
     # track_lin_vel_y_exp = RewTerm(
