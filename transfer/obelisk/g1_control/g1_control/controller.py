@@ -472,8 +472,12 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
 
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+        if np.linalg.norm(self.cmd_vel) < 0.05:
+            sin_phase = 0.0
+            cos_phase = 1.0
+        else:
+            sin_phase = np.sin(2 * np.pi * self.time / self.period)
+            cos_phase = np.cos(2 * np.pi * self.time / self.period)
 
         obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 

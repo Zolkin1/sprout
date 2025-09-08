@@ -244,13 +244,13 @@ class RLPolicy:
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action_isaac  # Past action
 
-        if des_vel[0] < 0.05:
-            # For removing jitter during standing
-            sin_phase = np.sin(0)
-            cos_phase = np.cos(0)
-        else:
-            sin_phase = np.sin(2 * np.pi * time / self.period)
-            cos_phase = np.cos(2 * np.pi * time / self.period)
+        # if des_vel[0] < 0.05:
+        #     # For removing jitter during standing
+        #     sin_phase = np.sin(0)
+        #     cos_phase = np.cos(0)
+        # else:
+        sin_phase = np.sin(2 * np.pi * time / self.period)
+        cos_phase = np.cos(2 * np.pi * time / self.period)
 
         if height_map is not None:
             height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)

@@ -7,7 +7,9 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_name: "running_hzd_clf/9_7_partial_pd_gl7.pt"
+        hf_policy_name: "running_hzd_clf/9_7_fl_af_15_gl7.pt"
+        # hf_policy_name: "running_hzd_clf/9_7_v_curr_stand_gl7.pt"
+        # hf_policy_name: "running_hzd_clf/9_7_partial_pd_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_6_eta_035_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_6_eta_03_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_6_new_weights_gl7.pt"
@@ -93,7 +95,7 @@ onboard:
         kd_y: 0.3
         use_odom: True
         log_odom: True
-        vel_increment_start: 0.7
+        vel_increment_start: 1.0
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
