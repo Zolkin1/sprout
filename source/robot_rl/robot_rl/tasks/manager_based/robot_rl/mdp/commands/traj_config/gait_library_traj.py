@@ -677,6 +677,7 @@ class GaitLibraryEndEffectorConfig:
         # Add the y offset to the COM y
         delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
         des_pos[:, 1] += delta_y
+        des_vel[:, 1] += base_velocity[:, 1]
 
         return des_pos, des_vel
     
