@@ -210,7 +210,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.curriculum.clf_curriculum.params = {
             "min_max_err": (0.1,0.1,0.2),
             "scale": (0.005,0.005,0.005), #0.001
-            "update_interval": 200 #20000
+            "update_interval": 20000
         }
 
         self.curriculum.terrain_levels = None
