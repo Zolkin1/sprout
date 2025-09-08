@@ -208,7 +208,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.rewards.clf_decreasing_condition.weight = -1
         # self.curriculum.clf_curriculum = None
         self.curriculum.clf_curriculum.params = {
-            "min_max_err": (0.1,0.1,0.1),
+            "min_max_err": (0.1,0.1,0.2),
             "scale": (0.005,0.005,0.005), #0.001
             "update_interval": 200 #20000
         }

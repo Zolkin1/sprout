@@ -94,3 +94,4 @@ transfer/sim/MUJOCO_LOG.TXT
 transfer/sim/experiments/plots
 paper_figures/
 transfer/sim/experiments/comparison_logs
+/amy_remote_mount/
