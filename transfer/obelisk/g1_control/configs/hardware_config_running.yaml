@@ -7,8 +7,10 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
+        # hf_policy_name: "running_hzd_clf/9_7_fl_af_15_gl7.pt"
+        hf_policy_name: "running_hzd_clf/9_7_v_curr_stand_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_4_inc_y_weight_inc_con_pen_gl6.pt"
-        hf_policy_name: "running_hzd_clf/9_4_y_pd_gl5-2.pt"
+        # hf_policy_name: "running_hzd_clf/9_4_y_pd_gl5-2.pt"
         # hf_policy_name: "running_hzd_clf/9_2_y_cmd_no_con_pen_gl5-2.pt"
         # hf_policy_name: "running_hzd_clf/9_1_yaw_mod_gl5-2_no_con_pen.pt"
         hf_repo_id: "zolkin/robot_rl"
@@ -109,7 +111,7 @@ onboard:
         kd_y: 0.3 #0.3
         use_odom: True
         log_odom: True
-        vel_increment_start: 0.7
+        vel_increment_start: 0.9
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -208,7 +210,7 @@ onboard:
       executable: obelisk_unitree_g1_hardware
       params:
         ic_keyframe: standing
-        network_interface_name: enp0s31f6 #enp4s0 # From ifconfig
+        network_interface_name: enx6c1ff7207b57 #enp4s0 # From ifconfig
         default_kp: [
           30., 30., 30.,    # L hip
           30., 30., 30.,    # L knee, ankle
