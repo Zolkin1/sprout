@@ -167,6 +167,17 @@ or
 python plot_odom.py /path/to/odom_data.csv
 ```
 
+You can also use `--start-time` and `--end-time` to specify and start and end time.
+
+# Plotting the Observations and Actions
+To plot these, run:
+```
+python plot_ctrl.py
+```
+
+You can also use `--start-time` and `--end-time` to specify and start and end time.
+
+
 # Using Optitrack
 We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.
 
