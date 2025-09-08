@@ -305,3 +305,29 @@ def track_lin_vel_y_exp(
     # compute the error
     lin_vel_error =  torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
     return torch.exp(-lin_vel_error / std**2)
+
+
+def ankle_roll_zero(
+    env: ManagerBasedRLEnv, std: float = 0.1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward keeping both ankle roll joints near zero position using exponential kernel."""
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    
+    # Get ankle roll joint indices - these are typically the last joints in each leg
+    # Based on the controller.py joint order:
+    # Index 19: left_ankle_roll_joint
+    # Index 20: right_ankle_roll_joint
+    ankle_roll_indices = [19, 20]  # left and right ankle roll joints
+    
+    # Get current ankle roll joint positions
+    ankle_roll_positions = asset.data.joint_pos[:, ankle_roll_indices]  # [B, 2]
+    
+    # Compute squared error from zero position
+    ankle_roll_error = torch.square(ankle_roll_positions)  # [B, 2]
+    
+    # Sum errors for both ankle roll joints and apply exponential kernel
+    total_error = ankle_roll_error.sum(dim=-1)  # [B]
+    reward = torch.exp(-total_error / std**2)
+    
+    return reward
