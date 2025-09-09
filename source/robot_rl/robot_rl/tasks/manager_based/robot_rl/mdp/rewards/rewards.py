@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import math
+import re
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
@@ -331,3 +332,75 @@ def ankle_roll_zero(
     reward = torch.exp(-total_error / std**2)
     
     return reward
+
+def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize applied torques if they cross the limits.
+
+    This is computed as a sum of the absolute value of the difference between the applied torques and the limits.
+    For implicit actuators, we manually compute the PD controller torques.
+    """
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    
+    # Manually compute PD controller torques for implicit actuators
+    computed_torque = torch.zeros_like(asset.data.joint_pos)
+    
+    # Get current joint positions, velocities, and desired positions
+    current_pos = asset.data.joint_pos
+    current_vel = asset.data.joint_vel
+    desired_pos = asset.data.joint_pos_target
+    
+    # Access actuator configurations from the asset
+    actuator_groups = asset.cfg.actuators
+    
+    for group_name, actuator_cfg in actuator_groups.items():
+        # Get joint indices for this actuator group
+        joint_indices = asset.find_joints(actuator_cfg.joint_names_expr)[0]
+        
+        # Get stiffness and damping values for this group
+        if isinstance(actuator_cfg.stiffness, dict):
+            # Handle per-joint stiffness values
+            kp_values = torch.zeros(len(joint_indices), dtype=torch.float32, device=env.device)
+            for i, joint_idx in enumerate(joint_indices):
+                joint_name = asset.joint_names[joint_idx]
+                # Find matching stiffness pattern
+                for pattern, value in actuator_cfg.stiffness.items():
+                    if re.match(pattern.replace(".*", ".*"), joint_name):
+                        kp_values[i] = value
+                        break
+        else:
+            # Single stiffness value for all joints in this group
+            kp_values = torch.full((len(joint_indices),), actuator_cfg.stiffness, dtype=torch.float32, device=env.device)
+        
+        if isinstance(actuator_cfg.damping, dict):
+            # Handle per-joint damping values
+            kd_values = torch.zeros(len(joint_indices), dtype=torch.float32, device=env.device)
+            for i, joint_idx in enumerate(joint_indices):
+                joint_name = asset.joint_names[joint_idx]
+                # Find matching damping pattern
+                for pattern, value in actuator_cfg.damping.items():
+                    if re.match(pattern.replace(".*", ".*"), joint_name):
+                        kd_values[i] = value
+                        break
+        else:
+            # Single damping value for all joints in this group
+            kd_values = torch.full((len(joint_indices),), actuator_cfg.damping, dtype=torch.float32, device=env.device)
+        
+        # Compute PD torques for this group: tau = kp * (q_des - q) - kd * q_dot
+        pos_error = desired_pos[:, joint_indices] - current_pos[:, joint_indices]
+        pd_torque = (kp_values[None, :] * pos_error - kd_values[None, :] * current_vel[:, joint_indices])
+        
+        # Store computed torques
+        computed_torque[:, joint_indices] = pd_torque
+    
+    # Compute torque limit violations
+    torque_limits_upper = asset.data.joint_effort_limits[0, asset_cfg.joint_ids]  # Upper limits
+
+    # Get computed torques for the specified joints
+    joint_torques = computed_torque[:, asset_cfg.joint_ids]
+    
+    # Compute violations: how much torques exceed the limits
+    violation = torch.clamp(torch.abs(joint_torques) - torque_limits_upper, min=0)
+
+    # Sum all violations
+    return torch.sum(violation, dim=1)

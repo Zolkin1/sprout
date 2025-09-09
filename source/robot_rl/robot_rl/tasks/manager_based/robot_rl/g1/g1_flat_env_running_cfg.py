@@ -130,11 +130,16 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
                 "start_vel": 2.0},
     )
 
-    ankle_roll_zero = RewTerm(
-        func=mdp.ankle_roll_zero,
-        weight=1.0,
-        params={"std": 0.2},
+    torque_lims = RewTerm(
+        func=mdp.torque_limits,
+        weight=-1.0,
     )
+
+    # ankle_roll_zero = RewTerm(
+    #     func=mdp.ankle_roll_zero,
+    #     weight=1.0,
+    #     params={"std": 0.2},
+    # )
 
     # track_lin_vel_y_exp = RewTerm(
     #     func=mdp.track_lin_vel_y_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
