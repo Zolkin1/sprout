@@ -238,6 +238,7 @@ onboard:
                   0, 0, 0,
                   0.07, 0.24, 0, 1.39, 0, 0, 0,
                   0.07, -0.24, 0, 1.39, 0, 0, 0]
+        logging: True
     # - is_simulated: True
     #   pkg: robot_sim
     #   executable: simulation
