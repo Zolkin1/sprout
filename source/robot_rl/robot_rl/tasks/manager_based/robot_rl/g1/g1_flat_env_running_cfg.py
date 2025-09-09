@@ -130,11 +130,16 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
                 "start_vel": 2.0},
     )
 
-    ankle_roll_zero = RewTerm(
-        func=mdp.ankle_roll_zero,
-        weight=1.0,
-        params={"std": 0.2},
+    torque_lims = RewTerm(
+        func=mdp.torque_limits,
+        weight=-1.0,
     )
+
+    # ankle_roll_zero = RewTerm(
+    #     func=mdp.ankle_roll_zero,
+    #     weight=1.0,
+    #     params={"std": 0.2},
+    # )
 
     # track_lin_vel_y_exp = RewTerm(
     #     func=mdp.track_lin_vel_y_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
@@ -240,6 +245,9 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+
+        # Other rewards
+        self.rewards.dof_torques_l2.weight = -1.0e-4
 
         ##
         # No holonomic constraint, use the CLF on the stance foot for all domains
