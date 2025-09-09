@@ -9,9 +9,9 @@ def step_to_max(sim_time):
 
 def smooth_ramp(sim_time):
     """Compute a ramp input over a few seconds up to max speed."""
-    RAMP_TIME = 2.0
+    RAMP_TIME = 1.0 # 2.0
 
-    MAX_SPEED = 0.75
+    MAX_SPEED = 2.5 #0.75
 
     slope = MAX_SPEED / RAMP_TIME
 

@@ -7,46 +7,68 @@ from sim.log_utils import extract_data, find_most_recent_timestamped_folder
 
 
 # Make plots
-def plot_joints_and_actions(data, save_dir):
-    fig, axes = plt.subplots(nrows=7, ncols=3, figsize=(10, 10))
+def plot_joints_and_actions(data, save_dir, joint_names=None):
+    fig, axes = plt.subplots(nrows=7, ncols=3, figsize=(18, 16))
 
     FLOATING_BASE = 7
 
     for i in range(7):
         for j in range(3):
-            axes[i, j].plot(data["time"], data["qpos"][:, i + 7 * j + FLOATING_BASE], label="qpos")
-            axes[i, j].plot(data["time"], data["action"][:, i + 7 * j], label="action")
-            axes[i, j].set_xlabel("time")
-            axes[i, j].set_ylabel(f"qpos {i + 7*j + FLOATING_BASE} (rad)")
+            joint_idx = i + 7 * j
+            joint_label = joint_names[joint_idx] if joint_names and joint_idx < len(joint_names) else f"joint {joint_idx}"
+            
+            axes[i, j].plot(data["time"], data["qpos"][:, joint_idx + FLOATING_BASE], label="qpos")
+            axes[i, j].plot(data["time"], data["action"][:, joint_idx], label="action")
+            axes[i, j].set_xlabel("time", fontsize=10)
+            axes[i, j].set_ylabel(f"{joint_label} (rad)", fontsize=10)
             axes[i, j].grid()
-            axes[i, j].legend()
+            axes[i, j].legend(fontsize=8)
+            axes[i, j].tick_params(axis='both', which='major', labelsize=9)
 
-    plt.savefig(os.path.join(save_dir, "joints_and_actions.png"))
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "joints_and_actions.png"), dpi=150, bbox_inches='tight')
 
 
-def plot_torques(data, save_dir):
-    fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(10, 10))
+def plot_torques(data, save_dir, joint_names=None, torque_limits=None):
+    fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(16, 14))
 
     for i in range(6):
         for j in range(2):
-            axes[i, j].plot(data["time"], data["torque"][:, i + 6 * j])
-            axes[i, j].set_xlabel("time")
-            axes[i, j].set_ylabel(f"torque {i + 6*j} (Nm)")
+            joint_idx = i + 6 * j
+            joint_label = joint_names[joint_idx] if joint_names and joint_idx < len(joint_names) else f"joint {joint_idx}"
+            
+            # Plot actual torque
+            axes[i, j].plot(data["time"], data["torque"][:, joint_idx], label="Actual")
+            
+            # Plot torque limits as dashed lines if available
+            if torque_limits and joint_idx < len(torque_limits):
+                torque_min, torque_max = torque_limits[joint_idx]
+                axes[i, j].axhline(y=torque_max, color='r', linestyle='--', alpha=0.7, label=f'Max ({torque_max:.1f})')
+                axes[i, j].axhline(y=torque_min, color='r', linestyle='--', alpha=0.7, label=f'Min ({torque_min:.1f})')
+            
+            axes[i, j].set_xlabel("time", fontsize=10)
+            axes[i, j].set_ylabel(f"{joint_label} torque (Nm)", fontsize=10)
             axes[i, j].grid()
+            axes[i, j].legend(fontsize=8)
+            axes[i, j].tick_params(axis='both', which='major', labelsize=9)
 
-    plt.savefig(os.path.join(save_dir, "torques.png"))
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "torques.png"), dpi=150, bbox_inches='tight')
 
 
-def plot_vels(data, save_dir):
+def plot_vels(data, save_dir, joint_names=None):
     fig, axes = plt.subplots(nrows=6, ncols=2, figsize=(10, 10))
 
     FLOATING_BASE = 6
 
     for i in range(6):
         for j in range(2):
-            axes[i, j].plot(data["time"], data["qvel"][:, i + 6 * j + FLOATING_BASE])
+            joint_idx = i + 6 * j
+            joint_label = joint_names[joint_idx] if joint_names and joint_idx < len(joint_names) else f"joint {joint_idx}"
+            
+            axes[i, j].plot(data["time"], data["qvel"][:, joint_idx + FLOATING_BASE])
             axes[i, j].set_xlabel("time")
-            axes[i, j].set_ylabel(f"qvel {i + 6*j + FLOATING_BASE} (rad/s)")
+            axes[i, j].set_ylabel(f"{joint_label} vel (rad/s)")
             axes[i, j].grid()
 
     plt.savefig(os.path.join(save_dir, "vels.png"))
@@ -210,10 +232,23 @@ def create_plots_for_newest():
     print(f"right_ankle_pos shape: {data['right_ankle_pos'].shape}")
     print(f"commanded_vel shape: {data['commanded_vel'].shape}")
 
+    # Get joint names and torque limits from config if available
+    joint_names = config.get("joint_names", None)
+    torque_limits = config.get("torque_limits", None)
+    if joint_names:
+        print(f"Using joint names: {joint_names}")
+    else:
+        print("No joint names found in config, using default labels")
+    
+    if torque_limits:
+        print(f"Using torque limits: {torque_limits}")
+    else:
+        print("No torque limits found in config")
+
     # Make a plot
-    plot_joints_and_actions(data, newest)
-    # plot_torques(data)
-    # plot_vels(data)
+    plot_joints_and_actions(data, newest, joint_names)
+    plot_torques(data, newest, joint_names, torque_limits)
+    # plot_vels(data, newest, joint_names)
     plot_base(data, newest)
     # import pdb; pdb.set_trace()
     # plot_ankles(data)
@@ -225,4 +260,4 @@ def create_plots_for_newest():
 
 if __name__ == "__main__":
     create_plots_for_newest()
-    plt.show()
+    # plt.show()

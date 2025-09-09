@@ -94,6 +94,20 @@ class Simulation:
         print(f"Saving rerun logs to {self.new_log_folder}.")
         self.log_file = os.path.join(self.new_log_folder, "sim_log.csv")
 
+        # Extract joint names and torque limits from actuators in the order they appear
+        joint_names = []
+        torque_limits = []
+        for i in range(self.robot.mj_model.nu):
+            actuator_id = i
+            joint_id = self.robot.mj_model.actuator_trnid[actuator_id, 0]
+            joint_name = mujoco.mj_id2name(self.robot.mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id)
+            joint_names.append(joint_name)
+            
+            # Extract torque limits (actuatorfrcrange gives [min, max])
+            torque_min = float(self.robot.mj_model.jnt_actfrcrange[actuator_id+1, 0])
+            torque_max = float(self.robot.mj_model.jnt_actfrcrange[actuator_id+1, 1])
+            torque_limits.append([torque_min, torque_max])
+
         # Save simulation configuration
         data_structure = [
             {"name": "time", "length": 1},
@@ -114,6 +128,8 @@ class Simulation:
             "policy_dt": self.policy.dt,
             "use_height_sensor": self.use_height_sensor,
             "data_structure": data_structure,
+            "joint_names": joint_names,
+            "torque_limits": torque_limits,
         }
 
         config_path = os.path.join(self.new_log_folder, "sim_config.yaml")
