@@ -247,7 +247,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
         # Other rewards
-        self.rewards.dof_torques_l2.weight = -1.0e-4
+        self.rewards.dof_torques_l2.weight = -1.0e-5
 
         ##
         # No holonomic constraint, use the CLF on the stance foot for all domains
@@ -312,9 +312,10 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1,3.0) #(1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (2.2,3.0) #(1.1, 2.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
+        self.commands.base_velocity.rel_y_envs = 1.0
         # self.commands.base_velocity.rel_standing_envs = 1.0
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5

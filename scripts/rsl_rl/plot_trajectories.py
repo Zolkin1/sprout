@@ -407,6 +407,160 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 plt.savefig(os.path.join(save_dir, f'error_metrics_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
+    # Generate focused COM and ankle plot
+    plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)
+
+
+def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
+    """Plot focused view of COM positions and left ankle position/orientation (desired vs actual)"""
+    # Set nice font for plots (LaTeX disabled due to missing packages)
+    plt.rcParams.update({
+        "text.usetex": False,
+        "font.family": "serif",
+    })
+    
+    # Convert lists to numpy arrays and handle torch tensors
+    processed_data = {}
+    for key, values in data.items():
+        if isinstance(values[0], torch.Tensor):
+            processed_data[key] = np.array([v.cpu().numpy() for v in values])
+        else:
+            processed_data[key] = np.array(values)
+    
+    # Create time array
+    time_steps = np.arange(len(processed_data[list(processed_data.keys())[0]]))
+    time = time_steps * 0.02    # Assume 50 Hz
+    
+    # Hard code number of envs to plot
+    N_ENVS_TO_PLOT = 2
+    env_ids = list(range(N_ENVS_TO_PLOT))
+    
+    # Check if we have y_out and y_act data
+    if 'y_out' not in processed_data or 'y_act' not in processed_data:
+        print("Warning: y_out or y_act data not found. Cannot create focused COM/ankle plots.")
+        return
+    
+    # Get axis names if available to identify which dimensions correspond to what
+    axis_names = []
+    if 'axis_names' in data and data['axis_names']:
+        axis_names_data = data['axis_names'][0] if isinstance(data['axis_names'], list) else data['axis_names']
+        if isinstance(axis_names_data, list):
+            axis_names = [axis_info['name'] for axis_info in axis_names_data]
+    
+    print(f"Debug - Available axis names: {axis_names}")
+    print(f"Debug - y_out shape: {processed_data['y_out'].shape}")
+    print(f"Debug - y_act shape: {processed_data['y_act'].shape}")
+    
+    for env_id in env_ids:
+        # Find indices for the metrics we want
+        com_x_idx = com_y_idx = com_z_idx = None
+        left_ankle_x_idx = left_ankle_z_idx = left_ankle_pitch_idx = None
+        
+        for i, name in enumerate(axis_names):
+            name_lower = name.lower()
+            if 'com' in name_lower and 'pos' in name_lower and 'x' in name_lower:
+                com_x_idx = i
+            elif 'com' in name_lower and 'pos' in name_lower and 'y' in name_lower:
+                com_y_idx = i
+            elif 'com' in name_lower and 'pos' in name_lower and 'z' in name_lower:
+                com_z_idx = i
+            elif 'left' in name_lower and 'ankle' in name_lower and 'pos' in name_lower and 'x' in name_lower:
+                left_ankle_x_idx = i
+            elif 'left' in name_lower and 'ankle' in name_lower and 'pos' in name_lower and 'z' in name_lower:
+                left_ankle_z_idx = i
+            elif 'left' in name_lower and 'ankle' in name_lower and 'pitch' in name_lower:
+                left_ankle_pitch_idx = i
+        
+        print(f"Debug - Found indices:")
+        print(f"  COM X: {com_x_idx}")
+        print(f"  COM Y: {com_y_idx}")
+        print(f"  COM Z: {com_z_idx}")
+        print(f"  Left Ankle X: {left_ankle_x_idx}")
+        print(f"  Left Ankle Z: {left_ankle_z_idx}")
+        print(f"  Left Ankle Pitch: {left_ankle_pitch_idx}")
+        
+        # Create the focused plot
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        fig.suptitle(f'COM and Left Ankle Tracking: Desired vs Actual (Env {env_id})', fontsize=16)
+        
+        # Plot COM positions
+        if com_x_idx is not None:
+            axes[0, 0].plot(time, processed_data['y_out'][:, env_id, com_x_idx], '--', linewidth=2, label='Reference')
+            axes[0, 0].plot(time, processed_data['y_act'][:, env_id, com_x_idx], linewidth=2, label='Actual')
+            axes[0, 0].set_title('COM Position X')
+            axes[0, 0].set_xlabel('Time (s)')
+            axes[0, 0].set_ylabel('Position (m)')
+            axes[0, 0].grid(True, alpha=0.3)
+            axes[0, 0].legend()
+        
+        if com_y_idx is not None:
+            axes[0, 1].plot(time, processed_data['y_out'][:, env_id, com_y_idx], '--', linewidth=2, label='Reference')
+            axes[0, 1].plot(time, processed_data['y_act'][:, env_id, com_y_idx], linewidth=2, label='Actual')
+            axes[0, 1].set_title('COM Position Y')
+            axes[0, 1].set_xlabel('Time (s)')
+            axes[0, 1].set_ylabel('Position (m)')
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].legend()
+        
+        if com_z_idx is not None:
+            axes[0, 2].plot(time, processed_data['y_out'][:, env_id, com_z_idx], '--', linewidth=2, label='Reference')
+            axes[0, 2].plot(time, processed_data['y_act'][:, env_id, com_z_idx], linewidth=2, label='Actual')
+            axes[0, 2].set_title('COM Position Z')
+            axes[0, 2].set_xlabel('Time (s)')
+            axes[0, 2].set_ylabel('Position (m)')
+            axes[0, 2].grid(True, alpha=0.3)
+            axes[0, 2].legend()
+        
+        # Plot left ankle
+        if left_ankle_x_idx is not None:
+            axes[1, 0].plot(time, processed_data['y_out'][:, env_id, left_ankle_x_idx], '--', linewidth=2, label='Reference')
+            axes[1, 0].plot(time, processed_data['y_act'][:, env_id, left_ankle_x_idx], linewidth=2, label='Actual')
+            axes[1, 0].set_title('Swing Ankle Position X')
+            axes[1, 0].set_xlabel('Time (s)')
+            axes[1, 0].set_ylabel('Position (m)')
+            axes[1, 0].grid(True, alpha=0.3)
+            axes[1, 0].legend()
+        
+        if left_ankle_z_idx is not None:
+            axes[1, 1].plot(time, processed_data['y_out'][:, env_id, left_ankle_z_idx], '--', linewidth=2, label='Reference')
+            axes[1, 1].plot(time, processed_data['y_act'][:, env_id, left_ankle_z_idx], linewidth=2, label='Actual')
+            axes[1, 1].set_title('Swing Ankle Position Z')
+            axes[1, 1].set_xlabel('Time (s)')
+            axes[1, 1].set_ylabel('Position (m)')
+            axes[1, 1].grid(True, alpha=0.3)
+            axes[1, 1].legend()
+        
+        if left_ankle_pitch_idx is not None:
+            axes[1, 2].plot(time, processed_data['y_out'][:, env_id, left_ankle_pitch_idx], '--', linewidth=2, label='Reference')
+            axes[1, 2].plot(time, processed_data['y_act'][:, env_id, left_ankle_pitch_idx], linewidth=2, label='Actual')
+            axes[1, 2].set_title('Swing Ankle Pitch Angle')
+            axes[1, 2].set_xlabel('Time (s)')
+            axes[1, 2].set_ylabel('Angle (rad)')
+            axes[1, 2].grid(True, alpha=0.3)
+            axes[1, 2].legend()
+        
+        # Hide any empty subplots
+        for i in range(2):
+            for j in range(3):
+                if not axes[i, j].lines:  # If no data was plotted
+                    axes[i, j].text(0.5, 0.5, 'No Data\nAvailable', ha='center', va='center', 
+                                   transform=axes[i, j].transAxes, fontsize=12)
+                    axes[i, j].set_title(f'Plot {i},{j} - No Data')
+        
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save as SVG automatically
+        if save_dir:
+            svg_path = os.path.join(save_dir, f'focused_com_ankle_env{env_id}.svg')
+            plt.savefig(svg_path, format='svg', bbox_inches='tight')
+            print(f"Saved focused COM and ankle plot to: {svg_path}")
+            
+            # Also save as PNG for backup
+            png_path = os.path.join(save_dir, f'focused_com_ankle_env{env_id}.png')
+            plt.savefig(png_path, dpi=300, bbox_inches='tight')
+        
+        plt.close(fig)
+
 
 def plot_hzd_trajectories(data, save_dir=None):
     """Plot HZD trajectories with proper labels and units"""
