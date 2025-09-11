@@ -7,7 +7,6 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        # hf_policy_name: "running_hzd_clf/9_8_tor_1e-4_gl7.pt"
         hf_policy_name: "running_hzd_clf/9_8_tor_lim_test_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_7_v_curr_stand_gl7.pt"
         # hf_policy_name: "running_hzd_clf/9_4_inc_y_weight_inc_con_pen_gl6.pt"
