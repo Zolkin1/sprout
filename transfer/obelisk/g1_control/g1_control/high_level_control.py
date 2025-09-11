@@ -87,9 +87,12 @@ class HighLevelController(ObeliskController, ABC):
             self.x_cmd = 0.0
             self.y_cmd = 0.0
 
+            self.x_pd_ff = 0.0
+
             self.ang_z_window = deque(maxlen=20)
             self.y_pos_window = deque(maxlen=10)
             self.y_vel_window = deque(maxlen=10)
+            self.x_vel_window = deque(maxlen=10)
 
             self.yaw_cur = 0.0
             self.y_pos_cur = 0.0
@@ -206,6 +209,7 @@ class HighLevelController(ObeliskController, ABC):
         self.z_vel_cur = twist_w.linear.z
 
         self.y_vel_window.append(self.y_vel_cur)
+        self.x_vel_window.append(self.x_vel_cur)
 
         # Log odometry data if enabled
         if self.log_odom and self.odom_count % 1 == 0:
@@ -276,8 +280,13 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # X Control
         ##
-        # self.x_vel_cmd = self.cmd_vel[0] - self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (self.x_vel_cur)
+        x_vel_avg = sum(self.x_vel_window)/len(self.x_vel_window)
+
         self.x_cmd = self.cmd_vel[0]
+
+        if self.lin_vel_mode == "X_PD":
+            self.x_cmd = -self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel_avg) + self.x_pd_ff
+            self.x_cmd = np.clip(self.x_cmd, self.v_x_min, self.v_x_max)
 
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
@@ -324,7 +333,8 @@ class HighLevelController(ObeliskController, ABC):
             " User Pose: Squares. \n" \
             " Joystick Mode: A. \n" \
             " Incremental Velocity Mode: B. \n" \
-            " Function Velocity Mode: X. \n" \
+            " X PD Mode: X. \n" \
+            # " Function Velocity Mode: X. \n" \
             " Increase Incremental Velocity: Right Bumper. \n" \
             " Decrease Incremental Velocity: Left Bumper. \n" \
             " Toggle Odom Correction: Y. \n" \
@@ -348,8 +358,10 @@ class HighLevelController(ObeliskController, ABC):
         X = 2
         if msg.buttons[X] >= 0.9 and now - self.last_X_press > 0.5:
             self.last_X_press = now
-            self.lin_vel_mode = "function"
-            self.get_logger().info("Function velocity mode enabled!")
+            self.lin_vel_mode = "X_PD" #"function"
+            self.x_pd_ff = self.cmd_vel[0]
+            self.get_logger().info(f"X PD mode enabled! Feedforward set to {self.x_pd_ff:.3f} m/s.")
+            # self.get_logger().info("Function velocity mode enabled!")
 
         Y = 3
         if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.5:
@@ -409,6 +421,9 @@ class HighLevelController(ObeliskController, ABC):
                 msg.v_y = float(self.y_cmd)
 
                 # TODO: Add option to set cmd vel with the x PD controller
+
+            if self.lin_vel_mode == "X_PD":
+                msg.v_x = self.x_cmd
 
             self.obk_publishers["pub_ctrl"].publish(msg)
 
