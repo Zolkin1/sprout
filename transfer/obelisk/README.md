@@ -34,6 +34,7 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
 
 
 # Setup within the Docker
+or do it manually:
 Run
 ```
 obk
@@ -50,7 +51,11 @@ obk-clean
 ```
 to clean the Obelisk build folder.
 
-After `obk` we can build this package:
+To build the local ROS workspace you can run
+```
+bash scripts/build.sh
+```
+or do it manually as follows. After `obk` we can build this package:
 ```
 colcon build --symlink-install --parallel-workers $(nproc)
 ```
@@ -113,6 +118,12 @@ At `user_pose`, the robot will snap to the default position specified by `user_p
 At `low_level_ctrl`, the output from the controller node will be applied to robot.
 
 # Setting up the Xbox remote
+You can now run the script:
+```
+bash scripts/joystick.sh
+```
+
+Or you can do it manually:
 You can make sure that you can see the remote control with
 ```
 sudo evtest
