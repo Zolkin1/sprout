@@ -7,7 +7,7 @@ import numpy as np
 
 from sim.log_utils import extract_data
 
-PLOT_MEANS = False
+PLOT_MEANS = True
 
 def get_index(time_vec, time: float):
     """Gets the index associated with a given time."""
@@ -45,7 +45,8 @@ def main():
 
     run_names = policy_names
 
-    run_names = ["HZD tracking","HZD-CLF"]
+    # run_names = ["No CLF", "CLF Weight 1", "CLF Weight 1.5"] #["HZD tracking","HZD-CLF"]
+
 
 
     # run_names = ["hzd_clf_minimum_reward", "hzd_dec_4_alpha_1", "hzd_dec_2_alpha_2", "hzd_dec_2_alpha_0.5", "hzd_dec_0"]
@@ -103,20 +104,20 @@ def main():
         if PLOT_MEANS:
             ## Mean plots
             # Get the steady state mean
-            ss_idx_start = get_index(time, 13)
-            ss_idx_end = get_index(time, 17) #time.size
+            ss_idx_start = get_index(time, 3)
+            ss_idx_end = get_index(time, 9) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
             
-            ss_idx_start = get_index(time, 7)
-            ss_idx_end = get_index(time, 11) #time.size
+            ss_idx_start = get_index(time, 9)
+            ss_idx_end = get_index(time, 15) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
             
-            ss_idx_start = get_index(time, 20)
-            ss_idx_end = get_index(time, 25) #time.size
+            ss_idx_start = get_index(time, 15)
+            ss_idx_end = get_index(time, 21) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")

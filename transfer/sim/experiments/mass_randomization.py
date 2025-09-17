@@ -83,7 +83,7 @@ def main():
 
     for i in range(NUM_RUNS):
         # Adjust the torso mass position
-        max_movement = np.array([0.03,0.03,0.01])
+        max_movement = np.array([0.05,0.05,0.01])
         pos_movement = robot_instance.randomize_torso_mass_pos(max_movement)
 
         # Create and run simulation

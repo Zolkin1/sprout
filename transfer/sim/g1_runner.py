@@ -13,7 +13,7 @@ from rl_policy_wrapper import RLPolicy
 from robot import Robot
 from simulation import Simulation
 
-from experiments.velocity_commands import speed_steps, smooth_ramp
+from experiments.velocity_commands import speed_steps, smooth_ramp_running
 
 def main():
     parser = argparse.ArgumentParser()
@@ -63,7 +63,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(
-        robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=smooth_ramp, use_pd=config["use_pd"]
+        robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=smooth_ramp_running, use_pd=config["use_pd"]
     )
 
     # Create and run simulation

@@ -123,7 +123,7 @@ class HighLevelController(ObeliskController, ABC):
                     "vel_x", "vel_y", "vel_z",
                     "ang_vel_x", "ang_vel_y", "ang_vel_z", "ang_z_filtered",
                     "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd",
-                    "x_cmd", "y_cmd", "y_vel_avg", "y_pos_target"
+                    "x_cmd", "y_cmd", "y_vel_avg", "y_pos_target", "x_pos_target"
                 ])
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
@@ -234,7 +234,7 @@ class HighLevelController(ObeliskController, ABC):
                 self.x_vel_cur, self.y_vel_cur, self.z_vel_cur,
                 ang_vel.x, ang_vel.y, self.ang_z_vel, ang_z_filtered,
                 self.yaw_cur, self.yaw_target, yaw_error, self.yaw_rate_cmd,
-                self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target
+                self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target, self.x_target
             ])
 
         self.odom_count += 1

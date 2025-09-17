@@ -59,9 +59,8 @@ def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
 
 def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
     plt.rcParams.update({'font.size': 18})
-    # Disable LaTeX rendering to avoid missing package issues
     plt.rcParams.update({
-        "text.usetex": False,
+        "text.usetex": True,
         "font.family": "serif",
     })
 
@@ -71,6 +70,8 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
     first_label = next(iter(grouped_data))
     time = grouped_data[first_label][0]["time"]
 
+
+    start_idx = 150
 
     dummy_patch = Patch(facecolor='none', alpha=0.0)  # Transparent dummy patch for handler
     custom_handles = []
@@ -98,14 +99,16 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
             mean_actual = np.zeros_like(time)
             std_actual = np.zeros_like(time)
 
-        ax.plot(time, mean_actual, color=color, linewidth=2.5)
-        ax.fill_between(time, mean_actual - std_actual, mean_actual + std_actual,
+        ax.plot(time[start_idx:], mean_actual[start_idx:], color=color, linewidth=2.5)
+        ax.fill_between(time[start_idx:], mean_actual[start_idx:] - std_actual[start_idx:], mean_actual[start_idx:] + std_actual[start_idx:],
                         color=color, alpha=0.2)
 
         line = Line2D([0], [0], color=color, lw=2.5)
         patch = Patch(facecolor=color, alpha=0.15)
         custom_handles.append((line, patch))
         custom_labels.append(fr"{display_label}")
+
+        print(f"[{display_label}] Average std: {np.mean(std_actual[start_idx:])} \n Average mean: {np.mean(mean_actual[start_idx:])}")
 
 
     commanded = grouped_data[first_label][0]["commanded_vel"][:, 0]
@@ -160,7 +163,9 @@ if __name__ == "__main__":
     label_override.update({"mass_randomization_g1_21j_config_baseline": "Baseline"})
     label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
     label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
-    label_override.update({"mass_randomization_g1_21j_config_running": "Running"})
+    label_override.update({"mass_randomization_g1_21j_config_running_clf_15": "CLF Weight 1.5"})
+    label_override.update({"mass_randomization_g1_21j_config_running_no_clf": "No CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_running": "CLF Weight 1"})
 
     if len(grouped_data) == 0:
         print("No data found. Check experiment folder structure and naming.")

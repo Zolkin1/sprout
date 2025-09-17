@@ -31,7 +31,7 @@ def speed_steps_running(sim_time):
     # time_steps = np.array([3, 3, 3, 3, 6, 6])
     # speeds = np.array([0, 0.25, -0.25, 0.5, 0.75, -0.5])
     time_steps = np.array([3, 6, 6, 6])
-    speeds = np.array([0, 2.0, 2.8, 2.5])
+    speeds = np.array([0, 2.0, 2.5, 1.6])
 
     # Compute start times of each interval
     start_times = np.cumsum(np.insert(time_steps[:-1], 0, 0))

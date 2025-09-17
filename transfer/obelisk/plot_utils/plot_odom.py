@@ -56,7 +56,7 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
         'vel_x': [], 'vel_y': [], 'vel_z': [],
         'ang_vel_x': [], 'ang_vel_y': [], 'ang_vel_z': [], 'ang_z_filtered': [],
         'yaw': [], 'yaw_target': [], 'yaw_error': [], 'yaw_rate_cmd': [],
-        'x_cmd': [], 'y_cmd': [], 'y_vel_avg': [], 'y_pos_target': []
+        'x_cmd': [], 'y_cmd': [], 'y_vel_avg': [], 'y_pos_target': [], 'x_pos_target': []
     }
     
     try:
@@ -76,17 +76,19 @@ def load_odom_data(csv_path: str) -> Tuple[np.ndarray, ...]:
 def plot_position_velocity(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarray, pos_z: np.ndarray,
                           vel_x: np.ndarray, vel_y: np.ndarray, vel_z: np.ndarray,
                           x_cmd: np.ndarray, y_cmd: np.ndarray, y_vel_avg: np.ndarray, y_pos_target: np.ndarray,
-                          save_dir: str) -> None:
+                          x_pos_target: np.ndarray, save_dir: str) -> None:
     """Create and save position and velocity plots."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     fig.suptitle('Position and Velocity Data', fontsize=16)
     
     # Position plots
-    axes[0, 0].plot(time, pos_x, 'b-', linewidth=2)
+    axes[0, 0].plot(time, pos_x, 'b-', linewidth=2, label='Actual X')
+    axes[0, 0].plot(time, x_pos_target, 'b--', linewidth=2, label='Target X')
     axes[0, 0].set_title('Position X')
     axes[0, 0].set_xlabel('Time (s)')
     axes[0, 0].set_ylabel('Position (m)')
     axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
     
     axes[0, 1].plot(time, pos_y, 'g-', linewidth=2, label='Actual Y')
     axes[0, 1].plot(time, y_pos_target, 'g--', linewidth=2, label='Target Y')
@@ -226,6 +228,7 @@ def main():
     parser.add_argument('--data', help='Path to CSV file (if not provided, uses most recent from odom_logs)')
     parser.add_argument('--start-time', type=float, default=0.0, help='Start time for plotting (seconds, default: 0.0)')
     parser.add_argument('--end-time', type=float, default=None, help='End time for plotting (seconds, default: None - use all data)')
+    parser.add_argument('--paper-plots', action='store_true', help='Generate publication-ready plots')
     args = parser.parse_args()
     
     # Determine CSV file to use
@@ -243,7 +246,7 @@ def main():
     print(f"Loading data from: {csv_path}")
     (time, pos_x, pos_y, pos_z, quat_x, quat_y, quat_z, quat_w,
      vel_x, vel_y, vel_z, ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
-     yaw, yaw_target, yaw_error, yaw_rate_cmd, x_cmd, y_cmd, y_vel_avg, y_pos_target) = load_odom_data(csv_path)
+     yaw, yaw_target, yaw_error, yaw_rate_cmd, x_cmd, y_cmd, y_vel_avg, y_pos_target, x_pos_target) = load_odom_data(csv_path)
     
     print(f"Loaded {len(time)} data points spanning {time[-1] - time[0]:.2f} seconds")
     
@@ -268,7 +271,7 @@ def main():
         print(f"Plotting data from time {time[start_idx]:.2f}s to end at {time[-1]:.2f}s (index {start_idx} to end)")
     
     # Slice all arrays from start index to end index
-    time = time[start_idx:end_idx]
+    time = time[start_idx:end_idx] - args.start_time
     pos_x = pos_x[start_idx:end_idx]
     pos_y = pos_y[start_idx:end_idx]
     pos_z = pos_z[start_idx:end_idx]
@@ -291,13 +294,106 @@ def main():
     y_cmd = y_cmd[start_idx:end_idx]
     y_vel_avg = y_vel_avg[start_idx:end_idx]
     y_pos_target = y_pos_target[start_idx:end_idx]
+    x_pos_target = x_pos_target[start_idx:end_idx]
     plot_position_velocity(time, pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, 
-                          x_cmd, y_cmd, y_vel_avg, y_pos_target, save_dir)
+                          x_cmd, y_cmd, y_vel_avg, y_pos_target, x_pos_target, save_dir)
     plot_orientation_angular_velocity(time, quat_x, quat_y, quat_z, quat_w,
                                      ang_vel_x, ang_vel_y, ang_vel_z, ang_z_filtered, 
                                      yaw, yaw_target, yaw_error, yaw_rate_cmd, save_dir)
     
+    # Generate paper plots if requested
+    if args.paper_plots:
+        plot_paper_figure(time, pos_x, pos_y, vel_x, vel_y, 
+                         yaw, ang_vel_z, ang_z_filtered,
+                         x_pos_target, y_pos_target, yaw_target,
+                         x_cmd, y_cmd, yaw_rate_cmd, save_dir)
+    
     print("Plotting complete!")
+
+
+def plot_paper_figure(time: np.ndarray, pos_x: np.ndarray, pos_y: np.ndarray, 
+                     vel_x: np.ndarray, vel_y: np.ndarray, 
+                     yaw: np.ndarray, ang_vel_z: np.ndarray, ang_z_filtered: np.ndarray,
+                     x_pos_target: np.ndarray, y_pos_target: np.ndarray, yaw_target: np.ndarray,
+                     x_cmd: np.ndarray, y_cmd: np.ndarray, yaw_rate_cmd: np.ndarray,
+                     save_dir: str) -> None:
+    """Create publication-ready figure with position and velocity data."""
+    
+    # Set LaTeX configuration before creating figure
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "text.latex.preamble": r"\usepackage{amsmath,amsfonts}",
+    })
+    
+    # Create figure with 3x2 subplots
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+
+    # Row 1: X Position and X Velocity
+    # X Position Error
+    axes[0, 0].plot(time, pos_x - x_pos_target, color='tab:blue', linewidth=2.5)
+    axes[0, 0].set_title('$x$ Position', fontsize=30)   # Error (on the treadmill)
+    axes[0, 0].set_ylabel('Position (m)', fontsize=26)
+    axes[0, 0].tick_params(axis='both', which='major', labelsize=22)
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # X Velocity
+    axes[0, 1].plot(time, vel_x, color='tab:blue', linewidth=2.5, label='Measured') # (rel.)
+    axes[0, 1].plot(time, x_cmd, color='tab:olive', linewidth=2, label='Commanded')
+    axes[0, 1].set_title('$x$ Velocity', fontsize=30)
+    axes[0, 1].set_ylabel('Velocity (m/s)', fontsize=26)
+    axes[0, 1].tick_params(axis='both', which='major', labelsize=22)
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend(fontsize=22, loc='lower right')
+    
+    # Row 2: Y Position and Y Velocity
+    # Y Position Error
+    axes[1, 0].plot(time, pos_y - y_pos_target, color='tab:brown', linewidth=2.5)
+    axes[1, 0].set_title('$y$ Error', fontsize=30)
+    axes[1, 0].set_ylabel('Position Error (m)', fontsize=26)
+    axes[1, 0].tick_params(axis='both', which='major', labelsize=22)
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Y Velocity
+    axes[1, 1].plot(time, vel_y, color='tab:brown', linewidth=2.5, label='Measured')
+    axes[1, 1].plot(time, y_cmd, color='tab:olive', linewidth=2, label='Commanded')
+    axes[1, 1].set_title('$y$ Velocity', fontsize=30)
+    axes[1, 1].set_ylabel('Velocity (m/s)', fontsize=26)
+    axes[1, 1].tick_params(axis='both', which='major', labelsize=22)
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].legend(fontsize=22, loc='lower right')
+    
+    # Row 3: Yaw Position and Yaw Velocity
+    # Yaw Position Error
+    yaw_unwrapped = np.unwrap(yaw)
+    yaw_target_unwrapped = np.unwrap(yaw_target)
+    axes[2, 0].plot(time, yaw_unwrapped - yaw_target_unwrapped, color='tab:grey', linewidth=2.5)
+    axes[2, 0].set_title('Yaw Error', fontsize=30)
+    axes[2, 0].set_xlabel('Time (s)', fontsize=26)
+    axes[2, 0].set_ylabel('Angle Error (rad)', fontsize=26)
+    axes[2, 0].tick_params(axis='both', which='major', labelsize=22)
+    axes[2, 0].grid(True, alpha=0.3)
+    
+    # Yaw Velocity
+    axes[2, 1].plot(time, ang_z_filtered, color='tab:grey', linewidth=2.5, label='Measured')
+    axes[2, 1].plot(time, yaw_rate_cmd, color='tab:olive', linewidth=2, label='Commanded')
+    axes[2, 1].set_title('Yaw Velocity', fontsize=30)
+    axes[2, 1].set_xlabel('Time (s)', fontsize=26)
+    axes[2, 1].set_ylabel('Angular Velocity (rad/s)', fontsize=26)
+    axes[2, 1].tick_params(axis='both', which='major', labelsize=22)
+    axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].legend(fontsize=22, loc='lower right')
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save as high-quality formats for papers
+    base_path = os.path.join(save_dir, 'paper_tracking_performance')
+    plt.savefig(f"{base_path}.png", dpi=300, bbox_inches='tight', facecolor='white')
+    plt.savefig(f"{base_path}.pdf", bbox_inches='tight', facecolor='white') 
+    plt.savefig(f"{base_path}.svg", bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"Saved paper figure to: {base_path}.[png/pdf/eps]")
 
 
 if __name__ == "__main__":

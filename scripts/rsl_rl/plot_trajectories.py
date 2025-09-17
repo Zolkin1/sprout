@@ -415,7 +415,7 @@ def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
     """Plot focused view of COM positions and left ankle position/orientation (desired vs actual)"""
     # Set nice font for plots (LaTeX disabled due to missing packages)
     plt.rcParams.update({
-        "text.usetex": False,
+        "text.usetex": True,
         "font.family": "serif",
     })
     
@@ -435,10 +435,15 @@ def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
     N_ENVS_TO_PLOT = 2
     env_ids = list(range(N_ENVS_TO_PLOT))
     
-    # Check if we have y_out and y_act data
+    # Check if we have required data
     if 'y_out' not in processed_data or 'y_act' not in processed_data:
         print("Warning: y_out or y_act data not found. Cannot create focused COM/ankle plots.")
         return
+    
+    # Check if we have base_velocity data
+    has_base_velocity = 'base_velocity' in processed_data
+    if not has_base_velocity:
+        print("Warning: base_velocity data not found. Will skip velocity plots.")
     
     # Get axis names if available to identify which dimensions correspond to what
     axis_names = []
@@ -479,75 +484,106 @@ def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
         print(f"  Left Ankle Z: {left_ankle_z_idx}")
         print(f"  Left Ankle Pitch: {left_ankle_pitch_idx}")
         
-        # Create the focused plot
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        fig.suptitle(f'COM and Left Ankle Tracking: Desired vs Actual (Env {env_id})', fontsize=16)
+        # Create the focused plot - new layout: Col 0=Commanded Velocities, Col 1=COM Positions, Col 2=Ankle Values
+        fig, axes = plt.subplots(3, 3, figsize=(18, 6))
         
-        # Plot COM positions
-        if com_x_idx is not None:
-            axes[0, 0].plot(time, processed_data['y_out'][:, env_id, com_x_idx], '--', linewidth=2, label='Reference')
-            axes[0, 0].plot(time, processed_data['y_act'][:, env_id, com_x_idx], linewidth=2, label='Actual')
-            axes[0, 0].set_title('COM Position X')
-            axes[0, 0].set_xlabel('Time (s)')
-            axes[0, 0].set_ylabel('Position (m)')
+        # Column 0: Base Velocities (commanded velocities)
+        if has_base_velocity and processed_data['base_velocity'].shape[2] >= 2:
+            # Plot X velocity
+            axes[0, 0].plot(time, processed_data['base_velocity'][:, env_id, 0], linewidth=2, color='tab:blue')
+            axes[0, 0].set_title('Commanded $x$ Velocity', fontsize=18)
+            axes[0, 0].set_xlabel('Time (s)', fontsize=14)
+            axes[0, 0].set_ylabel('Velocity (m/s)', fontsize=14)
+            axes[0, 0].tick_params(axis='both', which='major', labelsize=12)
             axes[0, 0].grid(True, alpha=0.3)
-            axes[0, 0].legend()
+            
+            # Plot Y velocity
+            axes[1, 0].plot(time, processed_data['base_velocity'][:, env_id, 1], linewidth=2, color='tab:blue')
+            axes[1, 0].set_title('Commanded $y$ Velocity', fontsize=18)
+            axes[1, 0].set_xlabel('Time (s)', fontsize=14)
+            axes[1, 0].set_ylabel('Velocity (m/s)', fontsize=14)
+            axes[1, 0].tick_params(axis='both', which='major', labelsize=12)
+            axes[1, 0].grid(True, alpha=0.3)
+            
+            # Plot Yaw velocity
+            axes[2, 0].plot(time, processed_data['base_velocity'][:, env_id, 2], linewidth=2, color='tab:blue')
+            axes[2, 0].set_title('Commanded Yaw Velocity', fontsize=18)
+            axes[2, 0].set_xlabel('Time (s)', fontsize=14)
+            axes[2, 0].set_ylabel('Angular Velocity (rad/s)', fontsize=14)
+            axes[2, 0].tick_params(axis='both', which='major', labelsize=12)
+            axes[2, 0].grid(True, alpha=0.3)
+        
+        # Column 1: COM Positions
+        if com_x_idx is not None:
+            axes[0, 1].plot(time, processed_data['y_out'][:, env_id, com_x_idx], '--', linewidth=2, label='Reference')
+            axes[0, 1].plot(time, processed_data['y_act'][:, env_id, com_x_idx], linewidth=2, label='Actual')
+            axes[0, 1].set_title('COM Position $x$', fontsize=18)
+            axes[0, 1].set_xlabel('Time (s)', fontsize=14)
+            axes[0, 1].set_ylabel('Position (m)', fontsize=14)
+            axes[0, 1].tick_params(axis='both', which='major', labelsize=12)
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].legend(fontsize=12, loc='lower right')
         
         if com_y_idx is not None:
-            axes[0, 1].plot(time, processed_data['y_out'][:, env_id, com_y_idx], '--', linewidth=2, label='Reference')
-            axes[0, 1].plot(time, processed_data['y_act'][:, env_id, com_y_idx], linewidth=2, label='Actual')
-            axes[0, 1].set_title('COM Position Y')
-            axes[0, 1].set_xlabel('Time (s)')
-            axes[0, 1].set_ylabel('Position (m)')
-            axes[0, 1].grid(True, alpha=0.3)
-            axes[0, 1].legend()
+            axes[1, 1].plot(time, processed_data['y_out'][:, env_id, com_y_idx], '--', linewidth=2, label='Reference')
+            axes[1, 1].plot(time, processed_data['y_act'][:, env_id, com_y_idx], linewidth=2, label='Actual')
+            axes[1, 1].set_title('COM Position $y$', fontsize=18)
+            axes[1, 1].set_xlabel('Time (s)', fontsize=14)
+            axes[1, 1].set_ylabel('Position (m)', fontsize=14)
+            axes[1, 1].tick_params(axis='both', which='major', labelsize=12)
+            axes[1, 1].grid(True, alpha=0.3)
+            axes[1, 1].legend(fontsize=12, loc='lower right')
         
         if com_z_idx is not None:
-            axes[0, 2].plot(time, processed_data['y_out'][:, env_id, com_z_idx], '--', linewidth=2, label='Reference')
-            axes[0, 2].plot(time, processed_data['y_act'][:, env_id, com_z_idx], linewidth=2, label='Actual')
-            axes[0, 2].set_title('COM Position Z')
-            axes[0, 2].set_xlabel('Time (s)')
-            axes[0, 2].set_ylabel('Position (m)')
-            axes[0, 2].grid(True, alpha=0.3)
-            axes[0, 2].legend()
+            axes[2, 1].plot(time, processed_data['y_out'][:, env_id, com_z_idx], '--', linewidth=2, label='Reference')
+            axes[2, 1].plot(time, processed_data['y_act'][:, env_id, com_z_idx], linewidth=2, label='Actual')
+            axes[2, 1].set_title('COM Position $z$', fontsize=18)
+            axes[2, 1].set_xlabel('Time (s)', fontsize=14)
+            axes[2, 1].set_ylabel('Position (m)', fontsize=14)
+            axes[2, 1].tick_params(axis='both', which='major', labelsize=12)
+            axes[2, 1].grid(True, alpha=0.3)
+            axes[2, 1].legend(fontsize=12, loc='lower right')
         
-        # Plot left ankle
+        # Column 2: Ankle Values
         if left_ankle_x_idx is not None:
-            axes[1, 0].plot(time, processed_data['y_out'][:, env_id, left_ankle_x_idx], '--', linewidth=2, label='Reference')
-            axes[1, 0].plot(time, processed_data['y_act'][:, env_id, left_ankle_x_idx], linewidth=2, label='Actual')
-            axes[1, 0].set_title('Swing Ankle Position X')
-            axes[1, 0].set_xlabel('Time (s)')
-            axes[1, 0].set_ylabel('Position (m)')
-            axes[1, 0].grid(True, alpha=0.3)
-            axes[1, 0].legend()
+            axes[0, 2].plot(time, processed_data['y_out'][:, env_id, left_ankle_x_idx], '--', linewidth=2, label='Reference')
+            axes[0, 2].plot(time, processed_data['y_act'][:, env_id, left_ankle_x_idx], linewidth=2, label='Actual')
+            axes[0, 2].set_title('Swing Ankle Position $x$', fontsize=18)
+            axes[0, 2].set_xlabel('Time (s)', fontsize=14)
+            axes[0, 2].set_ylabel('Position (m)', fontsize=14)
+            axes[0, 2].tick_params(axis='both', which='major', labelsize=12)
+            axes[0, 2].grid(True, alpha=0.3)
+            axes[0, 2].legend(fontsize=12, loc='lower right')
         
         if left_ankle_z_idx is not None:
-            axes[1, 1].plot(time, processed_data['y_out'][:, env_id, left_ankle_z_idx], '--', linewidth=2, label='Reference')
-            axes[1, 1].plot(time, processed_data['y_act'][:, env_id, left_ankle_z_idx], linewidth=2, label='Actual')
-            axes[1, 1].set_title('Swing Ankle Position Z')
-            axes[1, 1].set_xlabel('Time (s)')
-            axes[1, 1].set_ylabel('Position (m)')
-            axes[1, 1].grid(True, alpha=0.3)
-            axes[1, 1].legend()
+            axes[1, 2].plot(time, processed_data['y_out'][:, env_id, left_ankle_z_idx], '--', linewidth=2, label='Reference')
+            axes[1, 2].plot(time, processed_data['y_act'][:, env_id, left_ankle_z_idx], linewidth=2, label='Actual')
+            axes[1, 2].set_title('Swing Ankle Position $z$', fontsize=18)
+            axes[1, 2].set_xlabel('Time (s)', fontsize=14)
+            axes[1, 2].set_ylabel('Position (m)', fontsize=14)
+            axes[1, 2].tick_params(axis='both', which='major', labelsize=12)
+            axes[1, 2].grid(True, alpha=0.3)
+            axes[1, 2].legend(fontsize=12, loc='lower right')
         
         if left_ankle_pitch_idx is not None:
-            axes[1, 2].plot(time, processed_data['y_out'][:, env_id, left_ankle_pitch_idx], '--', linewidth=2, label='Reference')
-            axes[1, 2].plot(time, processed_data['y_act'][:, env_id, left_ankle_pitch_idx], linewidth=2, label='Actual')
-            axes[1, 2].set_title('Swing Ankle Pitch Angle')
-            axes[1, 2].set_xlabel('Time (s)')
-            axes[1, 2].set_ylabel('Angle (rad)')
-            axes[1, 2].grid(True, alpha=0.3)
-            axes[1, 2].legend()
+            axes[2, 2].plot(time, processed_data['y_out'][:, env_id, left_ankle_pitch_idx], '--', linewidth=2, label='Reference')
+            axes[2, 2].plot(time, processed_data['y_act'][:, env_id, left_ankle_pitch_idx], linewidth=2, label='Actual')
+            axes[2, 2].set_title('Swing Ankle Pitch Angle', fontsize=18)
+            axes[2, 2].set_xlabel('Time (s)', fontsize=14)
+            axes[2, 2].set_ylabel('Angle (rad)', fontsize=14)
+            axes[2, 2].tick_params(axis='both', which='major', labelsize=12)
+            axes[2, 2].grid(True, alpha=0.3)
+            axes[2, 2].legend(fontsize=12, loc='lower right')
         
         # Hide any empty subplots
-        for i in range(2):
+        for i in range(3):
             for j in range(3):
                 if not axes[i, j].lines:  # If no data was plotted
                     axes[i, j].text(0.5, 0.5, 'No Data\nAvailable', ha='center', va='center', 
                                    transform=axes[i, j].transAxes, fontsize=12)
-                    axes[i, j].set_title(f'Plot {i},{j} - No Data')
+                    axes[i, j].set_title(f'Plot {i},{j} - No Data', fontsize=18)
         
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout()
         
         # Save as SVG automatically
         if save_dir:

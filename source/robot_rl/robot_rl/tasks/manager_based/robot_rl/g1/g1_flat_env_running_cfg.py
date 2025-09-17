@@ -312,10 +312,11 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (2.2,3.0) #(1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (2.1,2.1) #(1.1, 2.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
+        self.commands.base_velocity.debug_vis = False
         # self.commands.base_velocity.rel_standing_envs = 1.0
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
