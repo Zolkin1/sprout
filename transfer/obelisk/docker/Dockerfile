@@ -70,21 +70,30 @@ RUN pip install --retries 5 --timeout=1000 -r requirements.txt
 # RUN pip install -r requirements.txt
 RUN rm requirements.txt
 
-# # Optitrack
-# RUN sudo apt install -y \
-#     ros-humble-tf2 \
-#     ros-humble-tf2-bullet \
-#     ros-humble-tf2-eigen \
-#     ros-humble-tf2-eigen-kdl \
-#     ros-humble-tf2-geometry-msgs \
-#     ros-humble-tf2-kdl \
-#     ros-humble-tf2-msgs \
-#     ros-humble-tf2-py \
-#     ros-humble-tf2-ros \
-#     ros-humble-tf2-ros-py \
-#     ros-humble-tf2-sensor-msgs \
-#     ros-humble-tf2-tools \
-#     wget && \
-#     cd /home/${USER} && git clone https://github.com/L2S-lab/natnet_ros2
-
-# RUN sudo apt update && sudo apt install -y python3-pyqt5 lshw
+# Lidar odometry
+# Install PCL and other dependencies for the lidar
+RUN sudo apt-get update && sudo apt-get install -y \
+    libpcl-dev \
+    pcl-tools \
+    ros-humble-pcl-ros \
+    ros-humble-pcl-conversions
+    
+WORKDIR /home/${USER}
+RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
+    cd Livox-SDK2 && \
+    mkdir build && cd build && \
+    cmake .. && \
+    make -j && \
+    sudo make install && \
+    cd /home/${USER} && \
+    mkdir -p livox_driver_ws/src && \
+    cd livox_driver_ws/src && \
+    git clone https://github.com/Livox-SDK/livox_ros_driver2.git && \
+    cd livox_ros_driver2 && source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh && \
+    cd /home/${USER} && mkdir -p lidar_odom_ws/src && cd lidar_odom_ws/src && \
+    git clone -b ROS2 https://github.com/wdc3iii/FAST_LIO_vel.git --recursive && cd .. && \
+    sudo rosdep init && \
+    rosdep update && \
+    rosdep install --from-paths src --ignore-src -r -y && \
+    colcon build --symlink-install && \
+    echo "source /home/${USER}/lidar_odom_ws/install/setup.bash" >> /home/${USER}/.bashrc
