@@ -32,8 +32,22 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
    - GPU-based (recommended for better performance)
    - No-GPU (if GPU is not available)
 
+# Quick start
+```
+source scripts/build.sh
+bash scripts/joystick.sh
+
+# Seperate terminal
+bash scripts/launch_lidar_odom.sh
+
+# obk-luanch...
+```
 
 # Setup within the Docker
+To build the local ROS workspace you can run
+```
+source scripts/build.sh
+```
 or do it manually:
 Run
 ```
@@ -51,11 +65,7 @@ obk-clean
 ```
 to clean the Obelisk build folder.
 
-To build the local ROS workspace you can run
-```
-bash scripts/build.sh
-```
-or do it manually as follows. After `obk` we can build this package:
+After `obk` we can build this package:
 ```
 colcon build --symlink-install --parallel-workers $(nproc)
 ```

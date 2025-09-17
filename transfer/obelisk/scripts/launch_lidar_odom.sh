@@ -1,5 +1,7 @@
 export ROS_DOMAIN_ID=2
 
+export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+
 source ~/livox_driver_ws/install/setup.bash
 source ~/lidar_odom_ws/install/setup.bash
 
