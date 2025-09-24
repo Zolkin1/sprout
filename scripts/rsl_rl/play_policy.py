@@ -81,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--video",
         action="store_true",
-        default=False, #True,
+        default=True,
         help="Record videos during playback."
     )
     parser.add_argument(
@@ -417,14 +417,14 @@ def main():
                 data = extract_reference_trajectory(env, log_vars,command_name)
                 logger.log_from_dict(data)
 
-        # timestep += 1
-        # if args_cli.video:
-        #     # Exit the play loop after recording one video
-        #     if timestep == args_cli.video_length:
-        #         break
-        #
-        # if timestep > max(100, args_cli.video_length):
-        #     break
+        timestep += 1
+        if args_cli.video:
+            # Exit the play loop after recording one video
+            if timestep == args_cli.video_length:
+                break
+
+        if timestep > max(100, args_cli.video_length):
+            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)

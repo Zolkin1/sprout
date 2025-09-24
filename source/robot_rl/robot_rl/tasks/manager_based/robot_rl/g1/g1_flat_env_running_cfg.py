@@ -64,17 +64,10 @@ class G1RunningGaitLibraryCommandsCfg:
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/full_library_v7",
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/running_library_v7",
         config_name="full",
-        # Running v1
-        # gait_velocity_ranges=(1.35, 1.98, 0.09),
 
-        # Running v2
-        # gait_velocity_ranges=(1.48, 2.88, 0.14),
-        # use_standing=False,
-
-        # Full
-        gait_velocity_ranges=(1.1, 3.0, 0.1), #(1.1, 3.0, 0.1), #(0.0, 3.00, 0.1),
+        gait_velocity_ranges=(1.1, 3.0, 0.1),
         use_standing=True,
 
         num_outputs=27,
@@ -100,19 +93,20 @@ class G1RunningGaitLibraryCommandsCfg:
 @configclass
 class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
     """Configuration for running gait library observations."""
-    @configclass
-    class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
-        # Add the domain flag
-        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
-        root_quat_w = ObsTerm(func=mdp.root_quat_w, noise=Unoise(n_min=-0.2, n_max=0.2))
-        # base_z = ObsTerm(func=mdp.base_z, noise=Unoise(n_min=-0.2, n_max=0.2))
-
-
-    @configclass
-    class G1RunningCriticCfg(G1HZDObservationsCfg.CriticCfg):
-        # Add the domain flag
-        domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
-        root_quat_w = ObsTerm(func=mdp.root_quat_w)
+    pass
+    # @configclass
+    # class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
+    #     # Add the domain flag
+    #     domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
+    #     root_quat_w = ObsTerm(func=mdp.root_quat_w, noise=Unoise(n_min=-0.2, n_max=0.2))
+    #     # base_z = ObsTerm(func=mdp.base_z, noise=Unoise(n_min=-0.2, n_max=0.2))
+    #
+    #
+    # @configclass
+    # class G1RunningCriticCfg(G1HZDObservationsCfg.CriticCfg):
+    #     # Add the domain flag
+    #     domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
+    #     root_quat_w = ObsTerm(func=mdp.root_quat_w)
 
     # observation groups
     # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
@@ -135,19 +129,6 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
         weight=-1.0,
     )
 
-    # ankle_roll_zero = RewTerm(
-    #     func=mdp.ankle_roll_zero,
-    #     weight=1.0,
-    #     params={"std": 0.2},
-    # )
-
-    # track_lin_vel_y_exp = RewTerm(
-    #     func=mdp.track_lin_vel_y_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-    # )
-    # track_ang_vel_z_exp_new = RewTerm(
-    #     func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
-    # )
-
 @configclass
 class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
@@ -155,24 +136,9 @@ class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
                                                    "max_weight": 1.0,
                                                    "update_amnt": 0.1})
 
-    # commanded_vel_curriculum = CurrTerm(func=mdp.cmd_vel_curriculum,
-    #                                     params={"update_interval": 20000,
-    #                                             "max_vel": 3.0,
-    #                                             "first_update": 40000,
-    #                                             "step": 0.1})
-
-    # walk_run_curriculum = CurrTerm(func=mdp.walk_run_curriculum,
-    #                                params={"update_interval": 40000,})   # TODO: make large after I debug
-
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
     pass
-    # randomize_contact_size = EventTerm(func=mdp.randomize_rigid_body_collider_offsets,
-    #                                    mode="reset",
-    #                                    params={
-    #                                        "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
-    #                                        "rest_offset_distribution_params": (0.02, 0.04)  # TODO tune or remove
-    #                                    })
 
 @configclass
 class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
@@ -250,14 +216,7 @@ class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.rewards.dof_torques_l2.weight = -1.0e-5
 
         ##
-        # No holonomic constraint, use the CLF on the stance foot for all domains
-        ##
-        # TODO: Consider removing again
-        # self.rewards.holonomic_constraint_vel = None
-        # self.rewards.holonomic_constraint = None
-
-        ##
-        # No Domain randomization to start
+        # Domain randomization
         ##
         # self.events.randomize_ground_contact_friction = None
         # self.events.add_base_mass = None
@@ -312,12 +271,12 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (2.1,2.1) #(1.1, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
         self.commands.base_velocity.debug_vis = False
-        # self.commands.base_velocity.rel_standing_envs = 1.0
+
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False
