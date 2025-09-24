@@ -75,8 +75,8 @@ class RLPolicy:
     def load(self):
         """Load RL Policy"""
         # Get the cwd and get the logs dir relative to this.
-        # NOTE: Assuming we are running from transfer/sim
-        two_up = Path.cwd().parent.parent
+        # NOTE: Assuming we are running from robot_rl
+        two_up = Path.cwd()
         policy_logs = os.path.join(two_up, "logs")
         full_path = os.path.join(policy_logs, self.checkpoint_path)
         print(f"Attempting to load {full_path}")

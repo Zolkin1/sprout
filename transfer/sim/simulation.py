@@ -8,7 +8,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import yaml
-from sim.robot import Robot
+from .robot import Robot
 
 
 def log_row_to_csv(filename, data):

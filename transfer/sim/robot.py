@@ -40,7 +40,7 @@ class Robot:
     def _get_model_data(self):
         """Create the mj model and data from the given robot."""
         file_name = f"{self.robot_name}_{self.scene_name}.xml"
-        relative_path = f"robots/g1/{file_name}"
+        relative_path = f"transfer/sim/robots/g1/{file_name}"
         path = os.path.join(os.getcwd(), relative_path)
         print(f"Trying to load the xml at {path}")
         mj_model = mujoco.MjModel.from_xml_path(path)

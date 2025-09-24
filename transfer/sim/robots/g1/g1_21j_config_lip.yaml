@@ -1,6 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j_compute"
-checkpoint_path: "paper_policy/lip_clf.pt"
+checkpoint_path: "g1_policies/lip/lip_clf/amy_raw/exported/policy.pt"
 num_obs: 74
 num_action: 21
 period: 0.8                   # s
