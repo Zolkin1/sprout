@@ -10,6 +10,8 @@ For now, only gait library plotting is implemented (ctrl-logs argument is reserv
 Plots are automatically saved to the ctrl_logs directory.
 """
 
+# TODO: This file needs a complete overhaul/re-write
+
 import argparse
 import os
 import sys
