@@ -61,6 +61,37 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
         self.curriculum.clf_curriculum = None
 
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import MLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (
+    HumanoidCommandsCfg
+)
+@configclass
+class G1MlipCommandsCfg(HumanoidCommandsCfg):
+    """Commands for the G1 Flat environment."""
+
+    hlip_ref = MLIPCommandCfg()
+
+
+
+@configclass
+class G1_custom_mlip_clf(G1FlatLipEnvCfg):
+    commands: G1MlipCommandsCfg = G1MlipCommandsCfg()
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        # both front and back 1.14
+        # just front: 0.616
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (0.616, 0.616),
+                "operation": "add",
+            },
+        )
+        
+        
 @configclass
 class G1_custom_lip_clf(G1FlatLipEnvCfg):
     def __post_init__(self):
@@ -77,7 +108,6 @@ class G1_custom_lip_clf(G1FlatLipEnvCfg):
                 "operation": "add",
             },
         )
-
 
 class G1FlatRefTrackingEnvCfg(G1FlatLipEnvCfg):
     """Configuration for the G1 Flat environment."""
