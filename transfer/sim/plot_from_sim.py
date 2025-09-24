@@ -78,21 +78,21 @@ def plot_ankles(data):
     axes[0, 1].plot(data["time"], data["left_ankle_pos"][:, 1])
     axes[0, 2].plot(data["time"], data["left_ankle_pos"][:, 2])
     axes[0, 0].set_xlabel("time")
-    axes[0, 0].set_ylabel(f"left_ankle_pos x (m)")
+    axes[0, 0].set_ylabel("left_ankle_pos x (m)")
     axes[0, 1].set_xlabel("time")
-    axes[0, 1].set_ylabel(f"left_ankle_pos y (m)")
+    axes[0, 1].set_ylabel("left_ankle_pos y (m)")
     axes[0, 2].set_xlabel("time")
-    axes[0, 2].set_ylabel(f"left_ankle_pos z (m)")
+    axes[0, 2].set_ylabel("left_ankle_pos z (m)")
 
     axes[1, 0].plot(data["time"], data["right_ankle_pos"][:, 0])
     axes[1, 1].plot(data["time"], data["right_ankle_pos"][:, 1])
     axes[1, 2].plot(data["time"], data["right_ankle_pos"][:, 2])
     axes[1, 0].set_xlabel("time")
-    axes[1, 0].set_ylabel(f"right_ankle_pos x (m)")
+    axes[1, 0].set_ylabel("right_ankle_pos x (m)")
     axes[1, 1].set_xlabel("time")
-    axes[1, 1].set_ylabel(f"right_ankle_pos y (m)")
+    axes[1, 1].set_ylabel("right_ankle_pos y (m)")
     axes[1, 2].set_xlabel("time")
-    axes[1, 2].set_ylabel(f"right_ankle_pos z (m)")
+    axes[1, 2].set_ylabel("right_ankle_pos z (m)")
 
 
 def plot_velocity_comparison(data, save_dir):
@@ -184,6 +184,7 @@ def plot_position_comparison(data, save_dir):
     plt.savefig(os.path.join(save_dir, "position_comparison.png"))
 
 
+
 def create_plots_for_newest():
     # Load in the data from rerun
     log_dir = os.getcwd() + "/logs"
@@ -198,8 +199,6 @@ def create_plots_for_newest():
         config = yaml.load(f, Loader=yaml.FullLoader)
 
         data = extract_data(os.path.join(newest, "sim_log.csv"), config)
-
-        # print(data)
 
     print("============== Data generated using " + config["simulator"] + " ===============")
 
@@ -223,6 +222,7 @@ def create_plots_for_newest():
     # Plot velocity and position comparisons
     plot_velocity_comparison(data, newest)
     plot_position_comparison(data, newest)
+
 
 
 if __name__ == "__main__":

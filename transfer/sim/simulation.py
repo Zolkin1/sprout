@@ -7,7 +7,7 @@ from datetime import datetime
 import mujoco
 import mujoco.viewer
 import numpy as np
-import yaml
+
 from .robot import Robot
 
 
@@ -223,8 +223,7 @@ class Simulation:
                     self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays
                 )
                 # Add custom debug spheres
-                ii = 0
-                for pos in height_map.reshape(-1, 3):
+                for ii, pos in height_map.reshape(-1, 3):
                     mujoco.mjv_initGeom(
                         viewer.user_scn.geoms[ii],
                         type=mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -234,7 +233,6 @@ class Simulation:
                         rgba=np.array([1, 0, 0, 1]),
                     )
                     viewer.user_scn.ngeom += 1
-                    ii += 1
 
             while viewer.is_running():
                 if total_time > 0 and self.robot.mj_data.time > total_time:
@@ -279,10 +277,8 @@ class Simulation:
                             self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays
                         )
                         # print(height_map)
-                        ii = 0
-                        for pos in height_map.reshape(-1, 3):
+                        for ii, pos in height_map.reshape(-1, 3):
                             viewer.user_scn.geoms[ii].pos = pos
-                            ii += 1
 
                     if force_disturbance is not None:
                         self.robot.apply_force_disturbance(force_disturbance(self.robot.mj_data.time))

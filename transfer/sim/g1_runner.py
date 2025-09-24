@@ -56,7 +56,7 @@ def main():
         default_angles=config["default_angles"],
         qvel_scale=config["qvel_scale"],
         ang_vel_scale=config["ang_vel_scale"],
-        height_map_scale=config.get("height_map_scale", None),
+        height_map_scale=config.get("height_map_scale"),
         policy_type=config["policy_type"],
     )
 

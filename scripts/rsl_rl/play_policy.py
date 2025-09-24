@@ -1,13 +1,3 @@
-# use the same play config,but use different trained policy
-# based on the specific environment specified, use the corresponding trained policy
-
-
-task = "custom-Isaac-Velocity-Flat-G1-Play-v0"
-
-# load different trained policy based on the env
-
-# "vanilla","custom","clf"
-
 import argparse
 import glob
 import os
@@ -28,9 +18,6 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 SIM_ENVIRONMENTS = {
     "vanilla": "G1-flat-vel",
     "lip_clf": "G1-LIP-ref-play",
-    "lip_ref_tracking": "G1-LIP-ref-play",
-    "lip_clf_vdot": "G1-LIP-ref-play",
-    "hzd_clf_play": "G1-hzd-clf-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
 }
 
