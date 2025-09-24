@@ -8,7 +8,7 @@ from scipy.spatial.transform import Rotation
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, rng=None):
+    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, use_pd: bool =False, rng=None):
         """Initialize the robot with its model and data."""
         if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
@@ -23,6 +23,8 @@ class Robot:
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
         self.torso_ipos = self.mj_model.body_ipos[body_id]
+
+        self.use_pd = use_pd
 
         if self.input_function is None:
             # Initialize joystick
@@ -108,23 +110,10 @@ class Robot:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(self.joystick.get_axis(0))
-            vx = -(self.joystick.get_axis(1))
-            vyaw = -(self.joystick.get_axis(3)) * 1
+            vy = -(0.5*self.joystick.get_axis(0))
+            vx = -(3.0*self.joystick.get_axis(1))
+            vyaw = -(self.joystick.get_axis(3)) * 0.5
 
-            # Clip or zero out small values
-            if abs(vx) < 0.1:
-                vx = 0
-            else:
-                vx = np.clip(vx, -0.75, 0.75)
-            if abs(vy) < 0.1:
-                vy = 0
-            else:
-                vy = np.clip(vy, -0.0, 0.0)
-            if abs(vyaw) < 0.1:
-                vyaw = 0
-            else:
-                vyaw = np.clip(vyaw, -3.14, 3.14)
             des_vel[0] = vx
             des_vel[1] = vy
             des_vel[2] = vyaw
@@ -145,11 +134,21 @@ class Robot:
         else:
             self.commanded_vel = self.input_function(sim_time)
 
-        # Apply a PD controller on the y axis through the heading
-        kp = 0.0
-        kd = 0.0
-        angular_vel = np.sign(self.commanded_vel[0]) * max(min(-kp * qpos[1] + -kd * qvel[1], 1), -1)
-        self.commanded_vel[2] = np.clip(angular_vel, -0.5, 0.5)
+        if self.use_pd:
+            kp_y = 1.5
+            kd_y = 0.3
+            y_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_y * qpos[1] + -kd_y * qvel[1], -0.5, 0.5)
+            self.commanded_vel[1] = y_vel
+
+            kp_yaw = 0.8
+            kd_yaw = 0.3
+            siny_cosp = 2 * (qpos[3] * qpos[6] + qpos[4] * qpos[5])
+            cosy_cosp = 1 - 2 * (qpos[5] * qpos[5] + qpos[6] * qpos[6])
+            yaw = np.arctan2(siny_cosp, cosy_cosp)
+            angular_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_yaw * yaw + -kd_yaw * qvel[5], -0.5, 0.5)
+            self.commanded_vel[2] = angular_vel
+
+        print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
 
         return policy.create_obs(
             qpos[7:],

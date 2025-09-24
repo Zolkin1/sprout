@@ -6,13 +6,14 @@ from typing import Literal
 import yaml
 
 # Add the project root to the Python path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+# sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from rl_policy_wrapper import RLPolicy
 
-from transfer.sim.robot import Robot
-from transfer.sim.simulation import Simulation
+from robot import Robot
+from simulation import Simulation
 
+from experiments.velocity_commands import speed_steps, smooth_ramp_running
 
 def main():
     parser = argparse.ArgumentParser()
@@ -62,7 +63,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(
-        robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=None
+        robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=None, use_pd=config["use_pd"]
     )
 
     # Create and run simulation

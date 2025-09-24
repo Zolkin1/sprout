@@ -7,4 +7,8 @@
 
 from .gaitPeriodCfg import GaitPeriodCfg
 
-__all__ = ["GaitPeriodCfg"] 
+from .treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
+
+from .treadmill_velocity_command import TreadmillVelocityCommand
+
+# __all__ = ["GaitPeriodCfg"]

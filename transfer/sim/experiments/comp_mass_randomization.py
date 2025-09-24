@@ -29,7 +29,7 @@ def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
     
     experiment_dirs = [
         os.path.join(root_dir, d)
-        for root_dir, _, _ in os.walk("experiments/mass_rand_comp")
+        for root_dir, _, _ in os.walk(".")
         for d in os.listdir(root_dir)
         if d.startswith(root_dir_pattern) and os.path.isdir(os.path.join(root_dir, d))
     ]
@@ -62,7 +62,6 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
     plt.rcParams.update({
         "text.usetex": True,
         "font.family": "serif",
-        "font.serif": ["Computer Modern Roman"],
     })
 
     fig, ax = plt.subplots(1, 1, figsize=(10, 5),sharex=True)
@@ -71,6 +70,8 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
     first_label = next(iter(grouped_data))
     time = grouped_data[first_label][0]["time"]
 
+
+    start_idx = 150
 
     dummy_patch = Patch(facecolor='none', alpha=0.0)  # Transparent dummy patch for handler
     custom_handles = []
@@ -81,18 +82,33 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
         color = colors[i % len(colors)]
         time = runs[0]["time"]
 
-        actual_stack = np.stack([run["actual_vel"] for run in runs])
-        mean_actual = np.mean(actual_stack, axis=0)
-        std_actual = np.std(actual_stack, axis=0)
+        # Handle variable-length runs by interpolating to common time grid
+        actual_vels = []
+        for run in runs:
+            # Interpolate each run to the common time grid
+            if len(run["actual_vel"]) > 0 and len(time) > 0:
+                interp_vel = np.interp(time, run["time"], run["actual_vel"][:, 0])
+                actual_vels.append(interp_vel)
+        
+        if actual_vels:
+            actual_stack = np.stack(actual_vels)
+            mean_actual = np.mean(actual_stack, axis=0)
+            std_actual = np.std(actual_stack, axis=0)
+        else:
+            # Fallback if no valid data
+            mean_actual = np.zeros_like(time)
+            std_actual = np.zeros_like(time)
 
-        ax.plot(time, mean_actual[:, 0], color=color, linewidth=2.5)
-        ax.fill_between(time, mean_actual[:, 0] - std_actual[:, 0], mean_actual[:, 0] + std_actual[:, 0],
+        ax.plot(time[start_idx:], mean_actual[start_idx:], color=color, linewidth=2.5)
+        ax.fill_between(time[start_idx:], mean_actual[start_idx:] - std_actual[start_idx:], mean_actual[start_idx:] + std_actual[start_idx:],
                         color=color, alpha=0.2)
 
         line = Line2D([0], [0], color=color, lw=2.5)
         patch = Patch(facecolor=color, alpha=0.15)
         custom_handles.append((line, patch))
         custom_labels.append(fr"{display_label}")
+
+        print(f"[{display_label}] Average std: {np.mean(std_actual[start_idx:])} \n Average mean: {np.mean(mean_actual[start_idx:])}")
 
 
     commanded = grouped_data[first_label][0]["commanded_vel"][:, 0]
@@ -102,7 +118,7 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
 
     ax.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
     ax.set_xlabel('Time (s)',fontsize=20)
-    ax.set_ylim(-0.6, 1.05)
+    ax.set_ylim(0.0, 3.05)
     plt.xticks(fontsize=20)
     plt.yticks(fontsize=20)
     ax.grid(True)
@@ -147,6 +163,9 @@ if __name__ == "__main__":
     label_override.update({"mass_randomization_g1_21j_config_baseline": "Baseline"})
     label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
     label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_running_clf_15": "CLF Weight 1.5"})
+    label_override.update({"mass_randomization_g1_21j_config_running_no_clf": "No CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_running": "CLF Weight 1"})
 
     if len(grouped_data) == 0:
         print("No data found. Check experiment folder structure and naming.")

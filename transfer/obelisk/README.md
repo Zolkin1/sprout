@@ -12,6 +12,15 @@ Set the `ROBOT_RL_ROOT` environment variable:
 export ROBOT_RL_ROOT=/your/path/to/robot_rl/transfer/obelisk
 ```
 
+## Creating a `.env`
+In the `docker` folder you must make a `.env` file that looks like:
+```
+USER=${USER:-$(id -un)}
+UID=1000
+GID=1000
+```
+But you may need to switch the numbers depending on your user.
+
 ## Running in Docker
 We recommend using VSCode's devcontainer feature to run the Docker environment.
 
@@ -23,8 +32,23 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
    - GPU-based (recommended for better performance)
    - No-GPU (if GPU is not available)
 
+# Quick start
+```
+source scripts/build.sh
+bash scripts/joystick.sh
+
+# Seperate terminal
+bash scripts/launch_lidar_odom.sh
+
+# obk-luanch...
+```
 
 # Setup within the Docker
+To build the local ROS workspace you can run
+```
+source scripts/build.sh
+```
+or do it manually:
 Run
 ```
 obk
@@ -71,6 +95,11 @@ Baseline:
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
 ```
 
+Running:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device_name=onboard bag=false
+```
+
 <!-- HZD with optitrack logging:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false
@@ -99,6 +128,12 @@ At `user_pose`, the robot will snap to the default position specified by `user_p
 At `low_level_ctrl`, the output from the controller node will be applied to robot.
 
 # Setting up the Xbox remote
+You can now run the script:
+```
+bash scripts/joystick.sh
+```
+
+Or you can do it manually:
 You can make sure that you can see the remote control with
 ```
 sudo evtest
@@ -143,6 +178,25 @@ To check running containers
 To open a new bash terminal for running container
 ```docker exec -it <container_id or container_name> /bin/bash```
 
+# Plotting Odomety
+To plot the odometry run
+```
+python plot_odom.py
+```
+or 
+```
+python plot_odom.py /path/to/odom_data.csv
+```
+
+You can also use `--start-time` and `--end-time` to specify and start and end time.
+
+# Plotting the Observations and Actions
+To plot these, run:
+```
+python plot_ctrl.py
+```
+
+You can also use `--start-time` and `--end-time` to specify and start and end time.
 
 
 # Using Optitrack

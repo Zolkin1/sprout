@@ -35,7 +35,7 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
-        self.commands.base_velocity.heading = (0,0)
+        self.commands.base_velocity.ranges.heading = (0,0)
 
         self.commands.step_period.period_range = (0.8,0.8)
 

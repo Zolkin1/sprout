@@ -47,29 +47,79 @@ def gaits_curriculum(
         # env.command_manager.set_term_cfg("base_velocity", cmd_term_cfg)
     return cmd_term.cfg.ranges.lin_vel_x[0]
 
+def cmd_vel_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_vel: float, step: float,
+                       update_interval: int = 100, first_update: int = 100):
+    """Curriculum to increase the commanded velocity."""
+    commanded_velocity = env.command_manager.get_term("base_velocity")
 
+    new_vel = commanded_velocity.cfg.ranges.lin_vel_x[1]
+
+    if env.common_step_counter >= first_update and env.common_step_counter % update_interval == 0:
+        # Compute new vel
+        new_vel = min(new_vel + step, max_vel)
+
+        # Assign vel - create new tuple since tuples are immutable
+        commanded_velocity.cfg.ranges.lin_vel_x = (commanded_velocity.cfg.ranges.lin_vel_x[0], new_vel)
+
+    return new_vel
+
+def walk_run_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], update_interval: int = 80000):
+    """Curriculum to switch between walking and running."""
+    commanded_velocity = env.command_manager.get_term("base_velocity")
+
+    top_vel = commanded_velocity.cfg.ranges.lin_vel_x[1]
+
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        if top_vel == 1.0:
+            commanded_velocity.cfg.ranges.lin_vel_x = (1.1, 3.0)
+        else:
+            commanded_velocity.cfg.ranges.lin_vel_x = (0.0, 1.0)
+
+    return top_vel
 
 def clf_curriculum(
-    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25), scale: tuple[float,float] = (0.01,0.01), update_interval: int = 100,
+    env: ManagerBasedRLEnv, env_ids: Sequence[int],min_max_err: tuple[float,float] = (0.1,0.25,0.1),
+        scale: tuple[float,float] = (0.01,0.01,0.01), update_interval: int = 100,
 ) -> float:
     """Curriculum based on clf value"""
     term_cfg = env.reward_manager.get_term_cfg("clf_decreasing_condition")
     new_max_eta_err = term_cfg.params["eta_max"]
     new_max_eta_dot_err = term_cfg.params["eta_dot_max"]
-    # clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
 
-    if env.common_step_counter  >= update_interval and env.common_step_counter % update_interval == 0:
-        
-            #the err
-            new_max_eta_err = max(new_max_eta_err - scale[0],min_max_err[0])
-            new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1],min_max_err[1])
-        
-            # term_cfg.params["max_eta_err"] = new_max_eta_err
-            # env.reward_manager.set_term_cfg("clf_reward", term_cfg)
+    clf_cfg = env.reward_manager.get_term_cfg("clf_reward")
+    clf_max_eta_err = clf_cfg.params["max_eta_err"]
+
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+            # Vdot update
+            new_max_eta_err = max(new_max_eta_err - scale[0], min_max_err[0])
+            new_max_eta_dot_err = max(new_max_eta_dot_err - scale[1], min_max_err[1])
+
             term_cfg.params["eta_max"] = new_max_eta_err
             term_cfg.params["eta_dot_max"] = new_max_eta_dot_err
             env.reward_manager.set_term_cfg("clf_decreasing_condition", term_cfg)
+
+            # V update
+            clf_max_eta_err = max(clf_max_eta_err - scale[2], min_max_err[2])
+
+            clf_cfg.params["max_eta_err"] = clf_max_eta_err
+            env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
+
     return new_max_eta_err
+
+def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float,
+                       update_interval: int = 100) -> float:
+    """Curriculum to adjust the weight on the contact penalty."""
+    term_cfg = env.reward_manager.get_term_cfg("flight_contact_penalty")
+    new_weight = term_cfg.params["weight_scalar"]
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        # Compute new contact weight
+        new_weight = min(new_weight + update_amnt, max_weight)
+
+        term_cfg.params["weight_scalar"] = new_weight
+        env.reward_manager.set_term_cfg("flight_contact_penalty", term_cfg)
+
+
+    return new_weight
 
 def terrain_levels(
     env: ManagerBasedRLEnv, env_ids: Sequence[int], asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")

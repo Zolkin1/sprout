@@ -67,7 +67,7 @@ For both `train` and `play` you can also specify a number of envs with `--num_en
 We suggest uploading the policy to hugging face when you are ready to run it on hardware so that this repo (the code repo) is kept clean.
 You can upload to hugging face automatically with
 ```bash
-python scripts/hardware/export_to_hardware.py --env_type=<env-type> --load_run=<run_dir> --hf_repo_id=<username/repo> --policy_name=<policy_name>
+python scripts/rsl_rl/export_to_hardware.py --env_type=<env-type> --load_run=<run_dir> --hf_repo_id=<username/repo> --policy_name=<policy_name>
 ```
 This will load a already exported run and upload the exported policy to hugging face in the specified repo with the specified name.
 
@@ -85,7 +85,7 @@ RL Task list:
 | `vanilla` |     G1     |  :white_check_mark:  | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
 | `lip_clf`         |     G1     |  :white_check_mark:  | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `hzd_clf_custom`  |     G1     |  :white_check_mark:  | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
-
+ | `running_hzd_clf` | G1 | :x: | Running controller using a gait library. |
 ## Copying checkpoitns from remote server 
 First mount the server to your local desktop
  

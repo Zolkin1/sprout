@@ -17,41 +17,62 @@ class CLF:
         device: torch.device = None,
         Q_weights: np.ndarray = None,
         R_weights: np.ndarray = None,
+        num_domain: int = 1,
+        domain_scalar: list[float]|None = None
     ):
         # Initialize device and basic parameters
         self.device = device 
         self.sim_dt = sim_dt
         self.n_outputs = n_outputs
 
-        # Convert LIP dynamics to NumPy
-   
-
         # Set up default Q, R if not provided
         # Q_weights should be length = n_states, R_weights length = n_inputs
+        self.num_domain = num_domain
+
         n_states = 2 * n_outputs
         n_inputs = n_outputs
         if Q_weights is None:
             Q_weights = np.ones(n_states)
         if R_weights is None:
             R_weights = 0.1 * np.ones(n_inputs)
-        self.Q_np = np.diag(Q_weights)
-        self.R_np = np.diag(R_weights)
 
-        # Solve for P and LQR gain K in NumPy
-        P_np, K_np = self._compute_PK_np()
 
-        # Cache as torch tensors
-        self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
-        # K shape: (n_inputs, n_states)
-        self.K = torch.from_numpy(K_np).to(self.device).to(torch.float32)
+        if self.num_domain == 1: 
+            
+            Q_np = np.diag(Q_weights)
+            R_np = np.diag(R_weights)
 
-        self.lambda_max = torch.linalg.eigvalsh(self.P)[-1]
-        self.norm_P = torch.linalg.norm(self.P, ord=2)
+            # Solve for P and LQR gain K in NumPy
+            P_np = self._compute_PK_np(Q_np,R_np)
 
+            # Cache as torch tensors
+            self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
+            self.lambda_max = torch.linalg.eigvalsh(self.P)[-1]
+            self.norm_P = torch.linalg.norm(self.P, ord=2)
+
+
+        else:
+            P = []
+            lambda_max = []
+            norm_P = []
+            for i in range(self.num_domain):
+                Q_np = np.diag(Q_weights)*domain_scalar[i*2]
+                R_np = np.diag(R_weights)*domain_scalar[i*2+1]
+
+                # Solve for P and LQR gain K in NumPy
+                P_np = self._compute_PK_np(Q_np,R_np)
+
+                # Cache as torch tensors
+                P.append(torch.from_numpy(P_np).to(self.device).to(torch.float32))
+                lambda_max.append(torch.linalg.eigvalsh(self.P)[-1])
+                norm_P.append(torch.linalg.norm(self.P, ord=2))
+            self.P = P
+
+        
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0
-
-    def _compute_PK_np(self) -> tuple[np.ndarray, np.ndarray]:
+        
+    def _compute_PK_np(self, Q_np, R_np) -> tuple[np.ndarray, np.ndarray]:
         """
         Construct a pure double integrator system for all outputs,
         and solve for the LQR gain K and Lyapunov matrix P.
@@ -72,12 +93,9 @@ class CLF:
 
 
         # 2) Solve CARE: A^T P + P A - P B R^{-1} B^T P + Q = 0
-        P = solve_continuous_are(A_full, B_full, self.Q_np, self.R_np)
+        P = solve_continuous_are(A_full, B_full, Q_np, R_np)
 
-        # 3) Compute LQR gain: K = R^{-1} B^T P
-        K = np.linalg.solve(self.R_np, B_full.T @ P)
-
-        return P, K
+        return P
 
 
     def compute_v(
@@ -87,6 +105,7 @@ class CLF:
         dy_act: torch.Tensor,
         dy_nom: torch.Tensor,
         yaw_idx: list[int],
+        domain_idx: int = 0,
     ) -> torch.Tensor:
         """
         Evaluate V = (y_act - y_nom)^T P (y_act - y_nom).
@@ -104,7 +123,11 @@ class CLF:
         wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
         eta[:,yaw_idx] = wrapped_yaw_err
 
-        V = torch.einsum('bi,ij,bj->b', eta, self.P, eta)
+        if self.num_domain > 1:
+            P = self.P[domain_idx]
+        else:
+            P = self.P
+        V = torch.einsum('bi,ij,bj->b', eta, P, eta)
 
         self.v_buffer[:, 2] = self.v_buffer[:, 1]
         self.v_buffer[:, 1] = self.v_buffer[:, 0]
@@ -147,11 +170,6 @@ class CLF:
         else:
             # step_count == 1 → no previous sample; just return zero
             vdot_raw = torch.zeros((B,), device=self.device)
-
-        # 5) (Optional) Exponential moving average on the raw derivative
-        #    If you do not want smoothing, skip these two lines and set vdot_smooth = vdot_raw.
-        # vdot_smooth = self.ema_beta * self.vdot_ema + (1.0 - self.ema_beta) * vdot_raw
-        # self.vdot_ema.copy_(vdot_smooth)
 
 
         return vdot_raw, v_curr

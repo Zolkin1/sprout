@@ -18,6 +18,7 @@ SIM_ENVIRONMENTS = {
     "vanilla": "G1-flat-vel",
     "lip_clf": "G1-LIP-ref-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
+    "running_hzd_clf": "G1-running-hzd-play",
 }
 
 class DataLogger:
@@ -136,7 +137,7 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def extract_reference_trajectory(env, log_vars,command_name):
+def extract_reference_trajectory(env, log_vars, command_name):
     # Get the underlying environment by unwrapping
     unwrapped_env = env.unwrapped
 
@@ -160,10 +161,9 @@ def extract_reference_trajectory(env, log_vars,command_name):
             elif hasattr(ref, 'gait_config') and hasattr(ref.gait_config, '_gait_cache'):
                 results[var] = ref.gait_config._gait_cache[list(ref.gait_config._gait_cache.keys())[0]].axis_names
             else:
-                results[var] = None
+                raise ValueError("[Extract Reference] Could not find the axis name!")
         else:
-            results[var] = None  # or raise an error/warning if you prefer
-
+            raise ValueError("[Extract Reference] No variable matching the given name found in the command!")
     return results
 
 
@@ -358,6 +358,10 @@ def main():
         'vdot',
         'stance_foot_pos_0',
         'stance_foot_ori_0',
+        'current_domains',
+        'phase_var',
+        'domain_durations',
+        'gait_indices',
     ]
     
     # Get the command term to determine what type of trajectory we're using
@@ -385,13 +389,10 @@ def main():
         key = list(ref.gait_config._gait_cache.keys())[0]
         for axis_info in ref.gait_config._gait_cache[key].axis_names:
             log_vars.append(axis_info['name'])
+        
         # Also log the axis names for plotting
         log_vars.append('axis_names')
-    elif hasattr(ref, 'robot') and hasattr(ref.robot, 'joint_names'):
-        # Joint trajectory case - add joint error metrics
-        trajectory_type = 'joint'
-        for joint_name in ref.robot.joint_names:
-            log_vars.append(f"error_{joint_name}")
+
     
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
@@ -421,7 +422,7 @@ def main():
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
-        
+
         if timestep > max(100, args_cli.video_length):
             break
 

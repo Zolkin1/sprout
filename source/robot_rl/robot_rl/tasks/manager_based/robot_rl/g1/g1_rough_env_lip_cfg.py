@@ -30,7 +30,7 @@ class G1RoughLipCommandsCfg(HumanoidCommandsCfg):
 
 
 @configclass
-class CurriculumCfg:
+class G1RoughLipCurriculumCfg:
     """Curriculum terms for the MDP."""
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
@@ -88,7 +88,7 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
     rewards: G1RoughLipRewards = G1RoughLipRewards()
     observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
     commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: G1RoughLipCurriculumCfg = G1RoughLipCurriculumCfg()
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -119,7 +119,6 @@ class G1RoughLipEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
-            
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
                 "x": (0.0, 0.0),

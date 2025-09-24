@@ -18,15 +18,7 @@ def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -
     #reshape from num_env, num_bodies, 3 to num_env, num_bodies*3
     return contact_flag.reshape(env.num_envs, -1)
 
-def step_duration(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    step_duration = cmd.T
-    return step_duration.unsqueeze(-1)
 
-def step_location(env: ManagerBasedRLEnv, command_name) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    step_location = cmd.foot_target[:,0:2]
-    return step_location
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     left_foot_vel = cmd.robot.data.body_lin_vel_w[:,cmd.feet_bodies_idx[0],:]
@@ -57,15 +49,15 @@ def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Ten
     act_traj[:,8] *= 50.0
     return act_traj
 
-def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    ref_traj = cmd.y_out[:,8]
-    return ref_traj.unsqueeze(-1)
+# def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     ref_traj = cmd.y_out[:,8]
+#     return ref_traj.unsqueeze(-1)
 
-def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    act_traj = cmd.y_act[:,8]
-    return act_traj.unsqueeze(-1)
+# def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+#     cmd = env.command_manager.get_term(command_name)
+#     act_traj = cmd.y_act[:,8]
+#     return act_traj.unsqueeze(-1)
 
 def ref_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
@@ -77,25 +69,20 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
-def joint_pos_des(env: ManagerBasedRLEnv, cmd_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(cmd_name)
-    joint_pos_des = cmd.joint_pos_des
-    return joint_pos_des
 
-def v_dot(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    v_dot = cmd.vdot.unsqueeze(-1)
-    return v_dot
-
-def v(env: ManagerBasedRLEnv, command_name:str) -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    v = cmd.v.unsqueeze(-1)
-    return v
-        
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    phase = 2*torch.pi * cmd.tp
+
+    # Get the commanded vel
+    commanded_velocity = env.command_manager.get_command("base_velocity")
+
+    phase = 2*torch.pi * cmd.gait_cycle_prop
+
+    # Zero the phase if we are standing (check all environments)
+    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    phase[standing_mask] = 0
+
     sphase = torch.sin(phase)
     if sphase.ndim == 1:
         # [B] → [B, 1]
@@ -105,7 +92,16 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
 def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    phase = 2*torch.pi * cmd.tp
+
+    # Get the commanded vel
+    commanded_velocity = env.command_manager.get_command("base_velocity")
+
+    phase = 2*torch.pi * cmd.gait_cycle_prop
+
+    # Zero the phase if we are standing (check all environments)
+    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    phase[standing_mask] = 0
+
     cphase = torch.cos(phase)
     if cphase.ndim == 1:
         # [B] → [B, 1]
@@ -120,7 +116,6 @@ def sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     return sphase
 
-
 def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     period = env.command_manager.get_command(command_name).clone()
 
@@ -129,3 +124,26 @@ def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     return cphase
 
+def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Return a domain flag based on which hybrid domain the reference trajectory is in.
+    0 = standing, 1 = walking, 2 = running
+    """
+    cmd = env.command_manager.get_term(command_name)
+    commanded_velocity = env.command_manager.get_command("base_velocity")
+
+    # Boolean masks
+    standing = torch.norm(commanded_velocity, dim=1) < cmd.standing_threshold
+    running = commanded_velocity[:, 0] >= 1.05
+    walking = (commanded_velocity[:, 0] > 0.0) & (commanded_velocity[:, 0] < 1.05)
+
+    # Default to standing (0)
+    domain = torch.zeros_like(commanded_velocity[:, 0], dtype=torch.long)
+
+    # Assign walking and running where applicable
+    domain[walking] = 1
+    domain[running] = 0
+
+    # Standing should override everything else
+    domain[standing] = 2
+
+    return domain.unsqueeze(-1)

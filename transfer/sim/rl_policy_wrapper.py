@@ -112,6 +112,10 @@ class RLPolicy:
             return self.create_cnn_obs(
                 qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
             )
+        elif self.policy_type == "mlp_behavior":
+            return self.create_mlp_behavior_obs(
+                qjoints, body_ang_vel, qvel, time, projected_gravity, des_vel, height_map, sensor_pos, convention
+            )
         else:
             raise ValueError(f"Invalid policy type: {self.policy_type}")
 
@@ -240,8 +244,13 @@ class RLPolicy:
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action_isaac  # Past action
 
-        sin_phase = np.sin(2 * np.pi * time / self.period)
-        cos_phase = np.cos(2 * np.pi * time / self.period)
+        if des_vel[0] < 0.05:
+            # For removing jitter during standing
+            sin_phase = np.sin(0)
+            cos_phase = np.cos(0)
+        else:
+            sin_phase = np.sin(2 * np.pi * time / self.period)
+            cos_phase = np.cos(2 * np.pi * time / self.period)
 
         if height_map is not None:
             height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
@@ -257,6 +266,66 @@ class RLPolicy:
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 
         # print(obs_tensor)
+
+        return obs_tensor
+
+    def create_mlp_behavior_obs(
+        self,
+        qjoints,
+        body_ang_vel,
+        qvel,
+        time,
+        projected_gravity,
+        des_vel,
+        height_map=None,
+        sensor_pos=None,
+        convention="mj",
+    ):
+        """Create the observation vector from the sensor data for running."""
+        obs = np.zeros(self.num_obs, dtype=np.float32)
+
+        obs[:3] = body_ang_vel * self.ang_vel_scale  # Angular velocity
+        obs[3:6] = projected_gravity  # Projected gravity
+        obs[6] = des_vel[0] * self.cmd_scale[0]  # Command velocity
+        obs[7] = des_vel[1] * self.cmd_scale[1]  # Command velocity
+        obs[8] = des_vel[2] * self.cmd_scale[2]
+        # Command velocity
+
+        nj = len(qjoints)
+        if convention == "mj":
+            qj = qjoints - self.default_angles
+            obs[9 : 9 + nj] = self.convert_to_isaac(qj)  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = self.convert_to_isaac(qvel) * self.qvel_scale  # Joint vel
+        else:
+            qj = qjoints - self.convert_to_isaac(self.default_angles)
+            obs[9 : 9 + nj] = qj  # Joint pos
+            obs[9 + nj : 9 + 2 * nj] = qvel * self.qvel_scale  # Joint vel
+
+        obs[9 + 2 * nj : 9 + 3 * nj] = self.action_isaac  # Past action
+
+        sin_phase = np.sin(2 * np.pi * time / self.period)
+        cos_phase = np.cos(2 * np.pi * time / self.period)
+
+        if height_map is not None:
+            height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
+            # print(height_obs)
+            # height_obs = np.ones(256)*0.25
+            obs[9 + 3 * nj : 9 + 3 * nj + height_obs.shape[0]] = height_obs
+            obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array(
+                [sin_phase, cos_phase]
+            )  # Phases
+        else:
+            obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+
+        if des_vel[0] < 0.05:
+            behavior_flag = 2
+        elif des_vel[0] < 1.05:
+            behavior_flag = 1
+        else:
+            behavior_flag = 0
+        obs[-1] = behavior_flag
+        obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+
 
         return obs_tensor
 

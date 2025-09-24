@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 import math
+import re
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
@@ -118,14 +119,14 @@ def holonomic_constraint_vel(
     cmd = env.command_manager.get_term(command_name)
 
     # linear velocity [B,3] and yaw rate [B,1]
-    v   = cmd.stance_foot_vel                        # [vx, vy, vz]
-    wz  = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1) # [ω_z]
+    v = cmd.stance_foot_vel  # [vx, vy, vz]
+    wz = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1)  # [ω_z]
 
     # stack into [B,4] error vector
     e_vel = torch.cat([v, wz], dim=-1)
 
-    # unified exponential‐norm reward
-    return torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
+    not_flight_mask = cmd.get_not_flight_envs()
+    return not_flight_mask * torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
 
 def holonomic_constraint(
     env: ManagerBasedRLEnv,
@@ -147,26 +148,26 @@ def holonomic_constraint(
 
     # planar position error [B,2]
     p0_xy = cmd.stance_foot_pos_0[:, :2]
-    p_xy  = cmd.stance_foot_pos[:, :2]
+    p_xy = cmd.stance_foot_pos[:, :2]
     delta_xy = p_xy - p0_xy
 
     # vertical error to the floor plane [B,1]
-    z_cur    = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
-    delta_z  = z_cur - cmd.stance_foot_pos_0[:,2].unsqueeze(-1)
+    z_cur = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
+    delta_z = z_cur - cmd.stance_foot_pos_0[:, 2].unsqueeze(-1)
 
     # roll error [B,1]
     roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
 
     # yaw error wrapped to [–π, π] [B,1]
     psi0 = cmd.stance_foot_ori_0[:, 2]
-    psi  = cmd.stance_foot_ori[:, 2]
+    psi = cmd.stance_foot_ori[:, 2]
     delta_psi = ((psi - psi0 + torch.pi) % (2 * torch.pi) - torch.pi).unsqueeze(-1)
 
     # stack into [B,5] error vector
     e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
 
-    # unified Gaussian‐like reward
-    return torch.exp(- (e_pose**2).sum(dim=-1) / sigma_pose**2)
+    not_flight_mask = cmd.get_not_flight_envs()
+    return not_flight_mask * torch.exp(- (e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
 
 
 def reference_tracking(
@@ -214,7 +215,6 @@ def reference_vel_tracking(    env: ManagerBasedRLEnv,
     reward_per_dim = weight_vec * torch.exp(-err_sq_scaled)  # [B, D]
     reward = reward_per_dim.sum(dim=1)/torch.sum(weight_vec)  # [B]
     return reward
-
 
 
 def foot_clearance(env: ManagerBasedRLEnv,
@@ -280,3 +280,127 @@ def phase_contact(
             contact = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids[i], :].norm(dim=-1).max(dim=1)[0] > 1.0
             res += ~(contact ^ is_stance)
     return res
+
+def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, base_vel_cmd: str,
+                           sensor_cfg: SceneEntityCfg, weight_scalar: float, start_vel: float) -> torch.Tensor:
+    """Penalize contacts while in the flight phase."""
+    cmd = env.command_manager.get_term(command_name)
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    flight_mask = cmd.get_flight_envs()
+
+    # Only apply penalty when commanded velocity is 2.0 m/s or greater                                                                                                                                                                                                                                                                                                                                           │ │
+    command_vel = env.command_manager.get_command(base_vel_cmd)[:, :3]  # Get x,y,z velocity commands                                                                                                                                                                                                                                                                                                            │ │
+    speed_mask = command_vel[:, 0] >= start_vel #2.0  # Create mask for high speed commands
+
+    contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
+    penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
+    return flight_mask * speed_mask * penalty
+
+def track_lin_vel_y_exp(
+    env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward tracking of linear velocity commands (xy axes) using exponential kernel."""
+    # extract the used quantities (to enable type-hinting)
+    asset: RigidObject = env.scene[asset_cfg.name]
+    # compute the error
+    lin_vel_error =  torch.square(env.command_manager.get_command(command_name)[:, 1] - asset.data.root_lin_vel_b[:, 1])
+    return torch.exp(-lin_vel_error / std**2)
+
+
+def ankle_roll_zero(
+    env: ManagerBasedRLEnv, std: float = 0.1, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Reward keeping both ankle roll joints near zero position using exponential kernel."""
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    
+    # Get ankle roll joint indices - these are typically the last joints in each leg
+    # Based on the controller.py joint order:
+    # Index 19: left_ankle_roll_joint
+    # Index 20: right_ankle_roll_joint
+    ankle_roll_indices = [19, 20]  # left and right ankle roll joints
+    
+    # Get current ankle roll joint positions
+    ankle_roll_positions = asset.data.joint_pos[:, ankle_roll_indices]  # [B, 2]
+    
+    # Compute squared error from zero position
+    ankle_roll_error = torch.square(ankle_roll_positions)  # [B, 2]
+    
+    # Sum errors for both ankle roll joints and apply exponential kernel
+    total_error = ankle_roll_error.sum(dim=-1)  # [B]
+    reward = torch.exp(-total_error / std**2)
+    
+    return reward
+
+def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize applied torques if they cross the limits.
+
+    This is computed as a sum of the absolute value of the difference between the applied torques and the limits.
+    For implicit actuators, we manually compute the PD controller torques.
+    """
+    # extract the used quantities (to enable type-hinting)
+    asset: Articulation = env.scene[asset_cfg.name]
+    
+    # Manually compute PD controller torques for implicit actuators
+    computed_torque = torch.zeros_like(asset.data.joint_pos)
+    
+    # Get current joint positions, velocities, and desired positions
+    current_pos = asset.data.joint_pos
+    current_vel = asset.data.joint_vel
+    desired_pos = asset.data.joint_pos_target
+    
+    # Access actuator configurations from the asset
+    actuator_groups = asset.cfg.actuators
+    
+    for group_name, actuator_cfg in actuator_groups.items():
+        # Get joint indices for this actuator group
+        joint_indices = asset.find_joints(actuator_cfg.joint_names_expr)[0]
+        
+        # Get stiffness and damping values for this group
+        if isinstance(actuator_cfg.stiffness, dict):
+            # Handle per-joint stiffness values
+            kp_values = torch.zeros(len(joint_indices), dtype=torch.float32, device=env.device)
+            for i, joint_idx in enumerate(joint_indices):
+                joint_name = asset.joint_names[joint_idx]
+                # Find matching stiffness pattern
+                for pattern, value in actuator_cfg.stiffness.items():
+                    if re.match(pattern.replace(".*", ".*"), joint_name):
+                        kp_values[i] = value
+                        break
+        else:
+            # Single stiffness value for all joints in this group
+            kp_values = torch.full((len(joint_indices),), actuator_cfg.stiffness, dtype=torch.float32, device=env.device)
+        
+        if isinstance(actuator_cfg.damping, dict):
+            # Handle per-joint damping values
+            kd_values = torch.zeros(len(joint_indices), dtype=torch.float32, device=env.device)
+            for i, joint_idx in enumerate(joint_indices):
+                joint_name = asset.joint_names[joint_idx]
+                # Find matching damping pattern
+                for pattern, value in actuator_cfg.damping.items():
+                    if re.match(pattern.replace(".*", ".*"), joint_name):
+                        kd_values[i] = value
+                        break
+        else:
+            # Single damping value for all joints in this group
+            kd_values = torch.full((len(joint_indices),), actuator_cfg.damping, dtype=torch.float32, device=env.device)
+        
+        # Compute PD torques for this group: tau = kp * (q_des - q) - kd * q_dot
+        pos_error = desired_pos[:, joint_indices] - current_pos[:, joint_indices]
+        pd_torque = (kp_values[None, :] * pos_error - kd_values[None, :] * current_vel[:, joint_indices])
+        
+        # Store computed torques
+        computed_torque[:, joint_indices] = pd_torque
+    
+    # Compute torque limit violations
+    torque_limits_upper = asset.data.joint_effort_limits[0, asset_cfg.joint_ids]  # Upper limits
+
+    # Get computed torques for the specified joints
+    joint_torques = computed_torque[:, asset_cfg.joint_ids]
+    
+    # Compute violations: how much torques exceed the limits
+    violation = torch.clamp(torch.abs(joint_torques) - torque_limits_upper, min=0)
+
+    # Sum all violations
+    return torch.sum(violation, dim=1)

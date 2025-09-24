@@ -1,12 +1,141 @@
-import torch
+import torch, yaml
 import numpy as np
-from typing import List, Dict
-from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz
-
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_config.jt_traj import get_euler_from_quat
+from typing import List, Dict, Tuple
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.hlip_cmd import _transfer_to_local_frame, euler_rates_to_omega
-from .base_traj import BaseTrajectoryConfig
+import math
 
+def _ncr(n, r):
+    return math.comb(n, r)
+
+def get_euler_from_quat(quat):
+    euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
+    euler_x = wrap_to_pi(euler_x)
+    euler_y = wrap_to_pi(euler_y)
+    euler_z = wrap_to_pi(euler_z)
+    return torch.stack([euler_x, euler_y, euler_z], dim=-1)
+
+def bezier_deg(
+    order: int,
+    tau: torch.Tensor,  # [batch], each in [0,1]
+    step_dur: torch.Tensor,  # [batch]
+    control_points: torch.Tensor,  # [n_dim, degree+1]
+    degree: int,
+) -> torch.Tensor:
+    """
+    Computes (for each τ in the batch) either
+      • the vector‐valued Bezier position B(τ) ∈ R^{n_dim}, or
+      • its time derivative B'(τ) ∈ R^{n_dim},
+
+    where `control_points` is shared across the whole batch and has shape [n_dim, degree+1].
+
+    Args:
+      order: 0 → position, 1 → time‐derivative.
+      tau:       shape [batch], clipped to [0,1].
+      step_dur:  shape [batch], positive scalars.
+      control_points: shape [n_dim, degree+1].
+      degree:    polynomial degree (so there are `degree+1` control points).
+
+    Returns:
+      If order==0: a tensor of shape [batch, n_dim], the Bezier‐position at each τ[i].
+      If order==1: a tensor of shape [batch, n_dim], the time‐derivative at each τ[i].
+    """
+    # 1) Clamp tau into [0,1]
+    tau = torch.clamp(tau, 0.0, 1.0)  # [batch]
+
+    # 2) Extract n_dim from control_points
+    #    control_points: [n_dim, degree+1]
+
+    if order == 1:
+        # ─── DERIVATIVE CASE ────────────────────────────────────────────────────
+        # We want:
+        #   B'(τ) = degree * sum_{i=0..degree-1} [
+        #             (CP_{i+1} - CP_i) * C(degree-1, i)
+        #             * (1-τ)^(degree-1-i) * τ^i
+        #          ]  / step_dur.
+
+        # 3) Compute CP differences along the "degree+1" axis:
+        #    cp_diff: [n_dim, degree], where
+        #      cp_diff[:, i] = control_points[:, i+1] - control_points[:, i].
+        cp_diff = control_points[:, 1:] - control_points[:, :-1]  # [n_dim, degree]
+
+        # 4) Binomial coefficients for (degree-1 choose i), i=0..degree-1:
+        #    coefs_diff: [degree].
+        coefs_diff = torch.tensor(
+            [_ncr(degree - 1, i) for i in range(degree)],
+            dtype=control_points.dtype,
+            device=control_points.device
+        )  # [degree]
+
+        # 5) Build (τ^i) and ((1-τ)^(degree-1-i)) for i=0..degree-1:
+        i_vec = torch.arange(degree, device=control_points.device)  # [degree]
+
+        #    tau_pow:     [batch, degree],  τ^i
+        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
+
+        #    one_minus_pow: [batch, degree], (1-τ)^(degree-1-i)
+        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - 1 - i_vec).unsqueeze(0))
+
+        # 6) Combine into a single "weight matrix" for the derivative:
+        #    weight_deriv[b, i] = degree * C(degree-1, i) * (1-τ[b])^(degree-1-i) * (τ[b])^i
+        #    → shape [batch, degree]
+        weight_deriv = (degree
+                        * coefs_diff.unsqueeze(0)        # [1, degree]
+                        * one_minus_pow                 # [batch, degree]
+                        * tau_pow)                       # [batch, degree]
+        # Now weight_deriv: [batch, degree]
+
+        # 7) Multiply these weights by cp_diff to get a [batch, n_dim] result:
+        #    For each batch b:  B'_b =  Σ_{i=0..degree-1} weight_deriv[b,i] * cp_diff[:,i],
+        #    which is exactly a mat‐mul:  weight_deriv[b,:] @ (cp_diff^T) → [n_dim].
+        #
+        #    cp_diff^T: [degree, n_dim], so (weight_deriv @ cp_diff^T) → [batch, n_dim].
+        Bdot = torch.matmul(weight_deriv, cp_diff.transpose(0, 1))  # [batch, n_dim]
+
+        # 8) Finally divide by step_dur:
+        return Bdot / step_dur.unsqueeze(1)  # [batch, n_dim]
+
+    else:
+        # ─── POSITION CASE ────────────────────────────────────────────────────────
+        # We want:
+        #   B(τ) = Σ_{i=0..degree} [
+        #            CP_i * C(degree, i) * (1-τ)^(degree-i) * τ^i
+        #         ].
+
+        # 3) Binomial coefficients for (degree choose i), i=0..degree:
+        #    coefs_pos: [degree+1]
+        coefs_pos = torch.tensor(
+            [_ncr(degree, i) for i in range(degree + 1)],
+            dtype=control_points.dtype,
+            device=control_points.device
+        )  # [degree+1]
+
+        # 4) Build τ^i and (1-τ)^(degree-i) for i=0..degree:
+        i_vec = torch.arange(degree + 1, device=control_points.device)  # [degree+1]
+
+        #    tau_pow:        [batch, degree+1]
+        tau_pow = tau.unsqueeze(1).pow(i_vec.unsqueeze(0))
+
+        #    one_minus_pow:  [batch, degree+1]
+        one_minus_pow = (1 - tau).unsqueeze(1).pow((degree - i_vec).unsqueeze(0))
+
+        # 5) Combine into a "weight matrix" for position:
+        #    weight_pos[b, i] = C(degree, i) * (1-τ[b])^(degree-i) * (τ[b])^i.
+        #    → shape [batch, degree+1]
+        weight_pos = (coefs_pos.unsqueeze(0)    # [1, degree+1]
+                      * one_minus_pow          # [batch, degree+1]
+                      * tau_pow)               # [batch, degree+1]
+        # Now weight_pos: [batch, degree+1]
+
+        # 6) Multiply by control_points to get [batch, n_dim]:
+        #    For each batch b:  B_b = Σ_{i=0..degree} weight_pos[b,i] * control_points[:,i],
+        #    i.e.  weight_pos[b,:]  (shape [degree+1]) @ (control_points^T) ([degree+1, n_dim]) → [n_dim].
+        #
+        #    So:  B = weight_pos @ control_points^T  → [batch, n_dim].
+        B = torch.matmul(weight_pos, control_points.transpose(0, 1))  # [batch, n_dim]
+
+        return B
+    
 def relable_ee_hand_coeffs():
     """Build relabel matrix for end effector coefficients."""
     R = np.eye(21)
@@ -68,51 +197,169 @@ def relable_ee_coeffs():
 
     return R
 
-class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
+def relable_ee_stance_coeffs():
+    """Build a relabelling matrix for end effector coefficients including the stance foot."""
+    R = np.eye(27)
+
+    ##
+    # COM
+    ##
+    # com pos: [1,-1,1]
+    R[1, 1] = -1
+
+    ##
+    # Pelvis
+    ##
+    # pelvis: [-1,1,-1]
+    R[3, 3] = -1
+    R[5, 5] = -1
+
+    ##
+    # Swing foot
+    ##
+    # swing_foot_pos:[1,-1,1]
+    R[7, 7] = -1
+    # swing_foot_or: [-1,1,-1]
+    R[9, 9] = -1
+    R[11, 11] = -1
+
+    ##
+    # Stance Foot
+    ##
+    # stance_foot_pos: [1, -1, 1]
+    R[13, 13] = -1
+    # stance_foot_ori: [-1, 1, -1]
+    R[15, 15] = -1
+    R[17, 17] = -1
+
+    ##
+    # Joints
+    ##
+    # waist yaw
+    R[18, 18] = -1
+
+    #swap arm coeffs
+    arm_offset = 18 + 1
+    left_arm = arm_offset + np.array([0, 1, 2, 3])
+    right_arm = arm_offset + np.array([4, 5, 6, 7])
+
+    tmp = R[left_arm, :].copy()
+    R[left_arm, :] = R[right_arm, :]
+    R[right_arm, :] = tmp
+
+    # Sign flips: shoulder_roll, shoulder_yaw
+    flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
+    R[flip_arm, :] *= -1
+
+    return R
+
+class EndEffectorTrajectory():
     """Configuration class for end effector trajectories."""
     
     def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
         self.constraint_specs = []
-        super().__init__(yaml_path)
+        self.yaml_path = yaml_path
+        # Make all the dicts that will hold {domain_name: value}
+        self.bezier_coeffs = {}
+        self.T = {}
+        self.left_coeffs = {}
+        self.right_coeffs = {}
+        self.bez_deg = {}  # Default Bezier degree
+        self.joint_order = {}
+        self.load_from_yaml()
     
-    def _load_specific_data(self, data):
+
+    def load_from_yaml(self):
+        """Load configuration from YAML file.
+        
+        This method loads the step period T and calls the abstract method
+        _load_specific_data() for subclass-specific data loading.
+        """
+        with open(self.yaml_path, 'r') as file:
+            data = yaml.safe_load(file)
+
+        if data.get('domain_sequence') is None:
+            raise ValueError("Domain sequence must be specified in the trajectory solution!")
+
+        self.domain_seq = data['domain_sequence']
+        for domain_name in self.domain_seq:
+            # Load common data
+            raw_T = data[domain_name]['T'][0] if isinstance(data[domain_name]['T'], list) else data[domain_name]['T']
+            self.T[domain_name] = round(raw_T / 0.005) * 0.005
+            self.bez_deg[domain_name] = data[domain_name]['spline_order']
+
+            if domain_name == self.domain_seq[0]:
+                # Load initial config
+                init_config = data[domain_name]['q'][0]
+                # Need to reorder xyzw to wxyz
+                init_vel = data[domain_name]['v'][0]
+                self.init_root_state = np.concatenate([init_config[:3], [init_config[6]], init_config[3:6]])  # [pos_xyz, yaw, rpy]
+                self.init_root_vel = init_vel[:6]
+                self.init_joint_pos = init_config[7:]
+                self.init_joint_vel = init_vel[6:]
+
+        # Load subclass-specific data
+        self._load_coeffs(data)
+
+
+    def _load_coeffs(self, data):
         """Load end effector specific data from YAML."""
         # Load constraint specifications
-        self.constraint_specs = data.get('constraint_specs', [])
-        
-        # Reshape bezier coefficients to [num_joints, num_control_points]
-        num_output = 21
-        domain_name = next(iter(data.keys()))
-        bezier_coeffs = data[domain_name]['bezier_coeffs']
-        num_control_points = data['spline_order'] + 1
-        bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_output, num_control_points)
-        
-        self.bezier_coeffs = bezier_coeffs_reshaped
-        self.joint_order = data['joint_order']
-    
-    def get_constraint_frames(self) -> List[str]:
-        """Extract frame names from constraint specs."""
-        frames = []
-        for spec in self.constraint_specs:
-            if "frame" in spec:
-                frames.append(spec["frame"])
-        return frames
+
+        # Read in the domain sequence
+        for domain_name in self.domain_seq:
+            if data[domain_name]['constraint_specs'] is None:
+                raise ValueError("No constraint specs in the solution file!")
+
+            # For now just assuming these are all the same TODO: may want to break this assumption
+            self.constraint_specs = data[domain_name]['constraint_specs']
+
+            # Reshape bezier coefficients to [num_virtual_const, num_control_points]
+
+            ##
+            # Compute the number of virtual constraints
+            ##
+            def count_constraint_entries(data):
+                total_count = 0
+                for spec in data:
+                    if 'axes' in spec:
+                        total_count += len(spec['axes'])
+                    if 'joint_names' in spec:
+                        total_count += len(spec['joint_names'])
+                return total_count
+            
+            num_virtual_const = count_constraint_entries(self.constraint_specs)
+
+            bezier_coeffs = data[domain_name]['bezier_coeffs']
+            num_control_points = data[domain_name]['spline_order'] + 1
+            bezier_coeffs_reshaped = np.array(bezier_coeffs).reshape(num_virtual_const, num_control_points)
+
+            self.bezier_coeffs[domain_name] = bezier_coeffs_reshaped
+            self.joint_order[domain_name] = data[domain_name]['joint_order']
+
 
     def reorder_and_remap(self, cfg, device):
         """Reorder and remap end effector coefficients using hardcoded relabeling matrix."""
-        # Load all bezier coefficients from YAML
-        self.right_coeffs = torch.tensor(self.bezier_coeffs, dtype=torch.float32, device=device)
+        # reorder for each domain
+        for domain_name in self.domain_seq:
+            # Load all bezier coefficients from YAML
+            self.right_coeffs[domain_name] = torch.tensor(self.bezier_coeffs[domain_name], dtype=torch.float32, device=device)
 
-        # Apply relabeling matrix to get left coefficients
-        R = relable_ee_coeffs()
+            # Apply relabeling matrix to get left coefficients
+            if self.bezier_coeffs[domain_name].shape[0] == 21:
+                R = relable_ee_coeffs()
+            elif self.bezier_coeffs[domain_name].shape[0] == 27:
+                R = relable_ee_stance_coeffs()
+            else:
+                raise ValueError("No hard coded bezier relabelling matrix for these virtual constraints!")
 
-        # Apply relabeling: left_coeffs = R @ right_coeffs
-        left_coeffs = R @ self.bezier_coeffs
+            # Apply relabeling: left_coeffs = R @ right_coeffs
+            left_coeffs = R @ self.bezier_coeffs[domain_name]
 
-        self.left_coeffs = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
+            self.left_coeffs[domain_name] = torch.tensor(left_coeffs, dtype=torch.float32, device=device)
 
-        # Generate axis names for metrics
-        self.generate_axis_names()
+            # Generate axis names for metrics
+            self.generate_axis_names(domain_name)
 
     def get_joint_idx_list(self, hzd_cmd):
         """Get the joint index list for the given command."""
@@ -123,7 +370,7 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
             joint_idx_list.append(joint_idx)
         return joint_idx_list
 
-    def generate_axis_names(self):
+    def generate_axis_names(self, domain_name):
         """Generate axis names for each constraint specification."""
         self.axis_names = []
         current_idx = 0
@@ -139,7 +386,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                     metric_name = f"com_pos_{axis_names[axis_idx]}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx + i
+                        'index': current_idx + i,
+                        'domain': domain_name,
                     })
                 current_idx += len(axes)
                 
@@ -152,7 +400,8 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                     metric_name = f"joint_{joint_name}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx
+                        'index': current_idx,
+                        'domain': domain_name,
                     })
                     current_idx += output_dim
                 
@@ -173,205 +422,10 @@ class EndEffectorTrajectoryConfig(BaseTrajectoryConfig):
                     metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}"
                     self.axis_names.append({
                         'name': metric_name,
-                        'index': current_idx + i
+                        'index': current_idx + i,
+                        'domain': domain_name,
                     })
                 
                 current_idx += len(axes)
 
-    def _apply_swing_modifications(self, hzd_cmd, des_pos, des_vel, base_velocity):
-        """Apply end effector specific swing modifications."""
-        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target, foot_vel_des
-
-        #5,11
-        stand_idx = torch.where(torch.norm(base_velocity, dim=1) < hzd_cmd.standing_threshold)[0]
-        #if standing, don't modify yaw
-        delta_psi = base_velocity[:, 2] * hzd_cmd.cur_swing_time
-
-        if stand_idx.numel() > 0:
-            delta_psi[stand_idx] = 0
-            base_velocity[stand_idx,2] = 0
-
-        des_pos[:, hzd_cmd.yaw_output_idx] += delta_psi.unsqueeze(-1)
-        des_vel[:, hzd_cmd.yaw_output_idx] += base_velocity[:, 2].unsqueeze(-1)
-
-        q_delta_yaw = quat_from_euler_xyz(
-            torch.zeros_like(delta_psi),               # roll=0
-            torch.zeros_like(delta_psi),               # pitch=0
-            delta_psi                                  # yaw=Δψ
-        ) 
-
-        #adjust foot target and com pos/vel to account for yaw change
-        des_pos[:,[6,7,8]] = quat_apply(q_delta_yaw, des_pos[:,[6,7,8]])  # [B,3]
-        des_vel[:,[6,7,8]] = quat_apply(q_delta_yaw, des_vel[:,[6,7,8]])  # [B,3]
-
-        des_pos[:,[0,1,2]] = quat_apply(q_delta_yaw, des_pos[:,[0,1,2]])  # [B,3]
-        des_vel[:,[0,1,2]] = quat_apply(q_delta_yaw, des_vel[:,[0,1,2]])  # [B,3]
-
-        delta_y = base_velocity[:, 1] * hzd_cmd.cur_swing_time
-        des_pos[:, hzd_cmd.foot_y_output_idx] += delta_y
-        des_vel[:, hzd_cmd.foot_y_output_idx] += base_velocity[:, 1]
-
-        for i in hzd_cmd.ori_idx_list:
-            des_vel[:, i] = euler_rates_to_omega(des_pos[:, i], des_vel[:, i])
-
-        return des_pos, des_vel
-
-    def get_actual_traj(self, hzd_cmd):
-        """Get actual trajectory from end effector tracker."""
-        data = hzd_cmd.robot.data
-        
-        # Determine swing foot frame name based on stance
-        # If stance_idx == 0 (left stance), then right foot is swing foot
-        # If stance_idx == 1 (right stance), then left foot is swing foot
-        swing_foot_idx = hzd_cmd.feet_bodies_idx[1] if hzd_cmd.stance_idx == 0 else hzd_cmd.feet_bodies_idx[0]
-
-        # Get stance foot pos and velocity for relative positioning
-        stance_foot_pos = hzd_cmd.stance_foot_pos_0 
-        
-        # Get actual values for each constraint specification in order
-        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
-        com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
-       
-        com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
-        com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
-
-        pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
-        pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
-
-        swing_foot_pos = data.body_pos_w[:, swing_foot_idx, :]
-        swing_foot_quat = data.body_quat_w[:, swing_foot_idx, :]
-        swing_foot_ori = get_euler_from_quat(swing_foot_quat)
-        sw2st_foot_pos = swing_foot_pos - stance_foot_pos
-        sw2st_foot_pos_local = _transfer_to_local_frame(sw2st_foot_pos, hzd_cmd.stance_foot_ori_quat_0)
-        
-        sw2st_foot_ori = swing_foot_ori 
-        sw2st_foot_ori[:, 2] = wrap_to_pi(swing_foot_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-   
-        foot_lin_vel_w = hzd_cmd.robot.data.body_lin_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-        foot_ang_vel_w = hzd_cmd.robot.data.body_ang_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-
-        sw2st_foot_vel = foot_lin_vel_w[:, 1 - hzd_cmd.stance_idx]
-        sw2st_foot_ang_vel = foot_ang_vel_w[:, 1 - hzd_cmd.stance_idx]
-
-        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, hzd_cmd.stance_foot_ori_quat_0)
-        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, hzd_cmd.stance_foot_ori_quat_0)
-
-        joint_pos  = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.joint_idx_list]
-        joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.joint_idx_list]
-
-        # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos_local, sw2st_foot_ori,
-                          joint_pos.squeeze(-1)], dim=-1)
-
-        # concatenate all the velocity values
-        dy_act = torch.cat([com_vel_local, pelvis_omega, sw2st_foot_vel_local, sw2st_foot_ang_vel_local,
-                           joint_vel.squeeze(-1)], dim=-1)
-        
-        return y_act, dy_act
-
-    def get_ref_traj(self, ee_hzd_cmd):
-        """Legacy method - now calls parent get_ref_traj."""
-        return super().get_ref_traj(ee_hzd_cmd)
-
-
-class StairEEtrajConfig(EndEffectorTrajectoryConfig):
-    def __init__(self, yaml_path="source/robot_rl/robot_rl/assets/robots/single_support_config_solution_ee.yaml"):
-        super().__init__(yaml_path)
-
-    def get_actual_traj(self, hzd_cmd):
-        """Get actual trajectory from end effector tracker."""
-        ee_tracker = hzd_cmd.ee_tracker
-
-        # Determine swing foot frame name based on stance
-        stance_foot_pos = hzd_cmd.stance_foot_pos_0 
-        
-        # Get actual values for each constraint specification in order
-        com2stance_foot = hzd_cmd.robot.data.root_com_pos_w - stance_foot_pos
-        com2stance_local = _transfer_to_local_frame(com2stance_foot, hzd_cmd.stance_foot_ori_quat_0)
-       
-        com_vel_w = hzd_cmd.robot.data.root_com_vel_w[:, 0:3]
-        com_vel_local = _transfer_to_local_frame(com_vel_w, hzd_cmd.stance_foot_ori_quat_0)
-
-        pelvis_ori = get_euler_from_quat(hzd_cmd.robot.data.root_quat_w)
-        pelvis_ori[:, 2] = wrap_to_pi(pelvis_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        pelvis_omega = hzd_cmd.robot.data.root_ang_vel_b
-
-        left_foot_pos, left_foot_ori, left_foot_quat = ee_tracker.get_pose("left_foot_middle")
-        right_foot_pos, right_foot_ori, right_foot_quat = ee_tracker.get_pose("right_foot_middle")
-
-        left2st_ft_pos = left_foot_pos - stance_foot_pos
-        left2st_ft_ori = left_foot_ori - hzd_cmd.stance_foot_ori_0
-        left2st_ft_ori[:, 2] = wrap_to_pi(left2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        right2st_ft_pos = right_foot_pos - stance_foot_pos
-        right2st_ft_ori = right_foot_ori - hzd_cmd.stance_foot_ori_0
-        right2st_ft_ori[:, 2] = wrap_to_pi(right2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        sw2st_foot_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
-        sw2st_foot_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
-
-        foot_lin_vel_w = hzd_cmd.robot.data.body_lin_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-        foot_ang_vel_w = hzd_cmd.robot.data.body_ang_vel_w[:, hzd_cmd.feet_bodies_idx, :]
-
-        batched_idx = torch.arange(foot_lin_vel_w.shape[0])
-        sw2st_foot_vel = foot_lin_vel_w[batched_idx, 1 - hzd_cmd.stance_idx]
-        sw2st_foot_ang_vel = foot_ang_vel_w[batched_idx, 1 - hzd_cmd.stance_idx]
-
-        sw2st_foot_vel_local = _transfer_to_local_frame(sw2st_foot_vel, hzd_cmd.stance_foot_ori_quat_0)
-        sw2st_foot_ang_vel_local = _transfer_to_local_frame(sw2st_foot_ang_vel, hzd_cmd.stance_foot_ori_quat_0)
-
-        waist_joint_pos = hzd_cmd.robot.data.joint_pos[:, hzd_cmd.waist_joint_idx]
-        waist_joint_vel = hzd_cmd.robot.data.joint_vel[:, hzd_cmd.waist_joint_idx]
-
-        # palm position
-        left_hand_pos, left_hand_ori, left_hand_quat = ee_tracker.get_pose("left_hand_palm_joint")
-        right_hand_pos, right_hand_ori, right_hand_quat = ee_tracker.get_pose("right_hand_palm_joint")
-
-        left2st_ft_pos = left_hand_pos - stance_foot_pos
-        left2st_ft_ori = left_hand_ori - hzd_cmd.stance_foot_ori_0
-        left2st_ft_ori[:, 2] = wrap_to_pi(left2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        right2st_ft_pos = right_hand_pos - stance_foot_pos
-        right2st_ft_ori = right_hand_ori - hzd_cmd.stance_foot_ori_0
-        right2st_ft_ori[:, 2] = wrap_to_pi(right2st_ft_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        
-        left_hand_vel, left_hand_omega = ee_tracker.get_velocity("left_hand_palm_joint", hzd_cmd.robot.data)
-        right_hand_vel, right_hand_omega = ee_tracker.get_velocity("right_hand_palm_joint", hzd_cmd.robot.data)
-
-        stance_hand_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_pos, left2st_ft_pos)
-        stance_hand_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right2st_ft_ori, left2st_ft_ori)
-        swing_hand_pos = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_pos, right2st_ft_pos)
-        swing_hand_ori = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left2st_ft_ori, right2st_ft_ori)
-
-        swing_hand_vel = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_vel, right_hand_vel)
-        swing_hand_omega = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, left_hand_omega, right_hand_omega)
-        stance_hand_vel = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_vel, left_hand_vel)
-        stance_hand_omega = torch.where(hzd_cmd.stance_idx.unsqueeze(-1) == 1, right_hand_omega, left_hand_omega)
-
-        swing_hand_vel_local = _transfer_to_local_frame(swing_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ang_vel_local = _transfer_to_local_frame(swing_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_vel_local = _transfer_to_local_frame(stance_hand_vel, hzd_cmd.stance_foot_ori_quat_0)
-        stance_hand_ang_vel_local = _transfer_to_local_frame(stance_hand_omega, hzd_cmd.stance_foot_ori_quat_0)
-
-        stance_hand_pos = stance_hand_pos - stance_foot_pos
-        stance_hand_pos = _transfer_to_local_frame(stance_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_pos = swing_hand_pos - stance_foot_pos
-
-        swing_hand_pos = _transfer_to_local_frame(swing_hand_pos, hzd_cmd.stance_foot_ori_quat_0)
-        swing_hand_ori[:, 2] = wrap_to_pi(swing_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-        stance_hand_ori[:, 2] = wrap_to_pi(stance_hand_ori[:, 2] - hzd_cmd.stance_foot_ori_0[:, 2])
-
-        # concatenate all the position values
-        y_act = torch.cat([com2stance_local, pelvis_ori, sw2st_foot_pos, sw2st_foot_ori,
-                          waist_joint_pos,
-                          swing_hand_pos, swing_hand_ori[:, 2].unsqueeze(-1), stance_hand_pos, stance_hand_ori[:, 2].unsqueeze(-1)], dim=-1)
-
-        # concatenate all the velocity values
-        dy_act = torch.cat([com_vel_local, pelvis_omega, sw2st_foot_vel_local, sw2st_foot_ang_vel_local,
-                           waist_joint_vel,
-                           swing_hand_vel_local, swing_hand_ang_vel_local[:, 2].unsqueeze(-1), stance_hand_vel_local, stance_hand_ang_vel_local[:, 2].unsqueeze(-1)], dim=-1)
-        
-        return y_act, dy_act
-        
-
+    

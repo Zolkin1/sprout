@@ -7,6 +7,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from functools import partial
 
+from sim.experiments.velocity_commands import smooth_ramp_running
+
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -25,7 +27,7 @@ FORCE_STOP = 3.125
 FORCE_VEC = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 DELTA_FORCE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 START_ADDED_MASS = 8.0 #6.0
-DELTA_MASS = 0. #1.5
+DELTA_MASS = 1.0 #0. #1.5
 
 METRIC = False
 
@@ -86,7 +88,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=smooth_ramp)
+                           input_function=smooth_ramp_running, use_pd=config["use_pd"])
 
     # Run all the simulations
     run_logs = []
@@ -94,7 +96,7 @@ def main():
     std_error = []
     added_masses = []
 
-    NUM_RUNS = 1
+    NUM_RUNS = 3
 
     for i in range(NUM_RUNS):
         # Added mass robustness

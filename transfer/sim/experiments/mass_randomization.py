@@ -16,7 +16,7 @@ from sim.plot_from_sim import create_plots_for_newest
 from sim.log_utils import find_most_recent_timestamped_folder, extract_data
 
 from performance_statistics import compute_stats
-from velocity_commands import speed_steps, smooth_ramp, ramped_speed_steps
+from velocity_commands import speed_steps, smooth_ramp, ramped_speed_steps, smooth_ramp_running
 
 
 def main():
@@ -72,7 +72,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=ramped_speed_steps, rng=rng)
+                           input_function=smooth_ramp_running, use_pd=config["use_pd"], rng=rng)
 
     # run_logs = []
     base_log_dir = os.path.join("experiments", f"mass_randomization_{config_file_name}")
