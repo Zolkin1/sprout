@@ -12,6 +12,7 @@ ENVIRONMENTS = {
     "lip_ref_tracking": "G1-flat-ref-tracking",
     "lip_clf_vdot": "G1-flat-clf-vdot",
     "lip_clf": "G1-lip-clf-custom",
+    "mlip_clf": "G1-mlip-clf-custom",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
     "hzd_clf_minimum": "G1-hzd-clf-minimum",
@@ -21,6 +22,7 @@ EXPERIMENT_NAMES = {
     "vanilla": "baseline",
     "basic": "baseline",
     "lip_clf": "lip",
+    "mlip_clf": "mlip",
     "lip_ref_tracking": "lip",
     "lip_clf_vdot": "lip",
     "lip_ref_play": "lip",
@@ -97,6 +99,7 @@ def main():
 
     import robot_rl.tasks  # noqa: F401
     from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+    from rsl_rl.runners import OnPolicyRunner
 
     # Configure PyTorch
     torch.backends.cuda.matmul.allow_tf32 = True
