@@ -172,7 +172,7 @@ def main():
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
         # Create and configure runner
-        runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         runner.add_git_repo_to_log(__file__)
 
         # Load checkpoint if resuming

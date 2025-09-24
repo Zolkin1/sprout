@@ -7,7 +7,7 @@ from datetime import datetime
 import mujoco
 import mujoco.viewer
 import numpy as np
-
+import yaml
 from .robot import Robot
 
 

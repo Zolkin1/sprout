@@ -159,3 +159,25 @@ class G1FlatLipEnvCfg_PLAY(G1FlatLipEnvCfg):
             "y": (-0.5, 0.5),
             "yaw": (0, 0),
         }  # (-3.14, 3.14)},
+
+
+class G1FlatMlipEnvCfg_PLAY(G1FlatLipEnvCfg):
+    commands: G1MlipCommandsCfg = G1MlipCommandsCfg()
+    def __post_init__(self) -> None:
+        # post init of parent
+        super().__post_init__()
+
+        # make a smaller scene for play
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+        # disable randomization for play
+        self.observations.policy.enable_corruption = False
+        # remove random pushing
+        self.events.base_external_force_torque = None
+        # self.events.push_robot = None
+        self.events.push_robot.interval_range_s = (5.0, 5.0)
+        self.events.reset_base.params["pose_range"] = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "yaw": (0, 0),
+        }  # (-3.14, 3.14)},

@@ -18,6 +18,7 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 SIM_ENVIRONMENTS = {
     "vanilla": "G1-flat-vel",
     "lip_clf": "G1-LIP-ref-play",
+    "mlip_clf": "G1-MLIP-ref-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
 }
 
@@ -199,8 +200,8 @@ def main():
 
     import robot_rl.tasks  # noqa: F401
 
-    # from rsl_rl.runners import OnPolicyRunner
-    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+    from rsl_rl.runners import OnPolicyRunner
+    # from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
 
     print("[DEBUG] Modules imported successfully")
 
@@ -279,7 +280,7 @@ def main():
 
     print(f"[DEBUG] Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    ppo_runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     ppo_runner.load(resume_path)
 
     # obtain the trained policy for inference
@@ -294,6 +295,8 @@ def main():
             )
 
         print("[DEBUG] Exporting policy to ONNX and JIT formats")
+        # extract the neural network module
+        # we do this in a try-except to maintain backwards compatibility.
         try:
             # version 2.3 onwards
             policy_nn = ppo_runner.alg.policy
@@ -301,13 +304,18 @@ def main():
             # version 2.2 and below
             policy_nn = ppo_runner.alg.actor_critic
 
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
+
         # export policy to onnx/jit
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-        os.makedirs(export_model_dir, exist_ok=True)
-        export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
-        export_policy_as_onnx(
-            policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
-        )
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
         print(f"[DEBUG] Policy exported to {export_model_dir}")
 
     dt = env.unwrapped.step_dt
@@ -365,7 +373,7 @@ def main():
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
 
     # reset environment
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
     timestep = 0
     print("[DEBUG] Starting simulation loop")
 
@@ -377,7 +385,7 @@ def main():
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, reward, _, extra = env.step(actions)
+            obs, _, _, _ = env.step(actions)
 
             # Log data
             if args_cli.log_data:
