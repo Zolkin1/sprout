@@ -77,6 +77,81 @@ R_weights = [
 ]
 
 
+
+Q_weights_mlip = [
+    25.0,
+    200.0,  # com_x pos, vel
+    300.0,
+    50.0,  # com_y pos, vel
+    400.0,
+    10.0,  # com_z pos, vel
+    420.0,
+    20.0,  # pelvis_roll pos, vel
+    200.0,
+    10.0,  # pelvis_pitch pos, vel
+    300.0,
+    10.0,  # pelvis_yaw pos, vel
+    1500.0,
+    125.0,  # swing_x pos, vel
+    1700.0,
+    125.0,  # swing_y pos, vel
+    3500.0,
+    100.0,  # swing_z pos, vel
+    30.0,
+    1.0,  # swing_ori_roll pos, vel
+    3500.0,
+    100.0,  # swing_ori_pitch pos, vel
+    400.0,
+    10.0,  # swing_ori_yaw pos, vel
+    3500.0,
+    100.0,  # stance_ori_pitch pos, vel
+    500.0,
+    10.0,  # waist_yaw pos, vel
+    40.0,
+    1.0,  # left shoulder pitch
+    40.0,
+    1.0,  # right shoulder pitch
+    100,
+    1.0,  # left shoulder roll
+    100,
+    1.0,  # right shoulder roll
+    50,
+    1.0,  # left shoulder yaw
+    50,
+    1.0,  # right shoulder yaw
+    30.0,
+    1.0,  # left elbow
+    30.0,
+    1.0,  # right elbow
+]
+
+
+R_weights_mlip = [
+    0.1,
+    0.1,
+    0.1,  # CoM inputs: allow moderate effort
+    0.05,
+    0.05,
+    0.05,  # pelvis inputs: lower torque priority
+    0.05,
+    0.05,
+    0.05,  # swing foot linear inputs
+    0.02,
+    0.05,
+    0.02,  # swing foot orientation inputs: small adjustments
+    0.05, #stance foot pitch
+    0.1,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+]
+
+
 @configclass
 class HLIPCommandCfg(CommandTermCfg):
     """
@@ -167,5 +242,5 @@ class MLIPCommandCfg(CommandTermCfg):
         ".*_elbow_joint",
     ]
 
-    Q_weights = Q_weights
-    R_weights = R_weights
+    Q_weights = Q_weights_mlip
+    R_weights = R_weights_mlip

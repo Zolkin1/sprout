@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation
 class Robot:
     def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, rng=None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
+        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute" and robot_name != "g1_21j_compute_mlip":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
 
         self.robot_name = robot_name

@@ -86,6 +86,7 @@ def _transfer_to_local_frame(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
 
+
 class MLIPCommandTerm(CommandTerm):
     def __init__(self, cfg: "MLIPCommandCfg", env):
         super().__init__(cfg, env)
@@ -109,7 +110,7 @@ class MLIPCommandTerm(CommandTerm):
 
         self.metrics = {}
 
-        n_output = 12 + len(self.upper_body_joint_idx)
+        n_output = 13 + len(self.upper_body_joint_idx)
         self.y_out = torch.zeros((self.num_envs, n_output), device=self.device)
         self.dy_out = torch.zeros((self.num_envs, n_output), device=self.device)
         self.y_act = torch.zeros((self.num_envs, n_output), device=self.device)
@@ -181,6 +182,9 @@ class MLIPCommandTerm(CommandTerm):
 
         new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
         self.swing_idx = 1 - new_stance_idx
+
+
+
 
         if self.stance_idx is None or new_stance_idx != self.stance_idx:
             if self.stance_idx is None:
@@ -354,11 +358,17 @@ class MLIPCommandTerm(CommandTerm):
         omega_ref = euler_rates_to_omega(pelvis_euler, pelvis_eul_dot)
         omega_foot_ref = euler_rates_to_omega(foot_eul, foot_eul_dot)  # (N,3)
         # setup up reference trajectory, com pos, pelvis orientation, swing foot pos, ori
+        
+        # add fixed 0.5 pitch angle for stance foot
+        pitch_angle = torch.full((N, 1), 0.5, device=self.device)
+        pitch_vel = torch.full((N, 1), 0.0, device=self.device)
+
+
         self.y_out = torch.cat(
-            [com_pos_des_yaw_adjusted, pelvis_euler, foot_pos, foot_eul, upper_body_joint_pos], dim=-1
+            [com_pos_des_yaw_adjusted, pelvis_euler, foot_pos, foot_eul, pitch_angle, upper_body_joint_pos], dim=-1
         )
         self.dy_out = torch.cat(
-            [com_vel_des_yaw_adjusted, omega_ref, foot_vel, omega_foot_ref, upper_body_joint_vel], dim=-1
+            [com_vel_des_yaw_adjusted, omega_ref, foot_vel, omega_foot_ref, pitch_vel, upper_body_joint_vel], dim=-1
         )
 
     def generate_upper_body_ref(self):
@@ -468,6 +478,9 @@ class MLIPCommandTerm(CommandTerm):
 
         # Foot orientations (Euler XYZ)
         swing_foot_ori = get_euler_from_quat(foot_ori_w[:, self.swing_idx, :])
+        
+        # stance foot orientation
+        stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.stance_idx, :])
 
         # 2. Velocities (world frame)
         com_vel_w = data.root_com_vel_w[:, 0:3]
@@ -491,17 +504,21 @@ class MLIPCommandTerm(CommandTerm):
             quat_inv(foot_ori_w[:, self.swing_idx, :]), foot_ang_vel_w[:, self.swing_idx, :]
         )
 
+        stance_foot_ang_vel_local_swing = quat_apply(
+            quat_inv(foot_ori_w[:, self.stance_idx, :]), foot_ang_vel_w[:, self.stance_idx, :]
+        )
+
         swing2stance_vel = foot_lin_vel_local_swing
 
         upper_body_joint_pos = self.robot.data.joint_pos[:, self.upper_body_joint_idx]
         upper_body_joint_vel = self.robot.data.joint_vel[:, self.upper_body_joint_idx]
         # 4. Assemble state vectors
         self.y_act = torch.cat(
-            [com2stance_local, pelvis_ori, swing2stance_local, swing_foot_ori, upper_body_joint_pos], dim=-1
+            [com2stance_local, pelvis_ori, swing2stance_local, swing_foot_ori, stance_foot_ori[:, 1].unsqueeze(-1), upper_body_joint_pos], dim=-1
         )
 
         self.dy_act = torch.cat(
-            [com_vel_local, pelvis_omega_local, swing2stance_vel, foot_ang_vel_local_swing, upper_body_joint_vel],
+            [com_vel_local, pelvis_omega_local, swing2stance_vel, foot_ang_vel_local_swing, stance_foot_ang_vel_local_swing[:, 1].unsqueeze(-1), upper_body_joint_vel],
             dim=-1,
         )
 
