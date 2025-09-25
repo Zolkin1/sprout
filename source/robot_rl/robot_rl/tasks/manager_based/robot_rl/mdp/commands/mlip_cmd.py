@@ -157,6 +157,7 @@ class MLIPCommandTerm(CommandTerm):
         self.metrics["error_sw_roll"] = torch.abs(self.y_out[:, 9] - self.y_act[:, 9])
         self.metrics["error_sw_pitch"] = torch.abs(self.y_out[:, 10] - self.y_act[:, 10])
         self.metrics["error_sw_yaw"] = torch.abs(self.y_out[:, 11] - self.y_act[:, 11])
+        self.metrics["error_st_pitch"] = torch.abs(self.y_out[:, 12] - self.y_act[:, 12])
 
         self.metrics["error_com_x"] = torch.abs(self.y_out[:, 0] - self.y_act[:, 0])
         self.metrics["error_com_y"] = torch.abs(self.y_out[:, 1] - self.y_act[:, 1])

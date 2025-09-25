@@ -12,8 +12,8 @@ qvel_scale: 0.05
 action_scale: 0.25
 height_map_scale: null        # Explicitly set to null for non-height-sensor version
 def_ang_order: "mj"
-default_angles: [-0.25, 0, 0, 0.46, -0.25, 0,
-                  -0.25, 0, 0, 0.46, -0.25, 0,
+default_angles: [-0.25, 0, 0, 0.5, 0.25, 0,  #changed default pos
+                  -0.25, 0, 0, 0.5, 0.25, 0,
                   0,
                   0.07, 0.24, 0, 1.39,
                   0.07, -0.24, 0, 1.39]

@@ -1,6 +1,6 @@
 <!-- Pulled from the unitree_ros repo on 10/18/2024 then modified.
 Position and velocity actuators added. -->
-<mujoco model="g1_21j_compute">
+<mujoco model="g1_21j_compute_mlip">
   <compiler angle="radian" meshdir="meshes"/>
 
   <option cone="elliptic" impratio="100" integrator="implicitfast" timestep="0.001"/>
@@ -670,12 +670,13 @@ Position and velocity actuators added. -->
 
   </sensor>
 
+  <!-- changed default pos -->
   <keyframe>
     <key name="standing"
       qpos="0.2 0 0.79
             1 0 0 0
-            -0.25 0 0 0.46 -0.25 0
-            -0.25 0 0 0.46 -0.25 0
+            -0.25 0 0 0.5 0.25 0 
+            -0.25 0 0 0.5 0.25 0
             0
             0.07 0.24 0 1.39
             0.07 -0.24 0 1.39"

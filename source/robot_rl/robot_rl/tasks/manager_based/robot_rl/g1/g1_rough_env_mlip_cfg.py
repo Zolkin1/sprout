@@ -97,10 +97,16 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         ##
         # Scene
         ##
-        self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.robot.init_state.joint_pos[".*_hip_pitch_joint"] = -0.25
-        self.scene.robot.init_state.joint_pos[".*_knee_joint"] = 0.5
-        self.scene.robot.init_state.joint_pos[".*_ankle_pitch_joint"] = 0.0
+        self.scene.robot = G1_MINIMAL_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/Robot",
+            init_state=G1_MINIMAL_CFG.init_state.replace(
+                joint_pos={
+                    ".*_hip_pitch_joint": -0.25,
+                    ".*_knee_joint": 0.5,
+                    ".*_ankle_pitch_joint": 0.25,
+                }
+            ),
+        )
         
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
 

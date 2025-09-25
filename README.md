@@ -98,7 +98,7 @@ This code base has a built in sim2sim transfer (i.e. the policy is trained in Is
 Currently, we only support the G1 (as that is the only policy we have right now), but the code is easily extended to other robots.
 To run the sim2sim transfer, from `robot_rl` directory run
 ```
-python transfer/sim/g1_runner.py --config_file=transfer/sim/robots/g1/g1_21j_config_lip.yaml
+python transfer/sim/g1_runner.py --config_file=/local_path/to/config/file
 ```
 
 The config file holds all the information about how the RL policy is used including which policy to load, scaling of
