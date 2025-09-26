@@ -14,7 +14,7 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (
     HumanoidEnvCfg,
     HumanoidRewardCfg,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import MLIPCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.mlip_cmd_cfg import MLIPCommandCfg
 
 ##
 # Pre-defined configs
@@ -117,8 +117,8 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         # Randomization
         ##
         self.events.push_robot.params["velocity_range"] = {
-            "x": (-1, 1),
-            "y": (-1, 1),
+            "x": (-.1, 1), #(-1, 1)
+            "y": (-0.4, 0.4), #(-1, 1)
             "roll": (-0.4, 0.4),
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
@@ -143,7 +143,9 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)
+        
+        # todo: for heel-to-toe, forward walking only for now
+        self.commands.base_velocity.ranges.lin_vel_x = (0, 0.75)  #(-0.75,0.75)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 

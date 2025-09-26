@@ -29,7 +29,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import (
 
 
 if TYPE_CHECKING:
-    from .cmd_cfg import MLIPCommandCfg
+    from .mlip_cmd_cfg import MLIPCommandCfg
 
 
 def euler_rates_to_omega(eul: torch.Tensor, eul_rates: torch.Tensor) -> torch.Tensor:
@@ -85,7 +85,50 @@ def _transfer_to_global_frame(vec, root_quat):
 def _transfer_to_local_frame(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
+class MLIPPhaseVariable:
+    def __init__(self, T_doublestep):
+        #state transition:  FA+ -> FA- -> UA+ -> UA- -> OA+ -> OA- -> FA+
+        #corresponding time_in_step:
+        #                   0 -> T_fa -> T_fa -> T_ss -> T_ss -> T_ss+T_ds or 0 -> 0
+        self.Tstep = T_doublestep/2.0 # total time for a step = T_fa + T_ua + T_oa
+        self.T_fa = self.Tstep * 0.4  # FA: 40% of a step
+        self.T_ua = self.Tstep * 0.4  # UA: 40% of a step
+        self.T_oa = self.Tstep * 0.2  # OA: 20% of a step
+        self.T_ss = self.T_fa + self.T_ua # total single support time
+        self.T_ds = self.T_oa  # total double support time
+        self.time_in_step = 0.0
+        self.phase_var = 0.0
+        self.isFirstStance = True # use to distinguish stance leg
 
+        self.domain = "FA" # initial state
+        self.phase_var_fa = 0.0
+        self.phase_var_ua = 0.0
+        self.phase_var_oa = 0.0
+
+    def update(self, simtime):
+        self.time_in_step = simtime % (self.T_ss + self.T_ds)
+        self.phase_var = self.time_in_step / self.T_ss
+        self.phase_var_fa = float('nan')
+        self.phase_var_ua = float('nan')
+        self.phase_var_oa = float('nan')
+        # Fixed logical operators (& -> and)
+        if self.time_in_step < self.T_fa:
+            self.domain = "FA"
+            self.phase_var_fa = self.time_in_step / self.T_fa
+        elif self.time_in_step < self.T_ss and self.time_in_step >= self.T_fa:
+            self.domain = "UA"
+            self.phase_var_ua = (self.time_in_step - self.T_fa) / self.T_ua
+        elif self.time_in_step < self.T_ss + self.T_oa and self.time_in_step >= self.T_ss:
+            self.domain = "OA"
+            self.phase_var_oa = (self.time_in_step - self.T_ss) / self.T_oa
+        
+        tp = (simtime % (2 * self.Tstep)) / (2 * self.Tstep)
+
+        # per-swing normalized phase [0,1]
+        if tp < 0.5:
+            self.isLeftStance = True
+        else:
+            self.isLeftStance = False
 
 class MLIPCommandTerm(CommandTerm):
     def __init__(self, cfg: "MLIPCommandCfg", env):

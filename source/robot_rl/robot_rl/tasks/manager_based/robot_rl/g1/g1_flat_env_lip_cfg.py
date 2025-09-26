@@ -61,11 +61,6 @@ class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
         self.curriculum.clf_curriculum = None
 
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import MLIPCommandCfg
-from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (
-    HumanoidCommandsCfg
-)
-
         
         
 @configclass
