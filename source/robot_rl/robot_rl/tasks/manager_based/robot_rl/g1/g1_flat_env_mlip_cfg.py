@@ -90,6 +90,8 @@ class G1FlatMlipEnvCfg_PLAY(G1FlatMlipEnvCfg):
         # make a smaller scene for play
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
         # disable randomization for play
         self.observations.policy.enable_corruption = False
         # remove random pushing

@@ -1,6 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j_compute_mlip"
-checkpoint_path: "g1_policies/mlip/mlip_clf/2025-09-25_10-57-23/exported/policy.pt"
+checkpoint_path: "g1_policies/mlip/mlip_clf/2025-09-25_16-22-02/exported/policy.pt"
 num_obs: 74
 num_action: 21
 period: 0.8                   # s

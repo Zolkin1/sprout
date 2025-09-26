@@ -99,12 +99,12 @@ Q_weights_mlip = [
     100.0,  # swing_z pos, vel
     30.0,
     1.0,  # swing_ori_roll pos, vel
-    3500.0,
-    100.0,  # swing_ori_pitch pos, vel
+    500.0,
+    10.0,  # swing_ori_pitch pos, vel
     400.0,
     10.0,  # swing_ori_yaw pos, vel
-    3500.0,
-    100.0,  # stance_ori_pitch pos, vel
+    500.0,
+    10.0,  # stance_ori_pitch pos, vel
     500.0,
     10.0,  # waist_yaw pos, vel
     40.0,
@@ -137,9 +137,9 @@ R_weights_mlip = [
     0.05,
     0.05,  # swing foot linear inputs
     0.02,
-    0.05,
+    0.02,
     0.02,  # swing foot orientation inputs: small adjustments
-    0.05, #stance foot pitch
+    0.02, #stance foot pitch
     0.1,
     0.01,
     0.01,
