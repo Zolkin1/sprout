@@ -25,6 +25,23 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.ref_gen import (
     calculate_cur_swing_foot_pos,
 )
 
+from enum import IntEnum
+
+class YIdx(IntEnum):
+    comx = 0
+    comy = 1
+    comz = 2
+    pelvis_roll = 3
+    pelvis_pitch = 4
+    pelvis_yaw = 5
+    swing_foot_x = 6
+    swing_foot_y = 7
+    swing_foot_z = 8
+    swing_foot_roll = 9
+    swing_foot_pitch = 10
+    swing_foot_yaw = 11
+    stance_foot_pitch = 12
+
 # from isaaclab.utils.transforms import combine_frame_transforms, quat_from_euler_xyz
 
 
@@ -85,66 +102,29 @@ def _transfer_to_global_frame(vec, root_quat):
 def _transfer_to_local_frame(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
-class MLIPPhaseVariable:
-    def __init__(self, T_doublestep):
-        #state transition:  FA+ -> FA- -> UA+ -> UA- -> OA+ -> OA- -> FA+
-        #corresponding time_in_step:
-        #                   0 -> T_fa -> T_fa -> T_ss -> T_ss -> T_ss+T_ds or 0 -> 0
-        self.Tstep = T_doublestep/2.0 # total time for a step = T_fa + T_ua + T_oa
-        self.T_fa = self.Tstep * 0.4  # FA: 40% of a step
-        self.T_ua = self.Tstep * 0.4  # UA: 40% of a step
-        self.T_oa = self.Tstep * 0.2  # OA: 20% of a step
-        self.T_ss = self.T_fa + self.T_ua # total single support time
-        self.T_ds = self.T_oa  # total double support time
-        self.time_in_step = 0.0
-        self.phase_var = 0.0
-        self.isFirstStance = True # use to distinguish stance leg
 
-        self.domain = "FA" # initial state
-        self.phase_var_fa = 0.0
-        self.phase_var_ua = 0.0
-        self.phase_var_oa = 0.0
+from .phase_var import MLIPPhaseVarGlobal
 
-    def update(self, simtime):
-        self.time_in_step = simtime % (self.T_ss + self.T_ds)
-        self.phase_var = self.time_in_step / self.T_ss
-        self.phase_var_fa = float('nan')
-        self.phase_var_ua = float('nan')
-        self.phase_var_oa = float('nan')
-        # Fixed logical operators (& -> and)
-        if self.time_in_step < self.T_fa:
-            self.domain = "FA"
-            self.phase_var_fa = self.time_in_step / self.T_fa
-        elif self.time_in_step < self.T_ss and self.time_in_step >= self.T_fa:
-            self.domain = "UA"
-            self.phase_var_ua = (self.time_in_step - self.T_fa) / self.T_ua
-        elif self.time_in_step < self.T_ss + self.T_oa and self.time_in_step >= self.T_ss:
-            self.domain = "OA"
-            self.phase_var_oa = (self.time_in_step - self.T_ss) / self.T_oa
-        
-        tp = (simtime % (2 * self.Tstep)) / (2 * self.Tstep)
+#todo: removed old self.T self.T_ds, self.phase_var, self.stance_idx, self.cur_swing_time
 
-        # per-swing normalized phase [0,1]
-        if tp < 0.5:
-            self.isLeftStance = True
-        else:
-            self.isLeftStance = False
+# todo: now in self._phase_var
 
+#self._phase_var.phase
 class MLIPCommandTerm(CommandTerm):
     def __init__(self, cfg: "MLIPCommandCfg", env):
         super().__init__(cfg, env)
-        self.T_ds = cfg.T_ds
         self.z0 = cfg.z0
         self.y_nom = cfg.y_nom
-
-        # grab from gait period command
-        self.T = env.cfg.commands.step_period.period_range[0] / 2
+        
+        if env.cfg.commands.step_period.period_range[0] == env.cfg.commands.step_period.period_range[1]:
+            self._phase_var = MLIPPhaseVarGlobal(env.cfg.commands.step_period.period_range[0])
+        else:
+            raise ValueError("MLIPCommandTerm requires fixed step period.")
 
         self.debug_vis = cfg.debug_vis
         if self.debug_vis:
             self.footprint_visualizer = VisualizationMarkers(cfg.footprint_cfg)
 
-        self.env = env
         self.robot = env.scene[cfg.asset_name]
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
         self.upper_body_joint_idx = self.robot.find_joints(cfg.upper_body_joint_name)[0]
@@ -161,14 +141,14 @@ class MLIPCommandTerm(CommandTerm):
 
         self.com_z = torch.ones((self.num_envs), device=self.device) * self.z0
 
-        grav = torch.abs(torch.tensor(self.env.cfg.sim.gravity[2], device=self.device))
+        grav = torch.abs(torch.tensor(self._env.cfg.sim.gravity[2], device=self.device))
         self.hlip_controller = HLIP(grav, self.z0, self.T_ds, self.T, self.y_nom)
 
         self.mass = sum(self.robot.data.default_mass.T)[0]
 
         self.clf = CLF(
             n_output,
-            self.env.cfg.sim.dt * self.env.cfg.sim.render_interval,
+            self._env.cfg.sim.dt * self._env.cfg.sim.render_interval,
             batch_size=self.num_envs,
             Q_weights=np.array(cfg.Q_weights),
             R_weights=np.array(cfg.R_weights),
@@ -179,60 +159,66 @@ class MLIPCommandTerm(CommandTerm):
         self.vdot = torch.zeros((self.num_envs), device=self.device)
         self.v_buffer = torch.zeros((self.num_envs, 100), device=self.device)
         self.vdot_buffer = torch.zeros((self.num_envs, 100), device=self.device)
-        self.stance_idx = None
+        self.old_stance_idx = None
 
     @property
     def command(self):
         return self.foot_target
 
     def _resample_command(self, env_ids):
-        self._update_command()
-        # Do nothing here
-        # device = self.env.command_manager.get_command("base_velocity").device
+        self.timeBasedDomainContactStatusSwitch()
+        self.generate_reference_trajectory()
+        self.get_actual_state()
+
+        # how to handle for the first step?
+        # i.e. v is not defined
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.cfg.yaw_idx)
+        self.vdot = vdot
+        self.v = vcur
+        if torch.sum(self.v_buffer) == 0:
+            # (E,) -> (E,1) -> broadcast to (E,100) on assignment
+            self.v_buffer[:] = self.v.unsqueeze(1)
+            self.vdot_buffer[:] = self.vdot.unsqueeze(1)
+
+        else:
+            self.v_buffer = torch.cat([self.v_buffer[:, 1:], self.v.unsqueeze(-1)], dim=-1)
+            self.vdot_buffer = torch.cat([self.vdot_buffer[:, 1:], self.vdot.unsqueeze(-1)], dim=-1)
 
         return
 
     def _update_metrics(self):
+        self.metrics["error_sw_x"] = torch.abs(self.y_out[:, YIdx.swing_foot_x] - self.y_act[:, YIdx.swing_foot_x])
+        self.metrics["error_sw_y"] = torch.abs(self.y_out[:, YIdx.swing_foot_y] - self.y_act[:, YIdx.swing_foot_y])
+        self.metrics["error_sw_z"] = torch.abs(self.y_out[:, YIdx.swing_foot_z] - self.y_act[:, YIdx.swing_foot_z])
+        self.metrics["error_sw_roll"] = torch.abs(self.y_out[:, YIdx.swing_foot_roll] - self.y_act[:, YIdx.swing_foot_roll])
+        self.metrics["error_sw_pitch"] = torch.abs(self.y_out[:, YIdx.swing_foot_pitch] - self.y_act[:, YIdx.swing_foot_pitch])
+        self.metrics["error_sw_yaw"] = torch.abs(self.y_out[:, YIdx.swing_foot_yaw] - self.y_act[:, YIdx.swing_foot_yaw])
+        self.metrics["error_st_pitch"] = torch.abs(self.y_out[:, YIdx.stance_foot_pitch] - self.y_act[:, YIdx.stance_foot_pitch])
 
-        self.metrics["error_sw_z"] = torch.abs(self.y_out[:, 8] - self.y_act[:, 8])
-        self.metrics["error_sw_x"] = torch.abs(self.y_out[:, 6] - self.y_act[:, 6])
-        self.metrics["error_sw_y"] = torch.abs(self.y_out[:, 7] - self.y_act[:, 7])
-        self.metrics["error_sw_roll"] = torch.abs(self.y_out[:, 9] - self.y_act[:, 9])
-        self.metrics["error_sw_pitch"] = torch.abs(self.y_out[:, 10] - self.y_act[:, 10])
-        self.metrics["error_sw_yaw"] = torch.abs(self.y_out[:, 11] - self.y_act[:, 11])
-        self.metrics["error_st_pitch"] = torch.abs(self.y_out[:, 12] - self.y_act[:, 12])
-
-        self.metrics["error_com_x"] = torch.abs(self.y_out[:, 0] - self.y_act[:, 0])
-        self.metrics["error_com_y"] = torch.abs(self.y_out[:, 1] - self.y_act[:, 1])
-        self.metrics["error_com_z"] = torch.abs(self.y_out[:, 2] - self.y_act[:, 2])
-        self.metrics["error_pelvis_roll"] = torch.abs(self.y_out[:, 3] - self.y_act[:, 3])
-        self.metrics["error_pelvis_pitch"] = torch.abs(self.y_out[:, 4] - self.y_act[:, 4])
-        self.metrics["error_pelvis_yaw"] = torch.abs(self.y_out[:, 5] - self.y_act[:, 5])
+        self.metrics["error_com_x"] = torch.abs(self.y_out[:, YIdx.comx] - self.y_act[:, YIdx.comx])
+        self.metrics["error_com_y"] = torch.abs(self.y_out[:, YIdx.comy] - self.y_act[:, YIdx.comy])
+        self.metrics["error_com_z"] = torch.abs(self.y_out[:, YIdx.comz] - self.y_act[:, YIdx.comz])
+        self.metrics["error_pelvis_roll"] = torch.abs(self.y_out[:, YIdx.pelvis_roll] - self.y_act[:, YIdx.pelvis_roll])
+        self.metrics["error_pelvis_pitch"] = torch.abs(self.y_out[:, YIdx.pelvis_pitch] - self.y_act[:, YIdx.pelvis_pitch])
+        self.metrics["error_pelvis_yaw"] = torch.abs(self.y_out[:, YIdx.pelvis_yaw] - self.y_act[:, YIdx.pelvis_yaw])
 
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
         self.metrics["avg_clf"] = torch.mean(self.v_buffer, dim=-1)
-        # max_clf = self.env.reward_manager.get_term_cfg("clf_reward").params["max_clf"]
+        # max_clf = self._env.reward_manager.get_term_cfg("clf_reward").params["max_clf"]
         # self.metrics["max_clf"] = torch.ones((self.num_envs), device=self.device) * max_clf
         # return self.foot_target  # Return the foot target tensor for observation
 
-    def update_Stance_Swing_idx(self):
-        Tswing = self.T - self.T_ds
-        self.tp = (self.env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-        phi_c = torch.tensor(
-            math.sin(2 * torch.pi * self.tp) / math.sqrt(math.sin(2 * torch.pi * self.tp) ** 2 + self.T),
-            device=self.env.device,
-        )
-
-        new_stance_idx = int(0.5 - 0.5 * torch.sign(phi_c))
-        self.swing_idx = 1 - new_stance_idx
-
-
-
-
-        if self.stance_idx is None or new_stance_idx != self.stance_idx:
-            if self.stance_idx is None:
-                self.stance_idx = new_stance_idx
+    def timeBasedDomainContactStatusSwitch(self):
+        
+        
+        self._phase_var.update(self._env.sim.current_time)
+        # for per env update
+        # t = env.episode_length_buf.unsqueeze(1) * env.step_dt
+        
+        if self.old_stance_idx is None or self.old_stance_idx != self._phase_var.stance_idx:
+            if self.old_stance_idx is None:
+                self.old_stance_idx = self._phase_var.stance_idx
             # update stance foot pos, ori
             foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
             foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
@@ -243,18 +229,22 @@ class MLIPCommandTerm(CommandTerm):
                 foot_pos_w[:, self.swing_idx, :] - self.stance_foot_pos_0, self.stance_foot_ori_quat_0
             )
 
-        self.stance_idx = new_stance_idx
-
-        if self.tp < 0.5:
-            self.phase_var = 2 * self.tp
-        else:
-            self.phase_var = 2 * self.tp - 1
-        self.cur_swing_time = self.phase_var * Tswing
-
+        self.old_stance_idx = self._phase_var.stance_idx
+        self.swing_idx = 1 - self._phase_var.stance_idx
+            
+    def update_walking_target(self):
+        #given command, update MLIP
+        pass
+    def compute_actual(self):
+        pass
+    def compute_desired(self):
+        pass
+    
+    
     def generate_orientation_ref(self, base_velocity, N):
         pelvis_euler = torch.zeros((N, 3), device=self.device)
         tp_tensor = torch.tensor(self.tp, device=self.device)
-        phase_tensor = torch.tensor(self.phase_var, device=self.device)
+
 
         roll_main_amp = 0.0  # main double bump amplitude
         roll_asym_amp = -0.05  # adds asymmetry
@@ -307,7 +297,7 @@ class MLIPCommandTerm(CommandTerm):
         return pelvis_euler, pelvis_eul_dot, foot_eul, foot_eul_dot
 
     def generate_reference_trajectory(self):
-        base_velocity = self.env.command_manager.get_command("base_velocity")  # (N,3)
+        base_velocity = self._env.command_manager.get_command("base_velocity")  # (N,3)
         N = base_velocity.shape[0]
 
         T = torch.full((N,), self.T, dtype=torch.float32, device=self.device)
@@ -417,7 +407,7 @@ class MLIPCommandTerm(CommandTerm):
 
     def generate_upper_body_ref(self):
         # phase: [B]
-        forward_vel = self.env.command_manager.get_command("base_velocity")[:, 0]
+        forward_vel = self._env.command_manager.get_command("base_velocity")[:, 0]
         N = forward_vel.shape[0]
         phase = 2 * torch.pi * self.tp
 
@@ -566,22 +556,3 @@ class MLIPCommandTerm(CommandTerm):
             dim=-1,
         )
 
-    def _update_command(self):
-
-        self.update_Stance_Swing_idx()
-        self.generate_reference_trajectory()
-        self.get_actual_state()
-
-        # how to handle for the first step?
-        # i.e. v is not defined
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.cfg.yaw_idx)
-        self.vdot = vdot
-        self.v = vcur
-        if torch.sum(self.v_buffer) == 0:
-            # (E,) -> (E,1) -> broadcast to (E,100) on assignment
-            self.v_buffer[:] = self.v.unsqueeze(1)
-            self.vdot_buffer[:] = self.vdot.unsqueeze(1)
-
-        else:
-            self.v_buffer = torch.cat([self.v_buffer[:, 1:], self.v.unsqueeze(-1)], dim=-1)
-            self.vdot_buffer = torch.cat([self.vdot_buffer[:, 1:], self.vdot.unsqueeze(-1)], dim=-1)
