@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 def euler_rates_to_omega(eul: torch.Tensor, eul_rates: torch.Tensor) -> torch.Tensor:
     """
-    Convert Z–Y–X Euler‐angle rates into body‐frame angular velocity.
+    Convert XYZ extrinsic Euler angle rates into body‐frame angular velocity.
 
     Args:
         eul:        Tensor of shape (..., 3), Euler angles [φ, θ, ψ]
@@ -43,29 +43,28 @@ def euler_rates_to_omega(eul: torch.Tensor, eul_rates: torch.Tensor) -> torch.Te
         omega:      Tensor of shape (..., 3), angular velocity [ωₓ, ωᵧ, ω_z]
     """
     # unpack
-    phi, theta, psi = eul.unbind(-1)
-
-    # precompute sines/cosines
-    c_th = torch.cos(theta)
-    s_th = torch.sin(theta)
-    c_ps = torch.cos(psi)
-    s_ps = torch.sin(psi)
-
-    # build the mapping matrix M(...,3,3)
-    zeros = torch.zeros_like(theta)
-    ones = torch.ones_like(theta)
-
-    M = torch.stack(
+    roll, pitch, yaw = eul.unbind(-1)
+    
+    # Precompute sines/cosines
+    s_pitch = torch.sin(pitch)
+    c_pitch = torch.cos(pitch)
+    s_roll = torch.sin(roll)
+    c_roll = torch.cos(roll)
+    
+    zeros = torch.zeros_like(pitch)
+    ones = torch.ones_like(pitch)
+    
+    RateMatrix = torch.stack(
         [
-            torch.stack([c_th * c_ps, s_ps, zeros], dim=-1),
-            torch.stack([-c_th * s_ps, c_ps, zeros], dim=-1),
-            torch.stack([s_th, zeros, ones], dim=-1),
+            torch.stack([ones,   zeros,  -s_pitch], dim=-1),
+            torch.stack([zeros, c_roll,  c_pitch*s_roll], dim=-1),
+            torch.stack([zeros, -s_roll, c_pitch*c_roll], dim=-1),
         ],
         dim=-2,
     )
 
     # apply to rates: ω = M @ eul_rates
-    omega = torch.einsum("...ij,...j->...i", M, eul_rates)
+    omega = torch.einsum("...ij,...j->...i", RateMatrix, eul_rates)
     return omega
 
 
