@@ -6,9 +6,14 @@ class MLIPPhaseVarGlobal:
         #corresponding time_in_step:
         #                   0 -> T_fa -> T_fa -> T_ss -> T_ss -> T_ss+T_ds or 0 -> 0
         self.Tstep = T_doublestep/2.0 # total time for a step = T_fa + T_ua + T_oa
-        self.T_fa = self.Tstep * 0.4  # FA: 40% of a step
-        self.T_ua = self.Tstep * 0.4  # UA: 40% of a step
-        self.T_oa = self.Tstep * 0.2  # OA: 20% of a step
+        # self.T_fa = self.Tstep * 0.4  # FA: 40% of a step
+        # self.T_ua = self.Tstep * 0.4  # UA: 40% of a step
+        # self.T_oa = self.Tstep * 0.2  # OA: 20% of a step
+        #todo: as debug
+        self.T_fa = self.Tstep * 0.  # FA: 40% of a step
+        self.T_ua = self.Tstep * 1.0  # UA: 40% of a step
+        self.T_oa = self.Tstep * 0.0  # OA: 20% of a step
+        
         self.T_ss = self.T_fa + self.T_ua # total single support time
         self.T_ds = self.T_oa  # total double support time
         self.time_in_step = 0.0
@@ -21,8 +26,9 @@ class MLIPPhaseVarGlobal:
         self.phase_oa = 0.0
 
     def update(self, simtime):
-        self.time_in_step = simtime % (self.T_ss + self.T_ds)
-        self.phase = self.time_in_step / self.T_ss
+        self.time_in_step = simtime % self.Tstep
+        # phase in [0,1] for single support
+        self.phase = self.time_in_step / self.T_ss 
         self.phase_fa = float('nan')
         self.phase_ua = float('nan')
         self.phase_oa = float('nan')
@@ -42,8 +48,10 @@ class MLIPPhaseVarGlobal:
         # per-swing normalized phase [0,1]
         if tp < 0.5:
             self.stance_idx = 0
+            self.swing_idx = 1
         else:
             self.stance_idx = 1
+            self.swing_idx = 0
             
 import torch            
 class MLIPPhaseVarEnvBatch:

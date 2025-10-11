@@ -77,10 +77,6 @@ def get_euler_from_quat(quat):
     return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
 
-def _transfer_to_global_frame(vec, root_quat):
-    return quat_apply(yaw_quat(root_quat), vec)
-
-
 def _transfer_to_local_frame(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
@@ -201,6 +197,7 @@ class HLIPCommandTerm(CommandTerm):
         else:
             self.phase_var = 2 * self.tp - 1
         self.cur_swing_time = self.phase_var * Tswing
+        return
 
     def generate_orientation_ref(self, base_velocity, N):
         pelvis_euler = torch.zeros((N, 3), device=self.device)
@@ -208,7 +205,7 @@ class HLIPCommandTerm(CommandTerm):
         phase_tensor = torch.tensor(self.phase_var, device=self.device)
 
         roll_main_amp = 0.0  # main double bump amplitude
-        roll_asym_amp = -0.05  # adds asymmetry
+        roll_asym_amp = -0.0  # adds asymmetry
 
         pelvis_euler[:, 0] = roll_main_amp * torch.sin(4 * torch.pi * tp_tensor) + roll_asym_amp * torch.sin(
             2 * torch.pi * tp_tensor
@@ -221,9 +218,9 @@ class HLIPCommandTerm(CommandTerm):
         # turning bias
         bias_yaw = torch.clamp(torch.atan((base_velocity[:, 0] * base_velocity[:, 2]) / 9.81), -0.2, 0.2)
 
-        pelvis_euler[:, 0] = pelvis_euler[:, 0] + bias_lat + bias_yaw
+        # pelvis_euler[:, 0] = pelvis_euler[:, 0] + bias_lat + bias_yaw
 
-        pitch_amp = 0.02
+        pitch_amp = 0.0
         pelvis_euler[:, 1] = self.cfg.pelv_pitch_ref + torch.sin(2 * torch.pi * tp_tensor) * pitch_amp
 
         yaw_amp = 0.0
@@ -355,6 +352,10 @@ class HLIPCommandTerm(CommandTerm):
         self.dy_out = torch.cat(
             [com_vel_des_yaw_adjusted, omega_ref, foot_vel, omega_foot_ref, upper_body_joint_vel], dim=-1
         )
+        
+
+        
+        return
 
     def generate_upper_body_ref(self):
         # phase: [B]
@@ -519,3 +520,25 @@ class HLIPCommandTerm(CommandTerm):
         else:
             self.v_buffer = torch.cat([self.v_buffer[:, 1:], self.v.unsqueeze(-1)], dim=-1)
             self.vdot_buffer = torch.cat([self.vdot_buffer[:, 1:], self.vdot.unsqueeze(-1)], dim=-1)
+            
+        # Debug prints - show full tensors
+        from robot_rl.tasks.manager_based.robot_rl.constants import IS_DEBUG
+        if IS_DEBUG:
+            with torch.no_grad():
+                torch.set_printoptions(profile="full", linewidth=1500, precision=4, sci_mode=False)
+                print("=" * 80)
+                print("HLIP DEBUG: y_out (positions/orientations):")
+                print(self.y_out)
+                print("HLIP DEBUG: dy_out (velocities/angular velocities):")
+                print(self.dy_out)
+                print("HLIP DEBUG: y_act (actual positions/orientations):")
+                print(self.y_act)
+                print("HLIP DEBUG: dy_act (actual velocities/angular velocities):")
+                print(self.dy_act)
+                print("HLIP DEBUG: v (CLF value):")
+                print(self.v)
+                print("HLIP DEBUG: vdot (CLF derivative):")
+                print(self.vdot)
+                print("=" * 80)
+        return
+

@@ -21,9 +21,11 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.mlip_cmd_cfg import MLIP
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 
+# from robot_rl.tasks.manager_based.robot_rl.terrains.stones_terrain_importer_cfg import StonesTerrainImporterCfg
 #
-
-
+import isaaclab.sim as sim_utils
+from dataclasses import MISSING
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 @configclass
 class G1RoughMlipCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""
@@ -65,7 +67,7 @@ class G1RoughMlipRewards(HumanoidRewardCfg):
         weight=10.0,
         params={
             "command_name": "hlip_ref",
-            "max_eta_err": 0.25,
+            "max_eta_err": 0.3,
         },
     )
 
@@ -74,7 +76,7 @@ class G1RoughMlipRewards(HumanoidRewardCfg):
         weight=-2.0,
         params={
             "command_name": "hlip_ref",
-            "alpha": 0.5,
+            "alpha": 1.0,
             "eta_max": 0.2,
             "eta_dot_max": 0.3,
         },
@@ -97,16 +99,35 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         ##
         # Scene
         ##
+        new_joint_pos = G1_MINIMAL_CFG.init_state.joint_pos | {
+            ".*_hip_pitch_joint": -0.25,
+            ".*_knee_joint": 0.46,
+            ".*_ankle_pitch_joint": -0.25,
+        }
         self.scene.robot = G1_MINIMAL_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
-            init_state=G1_MINIMAL_CFG.init_state.replace(
-                joint_pos={
-                    ".*_hip_pitch_joint": -0.25,
-                    ".*_knee_joint": 0.5,
-                    ".*_ankle_pitch_joint": 0.25,
-                }
-            ),
+            init_state=G1_MINIMAL_CFG.init_state.replace(joint_pos=new_joint_pos)
         )
+        # from isaaclab.terrains import TerrainImporterCfg
+        # self.scene.terrain = StonesTerrainImporterCfg(
+        #     prim_path="/World/ground",
+        #     terrain_type="generator",
+        #     terrain_generator=MISSING,
+        #     max_init_terrain_level=5,
+        #     collision_group=-1,
+        #     physics_material=sim_utils.RigidBodyMaterialCfg(
+        #         friction_combine_mode="multiply",
+        #         restitution_combine_mode="multiply",
+        #         static_friction=1.0,
+        #         dynamic_friction=1.0,
+        #     ),
+        #     visual_material=sim_utils.MdlFileCfg(
+        #         mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+        #         project_uvw=True,
+        #         texture_scale=(0.25, 0.25),
+        #     ),
+        #     debug_vis=False,
+        # )
         
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
 
@@ -117,8 +138,8 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         # Randomization
         ##
         self.events.push_robot.params["velocity_range"] = {
-            "x": (-.1, 1), #(-1, 1)
-            "y": (-0.4, 0.4), #(-1, 1)
+            "x": (-1, 1), 
+            "y": (-1, 1), 
             "roll": (-0.4, 0.4),
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
@@ -143,12 +164,18 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        
-        # todo: for heel-to-toe, forward walking only for now
-        self.commands.base_velocity.ranges.lin_vel_x = (0, 0.75)  #(-0.75,0.75)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 
+        #remove all randomization for debugging
+        from robot_rl.tasks.manager_based.robot_rl.constants import IS_DEBUG
+        if IS_DEBUG: 
+            self.events.reset_robot_joints = None
+            self.events.reset_base = None
+            self.commands.base_velocity.ranges.lin_vel_x = (0.75, 0.75)
+            self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+            self.commands.base_velocity.ranges.ang_vel_z = (0.5, 0.5)
         ##
         # Terminations
         ##

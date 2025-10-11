@@ -23,30 +23,9 @@ class G1FlatMlipEnvCfg(G1RoughMlipEnvCfg):
         # post init of parent
         super().__post_init__()
 
-        ##
-        # Scene
-        ##
-        # change terrain to flat
-        self.rewards.clf_reward.params = {
-            "command_name": "hlip_ref",
-            "max_eta_err": 0.3,
-        }
+
         # self.rewards.clf_decreasing_condition = None
-        # self.rewards.vdot_tanh = RewTerm(
-        #     func=mdp.vdot_tanh,
-        #     weight= 2.0,
-        #     params={
-        #         "command_name": "hlip_ref",
-        #         "alpha": 2.0,
-        #     }
-        # )
-        # self.rewards.vdot_tanh = None
-        self.rewards.clf_decreasing_condition.params = {
-            "command_name": "hlip_ref",
-            "alpha": 1.0,
-            "eta_max": 0.2,
-            "eta_dot_max": 0.3,
-        }
+
 
         self.rewards.action_rate_l2.weight = -0.01
 

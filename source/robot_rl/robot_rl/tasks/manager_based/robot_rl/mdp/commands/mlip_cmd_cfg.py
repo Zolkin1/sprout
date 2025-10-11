@@ -32,8 +32,8 @@ Q_weights_mlip = [
     10.0,  # swing_ori_pitch pos, vel
     400.0,
     10.0,  # swing_ori_yaw pos, vel
-    500.0,
-    10.0,  # stance_ori_pitch pos, vel
+    # 500.0,
+    # 10.0,  # stance_ori_pitch pos, vel
     500.0,
     10.0,  # waist_yaw pos, vel
     40.0,
@@ -68,7 +68,77 @@ R_weights_mlip = [
     0.02,
     0.02,
     0.02,  # swing foot orientation inputs: small adjustments
-    0.02, #stance foot pitch
+    # 0.02, #stance foot pitch
+    0.1,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+    0.01,
+]
+
+Q_weights = [
+    25.0,
+    200.0,  # com_x pos, vel
+    300.0,
+    50.0,  # com_y pos, vel
+    400.0,
+    10.0,  # com_z pos, vel
+    420.0,
+    20.0,  # pelvis_roll pos, vel
+    200.0,
+    10.0,  # pelvis_pitch pos, vel
+    300.0,
+    10.0,  # pelvis_yaw pos, vel
+    1500.0,
+    125.0,  # swing_x pos, vel
+    1700.0,
+    125.0,  # swing_y pos, vel
+    3500.0,
+    100.0,  # swing_z pos, vel
+    30.0,
+    1.0,  # swing_ori_roll pos, vel
+    10.0,
+    1.0,  # swing_ori_pitch pos, vel
+    400.0,
+    10.0,  # swing_ori_yaw pos, vel
+    500.0,
+    10.0,  # waist_yaw pos, vel
+    40.0,
+    1.0,  # left shoulder pitch
+    40.0,
+    1.0,  # right shoulder pitch
+    100,
+    1.0,  # left shoulder roll
+    100,
+    1.0,  # right shoulder roll
+    50,
+    1.0,  # left shoulder yaw
+    50,
+    1.0,  # right shoulder yaw
+    30.0,
+    1.0,  # left elbow
+    30.0,
+    1.0,  # right elbow
+]
+
+
+R_weights = [
+    0.1,
+    0.1,
+    0.1,  # CoM inputs: allow moderate effort
+    0.05,
+    0.05,
+    0.05,  # pelvis inputs: lower torque priority
+    0.05,
+    0.05,
+    0.05,  # swing foot linear inputs
+    0.02,
+    0.02,
+    0.02,  # swing foot orientation inputs: small adjustments
     0.1,
     0.01,
     0.01,
@@ -81,7 +151,6 @@ R_weights_mlip = [
 ]
 
 
-
 @configclass
 class MLIPCommandCfg(CommandTermCfg):
     """
@@ -90,10 +159,12 @@ class MLIPCommandCfg(CommandTermCfg):
 
     class_type: type = MLIPCommandTerm
     asset_name: str = "robot"
+    use_flat_foot: bool = True  # use flat foot model (vs. multi-domain)
     yaw_idx: list[int] = [5, 11]
     z0: float = 0.67  # CoM height (m)
     y_nom: float = 0.25  # nominal lateral foot offset (m)
-    gait_period: float = 0.8  # gait cycle period (s)
+    foot_length: float = 0.17  # foot length (m) for G1
+    foot_pitch_ref: float = 0.4 # max foot pitch angle (rad)
     debug_vis: bool = False  # enable debug visualization
     z_sw_max: float = 0.1  # max swing foot z height (m); this is ankle height so different from actual foot position
     z_sw_min: float = 0.0
@@ -124,5 +195,5 @@ class MLIPCommandCfg(CommandTermCfg):
         ".*_elbow_joint",
     ]
 
-    Q_weights = Q_weights_mlip
-    R_weights = R_weights_mlip
+    Q_weights = Q_weights
+    R_weights = R_weights

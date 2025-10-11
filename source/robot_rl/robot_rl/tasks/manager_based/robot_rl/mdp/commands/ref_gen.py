@@ -299,3 +299,18 @@ class HLIP(torch.nn.Module):
         self.x_init, self.y_init = self._remap_for_init_stance_state(Xdes, Ydes, Ux, Uy)
 
         return Xdes, Ux, Ydes, Uy
+
+if __name__ == "__main__":
+    # Test HLIP
+    T = 0.4
+    hlip = HLIP(9.81, z0=0.75, T_ds=0., T=T, y_nom=0.25)
+    vel = torch.tensor([[0.5, 0.1],
+                       [0.0, 0.5],
+                       [-0.5, -0.1],
+                       [0.3, 0.0],
+                       [-0.3, 0.0]], device='cpu')
+    Xdes, Ux, Ydes, Uy = hlip.compute_orbit(T, vel)
+    print("Xdes:", Xdes)
+    print("Ux:", Ux)
+    print("Ydes:", Ydes)
+    print("Uy:", Uy)

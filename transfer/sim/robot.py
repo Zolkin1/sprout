@@ -138,6 +138,7 @@ class Robot:
         """Create observation for the policy."""
         qpos = self.mj_data.qpos
         qvel = self.mj_data.qvel
+        print(f"base vel: {qvel[0:3]}")
         sim_time = self.mj_data.time
         pg = self.get_projected_gravity(qpos[3:7])
         if self.input_function is None:
