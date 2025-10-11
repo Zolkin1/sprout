@@ -187,7 +187,7 @@ def main():
         dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
         # Run training
-        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
 
         # Cleanup
         env.close()
