@@ -29,7 +29,7 @@ class G1FlatMlipEnvCfg(G1RoughMlipEnvCfg):
 
         self.rewards.action_rate_l2.weight = -0.01
 
-        self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
         # no height scan

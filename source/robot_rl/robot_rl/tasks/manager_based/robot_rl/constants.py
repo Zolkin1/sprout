@@ -1,17 +1,23 @@
-
+from dataclasses import dataclass
 
 IS_DEBUG = False
 
 
-# for stones config
-num_stones = 20
-stone_x = 0.2 # meters
-stone_y = 1 # meters
-stone_z = 0.1 # meters
-rel_stone_x = [0.2, 0.8]
-rel_stone_z = [-.1, 0.1]
-terrain_size_x = num_stones * rel_stone_x[1] #maximum terrain size in x direction
-terrain_size_y = stone_y  #maximum terrain size in y direction
+@dataclass
+class StonesConfig:
+   num_stones: int = 20
+   stone_x: float = 0.2  # stone x (length in meters)
+   stone_y: float = 1.0  # stone y (width in meters)
+   stone_z: float = 0.1  # stone z (height in meters)
+   rel_stone_x = [0.2, 0.8] # relative x distance range between stones
+   rel_stone_z = [-.1, 0.1] # relative z distance range between stones
+   start_platform_x = 1.0
+   num_init_steps = 1
+   terrain_size_x = num_stones * rel_stone_x[1] +  start_platform_x #terrain size in x direction
+   terrain_size_y = stone_y  #terrain size in y direction
+   
+   robot_launch_x_lb = (start_platform_x-stone_x/2.0)/2.0 - (start_platform_x-stone_x/2.0)/4.0
+   robot_launch_x_ub = (start_platform_x-stone_x/2.0)/2.0 + (start_platform_x-stone_x/2.0)/4.0
+   
 
-
-
+STONES = StonesConfig()
