@@ -1,7 +1,7 @@
 from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
+# from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -11,13 +11,60 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FO
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 import math
 
+WALKING_Q_weights = [
+    25.0,   250.0,      # com_x pos, vel
+    500.0,   20.0,      # com_y pos, vel
+    650.0,   10.0,      # com_z pos, vel
+    300.0,    20.0,     # pelvis_roll pos, vel
+    250.0,    10.0,     # pelvis_pitch pos, vel
+    300.0,    30.0,     # pelvis_yaw pos, vel
+    1500.0, 50.0,       # swing_x pos, vel
+    1500.0,  50.0,      # swing_y pos, vel
+    2500.0, 50.0,       # swing_z pos, vel
+    30.0,    1.0,       # swing_ori_roll pos, vel
+    150.0,    1.0,       # swing_ori_pitch pos, vel
+    400.0,    10.0,     # swing_ori_yaw pos, vel
+    1500.0, 50.0,       # stance_x pos, vel
+    1500.0,  50.0,      # stance_y pos, vel
+    2500.0, 50.0,       # stance_z pos, vel
+    30.0,    1.0,       # stance_ori_roll pos, vel
+    150.0,    1.0,       # stance_ori_pitch pos, vel
+    400.0,    10.0,     # swing_ori_yaw pos, vel
+    100.0,    1.0,      # waist_yaw pos, vel
+    40.0,1.0, #left shoulder pitch
+    40.0,1.0, #left shoulder roll
+    50.0,1.0, #left shoulder yaw
+    30.0,1.0, #left elbow
+    40.0,1.0, #right shoulder pitch
+    40.0,1.0, #right shoulder roll
+    50.0,1.0, #right shoulder yaw
+    30.0,1.0, #right elbow
+]
+
+
+WALKING_R_weights = [
+        0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort
+        0.05,0.05,0.05,     # pelvis inputs: lower torque priority
+        0.05,0.05,0.05,     # swing foot linear inputs
+        0.02,0.02,0.02,     # swing foot orientation inputs: small adjustments
+        0.05, 0.05, 0.05,   # stance foot linear inputs
+        0.02, 0.02, 0.02,   # stance foot orientation inputs: small adjustments
+        0.1,0.01,0.01,
+        0.01,0.01,0.01,
+        0.01,0.01,0.01,
+    ]
+
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/gait_library",
-        config_name="single_support_config",
-        gait_velocity_ranges=(-0.75, 0.75, 0.05)
+        gait_library_path="source/robot_rl/robot_rl/assets/robots/walking_10_13",
+        config_name="walking",
+        gait_velocity_ranges=(0.0, 1.0, 0.1),
+
+        num_outputs=27,
+        Q_weights=WALKING_Q_weights,
+        R_weights=WALKING_R_weights,
     )
 
 

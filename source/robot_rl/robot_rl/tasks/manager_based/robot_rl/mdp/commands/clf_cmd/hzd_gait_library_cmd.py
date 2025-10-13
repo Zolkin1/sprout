@@ -240,6 +240,11 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
     def get_flight_envs(self):
         """Get a masking tensor with a 1 for each environment in the flight phase."""
+        # Check if flight phase exists in the gait configuration
+        if "flight_phase" not in self.gait_config.domain_name_to_idx:
+            # Return all zeros if no flight phase exists
+            return torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
         # Get flight phase domain index
         flight_domain_idx = self.gait_config.domain_name_to_idx["flight_phase"]
 
@@ -250,6 +255,11 @@ class GaitLibraryHZDCommandTerm(CommandTerm):
 
 
     def get_not_flight_envs(self):
+        # Check if flight phase exists in the gait configuration
+        if "flight_phase" not in self.gait_config.domain_name_to_idx:
+            # Return all ones if no flight phase exists (all envs are not in flight)
+            return torch.ones(self.num_envs, dtype=torch.int32, device=self.device)
+
         # Get flight phase domain index
         flight_domain_idx = self.gait_config.domain_name_to_idx["flight_phase"]
 

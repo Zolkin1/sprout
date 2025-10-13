@@ -208,24 +208,28 @@ class GaitLibraryEndEffectorConfig:
         # self.yaw_output_idx[self.domain_name_to_idx["flight_phase"], :] = torch.tensor([5, 11, 17])
         # # self.yaw_output_idx[self.domain_name_to_idx["double_support"], :2] = torch.tensor([5, 11])
 
-        self.foot_yaw_output_idx = {self.domain_name_to_idx["single_support"]: [11],
-                                    self.domain_name_to_idx["flight_phase"]:  [11, 17],
-                                    # self.domain_name_to_idx["double_support"]:  [11],    # TODO: Remove/fix
-                                    }
+        self.foot_yaw_output_idx = {self.domain_name_to_idx["single_support"]: [11]}
+        if "flight_phase" in self.domain_name_to_idx:
+            self.foot_yaw_output_idx[self.domain_name_to_idx["flight_phase"]] = [11, 17]
+        # if "double_support" in self.domain_name_to_idx:
+        #     self.foot_yaw_output_idx[self.domain_name_to_idx["double_support"]] = [11]    # TODO: Remove/fix
 
-        self.foot_y_output_idx = {self.domain_name_to_idx["single_support"]: [7],
-                                    self.domain_name_to_idx["flight_phase"]:  [7], #[7, 13],
-                                    # self.domain_name_to_idx["double_support"]:  [7],    # TODO: Remove/fix
-                                    }
+        self.foot_y_output_idx = {self.domain_name_to_idx["single_support"]: [7]}
+        if "flight_phase" in self.domain_name_to_idx:
+            self.foot_y_output_idx[self.domain_name_to_idx["flight_phase"]] = [7]  #[7, 13]
+        # if "double_support" in self.domain_name_to_idx:
+        #     self.foot_y_output_idx[self.domain_name_to_idx["double_support"]] = [7]    # TODO: Remove/fix
 
-        self.ori_idx_list = {self.domain_name_to_idx["single_support"]:  [[3, 4, 5], [9, 10, 11]],
-                             self.domain_name_to_idx["flight_phase"]:  [[3, 4, 5], [9, 10, 11], [15, 16, 17]],
-                             # self.domain_name_to_idx["double_support"]:  [[3, 4, 5], [9, 10, 11]],    # TODO: Remove/fix
-                            }
-        self.yaw_output_idx = {self.domain_name_to_idx["single_support"]:  [5, 11],
-                               self.domain_name_to_idx["flight_phase"]:  [5, 11, 17],
-                               # self.domain_name_to_idx["double_support"]:  [5, 11],    # TODO: Remove/fix
-                              }
+        self.ori_idx_list = {self.domain_name_to_idx["single_support"]:  [[3, 4, 5], [9, 10, 11]]}
+        if "flight_phase" in self.domain_name_to_idx:
+            self.ori_idx_list[self.domain_name_to_idx["flight_phase"]] = [[3, 4, 5], [9, 10, 11], [15, 16, 17]]
+        # if "double_support" in self.domain_name_to_idx:
+        #     self.ori_idx_list[self.domain_name_to_idx["double_support"]] = [[3, 4, 5], [9, 10, 11]]    # TODO: Remove/fix
+        self.yaw_output_idx = {self.domain_name_to_idx["single_support"]:  [5, 11]}
+        if "flight_phase" in self.domain_name_to_idx:
+            self.yaw_output_idx[self.domain_name_to_idx["flight_phase"]] = [5, 11, 17]
+        # if "double_support" in self.domain_name_to_idx:
+        #     self.yaw_output_idx[self.domain_name_to_idx["double_support"]] = [5, 11]    # TODO: Remove/fix
 
         # Print gait library information
         self._print_gait_library_info()
