@@ -79,12 +79,12 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
         super().__post_init__()
 
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
 
-        self.commands.step_period.period_range = (0.8,0.8)
+        self.commands.step_period.period_range = (0.71,0.71)
 
         self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
@@ -123,7 +123,7 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
             }
         )
 
-        self.rewards.clf_decreasing_condition = None
+        # self.rewards.clf_decreasing_condition = None
 
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
@@ -189,7 +189,7 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         self.events.push_robot = None
         
         
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
