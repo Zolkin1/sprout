@@ -97,9 +97,8 @@ class StonesTerrainGenerator:
     For instance, the key "root_spawn" maps to a tensor containing the flat patches for spawning an asset.
     Similarly, the key "target_spawn" maps to a tensor containing the flat patches for setting targets.
     """
-    
-    terrain_info: dict[str, torch.Tensor]
-    """A dictionary containing terrain information such as stone positions."""
+
+    terrain_infos: dict[str, np.ndarray]
 
 
     def __init__(self, cfg: TerrainGeneratorCfg, device: str = "cpu"):
@@ -117,9 +116,6 @@ class StonesTerrainGenerator:
         self.device = device
         
 
-        #todo:
-        self.terrain_info: dict[str, torch.Tensor] = {}
-        self.terrain_info["test"] = torch.tensor([1,2,3], device=self.device)
 
         # set common values to all sub-terrains config
         from isaaclab.terrains.height_field import HfTerrainBaseCfg  # prevent circular import
@@ -156,6 +152,15 @@ class StonesTerrainGenerator:
         # create a list of all sub-terrains
         self.terrain_meshes = list()
         self.terrain_origins = np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3))
+        
+        # terrain info
+        from robot_rl.tasks.manager_based.robot_rl.constants import STONES
+        self.terrain_infos = {
+            "rel_x": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative x distances between stones
+            "rel_z": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative z distances between stones
+            "start_platform_pos": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # start platform position in each sub-terrain
+            "origin": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # origin position
+        }
 
         # parse configuration and add sub-terrains
         # create terrains based on curriculum or randomly
@@ -234,7 +239,7 @@ class StonesTerrainGenerator:
             # generate terrain
             mesh, origin, terrain_info = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_index])
             # add to sub-terrains
-            self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_index])
+            self._add_sub_terrain(mesh, origin, terrain_info, sub_row, sub_col, sub_terrains_cfgs[sub_index])
 
     def _generate_curriculum_terrains(self):
         """Add terrains based on the difficulty parameter."""
@@ -267,7 +272,7 @@ class StonesTerrainGenerator:
                 # generate terrain
                 mesh, origin, terrain_info = self._get_terrain_mesh(difficulty, sub_terrains_cfgs[sub_indices[sub_col]])
                 # add to sub-terrains
-                self._add_sub_terrain(mesh, origin, sub_row, sub_col, sub_terrains_cfgs[sub_indices[sub_col]])
+                self._add_sub_terrain(mesh, origin, terrain_info, sub_row, sub_col, sub_terrains_cfgs[sub_indices[sub_col]])
 
     """
     Internal helper functions.
@@ -296,7 +301,7 @@ class StonesTerrainGenerator:
         self.terrain_meshes.append(border)
 
     def _add_sub_terrain(
-        self, mesh: trimesh.Trimesh, origin: np.ndarray, row: int, col: int, sub_terrain_cfg: SubTerrainBaseCfg
+        self, mesh: trimesh.Trimesh, origin: np.ndarray, terrain_info: dict[str, np.ndarray], row: int, col: int, sub_terrain_cfg: SubTerrainBaseCfg
     ):
         """Add input sub-terrain to the list of sub-terrains.
 
@@ -342,6 +347,11 @@ class StonesTerrainGenerator:
         self.terrain_meshes.append(mesh)
         # add origin to the list
         self.terrain_origins[row, col] = origin + transform[:3, -1]
+        
+        self.terrain_infos["rel_x"][row, col] = terrain_info["rel_x"]
+        self.terrain_infos["rel_z"][row, col] = terrain_info["rel_z"]
+        self.terrain_infos["start_platform_pos"][row, col] = terrain_info["start_platform_pos"]
+        self.terrain_infos["origin"][row, col] = terrain_info["origin"]
 
     def _get_terrain_mesh(self, difficulty: float, cfg: SubTerrainBaseCfg) -> tuple[trimesh.Trimesh, np.ndarray]:
         """Generate a sub-terrain mesh based on the input difficulty parameter.
@@ -383,7 +393,7 @@ class StonesTerrainGenerator:
 
         # generate the terrain
         cfg.resample(difficulty)
-        meshes, origin, terrain_info = cfg.function(difficulty, cfg, self.cfg.seed)
+        meshes, origin, terrain_info = cfg.function(difficulty, cfg)
         mesh = trimesh.util.concatenate(meshes)
         # offset mesh such that they are in their center
         transform = np.eye(4)

@@ -38,11 +38,3 @@ class LongStonesTerrainCfg(SubTerrainBaseCfg):
         # assign updated stone size
         self.stone_size = (stone_x, self.stone_size[1], self.stone_size[2])
         
-      #   self.rel_x = rng.uniform(*self.rel_stone_x_range, self.num_stones)
-      #   self.rel_z = rng.uniform(*self.rel_stone_z_range, self.num_stones)
-
-      #   x0 = self.start_platform_size[0] - self.stone_size[0] / 2
-      #   self.abs_x = np.concatenate([x0*np.ones(self.num_init_steps), x0 + np.cumsum(self.rel_x)])
-      #   self.abs_z = np.concatenate([np.zeros(self.num_init_steps), np.cumsum(self.rel_z)])
-      #   self.end_platform_size = (self.size[0] -self.rel_x.sum()-self.start_platform_size[0], self.end_platform_size[1], self.end_platform_size[2])
-

@@ -6,8 +6,8 @@ if TYPE_CHECKING:
     from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import LongStonesTerrainCfg
 
 def long_stones_terrain(
-    difficulty: float, cfg: LongStonesTerrainCfg, seed: int | None = None
-) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+    difficulty: float, cfg: LongStonesTerrainCfg
+) -> tuple[list[trimesh.Trimesh], np.ndarray, dict[str,np.ndarray]]:
     meshes = []
     
     # resample difficulty-dependent parameters
@@ -55,6 +55,12 @@ def long_stones_terrain(
     # origin (where robot spawns)
     origin = np.array([start_pos[0], terrain_center[1], 0.0])
     
-    terrain_info = {"rel_x": rel_x, "rel_z": rel_z}
+    terrain_info: dict[str, np.ndarray] = {
+    "rel_x": rel_x,
+    "rel_z": rel_z,
+    "start_platform_pos": np.array([cfg.start_platform_size[0] - cfg.stone_size[0] / 2, terrain_center[1], 0.0]),
+    "origin": origin
+    }
+
 
     return meshes, origin, terrain_info
