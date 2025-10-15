@@ -1,4 +1,40 @@
-
+import torch    
+from typing import Union
+class PhaseVar:
+    def __init__(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
+        self.reconfigure(start_time, end_time)
+    def reconfigure(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
+        self.start_time = start_time
+        self.end_time = end_time
+        if isinstance(start_time, torch.Tensor) and isinstance(end_time, torch.Tensor):
+            self.tau = torch.zeros_like(start_time)
+            self.dtau = torch.zeros_like(start_time)
+            self._is_tensor = True
+        else:
+            self.tau = 0.0
+            self.dtau = 0.0
+            self._is_tensor = False        
+    def update(self, time: Union[float, torch.Tensor]):
+        if self._is_tensor:
+            self.tau = torch.clamp((time - self.start_time) / (self.end_time - self.start_time), 0.0, 1.0)
+            self.dtau =  1.0 / (self.end_time - self.start_time)
+            # Handle out-of-bounds time with warnings
+            out_of_bounds_low = time < self.start_time
+            out_of_bounds_high = time > self.end_time
+            if torch.any(out_of_bounds_low) or torch.any(out_of_bounds_high):
+                if torch.any(out_of_bounds_low):
+                    print(f"Warning: Some time values are before the start time {self.start_time}.")
+                if torch.any(out_of_bounds_high):
+                    print(f"Warning: Some time values are after the end time {self.end_time}.")
+        else:
+            self.tau = (time - self.start_time) / (self.end_time - self.start_time)
+            self.dtau = 1.0 / (self.end_time - self.start_time)
+            # Handle out-of-bounds time with warnings
+            if time < self.start_time or time > self.end_time:
+                if time < self.start_time:
+                    print(f"Warning: Time {time} is before the start time {self.start_time}.")
+                if time > self.end_time:
+                    print(f"Warning: Time {time} is after the end time {self.end_time}.")
 
 class MLIPPhaseVarGlobal:
     def __init__(self, T_doublestep):
@@ -53,7 +89,7 @@ class MLIPPhaseVarGlobal:
             self.stance_idx = 1
             self.swing_idx = 0
             
-import torch            
+        
 class MLIPPhaseVarEnvBatch:
     def __init__(self, T_doublestep, num_envs, device):
         #state transition:  FA+ -> FA- -> UA+ -> UA- -> OA+ -> OA- -> FA+

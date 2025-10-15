@@ -22,7 +22,7 @@ class StonesTerrainImporter(TerrainImporter):
         
         # Initialize env_terrain_infos as an actual dictionary
         self.env_terrain_infos: dict[str, torch.Tensor] = {}
-        if self.cfg.curriculum == False:
+        if self.cfg.terrain_generator.curriculum == False:
             raise RuntimeError("StonesTerrainImporter only supports curriculum learning currently.")
 
         self.configure_env_infos(self.terrain_infos)

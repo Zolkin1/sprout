@@ -90,8 +90,6 @@ def get_euler_from_quat(quat):
     return torch.stack([euler_x, euler_y, euler_z], dim=-1)
 
  
-
-
 def _transfer_to_local_frame(vec, root_quat):
     # apply -local_yaw rotation to vec
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
@@ -112,8 +110,7 @@ class MLIPCommandTerm(CommandTerm):
 
         #todo: check this
         self.debug_vis = cfg.debug_vis
-        if self.debug_vis:
-            self.footprint_visualizer = VisualizationMarkers(cfg.footprint_cfg)
+
 
         self.robot = env.scene[cfg.asset_name]
         #list of int, left foot idx 0, right foot idx 1
@@ -168,7 +165,7 @@ class MLIPCommandTerm(CommandTerm):
     def _resample_command(self, env_ids):
         self._update_command()
         return
-
+    
     def _update_command(self):
         self.timeBasedDomainContactStatusSwitch()
         self.update_walking_target()
@@ -375,7 +372,7 @@ class MLIPCommandTerm(CommandTerm):
         pelvis_eulxyz_dot[:, 2] = self.yaw_dot
         swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
         swingfoot_eulxyz_dot = pelvis_eulxyz_dot #Shape: (N,3)
-
+        
         upper_body_joint_pos, upper_body_joint_vel = self.generate_upper_body_ref() #Shape: (N, num_upper_joints)
         
         
@@ -389,6 +386,7 @@ class MLIPCommandTerm(CommandTerm):
         )  # Shape: (N,3)
         com_vel_des = torch.stack([com_dx, com_dy, torch.zeros((N), device=self.device)], dim=-1)  # Shape: (N,3)
         foot_target = torch.stack([Ux, Uy, torch.zeros((N), device=self.device)], dim=-1) # Shape: (N,3)
+        
 
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
         
@@ -403,14 +401,14 @@ class MLIPCommandTerm(CommandTerm):
         swing_foot_target_yaw_adjusted = quat_apply(quat_delta_yaw, foot_target)  # [N,3]
         com_pos_des_yaw_adjusted = quat_apply(quat_delta_yaw, com_pos_des)  # [N,3]
         com_vel_des_yaw_adjusted = quat_apply(quat_delta_yaw, com_vel_des)  # [N,3]
-        self.foot_target = swing_foot_target_yaw_adjusted # Shape: (N,3)
+        # self.foot_target = swing_foot_target_yaw_adjusted # Shape: (N,3)
         #clamp swing foot y to avoid too large step
         sign_swy = torch.sign(swing_foot_target_yaw_adjusted[:, 1])
-        self.foot_target[:, 1] = torch.clamp(
-            torch.abs(swing_foot_target_yaw_adjusted[:, 1]),
-            min=self.cfg.foot_target_range_y[0],
-            max=self.cfg.foot_target_range_y[1],
-        ) * sign_swy
+        # self.foot_target[:, 1] = torch.clamp(
+        #     swing_foot_target_yaw_adjusted[:, 1],
+        #     min=self.cfg.foot_target_range_y[0],
+        #     max=self.cfg.foot_target_range_y[1],
+        # ) * sign_swy
 
         
 
@@ -506,16 +504,12 @@ class MLIPCommandTerm(CommandTerm):
         self.dy_out = torch.cat(
             [com_vel_des_yaw_adjusted, omega_pelvis_ref, swing_foot_vel, omega_foot_ref, upper_body_joint_vel], dim=-1
         )
-        # # Debug prints - show full tensors
-        # with torch.no_grad():
-        #     torch.set_printoptions(profile="full", linewidth=1500, precision=4, sci_mode=False)
-        #     print("=" * 80)
-        #     print("MLIP DEBUG: y_out (positions/orientations):")
-        #     print(self.y_out)
-        #     print("MLIP DEBUG: dy_out (velocities/angular velocities):")
-        #     print(self.dy_out)
-        #     print("=" * 80)
-        # return
+        
+        if self.debug_vis:
+            self.swingfoot_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
+            self.quat_target_frame = quat_from_euler_xyz(torch.zeros_like(self.target_yaw), torch.zeros_like(self.target_yaw), self.target_yaw) #Shape: (N,4)
+            self.swingfoot_world_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
+        return
 
         
     def generate_upper_body_ref(self):
@@ -523,9 +517,7 @@ class MLIPCommandTerm(CommandTerm):
         forward_vel = self._env.command_manager.get_command("base_velocity")[:, 0]
 
         Tswing = self._phase_var.Tstep
-        #0.0125
         tp = (self._env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
-        #0.0785
         phase = 2 * torch.pi * tp
 
         # unpack your cfg scalars
@@ -601,3 +593,20 @@ class MLIPCommandTerm(CommandTerm):
         return ref, ref_dot
 
 
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        if debug_vis:
+            self.footprint_visualizer = VisualizationMarkers(self.cfg.footprint_cfg)
+            self.footprint_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "footprint_visualizer"):
+                self.footprint_visualizer.set_visibility(False)
+        return
+    
+    def _debug_vis_callback(self, event):
+        # check if robot is initialized
+        # note: this is needed in-case the robot is de-initialized. we can't access the data
+        if not self.robot.is_initialized:
+            return
+        if self.debug_vis:
+            self.footprint_visualizer.visualize(self.swingfoot_world_pos,self.swingfoot_quat)
