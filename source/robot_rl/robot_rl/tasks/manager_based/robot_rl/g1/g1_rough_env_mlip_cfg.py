@@ -31,6 +31,9 @@ class G1RoughMlipCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""
 
     hlip_ref = MLIPCommandCfg()
+    
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stones_cmd_cfg import StonesCommandCfg
+    stones_cmd = StonesCommandCfg()
 
 
 @configclass
@@ -113,42 +116,42 @@ class G1RoughMlipEnvCfg(HumanoidEnvCfg):
         from robot_rl.tasks.manager_based.robot_rl.terrains.stones_terrain_generator import StonesTerrainGenerator
         from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import LongStonesTerrainCfg
         from robot_rl.tasks.manager_based.robot_rl.constants import STONES
-        # STONES_CFG = TerrainGeneratorCfg(
-        #     class_type=StonesTerrainGenerator,
-        #     size=(STONES.terrain_size_x, STONES.terrain_size_y),
-        #     curriculum=True,
-        #     border_width=0.0,
-        #     border_height=0.0,
-        #     num_rows=10,
-        #     num_cols=20,
-        #     horizontal_scale=0.1,
-        #     vertical_scale=0.0005,
-        #     slope_threshold=0.75,
-        #     use_cache=False,
-        #     sub_terrains={
-        #         "stones": LongStonesTerrainCfg(),
-        #     },
-        # )
-        # self.scene.terrain = TerrainImporterCfg(
-        #     class_type=StonesTerrainImporter,
-        #     prim_path="/World/ground",
-        #     terrain_type="generator",
-        #     terrain_generator=STONES_CFG,
-        #     max_init_terrain_level=1,
-        #     collision_group=-1,
-        #     physics_material=sim_utils.RigidBodyMaterialCfg(
-        #         friction_combine_mode="multiply",
-        #         restitution_combine_mode="multiply",
-        #         static_friction=1.0,
-        #         dynamic_friction=1.0,
-        #     ),
-        #     visual_material=sim_utils.MdlFileCfg(
-        #         mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
-        #         project_uvw=True,
-        #         texture_scale=(0.25, 0.25),
-        #     ),
-        #     debug_vis=False,
-        # )
+        STONES_CFG = TerrainGeneratorCfg(
+            class_type=StonesTerrainGenerator,
+            size=(STONES.terrain_size_x, STONES.terrain_size_y),
+            curriculum=True,
+            border_width=0.0,
+            border_height=0.0,
+            num_rows=10,
+            num_cols=20,
+            horizontal_scale=0.1,
+            vertical_scale=0.0005,
+            slope_threshold=0.75,
+            use_cache=False,
+            sub_terrains={
+                "stones": LongStonesTerrainCfg(),
+            },
+        )
+        self.scene.terrain = TerrainImporterCfg(
+            class_type=StonesTerrainImporter,
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=STONES_CFG,
+            max_init_terrain_level=1,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            visual_material=sim_utils.MdlFileCfg(
+                mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+                project_uvw=True,
+                texture_scale=(0.25, 0.25),
+            ),
+            debug_vis=False,
+        )
         
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
 
