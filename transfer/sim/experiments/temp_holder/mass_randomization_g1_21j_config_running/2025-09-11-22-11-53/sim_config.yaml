@@ -1,0 +1,89 @@
+data_structure:
+- length: 1
+  name: time
+- length: 28
+  name: qpos
+- length: 27
+  name: qvel
+- length: 74
+  name: obs
+- length: 21
+  name: action
+- length: 21
+  name: torque
+- length: 3
+  name: left_ankle_pos
+- length: 3
+  name: right_ankle_pos
+- length: 3
+  name: commanded_vel
+joint_names:
+- left_hip_pitch_joint
+- left_hip_roll_joint
+- left_hip_yaw_joint
+- left_knee_joint
+- left_ankle_pitch_joint
+- left_ankle_roll_joint
+- right_hip_pitch_joint
+- right_hip_roll_joint
+- right_hip_yaw_joint
+- right_knee_joint
+- right_ankle_pitch_joint
+- right_ankle_roll_joint
+- waist_yaw_joint
+- left_shoulder_pitch_joint
+- left_shoulder_roll_joint
+- left_shoulder_yaw_joint
+- left_elbow_joint
+- right_shoulder_pitch_joint
+- right_shoulder_roll_joint
+- right_shoulder_yaw_joint
+- right_elbow_joint
+policy: g1_policies/hzd/running_hzd_clf/2025-09-08_21-13-54_torque_lim_test/exported/policy.pt
+policy_dt: 0.02
+robot: g1_21j
+simulator: mujoco
+torque_limits:
+- - -88.0
+  - 88.0
+- - -88.0
+  - 88.0
+- - -88.0
+  - 88.0
+- - -139.0
+  - 139.0
+- - -50.0
+  - 50.0
+- - -50.0
+  - 50.0
+- - -88.0
+  - 88.0
+- - -88.0
+  - 88.0
+- - -88.0
+  - 88.0
+- - -139.0
+  - 139.0
+- - -50.0
+  - 50.0
+- - -50.0
+  - 50.0
+- - -88.0
+  - 88.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+- - -25.0
+  - 25.0
+use_height_sensor: false

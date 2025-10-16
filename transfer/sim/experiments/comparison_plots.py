@@ -45,7 +45,7 @@ def main():
 
     run_names = policy_names
 
-    run_names = ["HZD tracking","HZD-CLF"]
+    # run_names = ["HZD tracking","HZD-CLF"]
 
 
     # run_names = ["hzd_clf_minimum_reward", "hzd_dec_4_alpha_1", "hzd_dec_2_alpha_2", "hzd_dec_2_alpha_0.5", "hzd_dec_0"]

@@ -26,13 +26,15 @@ class HandlerOverlay(HandlerBase):
         return [p, l]
 
 def load_multiple_runs_from_root(root_dir_pattern="mass_randomization_"):
-    
+
+    # Only search top-level "experiments" directory, not subdirectories
     experiment_dirs = [
-        os.path.join(root_dir, d)
-        for root_dir, _, _ in os.walk("experiments/mass_rand_comp")
-        for d in os.listdir(root_dir)
-        if d.startswith(root_dir_pattern) and os.path.isdir(os.path.join(root_dir, d))
+        os.path.join("experiments", d)
+        for d in os.listdir("experiments")
+        if d.startswith(root_dir_pattern) and os.path.isdir(os.path.join("experiments", d))
     ]
+
+    print("Experiment dirs:", experiment_dirs)
 
     grouped_data = defaultdict(list)
     for exp_dir in experiment_dirs:
@@ -144,9 +146,10 @@ if __name__ == "__main__":
     label_override = {k: v for k, v in zip(default_labels, default_legends)}
 
     # Optionally manually override here
-    label_override.update({"mass_randomization_g1_21j_config_baseline": "Baseline"})
-    label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
-    label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline_custom": "Custom Baseline"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline": "Unitree Baseline"})
+    # label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
+    # label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
 
     if len(grouped_data) == 0:
         print("No data found. Check experiment folder structure and naming.")

@@ -31,6 +31,7 @@ SIM_ENVIRONMENTS = {
     "lip_clf_vdot": "G1-LIP-ref-play",
     "hzd_clf_play": "G1-hzd-clf-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
+    "unitree_os_baseline": "Unitree-os-G1-flat-play"
 }
 
 class DataLogger:
@@ -374,7 +375,7 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla":
+    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or args_cli.env_type == "unitree_os_baseline":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"

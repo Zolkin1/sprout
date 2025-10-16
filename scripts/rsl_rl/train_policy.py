@@ -14,7 +14,8 @@ ENVIRONMENTS = {
     "lip_clf": "G1-lip-clf-custom",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
-    "hzd_clf_minimum": "G1-hzd-clf-minimum"
+    "hzd_clf_minimum": "G1-hzd-clf-minimum",
+    "unitree_os_baseline": "Unitree-os-G1-flat",
 }
 
 EXPERIMENT_NAMES = {
@@ -28,6 +29,7 @@ EXPERIMENT_NAMES = {
     "hzd_clf_play": "hzd",
     "hzd_clf_custom": "hzd",
     "hzd_clf_minimum": "hzd",
+    "unitree_os_baseline": "baseline",
 }
 
 
