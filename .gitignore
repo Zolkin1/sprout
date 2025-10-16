@@ -93,3 +93,4 @@ paper_figures/
 transfer/sim/experiments/comparison_logs
 transfer/sim/experiments/plots_RA-L
 vulcan_remote_mount/
+transfer/sim/experiments/temp_holder/
