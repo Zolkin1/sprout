@@ -17,24 +17,23 @@ class LongStonesTerrainCfg(SubTerrainBaseCfg):
     num_init_steps: int = STONES.num_init_steps
     stone_size: tuple[float, float, float] = (STONES.stone_x, STONES.stone_y, STONES.stone_z)  # (x,y,z) size of each stone
     rel_stone_x_range: tuple[float, float] = (STONES.rel_stone_x[0], STONES.rel_stone_x[1])
-    rel_stone_z_range: tuple[float, float] = (STONES.rel_stone_z[0], STONES.rel_stone_z[1])
-    start_platform_size: tuple[float, float, float] = (STONES.start_platform_x, STONES.stone_y, 0.1)
-    end_platform_size: tuple[float, float, float] = (1.0, STONES.stone_y, 0.1)
+    rel_stone_z_range: tuple[float, float] = (-STONES.rel_stone_z_max, STONES.rel_stone_z_max)
+    start_platform_size: tuple[float, float, float] = (STONES.start_platform_x, STONES.stone_y, STONES.stone_z)
+    
+    stone_target_length: float = STONES.stone_x  # target length between stones, used for curriculum
 
     size: tuple[float, float] = (STONES.terrain_size_x, STONES.terrain_size_y)  # (x,y) overall terrain size
-   #  rel_x: np.ndarray = np.zeros(num_stones)  # relative x distances between stones
-   #  rel_z: np.ndarray = np.zeros(num_stones)  # relative z distances between stones
-   #  abs_x: np.ndarray = np.zeros(num_stones+STONES.num_init_steps)  # absolute x positions of stones
-   #  abs_z: np.ndarray = np.zeros(num_stones+STONES.num_init_steps)  # absolute z positions of stones
+
     def resample(self, difficulty):
-        """Resample relative distances for each stone."""
+        """Resample relative distances for each stone given difficulty."""
         # interpolate rel_stone_z_range with difficulty
-        self.rel_stone_z_range = (self.rel_stone_z_range[0]*difficulty, self.rel_stone_z_range[1]*difficulty)
+        self.rel_stone_z_range = (-STONES.rel_stone_z_max*difficulty, STONES.rel_stone_z_max*difficulty)
+        
         # interpolate stone_x size with difficulty
-        min_val = self.rel_stone_x_range[1]     # fill all gap
-        max_val = self.stone_size[0]                # base size at hardest
-        stone_x = (1 - difficulty) * min_val + difficulty * max_val
+        max_val = STONES.rel_stone_x[1]                  # fill all gap
+        min_val = self.stone_target_length               # base size at hardest
+        stone_x_sampled = (1 - difficulty) * max_val + difficulty * min_val
 
         # assign updated stone size
-        self.stone_size = (stone_x, self.stone_size[1], self.stone_size[2])
-        
+        self.stone_size = (stone_x_sampled, self.stone_size[1], self.stone_size[2])
+

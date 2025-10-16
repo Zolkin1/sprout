@@ -16,6 +16,7 @@ ENVIRONMENTS = {
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
     "hzd_clf_minimum": "G1-hzd-clf-minimum",
+    "stepping_stone": "G1-steppingstone",
 }
 
 EXPERIMENT_NAMES = {
@@ -30,6 +31,7 @@ EXPERIMENT_NAMES = {
     "hzd_clf_play": "hzd",
     "hzd_clf_custom": "hzd",
     "hzd_clf_minimum": "hzd",
+    "stepping_stone": "stepping_stone",
 }
 
 

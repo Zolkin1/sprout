@@ -20,6 +20,7 @@ SIM_ENVIRONMENTS = {
     "lip_clf": "G1-LIP-ref-play",
     "mlip_clf": "G1-MLIP-ref-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
+    "stepping_stone": "G1-steppingstone-play",
 }
 
 

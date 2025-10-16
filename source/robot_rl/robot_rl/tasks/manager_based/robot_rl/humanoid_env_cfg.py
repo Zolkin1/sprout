@@ -18,9 +18,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ( 
     ObservationsCfg,
     RewardsCfg,
 )
-
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from . import mdp
-
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as isaacmdp
 
 @configclass
 class HumanoidActionsCfg:
@@ -291,6 +291,16 @@ class HumanoidRewardCfg(RewardsCfg):
     )
 
 
+@configclass
+class HumanoidTerminationsCfg:
+    """Termination terms for the MDP."""
+
+    time_out = DoneTerm(func=isaacmdp.time_out, time_out=True)
+    base_contact = DoneTerm(
+        func=isaacmdp.illegal_contact,
+        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="base"), "threshold": 1.0},
+    )
+
 ##
 # Environment configuration
 ##
@@ -301,3 +311,4 @@ class HumanoidEnvCfg(LocomotionVelocityRoughEnvCfg):
     events: HumanoidEventsCfg = HumanoidEventsCfg()
     actions: HumanoidActionsCfg = HumanoidActionsCfg()
     commands: HumanoidCommandsCfg = HumanoidCommandsCfg()
+    terminations: HumanoidTerminationsCfg = HumanoidTerminationsCfg()

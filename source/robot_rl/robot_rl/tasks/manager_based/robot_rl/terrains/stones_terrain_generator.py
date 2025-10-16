@@ -158,7 +158,7 @@ class StonesTerrainGenerator:
         self.terrain_infos = {
             "rel_x": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative x distances between stones
             "rel_z": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative z distances between stones
-            "start_platform_pos": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # start platform position in each sub-terrain
+            "start_stone_pos": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # start platform position in each sub-terrain
             "origin": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # origin position
         }
 
@@ -350,7 +350,7 @@ class StonesTerrainGenerator:
         
         self.terrain_infos["rel_x"][row, col] = terrain_info["rel_x"]
         self.terrain_infos["rel_z"][row, col] = terrain_info["rel_z"]
-        self.terrain_infos["start_platform_pos"][row, col] = terrain_info["start_platform_pos"]
+        self.terrain_infos["start_stone_pos"][row, col] = terrain_info["start_stone_pos"]
         self.terrain_infos["origin"][row, col] = terrain_info["origin"]
 
     def _get_terrain_mesh(self, difficulty: float, cfg: SubTerrainBaseCfg) -> tuple[trimesh.Trimesh, np.ndarray]:
@@ -392,7 +392,7 @@ class StonesTerrainGenerator:
             return mesh, origin
 
         # generate the terrain
-        cfg.resample(difficulty)
+        
         meshes, origin, terrain_info = cfg.function(difficulty, cfg)
         mesh = trimesh.util.concatenate(meshes)
         # offset mesh such that they are in their center
