@@ -40,7 +40,7 @@ class UnitreeOSRewardsCfg:
 
     joint_deviation_arms = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.1,
+        weight=-1.0, # -0.1
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",

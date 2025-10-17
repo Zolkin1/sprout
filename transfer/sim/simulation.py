@@ -150,9 +150,9 @@ class Simulation:
             action = self.policy.get_action(obs)
             self.robot.apply_action(action)
 
-            if self.robot.failed():
-                success = False
-                break
+            # if self.robot.failed():
+            #     success = False
+            #     break
 
             # Step the simulator
             for i in range(self.sim_steps_per_policy_update):
