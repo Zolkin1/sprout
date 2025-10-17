@@ -1,0 +1,244 @@
+
+from typing import Union
+import torch
+
+def solve_dare_batched(A, B, Q, R, tol=1e-6, max_iter=1000):
+    """
+    Batched discrete-time algebraic Riccati equation (DARE) solver.
+
+    Args:
+        A: [N, n, n]
+        B: [N, n, m]
+        Q: [N, n, n] or [n, n]
+        R: [N, m, m] or [m, m]
+    Returns:
+        X: [N, n, n]
+    """
+    N, n, _ = A.shape
+    m = B.shape[-1]
+    device, dtype = A.device, A.dtype
+
+    # Broadcast Q, R to [N, ...]
+    if Q.dim() == 2:
+        Q = Q.expand(N, n, n)
+    if R.dim() == 2:
+        R = R.expand(N, m, m)
+
+    X = Q.clone()
+    for _ in range(max_iter):
+        X_prev = X
+        # Compute intermediate terms
+        BTXB = torch.bmm(B.transpose(1, 2), torch.bmm(X, B)) + R  # [N, m, m]
+        BTXB_inv = torch.linalg.inv(BTXB)
+        K = torch.bmm(BTXB_inv, torch.bmm(B.transpose(1, 2), torch.bmm(X, A)))  # [N, m, n]
+        # DARE update
+        X = (
+            torch.bmm(A.transpose(1, 2), torch.bmm(X, A))
+            - torch.bmm(A.transpose(1, 2), torch.bmm(X, torch.bmm(B, K)))
+            + Q
+        )
+        if torch.norm(X - X_prev) / torch.norm(X) < tol:
+            break
+    return X
+def solve_dlqr_gain_batched(A, B, Q, R, tol=1e-6, max_iter=1000):
+    """
+    Batched DLQR gain solver.
+    Returns:
+        K: [N, m, n]
+    """
+    X = solve_dare_batched(A, B, Q, R, tol, max_iter)
+    BTXB = torch.bmm(B.transpose(1, 2), torch.bmm(X, B)) + R
+    BTXB_inv = torch.linalg.inv(BTXB)
+    K = torch.bmm(BTXB_inv, torch.bmm(B.transpose(1, 2), torch.bmm(X, A)))
+    return K
+
+
+class HLIP_P2:
+    z0: torch.Tensor # [N]
+    TSS: torch.Tensor # [N]
+    TDS: torch.Tensor # [N]
+    T: torch.Tensor # [N]
+    ASS: torch.Tensor # [N,2,2]
+    ADS: torch.Tensor # [N,2,2]
+    A_S2S: torch.Tensor # [N,2,2]
+    B_S2S: torch.Tensor # [N,2,1]
+    udes_p2_left: torch.Tensor # [N]
+    udes_p2_right: torch.Tensor # [N]
+    xdes_p2_left: torch.Tensor # [N,2,1]
+    xdes_p2_right: torch.Tensor # [N,2,1]
+
+    def __init__(self, 
+                 num_envs:int, 
+                 grav:float, 
+                 z0:float, 
+                 TSS:float,
+                 TDS:float,
+                 use_momentum=False, 
+                 use_feedback=False):
+        self.use_momentum = use_momentum
+        self.use_feedback = use_feedback
+        self.N = num_envs
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.grav = grav
+        
+        self.update_hlip(z0, TSS, TDS)
+    def update_hlip(self, z0:torch.Tensor, TSS:torch.Tensor, TDS:torch.Tensor):
+        self.z0 = z0
+        self.TSS = TSS
+        self.TDS = TDS
+        self.T = TSS + TDS
+
+        self.ASS = self.A2_ss(z0, self.grav, self.use_momentum)
+        self.ADS = self.A2_ds_constant_vel(z0, self.use_momentum)
+        self.A_S2S = torch.matrix_exp(TSS.view(-1,1,1) * self.ASS) @ torch.matrix_exp(TDS.view(-1,1,1) * self.ADS)
+
+        Busw = torch.tensor([[-1.0], [0.0]], device=z0.device).expand(z0.shape[0], 2, 1) #shape [N,2,1]
+        self.B_S2S = torch.matrix_exp(TSS.view(-1,1,1) * self.ASS) @ Busw
+        
+        self.Q = torch.eye(2,2,device=self.device)
+        self.R = torch.eye(1,1,device=self.device) * 20
+        if self.use_feedback:
+            self.K = -solve_dlqr_gain_batched(self.A_S2S, self.B_S2S, self.Q, self.R)
+
+    def update_desired_walking(self, vely: torch.Tensor, stepwidth: Union[float, torch.Tensor]):
+        """
+        Update desired walking parameters for N environments, like x_des_left, x_des_right, u_des_left, u_des_right.
+
+        Args:
+            vely: Tensor of shape [N] with velocities [vel_y]
+            stepwidth: Tensor of shape [N] with step widths or float
+        """
+        if isinstance(stepwidth, float):
+            stepwidth = torch.full_like(vely, stepwidth)
+
+        self.udes_p2_left = -stepwidth #[N]
+        self.udes_p2_right = 2 * vely * self.T - self.udes_p2_left # [N]
+
+        eye2 = torch.eye(2, device=self.device).expand(self.z0.shape[0], 2, 2) #[N,2,2]
+        lhs = eye2 - self.A_S2S @ self.A_S2S  # [N,2,2]
+        udes_left = self.udes_p2_left.view(-1, 1, 1)
+        udes_right = self.udes_p2_right.view(-1, 1, 1)
+        rhs_left = self.A_S2S @ self.B_S2S * udes_left + self.B_S2S * udes_right  # [N,2,1]
+        rhs_right = self.A_S2S @ self.B_S2S * udes_right + self.B_S2S * udes_left # [N,2,1]
+
+
+        # Solve lhs * X = rhs
+        self.xdes_p2_left = torch.linalg.solve(lhs, rhs_left)   # [N,2,1]
+        self.xdes_p2_right = torch.linalg.solve(lhs, rhs_right) # [N,2,1]
+        
+
+    def A2_ss(self, z0, grav, use_momentum):
+        # z0: [N]
+        if use_momentum:
+            A2 = torch.stack([
+                torch.stack([torch.zeros_like(z0), 1.0 / z0], dim=-1),
+                torch.stack([grav * torch.ones_like(z0), torch.zeros_like(z0)], dim=-1)
+            ], dim=-2)  # [N, 2, 2]
+        else:
+            A2 = torch.stack([
+                torch.stack([torch.zeros_like(z0), torch.ones_like(z0)], dim=-1),
+                torch.stack([grav / z0, torch.zeros_like(z0)], dim=-1)
+            ], dim=-2)
+        return A2  # [N,2,2]
+
+    def A2_ds_constant_vel(self, z0, use_momentum):
+        if use_momentum:
+            A2 = torch.stack([
+                torch.stack([torch.zeros_like(z0), 1.0 / z0], dim=-1),
+                torch.stack([torch.zeros_like(z0), torch.zeros_like(z0)], dim=-1)
+            ], dim=-2)
+        else:
+            A2 = torch.stack([
+                torch.stack([torch.zeros_like(z0), torch.ones_like(z0)], dim=-1),
+                torch.stack([torch.zeros_like(z0), torch.zeros_like(z0)], dim=-1)
+            ], dim=-2)
+        return A2  # [N,2,2]   
+     
+    def get_desired_com_state(self, stance_idx: torch.Tensor, time_in_step: torch.Tensor):
+        """
+        Get desired com state at given time_in_step and stance_idx.
+
+        Args:
+            stance_idx: Tensor of shape [N] with stance leg index (0=left, 1=right)
+            time_in_step: Tensor of shape [N] with time in current step [0,TSS+TDS] 
+        Returns:
+            com_y: Tensor of shape [N] with desired com y position
+            com_dy: Tensor of shape [N] with desired com y velocity
+        """
+        mask_left = (stance_idx == 0)
+        mask_right = (stance_idx == 1)
+        mask_ss = (time_in_step <= self.TSS)
+        mask_ds = (time_in_step > self.TSS)
+        y_com_state = torch.zeros((self.N, 2, 1), device=self.device)
+
+
+        #if DS, integrate forward from begining of DS
+        x_ds_plus = torch.zeros((self.N, 2, 1), device=self.device)
+        x_ds_plus[mask_left] = self.xdes_p2_left[mask_left]
+        x_ds_plus[mask_right] = self.xdes_p2_right[mask_right]
+        y_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_ds_plus[mask_ds]
+        
+        #if SS, integrate backward from end of SS
+        x_ss_minus = x_ds_plus #happens to be the same at the beginning of DS
+        y_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus[mask_ss]
+
+        return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
+
+    def get_desired_foot_placement(self, stance_idx: torch.Tensor, com_state: torch.Tensor = None):
+        """Get desired foot placement based on stance index and center of mass state.
+
+        Args:
+            stance_idx (torch.Tensor): Tensor indicating the stance leg (0=left, 1=right). shape [N]
+            com_state (torch.Tensor, optional): Current center of mass state. Defaults to None. shape [N, 2]
+
+        Returns:
+            torch.Tensor: Desired foot placement.[N]
+        """
+        udes_p2 = torch.zeros((self.N, ), device=self.device)
+        udes_p2[stance_idx == 0] = self.udes_p2_left[stance_idx == 0]
+        udes_p2[stance_idx == 1] = self.udes_p2_right[stance_idx == 1]
+
+        if self.use_feedback:
+            if com_state is None:
+                raise ValueError("com_state must be provided when use_feedback is True")
+            xdes_p2 = self.xdes_p2_left
+            xdes_p2[stance_idx == 1] = self.xdes_p2_right[stance_idx == 1]
+            udes_p2 += (self.K @ (xdes_p2 - com_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)
+
+        return udes_p2
+
+if __name__ == "__main__":
+   TDS= torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+   TSS= torch.tensor([0.4, 0.3, 0.2, 0.5, 0.6], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+   z0 = torch.tensor([0.75, 0.65, 0.55, 0.45, 0.35], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+   hlip_y = HLIP_P2(
+       num_envs=5,
+       grav=9.81,
+       z0=z0,
+       TSS=TSS,
+       TDS=TDS,
+       use_momentum=True,
+       use_feedback=True
+   )
+   vel = torch.tensor([0.5, 0.5, -0.5, 0.1, -0.1], device=hlip_y.device)
+   stepwidth = 0.25
+
+   hlip_y.update_desired_walking(vel, stepwidth)
+
+   print("Desired lateral states left (xdes_p2_left):", hlip_y.xdes_p2_left)
+   print("Desired lateral states right (xdes_p2_right):", hlip_y.xdes_p2_right)
+   print("Desired lateral foot step left (udes_p2_left):", hlip_y.udes_p2_left)
+   print("Desired lateral foot step right (udes_p2_right):", hlip_y.udes_p2_right)
+   stance_idx = torch.tensor([0, 0, 0, 0, 0], device=hlip_y.device)
+   time_in_step = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4], device=hlip_y.device)
+
+   com_y, com_dy = hlip_y.get_desired_com_state(stance_idx, time_in_step)
+   print("Desired coronal state:")
+   print(com_y)
+   print(com_dy)
+   
+   uy = hlip_y.get_desired_foot_placement(stance_idx, torch.stack([com_y, com_dy], dim=-1))
+   print("Desired foot placement uy:", uy)
+   
+   
