@@ -53,6 +53,66 @@ def solve_dlqr_gain_batched(A, B, Q, R, tol=1e-6, max_iter=1000):
     return K
 
 
+def solve_orbital_energy_batched(x: torch.Tensor, z_tilde: torch.Tensor, use_momentum: bool, g: float = 9.81):
+    """
+    Solve orbital energy for HLIP model in batch.
+
+    Args:
+        x: [N,2] horizontal states, is [p,v] if not use_momentum else [p,L]
+        z_tilde: [N] CoM height relative to the slope z_tilde = zcom_w - z_st_w - hdes/ldes*p
+        use_momentum: whether to use angular momentum L or linear velocity v
+        g: gravity constant
+    Returns:
+        E: [N] orbital energy
+    """
+    if use_momentum:
+        p = x[:,0]
+        L = x[:,1]
+        E = (L / z_tilde)**2 - (g / z_tilde) * (p**2)
+    else:
+        p = x[:,0]
+        v = x[:,1]
+        E = v**2 - (g / z_tilde) * (p**2)
+    return E
+
+def solve_time_to_reach_xdes_batched(x0: torch.Tensor, pdes: torch.Tensor, z_tilde: torch.Tensor, use_momentum: bool,g: float = 9.81, eps: float = 1e-9):
+    """
+    Solve time to reach desired x com position in batch.
+    Args:
+        x0: [N,2] horizontal states, is [p,v] if not use_momentum else [p,L]
+        pdes: [N] desired com position
+        z_tilde: [N] CoM height relative to the slope z_tilde = zcom_w - z_st_w - hdes/ldes*p
+        use_momentum: whether to use angular momentum L or linear velocity v
+        g: gravity constant
+        eps: small value to avoid nan
+    Returns:
+        t: [N] time to reach desired com position    
+    """
+    
+    p0 = x0[:, 0]
+    lam = torch.sqrt(g / z_tilde)  # [N]
+
+    forward = (pdes > p0) 
+    backward = (pdes <= p0) 
+    
+    if use_momentum:
+        L0 = x0[:, 1]
+        term = L0**2 * lam**2 - g**2 * p0**2 + g**2 * pdes**2
+        num_first = g * pdes
+        denominator = L0 * lam + g * p0
+    else:
+        v0 = x0[:, 1]
+        term = v0**2 - lam**2 * p0**2 + lam**2 * pdes**2
+        num_first = lam * pdes
+        denominator = v0 + lam * p0    
+    sqrt_term = torch.sqrt(torch.clamp(term, min=eps))  # avoid nan
+    num_pos = num_first + sqrt_term
+    num_neg = num_first - sqrt_term
+    numerator = torch.where(forward | (~backward), num_pos, num_neg)
+    T = torch.log(numerator / denominator) / lam
+    
+    return T
+
 class HLIP_P2:
     z0: torch.Tensor # [N]
     TSS: torch.Tensor # [N]
@@ -97,7 +157,7 @@ class HLIP_P2:
         self.B_S2S = torch.matrix_exp(TSS.view(-1,1,1) * self.ASS) @ Busw
         
         self.Q = torch.eye(2,2,device=self.device)
-        self.R = torch.eye(1,1,device=self.device) * 20
+        self.R = torch.eye(1,1,device=self.device) * 100
         if self.use_feedback:
             self.K = -solve_dlqr_gain_batched(self.A_S2S, self.B_S2S, self.Q, self.R)
 
@@ -218,7 +278,7 @@ if __name__ == "__main__":
        z0=z0,
        TSS=TSS,
        TDS=TDS,
-       use_momentum=True,
+       use_momentum=False,
        use_feedback=True
    )
    vel = torch.tensor([0.5, 0.5, -0.5, 0.1, -0.1], device=hlip_y.device)
@@ -231,7 +291,8 @@ if __name__ == "__main__":
    print("Desired lateral foot step left (udes_p2_left):", hlip_y.udes_p2_left)
    print("Desired lateral foot step right (udes_p2_right):", hlip_y.udes_p2_right)
    stance_idx = torch.tensor([0, 0, 0, 0, 0], device=hlip_y.device)
-   time_in_step = torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4], device=hlip_y.device)
+   time_in_step = torch.tensor([0., 0.1, 0.2, 0.3, 0.4], device=hlip_y.device)
+
 
    com_y, com_dy = hlip_y.get_desired_com_state(stance_idx, time_in_step)
    print("Desired coronal state:")
@@ -240,5 +301,16 @@ if __name__ == "__main__":
    
    uy = hlip_y.get_desired_foot_placement(stance_idx, torch.stack([com_y, com_dy], dim=-1))
    print("Desired foot placement uy:", uy)
+
+   xstate = torch.stack([com_y, com_dy], dim=-1)
+   E = solve_orbital_energy_batched(xstate, z0, hlip_y.use_momentum)
+   print("Orbital energy E:", E)
+
+
+#    xT = torch.tensor([0.5, 0.5, 0.3],device=hlip_y.device)
+#    x0 = torch.tensor([[-0.1, -0.2, -0.1],[0.9, 0.8, 0.7] ],device=hlip_y.device).T
+#    z0 = torch.tensor([0.67, 0.7, 0.8],device=hlip_y.device)
    
-   
+#    T = solve_time_to_reach_xdes_batched(x0, xT, z0, hlip_y.use_momentum)
+   T = solve_time_to_reach_xdes_batched(xstate, hlip_y.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip_y.use_momentum)
+   print("Time to reach desired foot placement T:", T)

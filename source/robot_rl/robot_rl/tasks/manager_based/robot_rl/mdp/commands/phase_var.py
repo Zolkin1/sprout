@@ -1,6 +1,12 @@
 import torch    
 from typing import Union
 class PhaseVar:
+    start_time: Union[float, torch.Tensor]
+    end_time: Union[float, torch.Tensor]
+    tau: Union[float, torch.Tensor]
+    dtau: Union[float, torch.Tensor]
+    time_in_step: Union[float, torch.Tensor]
+    
     def __init__(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
         self.reconfigure(start_time, end_time)
     def reconfigure(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
@@ -15,9 +21,12 @@ class PhaseVar:
             self.dtau = 0.0
             self._is_tensor = False        
     def update(self, time: Union[float, torch.Tensor]):
+        self.time_in_step = time - self.start_time
+        self.tau = (time - self.start_time) / (self.end_time - self.start_time)
+        self.dtau =  1.0 / (self.end_time - self.start_time)
+        
         if self._is_tensor:
-            self.tau = torch.clamp((time - self.start_time) / (self.end_time - self.start_time), 0.0, 1.0)
-            self.dtau =  1.0 / (self.end_time - self.start_time)
+            self.tau = torch.clamp(self.tau, 0.0, 1.0)
             # Handle out-of-bounds time with warnings
             out_of_bounds_low = time < self.start_time
             out_of_bounds_high = time > self.end_time
@@ -27,8 +36,7 @@ class PhaseVar:
                 if torch.any(out_of_bounds_high):
                     print(f"Warning: Some time values are after the end time {self.end_time}.")
         else:
-            self.tau = (time - self.start_time) / (self.end_time - self.start_time)
-            self.dtau = 1.0 / (self.end_time - self.start_time)
+            self.tau = max(0.0, min(1.0, self.tau))
             # Handle out-of-bounds time with warnings
             if time < self.start_time or time > self.end_time:
                 if time < self.start_time:
