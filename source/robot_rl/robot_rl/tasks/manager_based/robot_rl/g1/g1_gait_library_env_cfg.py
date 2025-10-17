@@ -76,7 +76,8 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
             }
         )
 
-        self.rewards.clf_decreasing_condition = None
+        # self.rewards.clf_decreasing_condition = None
+        self.rewards.vdot_tanh = None
 
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None

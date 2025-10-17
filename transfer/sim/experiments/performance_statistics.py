@@ -33,6 +33,13 @@ def compute_stats(start_time = 0):
         time = data['time']
         commanded_vel = data['commanded_vel']
         act_vel = data['qvel'][:, [0, 1, 5]]
+        qvel = data['qvel']
+        torque = data['torque']
+
+        dist = data['qpos'][-1, 0] - data['qpos'][0, 0]
+        mass = 35 # kg # TODO: Get correct mass
+        mcot = compute_mcot(qvel[:, 6:], torque, dist, mass, None, policy_dt)
+        print(f"MCOT: {mcot}")
 
         start_idx = get_index(time, start_time)
 
@@ -46,6 +53,7 @@ def compute_stats(start_time = 0):
         stats = {
             'mean_velocity_error': mean_error.tolist(),
             'std_dev_velocity_error': std_dev_error.tolist(),
+            'mech_cost_of_transport': mcot.tolist(),
         }
 
         with open(os.path.join(newest, 'stats.yaml'), 'w') as f:
@@ -53,7 +61,23 @@ def compute_stats(start_time = 0):
 
         return stats
 
+def compute_mcot(qdot, tau, dist, mass, total_time, dt):
+    """Compute the mechanical cost of transport (MCOT).
+    qdot: [t, nj]
+    tau: [t, nj]
+    """
 
+    if tau.shape != qdot.shape:
+        raise ValueError("tau and qdot must have same shape!")
+
+    mcot_int = 0
+    for t in range(qdot.shape[0]):
+        mcot_int += np.dot(np.abs(qdot[t, :]), np.abs(tau[t, :])) * dt
+
+    g = 9.81
+    mcot = mcot_int / (mass * g * dist)
+
+    return mcot
 
 if __name__ == "__main__":
     # Compute statistics and save
