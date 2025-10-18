@@ -190,10 +190,10 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         self.events.push_robot = None
         
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
-        self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
-        self.events.reset_base.params["pose_range"]["x"] = (-3,3)
-        self.events.reset_base.params["pose_range"]["y"] = (-3,3)
+        # self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
+        # self.events.reset_base.params["pose_range"]["x"] = (-3,3)
+        # self.events.reset_base.params["pose_range"]["y"] = (-3,3)
