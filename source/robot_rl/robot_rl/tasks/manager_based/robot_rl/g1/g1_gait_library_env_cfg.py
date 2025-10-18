@@ -79,7 +79,7 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
         super().__post_init__()
 
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
@@ -122,6 +122,7 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
                 "alpha": 1.0,
             }
         )
+        self.rewards.vdot_tanh = None
 
         # self.rewards.clf_decreasing_condition = None
 
