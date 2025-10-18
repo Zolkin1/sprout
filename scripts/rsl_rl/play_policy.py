@@ -338,7 +338,7 @@ def main():
     ]
 
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla":
+    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or args_cli.env_type == "stepping_stone":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"
