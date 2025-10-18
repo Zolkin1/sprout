@@ -372,6 +372,19 @@ class HLIP_3D(HLIP_P2):
 
         return udes_p1, udes_p2
 
+    def get_pre_impact_com_states(self, com_state: torch.Tensor, time2impact: torch.Tensor):
+        """
+        Get pre-impact com states by integrating current com_state forward by time2impact.
+
+        Args:
+            com_state: Tensor of shape [N,2] with current com states [p,v] or [p,L]
+            time2impact: Tensor of shape [N] with time to impact
+        Returns:
+            pre_impact_state: Tensor of shape [N,2] with pre-impact com states     
+        """
+        pre_impact_state = torch.matrix_exp(time2impact.view(-1,1,1) * self.ASS) @ com_state.unsqueeze(-1)
+        return pre_impact_state.squeeze(-1)
+        
 def test_hlip_p2():
    TDS= torch.tensor([0.0, 0.1, 0.2, 0.3, 0.4], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
    TSS= torch.tensor([0.4, 0.3, 0.2, 0.5, 0.6], device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -468,18 +481,16 @@ def test_hlip_3d():
    print("Orbital energy Ex:", Ex)
    print("Orbital energy Ey:", Ey)
 
-
-# #    xT = torch.tensor([0.5, 0.5, 0.3],device=hlip_y.device)
-# #    x0 = torch.tensor([[-0.1, -0.2, -0.1],[0.9, 0.8, 0.7] ],device=hlip_y.device).T
-# #    z0 = torch.tensor([0.67, 0.7, 0.8],device=hlip_y.device)
-   
-# #    T = solve_time_to_reach_xdes_batched(x0, xT, z0, hlip_y.use_momentum)
-
    Tx = solve_time_to_reach_xdes_batched(xstate, hlip.xdes_p1[:,0,:].squeeze(-1), z0, hlip.use_momentum)
    print("Time to reach desired com Tx:", Tx) 
 
    Ty = solve_time_to_reach_xdes_batched(ystate, hlip.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip.use_momentum)
    print("Time to reach desired com Ty:", Ty)
+   
+   pre_impact_xstate = hlip.get_pre_impact_com_states(xstate, Tx)
+   pre_impact_ystate = hlip.get_pre_impact_com_states(ystate, Ty)
+   print("Pre-impact com states in x:", pre_impact_xstate)
+   print("Pre-impact com states in y:", pre_impact_ystate)
 
 if __name__ == "__main__":
    test_hlip_3d()

@@ -96,8 +96,8 @@ class StonesOutputCommandTerm(CommandTerm):
         )
 
 
-        self.mass = sum(self.robot.data.default_mass.T)[0]
-        
+        self.mass = sum(self.robot.data.default_mass.T)[0].to(self.device)
+
         self.delta_yaw = 0.0
 
         self.clf = CLF(
@@ -249,12 +249,12 @@ class StonesOutputCommandTerm(CommandTerm):
         com2stance_local = _transfer_to_local_frame(com_w - self.stance_foot_pos_0, self.stance_foot_ori_quat_0)
         
         
-        ##compute real COM
+        # compute real COM
         link_pos_w = data.body_com_pos_w # (num_envs, num_bodies, 3)
         link_mass = data.default_mass.to(self.device) # (num_envs, num_bodies)
-        com_pos_w = (link_mass.unsqueeze(-1) * link_pos_w).sum(dim=1) / self.mass.to(self.device) # (num_envs,  3)
+        com_pos_w = (link_mass.unsqueeze(-1) * link_pos_w).sum(dim=1) / self.mass # (num_envs,  3)
 
-        ## compute angular momentum
+        # compute mass-normalized angular momentum
         link_inertia_b = data.default_inertia.to(self.device).view(*data.default_inertia.shape[:-1], 3, 3) # (num_envs, num_bodies, 3, 3)
         link_vel_w = data.body_com_lin_vel_w # (num_envs, num_bodies, 3)
         link_omega_w = data.body_com_ang_vel_w # (num_envs, num_bodies, 3)
@@ -263,7 +263,7 @@ class StonesOutputCommandTerm(CommandTerm):
         link_inertia_w = R_wb @ link_inertia_b @ R_wb.transpose(-1, -2) # (num_envs, num_bodies, 3, 3)
         term_rot = (link_inertia_w @ link_omega_w.unsqueeze(-1)).squeeze(-1) # (num_envs, num_bodies, 3)
         term_trans = torch.cross(link_pos_w - com_pos_w.unsqueeze(1), link_mass.unsqueeze(-1) * link_vel_w, dim=-1) # (num_envs, num_bodies, 3)
-        h_ang_w = term_rot.sum(dim=1) + term_trans.sum(dim=1) # (num_envs, 3)
+        h_ang_w = (term_rot.sum(dim=1) + term_trans.sum(dim=1)) / self.mass # (num_envs, 3)
 
         # Pelvis orientation (Euler XYZ)
         pelvis_ori = get_euler_from_quat(root_quat)
