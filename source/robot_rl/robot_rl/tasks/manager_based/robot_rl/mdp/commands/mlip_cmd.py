@@ -104,7 +104,7 @@ class MLIPCommandTerm(CommandTerm):
         self.y_nom = cfg.y_nom
         
         if env.cfg.commands.step_period.period_range[0] == env.cfg.commands.step_period.period_range[1]:
-            self._phase_var = MLIPPhaseVarGlobal(env.cfg.commands.step_period.period_range[0])
+            self.phase_var = MLIPPhaseVarGlobal(env.cfg.commands.step_period.period_range[0])
         else:
             raise ValueError("MLIPCommandTerm requires fixed step period.")
 
@@ -132,9 +132,9 @@ class MLIPCommandTerm(CommandTerm):
             num_envs=self.num_envs,
             grav=grav,
             z0=self.z0,
-            TOA=self._phase_var.T_oa,
-            TFA=self._phase_var.T_fa,
-            TUA=self._phase_var.T_ua,
+            TOA=self.phase_var.T_oa,
+            TFA=self.phase_var.T_fa,
+            TUA=self.phase_var.T_ua,
             footlength=self.cfg.foot_length, #approximate foot length for G1
             use_momentum=False
         )
@@ -233,25 +233,25 @@ class MLIPCommandTerm(CommandTerm):
 
     def timeBasedDomainContactStatusSwitch(self):
         #update phase var
-        self._phase_var.update(self._env.sim.current_time)
+        self.phase_var.update(self._env.sim.current_time)
         # for per env update
         # t = _env.episode_length_buf.unsqueeze(1) * _env.step_dt
         #use old_stance_idx to detect stance switch
-        if self.old_stance_idx is None or self.old_stance_idx != self._phase_var.stance_idx:
+        if self.old_stance_idx is None or self.old_stance_idx != self.phase_var.stance_idx:
             if self.old_stance_idx is None:
-                self.old_stance_idx = self._phase_var.stance_idx
+                self.old_stance_idx = self.phase_var.stance_idx
             # update stance foot pos, ori
             foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
             foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
-            self.stance_foot_pos_0 = foot_pos_w[:, self._phase_var.stance_idx, :]
-            self.stance_foot_ori_quat_0 = foot_ori_w[:, self._phase_var.stance_idx, :]
-            self.stance_foot_ori_0 = get_euler_from_quat(foot_ori_w[:, self._phase_var.stance_idx, :])
+            self.stance_foot_pos_0 = foot_pos_w[:, self.phase_var.stance_idx, :]
+            self.stance_foot_ori_quat_0 = foot_ori_w[:, self.phase_var.stance_idx, :]
+            self.stance_foot_ori_0 = get_euler_from_quat(foot_ori_w[:, self.phase_var.stance_idx, :])
             # self.swing2stance_foot_pos_0 = _transfer_to_local_frame(
-            #     foot_pos_w[:, self._phase_var.swing_idx, :] - self.stance_foot_pos_0, self.stance_foot_ori_quat_0
+            #     foot_pos_w[:, self.phase_var.swing_idx, :] - self.stance_foot_pos_0, self.stance_foot_ori_quat_0
             # )
             
 
-        self.old_stance_idx = self._phase_var.stance_idx
+        self.old_stance_idx = self.phase_var.stance_idx
         return
 
             
@@ -265,7 +265,7 @@ class MLIPCommandTerm(CommandTerm):
             self.mask_backward = torch.full((self.num_envs,), False, device=self.device, dtype=torch.bool)
             self.mask_flat = torch.full((self.num_envs,), True, device=self.device, dtype=torch.bool)
         else:
-            vel_thresh = self.cfg.foot_length/self._phase_var.Tstep
+            vel_thresh = self.cfg.foot_length/self.phase_var.Tstep
             self.mask_forward = base_vdes[:, 0] > vel_thresh
             self.mask_backward = base_vdes[:, 0] < -vel_thresh
             self.mask_flat = torch.abs(base_vdes[:, 0]) <= vel_thresh
@@ -273,7 +273,7 @@ class MLIPCommandTerm(CommandTerm):
         self.mlip.update_desired_walking(base_vdes, self.cfg.y_nom, 
                                          self.mask_forward, self.mask_backward, self.mask_flat)
 
-        self.delta_yaw = base_vdes[:, 2] * self._phase_var.time_in_step
+        self.delta_yaw = base_vdes[:, 2] * self.phase_var.time_in_step
         self.yaw_dot = base_vdes[:, 2]
         self.target_yaw = self.stance_foot_ori_0[:, 2] + self.delta_yaw
 
@@ -290,13 +290,13 @@ class MLIPCommandTerm(CommandTerm):
         foot_ori_w = data.body_quat_w[:, self.feet_bodies_idx, :]
 
         # Store raw foot positions
-        self.stance_foot_pos = foot_pos_w[:, self._phase_var.stance_idx, :]
-        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self._phase_var.stance_idx, :])
+        self.stance_foot_pos = foot_pos_w[:, self.phase_var.stance_idx, :]
+        self.stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.phase_var.stance_idx, :])
 
         # Convert foot positions to the robot's yaw-aligned local frame
 
         swing2stance_local = _transfer_to_local_frame(
-            foot_pos_w[:, self._phase_var.swing_idx, :] - self.stance_foot_pos_0, self.stance_foot_ori_quat_0
+            foot_pos_w[:, self.phase_var.swing_idx, :] - self.stance_foot_pos_0, self.stance_foot_ori_quat_0
         )
 
         # Center of mass to stance foot vector in local frame
@@ -307,10 +307,10 @@ class MLIPCommandTerm(CommandTerm):
         pelvis_ori = get_euler_from_quat(root_quat)
 
         # Foot orientations (Euler XYZ)
-        swing_foot_ori = get_euler_from_quat(foot_ori_w[:, self._phase_var.swing_idx, :])
+        swing_foot_ori = get_euler_from_quat(foot_ori_w[:, self.phase_var.swing_idx, :])
 
         # stance foot orientation
-        stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self._phase_var.stance_idx, :])
+        stance_foot_ori = get_euler_from_quat(foot_ori_w[:, self.phase_var.stance_idx, :])
 
         # 2. Velocities (world frame)
         com_vel_w = data.root_com_vel_w[:, 0:3]
@@ -318,8 +318,8 @@ class MLIPCommandTerm(CommandTerm):
         foot_lin_vel_w = data.body_lin_vel_w[:, self.feet_bodies_idx, :]
         foot_ang_vel_w = data.body_ang_vel_w[:, self.feet_bodies_idx, :]
 
-        self.stance_foot_vel = foot_lin_vel_w[:, self._phase_var.stance_idx, :]
-        self.stance_foot_ang_vel = foot_ang_vel_w[:, self._phase_var.stance_idx, :]
+        self.stance_foot_vel = foot_lin_vel_w[:, self.phase_var.stance_idx, :]
+        self.stance_foot_ang_vel = foot_ang_vel_w[:, self.phase_var.stance_idx, :]
         # Convert velocities to local frame
 
         com_vel_local = _transfer_to_local_frame(com_vel_w, self.stance_foot_ori_quat_0)
@@ -327,15 +327,15 @@ class MLIPCommandTerm(CommandTerm):
         pelvis_omega_local = data.root_ang_vel_b
 
         foot_lin_vel_local_swing = _transfer_to_local_frame(
-            foot_lin_vel_w[:, self._phase_var.swing_idx, :], self.stance_foot_ori_quat_0
+            foot_lin_vel_w[:, self.phase_var.swing_idx, :], self.stance_foot_ori_quat_0
         )
 
         foot_ang_vel_local_swing = quat_apply(
-            quat_inv(foot_ori_w[:, self._phase_var.swing_idx, :]), foot_ang_vel_w[:, self._phase_var.swing_idx, :]
+            quat_inv(foot_ori_w[:, self.phase_var.swing_idx, :]), foot_ang_vel_w[:, self.phase_var.swing_idx, :]
         )
 
         stance_foot_ang_vel_local_swing = quat_apply(
-            quat_inv(foot_ori_w[:, self._phase_var.stance_idx, :]), foot_ang_vel_w[:, self._phase_var.stance_idx, :]
+            quat_inv(foot_ori_w[:, self.phase_var.stance_idx, :]), foot_ang_vel_w[:, self.phase_var.stance_idx, :]
         )
 
         swing2stance_vel = foot_lin_vel_local_swing
@@ -377,8 +377,8 @@ class MLIPCommandTerm(CommandTerm):
         
         
         # Get desired foot placements and CoM trajectory from MLIP in target yaw frame
-        Ux,  Uy = self.mlip.get_desired_foot_placement(self._phase_var.stance_idx) #Shape: (N,)
-        com_x, com_dx, com_y, com_dy = self.mlip.get_desired_com_state(self._phase_var.stance_idx, self._phase_var.time_in_step) #Shape: (N,)
+        Ux,  Uy = self.mlip.get_desired_foot_placement(self.phase_var.stance_idx) #Shape: (N,)
+        com_x, com_dx, com_y, com_dy = self.mlip.get_desired_com_state(self.phase_var.stance_idx, self.phase_var.time_in_step) #Shape: (N,)
 
         # Concatenate x y z components
         com_pos_des = torch.stack(
@@ -415,8 +415,8 @@ class MLIPCommandTerm(CommandTerm):
         # Create horizontal control points with batch dimension
         horizontal_control_points = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0], device=self.device)
 
-        bht = bezier_deg(0, self._phase_var.phase, self._phase_var.T_ss, horizontal_control_points, 4)
-        dbht = bezier_deg(1, self._phase_var.phase, self._phase_var.T_ss, horizontal_control_points, 4)
+        bht = bezier_deg(0, self.phase_var.phase, self.phase_var.T_ss, horizontal_control_points, 4)
+        dbht = bezier_deg(1, self.phase_var.phase, self.phase_var.T_ss, horizontal_control_points, 4)
         # Horizontal X and Y (linear interpolation)
         p_swing_x = ((1 - bht) * (-swing_foot_target_yaw_adjusted[:, 0]) + bht * swing_foot_target_yaw_adjusted[:, 0]) #Shape: (N,)
         v_swing_x = ((-dbht) * (-swing_foot_target_yaw_adjusted[:, 0]) + dbht * swing_foot_target_yaw_adjusted[:, 0])  #Shape: (N,)
@@ -441,12 +441,12 @@ class MLIPCommandTerm(CommandTerm):
             z_sw_neg + 0.05 * (z_sw_max - z_sw_neg),
             z_sw_neg,  # End
         ], dim=1)  # Shape: (N,7)
-        if isinstance(self._phase_var.phase, float):
-            phase_tensor = torch.full((N,), self._phase_var.phase, device=self.device)
-            T_tensor = torch.full((N,), self._phase_var.T_ss, device=self.device)
+        if isinstance(self.phase_var.phase, float):
+            phase_tensor = torch.full((N,), self.phase_var.phase, device=self.device)
+            T_tensor = torch.full((N,), self.phase_var.T_ss, device=self.device)
         else:
-            phase_tensor = self._phase_var.phase
-            T_tensor = self._phase_var.T_ss
+            phase_tensor = self.phase_var.phase
+            T_tensor = self.phase_var.T_ss
         p_swing_z = bezier_deg(0, phase_tensor, T_tensor, control_v, degree_v)
         v_swing_z = bezier_deg(1, phase_tensor, T_tensor, control_v, degree_v)
 
@@ -459,11 +459,11 @@ class MLIPCommandTerm(CommandTerm):
         
         stance_foot_pitch_angle = torch.full((N, 1), 0.0, device=self.device)
         stance_foot_pitch_vel = torch.full((N, 1), 0.0, device=self.device)
-        if self._phase_var.domain == "FA":
+        if self.phase_var.domain == "FA":
             pass
-        elif self._phase_var.domain == "UA" and not self.cfg.use_flat_foot:
-            bht_ua = bezier_deg(0, self._phase_var.phase_ua, self._phase_var.T_ua, horizontal_control_points, 4)
-            dbht_ua = bezier_deg(1, self._phase_var.phase_ua, self._phase_var.T_ua, horizontal_control_points, 4)
+        elif self.phase_var.domain == "UA" and not self.cfg.use_flat_foot:
+            bht_ua = bezier_deg(0, self.phase_var.phase_ua, self.phase_var.T_ua, horizontal_control_points, 4)
+            dbht_ua = bezier_deg(1, self.phase_var.phase_ua, self.phase_var.T_ua, horizontal_control_points, 4)
             #heel to toe
             stance_foot_pitch_angle[self.mask_forward] = bht_ua * self.cfg.foot_pitch_ref
             stance_foot_pitch_vel[self.mask_forward] = dbht_ua * self.cfg.foot_pitch_ref
@@ -474,9 +474,9 @@ class MLIPCommandTerm(CommandTerm):
             stance_foot_pitch_vel[self.mask_backward] = -dbht_ua * self.cfg.foot_pitch_ref
             swingfoot_eulxyz[self.mask_backward, 1] = bht_ua * self.cfg.foot_pitch_ref
             swingfoot_eulxyz_dot[self.mask_backward, 1] = dbht_ua * self.cfg.foot_pitch_ref
-        elif self._phase_var.domain == "OA" and not self.cfg.use_flat_foot:
-            bht_oa = bezier_deg(0, self._phase_var.phase_oa, self._phase_var.T_oa, horizontal_control_points, 4)
-            dbht_oa = bezier_deg(1, self._phase_var.phase_oa, self._phase_var.T_oa, horizontal_control_points, 4)
+        elif self.phase_var.domain == "OA" and not self.cfg.use_flat_foot:
+            bht_oa = bezier_deg(0, self.phase_var.phase_oa, self.phase_var.T_oa, horizontal_control_points, 4)
+            dbht_oa = bezier_deg(1, self.phase_var.phase_oa, self.phase_var.T_oa, horizontal_control_points, 4)
             stance_foot_pitch_angle[self.mask_forward] = self.cfg.foot_pitch_ref #todo: or smooth from y0
             swingfoot_eulxyz[self.mask_forward, 1] = (torch.tensor(1.0, device=self.device) - bht_oa) * (-self.cfg.foot_pitch_ref)
             swingfoot_eulxyz_dot[self.mask_forward, 1] = dbht_oa * self.cfg.foot_pitch_ref
@@ -516,7 +516,7 @@ class MLIPCommandTerm(CommandTerm):
         # phase: [B]
         forward_vel = self._env.command_manager.get_command("base_velocity")[:, 0]
 
-        Tswing = self._phase_var.Tstep
+        Tswing = self.phase_var.Tstep
         tp = (self._env.sim.current_time % (2 * Tswing)) / (2 * Tswing)
         phase = 2 * torch.pi * tp
 

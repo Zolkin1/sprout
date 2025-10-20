@@ -9,9 +9,6 @@ class PhaseVar:
     
     def __init__(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
         self.reconfigure(start_time, end_time)
-    def reconfigure(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
-        self.start_time = start_time
-        self.end_time = end_time
         if isinstance(start_time, torch.Tensor) and isinstance(end_time, torch.Tensor):
             self.tau = torch.zeros_like(start_time)
             self.dtau = torch.zeros_like(start_time)
@@ -19,7 +16,11 @@ class PhaseVar:
         else:
             self.tau = 0.0
             self.dtau = 0.0
-            self._is_tensor = False        
+            self._is_tensor = False 
+    def reconfigure(self, start_time: Union[float, torch.Tensor], end_time: Union[float, torch.Tensor]):
+        self.start_time = start_time
+        self.end_time = end_time
+          
     def update(self, time: Union[float, torch.Tensor]):
         self.time_in_step = time - self.start_time
         self.tau = (time - self.start_time) / (self.end_time - self.start_time)

@@ -2,7 +2,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.managers import CommandTermCfg
 from isaaclab.markers import VisualizationMarkersCfg
 from isaaclab.utils import configclass
-
+from dataclasses import MISSING
 
 from .stones_cmd import StonesCommandTerm
 
@@ -18,7 +18,8 @@ class StonesCommandCfg(CommandTermCfg):
     class_type: type = StonesCommandTerm
     asset_name: str = "robot"
     debug_vis: bool = True
-    
+
+    output_command_name: str = MISSING
 
     resampling_time_range: tuple[float, float] = (5.0, 15.0)  # Resampling time range in seconds
 

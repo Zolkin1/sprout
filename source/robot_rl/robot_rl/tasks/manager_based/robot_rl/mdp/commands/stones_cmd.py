@@ -64,6 +64,9 @@ class StonesCommandTerm(CommandTerm):
         if not hasattr(self._env, "episode_length_buf"):
             return
         
+        stone_output_cmd = self._env.get_command_term(self.cfg.output_command_name)
+        self.ith_step = stone_output_cmd.ith_step
+        
         # Extract terrain info
         terrain = self._env.scene.terrain
         rel_x = terrain.env_terrain_infos["rel_x"] #(num_envs, num_stones)

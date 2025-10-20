@@ -51,7 +51,8 @@ class G1RoughMlipCommandsCfg(HumanoidCommandsCfg):
 
     hlip_ref = StonesOutputCommandCfg()
     
-
+    # StoneCfg = StonesCommandCfg()
+    # StoneCfg.output_command_name = "hlip_ref"
     # stones_cmd = StonesCommandCfg()
 
 
@@ -131,7 +132,11 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
 
     rewards: G1RoughMlipRewards = G1RoughMlipRewards()
-    observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation_stepping_stones import (
+    G1SteppingStonesObservationsCfg,
+)
+
+    observations: G1SteppingStonesObservationsCfg = G1SteppingStonesObservationsCfg()
     commands: G1RoughMlipCommandsCfg = G1RoughMlipCommandsCfg()
     curriculum: CurriculumMlipCfg = CurriculumMlipCfg()
     terminations: G1SteppingStonesTerminationsCfg = G1SteppingStonesTerminationsCfg()

@@ -146,3 +146,13 @@ def cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cphase = torch.cos(phase).unsqueeze(-1)
 
     return cphase
+
+def sincos_phase_batched(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    cmd = env.command_manager.get_term(command_name)
+
+    phase = cmd.phase_var.tau + cmd.stance_idx 
+    sphase = torch.sin(torch.pi * phase).unsqueeze(-1)
+    cphase = torch.cos(torch.pi * phase).unsqueeze(-1)
+
+    return torch.cat([sphase, cphase], dim=-1)
+
