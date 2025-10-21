@@ -26,7 +26,7 @@ def long_stones_terrain(
     meshes.append(start_box)
 
     # --- Stepping stones
-    curr_x = cfg.start_platform_size[0]  - cfg.stone_size[0] / 2
+    curr_x = cfg.start_platform_size[0]  - cfg.stone_target_x / 2
     curr_y, curr_z = start_platform_center_pos[1], start_platform_center_pos[2] 
 
     box_dims = cfg.stone_size
@@ -55,8 +55,8 @@ def long_stones_terrain(
     terrain_info: dict[str, np.ndarray] = {
     "rel_x": rel_x,
     "rel_z": rel_z,
-    # center position of the start stone (the virtual stone at the end of the start platform)
-    "start_stone_pos": np.array([start_platform_size[0]/2 - cfg.stone_size[0] / 2, 0., 0.]),
+    # center position of the start stone (the virtual stone at the end of the start platform), from specified origin
+    "start_stone_pos": np.array([start_platform_size[0]/2 - cfg.stone_target_x / 2, 0., 0.]),
     "stone_x": cfg.stone_size[0]
     }
     #todo consider different yaw angle?

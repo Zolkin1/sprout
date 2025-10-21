@@ -149,7 +149,7 @@ class StonesCommandTerm(CommandTerm):
     def _debug_vis_callback(self, event):
         if self.debug_vis:
             #for visualization, offset stone z position by half stone height
-            stone_center_offset = torch.tensor([0.0, 0.0, -self.cfg.nextstone_cfg.markers["nextstone"].size[2]/2.0], device=self.device)
+            stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
             self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
             self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
             self.origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)

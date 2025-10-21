@@ -20,7 +20,7 @@ class LongStonesTerrainCfg(SubTerrainBaseCfg):
     rel_stone_z_range: tuple[float, float] = (-STONES.rel_stone_z_max, STONES.rel_stone_z_max)
     start_platform_size: tuple[float, float, float] = (STONES.start_platform_x, STONES.stone_y, STONES.stone_z)
     
-    stone_target_length: float = STONES.stone_x  # target length between stones, used for curriculum
+    stone_target_x: float = STONES.stone_x  # target size x between stones, used for curriculum
 
     size: tuple[float, float] = (STONES.terrain_size_x, STONES.terrain_size_y)  # (x,y) overall terrain size
 
@@ -31,7 +31,7 @@ class LongStonesTerrainCfg(SubTerrainBaseCfg):
         
         # interpolate stone_x size with difficulty
         max_val = STONES.rel_stone_x[1]                  # fill all gap
-        min_val = self.stone_target_length               # base size at hardest
+        min_val = self.stone_target_x               # base size at hardest
         stone_x_sampled = (1 - difficulty) * max_val + difficulty * min_val
 
         # assign updated stone size

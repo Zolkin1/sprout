@@ -28,7 +28,7 @@ class StonesCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/stone",
         markers={
             "nextstone": sim_utils.CuboidCfg(
-                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
             )
         },
     )
@@ -36,7 +36,7 @@ class StonesCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/nextstone",
         markers={
             "nextnextstone": sim_utils.CuboidCfg(
-                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
             )
         },
     )
