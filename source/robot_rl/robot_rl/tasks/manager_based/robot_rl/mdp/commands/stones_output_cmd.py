@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stones_output_cmd_cfg import StonesOutputCommandCfg
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.mlip_cmd import euler_rates_to_omega_b, get_euler_from_quat, _transfer_to_local_frame
-
+from robot_rl.tasks.manager_based.robot_rl.constants import IS_DEBUG, STONES, TEST_FLAT
 
 from .phase_var import PhaseVar
 
@@ -52,20 +52,45 @@ def tensor_t_now(env):
 class StonesOutputCommandTerm(CommandTerm):
     z0: torch.Tensor  # (num_envs,) nominal CoM height
     y_nom: float  # nominal lateral foot placement
+    use_momentum: bool #where the second coordinate of HLIP is momentum or velocity
+    tSSplus: torch.Tensor  # (num_envs,) time of last SS+ event 
     TSS: torch.Tensor  # (num_envs,) single support duration
     TDS: torch.Tensor  # (num_envs,) double support duration
-    
-    tSSplus: torch.Tensor  # (num_envs,) time of last SS+ event 
 
-    
+    phase_var: PhaseVar  # (num_envs,) phase variable for footstep timing
     stance_idx: torch.Tensor  # (num_envs,) current stance foot index (0: left, 1: right)
     
     ith_step: torch.Tensor  # (num_envs,) current step index
+    
+    stance_foot_pos_0: torch.Tensor  # (num_envs, 3) stance foot position at the beginning of the step
+    stance_foot_ori_quat_0: torch.Tensor  # (num_envs, 4) stance foot orientation at the beginning of the step
+    stance_foot_ori_0: torch.Tensor  # (num_envs, 3) stance foot orientation (roll, pitch, yaw) at the beginning of the step
+
+    hdes: torch.Tensor  # (num_envs,) swing foot target z position from current stance foot
+    ldes: torch.Tensor  # (num_envs,) swing foot target x position from current stance foot
+    hdes_next: torch.Tensor  # (num_envs,) swing foot target z position from next stance foot
+    ldes_next: torch.Tensor  # (num_envs,) swing foot target x position from next stance foot
+
+    xcomf_des: torch.Tensor  # (num_envs,) desired xCOM position from current stance foot
+    zcomf_des: torch.Tensor  # (num_envs,) desired zCOM position from current stance foot
+    dzcomf_des: torch.Tensor  # (num_envs,) desired zCOM velocity from current stance foot
+    
+    current_stone_pos: torch.Tensor  # (num_envs, 3) current stone position in world frame
+    next_stone_pos:  torch.Tensor  # (num_envs, 3) next stone position in world frame
+    nextnext_stone_pos:  torch.Tensor  # (num_envs, 3) next next stone position in world frame
+    
+    stone_quat: torch.Tensor  # (num_envs, 4) stone orientation quaternion in world frame
+    
+    abs_x: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute x positions of stones
+    abs_y: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute y positions of stones
+    abs_z: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute z positions of stones
+    
     def __init__(self, cfg: "StonesOutputCommandCfg", env):
         super().__init__(cfg, env)
 
         self.z0 = torch.full((self.num_envs,), cfg.z0, device=self.device)
         self.y_nom = cfg.y_nom
+        self.use_momentum = cfg.use_momentum    
         
         if env.cfg.commands.step_period.period_range[0] == env.cfg.commands.step_period.period_range[1]:
             self.tSSplus = tensor_t_now(env)
@@ -103,7 +128,7 @@ class StonesOutputCommandTerm(CommandTerm):
             z0=self.z0,
             TSS=self.TSS,
             TDS=self.TDS,
-            use_momentum=False,
+            use_momentum=self.use_momentum,
             use_feedback=False
         )
 
@@ -126,11 +151,35 @@ class StonesOutputCommandTerm(CommandTerm):
         self.v_buffer = torch.zeros((self.num_envs, 100), device=self.device)
         self.vdot_buffer = torch.zeros((self.num_envs, 100), device=self.device)
 
-        self.ith_step = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
-        
+
         self.stance_foot_pos_0 = torch.zeros((self.num_envs, 3), device=self.device) 
         self.stance_foot_ori_quat_0 = torch.zeros((self.num_envs, 4), device=self.device) 
         self.stance_foot_ori_0 = torch.zeros((self.num_envs, 3), device=self.device) 
+
+        self.is_initialized = False
+        
+        #stone related
+        self.ith_step = torch.full((self.num_envs,), 0, dtype=torch.long, device=self.device)
+        self.current_stone_pos = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=self.device)
+        self.next_stone_pos = torch.zeros((env.num_envs, 3), dtype=torch.float32, device=self.device)
+        self.nextnext_stone_pos = torch.zeros((env.num_envs, 3), dtype=torch.float32, device=self.device)
+
+        #output related
+        self.hdes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.ldes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.hdes_next = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.ldes_next = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.xcomf_des = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.zcomf_des = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self.dzcomf_des = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+                                
+        #todo: for long stones now, always identity quat
+        self.stone_quat = torch.zeros((env.num_envs, 4), dtype=torch.float32, device=self.device)
+        self.stone_quat[:, 0] = 1.0 # identity quat
+
+        self.abs_x = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
+        self.abs_y = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
+        self.abs_z = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
 
     @property
     def command(self):
@@ -142,6 +191,9 @@ class StonesOutputCommandTerm(CommandTerm):
     
     def _update_command(self):
         self.timeBasedDomainContactStatusSwitch()
+        
+        
+        
         self.update_walking_target()
         self.compute_desired()
         self.compute_actual()
@@ -205,6 +257,62 @@ class StonesOutputCommandTerm(CommandTerm):
         # self.metrics["max_clf"] = torch.ones((self.num_envs), device=self.device) * max_clf
         # return self.foot_target  # Return the foot target tensor for observation
 
+    def reset_stone_global(self, reset_mask):
+        if reset_mask.any():
+            # Extract terrain info
+            terrain = self._env.scene.terrain
+            rel_x = terrain.env_terrain_infos["rel_x"] #(num_envs, num_stones)
+            rel_z = terrain.env_terrain_infos["rel_z"] #(num_envs, num_stones)
+            start_stone_pos_w = terrain.env_terrain_infos["start_stone_pos"] + terrain.env_origins #(num_envs, 3)
+            # Get positions for reset environments
+            robot_pos_w_init = self.robot.data.root_pos_w[reset_mask]  # (num_reset, 3)
+            start_pos = start_stone_pos_w[reset_mask]  # (num_reset, 3)
+        
+            # evenly interpolate x positions from robot to platform
+            t = torch.linspace( 1, STONES.num_init_steps, STONES.num_init_steps, device=self.device) / STONES.num_init_steps  # (num_init_steps,)
+        
+            # Compute initial stepping stones (interpolated from robot to platform)
+            abs_x_init = robot_pos_w_init[:, 0:1] + (start_pos[:, 0:1] - robot_pos_w_init[:, 0:1]) * t #(num_reset, num_init_steps)
+            abs_z_init = start_pos[:, 2:3].expand_as(abs_x_init) #(num_reset, num_init_steps)
+
+            # Concatenate with terrain stone sequence (cumulative offsets from start position)
+            stone_x_offsets = torch.cumsum(rel_x[reset_mask], dim=1) # (num_reset, num_stones)
+            stone_z_offsets = torch.cumsum(rel_z[reset_mask], dim=1) # (num_reset, num_stones)
+
+            self.abs_x[reset_mask] = torch.cat([abs_x_init, start_pos[:, 0:1] + stone_x_offsets], dim=1)
+            self.abs_z[reset_mask] = torch.cat([abs_z_init, start_pos[:, 2:3] + stone_z_offsets], dim=1)
+            self.abs_y[reset_mask] = start_pos[:, 1:2]
+        return
+    
+    def update_ithstep_stones_info(self, ithstep, mask):
+        """Update next and next-next stepping stone positions only for masked envs."""
+        if not torch.any(mask):
+            return
+        # --- Upcoming stepping stone, the target stone for swing foot ---
+        idx_next = torch.clamp(
+            ithstep[mask], 
+            max=STONES.num_stones + STONES.num_init_steps - 1
+        )
+        self.next_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
+        self.next_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
+        self.next_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
+
+        # --- Next Upcoming stepping stone, preview ---
+        idx_next_next = torch.clamp(
+            ithstep[mask] + 1, 
+            max=STONES.num_stones + STONES.num_init_steps - 1
+        )
+
+        self.nextnext_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
+        self.nextnext_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
+        self.nextnext_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
+        
+        self.hdes[mask] = self.next_stone_pos[mask, 2] - self.current_stone_pos[mask, 2]
+        self.ldes[mask] = self.next_stone_pos[mask, 0] - self.current_stone_pos[mask, 0]
+        self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
+        self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
+        return
+
     def timeBasedDomainContactStatusSwitch(self):
         tnow = tensor_t_now(self._env)
         
@@ -213,44 +321,81 @@ class StonesOutputCommandTerm(CommandTerm):
         # mask_DS2SS = tnow >= (self.tDSplus + self.TDS)
         eps = 1e-6
         
-        mask_next_step = tnow >= (self.tSSplus + self.TSS - eps) 
-        reset_buf = getattr(self._env, "reset_buf", None)
-        if reset_buf is None:
-            #initialization, make true tensor of size (num_envs, )
-            mask_next_step = torch.ones((self.num_envs,), device=self.device, dtype=torch.bool)
-        else:
-            mask_next_step = mask_next_step | reset_buf.bool()
-        
-        
-        
-        
+        mask_next_step = tnow >= (self.tSSplus + self.TSS - eps) #mask for time-based step switch
+        reset_buf = getattr(self._env, "reset_buf", None) #mask for env reset 
+
+        if not self.is_initialized:
+            mask_next_step = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+            reset_buf = torch.ones((self.num_envs,), device=self.device, dtype=torch.bool)
+            self.is_initialized = True
+            
+        mask_next_step = mask_next_step & torch.logical_not(reset_buf.bool()) #only mask next step for non-resetting envs, to avoid double update
         if torch.any(mask_next_step):
-            #update for envs that need to switch
-            self.tSSplus[mask_next_step] = tnow[mask_next_step]
-            #recompute TSS
-            #todo: fixed for now
-            self.TSS[mask_next_step] = self._env.cfg.commands.step_period.period_range[0]/2.0
-            self.hlip.update_hlip(self.z0, self.TSS, self.TDS)
-            self.phase_var.reconfigure(self.tSSplus , self.tSSplus + self.TSS)
-            self.stance_idx[mask_next_step] = 1 - self.stance_idx[mask_next_step]  # switch stance foot
-            foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
-            foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
-            self.stance_foot_pos_0[mask_next_step, :] = foot_pos_w[mask_next_step, self.stance_idx[mask_next_step], :]
-            self.stance_foot_ori_quat_0[mask_next_step, :] = foot_ori_w[mask_next_step, self.stance_idx[mask_next_step], :]
-            self.stance_foot_ori_0[mask_next_step, :] = get_euler_from_quat(self.stance_foot_ori_quat_0[mask_next_step])
+            self.reset_impact(mask_next_step)
             #update ith_step
             self.ith_step[mask_next_step] += 1
+            if TEST_FLAT == False:
+                self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[reset_buf, 0:2] #update current stone x-y pos based on stance foot 
+                #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
+                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step,2] 
+                self.update_ithstep_stones_info(self.ith_step, mask_next_step) #update next and next-next stone pos
 
+        if torch.any(reset_buf):
+            self.reset_impact(reset_buf)
+            #update ith_step
+            self.ith_step[reset_buf] = 0
+            if TEST_FLAT == False:
+                #update current stone pos, assume first step z is always zero
+                self.current_stone_pos[reset_buf, 0:2] = self.stance_foot_pos_0[reset_buf, 0:2] #initialize current stone x-y pos based on stance foot
+                self.current_stone_pos[reset_buf, 2] = 0 #initialize current stone z pos to zero, asumming always launch on the platform
+                self.reset_stone_global(reset_buf)
+                self.update_ithstep_stones_info(self.ith_step, reset_buf) #update next and next-next stone pos
 
+        if torch.any(torch.logical_and(mask_next_step, reset_buf)):
+            print("Warning: some envs are both stepping and resetting!")
         #update phase var
         self.phase_var.update(tnow)
-
-            
-
-
         return
 
-            
+    def reset_impact(self, mask):
+        #to be called when impact is detected
+        self.tSSplus[mask] = tensor_t_now(self._env)[mask]
+        #recompute TSS
+        #todo: fixed for now, need solve for reach
+        self.TSS[mask] = self._env.cfg.commands.step_period.period_range[0]/2.0
+        self.hlip.update_hlip(self.z0, self.TSS, self.TDS)
+        self.phase_var.reconfigure(self.tSSplus , self.tSSplus + self.TSS)
+        self.stance_idx[mask] = 1 - self.stance_idx[mask]  # switch stance foot, for short stones in the future, consider assign based on stone position
+        foot_pos_w = self.robot.data.body_pos_w[:, self.feet_bodies_idx, :]
+        foot_ori_w = self.robot.data.body_quat_w[:, self.feet_bodies_idx, :]
+        self.stance_foot_pos_0[mask, :] = foot_pos_w[mask, self.stance_idx[mask], :]
+        self.stance_foot_ori_quat_0[mask, :] = foot_ori_w[mask, self.stance_idx[mask], :]
+        self.stance_foot_ori_0[mask, :] = get_euler_from_quat(self.stance_foot_ori_quat_0[mask])  
+        return
+
+        
+    def compute_com_pos_and_mass_normalized_angular_momentum_w(self):
+        data = self.robot.data
+        
+        # compute real COM
+        link_pos_w = data.body_com_pos_w # (num_envs, num_bodies, 3)
+        link_mass = data.default_mass.to(self.device) # (num_envs, num_bodies)
+        com_pos_w = (link_mass.unsqueeze(-1) * link_pos_w).sum(dim=1) / self.mass # (num_envs,  3)
+
+        # compute mass-normalized angular momentum
+        link_inertia_b = data.default_inertia.to(self.device).view(*data.default_inertia.shape[:-1], 3, 3) # (num_envs, num_bodies, 3, 3)
+        link_vel_w = data.body_com_lin_vel_w # (num_envs, num_bodies, 3)
+        link_omega_w = data.body_com_ang_vel_w # (num_envs, num_bodies, 3)
+        link_quat_w = data.body_quat_w # (num_envs, num_bodies, 4)
+        R_wb = matrix_from_quat(link_quat_w)  # (N,B,3,3)
+        link_inertia_w = R_wb @ link_inertia_b @ R_wb.transpose(-1, -2) # (num_envs, num_bodies, 3, 3)
+        term_rot = (link_inertia_w @ link_omega_w.unsqueeze(-1)).squeeze(-1) # (num_envs, num_bodies, 3)
+        term_trans = torch.cross(link_pos_w - com_pos_w.unsqueeze(1), link_mass.unsqueeze(-1) * link_vel_w, dim=-1) # (num_envs, num_bodies, 3)
+        h_com_w = (term_rot.sum(dim=1) + term_trans.sum(dim=1)) / self.mass # (num_envs, 3) world frame angular momentum about CoM, mass-normalized
+        h_st_w = h_com_w + torch.cross(com_pos_w - self.stance_foot_pos_0, data.root_com_vel_w[:, 0:3], dim=-1) # (num_envs, 3) world frame angular momentum about stance foot, mass-normalized
+
+        return com_pos_w, h_st_w
+    
     def update_walking_target(self):
         #given velocity command, update MLIP
         base_vdes = self._env.command_manager.get_command("base_velocity")  # (N,3)
@@ -289,22 +434,6 @@ class StonesOutputCommandTerm(CommandTerm):
         com_w = data.root_com_pos_w
         com2stance_local = _transfer_to_local_frame(com_w - self.stance_foot_pos_0, self.stance_foot_ori_quat_0)
         
-        
-        # compute real COM
-        link_pos_w = data.body_com_pos_w # (num_envs, num_bodies, 3)
-        link_mass = data.default_mass.to(self.device) # (num_envs, num_bodies)
-        com_pos_w = (link_mass.unsqueeze(-1) * link_pos_w).sum(dim=1) / self.mass # (num_envs,  3)
-
-        # compute mass-normalized angular momentum
-        link_inertia_b = data.default_inertia.to(self.device).view(*data.default_inertia.shape[:-1], 3, 3) # (num_envs, num_bodies, 3, 3)
-        link_vel_w = data.body_com_lin_vel_w # (num_envs, num_bodies, 3)
-        link_omega_w = data.body_com_ang_vel_w # (num_envs, num_bodies, 3)
-        link_quat_w = data.body_quat_w # (num_envs, num_bodies, 4)
-        R_wb = matrix_from_quat(link_quat_w)  # (N,B,3,3)
-        link_inertia_w = R_wb @ link_inertia_b @ R_wb.transpose(-1, -2) # (num_envs, num_bodies, 3, 3)
-        term_rot = (link_inertia_w @ link_omega_w.unsqueeze(-1)).squeeze(-1) # (num_envs, num_bodies, 3)
-        term_trans = torch.cross(link_pos_w - com_pos_w.unsqueeze(1), link_mass.unsqueeze(-1) * link_vel_w, dim=-1) # (num_envs, num_bodies, 3)
-        h_ang_w = (term_rot.sum(dim=1) + term_trans.sum(dim=1)) / self.mass # (num_envs, 3)
 
         # Pelvis orientation (Euler XYZ)
         pelvis_ori = get_euler_from_quat(root_quat)
@@ -345,6 +474,15 @@ class StonesOutputCommandTerm(CommandTerm):
             [com2stance_local, pelvis_ori, swing2stance_local, swing_foot_ori,  upper_body_joint_pos], dim=-1
         )
 
+        if self.use_momentum:
+            com_w, h_st_w = self.compute_com_pos_and_mass_normalized_angular_momentum_w()
+        
+            h_st_local = _transfer_to_local_frame(h_st_w, self.stance_foot_ori_quat_0) 
+
+            com_vel_local[:,0] = -h_st_local[:,1] / self.z0
+            
+            com_vel_local[:,1] = - h_st_local[:,0] / self.z0
+            
         self.dy_act = torch.cat(
             [com_vel_local, pelvis_omega_local, swing2stance_vel, foot_ang_vel_local_swing, upper_body_joint_vel],
             dim=-1,
@@ -367,6 +505,10 @@ class StonesOutputCommandTerm(CommandTerm):
         # Get desired foot placements and CoM trajectory from HLIP in target yaw frame, no feedback used here
         Ux,  Uy = self.hlip.get_desired_foot_placement(self.stance_idx) #Shape: (N,)
         com_x, com_dx, com_y, com_dy = self.hlip.get_desired_com_state(self.stance_idx, self.phase_var.time_in_step) #Shape: (N,)
+        
+        if self.use_momentum:
+            com_dx = com_dx / self.z0
+            com_dy = com_dy / self.z0
 
         # Concatenate x y z components
         com_pos_des = torch.stack(
@@ -448,13 +590,7 @@ class StonesOutputCommandTerm(CommandTerm):
 
         omega_pelvis_ref = euler_rates_to_omega_b(pelvis_eulxyz, pelvis_eulxyz_dot)
         omega_foot_ref = euler_rates_to_omega_b(swingfoot_eulxyz, swingfoot_eulxyz_dot)  # (N,3)
-        # self.y_out = torch.cat(
-        #     [com_pos_des_yaw_adjusted, pelvis_eulxyz, swing_foot_pos, swingfoot_eulxyz,  stance_foot_pitch_angle, upper_body_joint_pos], dim=-1
-        # )
 
-        # self.dy_out = torch.cat(
-        #     [com_vel_des_yaw_adjusted, omega_pelvis_ref, swing_foot_vel, omega_foot_ref, stance_foot_pitch_vel, upper_body_joint_vel], dim=-1
-        # )
         self.y_out = torch.cat(
             [com_pos_des_yaw_adjusted, pelvis_eulxyz, swing_foot_pos, swingfoot_eulxyz, upper_body_joint_pos], dim=-1
         )
@@ -559,9 +695,24 @@ class StonesOutputCommandTerm(CommandTerm):
         if debug_vis:
             self.footprint_visualizer = VisualizationMarkers(self.cfg.footprint_cfg)
             self.footprint_visualizer.set_visibility(True)
+            
+            #stone related visualizer
+            self.nextstone_visualizer = VisualizationMarkers(self.cfg.nextstone_cfg)
+            self.nextnextstone_visualizer = VisualizationMarkers(self.cfg.nextnextstone_cfg)
+            self.nextstone_visualizer.set_visibility(True)
+            self.nextnextstone_visualizer.set_visibility(True)
+            
+            self.origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
+            self.origin_visualizer.set_visibility(True)
         else:
             if hasattr(self, "footprint_visualizer"):
                 self.footprint_visualizer.set_visibility(False)
+            if hasattr(self, "nextstone_visualizer"):
+                self.nextstone_visualizer.set_visibility(False)
+            if hasattr(self, "nextnextstone_visualizer"):
+                self.nextnextstone_visualizer.set_visibility(False)
+            if hasattr(self, "origin_visualizer"):
+                self.origin_visualizer.set_visibility(False)    
         return
     
     def _debug_vis_callback(self, event):
@@ -571,3 +722,7 @@ class StonesOutputCommandTerm(CommandTerm):
             return
         if self.debug_vis:
             self.footprint_visualizer.visualize(self.swingfoot_world_pos,self.swingfoot_quat)
+            stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
+            self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
+            self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
+            self.origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)

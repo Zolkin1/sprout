@@ -1,6 +1,6 @@
 # G1_21j config
 robot_name: "g1_21j_compute"
-checkpoint_path: "g1_policies/stepping_stone/stepping_stone/2025-10-20_15-07-57/exported/policy.pt"
+checkpoint_path: "g1_policies/stepping_stone/stepping_stone/2025-10-22_18-11-21/exported/policy.pt"
 num_obs: 74
 num_action: 21
 period: 0.8                   # s

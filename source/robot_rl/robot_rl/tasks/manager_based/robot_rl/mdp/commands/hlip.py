@@ -75,7 +75,7 @@ def solve_orbital_energy_batched(x: torch.Tensor, z_tilde: torch.Tensor, use_mom
         E = v**2 - (g / z_tilde) * (p**2)
     return E
 
-def solve_time_to_reach_xdes_batched(x0: torch.Tensor, pdes: torch.Tensor, z_tilde: torch.Tensor, use_momentum: bool,g: float = 9.81, eps: float = 1e-9, pos_tol: float = 1e-4):
+def solve_time2reach_pdes_batched(x0: torch.Tensor, pdes: torch.Tensor, z_tilde: torch.Tensor, use_momentum: bool,g: float = 9.81, eps: float = 1e-9, pos_tol: float = 1e-4):
     """
     Solve time to reach desired x com position in batch.
     Args:
@@ -161,9 +161,9 @@ class HLIP_P2:
         Busw = torch.tensor([[-1.0], [0.0]], device=z0.device).expand(z0.shape[0], 2, 1) #shape [N,2,1]
         self.B_S2S = torch.matrix_exp(TSS.view(-1,1,1) * self.ASS) @ Busw
         
-        self.Q = torch.eye(2,2,device=self.device)
-        self.R = torch.eye(1,1,device=self.device) * 100
         if self.use_feedback:
+            self.Q = torch.eye(2,2,device=self.device)
+            self.R = torch.eye(1,1,device=self.device) * 100
             self.K = -solve_dlqr_gain_batched(self.A_S2S, self.B_S2S, self.Q, self.R)
 
     def A2_ss(self, z0, grav, use_momentum):
@@ -248,6 +248,27 @@ class HLIP_P2:
         y_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus[mask_ss]
 
         return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
+
+    def get_desired_com_state_from_x0_sagittal(self, x0: torch.Tensor, time_in_step: torch.Tensor):
+        """
+        Get desired com state from initial position x0 for sagittal plane
+
+        Args:
+            x0: Tensor of shape [N, 2] with initial states [p0, L0 or v0]
+            time_in_step: Tensor of shape [N] with time in current step 
+
+        Returns:
+            com_x: Tensor of shape [N] with desired com x position
+            com_dx: Tensor of shape [N] with desired com x velocity or momentum
+        """
+        t = torch.clamp(time_in_step, 0, self.TSS)
+        x_com_state = torch.matrix_exp(t.view(-1,1,1) * self.ASS) @ x0.unsqueeze(-1) #[N,2,1]
+
+        mask_ds = (time_in_step > self.TSS)
+        if torch.any(mask_ds):
+            x_prev = x_com_state[mask_ds] 
+            x_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_prev
+        return x_com_state.squeeze(-1)[:, 0], x_com_state.squeeze(-1)[:, 1]
 
     def get_desired_foot_placement(self, stance_idx: torch.Tensor, com_state: torch.Tensor = None):
         """Get desired foot placement based on stance index and center of mass state.
@@ -428,8 +449,8 @@ def test_hlip_p2():
 #    x0 = torch.tensor([[-0.1, -0.2, -0.1],[0.9, 0.8, 0.7] ],device=hlip_y.device).T
 #    z0 = torch.tensor([0.67, 0.7, 0.8],device=hlip_y.device)
    
-#    T = solve_time_to_reach_xdes_batched(x0, xT, z0, hlip_y.use_momentum)
-   T = solve_time_to_reach_xdes_batched(xstate, hlip_y.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip_y.use_momentum)
+#    T = solve_time2reach_pdes_batched(x0, xT, z0, hlip_y.use_momentum)
+   T = solve_time2reach_pdes_batched(xstate, hlip_y.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip_y.use_momentum)
    print("Time to reach desired foot placement T:", T)
 
 def test_hlip_3d():
@@ -481,16 +502,20 @@ def test_hlip_3d():
    print("Orbital energy Ex:", Ex)
    print("Orbital energy Ey:", Ey)
 
-   Tx = solve_time_to_reach_xdes_batched(xstate, hlip.xdes_p1[:,0,:].squeeze(-1), z0, hlip.use_momentum)
+   Tx = solve_time2reach_pdes_batched(xstate, hlip.xdes_p1[:,0,:].squeeze(-1), z0, hlip.use_momentum)
    print("Time to reach desired com Tx:", Tx) 
 
-   Ty = solve_time_to_reach_xdes_batched(ystate, hlip.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip.use_momentum)
+   Ty = solve_time2reach_pdes_batched(ystate, hlip.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip.use_momentum)
    print("Time to reach desired com Ty:", Ty)
    
    pre_impact_xstate = hlip.get_pre_impact_com_states(xstate, Tx)
    pre_impact_ystate = hlip.get_pre_impact_com_states(ystate, Ty)
    print("Pre-impact com states in x:", pre_impact_xstate)
    print("Pre-impact com states in y:", pre_impact_ystate)
+   
+   
+   Ttest = solve_time2reach_pdes_batched(xstate, hlip.xdes_p2_left[:,0,:].squeeze(-1), z0, hlip.use_momentum)
+   print("Time to reach desired com Ttest:", Ttest)
 
 if __name__ == "__main__":
    test_hlip_3d()

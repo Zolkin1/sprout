@@ -5,7 +5,8 @@ from isaaclab.utils import configclass
 
 
 from .stones_output_cmd import StonesOutputCommandTerm
-
+from robot_rl.tasks.manager_based.robot_rl.constants import STONES
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 Q_weights = [
     25.0,
@@ -97,6 +98,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
     elbow_ref: float = 0.1
     foot_target_range_y: list[float] = [0.1, 0.5]
     resampling_time_range: tuple[float, float] = (5.0, 15.0)  # Resampling time range in seconds
+    use_momentum: bool = True 
     
     
     
@@ -105,24 +107,9 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
     E_star: float = 0.6
     eps: float = 0.6 #xCOM position reference; xCOM_target[i]=eps*rel_x[i]
+    TSS_max: float = 0.6  # max step time (s)
+    TSS_min: float = 0.2  # min step time (s)
     
-    
-    
-
-    
-    
-    
-
-    # Visualization configurations
-    footprint_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/footprint",
-        markers={
-            "swingfoot": sim_utils.CuboidCfg(
-                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
-            )
-        },
-    )
-
     foot_body_name: str = ".*_ankle_roll_link"
     upper_body_joint_name: list[str] = [
         "waist_yaw_joint",
@@ -134,3 +121,40 @@ class StonesOutputCommandCfg(CommandTermCfg):
 
     Q_weights = Q_weights
     R_weights = R_weights
+    
+
+    # Visualization configurations
+    footprint_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/footprint",
+        markers={
+            "swingfoot": sim_utils.CuboidCfg(
+                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+            )
+        },
+    )
+    nextstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/stone",
+        markers={
+            "nextstone": sim_utils.CuboidCfg(
+                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+            )
+        },
+    )
+    nextnextstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/nextstone",
+        markers={
+            "nextnextstone": sim_utils.CuboidCfg(
+                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+            )
+        },
+    )
+    
+    originframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/originframe",
+        markers={
+            "originframe": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+                scale=(0.1, 0.1, 0.1),
+            )}
+    )
+

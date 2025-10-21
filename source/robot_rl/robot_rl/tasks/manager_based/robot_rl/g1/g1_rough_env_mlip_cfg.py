@@ -32,8 +32,6 @@ class G1RoughMlipCommandsCfg(HumanoidCommandsCfg):
 
     hlip_ref = MLIPCommandCfg()
     
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stones_cmd_cfg import StonesCommandCfg
-    stones_cmd = StonesCommandCfg()
 
 
 @configclass

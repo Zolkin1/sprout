@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 IS_DEBUG = False
-
+TEST_FLAT = True
 
 @dataclass
 class StonesConfig:
