@@ -19,7 +19,7 @@ def long_stones_terrain(
     start_platform_size = cfg.start_platform_size
     start_platform_center_pos = (
         0.5 * start_platform_size[0],
-        0.0,
+        0.5 * start_platform_size[0],
         -cfg.start_platform_size[2] / 2
     )
     start_box = trimesh.creation.box(start_platform_size, trimesh.transformations.translation_matrix(start_platform_center_pos))
@@ -28,20 +28,12 @@ def long_stones_terrain(
     # --- Stepping stones
     curr_x = cfg.start_platform_size[0]  - cfg.stone_size[0] / 2
     curr_y, curr_z = start_platform_center_pos[1], start_platform_center_pos[2] 
-    
-    abs_x = np.zeros((cfg.num_stones + cfg.num_init_steps,), dtype=np.float32)
-    abs_z = np.zeros((cfg.num_stones + cfg.num_init_steps,), dtype=np.float32)
 
-    for i in range(cfg.num_init_steps):
-        abs_x[i] = curr_x
-        abs_z[i] = curr_z
     box_dims = cfg.stone_size
     for i in range(cfg.num_stones):
         dx, dz = rel_x[i], rel_z[i]
         curr_x += dx
         curr_z += dz
-        abs_x[i+cfg.num_init_steps] = curr_x
-        abs_z[i+cfg.num_init_steps] = curr_z
         box_pos = (curr_x, curr_y, curr_z)
         stone = trimesh.creation.box(box_dims, trimesh.transformations.translation_matrix(box_pos))
         meshes.append(stone)
@@ -63,11 +55,9 @@ def long_stones_terrain(
     terrain_info: dict[str, np.ndarray] = {
     "rel_x": rel_x,
     "rel_z": rel_z,
-    "abs_x": abs_x,
-    "abs_z": abs_z,
     # center position of the start stone (the virtual stone at the end of the start platform)
-    "start_stone_pos": np.array([start_platform_size[0]/2 - cfg.stone_size[0] / 2, start_platform_center_pos[1], start_platform_center_pos[2]]),
-    "origin": origin
+    "start_stone_pos": np.array([start_platform_size[0]/2 - cfg.stone_size[0] / 2, 0., 0.]),
+    "stone_x": cfg.stone_size[0]
     }
     #todo consider different yaw angle?
 

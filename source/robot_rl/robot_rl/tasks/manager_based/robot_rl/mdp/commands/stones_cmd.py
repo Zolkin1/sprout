@@ -64,7 +64,7 @@ class StonesCommandTerm(CommandTerm):
         if not hasattr(self._env, "episode_length_buf"):
             return
         
-        stone_output_cmd = self._env.get_command_term(self.cfg.output_command_name)
+        stone_output_cmd = self._env.command_manager.get_term(self.cfg.output_command_name)
         self.ith_step = stone_output_cmd.ith_step
         
         # Extract terrain info
@@ -97,19 +97,23 @@ class StonesCommandTerm(CommandTerm):
             self.abs_y[reset_mask] = start_pos[:, 1:2]
         
         # --- Current stepping stone ---
-        self.next_stone_pos[:, 0] = torch.gather(self.abs_x, 1, self.ith_step.unsqueeze(1)).squeeze(1)
-        self.next_stone_pos[:, 1] = start_stone_pos_w[:, 1]
-        self.next_stone_pos[:, 2] = torch.gather(self.abs_z, 1, self.ith_step.unsqueeze(1)).squeeze(1)
-        
-        # --- Next stepping stone ---
         idx_next = torch.clamp(
+            self.ith_step, 
+            max=STONES.num_stones + STONES.num_init_steps - 1
+        )
+        self.next_stone_pos[:, 0] = torch.gather(self.abs_x, 1, idx_next.unsqueeze(1)).squeeze(1)
+        self.next_stone_pos[:, 1] = start_stone_pos_w[:, 1]
+        self.next_stone_pos[:, 2] = torch.gather(self.abs_z, 1, idx_next.unsqueeze(1)).squeeze(1)
+
+        # --- Next stepping stone ---
+        idx_next_next = torch.clamp(
             self.ith_step + 1, 
             max=STONES.num_stones + STONES.num_init_steps - 1
         )
-        
-        self.nextnext_stone_pos[:, 0] = torch.gather(self.abs_x, 1, idx_next.unsqueeze(1)).squeeze(1)
+
+        self.nextnext_stone_pos[:, 0] = torch.gather(self.abs_x, 1, idx_next_next.unsqueeze(1)).squeeze(1)
         self.nextnext_stone_pos[:, 1] = start_stone_pos_w[:, 1]
-        self.nextnext_stone_pos[:, 2] = torch.gather(self.abs_z, 1, idx_next.unsqueeze(1)).squeeze(1)
+        self.nextnext_stone_pos[:, 2] = torch.gather(self.abs_z, 1, idx_next_next.unsqueeze(1)).squeeze(1)
 
         from robot_rl.tasks.manager_based.robot_rl.constants import IS_DEBUG
         if IS_DEBUG:
@@ -144,6 +148,8 @@ class StonesCommandTerm(CommandTerm):
     
     def _debug_vis_callback(self, event):
         if self.debug_vis:
-            self.nextstone_visualizer.visualize(self.next_stone_pos,self.stone_quat)
-            self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos,self.stone_quat)
+            #for visualization, offset stone z position by half stone height
+            stone_center_offset = torch.tensor([0.0, 0.0, -self.cfg.nextstone_cfg.markers["nextstone"].size[2]/2.0], device=self.device)
+            self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
+            self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
             self.origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)

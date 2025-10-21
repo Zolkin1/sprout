@@ -159,7 +159,7 @@ class StonesTerrainGenerator:
             "rel_x": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative x distances between stones
             "rel_z": np.zeros((self.cfg.num_rows, self.cfg.num_cols, STONES.num_stones)),  # relative z distances between stones
             "start_stone_pos": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # start platform position in each sub-terrain
-            "origin": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 3)),  # origin position
+            "stone_x": np.zeros((self.cfg.num_rows, self.cfg.num_cols, 1)),  # stone x size 
         }
 
         # parse configuration and add sub-terrains
@@ -351,7 +351,7 @@ class StonesTerrainGenerator:
         self.terrain_infos["rel_x"][row, col] = terrain_info["rel_x"]
         self.terrain_infos["rel_z"][row, col] = terrain_info["rel_z"]
         self.terrain_infos["start_stone_pos"][row, col] = terrain_info["start_stone_pos"]
-        self.terrain_infos["origin"][row, col] = terrain_info["origin"]
+        self.terrain_infos["stone_x"][row, col] = terrain_info["stone_x"]
 
     def _get_terrain_mesh(self, difficulty: float, cfg: SubTerrainBaseCfg) -> tuple[trimesh.Trimesh, np.ndarray]:
         """Generate a sub-terrain mesh based on the input difficulty parameter.

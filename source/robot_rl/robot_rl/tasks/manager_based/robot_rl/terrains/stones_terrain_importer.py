@@ -47,7 +47,7 @@ class StonesTerrainImporter(TerrainImporter):
         self.env_terrain_infos: dict[str, torch.Tensor] = {}
         if self.cfg.terrain_generator.curriculum == False:
             raise RuntimeError("StonesTerrainImporter only supports curriculum learning currently.")
-
+        #assuming _compute_env_origins_curriculum has been called in configure_env_origins
         self.configure_env_infos(self.terrain_infos)
 
     def configure_env_infos(self, terrain_infos):
@@ -60,12 +60,12 @@ class StonesTerrainImporter(TerrainImporter):
         self.env_terrain_infos["rel_x"] = torch.zeros((num_envs,infos["rel_x"].shape[-1]), dtype=torch.float32, device=self.device)
         self.env_terrain_infos["rel_z"] = torch.zeros((num_envs,infos["rel_z"].shape[-1]), dtype=torch.float32, device=self.device)
         self.env_terrain_infos["start_stone_pos"] = torch.zeros((num_envs, 3), dtype=torch.float32, device=self.device)
-        self.env_terrain_infos["origin"] = torch.zeros((num_envs, 3), dtype=torch.float32, device=self.device)
+        self.env_terrain_infos["stone_x"] = torch.zeros((num_envs, 1), dtype=torch.float32, device=self.device)
 
         self.env_terrain_infos["rel_x"][:] = infos["rel_x"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["rel_z"][:] = infos["rel_z"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["start_stone_pos"][:] = infos["start_stone_pos"][self.terrain_levels, self.terrain_types]
-        self.env_terrain_infos["origin"][:] = infos["origin"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["stone_x"][:] = infos["stone_x"][self.terrain_levels, self.terrain_types]
 
         return infos
     
