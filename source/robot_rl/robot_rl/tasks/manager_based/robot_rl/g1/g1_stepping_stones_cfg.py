@@ -120,6 +120,12 @@ class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):
                 "output_command_name": "hlip_ref",
             },
             time_out=False)
+        z_com_too_low = DoneTerm(
+            func=mdp.com_z_too_low,
+            params={
+                "output_command_name": "hlip_ref",
+            },
+            time_out=False)
 
 @configclass
 class G1SteppingStonesEnvCfg(HumanoidEnvCfg):

@@ -42,7 +42,7 @@ def stones_sagittal_terrain_levels_vel(
     asset: Articulation = env.scene[asset_cfg.name]
     terrain = env.scene.terrain
     command = env.command_manager.get_command("base_velocity")
-    command_x_vel_lb = env.cfg.base_velocity.ranges.lin_vel_x[0]
+    command_x_vel_lb = env.cfg.commands.base_velocity.ranges.lin_vel_x[0]
     # compute the x distance the robot walked
     distance = torch.abs(asset.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0])
     # robots that walked far enough progress to harder terrains

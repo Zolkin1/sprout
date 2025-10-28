@@ -75,6 +75,40 @@ def solve_orbital_energy_batched(x: torch.Tensor, z_tilde: torch.Tensor, use_mom
         E = v**2 - (g / z_tilde) * (p**2)
     return E
 
+def solve_velocity_or_momentum_positive_from_E_batched(
+    E: torch.Tensor,
+    p: torch.Tensor,
+    z_tilde: torch.Tensor,
+    use_momentum: bool,
+    g: float = 9.81,
+):
+    """
+    Solve for positive CoM velocity (v) or angular momentum (L) given orbital energy E.
+
+    Args:
+        E: [N] orbital energy
+        p: [N] horizontal CoM position
+        z_tilde: [N] CoM height relative to slope
+        use_momentum: whether to solve for L (if True) or v (if False)
+        g: gravity constant
+
+    Returns:
+        v_or_L: [N] positive CoM velocity (if not use_momentum) or angular momentum (if use_momentum)
+    """
+    # Argument inside the square root
+    inner = E + (g / z_tilde) * (p**2)
+    if torch.any(inner < 0):
+        print("Warning: Negative value inside square root in solve_velocity_or_momentum_positive_batched")
+        inner[inner < 0] = 0.0  # Clamp to zero to avoid NaN
+
+    if use_momentum:
+        v_or_L = z_tilde * torch.sqrt(inner)
+    else:
+        v_or_L = torch.sqrt(inner)
+    if torch.isinf(v_or_L).any() or torch.isnan(v_or_L).any():
+        print("Warning: NaN or Inf in computed velocity or momentum in solve_velocity_or_momentum_positive_batched")
+    return v_or_L
+
 def solve_time2reach_pdes_batched(x0: torch.Tensor, pdes: torch.Tensor, z_tilde: torch.Tensor, use_momentum: bool,g: float = 9.81, eps: float = 1e-9, pos_tol: float = 1e-4):
     """
     Solve time to reach desired x com position in batch.
@@ -249,27 +283,45 @@ class HLIP_P2:
 
         return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
 
-    def get_desired_com_state_from_x0_sagittal(self, x0: torch.Tensor, time_in_step: torch.Tensor):
+    def get_com_state_from_x0_sagittal(self, x0: torch.Tensor, T: torch.Tensor):
         """
         Get desired com state from initial position x0 for sagittal plane
 
         Args:
             x0: Tensor of shape [N, 2] with initial states [p0, L0 or v0]
-            time_in_step: Tensor of shape [N] with time in current step 
+            T: Tensor of shape [N]
+
+        Returns: 
+            x(T)
+            com_x: Tensor of shape [N] with desired com x position 
+            com_dx: Tensor of shape [N] with desired com x velocity or momentum
+        """
+        t = torch.clamp(T, torch.zeros_like(self.TSS), self.TSS)
+        x_com_state = torch.matrix_exp(t.view(-1,1,1) * self.ASS) @ x0.unsqueeze(-1) #[N,2,1]
+
+        mask_ds = (T > self.TSS)
+        if torch.any(mask_ds):
+            x_prev = x_com_state[mask_ds] 
+            x_com_state[mask_ds] = torch.matrix_exp((T[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_prev
+        return x_com_state.squeeze(-1)[:, 0], x_com_state.squeeze(-1)[:, 1]
+    
+    def get_desired_com_state_from_end_of_SS_sagittal(self, xTSS:torch.Tensor, time2SSm:torch.Tensor):
+        """
+        Get desired com state from end of single support phase for sagittal plane
+
+        Args:
+            xTSS: Tensor of shape [N, 2] with states at end of single support [pTSS, L0 or vTSS]
+            time2SSm: Tensor of shape [N] with time to impact, i.e. SS minus
 
         Returns:
             com_x: Tensor of shape [N] with desired com x position
             com_dx: Tensor of shape [N] with desired com x velocity or momentum
         """
-        t = torch.clamp(time_in_step, 0, self.TSS)
-        x_com_state = torch.matrix_exp(t.view(-1,1,1) * self.ASS) @ x0.unsqueeze(-1) #[N,2,1]
+        t = torch.clamp(time2SSm, min=0.0)
+        x_com_state = torch.matrix_exp(-t.view(-1,1,1) * self.ASS) @ xTSS.unsqueeze(-1) #[N,2,1]
 
-        mask_ds = (time_in_step > self.TSS)
-        if torch.any(mask_ds):
-            x_prev = x_com_state[mask_ds] 
-            x_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_prev
         return x_com_state.squeeze(-1)[:, 0], x_com_state.squeeze(-1)[:, 1]
-
+    
     def get_desired_foot_placement(self, stance_idx: torch.Tensor, com_state: torch.Tensor = None):
         """Get desired foot placement based on stance index and center of mass state.
 
