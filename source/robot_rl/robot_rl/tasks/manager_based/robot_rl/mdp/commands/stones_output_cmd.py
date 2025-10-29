@@ -1009,8 +1009,8 @@ class StonesOutputCommandTerm(CommandTerm):
             self.nextstone_visualizer.set_visibility(True)
             self.nextnextstone_visualizer = VisualizationMarkers(self.cfg.nextnextstone_cfg)    
             self.nextnextstone_visualizer.set_visibility(True)
-            self.terrain_origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
-            self.terrain_origin_visualizer.set_visibility(True)
+            # self.terrain_origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
+            # self.terrain_origin_visualizer.set_visibility(True)
             
             #com frame visualizer
             self.comref_visualizer = VisualizationMarkers(self.cfg.comrefframe_cfg)
@@ -1024,8 +1024,8 @@ class StonesOutputCommandTerm(CommandTerm):
                 self.nextstone_visualizer.set_visibility(False)
             if hasattr(self, "nextnextstone_visualizer"):
                 self.nextnextstone_visualizer.set_visibility(False)
-            if hasattr(self, "terrain_origin_visualizer"):
-                self.terrain_origin_visualizer.set_visibility(False)    
+            # if hasattr(self, "terrain_origin_visualizer"):
+            #     self.terrain_origin_visualizer.set_visibility(False)    
             if hasattr(self, "comref_visualizer"):
                 self.comref_visualizer.set_visibility(False)    
         return
@@ -1041,5 +1041,5 @@ class StonesOutputCommandTerm(CommandTerm):
             stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
             self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
             self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
-            self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
+            # self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
             self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)

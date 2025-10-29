@@ -161,14 +161,14 @@ class StonesOutputCommandCfg(CommandTermCfg):
         },
     )
     
-    originframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/originframe",
-        markers={
-            "originframe": sim_utils.UsdFileCfg(
-                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
-                scale=(0.1, 0.1, 0.1),
-            )}
-    )
+    # originframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+    #     prim_path="/World/Visuals/originframe",
+    #     markers={
+    #         "originframe": sim_utils.UsdFileCfg(
+    #             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+    #             scale=(0.1, 0.1, 0.1),
+    #         )}
+    # )
     
     comrefframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/comrefframe",

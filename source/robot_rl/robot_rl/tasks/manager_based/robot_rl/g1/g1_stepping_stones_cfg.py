@@ -39,7 +39,9 @@ from robot_rl.tasks.manager_based.robot_rl.constants import STONES, TEST_FLAT
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import (
     ROUGH_SLOPED_FOR_FLAT_HZD_CFG,
 )
-
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation_stepping_stones import (
+    G1SteppingStonesObservationsCfg,
+)
 
         
 @configclass
@@ -132,9 +134,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
 
     rewards: G1RoughMlipRewards = G1RoughMlipRewards()
-    from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation_stepping_stones import (
-    G1SteppingStonesObservationsCfg,
-)
+
 
     observations: G1SteppingStonesObservationsCfg = G1SteppingStonesObservationsCfg()
     commands: G1RoughMlipCommandsCfg = G1RoughMlipCommandsCfg()
@@ -218,7 +218,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
-            "pose_range": {"x": (-0.3, 0.), "y": (-0.1, 0.1), "yaw": (-0.1, 0.1)},
+            "pose_range": {"x": (0., 0.), "y": (0., 0.), "yaw": (0., 0.)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
