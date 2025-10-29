@@ -78,6 +78,7 @@ class G1SteppingStonesObservationsCfg:
             ),
             scale=1.0,
         )
+        # stones_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
         height_scan = None  # Removed - not supported yet
 
     # observation groups

@@ -156,3 +156,9 @@ def sincos_phase_batched(env: ManagerBasedRLEnv, command_name: str) -> torch.Ten
 
     return torch.cat([sphase, cphase], dim=-1)
 
+def stones_position(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    cmd = env.command_manager.get_term(command_name)
+    curr_stone_pos = cmd.current_stone_pos
+    next_stone_pos = cmd.next_stone_pos
+
+    return torch.cat([curr_stone_pos, next_stone_pos], dim=-1)

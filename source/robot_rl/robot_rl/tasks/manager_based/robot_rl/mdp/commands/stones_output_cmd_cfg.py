@@ -124,14 +124,25 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
 
     # Visualization configurations
-    footprint_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/footprint",
+    #yellow foot-size cube
+    foottarget_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/foottarget",
         markers={
-            "swingfoot": sim_utils.CuboidCfg(
-                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+            "foottarget": sim_utils.CuboidCfg(
+                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0))
             )
         },
     )
+    #purple foot-size cube
+    swingfoot_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/swingfoot",
+        markers={
+            "swingfoot": sim_utils.CuboidCfg(
+                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.0, 1.0))
+            )
+        },
+    )
+    #red long cube
     nextstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/stone",
         markers={
@@ -140,6 +151,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
             )
         },
     )
+    #green long cube
     nextnextstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/nextstone",
         markers={
@@ -153,6 +165,15 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/originframe",
         markers={
             "originframe": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+                scale=(0.1, 0.1, 0.1),
+            )}
+    )
+    
+    comrefframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/comrefframe",
+        markers={
+            "comrefframe": sim_utils.UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
                 scale=(0.1, 0.1, 0.1),
             )}

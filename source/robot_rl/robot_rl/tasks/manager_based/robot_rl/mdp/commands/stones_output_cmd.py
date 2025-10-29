@@ -382,13 +382,21 @@ class StonesOutputCommandTerm(CommandTerm):
             
         mask_next_step = mask_next_step & torch.logical_not(reset_buf.bool()) #only mask next step for non-resetting envs, to avoid double update
         if torch.any(mask_next_step):
-            self.ith_step[mask_next_step] += 1 #next step, increment ith step
             self.reset_stance_swing_foot(mask_next_step)
+            self.ith_step[mask_next_step] += 1 #next step, increment ith step
+            
             if TEST_FLAT == False:
                 self.prev_stone_pos[mask_next_step] = self.current_stone_pos[mask_next_step]
                 self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[mask_next_step, 0:2] #update current stone x-y pos based on stance foot 
+                mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > STONES.stone_x
+                mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
+                mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
+                self.ith_step[mask_no_progress_this_step_global] -=1 #if no progress this step, do not increment ith step
+                
+                mask_update_z = torch.logical_not(mask_no_progress_this_step_global) & mask_next_step
                 #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
-                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step,2] 
+                self.current_stone_pos[mask_update_z, 2] = self.next_stone_pos[mask_update_z,2] 
+                
                 self.update_ithstep_stones_info(self.ith_step, mask_next_step, self.current_stone_pos) #update next and next-next stone pos
             self.reset_impact(mask_next_step)
         
@@ -447,7 +455,8 @@ class StonesOutputCommandTerm(CommandTerm):
             )
             tmp = self.cfg.eps * self.hdes - middle_term + self.hdes
             self.zcomf_des[mask] = self.z0[mask] + tmp[mask] / 2.0
-            self.zcom0_des[mask] = com_pos_target_yaw0[mask, 2] - self.stance_foot_pos_0[mask, 2]
+            #todo, for now, set com z initial reference to z0, in practice, relate to hdes
+            self.zcom0_des[mask] = self.z0[mask]  # com_pos_target_yaw0[mask, 2] - self.stance_foot_pos_0[mask, 2]
             #todo, used z_tilde now, but may need to change to z0
             #todo, also may need to change to real com z pos instead of z0
             z_tilde_mask = compute_z_tilde_batched(self.z0[mask], self.hdes[mask], self.ldes[mask], x0[mask,0])
@@ -520,13 +529,15 @@ class StonesOutputCommandTerm(CommandTerm):
             self.yaw_dot = base_vdes[:, 2]
             self.target_yaw = self.stance_foot_ori_0[:, 2] + self.delta_yaw
         else:
-            # P2 HLIP: uses only lateral vy, y_nom
+            # P2 HLIP: uses only lateral vy, y_nom; but in fact never update
             self.hlip.update_desired_walking(base_vdes[:,1], self.cfg.y_nom)
             # for stepping stones, always targeting zero yaw
             # todo: consider adding different terrain yaw and replace zeros_like below
             self.target_yaw = torch.zeros_like(self.stance_foot_ori_0[:, 2])
-            self.delta_yaw = self.target_yaw - self.stance_foot_ori_0[:, 2]
-            self.yaw_dot = self.delta_yaw / self.TSS
+            
+            self.yaw_dot = (self.target_yaw - self.stance_foot_ori_0[:, 2]) / self.TSS
+            self.delta_yaw = self.yaw_dot * self.phase_var.time_in_step
+        return
         
 
     def compute_actual(self):
@@ -660,21 +671,27 @@ class StonesOutputCommandTerm(CommandTerm):
             
             
         #com z 
-        self.compute_dzcomf_des()
-        #TODO: check if it is better to use true zcom0
-        cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des , 
-                                                torch.zeros_like(self.zcom0_des),
-                                                self.zcomf_des ,
-                                                self.dzcomf_des,
-                                                self.phase_var.dtau) #Shape: (N,4)
-        com_z, com_dz = cubic_spline_eval(cubic_comz_coeff, self.phase_var.tau, self.phase_var.dtau)
-
+        # self.compute_dzcomf_des()
+        # #TODO: check if it is better to use true zcom0
+        # cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des , 
+        #                                         torch.zeros_like(self.zcom0_des),
+        #                                         self.zcomf_des ,
+        #                                         self.dzcomf_des,
+        #                                         self.phase_var.dtau) #Shape: (N,4)
+        
+        # com_z, com_dz = cubic_spline_eval(cubic_comz_coeff, self.phase_var.tau, self.phase_var.dtau)
+        com_z = self.z0
+        com_dz = torch.zeros_like(com_z)
         # Concatenate x y z components
         com_pos_des = torch.stack(
             [com_x, com_y, com_z], dim=-1
         )  # Shape: (N,3)
         com_vel_des = torch.stack([com_dx, com_dy, com_dz], dim=-1)  # Shape: (N,3)
         foot_target = torch.stack([Ux, Uy, torch.zeros((N), device=self.device)], dim=-1) # Shape: (N,3)
+        self.com_frame_vis_pos = com_pos_des + self.stance_foot_pos_0  # Shape: (N,3)
+        self.com_frame_vis_quat = quat_from_euler_xyz(
+            pelvis_eulxyz[:, 0], pelvis_eulxyz[:, 1], pelvis_eulxyz[:, 2]
+        )  # Shape: (N,4)
         
 
         # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
@@ -769,9 +786,11 @@ class StonesOutputCommandTerm(CommandTerm):
         )
         
         if self.debug_vis:
-            self.swingfoot_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
+            self.foottarget_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
             self.quat_target_frame = quat_from_euler_xyz(torch.zeros_like(self.target_yaw), torch.zeros_like(self.target_yaw), self.target_yaw) #Shape: (N,4)
-            self.swingfoot_world_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
+            self.foottarget_vis_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
+            self.swingfoot_vis_pos = swing_foot_pos + self.stance_foot_pos_0
+            self.swingfoot_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
         return    
     
     def compute_desired_flat(self):
@@ -884,9 +903,11 @@ class StonesOutputCommandTerm(CommandTerm):
         )
         
         if self.debug_vis:
-            self.swingfoot_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
+            self.foottarget_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
             self.quat_target_frame = quat_from_euler_xyz(torch.zeros_like(self.target_yaw), torch.zeros_like(self.target_yaw), self.target_yaw) #Shape: (N,4)
-            self.swingfoot_world_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
+            self.foottarget_vis_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
+            self.swingfoot_vis_pos = swing_foot_pos + self.stance_foot_pos_0
+            self.swingfoot_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
         return
 
         
@@ -977,26 +998,36 @@ class StonesOutputCommandTerm(CommandTerm):
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
-            self.footprint_visualizer = VisualizationMarkers(self.cfg.footprint_cfg)
-            self.footprint_visualizer.set_visibility(True)
+            #foot target and swing foot intermediate visualizer
+            self.foottarget_visualizer = VisualizationMarkers(self.cfg.foottarget_cfg)
+            self.foottarget_visualizer.set_visibility(True)
+            self.swingfoot_visualizer = VisualizationMarkers(self.cfg.swingfoot_cfg)
+            self.swingfoot_visualizer.set_visibility(True)
             
             #stone related visualizer
             self.nextstone_visualizer = VisualizationMarkers(self.cfg.nextstone_cfg)
-            self.nextnextstone_visualizer = VisualizationMarkers(self.cfg.nextnextstone_cfg)
             self.nextstone_visualizer.set_visibility(True)
+            self.nextnextstone_visualizer = VisualizationMarkers(self.cfg.nextnextstone_cfg)    
             self.nextnextstone_visualizer.set_visibility(True)
+            self.terrain_origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
+            self.terrain_origin_visualizer.set_visibility(True)
             
-            self.origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
-            self.origin_visualizer.set_visibility(True)
+            #com frame visualizer
+            self.comref_visualizer = VisualizationMarkers(self.cfg.comrefframe_cfg)
+            self.comref_visualizer.set_visibility(True)
         else:
-            if hasattr(self, "footprint_visualizer"):
-                self.footprint_visualizer.set_visibility(False)
+            if hasattr(self, "foottarget_visualizer"):
+                self.foottarget_visualizer.set_visibility(False)
+            if hasattr(self, "swingfoot_visualizer"):
+                self.swingfoot_visualizer.set_visibility(False)    
             if hasattr(self, "nextstone_visualizer"):
                 self.nextstone_visualizer.set_visibility(False)
             if hasattr(self, "nextnextstone_visualizer"):
                 self.nextnextstone_visualizer.set_visibility(False)
-            if hasattr(self, "origin_visualizer"):
-                self.origin_visualizer.set_visibility(False)    
+            if hasattr(self, "terrain_origin_visualizer"):
+                self.terrain_origin_visualizer.set_visibility(False)    
+            if hasattr(self, "comref_visualizer"):
+                self.comref_visualizer.set_visibility(False)    
         return
     
     def _debug_vis_callback(self, event):
@@ -1005,8 +1036,10 @@ class StonesOutputCommandTerm(CommandTerm):
         if not self.robot.is_initialized:
             return
         if self.debug_vis:
-            self.footprint_visualizer.visualize(self.swingfoot_world_pos,self.swingfoot_quat)
+            self.foottarget_visualizer.visualize(self.foottarget_vis_pos,self.foottarget_vis_quat)
+            self.swingfoot_visualizer.visualize(self.swingfoot_vis_pos, self.swingfoot_vis_quat)
             stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
             self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
             self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
-            self.origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
+            self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
+            self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)
