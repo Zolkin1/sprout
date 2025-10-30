@@ -207,12 +207,19 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         # Randomization
         ##
         self.events.push_robot.params["velocity_range"] = {
-            "x": (-1, 1), 
-            "y": (-1, 1), 
+            "x": (-.5, 0.5), 
+            "y": (-0.2, 0.2), 
             "roll": (-0.4, 0.4),
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
         }
+        # self.events.push_robot.params["velocity_range"] = {
+        #     "x": (-1, 1), 
+        #     "y": (-1, 1), 
+        #     "roll": (-0.4, 0.4),
+        #     "pitch": (-0.4, 0.4),
+        #     "yaw": (-0.4, 0.4),
+        # }
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
@@ -233,7 +240,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         ##
         # Commands
         ##
-        self.commands.base_velocity.ranges.lin_vel_x = (0.5, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.6, 0.6) #TODO:set to E_star for now
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
 
