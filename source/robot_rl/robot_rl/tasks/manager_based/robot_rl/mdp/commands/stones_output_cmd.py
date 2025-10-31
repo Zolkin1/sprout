@@ -33,7 +33,7 @@ class YIdx(IntEnum):
     swing_foot_roll = 9
     swing_foot_pitch = 10
     swing_foot_yaw = 11
-    stance_foot_pitch = 12
+    
 
 
 if TYPE_CHECKING:
@@ -62,6 +62,43 @@ def compute_z_tilde_batched(zc: torch.Tensor, hdes: torch.Tensor, ldes: torch.Te
     nonzero_ldes_mask = ldes.abs() > ZERO_EPS
     z_tilde[nonzero_ldes_mask] = zc[nonzero_ldes_mask] - hdes[nonzero_ldes_mask] / ldes[nonzero_ldes_mask] * xcom_st[nonzero_ldes_mask]
     return z_tilde
+
+def convert_foot_pos_to_midsole(foot_pos: torch.Tensor, 
+                                mid_foot_offset: torch.Tensor, 
+                                foot_ori_quat: torch.Tensor) -> torch.Tensor:
+    """Convert foot position and velocity from foot origin frame to mid-sole frame.
+    foot_pos: (N, 3) tensor
+    mid_foot_offset: (3, ) tensor
+    foot_ori_quat: (N, 4) tensor
+    return:
+    midsole_pos: (N, 3) tensor
+    """
+    mid_foot_offset_world = quat_apply(foot_ori_quat, mid_foot_offset.unsqueeze(0).expand(foot_ori_quat.shape[0], -1))
+    midsole_pos = foot_pos + mid_foot_offset_world  # (N, 3)
+    return midsole_pos
+
+def convert_foot_pos_vel_to_midsole(foot_pos: torch.Tensor, 
+                                foot_vel: torch.Tensor, 
+                                mid_foot_offset: torch.Tensor, 
+                                foot_ori_quat: torch.Tensor,
+                                foot_omega_w: torch.Tensor) -> torch.Tensor:
+    """Convert foot position and velocity from foot origin frame to mid-sole frame.
+    foot_pos: (N, 3) tensor
+    foot_vel: (N, 3) tensor
+    mid_foot_offset: (3, ) tensor
+    foot_ori_quat: (N, 4) tensor
+    foot_omega_w: (N, 3) tensor
+    return:
+    midsole_pos: (N, 3) tensor
+    midsole_vel: (N, 3) tensor
+    """
+    mid_foot_offset_world = quat_apply(foot_ori_quat, mid_foot_offset.unsqueeze(0).expand(foot_ori_quat.shape[0], -1))
+    midsole_pos = foot_pos + mid_foot_offset_world  # (N, 3)
+    
+    midsole_vel = foot_vel + torch.cross(foot_omega_w, mid_foot_offset_world, dim=1)  # (N, 3)
+
+    return midsole_pos, midsole_vel
+
 
 class StonesOutputCommandTerm(CommandTerm):
     z0: torch.Tensor  # (num_envs,) nominal CoM height
@@ -102,6 +139,9 @@ class StonesOutputCommandTerm(CommandTerm):
     
     def __init__(self, cfg: "StonesOutputCommandCfg", env):
         super().__init__(cfg, env)
+
+        #mid foot offset from roll_link frame to foot mid sole frame
+        self.mid_foot_offset = torch.tensor([0.035, 0.0, -0.047558], device=self.device)
 
         self.z0 = torch.full((self.num_envs,), cfg.z0, device=self.device)
         self.y_nom = cfg.y_nom
@@ -275,7 +315,6 @@ class StonesOutputCommandTerm(CommandTerm):
         self.metrics["error_sw_roll"] = torch.abs(self.y_out[:, YIdx.swing_foot_roll] - self.y_act[:, YIdx.swing_foot_roll])
         self.metrics["error_sw_pitch"] = torch.abs(self.y_out[:, YIdx.swing_foot_pitch] - self.y_act[:, YIdx.swing_foot_pitch])
         self.metrics["error_sw_yaw"] = torch.abs(self.y_out[:, YIdx.swing_foot_yaw] - self.y_act[:, YIdx.swing_foot_yaw])
-        self.metrics["error_st_pitch"] = torch.abs(self.y_out[:, YIdx.stance_foot_pitch] - self.y_act[:, YIdx.stance_foot_pitch])
 
         self.metrics["error_com_x"] = torch.abs(self.y_out[:, YIdx.comx] - self.y_act[:, YIdx.comx])
         self.metrics["error_com_y"] = torch.abs(self.y_out[:, YIdx.comy] - self.y_act[:, YIdx.comy])
@@ -284,6 +323,7 @@ class StonesOutputCommandTerm(CommandTerm):
         self.metrics["error_pelvis_pitch"] = torch.abs(self.y_out[:, YIdx.pelvis_pitch] - self.y_act[:, YIdx.pelvis_pitch])
         self.metrics["error_pelvis_yaw"] = torch.abs(self.y_out[:, YIdx.pelvis_yaw] - self.y_act[:, YIdx.pelvis_yaw])
 
+        self.metrics["error_ub_joints"] = torch.abs(self.y_out[:, 12:] - self.y_act[:, 12:]).mean(dim=1)
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
         self.metrics["avg_clf"] = torch.mean(self.v_buffer, dim=-1)
@@ -384,7 +424,7 @@ class StonesOutputCommandTerm(CommandTerm):
             if TEST_FLAT == False:
                 self.prev_stone_pos[mask_next_step] = self.current_stone_pos[mask_next_step]
                 self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[mask_next_step, 0:2] #update current stone x-y pos based on stance foot 
-                # self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2] #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
+                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2] #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
                 # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > STONES.stone_x
                 # mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                 # mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
@@ -1088,8 +1128,14 @@ class StonesOutputCommandTerm(CommandTerm):
             #so that center of visualized block is at stone center
             stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
             self.currentstone_visualizer.visualize(self.current_stone_pos + stone_center_offset ,self.stone_quat)
-            self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
-            self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
+            next_stone_pos = self.current_stone_pos + stone_center_offset
+            next_stone_pos[:,0] += self.ldes
+            next_stone_pos[:,2] += self.hdes
+            self.nextstone_visualizer.visualize(next_stone_pos,self.stone_quat)
+            nextnext_stone_pos = self.current_stone_pos + stone_center_offset
+            nextnext_stone_pos[:,0] += self.ldes + self.ldes_next
+            nextnext_stone_pos[:,2] += self.hdes + self.hdes_next
+            self.nextnextstone_visualizer.visualize(nextnext_stone_pos,self.stone_quat)
             self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
             self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)
             

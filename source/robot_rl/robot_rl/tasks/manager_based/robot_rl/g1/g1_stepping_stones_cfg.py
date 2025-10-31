@@ -59,8 +59,8 @@ class CurriculumMlipCfg:
     # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
     
     # todo: stones curriculum
-    # if TEST_FLAT==False:
-    #     stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel)
+    if TEST_FLAT==False:
+        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel)
     
 
 
@@ -316,10 +316,15 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         self.observations.policy.enable_corruption = False
         # remove random pushing
         self.events.base_external_force_torque = None
-        # self.events.push_robot = None
-        self.events.push_robot.interval_range_s = (5.0, 5.0)
-        self.events.reset_base.params["pose_range"] = {
-            "x": (-0.3, 0.0),
-            "y": (-0.1, 0.1),
-            "yaw": (-0.1, 0.1),
-        }
+        self.events.push_robot = None
+        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.reset_base.params["pose_range"] = {
+        #     "x": (-0.3, 0.0),
+        #     "y": (-0.1, 0.1),
+        #     "yaw": (-0.1, 0.1),
+        # }
+        
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 4
+        self.scene.terrain.terrain_generator.difficulty_range = (0, 0.2)
+        self.scene.terrain.max_init_terrain_level = 5

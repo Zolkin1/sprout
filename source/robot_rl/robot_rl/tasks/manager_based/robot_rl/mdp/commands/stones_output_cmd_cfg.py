@@ -21,9 +21,9 @@ Q_weights = [
     10.0,  # pelvis_pitch pos, vel
     300.0,
     10.0,  # pelvis_yaw pos, vel
-    1500.0,
+    2500.0,
     125.0,  # swing_x pos, vel
-    1700.0,
+    2700.0,
     125.0,  # swing_y pos, vel
     3500.0,
     100.0,  # swing_z pos, vel
@@ -107,8 +107,8 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
     E_star: float = 0.6
     eps: float = 0.6 #xCOM position reference; xCOM_target[i]=eps*rel_x[i]
-    TSS_max: float = 0.4  # max step time (s)
-    TSS_min: float = 0.4  # min step time (s)
+    TSS_max: float = 0.5  # max step time (s)
+    TSS_min: float = 0.3  # min step time (s)
     
     foot_body_name: str = ".*_ankle_roll_link"
     upper_body_joint_name: list[str] = [

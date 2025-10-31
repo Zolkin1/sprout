@@ -49,7 +49,7 @@ def stones_sagittal_terrain_levels_vel(
     # compute the x forward distance the robot walked
     distance = asset.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0]
     # robots that walked far enough progress to harder terrains
-    move_up = distance > terrain.cfg.terrain_generator.size[0] / 2
+    move_up = distance > terrain.cfg.terrain_generator.size[0] * 0.9
     # robots that walked less than half of their required distance go to simpler terrains
     move_down = distance < command_x_vel_lb * env.max_episode_length_s * 0.5
     move_down *= ~move_up
