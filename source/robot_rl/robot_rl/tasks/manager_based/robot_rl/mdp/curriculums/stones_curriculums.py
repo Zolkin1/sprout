@@ -41,16 +41,19 @@ def stones_sagittal_terrain_levels_vel(
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     terrain = env.scene.terrain
+    if not getattr(terrain, "initialized", False):
+        terrain.initialized = True
+        return torch.mean(terrain.terrain_levels.float())
     command = env.command_manager.get_command("base_velocity")
     command_x_vel_lb = env.cfg.commands.base_velocity.ranges.lin_vel_x[0]
-    # compute the x distance the robot walked
-    distance = torch.abs(asset.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0])
+    # compute the x forward distance the robot walked
+    distance = asset.data.root_pos_w[env_ids, 0] - env.scene.env_origins[env_ids, 0]
     # robots that walked far enough progress to harder terrains
     move_up = distance > terrain.cfg.terrain_generator.size[0] / 2
     # robots that walked less than half of their required distance go to simpler terrains
     move_down = distance < command_x_vel_lb * env.max_episode_length_s * 0.5
     move_down *= ~move_up
     # update terrain levels
-    terrain.update_env_origins(env_ids, move_up, move_down)
+    terrain.update_env_origins_and_infos(env_ids, move_up, move_down)
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())

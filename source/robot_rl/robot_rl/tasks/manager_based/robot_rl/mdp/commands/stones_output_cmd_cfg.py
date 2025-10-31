@@ -9,8 +9,8 @@ from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 Q_weights = [
-    25.0,
-    200.0,  # com_x pos, vel
+    300.0,
+    50.0,  # com_x pos, vel
     300.0,
     50.0,  # com_y pos, vel
     400.0,
@@ -89,7 +89,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
     asset_name: str = "robot"
     yaw_idx: list[int] = [5, 11]
     debug_vis: bool = True  # enable debug visualization
-    z_sw_max: float = 0.1  # max swing foot z height (m); this is ankle height so different from actual foot position
+    z_sw_max: float = 0.2  # max swing foot z height (m); this is ankle height so different from actual foot position
     z_sw_min: float = 0.0
     v_history_len: int = 5
     pelv_pitch_ref: float = 0.0
@@ -142,6 +142,16 @@ class StonesOutputCommandCfg(CommandTermCfg):
             )
         },
     )
+    #organe long cube
+    currentstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/currentstone",
+        markers={
+            "currentstone": sim_utils.CuboidCfg(
+                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.5, 0.0))
+            )
+        },
+    )
+    
     #red long cube
     nextstone_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/stone",
@@ -161,14 +171,14 @@ class StonesOutputCommandCfg(CommandTermCfg):
         },
     )
     
-    # originframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
-    #     prim_path="/World/Visuals/originframe",
-    #     markers={
-    #         "originframe": sim_utils.UsdFileCfg(
-    #             usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
-    #             scale=(0.1, 0.1, 0.1),
-    #         )}
-    # )
+    originframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/originframe",
+        markers={
+            "originframe": sim_utils.UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+                scale=(0.1, 0.1, 0.1),
+            )}
+    )
     
     comrefframe_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/World/Visuals/comrefframe",

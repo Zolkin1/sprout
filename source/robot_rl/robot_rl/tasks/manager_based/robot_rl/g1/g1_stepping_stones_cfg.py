@@ -59,8 +59,8 @@ class CurriculumMlipCfg:
     # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
     
     # todo: stones curriculum
-    if TEST_FLAT==False:
-        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel)
+    # if TEST_FLAT==False:
+    #     stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel)
     
 
 

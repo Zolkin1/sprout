@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 IS_DEBUG = False
-TEST_FLAT = True
+TEST_FLAT = False
 ZERO_EPS = 1e-8
 
 @dataclass

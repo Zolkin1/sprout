@@ -384,14 +384,15 @@ class StonesOutputCommandTerm(CommandTerm):
             if TEST_FLAT == False:
                 self.prev_stone_pos[mask_next_step] = self.current_stone_pos[mask_next_step]
                 self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[mask_next_step, 0:2] #update current stone x-y pos based on stance foot 
-                mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > STONES.stone_x
-                mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
-                mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
-                self.ith_step[mask_no_progress_this_step_global] -=1 #if no progress this step, do not increment ith step
+                # self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2] #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
+                # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > STONES.stone_x
+                # mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
+                # mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
+                # self.ith_step[mask_no_progress_this_step_global] -=1 #if no progress this step, do not increment ith step
                 
-                mask_update_z = torch.logical_not(mask_no_progress_this_step_global) & mask_next_step
-                #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
-                self.current_stone_pos[mask_update_z, 2] = self.next_stone_pos[mask_update_z,2] 
+                # mask_update_z = torch.logical_not(mask_no_progress_this_step_global) & mask_next_step
+                # #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
+                # self.current_stone_pos[mask_update_z, 2] = self.next_stone_pos[mask_update_z,2] 
                 
                 self.update_ithstep_stones_info(self.ith_step, mask_next_step, self.current_stone_pos) #update next and next-next stone pos
             self.reset_impact(mask_next_step)
@@ -562,6 +563,9 @@ class StonesOutputCommandTerm(CommandTerm):
             
             self.yaw_dot = (self.target_yaw - self.stance_foot_ori_0[:, 2]) / self.TSS
             self.delta_yaw = self.yaw_dot * self.phase_var.time_in_step
+            # self.delta_yaw = base_vdes[:, 2] * self.phase_var.time_in_step
+            # self.yaw_dot = base_vdes[:, 2]
+            # self.target_yaw = self.stance_foot_ori_0[:, 2] + self.delta_yaw
         return
         
 
@@ -1044,12 +1048,14 @@ class StonesOutputCommandTerm(CommandTerm):
             self.swingfoot_visualizer.set_visibility(True)
             
             #stone related visualizer
+            self.currentstone_visualizer = VisualizationMarkers(self.cfg.currentstone_cfg)
+            self.currentstone_visualizer.set_visibility(True)
             self.nextstone_visualizer = VisualizationMarkers(self.cfg.nextstone_cfg)
             self.nextstone_visualizer.set_visibility(True)
             self.nextnextstone_visualizer = VisualizationMarkers(self.cfg.nextnextstone_cfg)    
             self.nextnextstone_visualizer.set_visibility(True)
-            # self.terrain_origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
-            # self.terrain_origin_visualizer.set_visibility(True)
+            self.terrain_origin_visualizer = VisualizationMarkers(self.cfg.originframe_cfg)
+            self.terrain_origin_visualizer.set_visibility(True)
             
             #com frame visualizer
             self.comref_visualizer = VisualizationMarkers(self.cfg.comrefframe_cfg)
@@ -1059,12 +1065,14 @@ class StonesOutputCommandTerm(CommandTerm):
                 self.foottarget_visualizer.set_visibility(False)
             if hasattr(self, "swingfoot_visualizer"):
                 self.swingfoot_visualizer.set_visibility(False)    
+            if hasattr(self, "currentstone_visualizer"):
+                self.currentstone_visualizer.set_visibility(False)
             if hasattr(self, "nextstone_visualizer"):
                 self.nextstone_visualizer.set_visibility(False)
             if hasattr(self, "nextnextstone_visualizer"):
                 self.nextnextstone_visualizer.set_visibility(False)
-            # if hasattr(self, "terrain_origin_visualizer"):
-            #     self.terrain_origin_visualizer.set_visibility(False)    
+            if hasattr(self, "terrain_origin_visualizer"):
+                self.terrain_origin_visualizer.set_visibility(False)    
             if hasattr(self, "comref_visualizer"):
                 self.comref_visualizer.set_visibility(False)    
         return
@@ -1077,8 +1085,11 @@ class StonesOutputCommandTerm(CommandTerm):
         if self.debug_vis:
             self.foottarget_visualizer.visualize(self.foottarget_vis_pos,self.foottarget_vis_quat)
             self.swingfoot_visualizer.visualize(self.swingfoot_vis_pos, self.swingfoot_vis_quat)
+            #so that center of visualized block is at stone center
             stone_center_offset = torch.tensor([0.0, 0.0, -STONES.stone_z/2.0], device=self.device)
+            self.currentstone_visualizer.visualize(self.current_stone_pos + stone_center_offset ,self.stone_quat)
             self.nextstone_visualizer.visualize(self.next_stone_pos + stone_center_offset ,self.stone_quat)
             self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos + stone_center_offset,self.stone_quat)
-            # self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
+            self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
             self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)
+            

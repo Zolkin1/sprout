@@ -52,8 +52,8 @@ class StonesTerrainImporter(TerrainImporter):
 
     def configure_env_infos(self, terrain_infos):
         """Configure environment with terrain info."""
-        terrain_infos_tensor = {k: torch.tensor(v, dtype=torch.float32, device=self.device) for k, v in terrain_infos.items()}
-        self._compute_env_infos_curriculum(self.cfg.num_envs, terrain_infos_tensor)
+        self.terrain_infos_tensor = {k: torch.tensor(v, dtype=torch.float32, device=self.device) for k, v in terrain_infos.items()}
+        self._compute_env_infos_curriculum(self.cfg.num_envs, self.terrain_infos_tensor)
         
     def _compute_env_infos_curriculum(self, num_envs: int, infos: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Compute environment infos for curriculum learning."""
@@ -69,3 +69,23 @@ class StonesTerrainImporter(TerrainImporter):
 
         return infos
     
+    def update_env_origins_and_infos(self, env_ids: torch.Tensor, move_up: torch.Tensor, move_down: torch.Tensor):
+        """Update the environment origins based on the terrain levels."""
+        # check if grid-like spawning
+        if self.terrain_origins is None:
+            return
+        # update terrain level for the envs
+        self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
+        # robots that solve the last level are sent to a random one
+        # the minimum level is zero
+        self.terrain_levels[env_ids] = torch.where(
+            self.terrain_levels[env_ids] >= self.max_terrain_level,
+            torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
+            torch.clip(self.terrain_levels[env_ids], 0),
+        )
+        # update the env origins
+        self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
+        self.env_terrain_infos["rel_x"][:] = self.terrain_infos_tensor["rel_x"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["rel_z"][:] = self.terrain_infos_tensor["rel_z"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["start_stone_pos"][:] = self.terrain_infos_tensor["start_stone_pos"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["stone_x"][:] = self.terrain_infos_tensor["stone_x"][self.terrain_levels, self.terrain_types]
