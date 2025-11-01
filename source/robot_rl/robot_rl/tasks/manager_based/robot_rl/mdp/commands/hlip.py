@@ -123,8 +123,8 @@ def solve_time2reach_pdes_batched(x0: torch.Tensor, pdes: torch.Tensor, z_tilde:
     Returns:
         t: [N] time to reach desired com position    
     """
-    
-    p0 = x0[:, 0]
+
+    p0 = x0[:, 0].clone()
     lam = torch.sqrt(g / z_tilde)  # [N]
 
     # skip if target and current pos are nearly identical
@@ -183,9 +183,9 @@ class HLIP_P2:
         
         self.update_hlip(z0, TSS, TDS)
     def update_hlip(self, z0:torch.Tensor, TSS:torch.Tensor, TDS:torch.Tensor):
-        self.z0 = z0
-        self.TSS = TSS
-        self.TDS = TDS
+        self.z0 = z0.clone()
+        self.TSS = TSS.clone()
+        self.TDS = TDS.clone()
         self.T = TSS + TDS
 
         self.ASS = self.A2_ss(z0, self.grav, self.use_momentum)
@@ -278,33 +278,30 @@ class HLIP_P2:
         y_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_ds_plus[mask_ds]
         
         #if SS, integrate backward from end of SS
-        x_ss_minus = x_ds_plus #happens to be the same at the beginning of DS
+        x_ss_minus = x_ds_plus #happens to be the same at the beginning of DS, safe since read-only 
         y_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus[mask_ss]
 
         return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
 
     def get_com_state_from_x0_sagittal(self, x0: torch.Tensor, T: torch.Tensor):
         """
-        Get desired com state from initial position x0 for sagittal plane
+        Get desired com state from initial position x0 for sagittal plane.
 
         Args:
             x0: Tensor of shape [N, 2] with initial states [p0, L0 or v0]
             T: Tensor of shape [N]
 
-        Returns: 
-            x(T)
-            com_x: Tensor of shape [N] with desired com x position 
-            com_dx: Tensor of shape [N] with desired com x velocity or momentum
+        Returns:
+            com_x: Tensor of shape [N] with desired com x position
+            com_dx_or_L: Tensor of shape [N] with desired com x velocity (if use_momentum=False) or angular momentum (if use_momentum=True)
         """
         t = torch.clamp(T, torch.zeros_like(self.TSS), self.TSS)
         x_com_state = torch.matrix_exp(t.view(-1,1,1) * self.ASS) @ x0.unsqueeze(-1) #[N,2,1]
 
         mask_ds = (T > self.TSS)
         if torch.any(mask_ds):
-            x_prev = x_com_state[mask_ds] 
-            x_com_state[mask_ds] = torch.matrix_exp((T[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_prev
+            x_com_state[mask_ds] = torch.matrix_exp((T[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_com_state[mask_ds] 
         return x_com_state.squeeze(-1)[:, 0], x_com_state.squeeze(-1)[:, 1]
-    
     def get_desired_com_state_from_end_of_SS_sagittal(self, xTSS:torch.Tensor, time2SSm:torch.Tensor):
         """
         Get desired com state from end of single support phase for sagittal plane
@@ -339,7 +336,7 @@ class HLIP_P2:
         if self.use_feedback:
             if com_state is None:
                 raise ValueError("com_state must be provided when use_feedback is True")
-            xdes_p2 = self.xdes_p2_left
+            xdes_p2 = self.xdes_p2_left.clone()
             xdes_p2[stance_idx == 1] = self.xdes_p2_right[stance_idx == 1]
             udes_p2 += (self.K @ (xdes_p2 - com_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)
 
@@ -407,12 +404,12 @@ class HLIP_3D(HLIP_P2):
         y_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_ds_plus_p2[mask_ds]
 
         #if SS, integrate backward from end of SS
-        x_ss_minus_p2 = x_ds_plus_p2 #happens to be the same at the beginning of DS
+        x_ss_minus_p2 = x_ds_plus_p2 #happens to be the same at the beginning of DS, safe since read-only
         y_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus_p2[mask_ss]
-        
-        x_ds_plus_p1 = self.xdes_p1
+
+        x_ds_plus_p1 = self.xdes_p1.clone()
         x_com_state[mask_ds] = torch.matrix_exp((time_in_step[mask_ds] - self.TSS[mask_ds]).view(-1,1,1) * self.ADS[mask_ds]) @ x_ds_plus_p1[mask_ds]
-        x_ss_minus_p1 = x_ds_plus_p1 #happens to be the same at the beginning of DS
+        x_ss_minus_p1 = x_ds_plus_p1 #happens to be the same at the beginning of DS, safe since read-only
         x_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus_p1[mask_ss]
 
         return x_com_state.squeeze(-1)[:, 0], x_com_state.squeeze(-1)[:, 1], y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
@@ -438,7 +435,7 @@ class HLIP_3D(HLIP_P2):
         if self.use_feedback:
             if xcom_state is None or ycom_state is None:
                 raise ValueError("xcom_state and ycom_state must be provided when use_feedback is True")
-            xdes_p2 = self.xdes_p2_left
+            xdes_p2 = self.xdes_p2_left.clone()
             xdes_p2[stance_idx == 1] = self.xdes_p2_right[stance_idx == 1]
             udes_p2 += (self.K @ (xdes_p2 - ycom_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)
             udes_p1 += (self.K @ (self.xdes_p1 - xcom_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)

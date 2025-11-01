@@ -326,5 +326,5 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0, 0.2)
-        self.scene.terrain.max_init_terrain_level = 5
+        self.scene.terrain.terrain_generator.difficulty_range = (0, 0.5)
+        

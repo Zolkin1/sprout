@@ -24,8 +24,9 @@ def finished_long_stones(env, output_command_name: str) -> torch.Tensor:
     distance = torch.norm(current_st_foot_pos_xz - end_stone_pos_xz, dim=1)
 
     termination_flag = distance < 0.01  # close enough to last stone (x<10cm)
-    if torch.any(termination_flag):
-         print(f"Finished stepping stones for {termination_flag.sum().item()} environments.")
+   #  termination_flag = (current_st_foot_pos[:, 0] - output_command.abs_x[:, -1]) > 0.0
+   #  if torch.any(termination_flag):
+   #       print(f"Finished stepping stones for {termination_flag.sum().item()} environments.")
     return termination_flag
 
 def long_stones_deviation(env,output_command_name: str) -> torch.Tensor:

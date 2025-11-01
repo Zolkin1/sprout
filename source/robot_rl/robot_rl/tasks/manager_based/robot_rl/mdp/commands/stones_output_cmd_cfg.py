@@ -102,7 +102,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
     
     
-    z0: float = 0.67  # CoM height (m)
+    z0: float = 0.72  # CoM height (m)
     y_nom: float = 0.25  # nominal lateral foot offset (m)
     
     E_star: float = 0.6
@@ -138,7 +138,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/swingfoot",
         markers={
             "swingfoot": sim_utils.CuboidCfg(
-                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.5, 0.0, 1.0))
+                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.0, 1.0))
             )
         },
     )
