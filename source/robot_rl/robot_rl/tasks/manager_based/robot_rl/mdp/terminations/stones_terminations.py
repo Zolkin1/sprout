@@ -18,13 +18,10 @@ def finished_long_stones(env, output_command_name: str) -> torch.Tensor:
     output_command = env.command_manager.get_term(output_command_name)
     # --- Current and target positions (x–z) ---
     current_st_foot_pos = output_command.stance_foot_pos_0 # (num_envs, 3)
-    current_st_foot_pos_xz = current_st_foot_pos[:, [0, 2]]
-    end_stone_pos_xz = torch.stack([output_command.abs_x[:, -1], 
-                                 output_command.abs_z[:, -1]], dim=1) # (num_envs, 2)
-    distance = torch.norm(current_st_foot_pos_xz - end_stone_pos_xz, dim=1)
+    terrain = env.scene.terrain
+    distance = current_st_foot_pos[:, 0] - env.scene.env_origins[:, 0]
 
-    termination_flag = distance < 0.01  # close enough to last stone (x<10cm)
-   #  termination_flag = (current_st_foot_pos[:, 0] - output_command.abs_x[:, -1]) > 0.0
+    termination_flag = distance > terrain.cfg.terrain_generator.size[0] * 0.95
    #  if torch.any(termination_flag):
    #       print(f"Finished stepping stones for {termination_flag.sum().item()} environments.")
     return termination_flag

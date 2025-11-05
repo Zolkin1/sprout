@@ -60,7 +60,10 @@ class CurriculumMlipCfg:
     
     # todo: stones curriculum
     if TEST_FLAT==False:
-        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel)
+        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel, 
+                                     params={
+                                            "output_command_name": "hlip_ref",
+                                             },)
     
 
 

@@ -734,6 +734,9 @@ class StonesOutputCommandTerm(CommandTerm):
         #compute post-impact x com pos: p_plus
         x_plus = x_sagittal_minus - self.ldes
         
+        if torch.any(self.ldes==0):
+            print("Warning: ldes is zero in dzcomf_des computation!")
+        
         z0LIPplus_real = com_now[:,2] - self.hdes - x_plus * self.hdes_next / self.ldes_next
         z0LIPplus_des = self.zcomf_des - self.hdes - x_plus * self.hdes_next / self.ldes_next
         z0_interp = self.phase_var.tau * z0LIPplus_real + (1.0 - self.phase_var.tau) * z0LIPplus_des
@@ -747,8 +750,13 @@ class StonesOutputCommandTerm(CommandTerm):
             self.dzcomf_des[:] = (state2_sagittal_plus - state2_sagittal_minus + self.hdes * vx_com_now) / self.ldes
         else:
             self.dzcomf_des[:] = ((state2_sagittal_plus - state2_sagittal_minus)*z0_interp + self.hdes * vx_com_now) / self.ldes 
-        
-        return 
+            
+        if torch.any(self.dzcomf_des.isnan()):
+            print("Warning: dzcomf_des is NaN in dzcomf_des computation!")
+        self.dzcomf_des = torch.clamp(self.dzcomf_des, 
+                                       min=-torch.ones_like(self.hdes) * 1.0, 
+                                       max=torch.ones_like(self.hdes) * 1.0)
+        return
 
     def compute_desired_stones(self):
         N = self.num_envs
@@ -870,17 +878,17 @@ class StonesOutputCommandTerm(CommandTerm):
         com_x_target_frame, com_dx_target_frame = cubic_spline_eval(cubic_comx_coeff, self.phase_var.tau, self.phase_var.dtau)    
             
         #com z 
-        # self.compute_dzcomf_des()
-        # #TODO: check if it is better to use true zcom0
-        # cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des , 
-        #                                         torch.zeros_like(self.zcom0_des),
-        #                                         self.zcomf_des ,
-        #                                         self.dzcomf_des,
-        #                                         self.phase_var.dtau) #Shape: (N,4)
+        self.compute_dzcomf_des()
+        #TODO: check if it is better to use true zcom0
+        cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des , 
+                                                torch.zeros_like(self.zcom0_des),
+                                                self.zcomf_des ,
+                                                self.dzcomf_des,
+                                                self.phase_var.dtau) #Shape: (N,4)
         
-        # com_z, com_dz = cubic_spline_eval(cubic_comz_coeff, self.phase_var.tau, self.phase_var.dtau)
-        com_z_w = self.z0
-        com_dz_w = torch.zeros_like(com_z_w)
+        com_z_w, com_dz_w = cubic_spline_eval(cubic_comz_coeff, self.phase_var.tau, self.phase_var.dtau)
+        # com_z_w = self.z0
+        # com_dz_w = torch.zeros_like(com_z_w)
         # Concatenate x y z components
         com_pos_des = torch.stack(
             [com_x_target_frame, com_y_target_frame, com_z_w], dim=-1
