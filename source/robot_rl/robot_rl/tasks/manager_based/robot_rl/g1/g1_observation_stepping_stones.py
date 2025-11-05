@@ -31,6 +31,13 @@ class G1SteppingStonesObservationsCfg:
         sin_cos_phase = ObsTerm(func=mdp.sincos_phase_batched, params={"command_name": "hlip_ref"})
         
         stones_rel_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
+        
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            clip=(-1.0, 1.0),
+        )
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
@@ -81,7 +88,12 @@ class G1SteppingStonesObservationsCfg:
             scale=1.0,
         )
         stones_rel_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
-        height_scan = None  # Removed - not supported yet
+        height_scan = ObsTerm(
+            func=mdp.height_scan,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1),
+            clip=(-1.0, 1.0),
+        )
 
     # observation groups
     policy: PolicyCfg = PolicyCfg()

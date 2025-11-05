@@ -21,9 +21,9 @@ Q_weights = [
     10.0,  # pelvis_pitch pos, vel
     300.0,
     10.0,  # pelvis_yaw pos, vel
-    2500.0,
+    3500.0,
     125.0,  # swing_x pos, vel
-    2700.0,
+    1700.0,
     125.0,  # swing_y pos, vel
     3500.0,
     100.0,  # swing_z pos, vel

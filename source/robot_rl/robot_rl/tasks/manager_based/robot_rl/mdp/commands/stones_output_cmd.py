@@ -444,14 +444,14 @@ class StonesOutputCommandTerm(CommandTerm):
                 # self.current_stone_pos[mask_update_z, 2] = self.next_stone_pos[mask_update_z,2] 
                 
                 self.update_ithstep_stones_info(self.ith_step, mask_next_step, self.current_stone_pos) #update next and next-next stone pos
-                too_far_mask_local = self.ldes[mask_next_step] < 0.0
+                too_far_mask_local = self.ldes[mask_next_step] <= 0.0
                 while torch.any(too_far_mask_local):
                     too_far_mask_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                     too_far_mask_global[mask_next_step] = too_far_mask_local
                     # print("Warning: ldes is negative!")
-                    self.ith_step[too_far_mask_global] +=1 #if ldes is negative, skip this stone by incrementing ith_step again
+                    self.ith_step[too_far_mask_global] +=1 #if ldes is negative or zero, skip this stone by incrementing ith_step again
                     self.update_ithstep_stones_info(self.ith_step, too_far_mask_global, self.current_stone_pos)
-                    too_far_mask_local = self.ldes[mask_next_step] < 0.0  
+                    too_far_mask_local = self.ldes[mask_next_step] <= 0.0  
             self.reset_impact(mask_next_step)
         
         if torch.any(mask_reset_buf):
