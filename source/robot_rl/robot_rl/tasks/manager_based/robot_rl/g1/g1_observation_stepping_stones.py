@@ -31,6 +31,21 @@ class G1SteppingStonesObservationsCfg:
         sin_cos_phase = ObsTerm(func=mdp.sincos_phase_batched, params={"command_name": "hlip_ref"})
         
         stones_rel_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
+        # foot_positions = ObsTerm(
+        #     func=mdp.foot_positions_in_base,
+        #     params={"command_name": "hlip_ref"},
+        #     noise=Unoise(n_min=-0.01, n_max=0.01),
+        # )
+        
+        # foot_velocities = ObsTerm(
+        #     func=mdp.foot_velocities_in_base,
+        #     params={"command_name": "hlip_ref"},
+        #     noise=Unoise(n_min=-0.05, n_max=0.05),
+        # )
+        # contact_state = ObsTerm(
+        #     func=mdp.contact_state,
+        #     params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+        # )
         
         height_scan = ObsTerm(
             func=mdp.height_scan,
@@ -91,7 +106,6 @@ class G1SteppingStonesObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.height_scan,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            noise=Unoise(n_min=-0.1, n_max=0.1),
             clip=(-1.0, 1.0),
         )
 

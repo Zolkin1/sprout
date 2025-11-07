@@ -393,7 +393,10 @@ class StonesOutputCommandTerm(CommandTerm):
         self.ldes[mask] = self.next_stone_pos[mask, 0] - current_stone_pos[mask, 0]
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
         self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
-
+        # self.hdes[mask] = 0.0
+        # self.ldes[mask] = 0.3
+        # self.hdes_next[mask] = 0.0
+        # self.ldes_next[mask] = 0.3
         done_mask_local = ithstep[mask] >= (STONES.num_stones + STONES.num_init_steps - 2)
         if torch.any(done_mask_local):
             # Set fallback values for those envs

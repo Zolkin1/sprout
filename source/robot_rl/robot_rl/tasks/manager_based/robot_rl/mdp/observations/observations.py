@@ -164,3 +164,54 @@ def stones_position(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     # return torch.cat([curr_stone_pos, next_stone_pos], dim=-1)
     return diff
+
+def foot_positions_in_base(env: ManagerBasedRLEnv, command_name: str = "hlip_ref") -> torch.Tensor:
+    """Foot positions relative to base frame."""
+    cmd = env.command_manager.get_term(command_name)
+    
+    # Get foot positions in world frame
+    left_foot_pos_w = cmd.robot.data.body_pos_w[:, cmd.feet_bodies_idx[0], :]
+    right_foot_pos_w = cmd.robot.data.body_pos_w[:, cmd.feet_bodies_idx[1], :]
+    
+    # Get base position and quaternion
+    base_pos_w = cmd.robot.data.root_pos_w
+    base_quat_w = cmd.robot.data.root_quat_w
+    
+    # Transform to base frame
+    from isaaclab.utils.math import subtract_frame_transforms, quat_apply_inverse
+    
+    # Get relative positions
+    left_foot_pos_rel = left_foot_pos_w - base_pos_w
+    right_foot_pos_rel = right_foot_pos_w - base_pos_w
+    
+    # Rotate to base frame
+    left_foot_pos_base = quat_apply_inverse(base_quat_w, left_foot_pos_rel)
+    right_foot_pos_base = quat_apply_inverse(base_quat_w, right_foot_pos_rel)
+    
+    # Concatenate [left_x, left_y, left_z, right_x, right_y, right_z]
+    foot_positions = torch.cat([left_foot_pos_base, right_foot_pos_base], dim=-1)
+    
+    return foot_positions
+
+
+def foot_velocities_in_base(env: ManagerBasedRLEnv, command_name: str = "hlip_ref") -> torch.Tensor:
+    """Foot velocities relative to base frame."""
+    cmd = env.command_manager.get_term(command_name)
+    
+    # Get foot velocities in world frame
+    left_foot_vel_w = cmd.robot.data.body_lin_vel_w[:, cmd.feet_bodies_idx[0], :]
+    right_foot_vel_w = cmd.robot.data.body_lin_vel_w[:, cmd.feet_bodies_idx[1], :]
+    
+    # Get base quaternion to rotate to base frame
+    base_quat_w = cmd.robot.data.root_quat_w
+    
+    # Rotate to base frame
+    from isaaclab.utils.math import quat_apply_inverse
+    
+    left_foot_vel_base = quat_apply_inverse(base_quat_w, left_foot_vel_w)
+    right_foot_vel_base = quat_apply_inverse(base_quat_w, right_foot_vel_w)
+    
+    # Concatenate [left_vx, left_vy, left_vz, right_vx, right_vy, right_vz]
+    foot_velocities = torch.cat([left_foot_vel_base, right_foot_vel_base], dim=-1)
+    
+    return foot_velocities

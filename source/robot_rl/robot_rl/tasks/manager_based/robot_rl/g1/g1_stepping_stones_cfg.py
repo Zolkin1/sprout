@@ -131,6 +131,10 @@ class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):
                 "output_command_name": "hlip_ref",
             },
             time_out=False)
+        # stationary_too_long = DoneTerm(
+        #     func=mdp.stationary_termination,
+        #     params={"velocity_threshold": 0.1, "duration_threshold": 2.0},  # 2 seconds
+        #     time_out=False)
 
 @configclass
 class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
@@ -169,7 +173,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                 border_width=1.0,
                 border_height=0.0,
                 num_rows=10,
-                num_cols=40,
+                num_cols=60,
                 horizontal_scale=0.1,
                 vertical_scale=0.0005,
                 slope_threshold=0.75,
@@ -201,9 +205,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
             )
         else:
             self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-        # self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
 
-        # No height scanner for now
         
         self.scene.height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
@@ -211,7 +213,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.0, 1.0]),
         debug_vis=True,
-        mesh_prim_paths=["/World/ground"],
+        mesh_prim_paths=["/World/ground/terrain_stones"],
         )
 
         ##
@@ -337,5 +339,5 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
+        self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)
         

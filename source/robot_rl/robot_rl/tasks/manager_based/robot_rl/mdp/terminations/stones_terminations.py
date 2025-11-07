@@ -73,3 +73,36 @@ def com_z_too_low(env, output_command_name: str) -> torch.Tensor:
    #  if torch.any(termination_flag):
    #     print(f"Zcom too low termination triggered for {termination_flag.sum().item()} environments.")
     return termination_flag
+ 
+ 
+def stationary_termination(env, velocity_threshold: float, duration_threshold: float) -> torch.Tensor:
+    """Terminate if robot is stationary for too long.
+    
+    Args:
+        env: The environment.
+        velocity_threshold: Minimum velocity magnitude (m/s) to be considered moving.
+        duration_threshold: Maximum time (s) allowed to be stationary.
+    
+    Returns:
+        Boolean tensor indicating which environments should terminate.
+    """
+    # Initialize stationary time tracker if needed
+    if not hasattr(env, '_stationary_time'):
+        env._stationary_time = torch.zeros(env.num_envs, device=env.device)
+    
+    # Get current base velocity
+    base_vel = env.scene.articulations["robot"].data.root_lin_vel_w[:, :2]  # XY only
+    speed = torch.norm(base_vel, dim=-1)
+    
+    # Check if stationary
+    is_stationary = speed < velocity_threshold
+    
+    # Update stationary time
+    env._stationary_time = torch.where(
+        is_stationary,
+        env._stationary_time + env.step_dt,  # increment
+        torch.zeros_like(env._stationary_time)  # reset
+    )
+    
+    # Terminate if stationary for too long
+    return env._stationary_time > duration_threshold
