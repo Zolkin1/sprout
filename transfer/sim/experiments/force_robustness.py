@@ -87,12 +87,12 @@ def main():
     # Run all the simulations
     run_logs = []
 
-    NUM_FORCES = 24
-    NUM_ANGLES = 24
+    NUM_FORCES = 10 #24
+    NUM_ANGLES = 1 #10 #24
 
     successes = np.empty((NUM_FORCES, NUM_ANGLES))
-    force_mags = np.linspace(100, 300, NUM_FORCES)
-    angles = np.linspace(0, 2*np.pi, NUM_ANGLES)
+    force_mags = np.linspace(275, 400, NUM_FORCES)
+    angles = np.linspace(-np.pi, -np.pi, NUM_ANGLES) #2*np.pi
 
     for i in range(NUM_FORCES):
         for j in range(NUM_ANGLES):

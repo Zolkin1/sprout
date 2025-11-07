@@ -63,7 +63,7 @@ class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
 
         # self.curriculum.clf_curriculum.params = {
         #     "min_max_err": (0.1,0.1),
-        #     "scale": (0.001,0.001),
+        #     "scale": (0.01,0.01),
         #     "update_interval": 20000
         # }
 
@@ -127,26 +127,31 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         super().__post_init__()
         
         self.scene.num_envs = 2
-        self.scene.env_spacing = 2.5
-        self.observations.policy.enable_corruption = False
-        self.scene.terrain.size = (3,3)
-        self.scene.terrain.border_width = 0.0
-        self.scene.terrain.num_rows = 3
-        self.scene.terrain.num_cols = 2
-        # self.scene.terrain.terrain_type = "plane"
-        # self.scene.terrain.terrain_generator = None
+        # self.scene.env_spacing = 2.5
+        # self.observations.policy.enable_corruption = False
+        # self.scene.terrain.size = (3,3)
+        # self.scene.terrain.border_width = 0.0
+        # self.scene.terrain.num_rows = 3
+        # self.scene.terrain.num_cols = 2
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
 
-        self.events.randomize_ground_contact_friction = None
-        self.events.add_base_mass = None
-        self.events.base_com = None
+        # self.events.randomize_ground_contact_friction = None
+        # self.events.add_base_mass = None
+        # self.events.base_com = None
         self.events.base_external_force_torque = None
         self.events.push_robot = None
-        
-        
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.75, 0.75)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
-        self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
-        self.events.reset_base.params["pose_range"]["x"] = (-3,3)
-        self.events.reset_base.params["pose_range"]["y"] = (-3,3)
+        # Increase the base COM randomization
+        self.events.base_com.params["com_range"]["x"] = (-0.15, 0.15)
+        self.events.base_com.params["com_range"]["y"] = (-0.15, 0.15)
+        
+        self.commands.base_velocity.ranges.lin_vel_x = (0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
+
+        self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
+        self.events.reset_base.params["pose_range"]["x"] = (0,0)
+        self.events.reset_base.params["pose_range"]["y"] = (0,0)
+
+        self.seed = 41

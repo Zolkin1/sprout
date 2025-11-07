@@ -7,7 +7,7 @@ import numpy as np
 
 from sim.log_utils import extract_data
 
-PLOT_MEANS = False
+PLOT_MEANS = True
 
 def get_index(time_vec, time: float):
     """Gets the index associated with a given time."""
@@ -104,13 +104,13 @@ def main():
             ## Mean plots
             # Get the steady state mean
             ss_idx_start = get_index(time, 13)
-            ss_idx_end = get_index(time, 17) #time.size
+            ss_idx_end = get_index(time, 18) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
             
             ss_idx_start = get_index(time, 7)
-            ss_idx_end = get_index(time, 11) #time.size
+            ss_idx_end = get_index(time, 12) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")

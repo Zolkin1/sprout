@@ -67,7 +67,7 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
         "font.serif": ["Computer Modern Roman"],
     })
 
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5),sharex=True)
+    fig, ax = plt.subplots(1, 1, figsize=(13, 5),sharex=True)
     colors = plt.cm.tab10.colors
 
     first_label = next(iter(grouped_data))
@@ -98,8 +98,8 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
 
 
     commanded = grouped_data[first_label][0]["commanded_vel"][:, 0]
-    ax.plot(time, commanded, 'k--', linewidth=2)
-    custom_handles.append((Line2D([0], [0], color='k', linestyle='--'), dummy_patch))
+    ax.plot(time, commanded, 'k-', linewidth=2)
+    custom_handles.append((Line2D([0], [0], color='k', linestyle='-'), dummy_patch))
     custom_labels.append(r"$v_x^d$")
 
     ax.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
@@ -146,10 +146,10 @@ if __name__ == "__main__":
     label_override = {k: v for k, v in zip(default_labels, default_legends)}
 
     # Optionally manually override here
-    label_override.update({"mass_randomization_g1_21j_config_baseline_custom": "Custom Baseline"})
-    label_override.update({"mass_randomization_g1_21j_config_baseline": "Unitree Baseline"})
-    # label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
-    # label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline_custom": "Custom BL"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline": "Unitree BL"})
+    label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
+    label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
 
     if len(grouped_data) == 0:
         print("No data found. Check experiment folder structure and naming.")

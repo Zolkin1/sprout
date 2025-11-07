@@ -348,6 +348,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 plt.savefig(os.path.join(save_dir, f'positions_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
+
         # --- Velocities (dy_out vs dy_act) ---
         if 'dy_out' in processed_data and 'dy_act' in processed_data:
             n_dims = processed_data['dy_out'].shape[2]
@@ -378,6 +379,37 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'velocities_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- Velocity Tracking Error (dy_act - dy_out) ---
+        if 'dy_out' in processed_data and 'dy_act' in processed_data:
+            n_dims = processed_data['dy_out'].shape[2]
+            velocity_error = processed_data['dy_act'] - processed_data['dy_out']
+            if trajectory_type == 'end_effector':
+                title = f'Velocity Tracking Error (Actual - Reference) (Env {env_id})'
+            else:
+                title = f'Velocity Tracking Error (Actual - Reference) (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, velocity_error[:, env_id, i], linewidth=2, color='red')
+                ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
+                label = state_labels['dy_out'][i] if i < len(state_labels['dy_out']) else f'Dimension {i}'
+                unit = units['dy_out'][i] if i < len(units['dy_out']) else ''
+                ax.set_title(f'{label} Error', fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel(f'Error ({unit})')
+                ax.grid(True, alpha=0.3)
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'velocity_tracking_error_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
         # --- Base Velocity ---
@@ -460,6 +492,216 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'error_metrics_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
+
+    # --- Position Tracking Error (y_act - y_out) - All Environments ---
+    if 'y_out' in processed_data and 'y_act' in processed_data:
+        n_dims = processed_data['y_out'].shape[2]
+        position_error = processed_data['y_act'] - processed_data['y_out']
+
+        # Start plotting from time step 50
+        start_idx = 50
+        time_steps_subset = time_steps[start_idx:]
+        position_error_subset = position_error[start_idx:, :, :]
+
+        # Calculate mean and std across all environments
+        mean_error = np.mean(position_error_subset, axis=1)  # Shape: [time_steps, n_dims]
+        std_error = np.std(position_error_subset, axis=1)    # Shape: [time_steps, n_dims]
+
+        if trajectory_type == 'end_effector':
+            title = 'Position Tracking Error (Actual - Reference) - All Environments'
+        else:
+            title = 'Position Tracking Error (Actual - Reference) - All Environments'
+
+        n_cols = 4
+        n_rows = (n_dims + n_cols - 1) // n_cols
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+        fig.suptitle(title, fontsize=16)
+        axs = np.array(axs)
+
+        for i in range(n_dims):
+            ax = get_ax(axs, i, n_cols)
+
+            # Plot mean error
+            ax.plot(time_steps_subset, mean_error[:, i], linewidth=2, color='red', label='Mean Error')
+
+            # Plot shaded region for ±1 std
+            ax.fill_between(time_steps_subset,
+                           mean_error[:, i] - std_error[:, i],
+                           mean_error[:, i] + std_error[:, i],
+                           alpha=0.3, color='red', label='±1 Std Dev')
+
+            # Add zero reference line
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
+
+            label = state_labels['y_out'][i] if i < len(state_labels['y_out']) else f'Dimension {i}'
+            unit = units['y_out'][i] if i < len(units['y_out']) else ''
+            ax.set_title(f'{label} Error', fontsize=10)
+            ax.set_xlabel('Time Steps')
+            ax.set_ylabel(f'Error ({unit})')
+            ax.grid(True, alpha=0.3)
+
+            if i == 0:
+                ax.legend(loc='best')
+
+        for i in range(n_dims, n_rows * n_cols):
+            ax = get_ax(axs, i, n_cols)
+            ax.set_visible(False)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_dir:
+            plt.savefig(os.path.join(save_dir, 'position_tracking_error_all_envs.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    # --- Velocity Tracking Error (dy_act - dy_out) - All Environments ---
+    if 'dy_out' in processed_data and 'dy_act' in processed_data:
+        n_dims = processed_data['dy_out'].shape[2]
+        velocity_error = processed_data['dy_act'] - processed_data['dy_out']
+
+        # Start plotting from time step 50
+        start_idx = 50
+        time_steps_subset = time_steps[start_idx:]
+        velocity_error_subset = velocity_error[start_idx:, :, :]
+
+        # Calculate mean and std across all environments
+        mean_error = np.mean(velocity_error_subset, axis=1)  # Shape: [time_steps, n_dims]
+        std_error = np.std(velocity_error_subset, axis=1)    # Shape: [time_steps, n_dims]
+
+        if trajectory_type == 'end_effector':
+            title = 'Velocity Tracking Error (Actual - Reference) - All Environments'
+        else:
+            title = 'Velocity Tracking Error (Actual - Reference) - All Environments'
+
+        n_cols = 4
+        n_rows = (n_dims + n_cols - 1) // n_cols
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+        fig.suptitle(title, fontsize=16)
+        axs = np.array(axs)
+
+        for i in range(n_dims):
+            ax = get_ax(axs, i, n_cols)
+
+            # Plot mean error
+            ax.plot(time_steps_subset, mean_error[:, i], linewidth=2, color='red', label='Mean Error')
+
+            # Plot shaded region for ±1 std
+            ax.fill_between(time_steps_subset,
+                           mean_error[:, i] - std_error[:, i],
+                           mean_error[:, i] + std_error[:, i],
+                           alpha=0.3, color='red', label='±1 Std Dev')
+
+            # Add zero reference line
+            ax.axhline(y=0, color='k', linestyle='--', alpha=0.3, linewidth=1)
+
+            label = state_labels['dy_out'][i] if i < len(state_labels['dy_out']) else f'Dimension {i}'
+            unit = units['dy_out'][i] if i < len(units['dy_out']) else ''
+            ax.set_title(f'{label} Error', fontsize=10)
+            ax.set_xlabel('Time Steps')
+            ax.set_ylabel(f'Error ({unit})')
+            ax.grid(True, alpha=0.3)
+
+            if i == 0:
+                ax.legend(loc='best')
+
+        for i in range(n_dims, n_rows * n_cols):
+            ax = get_ax(axs, i, n_cols)
+            ax.set_visible(False)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_dir:
+            plt.savefig(os.path.join(save_dir, 'velocity_tracking_error_all_envs.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    # --- Velocity Tracking Error Standard Deviation Over Time - All Environments ---
+    if 'dy_out' in processed_data and 'dy_act' in processed_data:
+        n_dims = processed_data['dy_out'].shape[2]
+        velocity_error = processed_data['dy_act'] - processed_data['dy_out']
+
+        # Start plotting from time step 50
+        start_idx = 50
+        time_steps_subset = time_steps[start_idx:]
+        velocity_error_subset = velocity_error[start_idx:, :, :]
+
+        # Calculate std across all environments
+        std_error = np.std(velocity_error_subset, axis=1)    # Shape: [time_steps, n_dims]
+
+        if trajectory_type == 'end_effector':
+            title = 'Velocity Tracking Error Standard Deviation Over Time - All Environments'
+        else:
+            title = 'Velocity Tracking Error Standard Deviation Over Time - All Environments'
+
+        n_cols = 4
+        n_rows = (n_dims + n_cols - 1) // n_cols
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+        fig.suptitle(title, fontsize=16)
+        axs = np.array(axs)
+
+        for i in range(n_dims):
+            ax = get_ax(axs, i, n_cols)
+
+            # Plot std error over time
+            ax.plot(time_steps_subset, std_error[:, i], linewidth=2, color='blue')
+
+            label = state_labels['dy_out'][i] if i < len(state_labels['dy_out']) else f'Dimension {i}'
+            unit = units['dy_out'][i] if i < len(units['dy_out']) else ''
+            ax.set_title(f'{label} Std Dev', fontsize=10)
+            ax.set_xlabel('Time Steps')
+            ax.set_ylabel(f'Std Dev ({unit})')
+            ax.grid(True, alpha=0.3)
+
+        for i in range(n_dims, n_rows * n_cols):
+            ax = get_ax(axs, i, n_cols)
+            ax.set_visible(False)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_dir:
+            plt.savefig(os.path.join(save_dir, 'velocity_tracking_error_std_over_time.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
+
+    # --- Position Tracking Error Standard Deviation Over Time - All Environments ---
+    if 'y_out' in processed_data and 'y_act' in processed_data:
+        n_dims = processed_data['y_out'].shape[2]
+        position_error = processed_data['y_act'] - processed_data['y_out']
+
+        # Start plotting from time step 50
+        start_idx = 50
+        time_steps_subset = time_steps[start_idx:]
+        position_error_subset = position_error[start_idx:, :, :]
+
+        # Calculate std across all environments
+        std_error = np.std(position_error_subset, axis=1)    # Shape: [time_steps, n_dims]
+
+        if trajectory_type == 'end_effector':
+            title = 'Position Tracking Error Standard Deviation Over Time - All Environments'
+        else:
+            title = 'Position Tracking Error Standard Deviation Over Time - All Environments'
+
+        n_cols = 4
+        n_rows = (n_dims + n_cols - 1) // n_cols
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+        fig.suptitle(title, fontsize=16)
+        axs = np.array(axs)
+
+        for i in range(n_dims):
+            ax = get_ax(axs, i, n_cols)
+
+            # Plot std error over time
+            ax.plot(time_steps_subset, std_error[:, i], linewidth=2, color='blue')
+
+            label = state_labels['y_out'][i] if i < len(state_labels['y_out']) else f'Dimension {i}'
+            unit = units['y_out'][i] if i < len(units['y_out']) else ''
+            ax.set_title(f'{label} Std Dev', fontsize=10)
+            ax.set_xlabel('Time Steps')
+            ax.set_ylabel(f'Std Dev ({unit})')
+            ax.grid(True, alpha=0.3)
+
+        for i in range(n_dims, n_rows * n_cols):
+            ax = get_ax(axs, i, n_cols)
+            ax.set_visible(False)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        if save_dir:
+            plt.savefig(os.path.join(save_dir, 'position_tracking_error_std_over_time.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
 
 
 def plot_hzd_trajectories(data, save_dir=None):

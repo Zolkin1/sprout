@@ -68,7 +68,7 @@ def main():
 
     # Create robot instance
     robot_instance = Robot(robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"),
-                           input_function=smooth_ramp) #speed_steps)
+                           input_function=speed_steps) #speed_steps)
 
     # Create and run simulation
     sim = Simulation(policy, robot_instance, log=config.get("log", False),
