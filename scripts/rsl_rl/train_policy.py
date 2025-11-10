@@ -17,6 +17,8 @@ ENVIRONMENTS = {
     "hzd_clf_custom": "G1-hzd-clf-custom",
     "hzd_clf_minimum": "G1-hzd-clf-minimum",
     "stepping_stone": "G1-steppingstone",
+    "stepping_stone_distillation": "G1-steppingstone-distillation",
+    "stepping_stone_finetune": "G1-steppingstone-finetune",
 }
 
 EXPERIMENT_NAMES = {
@@ -32,6 +34,8 @@ EXPERIMENT_NAMES = {
     "hzd_clf_custom": "hzd",
     "hzd_clf_minimum": "hzd",
     "stepping_stone": "stepping_stone",
+    "stepping_stone_distillation": "stepping_stone",
+    "stepping_stone_finetune": "stepping_stone",
 }
 
 
@@ -53,6 +57,12 @@ def parse_args():
     parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
     parser.add_argument(
         "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+    )
+    parser.add_argument(
+        "--agent", 
+        type=str, 
+        default="rsl_rl_cfg_entry_point", 
+        help="Name of the RL agent configuration entry point."
     )
     # append RSL-RL cli arguments
     cli_args.add_rsl_rl_args(parser)
@@ -156,12 +166,13 @@ def main():
     )
     from isaaclab.utils.dict import print_dict
     from isaaclab.utils.io import dump_pickle, dump_yaml
-    from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+    import omni
+    from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
     from isaaclab_tasks.utils.hydra import hydra_task_config
 
-    import robot_rl.tasks  # noqa: F401
-    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
-    from rsl_rl.runners import OnPolicyRunner
+    import robot_rl.tasks
+
+    from rsl_rl.runners import OnPolicyRunner, DistillationRunner
 
     # Configure PyTorch
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -169,8 +180,8 @@ def main():
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = False
 
-    @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-    def train(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
+    @hydra_task_config(args_cli.task, args_cli.agent)
+    def train(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         """Train with RSL-RL agent."""
         # Override configurations with non-hydra CLI arguments
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -194,7 +205,7 @@ def main():
         # Create organized directory structure for logging
 
         base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
-        log_root_path = os.path.join(base_log_path, args_cli.env_type)
+        log_root_path = os.path.join(base_log_path, EXPERIMENT_NAMES[args_cli.env_type])
         log_root_path = os.path.abspath(log_root_path)
         print(f"[INFO] Logging experiment in directory: {log_root_path}")
 
@@ -204,6 +215,10 @@ def main():
             log_dir += f"_{agent_cfg.run_name}"
         log_dir = os.path.join(log_root_path, log_dir)
 
+ 
+
+        # set the log directory for the environment (works for all environment types)
+        env_cfg.log_dir = log_dir
         # Create environment
         if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
             env_cfg.__prepare_tensors__()
@@ -214,9 +229,8 @@ def main():
             env = multi_agent_to_single_agent(env)
 
         # Handle resume path
-        if agent_cfg.resume_path or agent_cfg.algorithm.class_name == "Distillation":
-            resume_path = agent_cfg.resume_path
-            agent_cfg.resume = True
+        if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
         # Setup video recording if enabled
         if args_cli.video:
@@ -233,8 +247,14 @@ def main():
         # Wrap environment for rsl-rl
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-        # Create and configure runner
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        # create runner from rsl-rl
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        # write git state to logs
         runner.add_git_repo_to_log(__file__)
 
         # Load checkpoint if resuming

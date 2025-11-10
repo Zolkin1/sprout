@@ -21,6 +21,8 @@ SIM_ENVIRONMENTS = {
     "mlip_clf": "G1-MLIP-ref-play",
     "hzd_clf_custom": "G1-hzd-clf-play",
     "stepping_stone": "G1-steppingstone-play",
+    "stepping_stone_distillation": "G1-steppingstone-distillation-play",
+    "stepping_stone_finetune": "G1-steppingstone-finetune-play"
 }
 
 
@@ -83,7 +85,9 @@ def parse_args():
     parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
     parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
     parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-
+    parser.add_argument(
+        "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+    )
     parser.add_argument(
         "--export_policy", action="store_true", default=False, help="Export the policy to ONNX and JIT formats."
     )
@@ -192,17 +196,18 @@ def main():
     from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
     from isaaclab.utils.dict import print_dict
     from isaaclab_rl.rsl_rl import (
-        RslRlOnPolicyRunnerCfg,
+        RslRlBaseRunnerCfg,
         RslRlVecEnvWrapper,
         export_policy_as_jit,
         export_policy_as_onnx,
     )
     from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
-
     import robot_rl.tasks  # noqa: F401
+    from isaaclab_tasks.utils.hydra import hydra_task_config
 
-    from rsl_rl.runners import OnPolicyRunner
-    # from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+
+    from rsl_rl.runners import OnPolicyRunner,DistillationRunner
+
 
     print("[DEBUG] Modules imported successfully")
 
@@ -221,13 +226,13 @@ def main():
         env_cfg.commands.base_velocity.ranges.lin_vel_y = (args_cli.sim_speed[1], args_cli.sim_speed[1])
         env_cfg.commands.base_velocity.ranges.ang_vel_z = (args_cli.sim_speed[2], args_cli.sim_speed[2])
 
-    agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
+    agent_cfg: RslRlBaseRunnerCfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     print("[DEBUG] Configurations parsed")
 
     # specify directory for logging experiments
 
     base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
-    log_root_path = os.path.join(base_log_path, args_cli.env_type)
+    log_root_path = os.path.join(base_log_path, EXPERIMENT_NAMES[args_cli.env_type])
     log_root_path = os.path.abspath(log_root_path)
     print(f"[DEBUG] Log root path: {log_root_path}")
 
@@ -281,43 +286,38 @@ def main():
 
     print(f"[DEBUG] Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    if agent_cfg.class_name == "OnPolicyRunner":
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    elif agent_cfg.class_name == "DistillationRunner":
+        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    else:
+        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    runner.load(resume_path)
 
     # obtain the trained policy for inference
-    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # Export policy if requested
-    if args_cli.export_policy:
-        if ppo_runner.alg.policy.__class__.__name__ == "ActorCriticCNN":
-            from robot_rl.network.exporter import (
-                export_policy_as_jit,
-                export_policy_as_onnx,
-            )
+    # extract the neural network module
+    # we do this in a try-except to maintain backwards compatibility.
+    try:
+        # version 2.3 onwards
+        policy_nn = runner.alg.policy
+    except AttributeError:
+        # version 2.2 and below
+        policy_nn = runner.alg.actor_critic
 
-        print("[DEBUG] Exporting policy to ONNX and JIT formats")
-        # extract the neural network module
-        # we do this in a try-except to maintain backwards compatibility.
-        try:
-            # version 2.3 onwards
-            policy_nn = ppo_runner.alg.policy
-        except AttributeError:
-            # version 2.2 and below
-            policy_nn = ppo_runner.alg.actor_critic
+    # extract the normalizer
+    if hasattr(policy_nn, "actor_obs_normalizer"):
+        normalizer = policy_nn.actor_obs_normalizer
+    elif hasattr(policy_nn, "student_obs_normalizer"):
+        normalizer = policy_nn.student_obs_normalizer
+    else:
+        normalizer = None
 
-        # extract the normalizer
-        if hasattr(policy_nn, "actor_obs_normalizer"):
-            normalizer = policy_nn.actor_obs_normalizer
-        elif hasattr(policy_nn, "student_obs_normalizer"):
-            normalizer = policy_nn.student_obs_normalizer
-        else:
-            normalizer = None
-
-        # export policy to onnx/jit
-        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-        print(f"[DEBUG] Policy exported to {export_model_dir}")
+    # export policy to onnx/jit
+    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
     dt = env.unwrapped.step_dt
 
@@ -338,7 +338,7 @@ def main():
     ]
 
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or args_cli.env_type == "stepping_stone":
+    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or args_cli.env_type == "stepping_stone" or args_cli.env_type == "stepping_stone_distillation" or args_cli.env_type == "stepping_stone_finetune":
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"

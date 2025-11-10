@@ -152,6 +152,24 @@ if not _registered:
         },
     )
     gym.register(
+        id="G1-steppingstone-distillation",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1_custom_stepping_stones_distillation",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_distillation_cfg:G1DistillationRunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-steppingstone-finetune",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1_custom_stepping_stones_finetune",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPOFinetuneRunnerCfg",
+        },
+    )
+    gym.register(
         id="G1-steppingstone-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
@@ -160,7 +178,23 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
-    
-    
+    gym.register(
+        id="G1-steppingstone-distillation-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1_custom_stepping_stones_distillation_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_distillation_cfg:G1DistillationRunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-steppingstone-finetune-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1_custom_stepping_stones_finetune_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
 
     _registered = True

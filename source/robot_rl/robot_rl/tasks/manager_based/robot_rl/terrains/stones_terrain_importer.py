@@ -32,13 +32,15 @@ class StonesTerrainImporter(TerrainImporter):
                 cfg=self.cfg.terrain_generator, device=self.device
             )
             self.import_mesh("terrain_stones", terrain_generator.terrain_mesh)
-            self._configure_stepping_stones_visual()
+            
             # configure the terrain origins based on the terrain generator
             self.configure_env_origins(terrain_generator.terrain_origins)
             # refer to the flat patches
             self._terrain_flat_patches = terrain_generator.flat_patches
-            self.import_ground_plane("terrain_flat")
-            self._configure_flat_collision()
+            
+            # self._configure_stepping_stones_visual()
+            # self.import_ground_plane("terrain_flat")
+            # self._configure_flat_collision()
             
             
         else:

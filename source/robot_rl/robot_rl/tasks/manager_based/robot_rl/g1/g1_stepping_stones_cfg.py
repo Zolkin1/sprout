@@ -40,7 +40,9 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.rough import (
     ROUGH_SLOPED_FOR_FLAT_HZD_CFG,
 )
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation_stepping_stones import (
-    G1SteppingStonesObservationsCfg,
+    G1SteppingStonesObservationsTeacherCfg,
+    G1SteppingStonesObservationsDistillationCfg,
+    G1SteppingStonesObservationsFinetuneCfg
 )
 
         
@@ -131,10 +133,7 @@ class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):
                 "output_command_name": "hlip_ref",
             },
             time_out=False)
-        # stationary_too_long = DoneTerm(
-        #     func=mdp.stationary_termination,
-        #     params={"velocity_threshold": 0.1, "duration_threshold": 2.0},  # 2 seconds
-        #     time_out=False)
+
 
 @configclass
 class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
@@ -143,7 +142,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
     rewards: G1RoughMlipRewards = G1RoughMlipRewards()
 
 
-    observations: G1SteppingStonesObservationsCfg = G1SteppingStonesObservationsCfg()
+    observations: G1SteppingStonesObservationsTeacherCfg = G1SteppingStonesObservationsTeacherCfg()
     commands: G1RoughMlipCommandsCfg = G1RoughMlipCommandsCfg()
     curriculum: CurriculumMlipCfg = CurriculumMlipCfg()
     terminations: G1SteppingStonesTerminationsCfg = G1SteppingStonesTerminationsCfg()
@@ -203,6 +202,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                 ),
                 debug_vis=False,
             )
+            self.terminations.time_out = None
         else:
             self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
@@ -301,6 +301,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
 
 
 class G1_custom_stepping_stones(G1SteppingStonesEnvCfg):
+    observations: G1SteppingStonesObservationsTeacherCfg = G1SteppingStonesObservationsTeacherCfg()
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
@@ -315,6 +316,21 @@ class G1_custom_stepping_stones(G1SteppingStonesEnvCfg):
                 "operation": "add",
             },
         )
+class G1_custom_stepping_stones_distillation(G1SteppingStonesEnvCfg):
+    observations: G1SteppingStonesObservationsDistillationCfg = G1SteppingStonesObservationsDistillationCfg()
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.observations = G1SteppingStonesObservationsDistillationCfg()
+        self.scene.terrain.max_init_terrain_level = 6
+        self.curriculum.stones_curriculum=None
+
+class G1_custom_stepping_stones_finetune(G1SteppingStonesEnvCfg):
+    observations: G1SteppingStonesObservationsFinetuneCfg = G1SteppingStonesObservationsFinetuneCfg()
+    def __post_init__(self):
+        # Post init of parent
+        super().__post_init__()
+        self.observations = G1SteppingStonesObservationsFinetuneCfg()
 
 class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
     def __post_init__(self) -> None:
@@ -341,3 +357,52 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         self.scene.terrain.terrain_generator.num_cols = 4
         self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)
         
+class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_distillation):
+    def __post_init__(self) -> None:
+        # post init of parent
+        super().__post_init__()
+
+        # make a smaller scene for play
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+
+        # disable randomization for play
+        self.observations.policy.enable_corruption = False
+        # remove random pushing
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.reset_base.params["pose_range"] = {
+        #     "x": (-0.3, 0.0),
+        #     "y": (-0.1, 0.1),
+        #     "yaw": (-0.1, 0.1),
+        # }
+        
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 4
+        self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)
+
+class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune):
+    def __post_init__(self) -> None:
+        # post init of parent
+        super().__post_init__()
+
+        # make a smaller scene for play
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+
+        # disable randomization for play
+        self.observations.policy.enable_corruption = False
+        # remove random pushing
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.reset_base.params["pose_range"] = {
+        #     "x": (-0.3, 0.0),
+        #     "y": (-0.1, 0.1),
+        #     "yaw": (-0.1, 0.1),
+        # }
+        
+        self.scene.terrain.terrain_generator.num_rows = 1
+        self.scene.terrain.terrain_generator.num_cols = 4
+        self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)        
