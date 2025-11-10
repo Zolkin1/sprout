@@ -38,7 +38,7 @@ class BasicStonesTerrainCfg(SubTerrainBaseCfg):
         return stone_y, stone_z
 
 @configclass
-class LongStonesFlatTerrainCfg(BasicStonesTerrainCfg):
+class LongStonesFlatTerrainCfg(BasicStonesTerrainCfg): #flat stones terrain
     def resample(self, difficulty):
         """Resample relative distances for each stone given difficulty."""
         # interpolate rel_stone_z_range with difficulty
@@ -49,30 +49,30 @@ class LongStonesFlatTerrainCfg(BasicStonesTerrainCfg):
         return
 
 @configclass
-class LongStonesTerrainCfg(BasicStonesTerrainCfg):
+class LongStonesTerrainCfg(BasicStonesTerrainCfg): #stepping stones terrain with vertical variation
     def resample(self, difficulty):
         """Resample relative distances for each stone given difficulty."""
-        self.rel_stone_x_range = (STONES.rel_stone_x_min, STONES.rel_stone_x_max)
+        self.rel_stone_x_range = (STONES.rel_stone_x_min, STONES.rel_stone_x_min + (STONES.rel_stone_x_max - STONES.rel_stone_x_min)*difficulty)
         self.rel_stone_z_range = (-STONES.rel_stone_z_max*difficulty, STONES.rel_stone_z_max*difficulty)
         
-        # interpolate stone_x size with difficulty
-        max_val = STONES.rel_stone_x_max  # fill all gap
-        min_val = self.stone_target_x  # base size at hardest
-        stone_x = (1 - difficulty) * max_val + difficulty * min_val
+        # # interpolate stone_x size with difficulty
+        # max_val = STONES.rel_stone_x_min  # fill all gap
+        # min_val = self.stone_target_x  # base size at hardest
+        stone_x = np.random.uniform(self.stone_length_min, STONES.rel_stone_x_min)
         
         stone_y, stone_z = self.resample_basic()
         self.stone_size = (stone_x, stone_y, stone_z)
         return
         
 @configclass
-class StairsTerrainCfg(BasicStonesTerrainCfg):
-    stair_x_min: float = 0.25
-    stair_x_max: float = 0.5
-    stair_z_max: float = 0.3
+class StairsTerrainCfg(BasicStonesTerrainCfg): #stairs
+    stair_x_min: float = 0.2 #typical 0.254 - 0.28
+    stair_x_max: float = 0.3
+    stair_z_max: float = 0.2 #typical stairs 0.177 - 0.203
     is_upstairs: bool = True
     def resample(self, difficulty):
         stone_y, stone_z = self.resample_basic()
-        rel_x = STONES.rel_stone_x_min + (STONES.rel_stone_x_max - STONES.rel_stone_x_min)*difficulty
+        rel_x = self.stair_x_min + (self.stair_x_max - self.stair_x_min)*difficulty
         self.rel_stone_x_range = (rel_x, rel_x)
         rel_z = difficulty * self.stair_z_max * (2 * self.is_upstairs -1)
         self.rel_stone_z_range = (rel_z, rel_z)

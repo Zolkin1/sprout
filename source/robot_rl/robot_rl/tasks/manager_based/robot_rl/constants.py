@@ -14,7 +14,7 @@ class StonesConfig:
    
    rel_stone_x_min = 0.3
    rel_stone_x_max = 0.7
-   rel_stone_z_max = 0.1  # relative z distance range between stones
+   rel_stone_z_max = 0.2  # relative z distance range between stones
    start_platform_x = 1.0
    num_init_steps = 2
    terrain_size_x = num_stones * rel_stone_x_max +  start_platform_x #terrain size in x direction
