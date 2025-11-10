@@ -5,7 +5,6 @@ from isaaclab.utils import configclass
 
 
 from .stones_output_cmd import StonesOutputCommandTerm
-from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 Q_weights = [
@@ -147,7 +146,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/currentstone",
         markers={
             "currentstone": sim_utils.CuboidCfg(
-                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.5, 0.0))
+                size=(0.2, 0.5, 0.12), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.5, 0.0))
             )
         },
     )
@@ -157,7 +156,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/stone",
         markers={
             "nextstone": sim_utils.CuboidCfg(
-                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+                size=(0.2, 0.5, 0.12), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
             )
         },
     )
@@ -166,7 +165,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/nextstone",
         markers={
             "nextnextstone": sim_utils.CuboidCfg(
-                size=(STONES.stone_x, STONES.stone_y/2.0, STONES.stone_z*1.2), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+                size=(0.2, 0.5, 0.12), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
             )
         },
     )

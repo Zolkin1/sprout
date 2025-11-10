@@ -6,55 +6,75 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones import long_
 from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 import numpy as np
 
-
 @configclass
-class LongStonesTerrainCfg(SubTerrainBaseCfg):
-    """Configuration for a terrain with a long stones pattern."""
-
-    function = long_stones_terrain_with_platform_underneath #long_stones_terrain
-
+class BasicStonesTerrainCfg(SubTerrainBaseCfg):
+    """Basic configuration for a terrain with stones pattern."""
+    function = long_stones_terrain_with_platform_underneath  # to be defined
+    size: tuple[float, float] = (STONES.terrain_size_x, STONES.terrain_size_y)  # (x,y) overall terrain size
     num_stones: int = STONES.num_stones
     num_init_steps: int = STONES.num_init_steps
-    stone_size: tuple[float, float, float] = (STONES.stone_x, STONES.stone_y, STONES.stone_z)  # (x,y,z) size of each stone
+    
+    stone_size: tuple[float, float, float] = (0.0, 0.0, 0.0)  # (x,y,z) size of each stone
     rel_stone_x_range: tuple[float, float] = (0.0, 0.0)
     rel_stone_z_range: tuple[float, float] = (0.0, 0.0)
-    start_platform_size: tuple[float, float, float] = (STONES.start_platform_x, STONES.stone_y, STONES.stone_z)
+    start_platform_size: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    underneath_platform_z: float = 0.0  # z pos of the underneath platform relative to stone top
+
     
-    stone_target_x: float = STONES.stone_x  # target size x between stones, used for curriculum
+    stone_target_x: float = 0.2  # target size x between stones, used for curriculum
+    
+    stone_length_min: float = 0.2
+    stone_width_min: float = 0.5
+    stone_height_min: float = 0.1
+    stone_height_max: float = 1.0
+    underneath_platform_z_min: float = -1.0  # z pos of the underneath platform relative to stone top
+    underneath_platform_z_max: float = 0.0  # z pos of the underneath platform relative to stone top
+    def resample_basic(self):
+        """Resample parameters based on difficulty if needed."""
+        stone_y = np.random.uniform(self.stone_width_min, STONES.terrain_size_y)
+        stone_z = np.random.uniform(self.stone_height_min, self.stone_height_max)
+        self.underneath_platform_z = np.random.uniform(self.underneath_platform_z_min, self.underneath_platform_z_max)
+        self.start_platform_size = (STONES.start_platform_x, stone_y, stone_z)
+        return stone_y, stone_z
 
-    size: tuple[float, float] = (STONES.terrain_size_x, STONES.terrain_size_y)  # (x,y) overall terrain size
-
+@configclass
+class LongStonesFlatTerrainCfg(BasicStonesTerrainCfg):
     def resample(self, difficulty):
         """Resample relative distances for each stone given difficulty."""
         # interpolate rel_stone_z_range with difficulty
+        self.rel_stone_x_range = (STONES.rel_stone_x_min, STONES.rel_stone_x_min + (STONES.rel_stone_x_max - STONES.rel_stone_x_min)*difficulty)
+        stone_x = np.random.uniform(self.stone_length_min, STONES.rel_stone_x_min)
+        stone_y, stone_z = self.resample_basic()
+        self.stone_size = (stone_x, stone_y, stone_z)
+        return
+
+@configclass
+class LongStonesTerrainCfg(BasicStonesTerrainCfg):
+    def resample(self, difficulty):
+        """Resample relative distances for each stone given difficulty."""
+        self.rel_stone_x_range = (STONES.rel_stone_x_min, STONES.rel_stone_x_max)
         self.rel_stone_z_range = (-STONES.rel_stone_z_max*difficulty, STONES.rel_stone_z_max*difficulty)
         
-        self.rel_stone_x_range = (STONES.rel_stone_x_min, STONES.rel_stone_x_min + (STONES.rel_stone_x_max - STONES.rel_stone_x_min)*difficulty)
+        # interpolate stone_x size with difficulty
+        max_val = STONES.rel_stone_x_max  # fill all gap
+        min_val = self.stone_target_x  # base size at hardest
+        stone_x = (1 - difficulty) * max_val + difficulty * min_val
         
-        # # interpolate stone_x size with difficulty
-        # max_val = STONES.rel_stone_x[1]                  # fill all gap
-        # min_val = self.stone_target_x               # base size at hardest
-        # stone_x_sampled = (1 - difficulty) * max_val + difficulty * min_val
-
-        # # assign updated stone size
-        # self.stone_size = (self.stone_size[0], self.stone_size[1], self.stone_size[2])
-
-class UpStairsTerrainCfg(SubTerrainBaseCfg):
-    """Configuration for a terrain with up stairs pattern."""
-
-    function = MISSING  # to be defined
-
-    num_steps: int = 10        # number of steps
-    
-    rel_stair_x_range: tuple[float, float] = (0.2, 0.5)  # (min,max) relative x distance range between stairs
-    rel_stair_z_range: tuple[float, float] = (0.0, 0.2)  # (min,max) relative z distance range between stairs
-    
-    rel_x: float   # fixed relative x distance between stairs
-    rel_z: float   # fixed relative z distance between stairs
-
-
-    size: tuple[float, float] = (STONES.terrain_size_x, STONES.terrain_size_y)   # (x,y) overall terrain size
+        stone_y, stone_z = self.resample_basic()
+        self.stone_size = (stone_x, stone_y, stone_z)
+        return
+        
+@configclass
+class StairsTerrainCfg(BasicStonesTerrainCfg):
+    stair_x_min: float = 0.25
+    stair_x_max: float = 0.5
+    stair_z_max: float = 0.3
+    is_upstairs: bool = True
     def resample(self, difficulty):
-        """Resample parameters based on difficulty if needed."""
-        self.rel_x = (1 - difficulty) * STONES.rel_stair_x_range[1] + difficulty * STONES.rel_stair_x_range[0]
-        self.rel_z = (1 - difficulty) * STONES.rel_stair_z_range[1] + difficulty * STONES.rel_stair_z_range[0]
+        stone_y, stone_z = self.resample_basic()
+        rel_x = STONES.rel_stone_x_min + (STONES.rel_stone_x_max - STONES.rel_stone_x_min)*difficulty
+        self.rel_stone_x_range = (rel_x, rel_x)
+        rel_z = difficulty * self.stair_z_max * (2 * self.is_upstairs -1)
+        self.rel_stone_z_range = (rel_z, rel_z)
+        self.stone_size = (rel_x, stone_y, stone_z)
+        return

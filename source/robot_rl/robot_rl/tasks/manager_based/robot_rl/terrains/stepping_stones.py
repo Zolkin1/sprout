@@ -90,12 +90,13 @@ def long_stones_terrain_with_platform_underneath(
     # --- Stepping stones
     curr_x = cfg.start_platform_size[0]  - cfg.stone_target_x / 2
     curr_y, curr_z = start_platform_center_pos[1], start_platform_center_pos[2] 
-
+    min_z = curr_z
     box_dims = cfg.stone_size
     for i in range(cfg.num_stones):
         dx, dz = rel_x[i], rel_z[i]
         curr_x += dx
         curr_z += dz
+        min_z = min(min_z, curr_z)  # Track lowest stone
         box_pos = (curr_x, curr_y, curr_z)
         stone = trimesh.creation.box(box_dims, trimesh.transformations.translation_matrix(box_pos))
         meshes.append(stone)
@@ -122,14 +123,14 @@ def long_stones_terrain_with_platform_underneath(
     "stone_x": cfg.stone_size[0]
     }
     
-    # Add a large flat platform underneath the stones, width = 3 * stone_y
+    # Add a large flat platform underneath the stones
     total_length = cfg.size[0]
     platform_thickness = 0.05  # thickness of underlying platform
-    platform_size = (total_length, cfg.stone_size[1] * 3, platform_thickness)
+    platform_size = (total_length, cfg.size[1], platform_thickness)
     platform_center = (
         total_length / 2,
         start_platform_center_pos[1],
-        -0.5 - platform_thickness / 2,
+        min_z - platform_thickness / 2 + cfg.underneath_platform_z,
     )
     base_platform = trimesh.creation.box(
         platform_size,

@@ -437,7 +437,7 @@ class StonesOutputCommandTerm(CommandTerm):
                 # self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[mask_next_step, 0:2] #update current stone x-y pos based on stance foot 
                 # self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2] #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
                 self.current_stone_pos[mask_next_step] = self.stance_foot_pos_0[mask_next_step].clone() 
-                # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > STONES.stone_x
+                # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > 0.2
                 # mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                 # mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
                 # self.ith_step[mask_no_progress_this_step_global] -=1 #if no progress this step, do not increment ith step
