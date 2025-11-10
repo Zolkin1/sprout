@@ -10,7 +10,7 @@ from scipy.spatial.transform import Rotation
 class Robot:
     def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, rng=None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute" and robot_name != "g1_21j_compute_mlip":
+        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute" and robot_name != "g1_21j_compute_mlip" and robot_name != "g1_21j_compute_stones":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
 
         self.robot_name = robot_name
@@ -129,7 +129,7 @@ class Robot:
             des_vel[1] = vy
             des_vel[2] = vyaw
         else:
-            des_vel = np.array([0.5, 0.0, 0.0])
+            des_vel = np.array([0.6, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
         print(f"Commanded velocity: {des_vel}")
         return des_vel

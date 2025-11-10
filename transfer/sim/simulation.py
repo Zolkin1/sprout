@@ -217,13 +217,13 @@ class Simulation:
 
             # Setup height sensor visualization if enabled
             if self.use_height_sensor:
-                grid_size = (1.5, 1.5)
-                x_y_num_rays = (25, 25)
+                grid_size = (1.0, 1.0)
+                x_y_num_rays = (11, 11)
                 height_map = self._ray_cast_sensor(
                     self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays
                 )
                 # Add custom debug spheres
-                for ii, pos in height_map.reshape(-1, 3):
+                for ii, pos in enumerate(height_map.reshape(-1, 3)):
                     mujoco.mjv_initGeom(
                         viewer.user_scn.geoms[ii],
                         type=mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -277,7 +277,7 @@ class Simulation:
                             self.robot.mj_model, self.robot.mj_data, "height_sensor_site", grid_size, x_y_num_rays
                         )
                         # print(height_map)
-                        for ii, pos in height_map.reshape(-1, 3):
+                        for ii, pos in enumerate(height_map.reshape(-1, 3)):
                             viewer.user_scn.geoms[ii].pos = pos
 
                     if force_disturbance is not None:
