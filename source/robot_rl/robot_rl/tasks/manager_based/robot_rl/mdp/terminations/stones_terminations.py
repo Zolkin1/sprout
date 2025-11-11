@@ -18,12 +18,12 @@ def finished_long_stones(env, output_command_name: str) -> torch.Tensor:
     output_command = env.command_manager.get_term(output_command_name)
     # --- Current and target positions (x–z) ---
     current_st_foot_pos = output_command.stance_foot_pos_0 # (num_envs, 3)
-    terrain = env.scene.terrain
+    # terrain = env.scene.terrain
     distance = current_st_foot_pos[:, 0] - env.scene.env_origins[:, 0]
 
-    termination_flag = distance > terrain.cfg.terrain_generator.size[0] * 0.95
-   #  if torch.any(termination_flag):
-   #       print(f"Finished stepping stones for {termination_flag.sum().item()} environments.")
+    termination_flag = distance > (output_command.last_stone_x- env.scene.env_origins[:, 0] + 1.2)
+    # if torch.any(termination_flag):
+    #      print(f"Finished stepping stones for {termination_flag.sum().item()} environments.")
     return termination_flag
 
 def long_stones_deviation(env,output_command_name: str) -> torch.Tensor:
@@ -47,8 +47,8 @@ def long_stones_deviation(env,output_command_name: str) -> torch.Tensor:
     
     termination_flag = distance > output_command.stone_width / 2.0  # deviated too far in y direction (> half stone width)
     
-   #  if torch.any(termination_flag):
-   #     print(f"Deviation termination triggered for {termination_flag.sum().item()} environments.")
+    # if torch.any(termination_flag):
+    #    print(f"Deviation termination triggered for {termination_flag.sum().item()} environments.")
     
     return termination_flag
 
@@ -70,8 +70,8 @@ def com_z_too_low(env, output_command_name: str) -> torch.Tensor:
     current_base_com_z = output_command.robot.data.root_com_pos_w[:, 2]  # (num_envs, )
 
     termination_flag = (current_base_com_z < current_st_foot_pos_z ) | (current_base_com_z < current_sw_foot_pos_z)
-   #  if torch.any(termination_flag):
-   #     print(f"Zcom too low termination triggered for {termination_flag.sum().item()} environments.")
+    # if torch.any(termination_flag):
+    #    print(f"Zcom too low termination triggered for {termination_flag.sum().item()} environments.")
     return termination_flag
  
  

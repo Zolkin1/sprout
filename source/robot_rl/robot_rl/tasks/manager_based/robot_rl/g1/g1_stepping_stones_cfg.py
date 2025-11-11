@@ -406,4 +406,5 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 0.7)        
+        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 0.7)     
+ 

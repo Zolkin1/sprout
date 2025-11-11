@@ -82,7 +82,7 @@ def parse_args():
         "--exp_name", type=str, default=None, help="Override the default experiment name for the environment type"
     )
     parser.add_argument("--video", action="store_true", default=True, help="Record videos during playback.")
-    parser.add_argument("--video_length", type=int, default=400, help="Length of the recorded video (in steps).")
+    parser.add_argument("--video_length", type=int, default=600, help="Length of the recorded video (in steps).")
     parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to simulate.")
     parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
     parser.add_argument(
