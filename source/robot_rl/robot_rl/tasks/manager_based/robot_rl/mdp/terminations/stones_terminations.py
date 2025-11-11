@@ -45,7 +45,7 @@ def long_stones_deviation(env,output_command_name: str) -> torch.Tensor:
 
     distance = torch.abs(current_st_foot_pos_y - end_stone_pos_y)
     
-    termination_flag = distance > STONES.stone_y / 2.0  # deviated too far in y direction (> half stone width)
+    termination_flag = distance > output_command.stone_width / 2.0  # deviated too far in y direction (> half stone width)
     
    #  if torch.any(termination_flag):
    #     print(f"Deviation termination triggered for {termination_flag.sum().item()} environments.")

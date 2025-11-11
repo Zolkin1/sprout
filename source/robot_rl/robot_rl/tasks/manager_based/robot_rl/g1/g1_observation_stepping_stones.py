@@ -31,7 +31,7 @@ class TeacherCfg(ObsGroup):
         clip=(-1.0, 1.0),
     )
     def __post_init__(self):
-        self.enable_corruption = True
+        self.enable_corruption = False
         self.concatenate_terms = True
 @configclass
 class StudentCfg(ObsGroup):
@@ -58,7 +58,10 @@ class StudentCfg(ObsGroup):
     def __post_init__(self):
         self.enable_corruption = True
         self.concatenate_terms = True
-
+class StudentDistillationCfg(StudentCfg):
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
 @configclass
 class CriticCfg(ObsGroup):
     """Observations for critic group."""
@@ -119,8 +122,8 @@ class G1SteppingStonesObservationsDistillationCfg:
     """Observation specifications for the G1 Flat environment."""
     # observation groups
     teacher: TeacherCfg = TeacherCfg()
-    policy: StudentCfg = StudentCfg()
-    
+    policy: StudentDistillationCfg = StudentDistillationCfg()
+
 @configclass
 class G1SteppingStonesObservationsFinetuneCfg:    
     """Observation specifications for the G1 Flat environment."""

@@ -179,10 +179,10 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                 use_cache=False,
                 difficulty_range=(0.0, 1.0),
                 sub_terrains={
-                    "flat_stones": LongStonesFlatTerrainCfg(proportion=0.25),
-                    "stones": LongStonesTerrainCfg(proportion=0.25),
                     "upstairs": StairsTerrainCfg(proportion=0.25, is_upstairs=True),
                     "downstairs": StairsTerrainCfg(proportion=0.25, is_upstairs=False),
+                    "flat_stones": LongStonesFlatTerrainCfg(proportion=0.25),
+                    "stones": LongStonesTerrainCfg(proportion=0.25),
                 },
             )
             self.scene.terrain = TerrainImporterCfg(
@@ -241,7 +241,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
-            "pose_range": {"x": (0., 0.), "y": (0., 0.), "yaw": (0., 0.)},
+            "pose_range": {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-0.1, 0.1)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
@@ -343,7 +343,6 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
 
         # make a smaller scene for play
         self.scene.num_envs = 2
-        self.scene.env_spacing = 2.5
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False
@@ -359,7 +358,7 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)
+        self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
         
 class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_distillation):
     def __post_init__(self) -> None:
@@ -368,7 +367,6 @@ class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_dist
 
         # make a smaller scene for play
         self.scene.num_envs = 2
-        self.scene.env_spacing = 2.5
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False
@@ -393,7 +391,6 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
 
         # make a smaller scene for play
         self.scene.num_envs = 2
-        self.scene.env_spacing = 2.5
 
         # disable randomization for play
         self.observations.policy.enable_corruption = False
@@ -409,4 +406,4 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.0, 0.7)        
+        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 0.7)        

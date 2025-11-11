@@ -128,7 +128,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/foottarget",
         markers={
             "foottarget": sim_utils.CuboidCfg(
-                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0))
+                size=(0.2, 0.065, 0.02), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0))
             )
         },
     )
@@ -137,7 +137,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
         prim_path="/World/Visuals/swingfoot",
         markers={
             "swingfoot": sim_utils.CuboidCfg(
-                size=(0.2, 0.065, 0.018), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.0, 1.0))
+                size=(0.2, 0.065, 0.02), visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.0, 1.0))
             )
         },
     )

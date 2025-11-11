@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 
 from dataclasses import MISSING
-from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones import long_stones_terrain, long_stones_terrain_with_platform_underneath, upstairs_with_platform_underneath
+from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones import long_stones_terrain_with_platform_underneath
 from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 import numpy as np
 

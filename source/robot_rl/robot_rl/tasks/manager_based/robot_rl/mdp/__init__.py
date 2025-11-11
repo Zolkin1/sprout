@@ -13,6 +13,7 @@ from .curriculums.curriculums import *  # noqa: F401, F403
 from .curriculums.stones_curriculums import *  # noqa: F401, F403
 from .events.init_config import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
+from .observations.noisyheightscan import *  # noqa: F401, F403
 from .rewards.rewards import *  # noqa: F401, F403
 from .rewards.stones_rewards import *  # noqa: F401, F403
 from .terminations.terminations import *  # noqa: F401, F403

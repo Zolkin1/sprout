@@ -6,10 +6,10 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 project_path = os.path.join(project_root, "logs/g1_policies/stepping_stone/stepping_stone")
-student_run = "2025-11-10_01-35-57"
-teacher_run = "2025-11-09_20-40-26"
-distill_ckpt = torch.load(os.path.join(project_path, student_run, "model_999.pt"))
-teacher_ckpt = torch.load(os.path.join(project_path, teacher_run, "model_4999.pt"))
+distill_run = "2025-11-11_09-43-59"
+teacher_run = "2025-11-11_01-09-58"
+distill_ckpt = torch.load(os.path.join(project_path, distill_run, "model_850.pt"))
+teacher_ckpt = torch.load(os.path.join(project_path, teacher_run, "model_9999.pt"))
 
 print("="*60)
 print("Converting distilled student + teacher's critic to PPO format")
@@ -54,7 +54,7 @@ for key in teacher_ckpt.keys():
         print(f"  ✓ Copied additional field: {key}")
 
 # Save
-output_path = os.path.join(project_path, student_run, "model_ppo.pt")
+output_path = os.path.join(project_path, distill_run, "model_ppo.pt")
 torch.save(new_ckpt, output_path)
 
 print("\n" + "="*60)

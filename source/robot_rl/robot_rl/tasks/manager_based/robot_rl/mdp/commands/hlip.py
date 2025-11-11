@@ -98,7 +98,7 @@ def solve_velocity_or_momentum_positive_from_E_batched(
     # Argument inside the square root
     inner = E + (g / z_tilde) * (p**2)
     if torch.any(inner < 0):
-        print("Warning: Negative value inside square root in solve_velocity_or_momentum_positive_batched")
+        # print("Warning: Negative value inside square root in solve_velocity_or_momentum_positive_batched")
         inner[inner < 0] = 0.0  # Clamp to zero to avoid NaN
 
     if use_momentum:
@@ -238,8 +238,8 @@ class HLIP_P2:
         if isinstance(stepwidth, float):
             stepwidth = torch.full_like(vely, stepwidth)
 
-        self.udes_p2_left = -stepwidth #[N]
-        self.udes_p2_right = 2 * vely * self.T - self.udes_p2_left # [N]
+        self.udes_p2_left = -stepwidth + vely * self.T #[N]
+        self.udes_p2_right = stepwidth + vely * self.T # [N]
 
         eye2 = torch.eye(2, device=self.device).expand(self.z0.shape[0], 2, 2) #[N,2,2]
         lhs = eye2 - self.A_S2S @ self.A_S2S  # [N,2,2]
@@ -338,7 +338,8 @@ class HLIP_P2:
                 raise ValueError("com_state must be provided when use_feedback is True")
             xdes_p2 = self.xdes_p2_left.clone()
             xdes_p2[stance_idx == 1] = self.xdes_p2_right[stance_idx == 1]
-            udes_p2 += (self.K @ (xdes_p2 - com_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)
+            state_feedback_term = (self.K @ (xdes_p2 - com_state.unsqueeze(-1)) ).squeeze(-1).squeeze(-1)
+            udes_p2 += torch.clamp(state_feedback_term, -0.1, 0.1)
 
         return udes_p2
 

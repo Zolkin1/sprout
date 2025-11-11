@@ -136,6 +136,10 @@ class StonesOutputCommandTerm(CommandTerm):
     abs_x: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute x positions of stones
     abs_y: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute y positions of stones
     abs_z: torch.Tensor  # (num_envs, STONES.num_stones + STONES.num_init_steps) absolute z positions of stones
+    last_stone_x: torch.Tensor  # (num_envs,) absolute x position of the last stone
+    last_stone_z: torch.Tensor  # (num_envs,) absolute z position of the last stone
+    max_stone_idx: int  # maximum stone index
+    stone_width: torch.Tensor  # (num_envs,) stone width in y direction
     
     def __init__(self, cfg: "StonesOutputCommandCfg", env):
         super().__init__(cfg, env)
@@ -158,6 +162,8 @@ class StonesOutputCommandTerm(CommandTerm):
         self.debug_vis = cfg.debug_vis
 
         self.robot = env.scene[cfg.asset_name]
+        self.terrain = env.scene.terrain
+        
         #list of int, left foot idx 0, right foot idx 1
         self.feet_bodies_idx = self.robot.find_bodies(cfg.foot_body_name)[0]
         self.upper_body_joint_idx = self.robot.find_joints(cfg.upper_body_joint_name)[0]
@@ -251,6 +257,12 @@ class StonesOutputCommandTerm(CommandTerm):
         self.abs_x = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
         self.abs_y = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
         self.abs_z = torch.zeros((env.num_envs, STONES.num_stones + STONES.num_init_steps), dtype=torch.float32, device=self.device)
+        self.last_stone_x = torch.zeros((env.num_envs,), dtype=torch.float32, device=self.device)
+        self.last_stone_z = torch.zeros((env.num_envs,), dtype=torch.float32, device=self.device)
+        self.max_stone_idx = STONES.num_stones + STONES.num_init_steps -1
+        self.stone_width = torch.zeros((env.num_envs,), dtype=torch.float32, device=self.device)
+        
+        
 
     @property
     def command(self):
@@ -337,15 +349,13 @@ class StonesOutputCommandTerm(CommandTerm):
         self.metrics["avg_clf"] = torch.mean(self.v_buffer, dim=-1)
         return
 
-
-
     def reset_stone_global(self, reset_mask):
         if reset_mask.any():
             # Extract terrain info
-            terrain = self._env.scene.terrain
-            rel_x = terrain.env_terrain_infos["rel_x"] #(num_envs, num_stones)
-            rel_z = terrain.env_terrain_infos["rel_z"] #(num_envs, num_stones)
-            start_stone_pos_w = terrain.env_terrain_infos["start_stone_pos"] + terrain.env_origins #(num_envs, 3)
+            rel_x = self.terrain.env_terrain_infos["rel_x"] #(num_envs, num_stones)
+            rel_z = self.terrain.env_terrain_infos["rel_z"] #(num_envs, num_stones)
+            start_stone_pos_w = self.terrain.env_terrain_infos["start_stone_pos"] + self.terrain.env_origins #(num_envs, 3)
+            self.stone_width = self.terrain.env_terrain_infos["stone_y"].squeeze(-1)  #(num_envs,)
             # Get positions for reset environments
             robot_pos_w_init = self.robot.data.root_pos_w[reset_mask]  # (num_reset, 3)
             start_pos = start_stone_pos_w[reset_mask]  # (num_reset, 3)
@@ -364,48 +374,64 @@ class StonesOutputCommandTerm(CommandTerm):
             self.abs_x[reset_mask] = torch.cat([abs_x_init, start_pos[:, 0:1] + stone_x_offsets], dim=1)
             self.abs_z[reset_mask] = torch.cat([abs_z_init, start_pos[:, 2:3] + stone_z_offsets], dim=1)
             self.abs_y[reset_mask] = start_pos[:, 1:2] #use stone y as constant y position
+            self.last_stone_x[reset_mask] = self.abs_x[reset_mask, -1]
+            self.last_stone_z[reset_mask] = self.abs_z[reset_mask, -1]
+            self.max_stone_idx = self.abs_x.shape[1] - 1
+
         return
     
     def update_ithstep_stones_info(self, ithstep, mask, current_stone_pos):
         """Update next and next-next stepping stone positions only for masked envs."""
         if not torch.any(mask):
             return
+        
+        # Determine which envs are within vs beyond terrain
+        beyond_terrain = ithstep[mask] > self.max_stone_idx
+        at_last_stone = ithstep[mask] == self.max_stone_idx
+  
         # --- Upcoming stepping stone, the target stone for swing foot ---
-        idx_next = torch.clamp(
-            ithstep[mask], 
-            max=STONES.num_stones + STONES.num_init_steps - 1
-        )
+        idx_next = torch.clamp(ithstep[mask], max=self.max_stone_idx)
         self.next_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         self.next_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         self.next_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
 
         # --- Next Upcoming stepping stone, preview ---
-        idx_next_next = torch.clamp(
-            ithstep[mask] + 1, 
-            max=STONES.num_stones + STONES.num_init_steps - 1
-        )
-
+        idx_next_next = torch.clamp(ithstep[mask] + 1, max=self.max_stone_idx)
         self.nextnext_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
         self.nextnext_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
         self.nextnext_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
         
+        # === Case 1: At last stone - next is real, next-next is pseudo ===
+        if torch.any(at_last_stone):
+            at_last_mask_global = torch.zeros_like(mask, dtype=torch.bool)
+            at_last_mask_global[mask] = at_last_stone
+            # next_stone_pos already correct from gather (last real stone)
+            # Create pseudo next-next stone
+            self.nextnext_stone_pos[at_last_mask_global, 0] = self.next_stone_pos[at_last_mask_global, 0] + 0.3
+            self.nextnext_stone_pos[at_last_mask_global, 1] = self.next_stone_pos[at_last_mask_global, 1]
+            self.nextnext_stone_pos[at_last_mask_global, 2] = self.next_stone_pos[at_last_mask_global, 2]
+    
+        # === Case 2: Beyond terrain - both next and next-next are pseudo ===
+        if torch.any(beyond_terrain):
+            beyond_mask_global = torch.zeros_like(mask, dtype=torch.bool)
+            beyond_mask_global[mask] = beyond_terrain
+
+            # Calculate steps beyond
+            steps_beyond = ithstep[beyond_mask_global] - self.max_stone_idx
+
+            # Create pseudo stones
+            self.next_stone_pos[beyond_mask_global, 0] = self.last_stone_x[beyond_mask_global] + 0.3 * steps_beyond
+            self.next_stone_pos[beyond_mask_global, 1] = self.abs_y[beyond_mask_global, 0]
+            self.next_stone_pos[beyond_mask_global, 2] = self.last_stone_z[beyond_mask_global]
+
+            self.nextnext_stone_pos[beyond_mask_global, 0] = self.last_stone_x[beyond_mask_global] + 0.3 * (steps_beyond + 1)
+            self.nextnext_stone_pos[beyond_mask_global, 1] = self.abs_y[beyond_mask_global, 0]
+            self.nextnext_stone_pos[beyond_mask_global, 2] = self.last_stone_z[beyond_mask_global]
+    
         self.hdes[mask] = self.next_stone_pos[mask, 2] - current_stone_pos[mask, 2]
         self.ldes[mask] = self.next_stone_pos[mask, 0] - current_stone_pos[mask, 0]
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
         self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
-        # self.hdes[mask] = 0.0
-        # self.ldes[mask] = 0.3
-        # self.hdes_next[mask] = 0.0
-        # self.ldes_next[mask] = 0.3
-        done_mask_local = ithstep[mask] >= (STONES.num_stones + STONES.num_init_steps - 2)
-        if torch.any(done_mask_local):
-            # Set fallback values for those envs
-            done_mask_global = torch.zeros_like(mask, dtype=torch.bool)
-            done_mask_global[mask] = done_mask_local
-            self.ldes[done_mask_global] = 0.3
-            self.ldes_next[done_mask_global] = 0.3
-        
-        
         if torch.any(self.ldes_next < ZERO_EPS):
             #raise error
             print("Warning: ldes_next is non-positive!")
@@ -434,9 +460,11 @@ class StonesOutputCommandTerm(CommandTerm):
             
             if TEST_FLAT == False:
                 self.prev_stone_pos[mask_next_step] = self.current_stone_pos[mask_next_step].clone()
-                # self.current_stone_pos[mask_next_step, 0:2] = self.stance_foot_pos_0[mask_next_step, 0:2] #update current stone x-y pos based on stance foot 
-                # self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2] #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
-                self.current_stone_pos[mask_next_step] = self.stance_foot_pos_0[mask_next_step].clone() 
+
+                self.current_stone_pos[mask_next_step, 0] = self.next_stone_pos[mask_next_step, 0].clone()
+                self.current_stone_pos[mask_next_step, 1] = self.stance_foot_pos_0[mask_next_step, 1].clone()
+                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2].clone()
+
                 # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > 0.2
                 # mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                 # mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
@@ -446,12 +474,13 @@ class StonesOutputCommandTerm(CommandTerm):
                 # #update current stone z pos based on next stone z pos, to avoid z offset bewteen foot contact point and stance foot origin frame
                 # self.current_stone_pos[mask_update_z, 2] = self.next_stone_pos[mask_update_z,2] 
                 
+                # Update next stone info
                 self.update_ithstep_stones_info(self.ith_step, mask_next_step, self.current_stone_pos) #update next and next-next stone pos
+                # Handle skip logic
                 too_far_mask_local = self.ldes[mask_next_step] <= 0.0
                 while torch.any(too_far_mask_local):
                     too_far_mask_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                     too_far_mask_global[mask_next_step] = too_far_mask_local
-                    # print("Warning: ldes is negative!")
                     self.ith_step[too_far_mask_global] +=1 #if ldes is negative or zero, skip this stone by incrementing ith_step again
                     self.update_ithstep_stones_info(self.ith_step, too_far_mask_global, self.current_stone_pos)
                     too_far_mask_local = self.ldes[mask_next_step] <= 0.0  
@@ -459,12 +488,16 @@ class StonesOutputCommandTerm(CommandTerm):
         
         if torch.any(mask_reset_buf):
             self.ith_step[mask_reset_buf] = 0 #env reset, reset ith step
+            self.stance_idx[mask_reset_buf] = 0 #reset to left foot stance
             self.reset_stance_swing_foot(mask_reset_buf)
             if TEST_FLAT == False:
                 #update current stone pos, assume first step z is always zero
                 self.current_stone_pos[mask_reset_buf, 0:2] = self.stance_foot_pos_0[mask_reset_buf, 0:2].clone() #initialize current stone x-y pos based on stance foot
                 self.current_stone_pos[mask_reset_buf, 2] = 0 #initialize current stone z pos to zero, asumming always launch on the platform
-                self.prev_stone_pos[mask_reset_buf] = self.current_stone_pos[mask_reset_buf].clone()
+                #update prev stone pos, 
+                self.prev_stone_pos[mask_reset_buf, 0] = self.current_stone_pos[mask_reset_buf,0].clone()
+                self.prev_stone_pos[mask_reset_buf, 1] = self.current_stone_pos[mask_reset_buf, 1].clone() + self.cfg.y_nom
+                self.prev_stone_pos[mask_reset_buf, 2] = self.current_stone_pos[mask_reset_buf, 2].clone()
                 self.reset_stone_global(mask_reset_buf)
                 self.update_ithstep_stones_info(self.ith_step, mask_reset_buf, self.current_stone_pos) #update next and next-next stone pos
             self.reset_impact(mask_reset_buf)
@@ -625,8 +658,9 @@ class StonesOutputCommandTerm(CommandTerm):
             self.yaw_dot = base_vdes[:, 2].clone()
             self.target_yaw = self.stance_foot_ori_0[:, 2] + self.delta_yaw
         else:
-            # P2 HLIP: uses only lateral vy, y_nom; but in fact never update
-            self.hlip.update_desired_walking(base_vdes[:,1], self.cfg.y_nom)
+            # P2 HLIP: uses only lateral vy, y_nom
+            delta_y = (self.prev_stone_pos[:, 1] + self.current_stone_pos[:, 1])/2.0 - self.terrain.env_origins[:,1]
+            self.hlip.update_desired_walking(base_vdes[:,1]-delta_y/self.TSS, self.cfg.y_nom)
             # for stepping stones, always targeting zero yaw
             # todo: consider adding different terrain yaw and replace zeros_like below
             self.target_yaw_stone = torch.zeros_like(self.stance_foot_ori_0[:, 2])
@@ -787,7 +821,7 @@ class StonesOutputCommandTerm(CommandTerm):
         #TODO: later consider add feedback
         Uy = self.hlip.get_desired_foot_placement(self.stance_idx) #Shape: (N,)
         #TODO: for now target yaw frame = world frame, later consider adding different terrain yaw
-        footplacement_target_frame = torch.stack([Ux, Uy, torch.zeros((N), device=self.device)], dim=-1) # Shape: (N,3)
+        footplacement_target_frame = torch.stack([Ux, Uy, self.hdes], dim=-1) # Shape: (N,3)
         # Create horizontal control points with batch dimension
         horizontal_control_points = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0], device=self.device)
         bht = bezier_deg(0, self.phase_var.tau, self.TSS, horizontal_control_points, 4) #Shape: (N,)
@@ -802,7 +836,7 @@ class StonesOutputCommandTerm(CommandTerm):
         #clamp swing foot y to avoid too large step
         sign_swy = torch.sign(Uy)
         #todo: for now, since not going sideway, just assume swy_0 = swy_T
-        y0 = sign_swy * self.cfg.y_nom #Shape: (N,)
+        y0 = self.prev_stone_pos[:, 1] - self.current_stone_pos[:, 1] #sign_swy * self.cfg.y_nom #Shape: (N,)
         p_swing_y = ((1 - bht) * (y0) + bht * Uy) #Shape: (N,)
         v_swing_y = ((-dbht) * y0 + dbht * Uy)  #Shape: (N,)
 
@@ -1121,7 +1155,12 @@ class StonesOutputCommandTerm(CommandTerm):
 
         return ref, ref_dot
 
-
+    def generate_upper_body_ref_static(self):
+        # return static upper body reference positions and zero velocities
+        joint_offset = self.robot.data.default_joint_pos[:, self.upper_body_joint_idx]
+        ref = joint_offset
+        ref_dot = torch.zeros_like(ref)
+        return ref, ref_dot
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -1180,6 +1219,6 @@ class StonesOutputCommandTerm(CommandTerm):
             nextnext_stone_pos[:,0] += self.ldes + self.ldes_next
             nextnext_stone_pos[:,2] += self.hdes + self.hdes_next
             self.nextnextstone_visualizer.visualize(nextnext_stone_pos,self.stone_quat)
-            self.terrain_origin_visualizer.visualize(self._env.scene.terrain.env_origins, self.stone_quat)
+            self.terrain_origin_visualizer.visualize(self.terrain.env_origins, self.stone_quat)
             self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)
             
