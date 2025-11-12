@@ -102,11 +102,11 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
     custom_handles.append((Line2D([0], [0], color='k', linestyle='-'), dummy_patch))
     custom_labels.append(r"$v_x^d$")
 
-    ax.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
-    ax.set_xlabel('Time (s)',fontsize=20)
+    ax.set_ylabel(r'$v_x$ (m/s)',fontsize=25)
+    ax.set_xlabel('Time (s)',fontsize=25)
     ax.set_ylim(-0.6, 1.05)
-    plt.xticks(fontsize=20)
-    plt.yticks(fontsize=20)
+    plt.xticks(fontsize=25)
+    plt.yticks(fontsize=25)
     ax.grid(True)
 
     ax.legend(
@@ -118,7 +118,7 @@ def plot_combined_velocity(grouped_data, save_path=None, label_override=None):
      framealpha=0.0,
      columnspacing=0.8,
      handler_map={tuple: HandlerOverlay()},
-     fontsize=20
+     fontsize=25
      )
 
 
@@ -146,8 +146,8 @@ if __name__ == "__main__":
     label_override = {k: v for k, v in zip(default_labels, default_legends)}
 
     # Optionally manually override here
-    label_override.update({"mass_randomization_g1_21j_config_baseline_custom": "Custom BL"})
-    label_override.update({"mass_randomization_g1_21j_config_baseline": "Unitree BL"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline_custom": "Custom"})
+    label_override.update({"mass_randomization_g1_21j_config_baseline": "Unitree"})
     label_override.update({"mass_randomization_g1_21j_config_lip": "LIP-CLF"})
     label_override.update({"mass_randomization_g1_21j_config_hzd": "HZD-CLF"})
 

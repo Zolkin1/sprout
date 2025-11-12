@@ -49,6 +49,7 @@ def main():
 
 
     # run_names = ["hzd_clf_minimum_reward", "hzd_dec_4_alpha_1", "hzd_dec_2_alpha_2", "hzd_dec_2_alpha_0.5", "hzd_dec_0"]
+    run_names = ["Custom", "LIP-CLF", "HZD-CLF"]
     run_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 'tab:brown', 'tab:pink', 'tab:cyan']
 
     plt.rcParams.update({'font.size': 18})
@@ -57,7 +58,7 @@ def main():
         "font.family": "serif",  # Use serif font (default LaTeX style)
         "font.serif": ["Computer Modern Roman"],  # LaTeX default font
     })
-    fig, axes = plt.subplots(1, 1, figsize=(10, 5), sharex=True)
+    fig, axes = plt.subplots(1, 1, figsize=(14, 4.5), sharex=True)
 
     # For shared legend
     handles = []
@@ -103,33 +104,33 @@ def main():
         if PLOT_MEANS:
             ## Mean plots
             # Get the steady state mean
-            ss_idx_start = get_index(time, 13)
-            ss_idx_end = get_index(time, 18) #time.size
+            ss_idx_start = get_index(time, 2)
+            ss_idx_end = get_index(time, 8) #time.size
             ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
             axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
                          color=color, linestyle="--", label=f"{run_names[i]}_mean")
             
-            ss_idx_start = get_index(time, 7)
-            ss_idx_end = get_index(time, 12) #time.size
-            ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
-            axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
-                         color=color, linestyle="--", label=f"{run_names[i]}_mean")
-            
-            ss_idx_start = get_index(time, 20)
-            ss_idx_end = get_index(time, 25) #time.size
-            ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
-            axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
-                         color=color, linestyle="--", label=f"{run_names[i]}_mean")
+            # ss_idx_start = get_index(time, 7)
+            # ss_idx_end = get_index(time, 12) #time.size
+            # ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
+            # axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
+            #              color=color, linestyle="--", label=f"{run_names[i]}_mean")
+            #
+            # ss_idx_start = get_index(time, 20)
+            # ss_idx_end = get_index(time, 25) #time.size
+            # ss_x_mean = np.mean(actual_vel[ss_idx_start:ss_idx_end, 0])
+            # axes.plot(time[ss_idx_start:ss_idx_end], np.full(ss_idx_end - ss_idx_start, ss_x_mean), linewidth="3",
+            #              color=color, linestyle="--", label=f"{run_names[i]}_mean")
 
 
     # Set axis labels
-    axes.set_ylabel(r'$v_x$ (m/s)',fontsize=20)
+    axes.set_ylabel(r'$v_x$ (m/s)',fontsize=25)
     # axes[1].set_ylabel(r'$v_y$ (m/s)')
     # axes[2].set_ylabel(r'$\omega_z$ (rad/s)')
 
-    axes.set_xlabel('Time (s)',fontsize=20)
-    plt.xticks(fontsize=20)
-    plt.yticks(fontsize=20)
+    axes.set_xlabel('Time (s)',fontsize=25)
+    plt.xticks(fontsize=25)
+    plt.yticks(fontsize=25)
     # axes.legend()
     axes.grid()
 
@@ -154,7 +155,7 @@ def main():
     axes.legend(handles=legend_handles,  loc="lower center",
      bbox_to_anchor=(0.5, 0.96),
      ncol=len(legend_handles),framealpha=0.0,
-     fontsize=20,
+     fontsize=25,
      columnspacing=0.8)  # Puts all legend entries in one row fontsize = 20,
                 # ncol=1, frameon=True)
 

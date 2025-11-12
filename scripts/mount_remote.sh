@@ -6,14 +6,16 @@
 set -e
 
 # Configuration
-#REMOTE_HOST="talos.caltech.edu"
+REMOTE_HOST="talos.caltech.edu"
+LOCAL_MOUNT_POINT="talos_remote_mount"
+
 # REMOTE_HOST="10.42.0.1"
 # REMOTE_PATH="/home/unitree/robot_rl/transfer/obelisk/ctrl_logs"
 # REMOTE_USER="unitree"
 REMOTE_USER="zolkin" #"kli5"
-REMOTE_HOST="131.215.101.40" #"vulcan.amberlab.caltech.edu"
+#REMOTE_HOST="131.215.101.40" #"vulcan.amberlab.caltech.edu"
 REMOTE_PATH="/home/zolkin/robot_rl/logs" #"/home/kli5/robot_rl/logs"
-LOCAL_MOUNT_POINT="vulcan_remote_mount"
+#LOCAL_MOUNT_POINT="vulcan_remote_mount"
 # LOCAL_MOUNT_POINT="vulcan_mount"
 # LOCAL_MOUNT_POINT="g1_mount"
 

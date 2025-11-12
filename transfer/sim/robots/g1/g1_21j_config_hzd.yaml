@@ -3,7 +3,8 @@ robot_name: "g1_21j_compute"
 # For the mass randomization figure I used "cur_dec_1_alpha_0.5_rough_less_less_angular.pt"
 # Decreasing comparison used: "hzd_dec_0.pt", "hzd_dec_1_alpha_0.5.pt", "hzd_dec_2_alpha_0.5.pt", "hzd_dec_4_alpha_1.pt"
 
-checkpoint_path: "g1_policies/hzd/hzd_clf_custom/2025-10-17_17-30-28_gait_lib_no_dec/exported/policy.pt"
+checkpoint_path: "ral_paper/paper_policy/8_1_alpha_2.pt"
+  #"g1_policies/hzd/hzd_clf_custom/2025-10-17_17-30-28_gait_lib_no_dec/exported/policy.pt"
 
   #"ral_paper/hzd_dec_0.pt"
   #"g1_policies/hzd/hzd_clf_custom/2025-10-17_17-30-28_gait_lib_no_dec/exported/policy.pt"

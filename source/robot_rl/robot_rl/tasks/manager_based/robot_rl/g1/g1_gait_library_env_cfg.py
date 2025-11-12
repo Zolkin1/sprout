@@ -7,7 +7,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG, PYRAMID_SLOPED_5DEG_CFG
 from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
 import math
 
@@ -110,7 +110,7 @@ class G1_custom_plate_GaitLibraryEnvCfg(G1GaitLibraryEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_distribution_params": (0.616,0.616),
+                "mass_distribution_params": (0,0), #(0.616,0.616),
                 "operation": "add",
             }
         )
@@ -133,8 +133,10 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         # self.scene.terrain.border_width = 0.0
         # self.scene.terrain.num_rows = 3
         # self.scene.terrain.num_cols = 2
-        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_type="plane"
         self.scene.terrain.terrain_generator = None
+        # self.scene.terrain.terrain_type = "generator"
+        # self.scene.terrain.terrain_generator = PYRAMID_SLOPED_5DEG_CFG
 
         # self.events.randomize_ground_contact_friction = None
         # self.events.add_base_mass = None
@@ -146,7 +148,7 @@ class G1GL_PlayEnvCfg(G1_custom_plate_GaitLibraryEnvCfg):
         self.events.base_com.params["com_range"]["x"] = (-0.15, 0.15)
         self.events.base_com.params["com_range"]["y"] = (-0.15, 0.15)
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.75, 0.75)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.75, 0.75) #(0.75, 0.75)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
 

@@ -161,6 +161,31 @@ UP_STAIR_CFG = TerrainGeneratorCfg(
 
 """Rough terrains configuration."""
 
+PYRAMID_SLOPED_5DEG_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=20,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=False,
+    sub_terrains={
+        "hf_pyramid_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+            proportion=0.5,
+            slope_range=(0.5, 0.5),  # 0 to 5 degrees (5 * pi/180 = 0.0873 rad)
+            platform_width=2.0,
+            border_width=0.25,
+        ),
+        "hf_pyramid_slope_inv": terrain_gen.HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.5,
+            slope_range=(0.5, 0.5),  # 0 to 5 degrees
+            platform_width=2.0,
+            border_width=0.25,
+        ),
+    },
+)
+
 STAIR_CFG = TerrainGeneratorCfg(
     curriculum=True,
     size=(6.0, 6.0),

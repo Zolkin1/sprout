@@ -462,11 +462,17 @@ def compare_tracking_error(run1_dir, run2_dir, run1_name=None, run2_name=None,
     # Find left ankle indices in the labels
     left_ankle_indices = []
     com_pos_x_idx = None
+    com_pos_y_idx = None
+    com_pos_z_idx = None
     for i, label in enumerate(labels):
         if 'left' in label.lower() and 'ankle' in label.lower():
             left_ankle_indices.append(i)
         if 'com_pos' in label.lower() and label.lower().endswith('x'):
             com_pos_x_idx = i
+        if 'com_pos' in label.lower() and label.lower().endswith('y'):
+            com_pos_y_idx = i
+        if 'com_pos' in label.lower() and label.lower().endswith('z'):
+            com_pos_z_idx = i
 
     time1 = time_steps1_subset*0.02
     time2 = time_steps2_subset*0.02
@@ -716,11 +722,19 @@ def compare_tracking_error(run1_dir, run2_dir, run1_name=None, run2_name=None,
             plt.savefig(output_path_paper_pdf, bbox_inches='tight')
             print(f"Saved paper-ready tracking analysis (PDF) to: {output_path_paper_pdf}")
 
-            # Print all mean values for the paper-ready figure
+            # Print all mean values for the paper-ready figure (and swing ankle z, com y, com z)
             print("\n" + "="*80)
-            print("Paper-Ready Figure Mean Values")
+            print("Paper-Ready Figure Mean Values (+ Swing Ankle Z, COM Y, COM Z)")
             print("="*80)
-            for row_name, idx in row_info:
+
+            # Add swing ankle z and COM Y/Z to the print output
+            print_info = row_info + [('Swing Ankle Z', left_ankle_z_idx)]
+            if com_pos_y_idx is not None:
+                print_info.append(('COM Y', com_pos_y_idx))
+            if com_pos_z_idx is not None:
+                print_info.append(('COM Z', com_pos_z_idx))
+
+            for row_name, idx in print_info:
                 print(f"\n{row_name}:")
 
                 # Position Error
@@ -751,6 +765,46 @@ def compare_tracking_error(run1_dir, run2_dir, run1_name=None, run2_name=None,
             print("="*80 + "\n")
 
             plt.close(fig_paper)
+
+    # Print comprehensive statistics for ALL dimensions
+    print("\n" + "="*80)
+    print("COMPREHENSIVE TRACKING STATISTICS - ALL DIMENSIONS")
+    print("="*80)
+
+    for i in range(n_dims):
+        label = labels[i] if i < len(labels) else f'Dimension {i}'
+        unit = units[i] if i < len(units) else ""
+
+        print(f"\n{label}:")
+
+        # Position Error
+        dim_mean_pos_error1 = np.mean(mean_error1[:, i])
+        dim_mean_pos_error2 = np.mean(mean_error2[:, i])
+        pct_diff_pos = ((dim_mean_pos_error1 - dim_mean_pos_error2) / dim_mean_pos_error2) * 100 if dim_mean_pos_error2 != 0 else 0
+        print(f"  Position Error:         {run1_name}: {dim_mean_pos_error1:.6f} {unit}  |  {run2_name}: {dim_mean_pos_error2:.6f} {unit}  |  Diff: {pct_diff_pos:+.2f}%")
+
+        # Position Error Std Dev
+        dim_mean_pos_std1 = np.mean(std_error1[:, i])
+        dim_mean_pos_std2 = np.mean(std_error2[:, i])
+        pct_diff_pos_std = ((dim_mean_pos_std1 - dim_mean_pos_std2) / dim_mean_pos_std2) * 100 if dim_mean_pos_std2 != 0 else 0
+        print(f"  Position Error Std Dev: {run1_name}: {dim_mean_pos_std1:.6f} {unit}  |  {run2_name}: {dim_mean_pos_std2:.6f} {unit}  |  Diff: {pct_diff_pos_std:+.2f}%")
+
+        # Velocity Error (if available)
+        if 'dy_out' in processed_data1 and 'dy_act' in processed_data1 and \
+           'dy_out' in processed_data2 and 'dy_act' in processed_data2:
+            dim_mean_vel_error1 = np.mean(mean_vel_error1[:, i])
+            dim_mean_vel_error2 = np.mean(mean_vel_error2[:, i])
+            vel_unit = f"{unit}/s" if unit else ""
+            pct_diff_vel = ((dim_mean_vel_error1 - dim_mean_vel_error2) / dim_mean_vel_error2) * 100 if dim_mean_vel_error2 != 0 else 0
+            print(f"  Velocity Error:         {run1_name}: {dim_mean_vel_error1:.6f} {vel_unit}  |  {run2_name}: {dim_mean_vel_error2:.6f} {vel_unit}  |  Diff: {pct_diff_vel:+.2f}%")
+
+            # Velocity Error Std Dev
+            dim_mean_vel_std1 = np.mean(std_vel_error1[:, i])
+            dim_mean_vel_std2 = np.mean(std_vel_error2[:, i])
+            pct_diff_vel_std = ((dim_mean_vel_std1 - dim_mean_vel_std2) / dim_mean_vel_std2) * 100 if dim_mean_vel_std2 != 0 else 0
+            print(f"  Velocity Error Std Dev: {run1_name}: {dim_mean_vel_std1:.6f} {vel_unit}  |  {run2_name}: {dim_mean_vel_std2:.6f} {vel_unit}  |  Diff: {pct_diff_vel_std:+.2f}%")
+
+    print("="*80 + "\n")
 
 
 def main():
