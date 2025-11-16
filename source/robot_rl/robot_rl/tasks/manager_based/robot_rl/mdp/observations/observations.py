@@ -161,9 +161,10 @@ def stones_position(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     curr_stone_pos = cmd.current_stone_pos
     next_stone_pos = cmd.next_stone_pos 
     diff = next_stone_pos - curr_stone_pos
+    diff2 = cmd.nextnext_stone_pos - next_stone_pos
 
-    # return torch.cat([curr_stone_pos, next_stone_pos], dim=-1)
-    return diff
+    return torch.cat([diff, diff2], dim=-1)
+
 
 def foot_positions_in_base(env: ManagerBasedRLEnv, command_name: str = "hlip_ref") -> torch.Tensor:
     """Foot positions relative to base frame."""

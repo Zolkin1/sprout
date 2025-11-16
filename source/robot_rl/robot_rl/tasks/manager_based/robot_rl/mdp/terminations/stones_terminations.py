@@ -75,7 +75,9 @@ def com_z_too_low(env, output_command_name: str) -> torch.Tensor:
     return termination_flag
  
  
-def stationary_termination(env, velocity_threshold: float, duration_threshold: float) -> torch.Tensor:
+def stationary_x_with_nonzero_vel_command(env, 
+                           velocity_threshold: float = 0.1, 
+                           duration_threshold: float = 1.0) -> torch.Tensor:
     """Terminate if robot is stationary for too long.
     
     Args:
@@ -90,16 +92,24 @@ def stationary_termination(env, velocity_threshold: float, duration_threshold: f
     if not hasattr(env, '_stationary_time'):
         env._stationary_time = torch.zeros(env.num_envs, device=env.device)
     
-    # Get current base velocity
-    base_vel = env.scene.articulations["robot"].data.root_lin_vel_w[:, :2]  # XY only
-    speed = torch.norm(base_vel, dim=-1)
+    command = env.command_manager.get_command("base_velocity")
+    commanded_vel_x = command[:, 0]  # X velocity command
     
+    # Only check when commanded to move (non-zero x velocity)
+    commanded_to_move = torch.abs(commanded_vel_x) > velocity_threshold  # small threshold for numerical stability
+    
+    
+    # Get current base velocity
+    base_vel_x = env.scene.articulations["robot"].data.root_lin_vel_w[:, 0]  # X only
+    speed = torch.abs(base_vel_x)
+
     # Check if stationary
     is_stationary = speed < velocity_threshold
-    
+    # Only accumulate time when BOTH stationary AND commanded to move
+    should_accumulate = is_stationary & commanded_to_move
     # Update stationary time
     env._stationary_time = torch.where(
-        is_stationary,
+        should_accumulate,
         env._stationary_time + env.step_dt,  # increment
         torch.zeros_like(env._stationary_time)  # reset
     )

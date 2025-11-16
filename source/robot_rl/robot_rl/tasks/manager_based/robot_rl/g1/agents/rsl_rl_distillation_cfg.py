@@ -8,7 +8,7 @@ from isaaclab_rl.rsl_rl import (
 
 @configclass
 class G1DistillationRunnerCfg(RslRlDistillationRunnerCfg):
-    num_steps_per_env = 120
+    num_steps_per_env = 120 #longer steps was not necessary for distillation
     max_iterations = 300
     save_interval = 50
     experiment_name = "g1"
@@ -25,8 +25,8 @@ class G1DistillationRunnerCfg(RslRlDistillationRunnerCfg):
     )
     algorithm = RslRlDistillationAlgorithmCfg(
         num_learning_epochs=10,
-        learning_rate=1.0e-4,
-        gradient_length=1,
-        max_grad_norm=1.0,
+        learning_rate=5.0e-4,#huber seems stable even with higher lr
+        gradient_length=2,
+        max_grad_norm=2.0,
         loss_type="huber",
     )

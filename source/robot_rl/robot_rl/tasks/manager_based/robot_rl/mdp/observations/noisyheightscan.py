@@ -40,3 +40,14 @@ def noisy_height_scan(env, sensor_cfg):
     height_map = F.conv2d(height_map.unsqueeze(1), kernel, padding=1).squeeze(1)
 
     return height_map
+
+
+def height_scan_isaaclab(env, sensor_cfg, offset: float = 0.5) -> torch.Tensor:
+    """Height scan from the given sensor w.r.t. the sensor's frame.
+
+    The provided offset (Defaults to 0.5) is subtracted from the returned values.
+    """
+    # extract the used quantities (to enable type-hinting)
+    sensor = env.scene.sensors[sensor_cfg.name]
+    # height scan: height = sensor_height - hit_point_z - offset
+    return sensor.data.pos_w[:, 2].unsqueeze(1) - sensor.data.ray_hits_w[..., 2] - offset

@@ -57,3 +57,68 @@ def stones_sagittal_terrain_levels_vel(
     terrain.update_env_origins_and_infos(env_ids, move_up, move_down)
     # return the mean terrain level
     return torch.mean(terrain.terrain_levels.float())
+
+
+def stones_sagittal_terrain_levels_termination(
+    env: ManagerBasedRLEnv, 
+    env_ids: Sequence[int], 
+    success_term_name: str,
+    neutral_term_names: list[str] = None,
+) -> torch.Tensor:
+    """Curriculum based on the distance the robot walked when commanded to move at a desired velocity.
+
+    This term is used to increase the difficulty of the terrain when the robot walks far enough and decrease the
+    difficulty when the robot walks less than half of the distance required by the commanded velocity.
+
+    .. note::
+        It is only possible to use this term with the terrain type ``generator``. For further information
+        on different terrain types, check the :class:`isaaclab.terrains.TerrainImporter` class.
+
+    Returns:
+        The mean terrain level for the given environment ids.
+    """
+    # extract the used quantities (to enable type-hinting)
+    terrain = env.scene.terrain
+    if not getattr(terrain, "initialized", False):
+        terrain.initialized = True
+        return torch.mean(terrain.terrain_levels.float())
+
+    success_term = env.termination_manager.get_term(success_term_name)
+    
+    if neutral_term_names is None:
+        neutral_term_names = []
+        
+    # robots that walked far enough progress to harder terrains
+    move_up = success_term[env_ids]
+    
+    # Get all neutral terminations
+    neutral_terms = torch.zeros(len(env_ids), dtype=torch.bool, device=env.device)
+    for neutral_name in neutral_term_names:
+        neutral_term = env.termination_manager.get_term(neutral_name)
+        neutral_terms |= neutral_term[env_ids]  # OR operation
+
+    # Any other termination means failure (boolean tensor)
+    all_terminated = env.termination_manager.dones[env_ids]
+    move_down = all_terminated & ~move_up & ~neutral_terms
+    # update terrain levels
+    terrain.update_env_origins_and_infos(env_ids, move_up, move_down)
+    # return the mean terrain level
+    return torch.mean(terrain.terrain_levels.float())
+
+
+
+def modify_reference_cfg(
+    env,  
+    env_ids: Sequence[int], 
+    term_name: str, 
+    steps: int = 0
+) -> int:
+    """Curriculum that modifies the reference Cfg after a certain number of steps."""
+    
+    command_cfg = env.command_manager.get_term(term_name).cfg
+
+    if env.common_step_counter > steps:
+        command_cfg.use_stance_foot_pos_as_ref = True
+        return 1  # Signal curriculum change occurred
+    
+    return 0

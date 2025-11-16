@@ -22,7 +22,7 @@ Q_weights = [
     10.0,  # pelvis_yaw pos, vel
     3500.0,
     125.0,  # swing_x pos, vel
-    1700.0,
+    3500.0,
     125.0,  # swing_y pos, vel
     3500.0,
     100.0,  # swing_z pos, vel
@@ -86,6 +86,8 @@ class StonesOutputCommandCfg(CommandTermCfg):
 
     class_type: type = StonesOutputCommandTerm
     asset_name: str = "robot"
+
+    use_stance_foot_pos_as_ref: bool = False 
     yaw_idx: list[int] = [5, 11]
     debug_vis: bool = True  # enable debug visualization
     z_sw_max: float = 0.2  # max swing foot z height (m); this is ankle height so different from actual foot position
@@ -103,11 +105,13 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
     z0: float = 0.72  # CoM height (m)
     y_nom: float = 0.25  # nominal lateral foot offset (m)
+    y_sw_min: float = 0.15
+    y_sw_max: float = 0.4
     
     E_star: float = 0.6
     eps: float = 0.6 #xCOM position reference; xCOM_target[i]=eps*rel_x[i]
-    TSS_max: float = 0.5  # max step time (s)
-    TSS_min: float = 0.3  # min step time (s)
+    TSS_max: float = 0.6  # max step time (s)
+    TSS_min: float = 0.2  # min step time (s)
     
     foot_body_name: str = ".*_ankle_roll_link"
     upper_body_joint_name: list[str] = [

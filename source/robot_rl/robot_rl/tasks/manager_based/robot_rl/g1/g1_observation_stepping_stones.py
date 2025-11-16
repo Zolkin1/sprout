@@ -25,7 +25,7 @@ class TeacherCfg(ObsGroup):
     stones_rel_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
 
     height_scan = ObsTerm(
-        func=mdp.height_scan,
+        func=mdp.height_scan_isaaclab,
         params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         noise=Unoise(n_min=-0.1, n_max=0.1),
         clip=(-1.0, 1.0),
@@ -48,9 +48,8 @@ class StudentCfg(ObsGroup):
     joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
     actions = ObsTerm(func=mdp.last_action, history_length=1)
 
-    # sin_cos_phase = ObsTerm(func=mdp.sincos_phase_batched, params={"command_name": "hlip_ref"})
     height_scan = ObsTerm(
-        func=mdp.height_scan,
+        func=mdp.height_scan_isaaclab,
         params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         noise=Unoise(n_min=-0.1, n_max=0.1),
         clip=(-1.0, 1.0),
@@ -106,7 +105,7 @@ class CriticCfg(ObsGroup):
     )
     stones_rel_pos = ObsTerm(func=mdp.stones_position, params={"command_name": "hlip_ref"}, scale=1.0)
     height_scan = ObsTerm(
-        func=mdp.height_scan,
+        func=mdp.height_scan_isaaclab,
         params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         clip=(-1.0, 1.0),
     )

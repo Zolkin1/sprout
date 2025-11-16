@@ -356,8 +356,10 @@ class RLPolicy:
             # IsaacLab default is "xy" for the grid ordering
             for x in range(height_map.shape[0]):
                 for y in range(height_map.shape[1]):
-                    # TODO: Verify that it is clipped
-                    obs[x * height_map.shape[1] + y] = np.clip(sensor_pos[2] - height_map[x, y, 2] - offset, -1, 1)
+                    # FIXED: Swap the indexing order to match Isaac Lab
+                    obs[y * height_map.shape[0] + x] = np.clip(
+                        sensor_pos[2] - height_map[x, y, 2] - offset, -1, 1
+                    )
         else:
             raise ValueError("Height map scale is none but a height map was passed in!")
         return obs

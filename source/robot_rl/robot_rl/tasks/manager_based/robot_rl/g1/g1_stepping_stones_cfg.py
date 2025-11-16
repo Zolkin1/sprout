@@ -62,11 +62,15 @@ class CurriculumMlipCfg:
     
     # todo: stones curriculum
     if TEST_FLAT==False:
-        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_vel, 
+        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_termination, 
                                      params={
-                                            "output_command_name": "hlip_ref",
+                                            "success_term_name": "finished_long_stones",
                                              },)
-    
+        modify_reference_cfg = CurrTerm(func=mdp.modify_reference_cfg, 
+                                        params={
+                                                "term_name": "hlip_ref",
+                                                "steps": 1000 * 24
+                                               },  )
 
 
 # Lip specific rewards
@@ -131,6 +135,13 @@ class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):
             func=mdp.com_z_too_low,
             params={
                 "output_command_name": "hlip_ref",
+            },
+            time_out=False)
+        stationary_x_with_nonzero_vel_command = DoneTerm(
+            func=mdp.stationary_x_with_nonzero_vel_command,
+            params={
+                "velocity_threshold": 0.1,
+                "duration_threshold": 4.0,
             },
             time_out=False)
 
@@ -211,12 +222,12 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
 
         
         self.scene.height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.0, 1.0]),
-        debug_vis=True,
-        mesh_prim_paths=["/World/ground/terrain_stones"],
+            prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.0, 1.0]),
+            debug_vis=True,
+            mesh_prim_paths=["/World/ground/terrain_stones"],
         )
 
         ##
@@ -325,8 +336,22 @@ class G1_custom_stepping_stones_distillation(G1SteppingStonesEnvCfg):
         # Post init of parent
         super().__post_init__()
         self.observations = G1SteppingStonesObservationsDistillationCfg()
-        self.scene.terrain.max_init_terrain_level = 1
-        # self.curriculum.stones_curriculum=None
+        self.scene.terrain.max_init_terrain_level = 10
+        self.curriculum.stones_curriculum = None
+        self.curriculum.modify_reference_cfg = None
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (0.616, 0.616),
+                "operation": "add",
+            },
+        )
+        self.commands.hlip_ref.use_stance_foot_pos_as_ref = True
+        
+       
+        
 
 class G1_custom_stepping_stones_finetune(G1SteppingStonesEnvCfg):
     observations: G1SteppingStonesObservationsFinetuneCfg = G1SteppingStonesObservationsFinetuneCfg()
@@ -335,6 +360,25 @@ class G1_custom_stepping_stones_finetune(G1SteppingStonesEnvCfg):
         super().__post_init__()
         self.observations = G1SteppingStonesObservationsFinetuneCfg()
         self.scene.terrain.max_init_terrain_level = 3
+        self.events.add_plate_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_distribution_params": (0.616, 0.616),
+                "operation": "add",
+            },
+        )
+        # self.events.push_robot.params["velocity_range"] = {
+        #     "x": (-1.0, 1.0), 
+        #     "y": (-0.4, 0.4), 
+        #     "roll": (-0.5, 0.5),
+        #     "pitch": (-0.5, 0.5),
+        #     "yaw": (-0.5, 0.5),
+        # }
+        self.events.reset_robot_joints.params["position_range"] = (0.9, 1.1)
+        self.curriculum.modify_reference_cfg = None
+        self.commands.hlip_ref.use_stance_foot_pos_as_ref = True
 
 class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
     def __post_init__(self) -> None:
@@ -355,10 +399,10 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         #     "y": (-0.1, 0.1),
         #     "yaw": (-0.1, 0.1),
         # }
-        
+        self.scene.terrain.max_init_terrain_level = 2
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.5, 0.5)
+        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 1.0)
         
 class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_distillation):
     def __post_init__(self) -> None:
@@ -382,7 +426,7 @@ class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_dist
         
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 4
-        self.scene.terrain.terrain_generator.difficulty_range = (0.1, 0.2)
+        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 0.7)
 
 class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune):
     def __post_init__(self) -> None:
@@ -397,7 +441,7 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
         # remove random pushing
         self.events.base_external_force_torque = None
         self.events.push_robot = None
-        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.push_robot.interval_range_s = (3.0, 3.0)
         # self.events.reset_base.params["pose_range"] = {
         #     "x": (-0.3, 0.0),
         #     "y": (-0.1, 0.1),

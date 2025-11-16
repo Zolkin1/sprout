@@ -357,14 +357,14 @@ class StonesOutputCommandTerm(CommandTerm):
             start_stone_pos_w = self.terrain.env_terrain_infos["start_stone_pos"] + self.terrain.env_origins #(num_envs, 3)
             self.stone_width = self.terrain.env_terrain_infos["stone_y"].squeeze(-1)  #(num_envs,)
             # Get positions for reset environments
-            robot_pos_w_init = self.robot.data.root_pos_w[reset_mask]  # (num_reset, 3)
+            foot_pos_w_init = self.stance_foot_pos_0[reset_mask]  # (num_reset, 3)
             start_pos = start_stone_pos_w[reset_mask]  # (num_reset, 3)
         
             # evenly interpolate x positions from robot to platform
             t = torch.linspace( 1, STONES.num_init_steps, STONES.num_init_steps, device=self.device) / STONES.num_init_steps  # (num_init_steps,)
         
             # Compute initial stepping stones (interpolated from robot to platform)
-            abs_x_init = robot_pos_w_init[:, 0:1] + (start_pos[:, 0:1] - robot_pos_w_init[:, 0:1]) * t #(num_reset, num_init_steps)
+            abs_x_init = foot_pos_w_init[:, 0:1] + (start_pos[:, 0:1] - foot_pos_w_init[:, 0:1]) * t #(num_reset, num_init_steps)
             abs_z_init = start_pos[:, 2:3].expand_as(abs_x_init) #(num_reset, num_init_steps)
 
             # Concatenate with terrain stone sequence (cumulative offsets from start position)
@@ -427,9 +427,14 @@ class StonesOutputCommandTerm(CommandTerm):
             self.nextnext_stone_pos[beyond_mask_global, 0] = self.last_stone_x[beyond_mask_global] + 0.3 * (steps_beyond + 1)
             self.nextnext_stone_pos[beyond_mask_global, 1] = self.abs_y[beyond_mask_global, 0]
             self.nextnext_stone_pos[beyond_mask_global, 2] = self.last_stone_z[beyond_mask_global]
-    
+        
         self.hdes[mask] = self.next_stone_pos[mask, 2] - current_stone_pos[mask, 2]
         self.ldes[mask] = self.next_stone_pos[mask, 0] - current_stone_pos[mask, 0]
+        if self.cfg.use_stance_foot_pos_as_ref == True:
+            self.ldes[mask] = self.next_stone_pos[mask, 0] - self.stance_foot_pos_0[mask, 0]
+            # self.hdes[mask] = self.next_stone_pos[mask, 2] - self.stance_foot_pos_0[mask, 2]
+            
+            
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
         self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
         if torch.any(self.ldes_next < ZERO_EPS):
@@ -461,10 +466,11 @@ class StonesOutputCommandTerm(CommandTerm):
             if TEST_FLAT == False:
                 self.prev_stone_pos[mask_next_step] = self.current_stone_pos[mask_next_step].clone()
 
-                self.current_stone_pos[mask_next_step, 0] = self.next_stone_pos[mask_next_step, 0].clone()
-                self.current_stone_pos[mask_next_step, 1] = self.stance_foot_pos_0[mask_next_step, 1].clone()
-                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2].clone()
-
+                self.current_stone_pos[mask_next_step, 0] = self.next_stone_pos[mask_next_step, 0]
+                self.current_stone_pos[mask_next_step, 1] = self.stance_foot_pos_0[mask_next_step, 1]
+                self.current_stone_pos[mask_next_step, 2] = self.next_stone_pos[mask_next_step, 2]
+                # self.current_stone_pos[mask_next_step] = self.stance_foot_pos_0[mask_next_step]
+                
                 # mask_no_progress_this_step_local = (self.next_stone_pos[mask_next_step,0] - self.current_stone_pos[mask_next_step,0] ) > 0.2
                 # mask_no_progress_this_step_global = torch.zeros_like(mask_next_step, dtype=torch.bool)
                 # mask_no_progress_this_step_global[mask_next_step] = mask_no_progress_this_step_local
@@ -817,9 +823,18 @@ class StonesOutputCommandTerm(CommandTerm):
         
         # Swingfoot rel to stancefoot x based on stepping stone position, in world frame
         Ux = self.ldes
+        # Ux = torch.clamp(Ux, min=-1.0, max=1.0)
         # Get desired foot placements from HLIP in target yaw frame, no feedback used here
         #TODO: later consider add feedback
         Uy = self.hlip.get_desired_foot_placement(self.stance_idx) #Shape: (N,)
+        #clamp step y to avoid too large step and foot crossing
+        left_stance = (self.stance_idx == 0)
+        right_stance = (self.stance_idx == 1)
+        Uy[left_stance] = torch.clamp(Uy[left_stance], min=-self.cfg.y_sw_max, max=-self.cfg.y_sw_min)
+        Uy[right_stance] = torch.clamp(Uy[right_stance], min=self.cfg.y_sw_min, max=self.cfg.y_sw_max)
+        
+        
+        
         #TODO: for now target yaw frame = world frame, later consider adding different terrain yaw
         footplacement_target_frame = torch.stack([Ux, Uy, self.hdes], dim=-1) # Shape: (N,3)
         # Create horizontal control points with batch dimension
@@ -834,9 +849,7 @@ class StonesOutputCommandTerm(CommandTerm):
         v_swing_x = ((-dbht) * x_init_target_frame + dbht * Ux)  #Shape: (N,)
         
         #clamp swing foot y to avoid too large step
-        sign_swy = torch.sign(Uy)
-        #todo: for now, since not going sideway, just assume swy_0 = swy_T
-        y0 = self.prev_stone_pos[:, 1] - self.current_stone_pos[:, 1] #sign_swy * self.cfg.y_nom #Shape: (N,)
+        y0 = self.prev_stone_pos[:, 1] - self.current_stone_pos[:, 1] #Shape: (N,)
         p_swing_y = ((1 - bht) * (y0) + bht * Uy) #Shape: (N,)
         v_swing_y = ((-dbht) * y0 + dbht * Uy)  #Shape: (N,)
 
@@ -887,9 +900,10 @@ class StonesOutputCommandTerm(CommandTerm):
         
         
         # com y based on HLIP
+        #TODO: how should I guide comy 
         com_y_target_frame, com_dy_target_frame = self.hlip.get_desired_com_state(self.stance_idx, self.phase_var.time_in_step) #Shape: (N,)
         if self.use_momentum: #convert angular momentum to velocity
-            com_dy_target_frame = com_dy_target_frame / self.z0 #vy^d = LxLIP^d / z0
+            com_dy_target_frame = com_dy_target_frame / self.z0 #vy^d = LxLIP^d / z0, as LxLIP = -Lx
             
         
         # com x based on target orbital energy and comf position at the end of SS
@@ -1214,11 +1228,11 @@ class StonesOutputCommandTerm(CommandTerm):
             next_stone_pos = self.current_stone_pos + stone_center_offset
             next_stone_pos[:,0] += self.ldes
             next_stone_pos[:,2] += self.hdes
-            self.nextstone_visualizer.visualize(next_stone_pos,self.stone_quat)
-            nextnext_stone_pos = self.current_stone_pos + stone_center_offset
-            nextnext_stone_pos[:,0] += self.ldes + self.ldes_next
-            nextnext_stone_pos[:,2] += self.hdes + self.hdes_next
-            self.nextnextstone_visualizer.visualize(nextnext_stone_pos,self.stone_quat)
-            self.terrain_origin_visualizer.visualize(self.terrain.env_origins, self.stone_quat)
+            self.nextstone_visualizer.visualize(self.next_stone_pos+ stone_center_offset ,self.stone_quat)
+            # nextnext_stone_pos = self.current_stone_pos + stone_center_offset
+            # nextnext_stone_pos[:,0] += self.ldes + self.ldes_next
+            # nextnext_stone_pos[:,2] += self.hdes + self.hdes_next
+            self.nextnextstone_visualizer.visualize(self.nextnext_stone_pos+ stone_center_offset ,self.stone_quat)
+            # self.terrain_origin_visualizer.visualize(self.terrain.env_origins, self.stone_quat)
             self.comref_visualizer.visualize(self.com_frame_vis_pos, self.com_frame_vis_quat)
             
