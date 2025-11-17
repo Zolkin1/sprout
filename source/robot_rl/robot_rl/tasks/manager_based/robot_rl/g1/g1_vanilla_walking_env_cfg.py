@@ -7,13 +7,14 @@ from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvC
 # Pre-defined configs
 ##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
 from isaaclab.sensors import  RayCasterCfg, patterns
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
 
 ##
 # Vanilla Rewards
@@ -128,13 +129,67 @@ class G1VanillaWalkingRewardsCfg(HumanoidRewardCfg):
     )
 
 ##
+# Observations
+##
+@configclass
+class G1VanillaWalkingObservationsCfg():
+    """Observation specifications for the G1 Flat environment."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
+                                    scale=(2.0, 2.0, 2.0))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
+
+        actions = ObsTerm(func=mdp.last_action)
+        # Phase clock
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Observations for critic group."""
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+        )
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
+                                    scale=(2.0, 2.0, 2.0))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+        actions = ObsTerm(func=mdp.last_action)
+
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
+        contact_state = ObsTerm(
+            func=mdp.contact_state,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+        )
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+##
 # Environment configuration
 ##
 @configclass
 class G1VanillaWalkingEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Rough environment."""
-    commands: G1RoughLipCommandsCfg = G1RoughLipCommandsCfg()
-    observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
+    observations: G1VanillaWalkingObservationsCfg = G1VanillaWalkingObservationsCfg()
     rewards: G1VanillaWalkingRewardsCfg = G1VanillaWalkingRewardsCfg()
 
     def __post_init__(self):

@@ -41,6 +41,7 @@ class G1LipCLFCurriculumCfg:
 ##
 # Rewards
 ##
+@configclass
 class G1LipCLFRewards(HumanoidRewardCfg):
     """Rewards specific to LIP Model"""
 
@@ -153,11 +154,11 @@ class G1LipCLFObservationsCfg():
 @configclass
 class G1LipCLFEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
-
     rewards: G1LipCLFRewards = G1LipCLFRewards()
     observations: G1LipCLFObservationsCfg = G1LipCLFObservationsCfg()
     commands: G1LipCLFCommandsCfg = G1LipCLFCommandsCfg()
     curriculum: G1LipCLFCurriculumCfg = G1LipCLFCurriculumCfg()
+
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
@@ -166,10 +167,6 @@ class G1LipCLFEnvCfg(HumanoidEnvCfg):
         # Scene
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/pelvis_link"
-
-        # No height scanner for now
-        self.scene.height_scanner = None
 
         ##
         # Randomization

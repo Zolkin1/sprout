@@ -12,9 +12,8 @@ ENVIRONMENTS = {
     "vanilla_ec": "G1-vanilla-walking-ec",
     "lip_clf": "G1-lip-clf",
     "lip_clf_ec": "G1-lip-clf-ec",
-    "hzd_clf": "G1-hzd-clf",
-    "hzd_clf_custom": "G1-hzd-clf-custom",
-    "hzd_clf_minimum": "G1-hzd-clf-minimum",
+    "walking_clf": "G1-walking-clf",
+    "walking_clf_ec": "G1-walking-clf-ec",
     "running_hzd_clf": "G1-running-hzd",
 }
 
@@ -25,10 +24,8 @@ EXPERIMENT_NAMES = {
     "lip_clf": "lip",
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
-    "hzd_clf": "hzd",
-    "hzd_clf_play": "hzd",
-    "hzd_clf_custom": "hzd",
-    "hzd_clf_minimum": "hzd",
+    "walking_clf": "walking_clf",
+    "walking_clf_ec": "walking_clf",
     "running_hzd_clf": "hzd",
 }
 
