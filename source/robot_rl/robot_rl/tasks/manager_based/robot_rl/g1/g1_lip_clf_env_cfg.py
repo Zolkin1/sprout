@@ -6,35 +6,40 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ObservationsCfg
 from isaaclab.managers import SceneEntityCfg
 
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
                                                                     HumanoidRewardCfg)
-
+from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ObservationsCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import CommandsCfg  #Inherit from the base envs
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.cmd_cfg import HLIPCommandCfg
+
 ##
 # Pre-defined configs
-##
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1RoughLipObservationsCfg
-#
 
+
+##
+# Commands
+##
 @configclass
 class G1LipCLFCommandsCfg(HumanoidCommandsCfg):
     """Commands for the G1 Flat environment."""   
     hlip_ref = HLIPCommandCfg()
 
+##
+# Curriculums
+##
 @configclass
 class G1LipCLFCurriculumCfg:
     """Curriculum terms for the MDP."""
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
 
-# Lip specific rewards
+##
+# Rewards
 ##
 class G1LipCLFRewards(HumanoidRewardCfg):
     """Rewards specific to LIP Model"""
@@ -77,20 +82,85 @@ class G1LipCLFRewards(HumanoidRewardCfg):
         }
     )
 
+##
+# Observations
+##
+@configclass
+class G1LipCLFObservationsCfg():
+    """Observation specifications for the G1 Flat environment."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Observations for policy group."""
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+            noise=Unoise(n_min=-0.05, n_max=0.05),
+        )
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
+                                    scale=(2.0, 2.0, 2.0))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
+
+        actions = ObsTerm(func=mdp.last_action)
+        # Phase clock
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Observations for critic group."""
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity,
+        )
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
+                                    scale=(2.0, 2.0, 2.0))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+        actions = ObsTerm(func=mdp.last_action)
+
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+
+        contact_state = ObsTerm(
+            func=mdp.contact_state,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
+        )
+
+        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hlip_ref"}, scale=1.0)
+        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hlip_ref"}, scale=1.0)
+        ref_traj = ObsTerm(
+            func=mdp.ref_traj,
+            params={"command_name": "hlip_ref"}
+        )
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hlip_ref"}, scale=1.0)
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hlip_ref"}, clip=(-20.0, 20.0,),
+                               scale=1.0)
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hlip_ref"}, clip=(-20.0, 20.0,),
+                               scale=1.0)
+        height_scan = None  # Removed - not supported yet
+
+    # observation groups
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 @configclass
 class G1LipCLFEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 Flat environment."""
 
     rewards: G1LipCLFRewards = G1LipCLFRewards()
-    observations: G1RoughLipObservationsCfg = G1RoughLipObservationsCfg()
+    observations: G1LipCLFObservationsCfg = G1LipCLFObservationsCfg()
     commands: G1LipCLFCommandsCfg = G1LipCLFCommandsCfg()
     curriculum: G1LipCLFCurriculumCfg = G1LipCLFCurriculumCfg()
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
-
-
         
         ##
         # Scene
