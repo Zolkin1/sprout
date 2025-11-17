@@ -2,7 +2,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
-from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
+from .g1_rough_env_lip_cfg import G1LipCLFEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
@@ -12,7 +12,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 # Environment configuration
 ##
 @configclass
-class G1FlatLipEnvCfg(G1RoughLipEnvCfg):
+class G1FlatLipEnvCfg(G1LipCLFEnvCfg):
     """Configuration for the G1 Flat environment."""
 
     def __post_init__(self):

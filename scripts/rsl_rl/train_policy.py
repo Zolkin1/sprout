@@ -8,10 +8,10 @@ import cli_args
 
 # Environment names
 ENVIRONMENTS = {
-    "vanilla": "G1-flat-vel",
-    "lip_ref_tracking": "G1-flat-ref-tracking",
-    "lip_clf_vdot": "G1-flat-clf-vdot",
-    "lip_clf": "G1-lip-clf-custom",
+    "vanilla": "G1-vanilla-walking",
+    "vanilla_ec": "G1-vanilla-walking-ec",
+    "lip_clf": "G1-lip-clf",
+    "lip_clf_ec": "G1-lip-clf-ec",
     "hzd_clf": "G1-hzd-clf",
     "hzd_clf_custom": "G1-hzd-clf-custom",
     "hzd_clf_minimum": "G1-hzd-clf-minimum",
@@ -19,11 +19,11 @@ ENVIRONMENTS = {
 }
 
 EXPERIMENT_NAMES = {
-    "vanilla": "baseline",
+    "vanilla": "vanilla",
+    "vanilla_ec": "vanilla",
     "basic": "baseline",
     "lip_clf": "lip",
-    "lip_ref_tracking": "lip",
-    "lip_clf_vdot": "lip",
+    "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
     "hzd_clf": "hzd",
     "hzd_clf_play": "hzd",

@@ -8,7 +8,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg
+from .g1_rough_env_lip_cfg import G1LipCLFEnvCfg
 import math
 
 WALKING_Q_weights = [
@@ -69,7 +69,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
 
 
 @configclass
-class G1GaitLibraryEnvCfg(G1RoughLipEnvCfg):
+class G1GaitLibraryEnvCfg(G1LipCLFEnvCfg):
     """Configuration for the G1 environment with gait library."""
     commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
     observations: G1HZDObservationsCfg = G1HZDObservationsCfg()

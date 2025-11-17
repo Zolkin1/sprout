@@ -172,36 +172,8 @@ class HumanoidEventsCfg:
 
 
 @configclass
-class HumanoidRewardCfg(RewardsCfg):
+class HumanoidRewardCfg:
     """Reward terms for the MDP."""
-
-    ##
-    # Termination
-    ###
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
-
-    ##
-    # Tracking
-    ##
-
-    ##
-    # Feet
-    ##
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time_positive_biped,
-        weight=0.25,
-        params={
-            "command_name": "base_velocity",
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-        },
-    )
-
-    phase_contact = RewTerm(
-        func=mdp.phase_contact,
-        weight=0.18,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-    )
-
     ##
     # Joint limits
     ##
@@ -212,73 +184,15 @@ class HumanoidRewardCfg(RewardsCfg):
     )
 
     ##
-    # Penalize deviation from default of the joints that are not essential for locomotion
+    # Torque
     ##
-    joint_deviation_hip = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=0,  # -0.2,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_yaw_joint", ".*_hip_roll_joint"])},
-    )
-    joint_deviation_arms = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.1,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    ".*_shoulder_pitch_joint",
-                    ".*_shoulder_roll_joint",
-                    ".*_shoulder_yaw_joint",
-                    ".*_elbow_joint",
-                ],
-            )
-        },
-    )
-
-    joint_deviation_torso = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.1,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names="waist_yaw_joint")},
-    )
+    dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-5)
 
     ##
-    # Torso Height
+    # Action rate
     ##
-    height_torso = RewTerm(
-        func=mdp.base_height_l2,
-        weight=-2.0,
-        params={"target_height": 0.78},
-    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
-    undesired_contacts = None
-
-    ##
-    # Regularization
-    ##
-    dof_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=-1e-3)
-    alive = RewTerm(func=mdp.is_alive, weight=0.15)
-
-    ##
-    # Feet
-    ##
-    feet_clearance = RewTerm(
-        func=mdp.foot_clearance,
-        weight=0.0,
-        params={
-            "target_height": 0.08,
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
-        },
-    )
-
-    contact_no_vel = RewTerm(
-        func=mdp.contact_no_vel,
-        weight=-0.1,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_ankle_roll_link"),
-        },
-    )
 
 
 ##
@@ -286,7 +200,7 @@ class HumanoidRewardCfg(RewardsCfg):
 ##
 @configclass
 class HumanoidEnvCfg(LocomotionVelocityRoughEnvCfg):
-    rewards: HumanoidRewardCfg = HumanoidRewardCfg()
+    # rewards: HumanoidRewardCfg = HumanoidRewardCfg()
     observations: HumanoidObservationsCfg = HumanoidObservationsCfg()
     events: HumanoidEventsCfg = HumanoidEventsCfg()
     actions: HumanoidActionsCfg = HumanoidActionsCfg()

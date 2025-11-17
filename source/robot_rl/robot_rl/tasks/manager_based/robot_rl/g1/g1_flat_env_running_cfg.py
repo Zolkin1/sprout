@@ -11,7 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 import math
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from .g1_rough_env_lip_cfg import G1RoughLipEnvCfg, G1RoughLipCurriculumCfg
+from .g1_rough_env_lip_cfg import G1LipCLFEnvCfg, G1LipCLFCurriculumCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..humanoid_env_cfg import HumanoidEventsCfg
 from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
@@ -130,7 +130,7 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
     )
 
 @configclass
-class G1RunningCurriculumCfg(G1RoughLipCurriculumCfg):
+class G1RunningCurriculumCfg(G1LipCLFCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
@@ -141,7 +141,7 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
     pass
 
 @configclass
-class G1RunningGaitLibraryEnvCfg(G1RoughLipEnvCfg):
+class G1RunningGaitLibraryEnvCfg(G1LipCLFEnvCfg):
     """Configuration for the G1 running gait library environment."""
     commands: G1RunningGaitLibraryCommandsCfg = G1RunningGaitLibraryCommandsCfg()
     observations: G1RunningHZDObservationCfg = G1RunningHZDObservationCfg()
