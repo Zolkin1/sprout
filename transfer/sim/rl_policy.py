@@ -76,10 +76,16 @@ class RLPolicy:
                 obs_np[obs_idx:obs_idx+shape] = self.create_action_obs() * scale
                 obs_idx += shape
             elif term == "sin_phase":
-                obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                if np.linalg.norm(cmd_vel) > 0.01:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                else:
+                    obs_np[obs_idx:obs_idx+shape] = 0 * scale
                 obs_idx += shape
             elif term == "cos_phase":
-                obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                if np.linalg.norm(cmd_vel) > 0.01:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                else:
+                    obs_np[obs_idx:obs_idx+shape] = 1 * scale
                 obs_idx += shape
             else:
                 raise NotImplementedError("Observation term not implemented yet!")
