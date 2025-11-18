@@ -111,6 +111,14 @@ Optionally you can also add `--load_run=<run_dir>` to run a specific policy, oth
 
 This uses information that must have been exported from the `play_policy.py` script.
 
+Then we can generate plots for the mujoco simulation. We can run
+```
+python plot_from_sim.py --env_type=<ENV_NAME>
+```
+and optionally you can pass `--load_run=<run_dir>` where `<run_dir>` is something like `025-11-17_15-04-12_walking_test`.
+You can also pass `--log_session=<folder>` to choose a folder from within those mujoco logs. 
+If either of these are unspecified then we plot the data for the newest run.
+
 To add a new robot, the associated robot sim files will need to be added into the `transfer/sim/robots/` folder,
 the `rl_policy_wrapper` will need to be adjusted a bit, and a new `runner` file will need to be made.
 

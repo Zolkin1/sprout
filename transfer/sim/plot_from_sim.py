@@ -1,9 +1,43 @@
+import argparse
+import glob
 import os
+import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 from sim.log_utils import extract_data, find_most_recent_timestamped_folder
+
+# Environment experiment names mapping (same as in g1_runner.py)
+EXPERIMENT_NAMES = {
+    "vanilla": "vanilla",
+    "vanilla_ec": "vanilla",
+    "basic": "baseline",
+    "lip_clf": "lip",
+    "lip_clf_ec": "lip",
+    "lip_ref_play": "lip",
+    "walking_clf": "walking_clf",
+    "walking_clf_ec": "walking_clf",
+    "running_clf": "running_clf",
+}
+
+
+def find_latest_run(log_root_path):
+    """Find the latest run directory in the given path."""
+    run_dirs = glob.glob(os.path.join(log_root_path, "*"))
+    if not run_dirs:
+        return None
+
+    # Get the latest run directory
+    latest_run = max(run_dirs, key=os.path.getmtime)
+    run_name = os.path.basename(latest_run)
+
+    return run_name
+
+
+def find_most_recent_mujoco_log(mujoco_logs_dir):
+    """Find the most recent timestamped folder in the MuJoCo logs directory."""
+    return find_most_recent_timestamped_folder(mujoco_logs_dir)
 
 
 # Make plots
@@ -206,20 +240,30 @@ def plot_position_comparison(data, save_dir):
     plt.savefig(os.path.join(save_dir, "position_comparison.png"))
 
 
-def create_plots_for_newest():
-    # Load in the data from rerun
-    log_dir = os.getcwd() + "/logs"
-    print(f"Looking for logs in {log_dir}.")
-    newest = find_most_recent_timestamped_folder(log_dir)
+def create_plots(log_dir):
+    """Create plots from the specified log directory.
 
-    print(f"Loading data from {newest}.")
+    Args:
+        log_dir: Path to the directory containing sim_config.yaml and sim_log.csv
+    """
+    print(f"Loading data from {log_dir}.")
 
-    # TODO: Load in pkl or csv
     # Parse the config file
-    with open(os.path.join(newest, "sim_config.yaml")) as f:
+    config_path = os.path.join(log_dir, "sim_config.yaml")
+    if not os.path.exists(config_path):
+        print(f"[ERROR] Config file not found: {config_path}")
+        sys.exit(1)
+
+    with open(config_path) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
 
-        data = extract_data(os.path.join(newest, "sim_log.csv"), config)
+    # Load data
+    data_path = os.path.join(log_dir, "sim_log.csv")
+    if not os.path.exists(data_path):
+        print(f"[ERROR] Data file not found: {data_path}")
+        sys.exit(1)
+
+    data = extract_data(data_path, config)
 
     print("============== Data generated using " + config["simulator"] + " ===============")
 
@@ -239,25 +283,91 @@ def create_plots_for_newest():
         print(f"Using joint names: {joint_names}")
     else:
         print("No joint names found in config, using default labels")
-    
+
     if torque_limits:
         print(f"Using torque limits: {torque_limits}")
     else:
         print("No torque limits found in config")
 
-    # Make a plot
-    plot_joints_and_actions(data, newest, joint_names)
-    plot_torques(data, newest, joint_names, torque_limits)
-    # plot_vels(data, newest, joint_names)
-    plot_base(data, newest)
-    # import pdb; pdb.set_trace()
-    # plot_ankles(data)
+    # Create plots directory
+    plots_dir = os.path.join(log_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+    print(f"Saving plots to {plots_dir}")
 
-    # Plot velocity and position comparisons
-    plot_velocity_comparison(data, newest)
-    plot_position_comparison(data, newest)
+    # Make plots
+    plot_joints_and_actions(data, plots_dir, joint_names)
+    plot_torques(data, plots_dir, joint_names, torque_limits)
+    plot_base(data, plots_dir)
+    plot_velocity_comparison(data, plots_dir)
+    plot_position_comparison(data, plots_dir)
+
+    print(f"[INFO] Plots saved to {plots_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create plots from MuJoCo simulation logs")
+    parser.add_argument("--env_type", type=str, required=True,
+                       choices=list(EXPERIMENT_NAMES.keys()),
+                       help="Type of environment (e.g., walking_clf, running_clf)")
+    parser.add_argument("--load_run", type=str, required=False, default=None,
+                       help="Specific run directory to load. If not specified, uses latest run.")
+    parser.add_argument("--log_session", type=str, required=False, default=None,
+                       help="Specific log session (timestamp folder) to plot. If not specified, uses latest.")
+    args = parser.parse_args()
+
+    # Construct path to logs directory (same structure as g1_runner.py)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(os.path.dirname(script_dir))
+
+    # Build path: logs/g1_policies/{experiment_name}/{env_type}
+    experiment_name = EXPERIMENT_NAMES[args.env_type]
+    base_log_path = os.path.join(root_dir, "logs", "g1_policies", experiment_name)
+    log_root_path = os.path.join(base_log_path, args.env_type)
+
+    print(f"[INFO] Looking for logs in: {log_root_path}")
+
+    # Find the run directory
+    if args.load_run:
+        run_name = args.load_run
+        run_dir = os.path.join(log_root_path, run_name)
+        if not os.path.exists(run_dir):
+            print(f"[ERROR] Specified run directory not found: {run_dir}")
+            sys.exit(1)
+    else:
+        print("[INFO] No run specified, finding latest run...")
+        run_name = find_latest_run(log_root_path)
+        if not run_name:
+            print(f"[ERROR] No runs found in {log_root_path}")
+            sys.exit(1)
+        run_dir = os.path.join(log_root_path, run_name)
+
+    print(f"[INFO] Using run: {run_name}")
+
+    # Find the mujoco_logs directory
+    mujoco_logs_dir = os.path.join(run_dir, "mujoco_logs")
+    if not os.path.exists(mujoco_logs_dir):
+        print(f"[ERROR] MuJoCo logs directory not found: {mujoco_logs_dir}")
+        print(f"[INFO] Make sure to run g1_runner.py with --log first")
+        sys.exit(1)
+
+    # Find the specific log session
+    if args.log_session:
+        log_dir = os.path.join(mujoco_logs_dir, args.log_session)
+        if not os.path.exists(log_dir):
+            print(f"[ERROR] Specified log session not found: {log_dir}")
+            sys.exit(1)
+    else:
+        print("[INFO] No log session specified, finding latest...")
+        log_dir = find_most_recent_mujoco_log(mujoco_logs_dir)
+        if not log_dir:
+            print(f"[ERROR] No log sessions found in {mujoco_logs_dir}")
+            sys.exit(1)
+
+    print(f"[INFO] Using log session: {os.path.basename(log_dir)}")
+
+    # Create the plots
+    create_plots(log_dir)
 
 
 if __name__ == "__main__":
-    create_plots_for_newest()
-    # plt.show()
+    main()
