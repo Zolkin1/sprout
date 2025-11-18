@@ -74,23 +74,105 @@ def export_policy_parameters(env, obs, actions, save_dir):
 
     # Add robot joint information
     params["default_joint_angles"] = robot.data.default_joint_pos[0].detach().cpu().numpy()
-    params["kp"] = robot.data.joint_stiffness[0].detach().cpu().numpy()
-    params["kd"] = robot.data.joint_damping[0].detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
-    # Add observation information
+    # Get base kp/kd from config if available, otherwise use current values
+    # Note: robot.data values may be randomized during training
+    if hasattr(robot, 'cfg') and hasattr(robot.cfg, 'actuators'):
+        # Try to extract base gains from configuration in the correct joint order
+        try:
+            import re
+            joint_names = robot.data.joint_names
+            kp_list = []
+            kd_list = []
+
+            # Iterate through each joint and find its actuator group
+            for joint_name in joint_names:
+                found = False
+                # Check each actuator group
+                for actuator_name, actuator_cfg in robot.cfg.actuators.items():
+                    # Check if this joint matches any of the patterns in this actuator group
+                    for pattern in actuator_cfg.joint_names_expr:
+                        if re.match(pattern.replace(".*", ".*?"), joint_name):
+                            # Get stiffness for this joint
+                            if isinstance(actuator_cfg.stiffness, dict):
+                                # Find matching pattern in stiffness dict
+                                kp_val = None
+                                for stiff_pattern, stiff_val in actuator_cfg.stiffness.items():
+                                    if re.match(stiff_pattern.replace(".*", ".*?"), joint_name):
+                                        kp_val = stiff_val
+                                        break
+                                if kp_val is None:
+                                    raise ValueError(f"No stiffness found for joint {joint_name}")
+                                kp_list.append(kp_val)
+                            else:
+                                kp_list.append(actuator_cfg.stiffness)
+
+                            # Get damping for this joint
+                            if isinstance(actuator_cfg.damping, dict):
+                                # Find matching pattern in damping dict
+                                kd_val = None
+                                for damp_pattern, damp_val in actuator_cfg.damping.items():
+                                    if re.match(damp_pattern.replace(".*", ".*?"), joint_name):
+                                        kd_val = damp_val
+                                        break
+                                if kd_val is None:
+                                    raise ValueError(f"No damping found for joint {joint_name}")
+                                kd_list.append(kd_val)
+                            else:
+                                kd_list.append(actuator_cfg.damping)
+
+                            found = True
+                            break
+                    if found:
+                        break
+
+                if not found:
+                    raise ValueError(f"No actuator found for joint {joint_name}")
+
+            params["kp"] = kp_list
+            params["kd"] = kd_list
+        except (AttributeError, KeyError, ValueError) as e:
+            print(f"[WARNING] Could not extract base gains from config: {e}")
+            # Fall back to current values if config extraction fails
+            params["kp"] = robot.data.joint_stiffness[0].detach().cpu().numpy()
+            params["kd"] = robot.data.joint_damping[0].detach().cpu().numpy()
+    else:
+        params["kp"] = robot.data.joint_stiffness[0].detach().cpu().numpy()
+        params["kd"] = robot.data.joint_damping[0].detach().cpu().numpy()
+
+    # Custom YAML representer for lists to use flow style for numerical lists
+    class FlowStyleList(list):
+        pass
+
+    def represent_flow_list(dumper, data):
+        return dumper.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
+
+    yaml.add_representer(FlowStyleList, represent_flow_list)
+
+    # Add observation information (only policy group, skip critic)
     obs_manager = unwrapped_env.observation_manager
     obs_info = {}
 
     for group_name, group_terms in obs_manager.active_terms.items():
+        # Only include policy observations
+        if group_name != "policy":
+            continue
+
         obs_info[group_name] = {}
         # Get the dimensions and configs for this group
         group_dims = obs_manager._group_obs_term_dim[group_name]
         group_cfgs = obs_manager._group_obs_term_cfgs[group_name]
 
         for term_name, term_dim, term_cfg in zip(group_terms, group_dims, group_cfgs):
+            # Convert shape to scalar if single dimension, otherwise keep as list
+            if len(term_dim) == 1:
+                shape_value = term_dim[0]
+            else:
+                shape_value = list(term_dim)
+
             term_info = {
-                "shape": list(term_dim),
+                "shape": shape_value,
             }
 
             # Try to get scale information if available
@@ -104,9 +186,36 @@ def export_policy_parameters(env, obs, actions, save_dir):
     # Convert to serializable format
     params = convert_to_serializable(params)
 
+    # Helper function to recursively convert lists to FlowStyleList
+    def convert_lists_to_flow_style(obj):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, list):
+                    obj[key] = FlowStyleList(value)
+                elif isinstance(value, dict):
+                    convert_lists_to_flow_style(value)
+        return obj
+
+    # Convert numerical lists to flow style
+    if 'default_joint_angles' in params:
+        params['default_joint_angles'] = FlowStyleList(params['default_joint_angles'])
+    if 'kp' in params:
+        params['kp'] = FlowStyleList(params['kp'])
+    if 'kd' in params:
+        params['kd'] = FlowStyleList(params['kd'])
+    if 'joint_names_isaac' in params:
+        params['joint_names_isaac'] = FlowStyleList(params['joint_names_isaac'])
+
+    # Convert all scale lists in observation_terms to flow style
+    if 'observation_terms' in params:
+        for group_name, group_terms in params['observation_terms'].items():
+            for term_name, term_info in group_terms.items():
+                if 'scale' in term_info and isinstance(term_info['scale'], list):
+                    term_info['scale'] = FlowStyleList(term_info['scale'])
+
     # Save to YAML file
     yaml_path = os.path.join(export_dir, "policy_parameters.yaml")
     with open(yaml_path, 'w') as f:
-        yaml.dump(params, f, default_flow_style=False, sort_keys=False)
+        yaml.dump(params, f, default_flow_style=False, sort_keys=False, width=120)
 
     print(f"[INFO] Exported policy parameters to {yaml_path}")
