@@ -14,7 +14,7 @@ ENVIRONMENTS = {
     "lip_clf_ec": "G1-lip-clf-ec",
     "walking_clf": "G1-walking-clf",
     "walking_clf_ec": "G1-walking-clf-ec",
-    "running_hzd_clf": "G1-running-clf",
+    "running_clf": "G1-running-clf",
 }
 
 EXPERIMENT_NAMES = {
@@ -26,7 +26,7 @@ EXPERIMENT_NAMES = {
     "lip_ref_play": "lip",
     "walking_clf": "walking_clf",
     "walking_clf_ec": "walking_clf",
-    "running_hzd_clf": "running_clf",
+    "running_clf": "running_clf",
 }
 
 

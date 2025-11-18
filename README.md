@@ -80,12 +80,12 @@ These policies are automatically downloaded in the `transfer/obelisk` controller
 
 RL Task list:
 
-| Task              |   Robot    |  Hardware Tested?  | Description                                                      |
-|-------------------|:----------:|:------------------:|------------------------------------------------------------------|
-| `vanilla`         |     G1     | :white_check_mark: | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
-| `lip_clf`         |     G1     | :white_check_mark: | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
-| `walking_clf`     |     G1     | :white_check_mark: | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
- | `running_hzd_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
+| Task          |   Robot    |  Hardware Tested?  | Description                                                      |
+|---------------|:----------:|:------------------:|------------------------------------------------------------------|
+| `vanilla`     |     G1     | :white_check_mark: | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
+| `lip_clf`     |     G1     | :white_check_mark: | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
+| `walking_clf` |     G1     | :white_check_mark: | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
+ | `running_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
 
