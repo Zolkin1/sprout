@@ -499,3 +499,33 @@ class HLIPCommandTerm(CommandTerm):
             self.vdot_buffer = torch.cat([self.vdot_buffer[:,1:], self.vdot.unsqueeze(-1)], dim=-1)
        
             
+    def get_flight_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase.
+        No flight phase available for the HLIP model
+        """
+
+        return torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+
+
+    def get_not_flight_envs(self):
+
+        return torch.ones(self.num_envs, dtype=torch.int32, device=self.device)
+
+    def get_ssp_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase.
+        Everything is in SSP for the HLIP model.
+        """
+        # Get flight phase domain index
+        ssp_domain_idx = self.gait_config.domain_name_to_idx["single_support"]
+
+        # Create boolean mask where current_domains equals flight_phase index
+        ssp_mask = (self.current_domains == ssp_domain_idx)
+
+        return torch.ones(self.num_envs, dtype=torch.int32, device=self.device)
+
+    def get_dsp_envs(self):
+        """Get a masking tensor with a 1 for each environment in the flight phase.
+        No DSP for HLIP model.
+        """
+
+        return torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)

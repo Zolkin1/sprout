@@ -10,61 +10,60 @@ _registered = False
 ##
 
 if not _registered:
+    ## =========================================
+    # Vanilla, heuristic RL
+    ## =========================================
     gym.register(
-        id="G1-flat-vel",
+        id="G1-vanilla-walking",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env:G1FlatEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_vanilla_walking_env_cfg:G1VanillaWalkingEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+    # Extra compute (EC)
     gym.register(
-        id="G1-LIP-clf",
+        id="G1-vanilla-walking-ec",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_lip_cfg:G1FlatLipEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_vanilla_walking_env_cfg:G1VanillaWalkingECEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+
+    ## =========================================
+    # LIP-CLF RL
+    ## =========================================
     gym.register(
-        id="G1-lip-clf-custom",
+        id="G1-lip-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_lip_cfg:G1_custom_lip_clf",
+            "env_cfg_entry_point": f"{__name__}.g1_lip_clf_env_cfg:G1LipCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+    # Extra compute (EC)
     gym.register(
-        id="G1-LIP-ref-tracking",
+        id="G1-lip-clf-ec",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_lip_cfg:G1FlatRefTrackingEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_lip_clf_env_cfg:G1LipCLFECEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
-    gym.register(
-        id="G1-LIP-clf-vdot",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_lip_cfg:G1FlatLipVdotEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
+    # Play
     gym.register(
         id="G1-LIP-ref-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -76,67 +75,65 @@ if not _registered:
         },
     )
 
+    ## =========================================
+    # Walking Trajectory Optimization
+    ## =========================================
     gym.register(
-        id="G1-hzd-clf",
+        id="G1-walking-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GaitLibraryEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+    # Extra compute (EC)
     gym.register(
-        id="G1-hzd-clf-play",
+        id="G1-walking-clf-ec",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1GL_PlayEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+    # Play
     gym.register(
-        id="G1-hzd-clf-custom",
+        id="G1-walking-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_custom_plate_GaitLibraryEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg_PLAY",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
+    ## =========================================
+    # Running Trajectory Optimization
+    ## =========================================
     gym.register(
-        id="G1-hzd-clf-minimum",
+        id="G1-running-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_gait_library_env_cfg:G1_clf_rl_minimum_rewards",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    gym.register(
-        id="G1-running-hzd",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_running_cfg:G1RunningGaitLibraryEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
+    # Play
     gym.register(
-        id="G1-running-hzd-play",
+        id="G1-running-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_running_cfg:G1RunningGaitLibraryEnvCfgPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }

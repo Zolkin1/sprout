@@ -97,3 +97,5 @@ transfer/sim/experiments/plots_RA-L
 paper_figures/
 transfer/sim/experiments/comparison_logs
 /amy_remote_mount/
+talos_remote_mount/
+transfer/sim/experiments/temp_holder/
