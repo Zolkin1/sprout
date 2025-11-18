@@ -12,6 +12,6 @@ class GaitPeriodCfg(CommandTermCfg):
 
     class_type: type = GaitPeriodCommand
 
-    period_range: tuple[float, float] = MISSING
+    gait_period_range: tuple[float, float] = MISSING
 
 

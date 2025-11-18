@@ -80,12 +80,12 @@ These policies are automatically downloaded in the `transfer/obelisk` controller
 
 RL Task list:
 
-| Task          |   Robot    |  Hardware Tested?  | Description                                                      |
+| Env. Type     |   Robot    |  Hardware Tested?  | Description                                                      |
 |---------------|:----------:|:------------------:|------------------------------------------------------------------|
 | `vanilla`     |     G1     | :white_check_mark: | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
 | `lip_clf`     |     G1     | :white_check_mark: | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `walking_clf` |     G1     | :white_check_mark: | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
- | `running_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
+| `running_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
 
@@ -103,13 +103,15 @@ This code base has a built in sim2sim transfer (i.e. the policy is trained in Is
 Currently, we only support the G1 (as that is the only policy we have right now), but the code is easily extended to other robots.
 To run the sim2sim transfer, go to the `transfer/sim/` directory. From this directory run
 ```
-python g1_runner.py --config_file=/path/to/config/file
+python g1_runner.py --env_type=<ENV_NAME>
 ```
+where `ENV_NAME` is the same as above: it is an entry into the table. The arguments here follow the same structure as the `play_policy.py` script.
+Optionally you can also add `--load_run=<run_dir>` to run a specific policy, otherwise the newest one will be run.
+`--log` enables logging to the same directory. You can choose the logging directory with `--log_dir`.
 
-The config file holds all the information about how the RL policy is used including which policy to load, scaling of
-observations and actions, and default angles.
+This uses information that must have been exported from the `play_policy.py` script.
 
-To add an additional robot, the associated robot sim files will need to be added into the `transfer/sim/robots/` folder,
+To add a new robot, the associated robot sim files will need to be added into the `transfer/sim/robots/` folder,
 the `rl_policy_wrapper` will need to be adjusted a bit, and a new `runner` file will need to be made.
 
 ## Code formatting

@@ -54,6 +54,13 @@ def export_policy_parameters(env, obs, actions, save_dir):
     except KeyError:
         pass
 
+    # Add gait period command if available
+    try:
+        gait_period_term = unwrapped_env.command_manager.get_term("gait_period")
+        params["gait_period_range"] = gait_period_term.cfg.gait_period_range
+    except KeyError:
+        pass
+
     # Add action scale
     try:
         params["action_scale"] = unwrapped_env.action_manager.get_term("joint_pos").cfg.scale
@@ -175,9 +182,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
                 "shape": shape_value,
             }
 
-            # Try to get scale information if available
+            # Try to get scale information if available, otherwise default to 1.0
             if hasattr(term_cfg, 'scale') and term_cfg.scale is not None:
                 term_info["scale"] = term_cfg.scale
+            else:
+                term_info["scale"] = 1.0
 
             obs_info[group_name][term_name] = term_info
 
@@ -205,6 +214,8 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params['kd'] = FlowStyleList(params['kd'])
     if 'joint_names_isaac' in params:
         params['joint_names_isaac'] = FlowStyleList(params['joint_names_isaac'])
+    if 'gait_period_range' in params:
+        params['gait_period_range'] = FlowStyleList(params['gait_period_range'])
 
     # Convert all scale lists in observation_terms to flow style
     if 'observation_terms' in params:

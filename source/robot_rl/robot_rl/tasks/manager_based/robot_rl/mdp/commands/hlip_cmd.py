@@ -74,7 +74,7 @@ class HLIPCommandTerm(CommandTerm):
         self.y_nom = cfg.y_nom
 
         #grab from gait period command
-        self.T = env.cfg.commands.step_period.period_range[0]/2
+        self.T = env.cfg.commands.gait_period.gait_period_range[0] / 2
 
         self.debug_vis = cfg.debug_vis
         if self.debug_vis:
