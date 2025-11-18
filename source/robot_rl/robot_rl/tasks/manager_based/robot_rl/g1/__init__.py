@@ -36,6 +36,8 @@ if not _registered:
         },
     )
 
+    # TODO: Add a play
+
 
     ## =========================================
     # LIP-CLF RL
@@ -65,7 +67,7 @@ if not _registered:
 
     # Play
     gym.register(
-        id="G1-LIP-ref-play",
+        id="G1-lip-ref-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
