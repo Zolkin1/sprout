@@ -225,7 +225,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
 
-        self.commands.step_period.period_range = (0.71,0.71)    # TODO: Remove?
+        self.commands.gait_period.gait_period_range = (0.71, 0.71)    # TODO: Remove?
 
         ##
         # Randomization

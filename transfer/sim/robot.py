@@ -1,5 +1,6 @@
 import os
 from collections.abc import Callable
+from typing import Dict
 
 import mujoco
 import numpy as np
@@ -8,7 +9,8 @@ from scipy.spatial.transform import Rotation
 
 
 class Robot:
-    def __init__(self, robot_name: str, scene_name: str, input_function: Callable[[float], np.array] = None, use_pd: bool =False, rng=None):
+    def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
+                 input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
         """Initialize the robot with its model and data."""
         if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
             raise ValueError("Invalid robot name! Only support g1_21j for now.")
@@ -19,6 +21,10 @@ class Robot:
         self.commanded_vel = np.zeros(3)  # Store commanded velocity
         self.input_function = input_function
         self.rng = rng
+        self.joystick_scaling = joystick_scaling
+        self.joint_names = self.get_joint_names()
+        self.gains = gains
+        print(f"Mujoco joint names: {self.joint_names}")
 
         body_name = "torso_link"
         body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
@@ -94,15 +100,6 @@ class Robot:
 
         self.mj_model.body_ipos[body_id] += self.torso_ipos
 
-    def get_projected_gravity(self, quat):
-        """Calculate projected gravity from quaternion."""
-        qw, qx, qy, qz = quat
-        pg = np.zeros(3)
-        pg[0] = 2 * (-qz * qx + qw * qy)
-        pg[1] = -2 * (qz * qy + qw * qx)
-        pg[2] = 1 - 2 * (qw * qw + qz * qz)
-        return pg
-
     def get_joystick_command(self):
         """Get velocity commands from joystick."""
         des_vel = np.zeros(3)
@@ -110,9 +107,9 @@ class Robot:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(0.0*self.joystick.get_axis(0))
-            vx = -(1.0*self.joystick.get_axis(1))
-            vyaw = -(self.joystick.get_axis(3)) * 0.5
+            vy = -(self.joystick_scaling[0]*self.joystick.get_axis(0))
+            vx = -(self.joystick_scaling[0]*self.joystick.get_axis(1))
+            vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3))
 
             des_vel[0] = vx
             des_vel[1] = vy
@@ -128,37 +125,23 @@ class Robot:
         qpos = self.mj_data.qpos
         qvel = self.mj_data.qvel
         sim_time = self.mj_data.time
-        pg = self.get_projected_gravity(qpos[3:7])
+        # pg = self.get_projected_gravity(qpos[3:7])
         if self.input_function is None:
             self.commanded_vel = self.get_joystick_command()
         else:
             self.commanded_vel = self.input_function(sim_time)
 
         if self.use_pd:
-            kp_y = 1.5
-            kd_y = 0.3
-            y_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_y * qpos[1] + -kd_y * qvel[1], -0.5, 0.5)
-            self.commanded_vel[1] = y_vel
-
-            kp_yaw = 0.8
-            kd_yaw = 0.3
-            siny_cosp = 2 * (qpos[3] * qpos[6] + qpos[4] * qpos[5])
-            cosy_cosp = 1 - 2 * (qpos[5] * qpos[5] + qpos[6] * qpos[6])
-            yaw = np.arctan2(siny_cosp, cosy_cosp)
-            angular_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_yaw * yaw + -kd_yaw * qvel[5], -0.5, 0.5)
-            self.commanded_vel[2] = angular_vel
-
-        print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
+            self.pd_control(qpos, qvel)
 
         return policy.create_obs(
-            qpos[7:],
+            qpos[:7],
             qvel[3:6],
+            qpos[7:],
             qvel[6:],
             sim_time,
-            pg,
             self.commanded_vel,
-            height_map=height_map,
-            sensor_pos=sensor_pos,
+            self.joint_names
         )
 
     def get_log_data(self, policy, obs, action):
@@ -197,6 +180,23 @@ class Robot:
 
         return v_local
 
+    def pd_control(self, qpos: np.ndarray, qvel: np.ndarray):
+        """Compute the PD control actions to keep the robot moving straight."""
+        kp_y = self.gains["kp_y"]
+        kd_y = self.gains["kd_y"]
+        y_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_y * qpos[1] + -kd_y * qvel[1], -0.5, 0.5)
+        self.commanded_vel[1] = y_vel
+
+        kp_yaw = self.gains["kp_yaw"]
+        kd_yaw = self.gains["kd_yaw"]
+        siny_cosp = 2 * (qpos[3] * qpos[6] + qpos[4] * qpos[5])
+        cosy_cosp = 1 - 2 * (qpos[5] * qpos[5] + qpos[6] * qpos[6])
+        yaw = np.arctan2(siny_cosp, cosy_cosp)
+        angular_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_yaw * yaw + -kd_yaw * qvel[5], -0.5, 0.5)
+        self.commanded_vel[2] = angular_vel
+
+        print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
+
     def apply_action(self, action):
         """Apply control action to the robot."""
         self.mj_data.ctrl[: len(action)] = action
@@ -207,3 +207,16 @@ class Robot:
 
     def failed(self):
         return self.mj_data.qpos[2] < 0.2
+
+    def get_joint_names(self) -> list[str]:
+        """Extract joint names from qpos in MuJoCo order.
+
+        Returns:
+            List of joint names corresponding to qpos[7:] (excluding floating base)
+        """
+        joint_names = []
+        for i in range(7, self.mj_model.nq):
+            joint_name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, i - 6)
+            if joint_name:
+                joint_names.append(joint_name)
+        return joint_names

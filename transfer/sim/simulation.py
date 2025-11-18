@@ -69,7 +69,7 @@ class Simulation:
         self.use_height_sensor = use_height_sensor
 
         # Setup simulation parameters
-        self.sim_steps_per_policy_update = int(policy.dt / robot.mj_model.opt.timestep)
+        self.sim_steps_per_policy_update = int(policy.get_dt() / robot.mj_model.opt.timestep)
         self.sim_loop_rate = self.sim_steps_per_policy_update * robot.mj_model.opt.timestep
         self.viewer_rate = math.ceil((1 / 50) / robot.mj_model.opt.timestep)
 
@@ -124,8 +124,8 @@ class Simulation:
         sim_config = {
             "simulator": "mujoco",
             "robot": self.robot.robot_name,
-            "policy": self.policy.get_chkpt_path(),
-            "policy_dt": self.policy.dt,
+            "policy": self.policy.policy_path,
+            "policy_dt": self.policy.get_dt(),
             "use_height_sensor": self.use_height_sensor,
             "data_structure": data_structure,
             "joint_names": joint_names,
@@ -147,7 +147,7 @@ class Simulation:
         """Run the simulation without a viewer."""
         print(
             f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
-            f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
+            f"Policy dt set to {self.policy.get_dt()} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
             f"Simulation dt set to {self.robot.mj_model.opt.timestep} s. Sim loop rate set to {self.sim_loop_rate} s.\n"
             f"Height sensor enabled: {self.use_height_sensor}\n"
         )
@@ -216,7 +216,7 @@ class Simulation:
         """Run the simulation."""
         print(
             f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
-            f"Policy dt set to {self.policy.dt} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
+            f"Policy dt set to {self.policy.get_dt()} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
             f"Simulation dt set to {self.robot.mj_model.opt.timestep} s. Sim loop rate set to {self.sim_loop_rate} s.\n"
             f"Height sensor enabled: {self.use_height_sensor}\n"
         )
@@ -264,7 +264,7 @@ class Simulation:
                     obs = self.robot.create_observation(self.policy, height_map=height_map, sensor_pos=sensor_pos)
                 else:
                     obs = self.robot.create_observation(self.policy)
-                action = self.policy.get_action(obs)
+                action = self.policy.get_action(obs, self.robot.joint_names)
                 self.robot.apply_action(action)
 
                 if self.robot.failed():

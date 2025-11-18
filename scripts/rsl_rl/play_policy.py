@@ -15,10 +15,10 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
 
 SIM_ENVIRONMENTS = {
-    "vanilla": "G1-flat-vel",
-    "lip_clf": "G1-LIP-ref-play",
-    "hzd_clf_custom": "G1-hzd-clf-play",
-    "running_hzd_clf": "G1-running-hzd-play",
+    "vanilla": "G1-vanilla-walking",
+    "lip_clf": "G1-lip-ref-play",
+    "walking_clf": "G1-walking-clf-play",
+    "running_clf": "G1-running-clf-play",
 }
 
 class DataLogger:
@@ -365,10 +365,12 @@ def main():
     ]
     
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla":
+    if "lip" in args_cli.env_type:
         command_name = "hlip_ref"
-    elif "hzd" in args_cli.env_type:
+    elif "clf" in args_cli.env_type:
         command_name = "hzd_ref"
+    elif args_cli.env_type == "vanilla":
+        raise ValueError(f"Need to implement vanilla in the play policy!")
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
     
@@ -393,12 +395,17 @@ def main():
         # Also log the axis names for plotting
         log_vars.append('axis_names')
 
-    
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
 
     # reset environment
     obs, _ = env.get_observations()
+    action = policy(obs)
+
+    # Export information to a yaml
+    from export_parameters import export_policy_parameters
+    export_policy_parameters(env, obs, action, play_log_dir)
+
     timestep = 0
     print("[DEBUG] Starting simulation loop")
 

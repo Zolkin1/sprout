@@ -105,8 +105,8 @@ class G1LipCLFObservationsCfg():
 
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
-        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "gait_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "gait_period"})
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -126,8 +126,8 @@ class G1LipCLFObservationsCfg():
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         actions = ObsTerm(func=mdp.last_action)
 
-        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "step_period"})
-        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "step_period"})
+        sin_phase = ObsTerm(func=mdp.sin_phase, params={"command_name": "gait_period"})
+        cos_phase = ObsTerm(func=mdp.cos_phase, params={"command_name": "gait_period"})
 
         contact_state = ObsTerm(
             func=mdp.contact_state,

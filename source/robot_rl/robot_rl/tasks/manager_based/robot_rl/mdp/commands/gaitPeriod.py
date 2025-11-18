@@ -21,7 +21,7 @@ class GaitPeriodCommand(CommandTerm):
         """Initialize the gait period generator."""
         super().__init__(cfg, env)
 
-        if self.cfg.period_range[1] < self.cfg.period_range[0]:
+        if self.cfg.gait_period_range[1] < self.cfg.gait_period_range[0]:
             raise ValueError("The GaitPeriodCommandCfg must have max_period >= min_period!")
 
         # Create a buffer to store the periods
@@ -30,8 +30,8 @@ class GaitPeriodCommand(CommandTerm):
     def __str__(self):
         """Return a string representation of the command."""
         msg = "GaitPeriodCommand:\n"
-        msg += f"\tMax period: {self.cfg.period_range[1]}\n"
-        msg += f"\tMin period: {self.cfg.period_range[0]}\n"
+        msg += f"\tMax period: {self.cfg.gait_period_range[1]}\n"
+        msg += f"\tMin period: {self.cfg.gait_period_range[0]}\n"
         return msg
 
     """
@@ -58,7 +58,7 @@ class GaitPeriodCommand(CommandTerm):
         r = torch.empty(len(env_ids), device=self.device)
 
         # Gait periods
-        self.periods[env_ids] = r.uniform_(*self.cfg.period_range)
+        self.periods[env_ids] = r.uniform_(*self.cfg.gait_period_range)
 
     def _update_command(self):
         """Update the command based on the current state."""

@@ -1,78 +1,142 @@
 import argparse
 import os
 import sys
+import glob
 from typing import Literal
+import numpy as np
 
 import yaml
 
 # Add the project root to the Python path
 # sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from rl_policy_wrapper import RLPolicy
+from rl_policy import RLPolicy
 
 from robot import Robot
 from simulation import Simulation
 
 from experiments.velocity_commands import speed_steps, smooth_ramp_running
 
+# Environment experiment names mapping (same as in train_policy.py)
+EXPERIMENT_NAMES = {
+    "vanilla": "vanilla",
+    "vanilla_ec": "vanilla",
+    "basic": "baseline",
+    "lip_clf": "lip",
+    "lip_clf_ec": "lip",
+    "lip_ref_play": "lip",
+    "walking_clf": "walking_clf",
+    "walking_clf_ec": "walking_clf",
+    "running_clf": "running_clf",
+}
+
+
+def find_latest_run(log_root_path):
+    """Find the latest run directory in the given path."""
+    run_dirs = glob.glob(os.path.join(log_root_path, "*"))
+    if not run_dirs:
+        return None
+
+    # Get the latest run directory
+    latest_run = max(run_dirs, key=os.path.getmtime)
+    run_name = os.path.basename(latest_run)
+
+    return run_name
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config_file", type=str, required=True)
-    parser.add_argument("--simulator", type=str, help="Choice of simulator to run (isaac_sim or mujoco)")
+    parser = argparse.ArgumentParser(description="Run G1 robot in MuJoCo simulation with RL policy")
+    parser.add_argument("--env_type", type=str, required=True,
+                       choices=list(EXPERIMENT_NAMES.keys()),
+                       help="Type of environment (e.g., walking_clf, running_clf)")
+    parser.add_argument("--load_run", type=str, required=False, default=None,
+                       help="Specific run directory to load (e.g., '2025-11-17_16-15-56_running_testA'). If not specified, uses latest run.")
+    parser.add_argument("--scene", type=str, default="basic_scene",
+                       help="Scene name for MuJoCo simulation")
+    parser.add_argument("--robot_name", type=str, default="g1_21j",
+                       help="Robot name")
+    parser.add_argument("--log", action="store_true", default=False,
+                       help="Enable logging")
+    parser.add_argument("--log_dir", type=str, default=None,
+                       help="Directory for logging")
     args = parser.parse_args()
 
-    with open(args.config_file) as f:
-        config = yaml.safe_load(f)
+    # Construct path to logs directory (same structure as play_policy.py)
+    # Get the script directory (transfer/sim) and go up two levels to root
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(os.path.dirname(script_dir))
 
-    # Parse the config file with default values
-    required_fields = {
-        "checkpoint_path": str,
-        "dt": float,
-        "num_obs": int,
-        "num_action": int,
-        "period": int,
-        "robot_name": str,
-        "action_scale": float,
-        "default_angles": list,
-        "qvel_scale": float,
-        "ang_vel_scale": float,
-        "command_scale": float,
-        "policy_type": Literal["mlp", "cnn"],
-    }
+    # Build path: logs/g1_policies/{experiment_name}/{env_type}
+    experiment_name = EXPERIMENT_NAMES[args.env_type]
+    base_log_path = os.path.join(root_dir, "logs", "g1_policies", experiment_name)
+    log_root_path = os.path.join(base_log_path, args.env_type)
 
-    # Check for required fields
-    missing_fields = [field for field in required_fields if field not in config]
-    if missing_fields:
-        raise ValueError(f"Missing required fields in config file: {', '.join(missing_fields)}")
+    print(f"[INFO] Looking for policies in: {log_root_path}")
+
+    # Find the run directory
+    if args.load_run:
+        run_name = args.load_run
+        run_dir = os.path.join(log_root_path, run_name)
+        if not os.path.exists(run_dir):
+            print(f"[ERROR] Specified run directory not found: {run_dir}")
+            sys.exit(1)
+    else:
+        print("[INFO] No run specified, finding latest run...")
+        run_name = find_latest_run(log_root_path)
+        if not run_name:
+            print(f"[ERROR] No runs found in {log_root_path}")
+            sys.exit(1)
+        run_dir = os.path.join(log_root_path, run_name)
+
+    print(f"[INFO] Using run: {run_name}")
+
+    # Paths to policy and parameters
+    exported_dir = os.path.join(run_dir, "exported")
+    policy_path = os.path.join(exported_dir, "policy.pt")
+    param_path = os.path.join(exported_dir, "policy_parameters.yaml")
+
+    # Check if files exist
+    if not os.path.exists(policy_path):
+        print(f"[ERROR] Policy file not found: {policy_path}")
+        print(f"[INFO] Make sure to run play_policy.py with --export_policy first")
+        sys.exit(1)
+
+    if not os.path.exists(param_path):
+        print(f"[ERROR] Parameters file not found: {param_path}")
+        print(f"[INFO] Make sure to run play_policy.py to export parameters first")
+        sys.exit(1)
+
+    print(f"[INFO] Loading policy from: {policy_path}")
+    print(f"[INFO] Loading parameters from: {param_path}")
 
     # Make the RL policy
-    policy = RLPolicy(
-        dt=config["dt"],
-        checkpoint_path=config["checkpoint_path"],
-        num_obs=config["num_obs"],
-        num_action=config["num_action"],
-        period=config["period"],
-        cmd_scale=config["command_scale"],
-        action_scale=config["action_scale"],
-        default_angles=config["default_angles"],
-        qvel_scale=config["qvel_scale"],
-        ang_vel_scale=config["ang_vel_scale"],
-        height_map_scale=config.get("height_map_scale"),
-        policy_type=config["policy_type"],
-    )
+    policy = RLPolicy(param_path, policy_path)
+    policy.load()
 
     # Create robot instance
+    gains = {"kp_y": 1.5, "kd_y": 0.3, "kp_yaw": 0.8, "kd_yaw": 0.3}
     robot_instance = Robot(
-        robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=None, use_pd=config["use_pd"]
+        robot_name=args.robot_name,
+        scene_name=args.scene,
+        joystick_scaling=np.array([1,1,1]),
+        input_function=None,
+        use_pd=False,
+        gains=gains,
     )
+
+    # Set up log directory
+    if args.log_dir is None:
+        log_dir = os.path.join(run_dir, "mujoco_logs")
+    else:
+        log_dir = args.log_dir
 
     # Create and run simulation
     sim = Simulation(
         policy,
         robot_instance,
-        log=config.get("log", False),
-        log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
-        use_height_sensor=config.get("height_map_scale") is not None,
+        log=args.log,
+        log_dir=log_dir,
+        use_height_sensor=False,  # Not using height sensor for now
         tracking_body_name="torso_link",
     )
     sim.run(-1)  # Run forever
