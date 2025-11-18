@@ -1,8 +1,8 @@
 from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_observation import G1HZDObservationsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_rough_env_lip_cfg import G1RoughLipRewards
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_walking_clf_env_cfg import (G1TrajOptObservationsCfg, G1WalkingCLFEnvCfg,
+                                                                             G1WalkingCLFRewards, G1WalkingCLFCurriculumCfg)
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -11,7 +11,6 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 import math
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from .g1_rough_env_lip_cfg import G1LipCLFEnvCfg, G1LipCLFCurriculumCfg
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..humanoid_env_cfg import HumanoidEventsCfg
 from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
@@ -60,7 +59,7 @@ RUNNING_EE_R_weights_GL = [
     ]
 
 @configclass
-class G1RunningGaitLibraryCommandsCfg:
+class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
     hzd_ref = GaitLibraryHZDCommandCfg(
         trajectory_type="end_effector",
@@ -91,7 +90,7 @@ class G1RunningGaitLibraryCommandsCfg:
         ))
 
 @configclass
-class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
+class G1RunningObservationCfg(G1TrajOptObservationsCfg):
     """Configuration for running gait library observations."""
     pass
     # @configclass
@@ -113,7 +112,7 @@ class G1RunningHZDObservationCfg(G1HZDObservationsCfg):
     # critic: G1RunningCriticCfg = G1RunningCriticCfg()
 
 @configclass
-class G1RunningHZDRewardCfg(G1RoughLipRewards):
+class G1RunningRewardCfg(G1WalkingCLFRewards):
     flight_contact_penalty = RewTerm(
         func=mdp.flight_contact_penalty,
         weight=-3.0,
@@ -130,7 +129,7 @@ class G1RunningHZDRewardCfg(G1RoughLipRewards):
     )
 
 @configclass
-class G1RunningCurriculumCfg(G1LipCLFCurriculumCfg):
+class G1RunningCurriculumCfg(G1WalkingCLFCurriculumCfg):
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 20000,
                                                    "max_weight": 1.0,
@@ -141,11 +140,11 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
     pass
 
 @configclass
-class G1RunningGaitLibraryEnvCfg(G1LipCLFEnvCfg):
+class G1RunningGaitLibraryEnvCfg(G1WalkingCLFEnvCfg):
     """Configuration for the G1 running gait library environment."""
     commands: G1RunningGaitLibraryCommandsCfg = G1RunningGaitLibraryCommandsCfg()
-    observations: G1RunningHZDObservationCfg = G1RunningHZDObservationCfg()
-    rewards: G1RunningHZDRewardCfg = G1RunningHZDRewardCfg()
+    observations: G1RunningObservationCfg = G1RunningObservationCfg()
+    rewards: G1RunningRewardCfg = G1RunningRewardCfg()
     curriculum: G1RunningCurriculumCfg = G1RunningCurriculumCfg()
     events: G1RunningEventsCfg = G1RunningEventsCfg()
 
@@ -185,11 +184,11 @@ class G1RunningGaitLibraryEnvCfg(G1LipCLFEnvCfg):
         }
         self.rewards.clf_decreasing_condition.weight = -1
         # self.curriculum.clf_curriculum = None
-        self.curriculum.clf_curriculum.params = {
-            "min_max_err": (0.1,0.1,0.2),
-            "scale": (0.005,0.005,0.005), #0.001
-            "update_interval": 20000
-        }
+        # self.curriculum.clf_curriculum.params = {
+        #     "min_max_err": (0.1,0.1,0.2),
+        #     "scale": (0.005,0.005,0.005), #0.001
+        #     "update_interval": 20000
+        # }
 
         self.curriculum.terrain_levels = None
 
