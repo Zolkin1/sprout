@@ -350,9 +350,11 @@ class VelocityTrackingController(ObeliskController, ABC):
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages."""
         if self.joystick_control:
-            self.cmd_vel[0] = min(
+            self.cmd_vel[0] = (
+            0.6 if min(
                 max(cmd_msg.v_x, self.get_parameter("v_x_min").get_parameter_value().double_value),
                 self.get_parameter("v_x_max").get_parameter_value().double_value,
+            ) > 0.5 else 0.0
             )
             v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
             self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
@@ -505,10 +507,10 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
 
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
+        # sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        # cos_phase = np.cos(2 * np.pi * self.time / self.period)
 
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+        # obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 

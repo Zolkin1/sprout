@@ -71,6 +71,15 @@ Baseline:
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
 ```
 
+Stones Sim:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/sim_config_stones.yaml device_name=onboard bag=false
+```
+Stones Hardware:
+```
+obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_stones.yaml device_name=onboard bag=false
+```
+
 <!-- HZD with optitrack logging:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false

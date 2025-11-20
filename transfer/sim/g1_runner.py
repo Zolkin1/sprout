@@ -64,6 +64,7 @@ def main():
     robot_instance = Robot(
         robot_name=config["robot_name"], scene_name=config.get("scene", "basic_scene"), input_function=None
     )
+    print(config["log"])
 
     # Create and run simulation
     sim = Simulation(
