@@ -100,7 +100,9 @@ def solve_velocity_or_momentum_positive_from_E_batched(
     if torch.any(inner < 0):
         # print("Warning: Negative value inside square root in solve_velocity_or_momentum_positive_batched")
         inner[inner < 0] = 0.0  # Clamp to zero to avoid NaN
-
+    if torch.any(z_tilde < 0):
+        # print("Warning: Negative z_tilde in solve_velocity_or_momentum_positive_batched")
+        z_tilde[z_tilde < 0] = 0.0  # Clamp to zero to avoid NaN
     if use_momentum:
         v_or_L = z_tilde * torch.sqrt(inner)
     else:

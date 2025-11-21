@@ -69,7 +69,7 @@ def com_z_too_low(env, output_command_name: str) -> torch.Tensor:
     current_sw_foot_pos_z = output_command.swing_foot_pos_0[:, 2] # (num_envs, )
     current_base_com_z = output_command.robot.data.root_com_pos_w[:, 2]  # (num_envs, )
 
-    termination_flag = (current_base_com_z < current_st_foot_pos_z ) | (current_base_com_z < current_sw_foot_pos_z)
+    termination_flag = (current_base_com_z < (current_st_foot_pos_z + 0.3)) | (current_base_com_z < (current_sw_foot_pos_z + 0.3))
     # if torch.any(termination_flag):
     #    print(f"Zcom too low termination triggered for {termination_flag.sum().item()} environments.")
     return termination_flag

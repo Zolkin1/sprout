@@ -10,9 +10,7 @@ class StonesConfig:
    stone_x: float = 0.2  # stone x (length in meters)
    stone_y: float = 1.0  # stone y (width in meters)
    stone_z: float = 0.1  # stone z (height in meters)
-   # rel_stone_x = [0.3, 0.7]  # relative x distance range between stones
-   
-   rel_stone_x_min = 0.3
+   rel_stone_x_min = 0.3 # min gap between stones in x direction; also max length of each stone
    rel_stone_x_max = 0.7
    rel_stone_z_max = 0.2  # relative z distance range between stones
    start_platform_x = 1.0

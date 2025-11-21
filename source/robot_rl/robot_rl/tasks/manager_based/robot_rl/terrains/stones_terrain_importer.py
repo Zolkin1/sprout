@@ -108,11 +108,13 @@ class StonesTerrainImporter(TerrainImporter):
         self.env_terrain_infos["rel_x"] = torch.zeros((num_envs,infos["rel_x"].shape[-1]), dtype=torch.float32, device=self.device)
         self.env_terrain_infos["rel_z"] = torch.zeros((num_envs,infos["rel_z"].shape[-1]), dtype=torch.float32, device=self.device)
         self.env_terrain_infos["start_stone_pos"] = torch.zeros((num_envs, 3), dtype=torch.float32, device=self.device)
+        self.env_terrain_infos["abs_pitch"] = torch.zeros((num_envs, infos["abs_pitch"].shape[-1]), dtype=torch.float32, device=self.device)
         self.env_terrain_infos["stone_y"] = torch.zeros((num_envs, 1), dtype=torch.float32, device=self.device)
 
         self.env_terrain_infos["rel_x"][:] = infos["rel_x"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["rel_z"][:] = infos["rel_z"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["start_stone_pos"][:] = infos["start_stone_pos"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["abs_pitch"][:] = infos["abs_pitch"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["stone_y"][:] = infos["stone_y"][self.terrain_levels, self.terrain_types]
 
         return infos
@@ -124,16 +126,23 @@ class StonesTerrainImporter(TerrainImporter):
             return
         # update terrain level for the envs
         self.terrain_levels[env_ids] += 1 * move_up - 1 * move_down
-        # robots that solve the last level are sent to a random one
-        # the minimum level is zero
-        self.terrain_levels[env_ids] = torch.where(
-            self.terrain_levels[env_ids] >= self.max_terrain_level,
-            torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
-            torch.clip(self.terrain_levels[env_ids], 0),
-        )
+        # # robots that solve the last level are sent to a random one
+        # # the minimum level is zero
+        # self.terrain_levels[env_ids] = torch.where(
+        #     self.terrain_levels[env_ids] >= self.max_terrain_level,
+        #     torch.randint_like(self.terrain_levels[env_ids], self.max_terrain_level),
+        #     torch.clip(self.terrain_levels[env_ids], 0),
+        # )
+        
+        # Clamp to valid range [0, max_terrain_level - 1]
+        # Robots stay at max level once they reach it
+        self.terrain_levels[env_ids] = torch.clip(self.terrain_levels[env_ids], 0, self.max_terrain_level - 1)
+    
+    
         # update the env origins
         self.env_origins[env_ids] = self.terrain_origins[self.terrain_levels[env_ids], self.terrain_types[env_ids]]
         self.env_terrain_infos["rel_x"][:] = self.terrain_infos_tensor["rel_x"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["rel_z"][:] = self.terrain_infos_tensor["rel_z"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["start_stone_pos"][:] = self.terrain_infos_tensor["start_stone_pos"][self.terrain_levels, self.terrain_types]
+        self.env_terrain_infos["abs_pitch"][:] = self.terrain_infos_tensor["abs_pitch"][self.terrain_levels, self.terrain_types]
         self.env_terrain_infos["stone_y"][:] = self.terrain_infos_tensor["stone_y"][self.terrain_levels, self.terrain_types]

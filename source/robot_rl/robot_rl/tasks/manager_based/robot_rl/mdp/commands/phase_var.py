@@ -28,22 +28,22 @@ class PhaseVar:
         
         if self._is_tensor:
             self.tau = torch.clamp(self.tau, 0.0, 1.0)
-            # Handle out-of-bounds time with warnings
-            out_of_bounds_low = time < self.start_time
-            out_of_bounds_high = time > self.end_time
-            if torch.any(out_of_bounds_low) or torch.any(out_of_bounds_high):
-                if torch.any(out_of_bounds_low):
-                    print(f"Warning: Some time values are before the start time {self.start_time}.")
-                if torch.any(out_of_bounds_high):
-                    print(f"Warning: Some time values are after the end time {self.end_time}.")
+            # # Handle out-of-bounds time with warnings
+            # out_of_bounds_low = time < self.start_time
+            # out_of_bounds_high = time > self.end_time
+            # if torch.any(out_of_bounds_low) or torch.any(out_of_bounds_high):
+            #     if torch.any(out_of_bounds_low):
+            #         print(f"Warning: Some time values are before the start time {self.start_time}.")
+            #     if torch.any(out_of_bounds_high):
+            #         print(f"Warning: Some time values are after the end time {self.end_time}.")
         else:
             self.tau = max(0.0, min(1.0, self.tau))
-            # Handle out-of-bounds time with warnings
-            if time < self.start_time or time > self.end_time:
-                if time < self.start_time:
-                    print(f"Warning: Time {time} is before the start time {self.start_time}.")
-                if time > self.end_time:
-                    print(f"Warning: Time {time} is after the end time {self.end_time}.")
+            # # Handle out-of-bounds time with warnings
+            # if time < self.start_time or time > self.end_time:
+            #     if time < self.start_time:
+            #         print(f"Warning: Time {time} is before the start time {self.start_time}.")
+            #     if time > self.end_time:
+            #         print(f"Warning: Time {time} is after the end time {self.end_time}.")
 
 class MLIPPhaseVarGlobal:
     def __init__(self, T_doublestep):

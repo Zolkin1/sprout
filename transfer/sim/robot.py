@@ -134,7 +134,7 @@ class Robot:
             #for stones, either 0.0 standing or 0.6 forward
             if self.mj_data.time < 1.0:
                 des_vel = np.array([0.0, 0.0, 0.0])
-            elif self.mj_data.time > 5.0:
+            elif self.mj_data.time > 10.0:
                 des_vel = np.array([0.0, 0.0, 0.0])    
         self.commanded_vel = des_vel  # Store the commanded velocity
         print(f"Commanded velocity: {des_vel}")

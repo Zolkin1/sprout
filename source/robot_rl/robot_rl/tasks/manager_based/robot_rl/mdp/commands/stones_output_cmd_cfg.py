@@ -110,7 +110,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
     
     E_star: float = 0.6
     eps: float = 0.6 #xCOM position reference; xCOM_target[i]=eps*rel_x[i]
-    TSS_max: float = 0.6  # max step time (s)
+    TSS_max: float = 0.5  # max step time (s)
     TSS_min: float = 0.2  # min step time (s)
     
     foot_body_name: str = ".*_ankle_roll_link"

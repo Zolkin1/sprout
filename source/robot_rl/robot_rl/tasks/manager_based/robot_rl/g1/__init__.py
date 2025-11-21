@@ -151,6 +151,34 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+    
+    gym.register(
+        id="G1-steppingstone-testing-no-heightmap",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1HardwareNoHeightMapTestingCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-steppingstone-testing-no-heightmapdistill",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1HardwareNoHeightMapTestingDistillCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_distillation_cfg:G1DistillationRunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-steppingstone-testing-no-heightmapfinetune",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_cfg:G1HardwareNoHeightMapTestingFinetuneCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPOFinetuneRunnerCfg",
+        },
+    )
     gym.register(
         id="G1-steppingstone-distillation",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",

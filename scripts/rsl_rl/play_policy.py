@@ -22,7 +22,10 @@ SIM_ENVIRONMENTS = {
     "hzd_clf_custom": "G1-hzd-clf-play",
     "stepping_stone": "G1-steppingstone-play",
     "stepping_stone_distillation": "G1-steppingstone-distillation-play",
-    "stepping_stone_finetune": "G1-steppingstone-finetune-play"
+    "stepping_stone_finetune": "G1-steppingstone-finetune-play",
+    "stepping_stone_noheightmap": "G1-steppingstone-testing-no-heightmap",
+    "stepping_stone_noheightmapdistill": "G1-steppingstone-testing-no-heightmapdistill",
+    "stepping_stone_noheightmapfinetune": "G1-steppingstone-testing-no-heightmapfinetune",
 }
 
 
@@ -338,7 +341,7 @@ def main():
     ]
 
     # Get the command term to determine what type of trajectory we're using
-    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or args_cli.env_type == "stepping_stone" or args_cli.env_type == "stepping_stone_distillation" or args_cli.env_type == "stepping_stone_finetune":
+    if "lip" in args_cli.env_type or args_cli.env_type == "vanilla" or "stepping_stone" in args_cli.env_type:
         command_name = "hlip_ref"
     elif "hzd" in args_cli.env_type:
         command_name = "hzd_ref"
