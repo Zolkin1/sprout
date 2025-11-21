@@ -190,3 +190,10 @@ To run the optitrack forwarding node:
 ```
 ros2 run g1_control optitrack_forwarding
 ```
+
+
+# Use with Lidar Height Map
+With Spoofing, before build height_mapping, set the following environment variable in the docker env:
+```
+export MUJOCO_DIR="$HOME/robot_rl/transfer/obelisk/build/robot_sim/_deps/mujoco-src"
+```

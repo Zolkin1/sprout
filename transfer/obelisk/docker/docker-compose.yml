@@ -26,6 +26,7 @@ services:
       - NET_ADMIN
     volumes:
       - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
+      - $ROBOT_RL_ROOT/../height_mapping:$ROBOT_RL_ROOT/../height_mapping
       - /tmp/.X11-unix:/tmp/.X11-unix
       - $HOME/.Xauthority:$HOME/.Xauthority:rw
       - $HOME/.bashrc:$HOME/.bashrc

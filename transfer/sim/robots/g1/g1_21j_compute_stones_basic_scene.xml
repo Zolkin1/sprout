@@ -23,11 +23,13 @@
 
     <worldbody>
         <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
-        <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/>
-        <!-- <geom name="startp" size="0.5 1.5 0.05" type="box" material="box_material" pos= "0 0 -0.05" group="2"/>
-        <geom name="bottom" size="10  1.5 0.05" type="box" material="groundplane" pos= "0 0 -0.95" group="2"/> -->
+        <!-- <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/> -->
+        <!-- <geom name="stone0"  size="0.15 0.15 0.2" type="box" material="box_material" pos= "0.5 0.5 0.2" group="2" /> -->
 
-        <!-- stones -->
+        <!-- <geom name="startp" size="0.5 1.5 0.05" type="box" material="box_material" pos= "0 0 -0.05" group="2"/>
+        <geom name="bottom" size="10  1.5 0.05" type="box" material="groundplane" pos= "0 0 -5.95" group="2"/> -->
+
+        <!-- stones with height change-->
         <!-- <geom name="stone0"  size="0.1 0.5 0.05" type="box" material="box_material" pos= "0.7  0 -0.05" group="2"/>
         <geom name="stone1"  size="0.1 0.5 0.05" type="box" material="box_material" pos= "1.1  0 -0.15" group="2"/>
         <geom name="stone2"  size="0.1 0.5 0.05" type="box" material="box_material" pos= "1.5  0 -0.05" group="2"/>
@@ -41,16 +43,30 @@
         <geom name="stone10" size="0.1 0.5 0.05" type="box" material="box_material" pos= "4.85  0 -0.05" group="2"/>
         <geom name="stone11" size="10.00 0.5 0.05" type="box" material="box_material" pos= "15  0 -0.05" group="2"/> -->
 
+        <!-- <geom name="stone0"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "0.75  0 -0.05" group="2"/>
+        <geom name="stone1"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "1.1  0 -0.05" group="2"/>
+        <geom name="stone2"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "1.5  0 -0.05" group="2"/>
+        <geom name="stone5"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "1.9  0 -0.05" group="2"/>
+        <geom name="stone3"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "2.5  0 -0.05" group="2"/>
+        <geom name="stone4"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "2.9  0 -0.05" group="2"/>
+        <geom name="stone6"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "3.4  0 0.05" group="2"/>
+        <geom name="stone7"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "4.1  0 0.05" group="2"/>
+        <geom name="stone8"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "4.6  0 0.05" group="2"/>
+        <geom name="stone9"  size="0.07 0.5 0.05" type="box" material="box_material" pos= "4.9  0 0.05" group="2"/>
+        <geom name="stone10" size="0.07 0.5 0.05" type="box" material="box_material" pos= "5.4  0 -0.05" group="2"/>
+        <geom name="stone11" size="10.00 0.5 0.05" type="box" material="box_material" pos= "15.55  0 -0.05" group="2"/> -->
+
+
         <!-- downstairs -->
         <!-- <geom name="stone0" size="0.1 0.75 0.05" type="box" material="box_material" pos= "0.6  0 -0.15" group="2"/>
-        <geom name="stone1" size="0.1 0.75 0.05" type="box" material="box_material" pos= "0.8  0 -0.25" group="2"/>
-        <geom name="stone2" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.0  0 -0.35" group="2"/>
-        <geom name="stone3" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.2  0 -0.45" group="2"/>
-        <geom name="stone4" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.4  0 -0.55" group="2"/>
-        <geom name="stone5" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.6  0 -0.65" group="2"/>
-        <geom name="stone6" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.8  0 -0.75" group="2"/>
-        <geom name="stone7" size="0.1 0.75 0.05" type="box" material="box_material" pos= "2.0  0 -0.85" group="2"/>
-        <geom name="stone8" size="1.0 0.75 0.05" type="box" material="box_material" pos= "3.1  0 -0.95" group="2"/> -->
+        <geom name="stone1" size="0.1 0.75 0.05" type="box" material="box_material" pos= "0.8  0 -0.35" group="2"/>
+        <geom name="stone2" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.0  0 -0.55" group="2"/>
+        <geom name="stone3" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.2  0 -0.75" group="2"/>
+        <geom name="stone4" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.4  0 -0.95" group="2"/>
+        <geom name="stone5" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.6  0 -1.15" group="2"/>
+        <geom name="stone6" size="0.1 0.75 0.05" type="box" material="box_material" pos= "1.8  0 -1.35" group="2"/>
+        <geom name="stone7" size="0.1 0.75 0.05" type="box" material="box_material" pos= "2.0  0 -1.55" group="2"/>
+        <geom name="stone8" size="1.0 0.75 0.05" type="box" material="box_material" pos= "3.1  0 -1.75" group="2"/> -->
 
 
         <!-- <geom name="stone0" size="0.1 0.5 0.5" type="box" material="box_material" pos= "0.7  0 -0.4" group="2"/>
