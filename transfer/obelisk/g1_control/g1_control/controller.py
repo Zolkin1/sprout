@@ -17,10 +17,14 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 from sensor_msgs.msg import Joy
 
+from sensor_msgs.msg import Image
+
 
 class VelocityTrackingController(ObeliskController, ABC):
     """Example position setpoint controller."""
-
+    height_map: np.ndarray
+    ngrid_x: int = 11
+    ngrid_y: int = 11
     def __init__(self, node_name: str = "velocity_tracking_controller") -> None:
         """Initialize the example position setpoint controller."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
@@ -242,6 +246,13 @@ class VelocityTrackingController(ObeliskController, ABC):
             key="sub_vel_cmd_key",  # key can be specified here or in the config file
             msg_type=VelocityCommand,
         )
+        #Declare subscriber to height map
+        self.register_obk_subscription(
+            "sub_height_map_setting",
+            self.heightmap_callback,  # type: ignore
+            key="sub_height_map_key",  # key can be specified here or in the config file
+            msg_type=Image,
+        )
 
 
         self.last_menu_press = self.get_clock().now().nanoseconds / 1e9
@@ -261,6 +272,8 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.get_logger().info(f"Policy: {policy_path} loaded on {self.device}.")
         self.get_logger().info("RL Velocity Tracking node constructor complete.")
+        
+        self.height_map = np.zeros((self.ngrid_x * self.ngrid_y, ), dtype=np.float32)
 
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_name: str) -> str:
         """Load policy from Hugging Face with local caching.
@@ -313,8 +326,9 @@ class VelocityTrackingController(ObeliskController, ABC):
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """Configure the controller."""
+        
         super().on_configure(state)
-
+        
         self.cmd_vel = np.zeros((3,))
         self.proj_g = np.zeros((3,))
         self.proj_g[2] = -1
@@ -411,9 +425,9 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
 
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+        # sin_phase = np.sin(2 * np.pi * self.time / self.period)
+        # cos_phase = np.cos(2 * np.pi * self.time / self.period)
+        # obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
 
         # if height_map is not None:
         #     height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
@@ -506,11 +520,15 @@ class VelocityTrackingController(ObeliskController, ABC):
         obs[9 + nj : 9 + 2 * nj] = joint_vel_isaac* self.qvel_scale # Joint velocity
 
         obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
+        
 
         # sin_phase = np.sin(2 * np.pi * self.time / self.period)
         # cos_phase = np.cos(2 * np.pi * self.time / self.period)
 
         # obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
+        
+        #add height map
+        obs[9 + 3 * nj : 9 + 3 * nj + self.ngrid_x * self.ngrid_y] = self.height_map
 
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 
@@ -627,6 +645,23 @@ class VelocityTrackingController(ObeliskController, ABC):
         obsaction = obs.tolist() + action.tolist()
         row = [log_time] + obsaction
         self.writer.writerow(row)
+        
+
+    def heightmap_callback(self, msg: Image) -> None:
+        """Height map callback to process incoming height map images."""
+        if msg.encoding in ['32FC1']:
+            # Depth image
+            dtype = np.float32
+            height_map_raw = np.frombuffer(msg.data, dtype=dtype)
+        else:
+            raise ValueError(f"Unsupported image encoding: {msg.encoding}")   
+
+        # Check size of height_map ngrid_x * ngrid_y
+        if height_map_raw.shape[0] != self.ngrid_x * self.ngrid_y:
+            raise ValueError(f"Height map size mismatch: expected {self.ngrid_x * self.ngrid_y}, got {height_map_raw.shape[0]}")
+
+        # Apply offset and clip values as in Isaac Lab setup
+        self.height_map = np.clip(height_map_raw - 0.5, -1.0, 1.0).astype(np.float32)
 
 
 

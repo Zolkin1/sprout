@@ -7,10 +7,10 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        local_policy_name: "stones/standwalkbasic.pt"
+        local_policy_name: "stones/withheightmap_nostanding.pt"
         # hf_policy_name: TODO: Fill out!
         hf_repo_id: "zolkin/robot_rl"
-        num_obs: 72
+        num_obs: 193
         num_actions: 21
         period: 0.8                   # s
         ang_vel_scale: 1.0
@@ -67,6 +67,11 @@ onboard:
         # ----- High Level Command subscriber ----- #
         - ros_parameter: sub_vel_cmd_setting
           topic: /obelisk/g1/high_level_ctrl
+          history_depth: 10
+          callback_group: None
+        # ----- Height Map Subscriber ----- #
+        - ros_parameter: sub_height_map_setting
+          topic: /height_grid/height_map
           history_depth: 10
           callback_group: None
         # ----- Joystick subscriber ----- #

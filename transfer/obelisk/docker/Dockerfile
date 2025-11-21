@@ -82,7 +82,28 @@ RUN sudo apt install -y \
     ros-humble-tf2-ros-py \
     ros-humble-tf2-sensor-msgs \
     ros-humble-tf2-tools \
+    ros-humble-cv-bridge \
+    libpcl-dev \
+    ros-humble-pcl-conversions \
+    ros-humble-pcl-ros \
+    libopencv-dev \
     wget && \
     cd /home/${USER} && git clone https://github.com/L2S-lab/natnet_ros2
 
 RUN sudo apt update && sudo apt install -y python3-pyqt5 lshw
+
+# [2] install Livox
+RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git \
+    && cd ./Livox-SDK2/ \
+    && mkdir build \
+    && cd build \
+    && cmake .. && make -j \
+    && sudo make install
+
+# [3] install livox_ros2_driver
+RUN mkdir -p ws_livox/src \
+    && cd ws_livox/src \
+    && git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+WORKDIR /home/${USER}/ws_livox/src/livox_ros_driver2
+RUN bash -lc "source /opt/ros/humble/setup.bash && ./build.sh humble"
+WORKDIR /home/${USER}
