@@ -1,5 +1,5 @@
 from isaaclab.utils import configclass
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
+# from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 # from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
@@ -15,6 +15,8 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 import math
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 
 ##
 # Lyapunov Weights
@@ -68,15 +70,24 @@ WALKING_R_weights = [
 @configclass
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
-    hzd_ref = GaitLibraryHZDCommandCfg(
-        trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/walking_10_13",
-        config_name="walking",
-        gait_velocity_ranges=(0.0, 1.0, 0.1),
-
-        num_outputs=27,
-        Q_weights=WALKING_Q_weights,
-        R_weights=WALKING_R_weights,
+    # hzd_ref = GaitLibraryHZDCommandCfg(
+    #     trajectory_type="end_effector",
+    #     gait_library_path="source/robot_rl/robot_rl/assets/robots/walking_10_13",
+    #     config_name="walking",
+    #     gait_velocity_ranges=(0.0, 1.0, 0.1),
+    #
+    #     num_outputs=27,
+    #     Q_weights=WALKING_Q_weights,
+    #     R_weights=WALKING_R_weights,
+    # )
+    traj_ref = TrajectoryCommandCfg(
+        contact_frames = [".*_ankle_roll_link"],
+        manager_type = "trajectory",
+        conditioner_generator_name = "base_velocity",
+        num_outputs = 27,
+        path = "source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
+        Q_weights = WALKING_Q_weights,
+        R_weights = WALKING_R_weights,
     )
 
 ##
@@ -109,8 +120,8 @@ class G1TrajOptObservationsCfg():
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -131,20 +142,23 @@ class G1TrajOptObservationsCfg():
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         actions = ObsTerm(func=mdp.last_action)
         # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
+        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
+        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
         contact_state = ObsTerm(
             func=mdp.contact_state,
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
         )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hzd_ref"}, scale=1.0)
-        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hzd_ref"}, scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"}, clip=(-20.0, 20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"}, clip=(-20.0, 20.0,))
+        # TODO: Modify this to be more generic, I want the critic to get the values for all the end effector frames being tracked
+        # TODO: Fix (above) and put back
+        # foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "traj_ref"}, scale=1.0)
+        # foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "traj_ref"}, scale=1.0)
+
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
 
         height_scan = None  # Removed - not supported yet
 

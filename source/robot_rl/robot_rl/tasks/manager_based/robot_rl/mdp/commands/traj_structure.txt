@@ -1,0 +1,77 @@
+2 types of trajectories:
+- Periodic
+- Episodic
+
+There are also perpetual poses, but they don't have full trajectories for them.
+
+Periodic trajectories are assumed to be either half the period or the whole period (walking single swing or jumping jack full motion).
+
+For half motions I need to support re-label and re-mapping. For full motions this is not required.
+
+All motions should have the same virtual constraints (feet end effectors, hand end effectors, pelvis, waist joint)
+
+I want the domain constraints to be the same for everything, so we need to define the contact bodies for the optimization ahead of time.
+I'm thinking hands and feet for now, but could include knees if I want.
+
+Episodic motions do not have a re-labeling or re-mapping. They have a fixed period of time that can be extracted.
+Episodic motions are assumed to always start and end in a perpetual pose, but it doesn't need to be the same pose.
+
+I should update the yaml format to list the bezier coefficients by virtual constraint which will make it easier to parse.
+
+This will probably be easiest has a large re-write while referencing the old stuff.
+
+Maybe I should also store these somewhere thats not github but still in the cloud?
+
+
+
+-----
+The env ultimately needs a Isaac command cfg and cmd class.
+The cmd output is y and dy (virtual constraints to track, both position and velocity).
+The cmd should also manage the lyapunov function V.
+Cmd updates metrics.
+Can also keep track of contact state for each contact point.
+
+CFG:
+When the cmd if configured (in the cfg) we need to specify the single trajectory or gait library being used.
+The Q and R weights need to be specified.
+The number of outputs should be determined from the trajectory.
+If the library is applied over a distribution of parameters then that should be a specified in a library description yaml.
+    - This includes things like a velocity range for locomotion gait libraries, or maybe stair heights or ramp angles for terrain aware.
+We can also have a flag for library vs single trajectory.
+
+-----
+Example trajectories:
+- Walking: Library (vel conditioned), Half Periodic
+- Running: Library (vel conditioned), Half Periodic
+- Waving: Single Traj, Full Periodic
+- Bow: Single Traj, Episodic
+- Bend up: Single Traj, Episodic
+- Jumping Jacks: Single Traj, Full Periodic
+- Stairs: Library (vel conditioned or stair shape conditioned or both), Half Periodic
+- Box move (on table): Library, Episodic
+- Flip: Single Traj, Episodic
+- Crouched walking: Library (vel conditioned), Half Periodic
+- Sit: Single Traj, Episodic  -- Could do a library if I wanted various chair heights (height conditioned)...
+- Stand: Single Traj, Episodic
+
+-----
+The command should just be the interface with IsaacLab, it should hold other objects that do most of the work.
+The command will hold:
+    - CLF object: Can hold the values of V and Vdot
+    - Trajectory/library object: Can query the bezier splines for each output at a given point in the trajectory.
+        For libraries conditioned on a value, this object will handle that conditioning (put you need to pass the associated variable)
+        This object will also return the contact state for each contact point given the time and the conditioning variable.
+
+
+The trajectory/library object can be broken up as:
+- Trajectory class that holds all the information for a single trajectory (yaml)
+- A library class that holds a collection of trajectory objects
+
+Trajectory manager class:
+- This should be able to get the interpolated outputs (interpolating the bezier) but this needs to happen efficiently in a batched manner
+    The function should take a vector of times and output a tensor of outputs (each scalar time is associated with a vector of outputs)
+
+
+There should probably be support for perpetual pose start and ends
+
+

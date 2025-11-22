@@ -1,0 +1,462 @@
+import numpy as np
+import re
+import torch
+from isaaclab.managers import CommandTerm
+
+from .clf import CLF
+from .library_manager import LibraryManager
+from .trajectory_manager import TrajectoryManager
+
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi, yaw_quat, quat_inv
+
+class TrajectoryCommand(CommandTerm):
+    """Trajectory command term. This keeps track of the underlying single trajectory or library as well as CLF for tracking."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+
+        self.env = env
+        self.robot = env.scene[cfg.asset_name]
+
+        # Expand wildcards in contact frames
+        self.contact_frames = self._expand_wildcard_frames(cfg.contact_frames)
+
+        self.manager_type = cfg.manager_type
+        self.conditioner_generator = cfg.conditioner_generator_name
+
+        self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+
+        self.y_des = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+        self.dy_des = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
+
+        # Create trajectory/library manager
+        if cfg.manager_type == "trajectory":
+            self.manager = TrajectoryManager(cfg.path, env.device)
+            self.trajectory_type = self.manager.traj_data.trajectory_type
+        elif cfg.manager_type == "library":
+            self.manager = LibraryManager(cfg.path, env.device)
+            self.trajectory_type = self.manager.trajectory_type
+        else:
+            raise NotImplementedError(f"Manager Type {cfg.manager_type} is not implemented!")
+
+        self.verify_contact_frames()
+
+        # Hold a list of current domains for each env
+        self.current_domain = -1 * torch.ones(self.num_envs, device=self.device)
+
+        # Create a list of indices to be used
+        self.joint_idx, self.body_idx, self.use_com = self._parse_outputs(self.manager.get_output_names)
+
+        # Create a list of indices for the reference frames
+        self.ref_frame_indices = self._parse_ref_frames(self.manager.traj_data.reference_frames)
+
+        # Current reference frame poses
+        self.ref_poses = torch.zeros((self.num_envs, 7), device=self.device)    # [N, [position, quat]]
+
+        # Create CLF
+        self.clf = CLF(
+            self.cfg.num_outputs, self.env.cfg.sim.dt,
+            batch_size=self.num_envs,
+            Q_weights=np.array(self.cfg.Q_weights),
+            R_weights=np.array(self.cfg.R_weights),
+            device=self.device
+        )
+
+    def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
+        if self.manager_type == "trajectory":
+            return self.manager.get_phasing_var(t)
+        elif self.manager_type == "library":
+            conditioner = self.get_conditioner_var()
+            return self.manager.get_phasing_var(conditioner, t)
+        else:
+            raise ValueError(f"Cannot get phasing variable for manager of type {self.manager_type}.")
+
+    def get_conditioner_var(self) -> torch.Tensor:
+        """Get the conditioner variable."""
+        cond_term = self.env.command_manager.get_term(self.conditioner_generator)
+
+        # TODO: For now just hard code the conditioning variable as velocity
+        condition_vars = cond_term[:, 0]
+
+        # condition_vars = cond_term.get_condition_vars() # TODO: Implement. This could come from a command or from terrain (i.e. stair height, slope)
+        return condition_vars
+
+    def _expand_wildcard_frames(self, frame_patterns: list[str]) -> list[str]:
+        """
+        Expand wildcard patterns in contact frame names.
+
+        Args:
+            frame_patterns: List of frame names that may contain wildcards (e.g., ".*_ankle_roll_link")
+
+        Returns:
+            List of explicit frame names with wildcards expanded
+        """
+        expanded_frames = []
+
+        # Get all body names from the robot
+        body_names = self.robot.body_names
+
+        for pattern in frame_patterns:
+            # Check if the pattern contains wildcards (. or *)
+            if '*' in pattern or '.*' in pattern:
+                # Convert glob-style pattern to regex
+                # Replace .* with .* (already regex), and * with .*
+                regex_pattern = pattern.replace('*', '.*') if not '.*' in pattern else pattern
+                regex_pattern = f'^{regex_pattern}$'
+
+                # Find all matching body names
+                matched = False
+                for body_name in body_names:
+                    if re.match(regex_pattern, body_name):
+                        expanded_frames.append(body_name)
+                        matched = True
+
+                if not matched:
+                    raise ValueError(f"Wildcard pattern '{pattern}' did not match any body names in the robot.")
+            else:
+                # No wildcard, add as-is
+                expanded_frames.append(pattern)
+
+        return expanded_frames
+
+    def get_contact_state(self, t: torch.Tensor):
+        """
+        Gets the desired contact state at the given time for the specified contact point.
+
+        Args:
+            t: shape [N] the times in each environment
+
+        Returns:
+            contact_states: shape [N, num_contacts]. A tensor of binary values with a 1 indicating in contact and 0 otherwise.
+        """
+        # For a library we need the conditioner value too
+        if self.manager_type == "library":
+            conditioner = self.get_conditioner_var()
+            return self.manager.get_contact_state(conditioner, t, self.contact_frames)
+        else:
+            return self.manager.get_contact_state(t, self.contact_frames)
+
+    def get_trajectory_type(self):
+        """Gets the type of trajectory: periodic or episodic."""
+        return self.trajectory_type
+
+    def verify_contact_frames(self):
+        traj_frames = []
+        if self.manager_type == "trajectory":
+            for domain in self.manager.traj_data.domain_data.values():
+                traj_frames.append(domain.contact_frames)
+        elif self.manager_type == "library":
+            for manager in self.manager.trajectory_managers:
+                for domain in manager.traj_data.domain_data:
+                    traj_frames.append(domain.contact_frames)
+        else:
+            raise NotImplementedError(f"Manager Type {self.manager_type} is not implemented!")
+
+        # Verify that every frame in traj_frames appears in self.contact_frames
+        for frames in traj_frames:
+            for frame in frames:
+                if frame not in self.contact_frames:
+                    raise ValueError(f"Contact frame {frame} from a trajectory is not in the contact frames list!")
+
+    def get_ref_frame_poses(self) -> torch.Tensor:
+        """Get the reference frame poses."""
+        poses = torch.zeros(self.num_envs, len(self.ref_frame_indices), 7, device=self.device)
+
+        poses[:, :, :3] = self.robot.data.body_pos_w[:, self.ref_frame_indices]
+        poses[:, :, 3:] = self.robot.data.body_quat_w[:, self.ref_frame_indices]
+
+        return poses
+
+
+    def get_measured_outputs(self, t: torch.Tensor):
+        """
+        Get the measured state then compute the measured outputs.
+        """
+        ref_poses = self.get_ref_frame_poses()        # Get the pose of every frame that should be in contact
+
+        # TODO: For now assume that reference frames are always contact bodies.
+        #   Then only updated the reference frame if it changes domain into a domain with contact.
+        #   Each env needs its own reference frame, but it only ever needs one at a time.
+        #   If there is a half periodic trajectory then assume that it switches to the other (left or right) frame.
+        #   The self.ref_poses should be of shape [N, 7] and should just be holding the current in use reference frame.
+
+        # Get the current domains
+        new_domains = self.manager.get_current_domains(t)
+
+        # Check if the domains changed
+        changed = new_domains != self.current_domain
+
+        # Update the list of current domains
+        self.current_domain = new_domains
+
+        # Get the correct reference frame to pass
+        # TODO: Determine the in use ref frames
+        # frame_idx_in_use
+        self.ref_poses[changed, :] = ref_poses[changed, 0, :]
+
+        # Compute the measured outputs
+        self.y_act, self.dy_act = self.compute_measured_output(self.ref_poses[:, :3], self.ref_poses[:, 3:])
+
+
+    def compute_measured_output(self, ref_frame_pos_w, ref_frame_quat) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get the measured state."""
+        # TODO: Make more general. For now assuming CoM then bodies then joints always
+
+        output_idx = 0
+
+        # Get the relevant end effector positions (in global frame)
+        if self.use_com:
+            # Deal with CoM as a special case
+            com_pos_w = self.robot.data.root_com_pos_w
+            com_vel_w = self.robot.data.root_com_vel_w
+
+            # Put into the reference frame
+            com_pos_local = _transfer_to_local_frame(com_pos_w - ref_frame_pos_w, ref_frame_quat)
+            com_vel_local = _transfer_to_local_frame(com_vel_w, ref_frame_quat)
+
+            # TODO: Add to the outputs in the correct order
+            self.y_act[output_idx:output_idx+3] = com_pos_local
+            self.dy_act[output_idx:output_idx+3] = com_vel_local
+            output_idx += 3
+
+        def _get_pos_ori_vel_relative(idx, base_frame_pos, base_frame_quat):
+            """
+            Compute the position, orientation, and velocity relative to the reference frame.
+
+            Args:
+                idx: tensor of shape [N]
+                base_frame_pos: tensor of shape [3]
+                base_frame_quat: tensor of shape [4]
+            """
+            # TODO: Does this handle a tensor of idx correctly?
+            base_frame_ori = get_euler_from_quat(base_frame_quat)
+
+            frame_pos = self.robot.body_pos_w[:, idx, :]
+            frame_quat = self.robot.body_quat_w[:, idx, :]
+            frame_ori = get_euler_from_quat(frame_quat)
+
+            frame_pos_rel = frame_pos - base_frame_pos
+            frame_pos_rel_local = _transfer_to_local_frame(frame_pos_rel, base_frame_quat)
+
+            frame_ori_rel = frame_ori
+            frame_ori_rel[:, 2] = wrap_to_pi(frame_ori_rel[:, 2] - base_frame_ori[:, 2])
+
+            frame_lin_vel_w = self.robot.body_lin_vel_w[:, idx, :]
+            frame_ang_vel_w = self.robot.body_ang_vel_w[:, idx, :]
+
+            frame_vel_local = _transfer_to_local_frame(frame_lin_vel_w, base_frame_quat)
+            frame_ang_vel_local = _transfer_to_local_frame(frame_ang_vel_w, base_frame_quat)
+
+            # TODO: Make sure the returned shape is [N, 3] for each
+            return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
+
+        if self.body_idx is not None:
+            # TODO: Does the root link need to be dealt with specially?
+
+            body_pos_local, body_ori_local, body_vel_local, body_ang_vel_local = _get_pos_ori_vel_relative(
+                self.body_idx, ref_frame_pos_w, ref_frame_quat,)
+
+            # TODO: Make sure this is being added correctly
+            self.y_act[output_idx:output_idx+(3*body_pos_local.shape[0])] = body_pos_local.flatten()
+            self.dy_act[output_idx:output_idx+(3*body_vel_local.shape[0])] = body_vel_local.flatten()
+
+            output_idx += (3*body_vel_local.shape[0])
+
+        # Get the relevant joint angles
+        if self.joint_idx is not None:
+            joint_pos = self.robot.data.joint_pos[:, self.joint_idx]
+            joint_vel = self.robot.data.joint_vel[:, self.joint_idx]
+
+            # TODO: Make sure this is being added correctly
+            self.y_act[output_idx:output_idx+(joint_pos.shape[0])] = joint_pos
+            self.dy_act[output_idx:output_idx+(joint_vel.shape[0])] = joint_vel
+
+            output_idx += joint_vel
+
+    def get_desired_output(self, t: torch.Tensor, conditioner: torch.Tensor = None):
+        """
+        Get the desired output to track from the trajectory.
+
+        TODO: Need to support adjustments to the trajectory, such as yawing and lateral motion for locomoting.
+        """
+
+        if self.manager_type == "library":
+            y = self.manager.get_output(t, conditioner)
+        else:
+            y = self.manager.get_output(t)
+
+        self.y_des = y[:, 0, :]
+        self.dy_des = y[:, 1, :]
+
+
+    @property
+    def command(self):
+        return self.y_des
+
+    def _resample_command(self, env_ids):
+        """Resample the command."""
+        self._update_command()
+        return
+
+    def _update_command(self):
+        """Update the command values."""
+        # Time in each env
+        t = self.env.sim.current_time * torch.ones(self.num_envs, device=self.device)
+
+        # Get conditioning variables (velocity, etc...)
+        cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
+
+        # Update the measured outputs
+        self.get_measured_outputs(t)
+
+        # Get desired output
+        self.get_desired_outputs(t, cond_vars)
+
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
+        self.vdot = vdot
+        self.v = vcur
+
+    def _update_metrics(self):
+        """
+        Update the metrics.
+
+        Metrics to update:
+        - Position tracking
+        - Velocity tracking
+        - CLF values
+
+        """
+        # TODO: Double check
+        # Call parent method for base metrics
+        self.metrics["v"] = self.v
+        self.metrics["vdot"] = self.vdot
+
+        # Update metrics based on trajectory type
+        if hasattr(self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]], 'axis_names'):
+            # End-effector trajectories
+            for axis_info in self.gait_config._gait_cache[list(self.gait_config._gait_cache.keys())[0]].axis_names:
+                error_key = axis_info['name']
+                index = axis_info['index']
+                self.metrics[error_key] = torch.abs(
+                    self.y_out[:, index] -
+                    self.y_act[:, index]
+                )
+        else:
+            # Joint trajectories
+            for i, joint_name in enumerate(self.robot.joint_names):
+                error_key = f"error_{joint_name}"
+                self.metrics[error_key] = torch.abs(self.y_out[:, i] - self.y_act[:, i])
+
+    def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool]:
+        """
+        Parse the output names to indices to be used for getting data from the robot in sim.
+
+        Args:
+            output_names: List of output names in the format "frame:axis" or "joint:joint_name"
+
+        Returns:
+            joint_idx: List of joint indices (or None if no joints)
+            body_idx: List of body indices (or None if no bodies)
+            use_com: True if CoM is used, False otherwise
+        """
+        joint_indices = []
+        body_indices = []
+        use_com = False
+
+        # Track which frames we've already added to avoid duplicates
+        added_bodies = set()
+
+        for output_name in output_names:
+            if output_name.startswith('joint:'):
+                # Joint output: "joint:joint_name"
+                joint_name = output_name.split(':', 1)[1]
+
+                # Get the index of this joint
+                if joint_name in self.robot.joint_names:
+                    joint_idx = self.robot.joint_names.index(joint_name)
+                    if joint_idx not in joint_indices:
+                        joint_indices.append(joint_idx)
+                else:
+                    raise ValueError(f"Joint '{joint_name}' not found in robot joint names.")
+
+            elif output_name.startswith('com:'):
+                # CoM output: "com:pos_x", "com:pos_y", etc.
+                use_com = True
+
+            else:
+                # Frame output: "frame_name:axis"
+                frame_name = output_name.split(':', 1)[0]
+
+                # Skip if we've already added this body
+                if frame_name in added_bodies:
+                    continue
+
+                # Get the index of this body
+                if frame_name in self.robot.body_names:
+                    body_idx = self.robot.body_names.index(frame_name)
+                    body_indices.append(body_idx)
+                    added_bodies.add(frame_name)
+                else:
+                    raise ValueError(f"Body frame '{frame_name}' not found in robot body names.")
+
+        # Convert to None if empty
+        joint_idx_result = joint_indices if len(joint_indices) > 0 else None
+        body_idx_result = body_indices if len(body_indices) > 0 else None
+
+        return joint_idx_result, body_idx_result, use_com
+
+    def _parse_ref_frames(self, reference_frames: list[str]) -> list[int]:
+        """
+        Parse the reference frame names to body indices.
+
+        Args:
+            reference_frames: List of body frame names (e.g., ["left_ankle_roll_link", "right_ankle_roll_link"])
+
+        Returns:
+            List of body indices corresponding to the reference frames
+
+        Note:
+            If any frame starts with "right" or "left", the corresponding opposite side frame
+            is also added automatically to ensure bilateral symmetry.
+        """
+        expanded_frames = []
+
+        for frame_name in reference_frames:
+            # Add the original frame
+            if frame_name not in expanded_frames:
+                expanded_frames.append(frame_name)
+
+            # Check if the frame starts with "right" or "left" and add the opposite side
+            if frame_name.startswith("right"):
+                # Replace "right" with "left"
+                opposite_frame = "left" + frame_name[5:]  # Remove "right" and add "left"
+                if opposite_frame not in expanded_frames:
+                    expanded_frames.append(opposite_frame)
+            elif frame_name.startswith("left"):
+                # Replace "left" with "right"
+                opposite_frame = "right" + frame_name[4:]  # Remove "left" and add "right"
+                if opposite_frame not in expanded_frames:
+                    expanded_frames.append(opposite_frame)
+
+        # Convert frame names to body indices
+        frame_indices = []
+        for frame_name in expanded_frames:
+            if frame_name in self.robot.body_names:
+                frame_idx = self.robot.body_names.index(frame_name)
+                frame_indices.append(frame_idx)
+            else:
+                raise ValueError(f"Reference frame '{frame_name}' not found in robot body names.")
+
+        return frame_indices
+
+
+def _transfer_to_local_frame(vec, root_quat):
+    return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
+
+def get_euler_from_quat(quat):
+    euler_x, euler_y, euler_z = euler_xyz_from_quat(quat)
+    euler_x = wrap_to_pi(euler_x)
+    euler_y = wrap_to_pi(euler_y)
+    euler_z = wrap_to_pi(euler_z)
+    return torch.stack([euler_x, euler_y, euler_z], dim=-1)
