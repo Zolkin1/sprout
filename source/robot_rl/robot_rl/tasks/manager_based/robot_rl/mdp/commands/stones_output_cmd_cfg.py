@@ -10,8 +10,8 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 Q_weights = [
     300.0,
     50.0,  # com_x pos, vel
-    300.0,
-    50.0,  # com_y pos, vel
+    120.0,
+    15.0,  # com_y pos, vel 120, 15 seems better; 50, 1 was too small
     400.0,
     10.0,  # com_z pos, vel
     420.0,
