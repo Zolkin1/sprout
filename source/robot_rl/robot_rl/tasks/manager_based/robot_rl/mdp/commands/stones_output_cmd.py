@@ -456,6 +456,9 @@ class StonesOutputCommandTerm(CommandTerm):
             
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
         self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
+        if torch.any(self.ldes[mask] <= ZERO_EPS):
+            #raise error
+            print("Warning: ldes is non-positive!")
         if torch.any(self.ldes_next < ZERO_EPS):
             #raise error
             print("Warning: ldes_next is non-positive!")
@@ -918,6 +921,7 @@ class StonesOutputCommandTerm(CommandTerm):
         E_envs = torch.ones((self.num_envs,), device=self.device) * self.cfg.E_star
         E_envs[self.is_standing_cmd] = 0.0  #if commanded standing, set E = 0
 
+        #solve for Lyplus which corresponds to desired oribital energy Estar
         state2_sagittal_plus = solve_velocity_or_momentum_positive_from_E_batched(E=E_envs,
                                                                     p=x_plus,
                                                                     z_tilde=z0_interp,
@@ -937,15 +941,27 @@ class StonesOutputCommandTerm(CommandTerm):
 
     def compute_desired_stones(self):
         N = self.num_envs
+        #TODO: MUST half and half delta yaw for pelvis and swing foot
 
-        pelvis_eulxyz = torch.zeros((N, 3), device=self.device) #Shape: (N,3)
-        pelvis_eulxyz[:, 2] =  self.stance_foot_ori_0[:, 2] + self.delta_yaw
-        pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)#Shape: (N,3)
-        pelvis_eulxyz_dot[:, 2] = self.yaw_dot
-        swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
-        swingfoot_eulxyz_dot = pelvis_eulxyz_dot #Shape: (N,3)
+        # pelvis_eulxyz = torch.zeros((N, 3), device=self.device) #Shape: (N,3)
+        # pelvis_eulxyz[:, 2] =  self.stance_foot_ori_0[:, 2] + self.delta_yaw
+        # pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)#Shape: (N,3)
+        # pelvis_eulxyz_dot[:, 2] = self.yaw_dot
+        # swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
+        # swingfoot_eulxyz_dot = pelvis_eulxyz_dot #Shape: (N,3)
         
-        
+        pelvis_eulxyz = torch.zeros((N, 3), device=self.device)
+        pelvis_eulxyz[:, 2] = self.stance_foot_ori_0[:, 2] + self.delta_yaw * 0.5
+
+        pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)
+        pelvis_eulxyz_dot[:, 2] = self.yaw_dot * 0.5
+
+        swingfoot_eulxyz = torch.zeros((N, 3), device=self.device)
+        swingfoot_eulxyz[:, 2] = self.stance_foot_ori_0[:, 2] + self.delta_yaw
+
+        swingfoot_eulxyz_dot = torch.zeros((N, 3), device=self.device)
+        swingfoot_eulxyz_dot[:, 2] = self.yaw_dot
+
         upper_body_joint_pos, upper_body_joint_vel = self.generate_upper_body_ref() #Shape: (N, num_upper_joints)
         
         zeros_N = torch.zeros((N,), device=self.device)
