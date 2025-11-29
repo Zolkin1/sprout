@@ -197,7 +197,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                     "downstairs": StairsTerrainCfg(proportion=0.3, is_upstairs=False),
                     "flat_stones": LongStonesFlatTerrainCfg(proportion=0.1),
                     "stones": LongStonesTerrainCfg(proportion=0.25),
-                    "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
+                    # "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
                 },
             )
             self.scene.terrain = TerrainImporterCfg(
@@ -419,8 +419,8 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         self.observations.policy.enable_corruption = False
         # remove random pushing
         self.events.base_external_force_torque = None
-        self.events.push_robot = None
-        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.push_robot = None
+        self.events.push_robot.interval_range_s = (2.0, 2.0)
         # self.events.reset_base.params["pose_range"] = {
         #     "x": (-0.3, 0.0),
         #     "y": (-0.1, 0.1),
@@ -477,6 +477,6 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
         # }
         
         self.scene.terrain.terrain_generator.num_rows = 1
-        self.scene.terrain.terrain_generator.num_cols = 5
+        self.scene.terrain.terrain_generator.num_cols = 10
         self.scene.terrain.terrain_generator.difficulty_range = (0.7, 1.0)     
  

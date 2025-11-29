@@ -6,8 +6,8 @@ import os
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 project_path = os.path.join(project_root, "logs/g1_policies/stepping_stone/stepping_stone")
-distill_run = "2025-11-14_12-17-08"
-teacher_run = "2025-11-13_21-19-48"
+distill_run = "2025-11-25_20-25-35"
+teacher_run = "2025-11-24_20-15-32"
 distill_ckpt = torch.load(os.path.join(project_path, distill_run, "model_999.pt"))
 teacher_ckpt = torch.load(os.path.join(project_path, teacher_run, "model_9999.pt"))
 

@@ -25,8 +25,8 @@ class BasicStonesTerrainCfg(SubTerrainBaseCfg):
     
     stone_length_min: float = 0.13
     stone_width_min: float = 0.75
-    stone_width_max: float = 1.25
-    stone_height_min: float = 0.05
+    stone_width_max: float = 1.25 #real stones 1.22
+    stone_height_min: float = 0.05 #thickness of the stones, should not matter too much
     stone_height_max: float = 0.15
     underneath_platform_z_min: float = -1.0  # z pos of the underneath platform relative to stone top
     underneath_platform_z_max: float = 0.0  # z pos of the underneath platform relative to stone top
@@ -94,7 +94,16 @@ class StairsTerrainCfg(BasicStonesTerrainCfg): #stairs
         stone_y, stone_z = self.resample_basic()
         rel_x = np.random.uniform(self.stair_x_min, self.stair_x_max)
         self.rel_stone_x_range = (rel_x, rel_x)
-        rel_z = difficulty * self.stair_z_max * (2 * self.is_upstairs -1)
+        # old: difficult terrain has only hard stairs
+        # rel_z = difficulty * self.stair_z_max * (2 * self.is_upstairs -1)
+        
+        # Sample height uniformly from [min, difficulty * max]
+        # Easy terrain: small range [0, 0.02] (if difficulty=0.1)
+        # Hard terrain: full range [0, 0.2] (if difficulty=1.0)
+        max_height = difficulty * self.stair_z_max
+        rel_z = np.random.uniform(0.0, max_height)
+        # Apply upstairs/downstairs direction
+        rel_z = rel_z * (2 * self.is_upstairs - 1)
         self.rel_stone_z_range = (rel_z, rel_z)
         self.stone_size = (rel_x, stone_y, stone_z)
         return
