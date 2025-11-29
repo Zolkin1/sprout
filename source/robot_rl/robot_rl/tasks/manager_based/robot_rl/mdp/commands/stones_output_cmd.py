@@ -243,7 +243,7 @@ class StonesOutputCommandTerm(CommandTerm):
         #output related
         self.hdes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.ldes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
-        self.pitchdes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        # self.pitchdes = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.hdes_next = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.ldes_next = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self.xcomf_des = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
@@ -251,7 +251,6 @@ class StonesOutputCommandTerm(CommandTerm):
         self.zcomf_des = self.z0.clone()
         self.dzcomf_des = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
                                 
-        #todo: for long stones now, always identity quat
         self.stone_quat = torch.zeros((env.num_envs, 4), dtype=torch.float32, device=self.device)
         self.stone_quat[:, 0] = 1.0 # identity quat
 
@@ -278,9 +277,10 @@ class StonesOutputCommandTerm(CommandTerm):
         return
     
     def _update_command(self):
-         
+         #check nan
+        if torch.isnan(self.robot.data.body_com_pos_w).any():
+            raise ValueError("NaN detected in body_com_pos_w")
 
-        
         self.timeBasedDomainContactStatusSwitchwithStanding()
 
         self.update_walking_target()
@@ -406,7 +406,7 @@ class StonesOutputCommandTerm(CommandTerm):
         self.next_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         self.next_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         
-        self.pitchdes[mask] = torch.gather(self.abs_pitch[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
+        # self.pitchdes[mask] = torch.gather(self.abs_pitch[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
 
         # --- Next Upcoming stepping stone, preview ---
         idx_next_next = torch.clamp(ithstep[mask] + 1, max=self.max_stone_idx)
@@ -423,7 +423,8 @@ class StonesOutputCommandTerm(CommandTerm):
             self.nextnext_stone_pos[at_last_mask_global, 0] = self.next_stone_pos[at_last_mask_global, 0] + 0.3
             self.nextnext_stone_pos[at_last_mask_global, 1] = self.next_stone_pos[at_last_mask_global, 1]
             self.nextnext_stone_pos[at_last_mask_global, 2] = self.next_stone_pos[at_last_mask_global, 2]
-    
+            # check pitchdes for pseudo stone
+
         # === Case 2: Beyond terrain - both next and next-next are pseudo ===
         if torch.any(beyond_terrain):
             beyond_mask_global = torch.zeros_like(mask, dtype=torch.bool)
@@ -442,14 +443,15 @@ class StonesOutputCommandTerm(CommandTerm):
             self.nextnext_stone_pos[beyond_mask_global, 2] = self.last_stone_z[beyond_mask_global]
             
             # For pseudo stones, set pitch to zero
-            self.pitchdes[beyond_mask_global] = 0.0
+            # self.pitchdes[beyond_mask_global] = 0.0
             
         
         self.hdes[mask] = self.next_stone_pos[mask, 2] - current_stone_pos[mask, 2]
         self.ldes[mask] = self.next_stone_pos[mask, 0] - current_stone_pos[mask, 0]
         if self.cfg.use_stance_foot_pos_as_ref == True:
             self.ldes[mask] = self.next_stone_pos[mask, 0] - self.stance_foot_pos_0[mask, 0]
-            # self.hdes[mask] = self.next_stone_pos[mask, 2] - self.stance_foot_pos_0[mask, 2]
+            self.hdes[mask] = self.next_stone_pos[mask, 2] - self.stance_foot_pos_0[mask, 2]
+            #TODO: check hdes with stance foot pos as ref
             
             
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
@@ -588,6 +590,7 @@ class StonesOutputCommandTerm(CommandTerm):
             self.ith_step[mask_reset_buf] = 0 #env reset, reset ith step
             self.stance_idx[mask_reset_buf] = 0 #reset to left foot stance
             self.reset_stance_swing_foot(mask_reset_buf) #reset stance and swing foot, so always start from right
+            #TODO: on hardware, robot always start with left foot stance
             
             #update current stone pos, assume first step z is always zero
             self.current_stone_pos[mask_reset_buf, 0:2] = self.stance_foot_pos_0[mask_reset_buf, 0:2].clone() #initialize current stone x-y pos based on stance foot
@@ -685,7 +688,6 @@ class StonesOutputCommandTerm(CommandTerm):
 
             self.TSS[mask] = self._env.cfg.commands.step_period.period_range[0]/2.0
         else: 
-            #todo: assume zero target yaw for stones now
             target_yaw = torch.zeros((self.num_envs,), device=self.device)
             self.com_pos_target_yaw0, self.com_state2_target_yaw0 = self.compute_com_rel_to_stance_state_target_yaw_frame(self.use_momentum, target_yaw)
             x0 = self.get_sagittal_com_states_stacked(self.com_pos_target_yaw0, self.com_state2_target_yaw0, self.use_momentum)
@@ -797,7 +799,6 @@ class StonesOutputCommandTerm(CommandTerm):
             delta_y = (self.prev_stone_pos[:, 1] + self.current_stone_pos[:, 1])/2.0 - self.terrain.env_origins[:,1]
             self.hlip.update_desired_walking(base_vdes[:,1]-delta_y/self.TSS, self.cfg.y_nom)
             # for stepping stones, always targeting zero yaw
-            # todo: consider adding different terrain yaw and replace zeros_like below
             self.target_yaw_stone = torch.zeros_like(self.stance_foot_ori_0[:, 2])
             self.yaw_dot = (self.target_yaw_stone - self.stance_foot_ori_0[:, 2]) / self.TSS
             self.yaw_dot = torch.clamp(self.yaw_dot, 
@@ -858,7 +859,7 @@ class StonesOutputCommandTerm(CommandTerm):
         
 
         # Center of mass to stance foot vector in local frame
-        #todo: used generic root com pos for now
+        #TODO: used generic root com pos for now
         com_w = data.root_com_pos_w
         com2stance_local = _transfer_to_local_frame(com_w - self.stance_foot_pos_0, self.stance_foot_ori_quat_0_zerorollpitch)
         # Velocities (world frame)
@@ -898,6 +899,7 @@ class StonesOutputCommandTerm(CommandTerm):
         #predict preimpact sagittal com x and vx/Ly
         com_now, com_d_now = self.compute_com_rel_to_stance_state_target_yaw_frame(self.use_momentum, torch.zeros((self.num_envs,), device=self.device))
         time2impact = self.TSS - self.phase_var.time_in_step
+        #TODO:use the function to stack xnow_sagittal
         if self.use_momentum:
             xnow_sagittal = torch.stack([com_now[:,0], com_d_now[:,1]], dim=1) #Shape: (N,2)
         else:
@@ -964,17 +966,14 @@ class StonesOutputCommandTerm(CommandTerm):
         Uy[right_stance] = torch.clamp(Uy[right_stance], min=self.cfg.y_sw_min, max=self.cfg.y_sw_max)
         
         
-        
-        #TODO: for now target yaw frame = world frame, later consider adding different terrain yaw
         footplacement_target_frame = torch.stack([Ux, Uy, self.hdes], dim=-1) # Shape: (N,3)
         # Create horizontal control points with batch dimension
         horizontal_control_points = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0], device=self.device)
         bht = bezier_deg(0, self.phase_var.tau, self.TSS, horizontal_control_points, 4) #Shape: (N,)
         dbht = bezier_deg(1, self.phase_var.tau, self.TSS, horizontal_control_points, 4) #Shape: (N,)
         # Horizontal X and Y (linear interpolation)
+        #TODO: use stancepos0 or not
         x_init_target_frame = self.prev_stone_pos[:, 0] - self.current_stone_pos[:, 0]
-        
-        
         p_swing_x = ((1 - bht) * x_init_target_frame + bht * Ux) #Shape: (N,)
         v_swing_x = ((-dbht) * x_init_target_frame + dbht * Ux)  #Shape: (N,)
         
@@ -984,9 +983,9 @@ class StonesOutputCommandTerm(CommandTerm):
         v_swing_y = ((-dbht) * y0 + dbht * Uy)  #Shape: (N,)
         
         
-        #TODO: check this added swing pitch angle and velocity
-        swingfoot_eulxyz[:, 1] = (1 - bht) * self.stance_foot_ori_0[:,1] + bht * self.pitchdes
-        swingfoot_eulxyz_dot[:, 1] = dbht * (self.pitchdes - self.stance_foot_ori_0[:,1])
+        # #TODO: check this added swing pitch angle and velocity
+        # swingfoot_eulxyz[:, 1] = (1 - bht) * self.stance_foot_ori_0[:,1] + bht * self.pitchdes
+        # swingfoot_eulxyz_dot[:, 1] = dbht * (self.pitchdes - self.stance_foot_ori_0[:,1])
 
         # swing foot z
         z_sw_max = torch.full((N,), self.cfg.z_sw_max, device=self.device)
@@ -1035,11 +1034,12 @@ class StonesOutputCommandTerm(CommandTerm):
         
         # com y based on HLIP
         #TODO: how should I guide comy 
+        #TODO: lower comy tracking weight?
         com_y_target_frame, com_dy_target_frame = self.hlip.get_desired_com_state(self.stance_idx, self.phase_var.time_in_step) #Shape: (N,)
         if self.use_momentum: #convert angular momentum to velocity
             com_dy_target_frame = com_dy_target_frame / self.z0 #vy^d = LxLIP^d / z0, as LxLIP = -Lx
             
-        
+        #TODO: did not use z_tilde here
         # com x based on target orbital energy and comf position at the end of SS
         v_or_L_target_frame = solve_velocity_or_momentum_positive_from_E_batched(E=self.cfg.E_star, 
                                                                     p=self.xcomf_des, #target frame
@@ -1064,7 +1064,7 @@ class StonesOutputCommandTerm(CommandTerm):
             
         #com z 
         self.compute_dzcomf_des()
-        #TODO: check if it is better to use true zcom0
+        #TODO: MUST check if it is better to use true zcom0
         cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des , 
                                                 torch.zeros_like(self.zcom0_des),
                                                 self.zcomf_des ,
@@ -1233,7 +1233,7 @@ class StonesOutputCommandTerm(CommandTerm):
         pelvis_eulxyz[:, 2] =  self.stance_foot_ori_0[standing_mask, 2]
         #TODO: pitch can be non-zero for standing on stepping stone, may update eul y later
         swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
-        swingfoot_eulxyz[:, 1] = self.stance_foot_ori_0[standing_mask, 1]
+        # swingfoot_eulxyz[:, 1] = self.stance_foot_ori_0[standing_mask, 1]
 
         #no need to convert, just standing
         omega_pelvis_ref = torch.zeros((N_standing, 3), device=self.device)#Shape: (N,3)
@@ -1249,7 +1249,7 @@ class StonesOutputCommandTerm(CommandTerm):
         quat_world_to_stanceyaw = quat_from_euler_xyz(zeros_N, zeros_N,
                                                        - self.stance_foot_ori_0[standing_mask, 2])  # Shape: (N,4)
 
-        # in world, which is also target yaw frame
+        # swing foot stays at swing foot pos0 in world, which is also target yaw frame
         p_swing_init = self.swing_foot_pos_0[standing_mask] - self.stance_foot_pos_0[standing_mask]  #Shape: (N,)
 
         # Combine to get full swing foot position and velocity
@@ -1258,6 +1258,7 @@ class StonesOutputCommandTerm(CommandTerm):
 
         #TODO: for now, used stance foot pos for x, so relative to stance foot, com x=0
         com_y = p_swing_init[:, 1] / 2.0
+        #TODO: used 0 for com x position, option p_swing_init[:, 0] / 2.0 
         com_pos_des = torch.stack(
             [zeros_N, com_y, self.zcomf_des[standing_mask]], dim=-1
         )
