@@ -198,10 +198,10 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                 use_cache=False,
                 difficulty_range=(0.0, 1.0),
                 sub_terrains={
-                    "upstairs": StairsTerrainCfg(proportion=0.2, is_upstairs=True),
-                    "downstairs": StairsTerrainCfg(proportion=0.3, is_upstairs=False),
-                    "flat_stones": LongStonesFlatTerrainCfg(proportion=0.1),
-                    "stones": LongStonesTerrainCfg(proportion=0.25),
+                    "upstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=True),
+                    "downstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=False),
+                    "flat_stones": LongStonesFlatTerrainCfg(proportion=0.4),
+                    "stones": LongStonesTerrainCfg(proportion=0.4),
                     # "flat_ground": FlatGroundTestingCfg(proportion=1.0)
                     # "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
                 },
@@ -311,6 +311,10 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         self.rewards.joint_deviation_arms = None
         self.rewards.joint_deviation_torso = None
         self.rewards.height_torso = None
+
+        self.curriculum.modify_reference_cfg = None
+        self.commands.hlip_ref.use_stance_foot_pos_as_ref = True
+
 
 
 class G1_custom_stepping_stones(G1SteppingStonesEnvCfg):
