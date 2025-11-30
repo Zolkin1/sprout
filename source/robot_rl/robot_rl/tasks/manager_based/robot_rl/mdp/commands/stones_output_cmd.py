@@ -456,6 +456,13 @@ class StonesOutputCommandTerm(CommandTerm):
             
         self.hdes_next[mask] = self.nextnext_stone_pos[mask, 2] - self.next_stone_pos[mask, 2]
         self.ldes_next[mask] = self.nextnext_stone_pos[mask, 0] - self.next_stone_pos[mask, 0]
+        
+        # #debug, hardcode 0.3
+        # self.ldes[mask] = 0.3
+        # self.ldes_next[mask] = 0.3
+        # self.hdes[mask] = 0.0
+        # self.hdes_next[mask] = 0.0
+        
         if torch.any(self.ldes[mask] <= ZERO_EPS):
             #raise error
             print("Warning: ldes is non-positive!")

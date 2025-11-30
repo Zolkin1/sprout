@@ -6,7 +6,6 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (
-    HumanoidCommandsCfg,
     HumanoidEnvCfg,
     HumanoidRewardCfg,
     HumanoidTerminationsCfg
@@ -31,7 +30,13 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.stones_output_cmd_cfg im
 from isaaclab.terrains import TerrainImporterCfg, TerrainGeneratorCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.stones_terrain_importer import StonesTerrainImporter
 from robot_rl.tasks.manager_based.robot_rl.terrains.stones_terrain_generator import StonesTerrainGenerator
-from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import LongStonesFlatTerrainCfg, LongStonesTerrainCfg, StairsTerrainCfg, TiltedStonesTerrainCfg
+from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import (
+    LongStonesFlatTerrainCfg, 
+    LongStonesTerrainCfg, 
+    StairsTerrainCfg, 
+    TiltedStonesTerrainCfg,
+    FlatGroundTestingCfg
+)
 from robot_rl.tasks.manager_based.robot_rl.constants import STONES, TEST_FLAT
 from isaaclab.sensors import RayCasterCfg, patterns        
         
@@ -197,6 +202,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                     "downstairs": StairsTerrainCfg(proportion=0.3, is_upstairs=False),
                     "flat_stones": LongStonesFlatTerrainCfg(proportion=0.1),
                     "stones": LongStonesTerrainCfg(proportion=0.25),
+                    # "flat_ground": FlatGroundTestingCfg(proportion=1.0)
                     # "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
                 },
             )
@@ -259,6 +265,8 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
                 "yaw": (0.0, 0.0),
             },
         }
+        self.events.randomize_ground_contact_friction.params["static_friction_range"] = (0.4, 1.0)
+        self.events.randomize_ground_contact_friction.params["dynamic_friction_range"] = (0.4, 1.0)
 
         self.events.base_external_force_torque = None
 
