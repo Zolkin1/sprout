@@ -266,6 +266,20 @@ class StonesOutputCommandTerm(CommandTerm):
         self.is_walking_env = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self.is_standing_cmd = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         
+        self.swing_foot_pos_actual = torch.zeros((self.num_envs, 3), device=self.device)
+        self.swing_foot_error_at_contact = torch.zeros((self.num_envs, 3), device=self.device)
+        self.mask_at_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        
+        # for debug visualization
+        self.foottarget_vis_quat = torch.zeros((self.num_envs, 4), device=self.device)
+        self.foottarget_vis_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        self.swingfoot_vis_quat = torch.zeros((self.num_envs, 4), device=self.device)
+        self.swingfoot_vis_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        self.com_frame_vis_quat = torch.zeros((self.num_envs, 4), device=self.device)
+        self.com_frame_vis_pos = torch.zeros((self.num_envs, 3), device=self.device)
+        
+        # for stepping stones, always targeting zero yaw
+        self.target_yaw_stone = torch.zeros_like(self.stance_foot_ori_0[:, 2])
         
 
     @property
@@ -283,12 +297,12 @@ class StonesOutputCommandTerm(CommandTerm):
 
         self.timeBasedDomainContactStatusSwitchwithStanding()
 
-        self.update_walking_target()
+        self.update_walking_target(self.is_walking_env)
         
         self.compute_actual()
 
         if TEST_FLAT == False:
-            self.compute_desired_stones()
+            self.compute_desired_stones(self.is_walking_env)
         else:
             self.compute_desired_flat()
 
@@ -401,7 +415,7 @@ class StonesOutputCommandTerm(CommandTerm):
         at_last_stone = ithstep[mask] == self.max_stone_idx
   
         # --- Upcoming stepping stone, the target stone for swing foot ---
-        idx_next = torch.clamp(ithstep[mask], max=self.max_stone_idx)
+        idx_next = torch.clamp(ithstep[mask], min=0, max=self.max_stone_idx)
         self.next_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         self.next_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
         self.next_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
@@ -409,7 +423,7 @@ class StonesOutputCommandTerm(CommandTerm):
         # self.pitchdes[mask] = torch.gather(self.abs_pitch[mask], 1, idx_next.unsqueeze(1)).squeeze(1)
 
         # --- Next Upcoming stepping stone, preview ---
-        idx_next_next = torch.clamp(ithstep[mask] + 1, max=self.max_stone_idx)
+        idx_next_next = torch.clamp(ithstep[mask] + 1, min=0, max=self.max_stone_idx)
         self.nextnext_stone_pos[mask, 0] = torch.gather(self.abs_x[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
         self.nextnext_stone_pos[mask, 1] = torch.gather(self.abs_y[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
         self.nextnext_stone_pos[mask, 2] = torch.gather(self.abs_z[mask], 1, idx_next_next.unsqueeze(1)).squeeze(1)
@@ -562,10 +576,20 @@ class StonesOutputCommandTerm(CommandTerm):
         mask_timer_expired = mask_timer_expired & torch.logical_not(mask_reset_buf.bool()) 
         #similarly, only process stand2walk for non-resetting and standing envs
         mask_stand2walk = mask_stand2walk & torch.logical_not(mask_reset_buf.bool()) 
+        
+        
+        self.swing_foot_error_at_contact = torch.zeros((self.num_envs, 3), device=self.device)
+        self.mask_at_contact = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         # TYPE 1: TIMER EXPIRED
         if torch.any(mask_timer_expired):
             # Walk -> Walk: walking & timer expired, not standing command
             mask_walk2walk = mask_timer_expired & (~self.is_standing_cmd) 
+            
+            self.swing_foot_error_at_contact[mask_walk2walk] = self.swing_foot_pos_actual[mask_walk2walk] - self.next_stone_pos[mask_walk2walk]
+            self.mask_at_contact = mask_walk2walk.clone()
+            
+            
             # Walk -> Stand: walking & timer expired, standing command
             mask_walk2stand = mask_timer_expired & self.is_standing_cmd 
         
@@ -690,6 +714,7 @@ class StonesOutputCommandTerm(CommandTerm):
         #     max=self.z0[mask] + 0.2   # Don't go too high
         # )
         return
+    
     def reset_impact(self, mask):
         #to be called when impact is detected
         self.tSSplus[mask] = tensor_t_now(self._env)[mask]
@@ -729,7 +754,9 @@ class StonesOutputCommandTerm(CommandTerm):
             self.TSS[mask] = torch.clamp(TSS_raw_mask_nan_removed, min=self.cfg.TSS_min, max=self.cfg.TSS_max)
             if torch.isnan(self.TSS).any() or torch.isinf(self.TSS).any():
                 print("Warning: NaN detected in TSS computation!")
-        self.hlip.update_hlip(self.z0, self.TSS, self.TDS)
+        self.hlip.update_hlip_partial_noDS(self.TSS[mask], mask)
+        # self.hlip.update_hlip(self.z0, self.TSS, self.TDS)
+        
         self.phase_var.reconfigure(self.tSSplus , self.tSSplus + self.TSS)
 
         return
@@ -795,7 +822,7 @@ class StonesOutputCommandTerm(CommandTerm):
             # return com_y and com_vy
             return torch.stack([com3d_state1[:,1], com3d_state2[:,1]], dim=1)  # Shape: (num_envs, 2)
     
-    def update_walking_target(self):
+    def update_walking_target(self, mask):
         #given velocity command, update MLIP
         base_vdes = self._env.command_manager.get_command("base_velocity")  # (N,3)
         if TEST_FLAT:
@@ -806,10 +833,12 @@ class StonesOutputCommandTerm(CommandTerm):
             self.target_yaw = self.stance_foot_ori_0[:, 2] + self.delta_yaw
         else:
             # P2 HLIP: uses only lateral vy, y_nom
-            delta_y = (self.prev_stone_pos[:, 1] + self.current_stone_pos[:, 1])/2.0 - self.terrain.env_origins[:,1]
-            self.hlip.update_desired_walking(base_vdes[:,1]-delta_y/self.TSS, self.cfg.y_nom)
+            delta_y = (self.prev_stone_pos[mask, 1] + self.current_stone_pos[mask, 1])/2.0 - self.terrain.env_origins[mask, 1]
+            self.hlip.update_desired_walking_partial(base_vdes[mask, 1]-delta_y/self.TSS[mask], self.cfg.y_nom, mask)
+            # delta_y = (self.prev_stone_pos[:, 1] + self.current_stone_pos[:, 1])/2.0 - self.terrain.env_origins[:,1]
+            # self.hlip.update_desired_walking(base_vdes[:,1]-delta_y/self.TSS, self.cfg.y_nom)
+            
             # for stepping stones, always targeting zero yaw
-            self.target_yaw_stone = torch.zeros_like(self.stance_foot_ori_0[:, 2])
             self.yaw_dot = (self.target_yaw_stone - self.stance_foot_ori_0[:, 2]) / self.TSS
             self.yaw_dot = torch.clamp(self.yaw_dot, 
                                        min=-torch.ones_like(self.target_yaw_stone) * 0.5, 
@@ -852,7 +881,8 @@ class StonesOutputCommandTerm(CommandTerm):
                                         mid_foot_offset=self.mid_foot_offset,
                                         foot_ori_quat=foot_quat_w[batch_idx, self.stance_idx, :],
                                         foot_omega_w=foot_ang_vel_w[batch_idx, self.stance_idx, :])
-        swing_foot_pos_actual, swing_foot_lin_vel = convert_foot_pos_vel_to_midsole(foot_pos=foot_pos_w[batch_idx, 1-self.stance_idx, :],
+        
+        self.swing_foot_pos_actual, swing_foot_lin_vel = convert_foot_pos_vel_to_midsole(foot_pos=foot_pos_w[batch_idx, 1-self.stance_idx, :],
                                                                 foot_vel=foot_lin_vel_w[batch_idx, 1-self.stance_idx, :],
                                                                 mid_foot_offset=self.mid_foot_offset,
                                                                 foot_ori_quat=foot_quat_w[batch_idx, 1-self.stance_idx, :],
@@ -860,13 +890,13 @@ class StonesOutputCommandTerm(CommandTerm):
         
         # Convert foot positions to the robot's yaw-aligned local frame
         swing2stance0_local = _transfer_to_local_frame(
-            swing_foot_pos_actual - self.stance_foot_pos_0, self.stance_foot_ori_quat_0_zerorollpitch
+            self.swing_foot_pos_actual - self.stance_foot_pos_0, self.stance_foot_ori_quat_0_zerorollpitch
         )
         swing_foot_lin_vel_local = _transfer_to_local_frame(
             swing_foot_lin_vel, self.stance_foot_ori_quat_0_zerorollpitch
         )
         
-        
+
 
         # Center of mass to stance foot vector in local frame
         #TODO: used generic root com pos for now
@@ -905,67 +935,77 @@ class StonesOutputCommandTerm(CommandTerm):
         return
     
     
-    def compute_dzcomf_des(self):
+    def compute_dzcomf_des(self, mask: torch.Tensor):
+        if not mask.any():
+            return
+        N_masked = mask.sum().item()
         #predict preimpact sagittal com x and vx/Ly
-        com_now, com_d_now = self.compute_com_rel_to_stance_state_target_yaw_frame(self.use_momentum, torch.zeros((self.num_envs,), device=self.device))
-        time2impact = self.TSS - self.phase_var.time_in_step
-        #TODO:use the function to stack xnow_sagittal
-        if self.use_momentum:
-            xnow_sagittal = torch.stack([com_now[:,0], com_d_now[:,1]], dim=1) #Shape: (N,2)
-        else:
-            xnow_sagittal = torch.stack([com_now[:,0], com_d_now[:,0]], dim=1) #Shape: (N,2)
-        x_sagittal_minus, state2_sagittal_minus = self.hlip.get_com_state_from_x0_sagittal(xnow_sagittal, time2impact)#Shape: (N,2)
+        com_now_full, com_d_now_full = self.compute_com_rel_to_stance_state_target_yaw_frame(
+            self.use_momentum, 
+            torch.zeros((self.num_envs,), device=self.device)
+        ) #Shape: (N,3)
+        time2impact = self.TSS - self.phase_var.time_in_step #Shape: (N,)
+        
+        xnow_sagittal = self.get_sagittal_com_states_stacked(com_now_full, com_d_now_full, self.use_momentum) #Shape: (N,2)
+
+        x_sagittal_minus, state2_sagittal_minus = self.hlip.get_com_state_from_x0_sagittal(xnow_sagittal, time2impact)#Shape: (N,)
+        
+        x_sagittal_minus_masked = x_sagittal_minus[mask] #Shape: (N_masked,)
+        state2_sagittal_minus_masked = state2_sagittal_minus[mask] #Shape: (N_masked,)
+        
         #compute post-impact x com pos: p_plus
-        x_plus = x_sagittal_minus - self.ldes
+        x_plus = x_sagittal_minus_masked - self.ldes[mask] #Shape: (N_masked,2)
+
+        # if torch.any(self.ldes[mask] <= 0):
+        #     print("Warning: ldes is negative in dzcomf_des computation!")
         
-        if torch.any(self.ldes==0):
-            print("Warning: ldes is zero in dzcomf_des computation!")
-        
-        z0LIPplus_real = com_now[:,2] - self.hdes - x_plus * self.hdes_next / self.ldes_next
-        z0LIPplus_des = self.zcomf_des - self.hdes - x_plus * self.hdes_next / self.ldes_next
-        z0_interp = self.phase_var.tau * z0LIPplus_real + (1.0 - self.phase_var.tau) * z0LIPplus_des
-        
+        # Safe division for ldes_next term
+        term_ldes_next = torch.where(
+            self.ldes_next[mask] > ZERO_EPS,
+            x_plus * self.hdes_next[mask] / self.ldes_next[mask],
+            torch.zeros_like(x_plus)
+        )
+        #interpolate z0 between real and desired
+        z0LIPplus_real = com_now_full[mask,2] - self.hdes[mask] - term_ldes_next
+        z0LIPplus_des = self.zcomf_des[mask] - self.hdes[mask] - term_ldes_next
+        z0_interp = self.phase_var.tau[mask] * z0LIPplus_real + (1.0 - self.phase_var.tau[mask]) * z0LIPplus_des #Shape: (N_masked,)
+
         E_envs = torch.ones((self.num_envs,), device=self.device) * self.cfg.E_star
         E_envs[self.is_standing_cmd] = 0.0  #if commanded standing, set E = 0
+        E_envs_masked = E_envs[mask]  #Shape: (N_masked,)
 
         #solve for Lyplus which corresponds to desired oribital energy Estar
-        state2_sagittal_plus = solve_velocity_or_momentum_positive_from_E_batched(E=E_envs,
+        state2_sagittal_plus = solve_velocity_or_momentum_positive_from_E_batched(E=E_envs_masked,
                                                                     p=x_plus,
                                                                     z_tilde=z0_interp,
-                                                                    use_momentum=self.use_momentum)
-        vx_com_now = com_d_now[:,0]
+                                                                    use_momentum=self.use_momentum) #Shape: (N_masked,)
+        vx_com_now = self.robot.data.root_com_vel_w[mask, 0]  #Shape: (N_masked,)
         if self.use_momentum:
-            self.dzcomf_des[:] = (state2_sagittal_plus - state2_sagittal_minus + self.hdes * vx_com_now) / self.ldes
+            self.dzcomf_des[mask] = (state2_sagittal_plus - state2_sagittal_minus_masked + self.hdes[mask] * vx_com_now) / self.ldes[mask]
         else:
-            self.dzcomf_des[:] = ((state2_sagittal_plus - state2_sagittal_minus)*z0_interp + self.hdes * vx_com_now) / self.ldes 
-            
+            self.dzcomf_des[mask] = ((state2_sagittal_plus - state2_sagittal_minus_masked)*z0_interp + self.hdes[mask] * vx_com_now) / self.ldes[mask]
+
         if torch.any(self.dzcomf_des.isnan()):
             print("Warning: dzcomf_des is NaN in dzcomf_des computation!")
-        self.dzcomf_des = torch.clamp(self.dzcomf_des, 
-                                       min=-torch.ones_like(self.hdes) * 1.0, 
+            #nan to zero
+            self.dzcomf_des[self.dzcomf_des.isnan()] = 0.0
+
+        self.dzcomf_des[self.ldes < 0] = 0.0
+        self.dzcomf_des = torch.clamp(self.dzcomf_des,
+                                       min=-torch.ones_like(self.hdes) * 1.0,
                                        max=torch.ones_like(self.hdes) * 1.0)
         return
 
-    def compute_desired_stones(self):
-        N = self.num_envs
-        #TODO: MUST half and half delta yaw for pelvis and swing foot
+    def compute_desired_stones_nomask(self):
 
-        # pelvis_eulxyz = torch.zeros((N, 3), device=self.device) #Shape: (N,3)
-        # pelvis_eulxyz[:, 2] =  self.stance_foot_ori_0[:, 2] + self.delta_yaw
-        # pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)#Shape: (N,3)
-        # pelvis_eulxyz_dot[:, 2] = self.yaw_dot
-        # swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
-        # swingfoot_eulxyz_dot = pelvis_eulxyz_dot #Shape: (N,3)
-        
+        N = self.num_envs
+        #half delta yaw for pelvis and full on swing foot
         pelvis_eulxyz = torch.zeros((N, 3), device=self.device)
         pelvis_eulxyz[:, 2] = self.stance_foot_ori_0[:, 2] + self.delta_yaw * 0.5
-
         pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)
         pelvis_eulxyz_dot[:, 2] = self.yaw_dot * 0.5
-
         swingfoot_eulxyz = torch.zeros((N, 3), device=self.device)
         swingfoot_eulxyz[:, 2] = self.stance_foot_ori_0[:, 2] + self.delta_yaw
-
         swingfoot_eulxyz_dot = torch.zeros((N, 3), device=self.device)
         swingfoot_eulxyz_dot[:, 2] = self.yaw_dot
 
@@ -1129,78 +1169,83 @@ class StonesOutputCommandTerm(CommandTerm):
             self.com_frame_vis_pos = quat_apply(quat_target_frame, com_pos_des) + self.stance_foot_pos_0  # Shape: (N,3)
         return    
     
-    def compute_desired_flat(self):
+    def compute_desired_stones(self, walking_mask: torch.Tensor):
+        if not walking_mask.any():
+            return
+        N_walking = torch.sum(walking_mask).item()
+        
         N = self.num_envs
+        #half delta yaw for pelvis and full on swing foot
+        pelvis_eulxyz = torch.zeros((N_walking, 3), device=self.device)
+        pelvis_eulxyz[:, 2] = self.stance_foot_ori_0[walking_mask, 2] + self.delta_yaw[walking_mask] * 0.5
+        pelvis_eulxyz_dot = torch.zeros((N_walking, 3), device=self.device)
+        pelvis_eulxyz_dot[:, 2] = self.yaw_dot[walking_mask] * 0.5
+        swingfoot_eulxyz = torch.zeros((N_walking, 3), device=self.device)
+        swingfoot_eulxyz[:, 2] = self.stance_foot_ori_0[walking_mask, 2] + self.delta_yaw[walking_mask]
+        swingfoot_eulxyz_dot = torch.zeros((N_walking, 3), device=self.device)
+        swingfoot_eulxyz_dot[:, 2] = self.yaw_dot[walking_mask]
 
-        pelvis_eulxyz = torch.zeros((N, 3), device=self.device) #Shape: (N,3)
-        pelvis_eulxyz[:, 2] =  self.stance_foot_ori_0[:, 2] + self.delta_yaw
-        pelvis_eulxyz_dot = torch.zeros((N, 3), device=self.device)#Shape: (N,3)
-        pelvis_eulxyz_dot[:, 2] = self.yaw_dot
-        swingfoot_eulxyz = pelvis_eulxyz #Shape: (N,3)
-        swingfoot_eulxyz_dot = pelvis_eulxyz_dot #Shape: (N,3)
-        
-        upper_body_joint_pos, upper_body_joint_vel = self.generate_upper_body_ref() #Shape: (N, num_upper_joints)
-        
-        # Get desired foot placements and CoM trajectory from HLIP in target yaw frame, no feedback used here
-        Ux,  Uy = self.hlip.get_desired_foot_placement(self.stance_idx) #Shape: (N,)
-        com_x, com_dx, com_y, com_dy = self.hlip.get_desired_com_state(self.stance_idx, self.phase_var.time_in_step) #Shape: (N,)
-        
-        if self.use_momentum:
-            com_dx = com_dx / self.z0
-            com_dy = com_dy / self.z0
+        # Generate upper body ref for ALL envs, then index (like standing)
+        full_upper_pos, full_upper_vel = self.generate_upper_body_ref()
+        upper_body_joint_pos = full_upper_pos[walking_mask]
+        upper_body_joint_vel = full_upper_vel[walking_mask]
 
-        # Concatenate x y z components
-        com_pos_des = torch.stack(
-            [com_x, com_y, torch.ones((N,), device=self.device) * self.z0], dim=-1
-        )  # Shape: (N,3)
-        com_vel_des = torch.stack([com_dx, com_dy, torch.zeros((N), device=self.device)], dim=-1)  # Shape: (N,3)
-        foot_target = torch.stack([Ux, Uy, torch.zeros((N), device=self.device)], dim=-1) # Shape: (N,3)
-        
-
-        # based on yaw velocity, update com_pos_des, com_vel_des, foot_target,
-        
-        pelvis_eulxyz_actual = get_euler_from_quat(self.robot.data.root_quat_w) #Shape: (N,3)
-        # quat_delta_yaw = quat_from_euler_xyz(
-        #     torch.zeros_like(self.delta_yaw), torch.zeros_like(self.delta_yaw), self.target_yaw - pelvis_eulxyz_actual[:, 2]  # roll=0  # pitch=0  # yaw=Δyaw
-        # ) # Shape: (N,4)
-        #todo: check which one is better
-        quat_delta_yaw = quat_from_euler_xyz(
-            torch.zeros_like(self.delta_yaw), torch.zeros_like(self.delta_yaw), self.delta_yaw  # roll=0  # pitch=0  # yaw=Δyaw
-        ) # Shape: (N,4)
-        swing_foot_target_yaw_adjusted = quat_apply(quat_delta_yaw, foot_target)  # [N,3]
-        com_pos_des_yaw_adjusted = quat_apply(quat_delta_yaw, com_pos_des)  # [N,3]
-        com_vel_des_yaw_adjusted = quat_apply(quat_delta_yaw, com_vel_des)  # [N,3]
-        # self.foot_target = swing_foot_target_yaw_adjusted # Shape: (N,3)
-        #clamp swing foot y to avoid too large step
-        sign_swy = torch.sign(swing_foot_target_yaw_adjusted[:, 1])
-        # self.foot_target[:, 1] = torch.clamp(
-        #     swing_foot_target_yaw_adjusted[:, 1],
-        #     min=self.cfg.foot_target_range_y[0],
-        #     max=self.cfg.foot_target_range_y[1],
-        # ) * sign_swy
+        zeros_N = torch.zeros((N_walking,), device=self.device)
+        quat_target_frame = quat_from_euler_xyz(zeros_N, zeros_N, self.target_yaw[walking_mask])  # Shape: (N,4)
+        quat_targetyaw_to_stanceyaw = quat_from_euler_xyz(zeros_N, zeros_N, self.target_yaw[walking_mask]-self.stance_foot_ori_0[walking_mask, 2])  # Shape: (N,4)
 
         
+        # Swingfoot rel to stancefoot x based on stepping stone position, in world frame
+        Ux = self.ldes[walking_mask]
+        # Ux = torch.clamp(Ux, min=-1.0, max=1.0)
+        # Get desired foot placements from HLIP in target yaw frame, no feedback used here
+        #TODO: later consider add feedback
+        Uy_full = self.hlip.get_desired_foot_placement(self.stance_idx)
+        Uy = Uy_full[walking_mask]
+        # Index stance_idx for the walking envs
+        stance_idx_walking = self.stance_idx[walking_mask]
+        left_stance = (stance_idx_walking == 0)
+        right_stance = (stance_idx_walking == 1)
+        #clamp step y to avoid too large step and foot crossing
+        Uy[left_stance] = torch.clamp(Uy[left_stance], min=-self.cfg.y_sw_max, max=-self.cfg.y_sw_min)
+        Uy[right_stance] = torch.clamp(Uy[right_stance], min=self.cfg.y_sw_min, max=self.cfg.y_sw_max)
 
+
+        footplacement_target_frame = torch.stack([Ux, Uy, self.hdes[walking_mask]], dim=-1) # Shape: (N_walking,3)
         # Create horizontal control points with batch dimension
         horizontal_control_points = torch.tensor([0.0, 0.0, 1.0, 1.0, 1.0], device=self.device)
-
-        bht = bezier_deg(0, self.phase_var.tau, self.TSS, horizontal_control_points, 4) #Shape: (N,)
-        dbht = bezier_deg(1, self.phase_var.tau, self.TSS, horizontal_control_points, 4) #Shape: (N,)
+        bht = bezier_deg(0, self.phase_var.tau[walking_mask], self.TSS[walking_mask], horizontal_control_points, 4) #Shape: (N_walking,)
+        dbht = bezier_deg(1, self.phase_var.tau[walking_mask], self.TSS[walking_mask], horizontal_control_points, 4) #Shape: (N_walking,)
         # Horizontal X and Y (linear interpolation)
-        p_swing_x = ((1 - bht) * (-swing_foot_target_yaw_adjusted[:, 0]) + bht * swing_foot_target_yaw_adjusted[:, 0]) #Shape: (N,)
-        v_swing_x = ((-dbht) * (-swing_foot_target_yaw_adjusted[:, 0]) + dbht * swing_foot_target_yaw_adjusted[:, 0])  #Shape: (N,)
-        #todo: for now, since not going sideway, just assume swy_0 = swy_T
-        y0 = sign_swy * self.cfg.y_nom #Shape: (N,)
-        p_swing_y = ((1 - bht) * (y0) + bht * swing_foot_target_yaw_adjusted[:, 1]) #Shape: (N,)
-        v_swing_y = ((-dbht) * (swing_foot_target_yaw_adjusted[:, 1]) + dbht * swing_foot_target_yaw_adjusted[:, 1])  #Shape: (N,)
+        #TODO: use stancepos0 or not
+        x_init_target_frame = self.prev_stone_pos[walking_mask, 0] - self.current_stone_pos[walking_mask, 0]
+        p_swing_x = ((1 - bht) * x_init_target_frame + bht * Ux) #Shape: (N_walking,)
+        v_swing_x = ((-dbht) * x_init_target_frame + dbht * Ux)  #Shape: (N_walking,)
 
+        #clamp swing foot y to avoid too large step
+        y0 = self.prev_stone_pos[walking_mask, 1] - self.current_stone_pos[walking_mask, 1] #Shape: (N_walking,)
+        p_swing_y = ((1 - bht) * (y0) + bht * Uy) #Shape: (N_walking,)
+        v_swing_y = ((-dbht) * y0 + dbht * Uy)  #Shape: (N_walking,)
+
+
+        #  check this added swing pitch angle and velocity
+        # swingfoot_eulxyz[:, 1] = (1 - bht) * self.stance_foot_ori_0[:,1] + bht * self.pitchdes
+        # swingfoot_eulxyz_dot[:, 1] = dbht * (self.pitchdes - self.stance_foot_ori_0[:,1])
 
         # swing foot z
-        z_sw_max = torch.full((N,), self.cfg.z_sw_max, device=self.device)
-        z_sw_neg = torch.full((N,), self.cfg.z_sw_min, device=self.device)
-        degree_v = 6
-        zsw0 = 0
-        z_init = torch.full((N,), zsw0, device=self.device)
+        z_sw_max = torch.full((N_walking,), self.cfg.z_sw_max, device=self.device)
+
+        # z_init = self.swing_foot_pos_0[:, 2] - self.stance_foot_pos_0[:, 2]  # Initial swing foot height relative to stance foot
+        z_init = self.prev_stone_pos[walking_mask, 2] - self.current_stone_pos[walking_mask, 2]
+        z_sw_neg = self.hdes[walking_mask] + self.cfg.z_sw_min #adjusted based on stepping stone height
+        z_candidates = torch.stack([
+            self.prev_stone_pos[walking_mask, 2],
+            self.current_stone_pos[walking_mask, 2],
+            self.next_stone_pos[walking_mask, 2]
+        ], dim=1)
+        z_max_stones = z_candidates.max(dim=1).values  # shape (N_walking,)
+        z_sw_max = z_max_stones - self.current_stone_pos[walking_mask, 2] + self.cfg.z_sw_max # shape (N_walking,)
+
         control_v = torch.stack(
         [   z_init,  # Start
             z_init + 0.2 * (z_sw_max - z_init),
@@ -1209,41 +1254,94 @@ class StonesOutputCommandTerm(CommandTerm):
             z_sw_neg + 0.5 * (z_sw_max - z_sw_neg),
             z_sw_neg + 0.05 * (z_sw_max - z_sw_neg),
             z_sw_neg,  # End
-        ], dim=1)  # Shape: (N,7)
+        ], dim=1)  # Shape: (N_walking,7)
+        degree_v = control_v.shape[1] - 1
         if isinstance(self.phase_var.tau, float):
-            phase_tensor = torch.full((N,), self.phase_var.tau, device=self.device)
-            T_tensor = torch.full((N,), self.TSS, device=self.device)
+            phase_tensor = torch.full((N_walking,), self.phase_var.tau, device=self.device)
+            T_tensor = torch.full((N_walking,), self.TSS, device=self.device)
         else:
-            phase_tensor = self.phase_var.tau
-            T_tensor = self.TSS
+            phase_tensor = self.phase_var.tau[walking_mask]
+            T_tensor = self.TSS[walking_mask]
         p_swing_z = bezier_deg(0, phase_tensor, T_tensor, control_v, degree_v)
         v_swing_z = bezier_deg(1, phase_tensor, T_tensor, control_v, degree_v)
 
         # Combine to get full swing foot position and velocity
-        swing_foot_pos = torch.stack([p_swing_x, p_swing_y, p_swing_z], dim=-1)  # Shape: (N,3)
-        swing_foot_vel = torch.stack([v_swing_x, v_swing_y, v_swing_z], dim=-1)  # Shape: (N,3)
+        swing_foot_pos_local = quat_apply(quat_targetyaw_to_stanceyaw, torch.stack([p_swing_x, p_swing_y, p_swing_z], dim=-1))  # Shape: (N_walking,3)
+        swing_foot_vel_local = quat_apply(quat_targetyaw_to_stanceyaw, torch.stack([v_swing_x, v_swing_y, v_swing_z], dim=-1))  # Shape: (N_walking,3)
 
         
+        # com y based on HLIP
+        #TODO: how should I guide comy 
+        #TODO: lower comy tracking weight?
+        com_y_target_frame, com_dy_target_frame = self.hlip.get_desired_com_state_partial(
+            self.stance_idx[walking_mask], self.phase_var.time_in_step[walking_mask], walking_mask
+        )
+        if self.use_momentum: #convert angular momentum to velocity
+            com_dy_target_frame = com_dy_target_frame / self.z0[walking_mask] #vy^d = LxLIP^d / z0, as LxLIP = -Lx
 
-        #todo: for DS, swing foot should remain constant
+        #TODO: did not use z_tilde here
+        # com x based on target orbital energy and comf position at the end of SS
+        v_or_L_target_frame = solve_velocity_or_momentum_positive_from_E_batched(E=self.cfg.E_star, 
+                                                                    p=self.xcomf_des[walking_mask], #target frame
+                                                                    z_tilde=self.z0[walking_mask], #z_tilde=compute_z_tilde_batched(self.z0, self.hdes, self.ldes, self.xcomf_des), 
+                                                                    use_momentum=self.use_momentum)
+        if self.use_momentum:
+            vT = v_or_L_target_frame / self.z0[walking_mask] #Ly/z0
+            v0 = self.com_state2_target_yaw0[walking_mask,1] / self.z0[walking_mask] #Ly/z0
+        else:
+            vT = v_or_L_target_frame[walking_mask]
+            v0 = self.com_state2_target_yaw0[walking_mask,0] #vx
 
+        cubic_comx_coeff = cubic_spline_coeff_batched(y0=self.com_pos_target_yaw0[walking_mask,0],
+                                                dy0=v0,
+                                                y1=self.xcomf_des[walking_mask],
+                                                dy1=vT,
+                                                dtaudt=self.phase_var.dtau[walking_mask]) #Shape: (N,4)
+
+        com_x_target_frame, com_dx_target_frame = cubic_spline_eval(cubic_comx_coeff, self.phase_var.tau[walking_mask], self.phase_var.dtau[walking_mask])
+
+        #com z
+        self.compute_dzcomf_des(walking_mask) #TODO
+        #TODO: MUST check if it is better to use true zcom0
+        cubic_comz_coeff = cubic_spline_coeff_batched(self.zcom0_des[walking_mask] , 
+                                                torch.zeros_like(self.zcom0_des[walking_mask]),
+                                                self.zcomf_des[walking_mask] ,
+                                                self.dzcomf_des[walking_mask],
+                                                self.phase_var.dtau[walking_mask]) #Shape: (N,4)
+
+        com_z_w, com_dz_w = cubic_spline_eval(cubic_comz_coeff, self.phase_var.tau[walking_mask], self.phase_var.dtau[walking_mask])
+        # com_z_w = self.z0
+        # com_dz_w = torch.zeros_like(com_z_w)
+        # Concatenate x y z components
+        com_pos_des = torch.stack(
+            [com_x_target_frame, com_y_target_frame, com_z_w], dim=-1
+        )  # Shape: (N,3)
+        com_vel_des = torch.stack([com_dx_target_frame, com_dy_target_frame, com_dz_w], dim=-1)  # Shape: (N,3)
+
+        com_pos_des_local = quat_apply(quat_targetyaw_to_stanceyaw, com_pos_des)  # [N,3]
+        com_vel_des_local = quat_apply(quat_targetyaw_to_stanceyaw, com_vel_des)  # [N,3]
+
+
+
+        #convert euler rates to omega body
         omega_pelvis_ref = euler_rates_to_omega_b(pelvis_eulxyz, pelvis_eulxyz_dot)
         omega_foot_ref = euler_rates_to_omega_b(swingfoot_eulxyz, swingfoot_eulxyz_dot)  # (N,3)
-
-        self.y_out = torch.cat(
-            [com_pos_des_yaw_adjusted, pelvis_eulxyz, swing_foot_pos, swingfoot_eulxyz, upper_body_joint_pos], dim=-1
+        
+        self.y_out[walking_mask] = torch.cat(
+            [com_pos_des_local, pelvis_eulxyz, swing_foot_pos_local, swingfoot_eulxyz, upper_body_joint_pos], dim=-1
         )
 
-        self.dy_out = torch.cat(
-            [com_vel_des_yaw_adjusted, omega_pelvis_ref, swing_foot_vel, omega_foot_ref, upper_body_joint_vel], dim=-1
+        self.dy_out[walking_mask] = torch.cat(
+            [com_vel_des_local, omega_pelvis_ref, swing_foot_vel_local, omega_foot_ref, upper_body_joint_vel], dim=-1
         )
         
         if self.debug_vis:
-            self.foottarget_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
-            self.quat_target_frame = quat_from_euler_xyz(torch.zeros_like(self.target_yaw), torch.zeros_like(self.target_yaw), self.target_yaw) #Shape: (N,4)
-            self.foottarget_vis_pos = self.stance_foot_pos_0 + quat_apply(self.quat_target_frame, foot_target) #Shape: (N,3)
-            self.swingfoot_vis_pos = swing_foot_pos + self.stance_foot_pos_0
-            self.swingfoot_vis_quat = quat_from_euler_xyz(swingfoot_eulxyz[:, 0], swingfoot_eulxyz[:, 1], swingfoot_eulxyz[:, 2]) #Shape: (N,4)
+            self.foottarget_vis_quat[walking_mask] = quat_target_frame #Shape: (N_walking,4)
+            self.foottarget_vis_pos[walking_mask] = footplacement_target_frame + self.stance_foot_pos_0[walking_mask]  #Shape: (N_walking,3)
+            self.swingfoot_vis_quat[walking_mask] = quat_target_frame #Shape: (N_walking,4)
+            self.swingfoot_vis_pos[walking_mask] = quat_apply(self.stance_foot_ori_quat_0_zerorollpitch[walking_mask, :], swing_foot_pos_local) + self.stance_foot_pos_0[walking_mask]
+            self.com_frame_vis_quat[walking_mask] = quat_target_frame
+            self.com_frame_vis_pos[walking_mask] = com_pos_des + self.stance_foot_pos_0[walking_mask]  # Shape: (N,3)
         return
 
     def compute_desired_standing(self, standing_mask):
@@ -1295,6 +1393,14 @@ class StonesOutputCommandTerm(CommandTerm):
         self.dy_out[standing_mask] = torch.cat(
             [com_vel_des_local, omega_pelvis_ref, swing_foot_vel_local, omega_foot_ref, upper_body_joint_vel], dim=-1
         )
+        if self.debug_vis:
+            quat_target_frame = quat_from_euler_xyz(zeros_N, zeros_N, self.target_yaw[standing_mask])  # Shape: (N,4)
+            self.foottarget_vis_quat[standing_mask] = quat_target_frame #Shape: (N,4)
+            self.foottarget_vis_pos[standing_mask] = self.swing_foot_pos_0[standing_mask]  #Shape: (N,3)
+            self.swingfoot_vis_quat[standing_mask] = quat_target_frame #Shape: (N,4)
+            self.swingfoot_vis_pos[standing_mask] =  self.swing_foot_pos_0[standing_mask]
+            self.com_frame_vis_quat[standing_mask] = quat_target_frame
+            self.com_frame_vis_pos[standing_mask] = com_pos_des + self.stance_foot_pos_0[standing_mask]  # Shape: (N,3)
         
         return  
         

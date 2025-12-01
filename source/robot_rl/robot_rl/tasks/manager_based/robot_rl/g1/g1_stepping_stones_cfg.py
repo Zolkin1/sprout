@@ -113,7 +113,7 @@ class G1RoughMlipRewards(HumanoidRewardCfg):
 
     clf_reward = RewTerm(
         func=mdp.clf_reward,
-        weight=10.0,
+        weight=10.0, #from 10 to 15,13,11.5 all failed; 9 seems to be better
         params={
             "command_name": "hlip_ref",
             "max_eta_err": 0.3,
@@ -130,6 +130,15 @@ class G1RoughMlipRewards(HumanoidRewardCfg):
             "eta_dot_max": 0.3,
         },
     )
+    
+    # swing_foot_position_error_at_contact = RewTerm(
+    #     func=mdp.swing_foot_position_error_at_contact_reward,
+    #     weight=1.0,
+    #     params={
+    #         "command_name": "hlip_ref",
+    #         "kd": 0.1,
+    #     },
+    # )
 
 
 class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):

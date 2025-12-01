@@ -184,6 +184,8 @@ class HLIP_P2:
         self.grav = grav
         
         self.update_hlip(z0, TSS, TDS)
+        self.update_desired_walking(torch.zeros_like(z0), 0.25)
+
     def update_hlip(self, z0:torch.Tensor, TSS:torch.Tensor, TDS:torch.Tensor):
         self.z0 = z0.clone()
         self.TSS = TSS.clone()
@@ -201,6 +203,33 @@ class HLIP_P2:
             self.Q = torch.eye(2,2,device=self.device)
             self.R = torch.eye(1,1,device=self.device) * 100
             self.K = -solve_dlqr_gain_batched(self.A_S2S, self.B_S2S, self.Q, self.R)
+    
+    def update_hlip_partial_noDS(self, TSS:torch.Tensor, mask: torch.Tensor):
+        """
+        Update HLIP parameters when only TSS changes (z0 and TDS remain constant).
+
+        Args:
+            TSS: New TSS values for masked environments (shape: (N_masked,))
+            mask: Boolean mask indicating which environments to update (shape: (N,))
+        """
+        if not mask.any():
+            return
+        self.TSS[mask] = TSS
+        self.T[mask] = TSS + self.TDS[mask]
+        # Update A_S2S: exp(TSS * ASS) @ exp(TDS * ADS)
+        # ASS and ADS don't change since z0 is constant
+        exp_TSS_ASS = torch.matrix_exp(TSS.view(-1, 1, 1) * self.ASS[mask])
+        exp_TDS_ADS = torch.matrix_exp(self.TDS[mask].view(-1, 1, 1) * self.ADS[mask])
+        self.A_S2S[mask] = exp_TSS_ASS @ exp_TDS_ADS
+
+        # Update B_S2S: exp(TSS * ASS) @ Busw
+        N_masked = TSS.shape[0]
+        Busw = torch.tensor([[-1.0], [0.0]], device=TSS.device).expand(N_masked, 2, 1)
+        self.B_S2S[mask] = exp_TSS_ASS @ Busw
+        if self.use_feedback:
+            #error now, not supported
+            print("Feedback control not tested for now")
+        return
 
     def A2_ss(self, z0, grav, use_momentum):
         # z0: [N]
@@ -254,7 +283,43 @@ class HLIP_P2:
         # Solve lhs * X = rhs
         self.xdes_p2_left = torch.linalg.solve(lhs, rhs_left)   # [N,2,1]
         self.xdes_p2_right = torch.linalg.solve(lhs, rhs_right) # [N,2,1]
-         
+    def update_desired_walking_partial(self, vely: torch.Tensor, stepwidth: Union[float, torch.Tensor], mask: torch.Tensor):
+        """
+        Update desired walking parameters for a subset of environments.
+
+        Args:
+            vely: Tensor of shape [N_masked] with velocities [vel_y] for masked environments
+            stepwidth: Tensor of shape [N_masked] with step widths or float
+            mask: Boolean mask of shape [N] indicating which environments to update
+        """
+        N_masked = vely.shape[0]
+
+        if isinstance(stepwidth, float):
+            stepwidth = torch.full_like(vely, stepwidth)
+
+        # Compute for masked environments only
+        udes_p2_left = -stepwidth + vely * self.T[mask]  # [N_masked]
+        udes_p2_right = stepwidth + vely * self.T[mask]  # [N_masked]
+
+        # Update stored values
+        self.udes_p2_left[mask] = udes_p2_left
+        self.udes_p2_right[mask] = udes_p2_right
+
+        eye2 = torch.eye(2, device=self.device).expand(N_masked, 2, 2)  # [N_masked, 2, 2]
+        A_S2S_masked = self.A_S2S[mask]  # [N_masked, 2, 2]
+        B_S2S_masked = self.B_S2S[mask]  # [N_masked, 2, 1]
+
+        lhs = eye2 - A_S2S_masked @ A_S2S_masked  # [N_masked, 2, 2]
+        udes_left = udes_p2_left.view(-1, 1, 1)
+        udes_right = udes_p2_right.view(-1, 1, 1)
+        rhs_left = A_S2S_masked @ B_S2S_masked * udes_left + B_S2S_masked * udes_right  # [N_masked, 2, 1]
+        rhs_right = A_S2S_masked @ B_S2S_masked * udes_right + B_S2S_masked * udes_left  # [N_masked, 2, 1]
+
+        # Solve and update
+        self.xdes_p2_left[mask] = torch.linalg.solve(lhs, rhs_left)   # [N_masked, 2, 1]
+        self.xdes_p2_right[mask] = torch.linalg.solve(lhs, rhs_right) # [N_masked, 2, 1]
+
+     
     def get_desired_com_state(self, stance_idx: torch.Tensor, time_in_step: torch.Tensor):
         """
         Get desired com state at given time_in_step and stance_idx.
@@ -284,7 +349,47 @@ class HLIP_P2:
         y_com_state[mask_ss] = torch.matrix_exp((time_in_step[mask_ss]- self.TSS[mask_ss]).view(-1,1,1) * self.ASS[mask_ss]) @ x_ss_minus[mask_ss]
 
         return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
-
+    def get_desired_com_state_partial(self, stance_idx: torch.Tensor, time_in_step: torch.Tensor, mask: torch.Tensor):
+        """
+        Get desired com state for a subset of environments.
+    
+        Args:
+            stance_idx: Tensor of shape [N_masked] with stance leg index (0=left, 1=right) for masked environments
+            time_in_step: Tensor of shape [N_masked] with time in current step [0,TSS+TDS] for masked environments
+            mask: Boolean mask of shape [N] indicating which environments to compute for
+        Returns:
+            com_y: Tensor of shape [N_masked] with desired com y position
+            com_dy: Tensor of shape [N_masked] with desired com y velocity
+        """
+        N_masked = stance_idx.shape[0]
+        
+        mask_left = (stance_idx == 0)
+        mask_right = (stance_idx == 1)
+        
+        TSS_masked = self.TSS[mask]
+        mask_ss = (time_in_step <= TSS_masked)
+        mask_ds = (time_in_step > TSS_masked)
+        
+        y_com_state = torch.zeros((N_masked, 2, 1), device=self.device)
+    
+        # if DS, integrate forward from beginning of DS
+        x_ds_plus = torch.zeros((N_masked, 2, 1), device=self.device)
+        x_ds_plus[mask_left] = self.xdes_p2_left[mask][mask_left]
+        x_ds_plus[mask_right] = self.xdes_p2_right[mask][mask_right]
+        
+        if mask_ds.any():
+            y_com_state[mask_ds] = torch.matrix_exp(
+                (time_in_step[mask_ds] - TSS_masked[mask_ds]).view(-1, 1, 1) * self.ADS[mask][mask_ds]
+            ) @ x_ds_plus[mask_ds]
+        
+        # if SS, integrate backward from end of SS
+        x_ss_minus = x_ds_plus  # happens to be the same at the beginning of DS, safe since read-only 
+        if mask_ss.any():
+            y_com_state[mask_ss] = torch.matrix_exp(
+                (time_in_step[mask_ss] - TSS_masked[mask_ss]).view(-1, 1, 1) * self.ASS[mask][mask_ss]
+            ) @ x_ss_minus[mask_ss]
+    
+        return y_com_state.squeeze(-1)[:, 0], y_com_state.squeeze(-1)[:, 1]
     def get_com_state_from_x0_sagittal(self, x0: torch.Tensor, T: torch.Tensor):
         """
         Get desired com state from initial position x0 for sagittal plane.
