@@ -38,7 +38,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import (
     TiltedStonesTerrainCfg,
     FlatGroundTestingCfg
 )
-from robot_rl.tasks.manager_based.robot_rl.constants import STONES, TEST_FLAT
+from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 from isaaclab.sensors import RayCasterCfg, patterns        
         
 from isaaclab.managers import ObservationGroupCfg as ObsGroup

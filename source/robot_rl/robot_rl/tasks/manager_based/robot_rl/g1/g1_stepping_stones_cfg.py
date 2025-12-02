@@ -37,7 +37,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.stepping_stones_cfg import (
     TiltedStonesTerrainCfg,
     FlatGroundTestingCfg
 )
-from robot_rl.tasks.manager_based.robot_rl.constants import STONES, TEST_FLAT
+from robot_rl.tasks.manager_based.robot_rl.constants import STONES
 from isaaclab.sensors import RayCasterCfg, patterns        
         
         
@@ -75,19 +75,15 @@ class G1RoughMlipCommandsCfg:
 @configclass
 class CurriculumMlipCfg:
     """Curriculum terms for the MDP."""
-
-
-    # todo: stones curriculum
-    if TEST_FLAT==False:
-        stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_termination, 
-                                     params={
-                                            "success_term_name": "finished_long_stones",
-                                             },)
-        modify_reference_cfg = CurrTerm(func=mdp.modify_reference_cfg, 
-                                        params={
-                                                "term_name": "hlip_ref",
-                                                "steps": 1000 * 24
-                                               },  )
+    stones_curriculum = CurrTerm(func=mdp.stones_sagittal_terrain_levels_termination, 
+                                 params={
+                                        "success_term_name": "finished_long_stones",
+                                         },)
+    modify_reference_cfg = CurrTerm(func=mdp.modify_reference_cfg, 
+                                    params={
+                                            "term_name": "hlip_ref",
+                                            "steps": 1000 * 24
+                                           },  )
 
 
 
@@ -143,37 +139,36 @@ class G1RoughMlipRewards(HumanoidRewardCfg):
 
 class G1SteppingStonesTerminationsCfg(HumanoidTerminationsCfg):
     """Termination terms for the G1 Stepping Stones environment."""
-    if TEST_FLAT==False:
-        finished_long_stones = DoneTerm(
-            func=mdp.finished_long_stones,
-            params={
-                "output_command_name": "hlip_ref",
-            },
-            time_out=True)
-        long_stones_deviation = DoneTerm(
-            func=mdp.long_stones_deviation,
-            params={
-                "output_command_name": "hlip_ref",
-            },
-            time_out=False)
-        z_com_too_low = DoneTerm(
-            func=mdp.com_z_too_low,
-            params={
-                "output_command_name": "hlip_ref",
-            },
-            time_out=False)
-        stationary_x_with_nonzero_vel_command = DoneTerm(
-            func=mdp.stationary_x_with_nonzero_vel_command,
-            params={
-                "velocity_threshold": 0.1,
-                "duration_threshold": 4.0,
-            },
-            time_out=False)
+    finished_long_stones = DoneTerm(
+        func=mdp.finished_long_stones,
+        params={
+            "output_command_name": "hlip_ref",
+        },
+        time_out=True)
+    long_stones_deviation = DoneTerm(
+        func=mdp.long_stones_deviation,
+        params={
+            "output_command_name": "hlip_ref",
+        },
+        time_out=False)
+    z_com_too_low = DoneTerm(
+        func=mdp.com_z_too_low,
+        params={
+            "output_command_name": "hlip_ref",
+        },
+        time_out=False)
+    stationary_x_with_nonzero_vel_command = DoneTerm(
+        func=mdp.stationary_x_with_nonzero_vel_command,
+        params={
+            "velocity_threshold": 0.1,
+            "duration_threshold": 4.0,
+        },
+        time_out=False)
 
 
 @configclass
 class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
-    """Configuration for the G1 Flat environment."""
+    """Configuration for the G1 stones environment."""
 
     rewards: G1RoughMlipRewards = G1RoughMlipRewards()
 
@@ -192,52 +187,50 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        if TEST_FLAT==False:
-            STONES_CFG = TerrainGeneratorCfg(
-                class_type=StonesTerrainGenerator,
-                size=(STONES.terrain_size_x, STONES.terrain_size_y),
-                curriculum=True,
-                border_width=1.0,
-                border_height=0.0,
-                num_rows=10,  # difficulty levels
-                num_cols=100,  # corresponds to terrain types, num of sub terrain envs = proportion * num_cols
-                horizontal_scale=0.1,
-                vertical_scale=0.0005,
-                slope_threshold=0.75,
-                use_cache=False,
-                difficulty_range=(0.0, 1.0),
-                sub_terrains={
-                    "upstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=True),
-                    "downstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=False),
-                    "flat_stones": LongStonesFlatTerrainCfg(proportion=0.4),
-                    "stones": LongStonesTerrainCfg(proportion=0.4),
-                    # "flat_ground": FlatGroundTestingCfg(proportion=1.0)
-                    # "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
-                },
-            )
-            self.scene.terrain = TerrainImporterCfg(
-                class_type=StonesTerrainImporter,
-                prim_path="/World/ground",
-                terrain_type="generator",
-                terrain_generator=STONES_CFG,
-                max_init_terrain_level=0,
-                collision_group=-1,
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
-                    static_friction=1.0,
-                    dynamic_friction=1.0,
-                ),
-                visual_material=sim_utils.MdlFileCfg(
-                    mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
-                    project_uvw=True,
-                    texture_scale=(0.25, 0.25),
-                ),
-                debug_vis=False,
-            )
-            self.terminations.time_out = None
-        else:
-            self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+        
+        STONES_CFG = TerrainGeneratorCfg(
+            class_type=StonesTerrainGenerator,
+            size=(STONES.terrain_size_x, STONES.terrain_size_y),
+            curriculum=True,
+            border_width=1.0,
+            border_height=0.0,
+            num_rows=10,  # difficulty levels
+            num_cols=100,  # corresponds to terrain types, num of sub terrain envs = proportion * num_cols
+            horizontal_scale=0.1,
+            vertical_scale=0.0005,
+            slope_threshold=0.75,
+            use_cache=False,
+            difficulty_range=(0.0, 1.0),
+            sub_terrains={
+                "upstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=True),
+                "downstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=False),
+                "flat_stones": LongStonesFlatTerrainCfg(proportion=0.4),
+                "stones": LongStonesTerrainCfg(proportion=0.4),
+                # "flat_ground": FlatGroundTestingCfg(proportion=1.0)
+                # "tilted_stones": TiltedStonesTerrainCfg(proportion=0.15),
+            },
+        )
+        self.scene.terrain = TerrainImporterCfg(
+            class_type=StonesTerrainImporter,
+            prim_path="/World/ground",
+            terrain_type="generator",
+            terrain_generator=STONES_CFG,
+            max_init_terrain_level=0,
+            collision_group=-1,
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="multiply",
+                restitution_combine_mode="multiply",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+            ),
+            visual_material=sim_utils.MdlFileCfg(
+                mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+                project_uvw=True,
+                texture_scale=(0.25, 0.25),
+            ),
+            debug_vis=False,
+        )
+        self.terminations.time_out = None
 
         
         self.scene.height_scanner = RayCasterCfg(
