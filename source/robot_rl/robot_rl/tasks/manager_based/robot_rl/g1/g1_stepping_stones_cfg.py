@@ -252,6 +252,13 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
         }
+        # self.events.push_robot.params["velocity_range"] = {
+        #     "x": (-0.05, 0.05), 
+        #     "y": (-0.05, 0.05), 
+        #     "roll": (-0.05, 0.05),
+        #     "pitch": (-0.05, 0.05),
+        #     "yaw": (-0.05, 0.05),
+        # }
         self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
@@ -407,7 +414,7 @@ class G1_custom_stepping_stones_finetune(G1SteppingStonesEnvCfg):
         super().__post_init__()
         self.observations = G1SteppingStonesObservationsFinetuneCfg()
         # self.observations = G1SteppingStonesObservationsFinetuneNewCfg()
-        self.scene.terrain.max_init_terrain_level = 3
+        self.scene.terrain.max_init_terrain_level = 0
         self.events.add_plate_mass = EventTerm(
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
