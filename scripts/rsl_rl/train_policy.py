@@ -22,6 +22,7 @@ ENVIRONMENTS = {
     "stepping_stone_noheightmap": "G1-steppingstone-testing-no-heightmap",
     "stepping_stone_noheightmapdistill": "G1-steppingstone-testing-no-heightmapdistill",
     "stepping_stone_noheightmapfinetune": "G1-steppingstone-testing-no-heightmapfinetune",
+    "stepping_stone_baseline": "G1-steppingstone-baseline",
 }
 
 EXPERIMENT_NAMES = {
@@ -42,6 +43,7 @@ EXPERIMENT_NAMES = {
     "stepping_stone_noheightmap": "stepping_stone",
     "stepping_stone_noheightmapdistill": "stepping_stone",
     "stepping_stone_noheightmapfinetune": "stepping_stone",
+    "stepping_stone_baseline": "stepping_stone_baseline",
 }
 
 

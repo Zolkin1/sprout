@@ -151,7 +151,24 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
-    
+    gym.register(
+        id="G1-steppingstone-baseline",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_baseline_cfg:G1SteppingStonesBaselineEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-steppingstone-baseline-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stepping_stones_baseline_cfg:G1SteppingStonesBaselinePlayCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     gym.register(
         id="G1-steppingstone-testing-no-heightmap",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",

@@ -26,6 +26,7 @@ SIM_ENVIRONMENTS = {
     "stepping_stone_noheightmap": "G1-steppingstone-testing-no-heightmap",
     "stepping_stone_noheightmapdistill": "G1-steppingstone-testing-no-heightmapdistill",
     "stepping_stone_noheightmapfinetune": "G1-steppingstone-testing-no-heightmapfinetune",
+    "stepping_stone_baseline": "G1-steppingstone-baseline-play",
 }
 
 
