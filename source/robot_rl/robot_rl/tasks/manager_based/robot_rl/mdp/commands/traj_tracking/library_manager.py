@@ -134,6 +134,46 @@ class LibraryManager:
 
         return outputs
 
+    def get_ref_frames_in_use(self, conditioner: torch.Tensor,
+                              t: torch.Tensor,
+                              ref_frames: list[str]) -> torch.Tensor:
+        """
+        Determine the reference frame in use for each environment.
+
+        Args:
+            conditioner (torch.Tensor): conditioning variable for each env. shape [N]
+            t (torch.Tensor): time in each env. shape [N]
+            ref_frames (list[str]): list of reference frame names
+
+        Returns:
+            frame_indices (torch.Tensor): indices into ref_frames for the active frame in each env. shape [N]
+        """
+        indices = self.get_traj_indices(conditioner)
+
+        # Initialize output tensor
+        N = t.shape[0]
+        frame_indices = torch.zeros(N, device=self.device)
+
+        # Get the unique managers (avoid repeats)
+        unique_indicies = torch.unique(indices)
+
+        # Bin each conditioner by manager
+        for idx in unique_indicies:
+            # Find which environments use this trajectory
+            mask = indices == idx
+            env_indices = torch.where(mask)[0]
+
+            # Get times for these environments
+            t_for_manager = t[env_indices]
+
+            # Call get_ref_frames_in_use for this manager
+            manager_frame_indices = self.trajectory_managers[idx.item()].get_ref_frames_in_use(t_for_manager, ref_frames)
+
+            # Place outputs in the correct positions
+            frame_indices[env_indices] = manager_frame_indices
+
+        return frame_indices
+
     def get_contact_state(self, conditioner: torch.Tensor,     # shape: [N]
                            t: torch.Tensor,                     # shape: [N]
                            contact_frames: list[str]            # shape: [num_contacts]

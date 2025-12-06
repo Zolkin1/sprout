@@ -167,14 +167,16 @@ class TrajectoryManager:
         )
 
     def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute the phasing variable which is a number in [0,1] that tells how far through the trajectory we are."""
+        """
+        Compute the phasing variable which is a number in [0,1] that tells how far through the trajectory we are.
+
+        For half periodic trajectories the [0, 1] is scaled to the full period. So 0.5 is the end of the provided trajectory.
+        """
         # Map time based on trajectory time
         if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
             # Determine which half of the period the time is in
             full_period_time = self.traj_data.total_time * 2
             t_into_traj = t % full_period_time
-            # In the second half
-            t_into_traj = t_into_traj - self.traj_data.total_time
 
             return t_into_traj / self.traj_data.total_time
         elif self.traj_data.trajectory_type == TrajectoryType.FULL_PERIODIC:
@@ -261,7 +263,7 @@ class TrajectoryManager:
 
         Returns:
             contact_states: shape [N, num_contacts] where num_contacts is the number
-             of contact points of interest defined by the trajectory. A 1 indicates in contact, 0 otherwise.
+             of contact points. A 1 indicates in contact, 0 otherwise.
         """
         # Determine the domain for each time
         domain_indicies = self.get_current_domains(t)
@@ -294,6 +296,35 @@ class TrajectoryManager:
 
         return torch.searchsorted(domain_boundaries, t, right=False) - 1
 
+
+    def get_ref_frames_in_use(self, t: torch.Tensor, ref_frames: list[str]) -> torch.Tensor:
+        """
+        Determine the reference frame in use.
+
+        Args:
+            t: shape [N] where N is the number envs.
+            ref_frames: a list of reference frames.
+
+        Returns:
+            frame_tensor: a torch tensor of shape [N] where each scalar is the index into ref_frames for the active frame.
+        """
+        domain_indices = self.get_current_domains(t)
+
+        # Create a mapping tensor: domain_idx -> ref_frame_idx
+        # This is done once per call, but it's O(num_domains) not O(num_envs)
+        domain_to_ref_frame_idx = torch.zeros(self.num_domains, dtype=torch.long, device=self.device)
+
+        for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+            bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+            if bezier_frame in ref_frames:
+                domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
+            else:
+                raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
+        # Use advanced indexing to get frame indices for all envs at once
+        frame_indices = domain_to_ref_frame_idx[domain_indices]
+
+        return frame_indices
 
 
     def remap_trajectory(self) -> torch.Tensor:
