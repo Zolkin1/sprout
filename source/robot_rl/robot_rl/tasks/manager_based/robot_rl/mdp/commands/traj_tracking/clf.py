@@ -148,7 +148,7 @@ class CLF:
         """
         Compute V_dot = (V_curr - V_prev) / sim_dt, returns (vdot, V_curr).
         """
-        v_curr = self.compute_v(y_act, y_nom,dy_act,dy_nom, yaw_idx)
+        v_curr = self.compute_v(y_act, y_nom, dy_act, dy_nom, yaw_idx)
        
         dt = self.sim_dt
         B = v_curr.shape[0]

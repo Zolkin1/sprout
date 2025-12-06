@@ -179,7 +179,7 @@ class G1WalkingCLFRewards(HumanoidRewardCfg):
         func=mdp.holonomic_constraint,
         weight=4.0,
         params={
-            "command_name": "hlip_ref",
+            "command_name": "traj_ref",
             "z_offset": 0.036,
         }
     )
@@ -188,7 +188,7 @@ class G1WalkingCLFRewards(HumanoidRewardCfg):
         func=mdp.holonomic_constraint_vel,
         weight=2.0,
         params={
-            "command_name": "hlip_ref",
+            "command_name": "traj_ref",
         }
     )
 
@@ -197,7 +197,7 @@ class G1WalkingCLFRewards(HumanoidRewardCfg):
         func=mdp.clf_reward,
         weight=10.0,
         params={
-            "command_name": "hlip_ref",
+            "command_name": "traj_ref",
             "max_eta_err": 0.25,
         }
     )
@@ -206,7 +206,7 @@ class G1WalkingCLFRewards(HumanoidRewardCfg):
         func=mdp.clf_decreasing_condition,
         weight=-2.0,
         params={
-            "command_name": "hlip_ref",
+            "command_name": "traj_ref",
             "alpha": 0.5,
             "eta_max": 0.2,
             "eta_dot_max":0.3,
@@ -272,15 +272,15 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Rewards
         ##
-        self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
-        self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
+        self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
+        self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
 
         self.rewards.clf_reward.params = {
-            "command_name": "hzd_ref",
+            "command_name": "traj_ref",
             "max_eta_err": 0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
-            "command_name": "hzd_ref",
+            "command_name": "traj_ref",
             "alpha": 0.5,
             "eta_max": 0.25,
             "eta_dot_max": 0.3,

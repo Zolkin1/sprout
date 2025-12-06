@@ -5,6 +5,7 @@ import torch
 import yaml
 from dataclasses import dataclass
 import math
+import numpy as np
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
@@ -56,6 +57,10 @@ class TrajectoryManager:
         for i, domain in enumerate(self.traj_data.domain_order):
             self.T[i] = self.traj_data.domain_data[domain].time
             self.bezier_coeffs[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+
+        # Pre-compute relabeling matrix as a tensor
+        R_numpy = self.relable_ee_stance_coeffs()
+        self.R_relabel = torch.from_numpy(R_numpy).to(device=self.device, dtype=self.bezier_coeffs.dtype)
 
 
     def _resolve_trajectory_path(self, traj_path: str) -> str:
@@ -215,14 +220,14 @@ class TrajectoryManager:
             # Determine which half of the period the time is in
             full_period_time = self.traj_data.total_time * 2
             t_into_traj = t % full_period_time
-            if t_into_traj/full_period_time > 0.5:
-                # In the second half
-                t_into_traj = t_into_traj - self.traj_data.total_time
-                # Need to remap the trajectory
-                bezier_coeffs = self.remap_trajectory()
-            else:
-                # In the first half
-                bezier_coeffs = self.bezier_coeffs
+
+            second_half = t_into_traj/full_period_time > 0.5
+
+            # In the second half
+            t_into_traj[second_half] = t_into_traj[second_half] - self.traj_data.total_time
+
+            # Need to remap the trajectory
+            bezier_coeffs = self.remap_trajectory()
         elif self.traj_data.trajectory_type == TrajectoryType.FULL_PERIODIC:
             # Map into the period time
             t_into_traj = t % self.traj_data.total_time
@@ -236,7 +241,7 @@ class TrajectoryManager:
             raise NotImplementedError(f"Trajectory type {self.traj_data.trajectory_type} is not implemented.")
 
         # Determine the domain for each time
-        domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0]), self.T]), dim=0)
+        domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
 
         domain_indicies = self.get_current_domains(t)
 
@@ -245,9 +250,10 @@ class TrajectoryManager:
         tau = (t_into_traj - domain_start_times)/self.T[domain_indicies]
 
         # Compute outputs
-        outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs)
-        outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs, self.T[domain_indicies])
-        outputs[:, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs, self.T[domain_indicies])
+        outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs, device=self.device)
+        for dom in domain_indicies:
+            outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
+            outputs[:, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
 
         return outputs
 
@@ -331,7 +337,12 @@ class TrajectoryManager:
         """
         Remap the trajectory
         """
-        # TODO: Implement
+        # Apply relabeling: left_coeffs = R @ right_coeffs
+        remap_coeffs = self.R_relabel @ self.bezier_coeffs
+
+        # self.generate_axis_names()
+
+        return remap_coeffs
 
     @staticmethod
     def _compute_bezier_interp(derivative: int,         # 0 -> position, 1 -> velocity
@@ -345,7 +356,7 @@ class TrajectoryManager:
         # Clamp tau into [0,1]
         tau = torch.clamp(tau, 0.0, 1.0)  # [batch]
 
-        degree = ctrl_pts.shape[1]
+        degree = ctrl_pts.shape[1] - 1
 
         if derivative == 1:
             # ─── DERIVATIVE CASE ────────────────────────────────────────────────────
@@ -564,6 +575,122 @@ class TrajectoryManager:
         num_outputs = len(output_names)
 
         return num_outputs, output_names, ref_spline_order
+
+    # TODO: Clean
+    def relable_ee_stance_coeffs(self):
+        """Build a relabelling matrix for end effector coefficients including the stance foot."""
+        R = np.eye(27)
+
+        ##
+        # COM
+        ##
+        # com pos: [1,-1,1]
+        R[1, 1] = -1
+
+        ##
+        # Pelvis
+        ##
+        # pelvis: [-1,1,-1]
+        R[3, 3] = -1
+        R[5, 5] = -1
+
+        ##
+        # Swing foot
+        ##
+        # swing_foot_pos:[1,-1,1]
+        R[7, 7] = -1
+        # swing_foot_or: [-1,1,-1]
+        R[9, 9] = -1
+        R[11, 11] = -1
+
+        ##
+        # Stance Foot
+        ##
+        # stance_foot_pos: [1, -1, 1]
+        R[13, 13] = -1
+        # stance_foot_ori: [-1, 1, -1]
+        R[15, 15] = -1
+        R[17, 17] = -1
+
+        ##
+        # Joints
+        ##
+        # waist yaw
+        R[18, 18] = -1
+
+        #swap arm coeffs
+        arm_offset = 18 + 1
+        left_arm = arm_offset + np.array([0, 1, 2, 3])
+        right_arm = arm_offset + np.array([4, 5, 6, 7])
+
+        tmp = R[left_arm, :].copy()
+        R[left_arm, :] = R[right_arm, :]
+        R[right_arm, :] = tmp
+
+        # Sign flips: shoulder_roll, shoulder_yaw
+        flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
+        R[flip_arm, :] *= -1
+
+        return R
+
+    # TODO: Clean
+    def generate_axis_names(self, domain_name):
+        """Generate axis names for each constraint specification."""
+        self.axis_names = []
+        current_idx = 0
+
+        for spec in self.constraint_specs:
+            constraint_type = spec["type"]
+
+            if constraint_type == "com_pos":
+                axes = spec.get("axes", [0, 1, 2])
+                axis_names = ["x", "y", "z"]
+                # Generate metric names for COM position (only specified axes)
+                for i, axis_idx in enumerate(axes):
+                    metric_name = f"com_pos_{axis_names[axis_idx]}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx + i,
+                        'domain': domain_name,
+                    })
+                current_idx += len(axes)
+
+            elif constraint_type == "joint":
+                output_dim = 1
+                joint_names = spec["joint_names"]
+
+                for joint_name in joint_names:
+                    # Generate metric name for joint
+                    metric_name = f"joint_{joint_name}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx,
+                        'domain': domain_name,
+                    })
+                    current_idx += output_dim
+
+            elif "frame" in spec:
+                frame_name = spec["frame"]
+
+                # Determine output dimension and axis names
+                axes = spec.get("axes", [0, 1, 2])
+                if constraint_type in ["ee_pos"]:
+                    axis_names = ["x", "y", "z"]
+                elif constraint_type in ["ee_ori"]:
+                    axis_names = ["roll", "pitch", "yaw"]
+                else:
+                    axis_names = ["x", "y", "z"]
+
+                # Generate metric names for each axis (only specified axes)
+                for i, axis_idx in enumerate(axes):
+                    metric_name = f"{frame_name}_{constraint_type}_{axis_names[axis_idx]}"
+                    self.axis_names.append({
+                        'name': metric_name,
+                        'index': current_idx + i,
+                        'domain': domain_name,
+                    })
+
+                current_idx += len(axes)
 
 def _ncr(n, r):
     return math.comb(n, r)

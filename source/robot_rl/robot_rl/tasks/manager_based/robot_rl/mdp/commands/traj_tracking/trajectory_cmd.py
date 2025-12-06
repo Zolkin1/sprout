@@ -22,6 +22,17 @@ class TrajectoryCommand(CommandTerm):
         # Expand wildcards in contact frames
         self.contact_frames = self._expand_wildcard_frames(cfg.contact_frames)
 
+        # Extract the index into the robot data bodies for the contact frames
+        self.contact_frame_indices = torch.zeros(len(self.contact_frames), dtype=torch.long, device=self.device)
+        for i, frame_name in enumerate(self.contact_frames):
+            if frame_name in self.robot.body_names:
+                self.contact_frame_indices[i] = self.robot.body_names.index(frame_name)
+            else:
+                raise ValueError(f"Contact frame '{frame_name}' not found in robot body names.")
+
+        self.current_contact_poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, dtype=torch.float, device=self.device)
+        self.desired_contact_poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, dtype=torch.float, device=self.device)
+
         self.manager_type = cfg.manager_type
         self.conditioner_generator = cfg.conditioner_generator_name
 
@@ -48,6 +59,14 @@ class TrajectoryCommand(CommandTerm):
 
         # Create a list of indices to be used
         self.joint_idx, self.body_idx, self.use_com = self._parse_outputs(self.manager.get_output_names)
+
+        # For now assuming that all bodies have a yaw tracking
+        self.yaw_output_idxs = []
+        for body in range(len(self.body_idx)):
+            start = 0
+            if self.use_com:
+                start += 2
+            self.yaw_output_idxs = start + 5*body
 
         # Create a list of indices for the reference frames
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(self.manager.traj_data.reference_frames)
@@ -185,6 +204,49 @@ class TrajectoryCommand(CommandTerm):
 
         return poses
 
+    def get_contact_poses(self, contact_state: torch.Tensor) -> torch.Tensor:
+        """
+        Determine the pose of each frame that is in contact.
+
+        The idea here will be to always grab the pose of all the frames but then mask it with 0's when out of contact
+
+        Args:
+            contact_state: shape [N, num_contacts]
+
+        Returns:
+            poses is shape [N, num_ref_frames, 6]
+        """
+
+        poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, device=self.device)
+
+        not_in_contact = contact_state == 0
+
+        # Get the poses of all the possible contact bodies
+        poses[:, :, :3] = self.robot.data.body_pos_w[:, self.contact_frame_indices, :]
+        for i in range(len(self.contact_frames)):
+            poses[:, i, 3:] = get_euler_from_quat(self.robot.data.body_quat_w[:, self.contact_frame_indices[i], :])
+
+        # Now mask
+        poses[not_in_contact, :] *= 0
+
+
+        return poses
+
+    def get_desired_contact_poses(self, changed: torch.Tensor, current_poses: torch.Tensor) -> torch.Tensor:
+        """
+        Get the desired contact poses. This is always the pose of the frame when it first makes contact.
+
+        Mask all the current poses by if they are in contact and if the domain just changed (because we want where we just made contact)
+
+        TODO: Need to consider what if we want to rotate but not translate?
+        """
+
+        # Check to make sure that there is at least one True in changed
+        if torch.any(changed):
+            self.desired_contact_poses[changed] = current_poses[changed]
+
+        return self.desired_contact_poses
+
 
     def get_measured_outputs(self, t: torch.Tensor):
         """
@@ -209,6 +271,9 @@ class TrajectoryCommand(CommandTerm):
 
         # Determine which reference frames/bodies are in contact
         contact_state = self.get_contact_state(t)  # Shape: [N, num_contact_frames]
+
+        self.current_contact_poses = self.get_contact_poses(contact_state)
+        self.desired_contact_poses = self.get_desired_contact_poses(changed, self.current_contact_poses)
 
         # Get the indices into self.ref_frames for the reference frame in use for each env
         if self.manager_type == "trajectory":
@@ -320,7 +385,7 @@ class TrajectoryCommand(CommandTerm):
 
             output_idx += joint_vel
 
-    def get_desired_output(self, t: torch.Tensor, conditioner: torch.Tensor = None):
+    def get_desired_outputs(self, t: torch.Tensor):
         """
         Get the desired output to track from the trajectory.
 
@@ -328,6 +393,7 @@ class TrajectoryCommand(CommandTerm):
         """
 
         if self.manager_type == "library":
+            conditioner = self.get_conditioner_var()
             y = self.manager.get_output(t, conditioner)
         else:
             y = self.manager.get_output(t)
@@ -350,15 +416,15 @@ class TrajectoryCommand(CommandTerm):
         t = self.env.sim.current_time * torch.ones(self.num_envs, device=self.device)
 
         # Get conditioning variables (velocity, etc...)
-        cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
+        # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
 
         # Update the measured outputs
         self.get_measured_outputs(t)
 
         # Get desired output
-        self.get_desired_outputs(t, cond_vars)
+        self.get_desired_outputs(t)
 
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_out, self.dy_act, self.dy_out, self.yaw_output_idx)
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des, self.yaw_output_idxs)
         self.vdot = vdot
         self.v = vcur
 

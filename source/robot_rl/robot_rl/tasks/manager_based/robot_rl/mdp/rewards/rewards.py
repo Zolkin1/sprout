@@ -146,6 +146,8 @@ def holonomic_constraint(
 
     cmd = env.command_manager.get_term(command_name)
 
+    # TODO: Re-write to handle arbitrary contacts
+
     # planar position error [B,2]
     p0_xy = cmd.stance_foot_pos_0[:, :2]
     p_xy = cmd.stance_foot_pos[:, :2]
