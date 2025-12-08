@@ -188,3 +188,20 @@ Some examples of packages that can likely be excluded are:
 "<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
 ...
 ```
+
+
+
+### Run from Talos
+```
+ssh mind@talos.caltech.edu
+```
+X: x-th of gpu
+```
+tmux new -s trainX
+conda activate env_isaaclab
+cd robot_rl
+CUDA_VISIBLE_DEVICES=X python scripts/rsl_rl/train_policy.py --env_type=stepping_stone --headless --max_iterations=10000
+```
+or reattach to existing session
+```
+tmux attach -t trainX
