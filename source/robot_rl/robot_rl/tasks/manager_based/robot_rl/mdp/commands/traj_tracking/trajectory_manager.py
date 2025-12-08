@@ -251,9 +251,15 @@ class TrajectoryManager:
 
         # Compute outputs
         outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs, device=self.device)
-        for dom in domain_indicies:
-            outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
-            outputs[:, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
+        outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[0, :, :].squeeze(), self.T[domain_indicies])
+
+        # Get the unique domains
+        unique_domains = torch.unique(domain_indicies)
+
+        for dom in unique_domains:
+            current_domains = domain_indicies == unique_domains # TODO: Check
+            outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
+            outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
 
         return outputs
 
@@ -300,7 +306,12 @@ class TrajectoryManager:
         # Determine the domain for each time
         domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
 
-        return torch.searchsorted(domain_boundaries, t, right=False) - 1
+        domains = torch.searchsorted(domain_boundaries, t, right=False) - 1
+
+        # Clamp to valid domain range [0, num_domains-1]
+        domains = torch.clamp(domains, 0, self.num_domains - 1)
+
+        return domains
 
 
     def get_ref_frames_in_use(self, t: torch.Tensor, ref_frames: list[str]) -> torch.Tensor:

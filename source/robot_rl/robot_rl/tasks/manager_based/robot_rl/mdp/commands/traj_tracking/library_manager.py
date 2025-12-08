@@ -152,7 +152,7 @@ class LibraryManager:
 
         # Initialize output tensor
         N = t.shape[0]
-        frame_indices = torch.zeros(N, device=self.device)
+        frame_indices = torch.zeros(N, dtype=torch.long, device=self.device)
 
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(indices)
