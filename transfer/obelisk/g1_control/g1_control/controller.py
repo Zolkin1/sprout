@@ -19,6 +19,8 @@ from sensor_msgs.msg import Joy
 
 from sensor_msgs.msg import Image
 
+from std_msgs.msg import Float64
+
 
 class VelocityTrackingController(ObeliskController, ABC):
     """Example position setpoint controller."""
@@ -253,6 +255,12 @@ class VelocityTrackingController(ObeliskController, ABC):
             key="sub_height_map_key",  # key can be specified here or in the config file
             msg_type=Image,
         )
+        
+        self.register_obk_publisher(
+            "pub_yaw_jointangle_setting",
+            msg_type=Float64,
+            key="pub_yaw_jointangle",
+        )
 
 
         self.last_menu_press = self.get_clock().now().nanoseconds / 1e9
@@ -371,9 +379,9 @@ class VelocityTrackingController(ObeliskController, ABC):
             ) > 0.5 else 0.0
             )
             v_y_max = self.get_parameter("v_y_max").get_parameter_value().double_value
-            self.cmd_vel[1] = min(max(cmd_msg.v_y, -v_y_max), v_y_max)
+            self.cmd_vel[1] = 0.0 #min(max(cmd_msg.v_y, -v_y_max), v_y_max)
             w_z_max = self.get_parameter("w_z_max").get_parameter_value().double_value
-            self.cmd_vel[2] = min(max(cmd_msg.w_z, -w_z_max), w_z_max)
+            self.cmd_vel[2] = 0.0 #min(max(cmd_msg.w_z, -w_z_max), w_z_max)
         else:
             vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
             RAMP_TIME = 2.0
@@ -530,9 +538,10 @@ class VelocityTrackingController(ObeliskController, ABC):
         #add height map
         obs[9 + 3 * nj : 9 + 3 * nj + self.ngrid_x * self.ngrid_y] = self.height_map
 
+        # print("obs: ", obs)
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
 
-        # print(obs_tensor)
+        # print("obs_tensor: ", obs_tensor)
 
         return obs_tensor
     
@@ -554,7 +563,7 @@ class VelocityTrackingController(ObeliskController, ABC):
                 obs = self.get_obs()
 
             # Call RL model
-            self.action = self.policy(torch.tensor(obs).to(self.device).float()).detach().cpu().numpy().squeeze()
+            self.action = self.policy(obs.to(self.device).float()).clone().detach().cpu().numpy().squeeze()
 
             # setting the message
             pd_ff_msg = PDFeedForward()
@@ -575,6 +584,13 @@ class VelocityTrackingController(ObeliskController, ABC):
             pd_ff_msg.kp = self.kps
             pd_ff_msg.kd = self.kds
             self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
+            
+            
+            yaw_msg = Float64()
+            yaw_index = self.joint_names.index("waist_yaw_joint")
+            yaw_msg.data = self.joint_pos[yaw_index]
+            # print("Yaw angle: ", yaw_msg.data)
+            self.obk_publishers["pub_yaw_jointangle"].publish(yaw_msg)
 
             # Log observation and action
             if self.log and self.ctrl_count % self.log_decimation == 0:

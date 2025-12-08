@@ -108,28 +108,22 @@ class Robot:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(self.joystick.get_axis(0))
+            # vy = -(self.joystick.get_axis(0))
             vx = -(self.joystick.get_axis(1))
-            vyaw = -(self.joystick.get_axis(3)) * 1
+            # vyaw = -(self.joystick.get_axis(3)) * 1
 
             # Clip or zero out small values
-            if abs(vx) < 0.1:
+            if abs(vx) < 0.55:
                 vx = 0
             else:
-                vx = np.clip(vx, -0.75, 0.75)
-            if abs(vy) < 0.1:
-                vy = 0
-            else:
-                vy = np.clip(vy, -0.0, 0.0)
-            if abs(vyaw) < 0.1:
-                vyaw = 0
-            else:
-                vyaw = np.clip(vyaw, -3.14, 3.14)
+                vx = 0.6
+
+
             des_vel[0] = vx
-            des_vel[1] = vy
-            des_vel[2] = vyaw
+            des_vel[1] = 0
+            des_vel[2] = 0
         else:
-            
+            print(self.mj_data.time)
             des_vel = np.array([0.6, 0.0, 0.0])
             #for stones, either 0.0 standing or 0.6 forward
             if self.mj_data.time < 1.0:
@@ -138,6 +132,7 @@ class Robot:
                 des_vel = np.array([0.0, 0.0, 0.0])    
         self.commanded_vel = des_vel  # Store the commanded velocity
         print(f"Commanded velocity: {des_vel}")
+        print(f"Current Pos = {self.mj_data.qpos[0:3]}")
         return des_vel
 
     def create_observation(self, policy, height_map=None, sensor_pos=None):

@@ -187,10 +187,10 @@ def plot_position_comparison(data, save_dir):
 
 def create_plots_for_newest():
     # Load in the data from rerun
-    log_dir = "home/dm/robot_rl/logs"
+    log_dir = "/home/dm/robot_rl/logs"
     print(f"Looking for logs in {log_dir}.")
     newest = find_most_recent_timestamped_folder(log_dir)
-    newest = "/home/dm/robot_rl/logs/2025-11-20-11-20-16"
+    # newest = "/home/dm/robot_rl/logs/2025-11-24-11-26-28"
 
     print(f"Loading data from {newest}.")
 

@@ -193,7 +193,31 @@ ros2 run g1_control optitrack_forwarding
 
 
 # Use with Lidar Height Map
+After build obelisk, build the height mapping package:
+
+```
+export MUJOCO_DIR="$HOME/robot_rl/transfer/obelisk/build/robot_sim/_deps/mujoco-src"
+cd ../height_mapping/
+source /opt/ros/humble/setup.bash && source ~/ws_livox/install/setup.bash
+colcon build --symlink-install --cmake-args -DBUILD_MUJOCO_SPOOF_NODE=ON
+source install/setup.bash
+```
+
 With Spoofing, before build height_mapping, set the following environment variable in the docker env:
 ```
 export MUJOCO_DIR="$HOME/robot_rl/transfer/obelisk/build/robot_sim/_deps/mujoco-src"
 ```
+
+for launching the height mapping with mocap and mujoco spoofing:
+```
+ros2 launch height_mapping height_spoof_mocap.launch.py 
+```
+
+
+### random debug 
+do not run 
+```
+sudo ufw enable
+```
+This will block some necessary ports for ROS2 communication.
+
