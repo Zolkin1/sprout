@@ -36,23 +36,24 @@ class LibraryManager:
         # Make a trajectory manager object for each file
         traj_conditioner_pairs = []
         for yaml_file in yaml_files:
-            traj_manager = TrajectoryManager(str(yaml_file))
+            traj_manager = TrajectoryManager(str(yaml_file), self.device)
             traj_conditioner_pairs.append((traj_manager, traj_manager.traj_data.conditioner))
 
         # Sort by first conditioning variable to allow searchsorted in get_output
-        traj_conditioner_pairs.sort(key=lambda x: x[1][0].item())
+        traj_conditioner_pairs.sort(key=lambda x: x[1][0])
 
         # Separate back into lists while maintaining sorted order
         self.trajectory_managers = [pair[0] for pair in traj_conditioner_pairs]
         conditioner_list = [pair[1] for pair in traj_conditioner_pairs]
 
         # Create conditioning tensor of shape (n_traj, 2)
-        self.conditioning_vars = torch.stack(conditioner_list, dim=0)
+        self.conditioning_vars = torch.tensor(conditioner_list, device=self.device)
 
-        # Verify the trajectories are compatible (num_outputs, type)
+        # Verify the trajectories are compatible (num_outputs, type, reference_frames)
         num_ouputs = self.trajectory_managers[0].traj_data.num_outputs
         output_names = self.trajectory_managers[0].traj_data.output_names
-        trajectory_type = self.trajectory_managers[0].trajectory_type
+        trajectory_type = self.trajectory_managers[0].traj_data.trajectory_type
+        ref_frames = self.trajectory_managers[0].traj_data.reference_frames
         for manager in self.trajectory_managers:
             if manager.traj_data.num_outputs != num_ouputs:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying number of outputs!")
@@ -60,20 +61,25 @@ class LibraryManager:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying trajectory_type!")
             if manager.traj_data.output_names != output_names:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying output_names!")
-
+            if manager.traj_data.reference_frames != ref_frames:
+                raise ValueError(f"Trajectories in the library are not compatible! Varying reference_frames!")
 
         self.trajectory_type = trajectory_type
         self.num_outputs = num_ouputs
         self.output_names = output_names
+        self.ref_frames = ref_frames
 
     @property
     def get_output_names(self):
         return self.output_names
 
+    def get_reference_frames(self):
+        return self.ref_frames
+
     def get_phasing_var(self, conditioner: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         indices = self.get_traj_indices(conditioner)
 
-        phasing_var = torch.zeros(t.shape[0], self.device)
+        phasing_var = torch.zeros(t.shape[0], device=self.device)
 
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(indices)
@@ -209,7 +215,7 @@ class LibraryManager:
             t_for_manager = t[env_indices]
 
             # Call get_output for this manager
-            manager_states = self.trajectory_managers[idx.item()].get_contact_state(t_for_manager)
+            manager_states = self.trajectory_managers[idx.item()].get_contact_state(t_for_manager, contact_frames)
 
             # Place outputs in the correct positions
             contact_states[env_indices] = manager_states
@@ -224,7 +230,7 @@ class LibraryManager:
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(traj_idx)
 
-        domain_idx = torch.zeros(conditioner.shape[0], device=self.device)
+        domain_idx = torch.zeros(conditioner.shape[0], dtype=torch.long, device=self.device)
 
         # Bin each conditioner by manager
         for idx in unique_indicies:

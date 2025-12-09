@@ -70,7 +70,7 @@ class TrajectoryCommand(CommandTerm):
             self.yaw_output_idxs = start + 5*body
 
         # Create a list of indices for the reference frames
-        self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(self.manager.traj_data.reference_frames)
+        self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(self.manager.get_reference_frames())
 
         # Verify all reference frames are in contact frames
         for ref_frame in self.ref_frames:
@@ -109,7 +109,7 @@ class TrajectoryCommand(CommandTerm):
         cond_term = self.env.command_manager.get_term(self.conditioner_generator)
 
         # TODO: For now just hard code the conditioning variable as velocity
-        condition_vars = cond_term[:, 0]
+        condition_vars = cond_term.command[:, 0]
 
         # condition_vars = cond_term.get_condition_vars() # TODO: Implement. This could come from a command or from terrain (i.e. stair height, slope)
         return condition_vars
@@ -180,7 +180,7 @@ class TrajectoryCommand(CommandTerm):
                 traj_frames.append(domain.contact_frames)
         elif self.manager_type == "library":
             for manager in self.manager.trajectory_managers:
-                for domain in manager.traj_data.domain_data:
+                for domain in manager.traj_data.domain_data.values():
                     traj_frames.append(domain.contact_frames)
         else:
             raise NotImplementedError(f"Manager Type {self.manager_type} is not implemented!")
@@ -283,7 +283,11 @@ class TrajectoryCommand(CommandTerm):
         #   The self.ref_poses should be of shape [N, 7] and should just be holding the current in use reference frame.
 
         # Get the current domains
-        new_domains = self.manager.get_current_domains(t)
+        if self.manager_type == "library":
+            conditioner = self.get_conditioner_var()
+            new_domains = self.manager.get_current_domains(conditioner, t)
+        else:
+            new_domains = self.manager.get_current_domains(t)
 
         # Check if the domains changed
         changed = new_domains != self.current_domain

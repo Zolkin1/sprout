@@ -171,6 +171,9 @@ class TrajectoryManager:
             reference_frames=ref_frames,
         )
 
+    def get_reference_frames(self) -> list[str]:
+        return self.traj_data.reference_frames
+
     def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
         """
         Compute the phasing variable which is a number in [0,1] that tells how far through the trajectory we are.

@@ -82,10 +82,14 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     # )
     traj_ref = TrajectoryCommandCfg(
         contact_frames = [".*_ankle_roll_link"],
-        manager_type = "trajectory",
+
+        # manager_type = "trajectory",
+        # path="source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
+        manager_type="library",
+        path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
+
         conditioner_generator_name = "base_velocity",
         num_outputs = 27,
-        path = "source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
         Q_weights = WALKING_Q_weights,
         R_weights = WALKING_R_weights,
     )
