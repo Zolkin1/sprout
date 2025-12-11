@@ -85,8 +85,11 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
 
         # manager_type = "trajectory",
         # path="source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
+
         manager_type="library",
-        path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
+        # path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
+        hf_repo = "zolkin/robot_rl",
+        path = "trajectories/walking",
 
         conditioner_generator_name = "base_velocity",
         num_outputs = 27,
@@ -154,10 +157,6 @@ class G1TrajOptObservationsCfg():
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
         )
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        # TODO: Modify this to be more generic, I want the critic to get the values for all the end effector frames being tracked
-        # TODO: Fix (above) and put back
-        # foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "traj_ref"}, scale=1.0)
-        # foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "traj_ref"}, scale=1.0)
 
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})

@@ -42,11 +42,14 @@ class TrajectoryData:
 class TrajectoryManager:
     """Manages a single trajectory. The trajectory is specified in a yaml file."""
 
-    def __init__(self, traj_path: str, device):
+    def __init__(self, traj_path: str, hf_repo: str, device):
         self.device = device
 
-        # Resolve the trajectory file path
-        self.traj_path = self._resolve_trajectory_path(traj_path)
+        if hf_repo is None:
+            # Resolve the trajectory file path
+            self.traj_path = self._resolve_trajectory_path(traj_path)
+        else:
+            self.traj_path = self._get_from_hugging_face(hf_repo, traj_path)
 
         # Load the trajectory and corresponding information
         self.traj_data = self.load_from_yaml()
@@ -76,6 +79,64 @@ class TrajectoryManager:
         # TODO: Fix the trajectory manager so that the bezier coefficient use the same order as the measured states
         # TODO: Make the R to remap programatic instead of hard-coded
         # TODO: Why are the z height values never at zero when the foot is in stance?
+
+    def _get_from_hugging_face(self, hf_repo: str, hf_path: str) -> str:
+        """
+        Load the trajectories from hugging face. Download it into the run folder /hf/ folder.
+        Make the /hf/ folder if it doesn't exist.
+
+        Args:
+            hf_repo: hugging face repo to use (e.g., 'username/repo-name')
+            hf_path: the path to the trajectory in the hf repo (e.g., 'trajectories/walk.yaml')
+
+        Returns:
+            Local path to the downloaded trajectory file
+        """
+        import os
+        import shutil
+
+        # Get the robot_rl root directory and go two folders above it
+        root = os.environ.get("ROBOT_RL_ROOT", os.getcwd())
+        hf_base = os.path.join(root, "..", "..")
+        hf_base = os.path.abspath(hf_base)  # Resolve to absolute path
+
+        # Create cache directory in the hf folder
+        cache_dir = os.path.join(hf_base, "hf", hf_repo.replace("/", "_"))
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Extract filename from hf_path
+        filename = os.path.basename(hf_path)
+        local_traj_path = os.path.join(cache_dir, filename)
+
+        # Check if trajectory already exists locally
+        if os.path.exists(local_traj_path):
+            print(f"Using cached trajectory from {local_traj_path}")
+            return local_traj_path
+
+        # Download from Hugging Face
+        try:
+            from huggingface_hub import hf_hub_download
+
+            print(f"Downloading trajectory {hf_path} from {hf_repo}...")
+
+            downloaded_path = hf_hub_download(
+                repo_id=hf_repo,
+                filename=hf_path,
+                cache_dir=cache_dir,
+                local_dir=cache_dir,
+            )
+
+            # If downloaded to a different location, copy to our expected path
+            if downloaded_path != local_traj_path:
+                shutil.copy2(downloaded_path, local_traj_path)
+
+            print(f"Successfully downloaded trajectory to {local_traj_path}")
+            return local_traj_path
+
+        except ImportError:
+            raise RuntimeError("huggingface_hub is required for downloading trajectories. Install with: pip install huggingface_hub")
+        except Exception as e:
+            raise RuntimeError(f"Failed to download trajectory from Hugging Face: {e}")
 
     def _resolve_trajectory_path(self, traj_path: str) -> str:
         """

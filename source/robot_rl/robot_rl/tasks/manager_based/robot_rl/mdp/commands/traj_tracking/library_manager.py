@@ -6,20 +6,22 @@ from .trajectory_manager import TrajectoryManager
 
 class LibraryManager:
 
-    def __init__(self, library_folder_path: str, device):
+    def __init__(self, library_folder_path: str, hf_repo: str, device):
         self.folder_path = library_folder_path
         self.device = device
         self.trajectory_managers = []
         self.conditioning_vars = None
         self.num_outputs = None
 
-        self.load_library()
+        self.load_library(hf_repo)
 
 
-    def load_library(self):
+    def load_library(self, hf_repo: str):
         """Load all trajectory files from the library folder into a list."""
-        # Iterate through the trajectory files in the library
-        library_path = Path(self.folder_path)
+        if hf_repo is None:
+            library_path = Path(self.folder_path)
+        else:
+            library_path = self._get_from_hugging_face(hf_repo, self.folder_path)
 
         if not library_path.exists():
             raise FileNotFoundError(f"Library folder not found: {self.folder_path}")
@@ -36,7 +38,7 @@ class LibraryManager:
         # Make a trajectory manager object for each file
         traj_conditioner_pairs = []
         for yaml_file in yaml_files:
-            traj_manager = TrajectoryManager(str(yaml_file), self.device)
+            traj_manager = TrajectoryManager(str(yaml_file), None, self.device)
             traj_conditioner_pairs.append((traj_manager, traj_manager.traj_data.conditioner))
 
         # Sort by first conditioning variable to allow searchsorted in get_output
@@ -68,6 +70,60 @@ class LibraryManager:
         self.num_outputs = num_ouputs
         self.output_names = output_names
         self.ref_frames = ref_frames
+
+    def _get_from_hugging_face(self, hf_repo: str, hf_path: str) -> Path:
+        """
+        Load the trajectory library folder from hugging face. Download it into the hf folder.
+        Make the /hf/ folder if it doesn't exist.
+
+        Args:
+            hf_repo: hugging face repo to use (e.g., 'username/repo-name')
+            hf_path: the path to the trajectory folder in the hf repo (e.g., 'trajectories/library')
+
+        Returns:
+            Local Path to the downloaded trajectory folder
+        """
+        import os
+
+        # Get the robot_rl root directory and go two folders above it
+        root = os.getcwd() #os.environ.get("ROBOT_RL_ROOT", os.getcwd())
+        hf_base = os.path.join(root)
+        hf_base = os.path.abspath(hf_base)  # Resolve to absolute path
+
+        # Create cache directory in the hf folder
+        cache_dir = os.path.join(hf_base, "hf")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # The local path to the trajectory folder
+        local_folder_path = os.path.join(cache_dir, hf_path)
+
+        # Check if folder already exists locally and has YAML files
+        if os.path.exists(local_folder_path) and os.path.isdir(local_folder_path):
+            yaml_files = list(Path(local_folder_path).glob("*.yaml")) + list(Path(local_folder_path).glob("*.yml"))
+            if len(yaml_files) > 0:
+                print(f"Using cached trajectory library from {local_folder_path}")
+                return Path(local_folder_path)
+
+        # Download from Hugging Face
+        try:
+            from huggingface_hub import snapshot_download
+
+            print(f"Downloading trajectory library {hf_path} from {hf_repo}...")
+
+            # Download the entire repo or specific folder
+            snapshot_download(
+                repo_id=hf_repo,
+                allow_patterns=f"{hf_path}/*",  # Download only files in the specified folder
+                local_dir=cache_dir,
+            )
+
+            print(f"Successfully downloaded trajectory library to {local_folder_path}")
+            return Path(local_folder_path)
+
+        except ImportError:
+            raise RuntimeError("huggingface_hub is required for downloading trajectories. Install with: pip install huggingface_hub")
+        except Exception as e:
+            raise RuntimeError(f"Failed to download trajectory library from Hugging Face: {e}")
 
     @property
     def get_output_names(self):
@@ -253,7 +309,12 @@ class LibraryManager:
     def get_traj_indices(self, conditioner: torch.Tensor) -> torch.Tensor:
         """Determine which trajectories are in use for each env."""
         # Determine which trajectory is in use. Use searchsorted
-        indicies = torch.searchsorted(self.conditioning_vars[:, 0], conditioner, right=False) - 1
+        # Ensure tensors are contiguous to avoid performance warnings
+        indicies = torch.searchsorted(
+            self.conditioning_vars[:, 0].contiguous(),
+            conditioner.contiguous(),
+            right=False
+        ) - 1
 
         return torch.clamp(indicies, 0, len(self.trajectory_managers) - 1)
 

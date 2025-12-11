@@ -45,10 +45,10 @@ class TrajectoryCommand(CommandTerm):
 
         # Create trajectory/library manager
         if cfg.manager_type == "trajectory":
-            self.manager = TrajectoryManager(cfg.path, env.device)
+            self.manager = TrajectoryManager(cfg.path, cfg.hf_repo, env.device)
             self.trajectory_type = self.manager.traj_data.trajectory_type
         elif cfg.manager_type == "library":
-            self.manager = LibraryManager(cfg.path, env.device)
+            self.manager = LibraryManager(cfg.path, cfg.hf_repo, env.device)
             self.trajectory_type = self.manager.trajectory_type
         else:
             raise NotImplementedError(f"Manager Type {cfg.manager_type} is not implemented!")

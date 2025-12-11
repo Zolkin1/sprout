@@ -18,7 +18,6 @@ def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -
     #reshape from num_env, num_bodies, 3 to num_env, num_bodies*3
     return contact_flag.reshape(env.num_envs, -1)
 
-
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     left_foot_vel = cmd.robot.data.body_lin_vel_w[:,cmd.feet_bodies_idx[0],:]
@@ -48,16 +47,6 @@ def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Ten
     act_traj = cmd.y_act.clone()
     act_traj[:,8] *= 50.0   # TODO: What is this?
     return act_traj
-
-# def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     ref_traj = cmd.y_out[:,8]
-#     return ref_traj.unsqueeze(-1)
-
-# def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     act_traj = cmd.y_act[:,8]
-#     return act_traj.unsqueeze(-1)
 
 def ref_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
