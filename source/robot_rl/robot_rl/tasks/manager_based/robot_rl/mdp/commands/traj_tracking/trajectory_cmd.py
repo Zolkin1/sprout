@@ -20,19 +20,19 @@ class TrajectoryCommand(CommandTerm):
         self.robot = env.scene[cfg.asset_name]
 
         # Expand wildcards in contact frames
-        self.contact_frames = self._expand_wildcard_frames(cfg.contact_frames)
+        self.contact_bodies = self._expand_wildcard_frames(cfg.contact_bodies)
 
         # Extract the index into the robot data bodies for the contact frames
-        self.contact_frame_indices = torch.zeros(len(self.contact_frames), dtype=torch.long, device=self.device)
-        for i, frame_name in enumerate(self.contact_frames):
+        self.contact_frame_indices = torch.zeros(len(self.contact_bodies), dtype=torch.long, device=self.device)
+        for i, frame_name in enumerate(self.contact_bodies):
             if frame_name in self.robot.body_names:
                 self.contact_frame_indices[i] = self.robot.body_names.index(frame_name)
             else:
                 raise ValueError(f"Contact frame '{frame_name}' not found in robot body names.")
 
-        self.current_contact_poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, dtype=torch.float, device=self.device)
-        self.current_contact_vels = torch.zeros(self.num_envs, len(self.contact_frames), 6, dtype=torch.float, device=self.device)
-        self.desired_contact_poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, dtype=torch.float, device=self.device)
+        self.current_contact_poses = torch.zeros(self.num_envs, len(self.contact_bodies), 6, dtype=torch.float, device=self.device)
+        self.current_contact_vels = torch.zeros(self.num_envs, len(self.contact_bodies), 6, dtype=torch.float, device=self.device)
+        self.desired_contact_poses = torch.zeros(self.num_envs, len(self.contact_bodies), 6, dtype=torch.float, device=self.device)
 
         self.manager_type = cfg.manager_type
         self.conditioner_generator = cfg.conditioner_generator_name
@@ -59,7 +59,18 @@ class TrajectoryCommand(CommandTerm):
         self.current_domain = -1 * torch.ones(self.num_envs, device=self.device)
 
         # Create a list of indices to be used
-        self.joint_idx, self.body_idx, self.use_com, self.ordered_output_names = self._parse_outputs(self.manager.get_output_names)
+        self.joint_idx, self.body_idx, self.use_com, self.ordered_output_names, self.body_type = self._parse_outputs(self.manager.get_output_names)
+
+        # Order the manager to match the order here
+        self.manager.order_outputs(self.ordered_output_names)
+
+        self.body_type = torch.tensor(self.body_type, dtype=torch.int, device=self.device)
+
+        print(f"Order output names: {self.ordered_output_names}")
+
+        if cfg.num_outputs != len(self.ordered_output_names):
+            raise ValueError(f"Number of output names does not match number of outputs in the cfg! "
+                             f"Len of names: {len(self.ordered_output_names)}, cfg len: {cfg.num_outputs} !")
 
         # For now assuming that all bodies have a yaw tracking
         self.yaw_output_idxs = []
@@ -74,14 +85,14 @@ class TrajectoryCommand(CommandTerm):
 
         # Verify all reference frames are in contact frames
         for ref_frame in self.ref_frames:
-            if ref_frame not in self.contact_frames:
-                raise ValueError(f"Reference frame '{ref_frame}' is not in the contact frames list: {self.contact_frames}")
+            if ref_frame not in self.contact_bodies:
+                raise ValueError(f"Reference frame '{ref_frame}' is not in the contact frames list: {self.contact_bodies}")
 
         # Create a mapping from ref_frames to contact_frames indices
         # This allows us to map ref_frame_indices to contact_state indices
         self.ref_to_contact_idx = torch.zeros(len(self.ref_frames), dtype=torch.long, device=self.device)
         for i, ref_frame in enumerate(self.ref_frames):
-            self.ref_to_contact_idx[i] = self.contact_frames.index(ref_frame)
+            self.ref_to_contact_idx[i] = self.contact_bodies.index(ref_frame)
 
         # Current reference frame poses
         self.ref_poses = torch.zeros((self.num_envs, 7), device=self.device)    # [N, [position, quat]]
@@ -165,9 +176,9 @@ class TrajectoryCommand(CommandTerm):
         # For a library we need the conditioner value too
         if self.manager_type == "library":
             conditioner = self.get_conditioner_var()
-            return self.manager.get_contact_state(conditioner, t, self.contact_frames)
+            return self.manager.get_contact_state(conditioner, t, self.contact_bodies)
         else:
-            return self.manager.get_contact_state(t, self.contact_frames)
+            return self.manager.get_contact_state(t, self.contact_bodies)
 
     def get_trajectory_type(self):
         """Gets the type of trajectory: periodic or episodic."""
@@ -177,18 +188,18 @@ class TrajectoryCommand(CommandTerm):
         traj_frames = []
         if self.manager_type == "trajectory":
             for domain in self.manager.traj_data.domain_data.values():
-                traj_frames.append(domain.contact_frames)
+                traj_frames.append(domain.contact_bodies)
         elif self.manager_type == "library":
             for manager in self.manager.trajectory_managers:
                 for domain in manager.traj_data.domain_data.values():
-                    traj_frames.append(domain.contact_frames)
+                    traj_frames.append(domain.contact_bodies)
         else:
             raise NotImplementedError(f"Manager Type {self.manager_type} is not implemented!")
 
         # Verify that every frame in traj_frames appears in self.contact_frames
         for frames in traj_frames:
             for frame in frames:
-                if frame not in self.contact_frames:
+                if frame not in self.contact_bodies:
                     raise ValueError(f"Contact frame {frame} from a trajectory is not in the contact frames list!")
 
     def get_ref_frame_poses(self) -> torch.Tensor:
@@ -218,13 +229,13 @@ class TrajectoryCommand(CommandTerm):
             poses is shape [N, num_contacts, 6]. Everything not in contact is masked to 0
         """
 
-        poses = torch.zeros(self.num_envs, len(self.contact_frames), 6, device=self.device)
+        poses = torch.zeros(self.num_envs, len(self.contact_bodies), 6, device=self.device)
 
         not_in_contact = contact_state == 0
 
         # Get the poses of all the possible contact bodies
         poses[:, :, :3] = self.robot.data.body_pos_w[:, self.contact_frame_indices, :]
-        for i in range(len(self.contact_frames)):
+        for i in range(len(self.contact_bodies)):
             poses[:, i, 3:] = get_euler_from_quat(self.robot.data.body_quat_w[:, self.contact_frame_indices[i], :])
 
         # Now mask
@@ -258,7 +269,7 @@ class TrajectoryCommand(CommandTerm):
         Returns:
             vels is shape [N, num_contacts, 6]. Everything not in contact is masked to 0
         """
-        vels = torch.zeros(self.num_envs, len(self.contact_frames), 6, device=self.device)
+        vels = torch.zeros(self.num_envs, len(self.contact_bodies), 6, device=self.device)
 
         not_in_contact = contact_state == 0
 
@@ -297,6 +308,7 @@ class TrajectoryCommand(CommandTerm):
 
         # Determine which reference frames/bodies are in contact
         contact_state = self.get_contact_state(t)  # Shape: [N, num_contact_frames]
+        # print(f"contact_state: {contact_state}, contact_frames: {self.contact_bodies}")
 
         self.current_contact_poses = self.get_contact_poses(contact_state)
         self.current_contact_vels = self.get_contact_vels(contact_state)
@@ -398,11 +410,27 @@ class TrajectoryCommand(CommandTerm):
             body_pos_local, body_ori_local, body_vel_local, body_ang_vel_local = _get_pos_ori_vel_relative(
                 self.body_idx, ref_frame_pos_w, ref_frame_quat,)
 
-            # TODO: Make sure this is being added correctly
-            self.y_act[:, output_idx:output_idx+(3*len(self.body_idx))] = body_pos_local.flatten(1)
-            self.dy_act[:, output_idx:output_idx+(3*len(self.body_idx))] = body_vel_local.flatten(1)
+            pos_bodies = (self.body_type == 1) | (self.body_type == 2)
+            num_pos_bodies = pos_bodies.sum()
+            ori_bodies = (self.body_type == 0) | (self.body_type == 2)
+            num_ori_bodies = ori_bodies.sum()
 
-            output_idx += (3*len(self.body_idx))
+            # TODO: Make sure this is being added correctly
+            # Add linear
+            self.y_act[:, output_idx:output_idx+(3*num_pos_bodies)] = (
+                body_pos_local[:, pos_bodies, :].flatten(1))
+            self.dy_act[:, output_idx:output_idx+(3*num_pos_bodies)] = (
+                body_vel_local[:, pos_bodies, :].flatten(1))
+
+            output_idx += (3*num_pos_bodies.item())
+
+            # Add angles
+            self.y_act[:, output_idx:output_idx+(3*num_ori_bodies)] = (
+                body_ori_local[:, ori_bodies, :].flatten(1))
+            self.dy_act[:, output_idx:output_idx+(3*num_ori_bodies)] = (
+                body_ang_vel_local[:, ori_bodies, :].flatten(1))
+
+            output_idx += (3*num_ori_bodies.item())
 
         # Get the relevant joint angles
         if self.joint_idx is not None:
@@ -474,7 +502,7 @@ class TrajectoryCommand(CommandTerm):
         for i, output in enumerate(self.ordered_output_names):
             self.metrics[output] = torch.abs(self.y_des[:, i] - self.y_act[:, i])
 
-    def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str]]:
+    def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[int]]:
         """
         Parse the output names to indices to be used for getting data from the robot in sim.
 
@@ -493,6 +521,9 @@ class TrajectoryCommand(CommandTerm):
         body_names_list = []
         use_com = False
         com_axes = []
+
+        body_type = {}
+        body_type_list = []
 
         # Track which frames we've already added to avoid duplicates
         added_bodies = set()
@@ -522,6 +553,11 @@ class TrajectoryCommand(CommandTerm):
                 # Frame output: "frame_name:axis"
                 frame_name = output_name.split(':', 1)[0]
 
+                if frame_name not in body_type:
+                    body_type[frame_name] = [output_name.split(':', 1)[1]]
+                else:
+                    body_type[frame_name].append(output_name.split(':', 1)[1])
+
                 # Skip if we've already added this body
                 if frame_name in added_bodies:
                     continue
@@ -543,14 +579,32 @@ class TrajectoryCommand(CommandTerm):
             for axis in com_axes:
                 ordered_output_names.append(f"com:{axis}")
 
-        # Add body outputs
+        # Add body outputs - start with all positions
         for body_name in body_names_list:
-            # Add position and orientation outputs for each body
-            ordered_output_names.extend([
-                f"{body_name}:pos_x",
-                f"{body_name}:pos_y",
-                f"{body_name}:pos_z"
-            ])
+            for btype in body_type[body_name]:
+                if "pos" in btype:
+                    ordered_output_names.append(f"{body_name}:{btype}")
+
+        # Add body outputs - then do orientations
+        for body_name in body_names_list:
+            for btype in body_type[body_name]:
+                if "ori" in btype:
+                    ordered_output_names.append(f"{body_name}:{btype}")
+
+        for body_name in body_names_list:
+            ori = False
+            pos = False
+            for btype in body_type[body_name]:
+                if "ori" in btype:
+                    ori = True
+                if "pos" in btype:
+                    pos = True
+            if pos and ori:
+                body_type_list.append(2)
+            if pos and not ori:
+                body_type_list.append(1)
+            if ori and not pos:
+                body_type_list.append(0)
 
         # Add joint outputs
         for joint_name in joint_names_list:
@@ -560,7 +614,7 @@ class TrajectoryCommand(CommandTerm):
         joint_idx_result = joint_indices if len(joint_indices) > 0 else None
         body_idx_result = body_indices if len(body_indices) > 0 else None
 
-        return joint_idx_result, body_idx_result, use_com, ordered_output_names
+        return joint_idx_result, body_idx_result, use_com, ordered_output_names, body_type_list
 
     def _parse_ref_frames(self, reference_frames: list[str]) -> tuple[list[int], list[str]]:
         """

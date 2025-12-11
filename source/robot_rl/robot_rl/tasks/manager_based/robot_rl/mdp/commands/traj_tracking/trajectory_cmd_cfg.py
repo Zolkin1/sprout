@@ -12,7 +12,7 @@ class TrajectoryCommandCfg(CommandTermCfg):
 
     class_type: type = TrajectoryCommand
     asset_name: str = "robot"
-    contact_frames: list[str] = None
+    contact_bodies: list[str] = None
     manager_type: str = ""
     conditioner_generator_name: str = ""
     num_outputs: int = -1

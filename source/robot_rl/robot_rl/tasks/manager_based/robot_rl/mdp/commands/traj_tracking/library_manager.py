@@ -256,3 +256,7 @@ class LibraryManager:
         indicies = torch.searchsorted(self.conditioning_vars[:, 0], conditioner, right=False) - 1
 
         return torch.clamp(indicies, 0, len(self.trajectory_managers) - 1)
+
+    def order_outputs(self, order_output_names: list[str]):
+        for manager in self.trajectory_managers:
+            manager.order_outputs(order_output_names)

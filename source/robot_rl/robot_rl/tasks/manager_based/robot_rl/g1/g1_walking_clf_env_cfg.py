@@ -81,7 +81,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     #     R_weights=WALKING_R_weights,
     # )
     traj_ref = TrajectoryCommandCfg(
-        contact_frames = [".*_ankle_roll_link"],
+        contact_bodies = [".*_ankle_roll_link"],
 
         # manager_type = "trajectory",
         # path="source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
@@ -240,7 +240,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (0, 0) # TODO: put back: (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
 
         self.commands.gait_period.gait_period_range = (0.71, 0.71)    # TODO: Remove?
@@ -377,7 +377,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         self.events.push_robot = None
         
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 

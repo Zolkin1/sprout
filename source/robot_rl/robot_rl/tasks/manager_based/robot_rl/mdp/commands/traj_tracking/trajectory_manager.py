@@ -6,6 +6,8 @@ import yaml
 from dataclasses import dataclass
 import math
 import numpy as np
+from hid import device
+
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
@@ -18,7 +20,7 @@ class DomainData:
     domain_name: str
     bezier_coeffs: dict
     bezier_tensor: torch.Tensor
-    contact_frames: list[str]
+    contact_bodies: list[str]
     time: float
     bezier_frame: str           # Frame of reference used for the splines
     bezier_frame_domain: str    # Domain in which the frame was measured
@@ -51,6 +53,10 @@ class TrajectoryManager:
 
         # Load some data into more efficient data structures
         self.num_domains = len(self.traj_data.domain_order)
+        self.expanded_num_domains =self.num_domains
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            self.expanded_num_domains *= 2
+
 
         self.T = torch.zeros(self.num_domains, device=self.device)
         self.bezier_coeffs = torch.zeros(self.num_domains, self.traj_data.num_outputs, self.traj_data.spline_order + 1, device=self.device)
@@ -58,10 +64,18 @@ class TrajectoryManager:
             self.T[i] = self.traj_data.domain_data[domain].time
             self.bezier_coeffs[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor
 
+        if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+            self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
+        else:
+            self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T, self.T]), dim=0)
+
         # Pre-compute relabeling matrix as a tensor
         R_numpy = self.relable_ee_stance_coeffs()
         self.R_relabel = torch.from_numpy(R_numpy).to(device=self.device, dtype=self.bezier_coeffs.dtype)
 
+        # TODO: Fix the trajectory manager so that the bezier coefficient use the same order as the measured states
+        # TODO: Make the R to remap programatic instead of hard-coded
+        # TODO: Why are the z height values never at zero when the foot is in stance?
 
     def _resolve_trajectory_path(self, traj_path: str) -> str:
         """
@@ -140,7 +154,7 @@ class TrajectoryManager:
                 bezier_coeffs=domain_yaml['bezier_coeffs'],
                 bezier_tensor=bezier_tensor,
                 time=domain_yaml['T'][0],
-                contact_frames=domain_yaml['contact_bodies'],
+                contact_bodies=domain_yaml['contact_bodies'],
                 bezier_frame=domain_yaml['ref_frame'],
                 bezier_frame_domain=domain_yaml['ref_frame_domain']
             )
@@ -186,17 +200,17 @@ class TrajectoryManager:
             full_period_time = self.traj_data.total_time * 2
             t_into_traj = t % full_period_time
 
-            return t_into_traj / self.traj_data.total_time
+            return torch.clamp(t_into_traj / (self.traj_data.total_time * 2), 0, 1)
         elif self.traj_data.trajectory_type == TrajectoryType.FULL_PERIODIC:
             # Map into the period time
             t_into_traj = t % self.traj_data.total_time
-            return t_into_traj / self.traj_data.total_time
+            return torch.clamp(t_into_traj / self.traj_data.total_time, 0, 1)
 
         elif self.traj_data.trajectory_type == TrajectoryType.EPISODIC:
             return torch.clamp(t / self.traj_data.total_time, 0, 1)
         elif self.traj_data.trajectory_type == TrajectoryType.PERPETUAL:
             # For now all perpetual motions are assumed to have no phasing associated with them
-            return torch.zeros(t.shape[0], self.device)
+            return torch.clamp(torch.zeros(t.shape[0], self.device), 0, 1)
         else:
             raise NotImplementedError(f"Trajectory type {self.traj_data.trajectory_type} is not implemented.")
 
@@ -218,51 +232,45 @@ class TrajectoryManager:
 
         To compute this value, we first determine which domain the times are in then we compute the values in a batched manner.
         """
+        bezier_coeffs = self.bezier_coeffs
+
         # Map time based on trajectory time
         if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            # Determine which half of the period the time is in
-            full_period_time = self.traj_data.total_time * 2
-            t_into_traj = t % full_period_time
-
-            second_half = t_into_traj/full_period_time > 0.5
-
-            # In the second half
-            t_into_traj[second_half] = t_into_traj[second_half] - self.traj_data.total_time
-
-            # Need to remap the trajectory
-            bezier_coeffs = self.remap_trajectory()
-        elif self.traj_data.trajectory_type == TrajectoryType.FULL_PERIODIC:
-            # Map into the period time
-            t_into_traj = t % self.traj_data.total_time
-
-            bezier_coeffs = self.bezier_coeffs  # TODO: Is this inefficient? Is it copying or referencing?
-        elif self.traj_data.trajectory_type == TrajectoryType.EPISODIC or self.traj_data.trajectory_type == TrajectoryType.PERPETUAL:
-            # Don't need to touch this
-            t_into_traj = t
-            bezier_coeffs = self.bezier_coeffs
-        else:
-            raise NotImplementedError(f"Trajectory type {self.traj_data.trajectory_type} is not implemented.")
+            bezier_coeffs_reflect = self.remap_trajectory() # TODO: Fix remap to be flexible in the ordering
 
         # Determine the domain for each time
-        domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
 
-        domain_indicies = self.get_current_domains(t)
+        domain_indices = self.get_current_domains(t)
 
         # Normalize the time relative to the domain
-        domain_start_times = domain_boundaries[domain_indicies]
-        tau = (t_into_traj - domain_start_times)/self.T[domain_indicies]
+        domain_start_times = self.domain_boundaries[domain_indices]
+        tau = self.get_phasing_var(t)
+        T = self.T
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            # Normalize
+            tau[tau >= 0.5] -= 0.5
+            tau /= 0.5
+            T = torch.cat((self.T, self.T))
 
         # Compute outputs
         outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs, device=self.device)
-        outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[0, :, :].squeeze(), self.T[domain_indicies])
+        # outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[0, :, :].squeeze(), T[domain_indices])
 
         # Get the unique domains
-        unique_domains = torch.unique(domain_indicies)
+        unique_domains = torch.unique(domain_indices)
 
         for dom in unique_domains:
-            current_domains = domain_indicies == unique_domains # TODO: Check
-            outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
-            outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), self.T[domain_indicies])
+            current_domains = domain_indices == unique_domains # TODO: Check
+            if dom >= self.num_domains:
+                if bezier_coeffs_reflect is None:
+                    raise ValueError(f"Issue indexing into the bezier coefficients due to the half period!")
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                                                                             T[domain_indices])
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                                                                             T[domain_indices])
+            else:
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), T[domain_indices])
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), T[domain_indices])
 
         return outputs
 
@@ -287,18 +295,35 @@ class TrajectoryManager:
         N = t.shape[0]
         num_contacts = len(contact_frames)
         contact_states = torch.zeros(N, num_contacts, device=self.device)
+        phi = self.get_phasing_var(t)
 
         # For each contact frame, check if it's in contact across all domains
         for i, frame in enumerate(contact_frames):
             # For each domain, check if this frame is in contact
-            for domain_idx in range(self.num_domains):
-                domain_name = self.traj_data.domain_order[domain_idx]
-                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_frames
+            for domain_idx in range(self.expanded_num_domains):
+                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
+                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
 
-                if frame in domain_contact_frames:
-                    # Set all times in this domain to 1 for this contact frame
-                    mask = domain_indicies == domain_idx
+                if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+                    # Swap left/right in contact frame names for half periodic trajectories
+                    reflect_domain_contact_frames = [
+                        frame_name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+                        for frame_name in domain_contact_frames
+                    ]
+
+                mask = None
+                if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+                    if frame in domain_contact_frames:
+                        mask = domain_indicies == domain_idx
+                else:       # Half periodic
+                    if frame in domain_contact_frames:
+                        mask = (domain_indicies == domain_idx) & (phi < 0.5)
+                    elif frame in reflect_domain_contact_frames:
+                        mask = (domain_indicies == domain_idx) & (phi >= 0.5)
+
+                if mask is not None:
                     contact_states[mask, i] = 1.0
+
 
         return contact_states
 
@@ -307,12 +332,12 @@ class TrajectoryManager:
         Determine what domain each env is in given the time.
         """
         # Determine the domain for each time
-        domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
+        T = self.traj_data.total_time
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            T *= 2
+        domains = torch.searchsorted(self.domain_boundaries, t % T, right=False) - 1
 
-        domains = torch.searchsorted(domain_boundaries, t, right=False) - 1
-
-        # Clamp to valid domain range [0, num_domains-1]
-        domains = torch.clamp(domains, 0, self.num_domains - 1)
+        domains = torch.clamp(domains, 0, self.expanded_num_domains - 1)
 
         return domains
 
@@ -332,17 +357,38 @@ class TrajectoryManager:
 
         # Create a mapping tensor: domain_idx -> ref_frame_idx
         # This is done once per call, but it's O(num_domains) not O(num_envs)
-        domain_to_ref_frame_idx = torch.zeros(self.num_domains, dtype=torch.long, device=self.device)
+        domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
+
+        frame_indices = torch.zeros(t.shape[0], dtype=torch.long, device=self.device)
+
+        phi = self.get_phasing_var(t)
 
         for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
             bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+
             if bezier_frame in ref_frames:
                 domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
             else:
                 raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
 
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+                bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+                bezier_frame_reflect = bezier_frame.replace("right", "TEMP").replace("left", "right").replace("TEMP",
+                                                                                                              "left")
+                if bezier_frame_reflect in ref_frames:
+                    domain_to_ref_frame_idx[domain_idx + self.num_domains] = ref_frames.index(bezier_frame_reflect)
+                else:
+                    raise ValueError(
+                        f"Bezier frame '{bezier_frame_reflect}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
         # Use advanced indexing to get frame indices for all envs at once
+        # if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
         frame_indices = domain_to_ref_frame_idx[domain_indices]
+        # else:
+        #     # Mask properly if using a half periodic trajectory
+        #     first_half_mask = phi < 0.5
+        #     frame_indices[first_half_mask] = domain_to_ref_frame_idx[domain_indices][first_half_mask]
 
         return frame_indices
 
@@ -357,6 +403,28 @@ class TrajectoryManager:
         # self.generate_axis_names()
 
         return remap_coeffs
+
+    def order_outputs(self, ordered_output_names: list[str]):
+        """
+        Order the outputs in this class to match the given order.
+        This will update the output_names list and the bezier tensor to match the new order.
+
+        Args:
+            ordered_output_names: a ordered list of output names.
+
+        Returns:
+            Nothing.
+        """
+        self.traj_data.output_names = ordered_output_names
+
+        for dom in self.traj_data.domain_data.values():
+            dom.bezier_tensor = self._create_bezier_tensor(dom.bezier_coeffs, self.traj_data.output_names)
+
+        for i, domain in enumerate(self.traj_data.domain_order):
+            self.bezier_coeffs[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+
+        # Regenerate the relabeling matrix
+        self.R_relabel = torch.from_numpy(self.relable_ee_stance_coeffs()).to(device=self.device, dtype=self.bezier_coeffs.dtype)
 
     @staticmethod
     def _compute_bezier_interp(derivative: int,         # 0 -> position, 1 -> velocity
@@ -478,13 +546,15 @@ class TrajectoryManager:
             if output_name.startswith('joint:'):
                 # Joint output
                 joint_name = output_name.split(':', 1)[1]
-                coeffs = bezier_coeffs['joints'][joint_name]
+                if joint_name not in bezier_coeffs['joints']:
+                    raise ValueError("Joint is missing from bezier coefficient!")
+                coefficient_lists.append(bezier_coeffs['joints'][joint_name])
             else:
                 # Frame output (format: "frame_name:axis")
                 frame_name, axis = output_name.split(':', 1)
-                coeffs = bezier_coeffs['frames'][frame_name][axis]
-
-            coefficient_lists.append(coeffs)
+                if frame_name not in bezier_coeffs['frames']:
+                    raise ValueError("Frame is missing from bezier coefficient!")
+                coefficient_lists.append(bezier_coeffs['frames'][frame_name][axis])
 
         # Stack into tensor: [num_outputs, degree+1]
         bezier_tensor = torch.tensor(coefficient_lists, dtype=torch.float32, device=self.device)
@@ -593,57 +663,85 @@ class TrajectoryManager:
     # TODO: Clean
     def relable_ee_stance_coeffs(self):
         """Build a relabelling matrix for end effector coefficients including the stance foot."""
-        R = np.eye(27)
-
+        R_dict = {}
         ##
         # COM
         ##
-        # com pos: [1,-1,1]
-        R[1, 1] = -1
+        R_dict["com:pos_x"] = 1
+        R_dict["com:pos_y"] = -1
+        R_dict["com:pos_z"] = 1
+
+        ##
+        # Left Foot
+        ##
+        R_dict["left_ankle_roll_link:pos_x"] = 1
+        R_dict["left_ankle_roll_link:pos_y"] = -1
+        R_dict["left_ankle_roll_link:pos_z"] = 1
+
+        R_dict["left_ankle_roll_link:ori_x"] = 1 #-1
+        R_dict["left_ankle_roll_link:ori_y"] = 1
+        R_dict["left_ankle_roll_link:ori_z"] = 1 #-1
+
+        ##
+        # Right Foot
+        ##
+        R_dict["right_ankle_roll_link:pos_x"] = 1
+        R_dict["right_ankle_roll_link:pos_y"] = -1
+        R_dict["right_ankle_roll_link:pos_z"] = 1
+
+        R_dict["right_ankle_roll_link:ori_x"] = 1 #-1
+        R_dict["right_ankle_roll_link:ori_y"] = 1
+        R_dict["right_ankle_roll_link:ori_z"] = 1 #-1
 
         ##
         # Pelvis
         ##
-        # pelvis: [-1,1,-1]
-        R[3, 3] = -1
-        R[5, 5] = -1
+        R_dict["pelvis_link:pos_x"] = 1
+        R_dict["pelvis_link:pos_y"] = -1
+        R_dict["pelvis_link:pos_z"] = 1
+
+        R_dict["pelvis_link:ori_x"] = -1
+        R_dict["pelvis_link:ori_y"] = 1
+        R_dict["pelvis_link:ori_z"] = -1
 
         ##
-        # Swing foot
+        # Arm Joints
         ##
-        # swing_foot_pos:[1,-1,1]
-        R[7, 7] = -1
-        # swing_foot_or: [-1,1,-1]
-        R[9, 9] = -1
-        R[11, 11] = -1
 
-        ##
-        # Stance Foot
-        ##
-        # stance_foot_pos: [1, -1, 1]
-        R[13, 13] = -1
-        # stance_foot_ori: [-1, 1, -1]
-        R[15, 15] = -1
-        R[17, 17] = -1
+        # Left
+        R_dict["joint:left_elbow_joint"] = 1
+        R_dict["joint:left_shoulder_pitch_joint"] = 1
+        R_dict["joint:left_shoulder_roll_joint"] = -1
+        R_dict["joint:left_shoulder_yaw_joint"] = 1
 
-        ##
-        # Joints
-        ##
-        # waist yaw
-        R[18, 18] = -1
+        # Right
+        R_dict["joint:right_elbow_joint"] = 1
+        R_dict["joint:right_shoulder_pitch_joint"] = 1
+        R_dict["joint:right_shoulder_roll_joint"] = -1
+        R_dict["joint:right_shoulder_yaw_joint"] = 1
 
-        #swap arm coeffs
-        arm_offset = 18 + 1
-        left_arm = arm_offset + np.array([0, 1, 2, 3])
-        right_arm = arm_offset + np.array([4, 5, 6, 7])
+        # Waist
+        R_dict["joint:waist_yaw_joint"] = -1
 
-        tmp = R[left_arm, :].copy()
-        R[left_arm, :] = R[right_arm, :]
-        R[right_arm, :] = tmp
 
-        # Sign flips: shoulder_roll, shoulder_yaw
-        flip_arm = arm_offset + np.array([1, 2, 5, 6])  # left/right roll/yaw
-        R[flip_arm, :] *= -1
+        R = np.zeros((27, 27))
+        for i, name in enumerate(self.get_output_names):
+            if name not in R_dict:
+                raise ValueError("No corresponding entry for an output name in relabeling matrix!"
+                                 f"Name: {name}.")
+
+            # Check if there is an associated right/left mirror in the output_names
+            # Determine the index of the mirror
+            mirror_name = name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+
+            if mirror_name in self.get_output_names:
+                # Find the index of the mirrored output
+                j = self.get_output_names.index(mirror_name)
+                # Set the relabeling: output[i] = R_dict[name] * input[j]
+                R[i, j] = R_dict[name]
+            else:
+                # No mirror exists, just apply sign flip to same index
+                R[i, i] = R_dict[name]
 
         return R
 
