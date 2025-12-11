@@ -361,7 +361,6 @@ class TrajectoryCommand(CommandTerm):
             # import pdb; pdb.set_trace()
             com_vel_local = _transfer_to_local_frame(com_vel_w, ref_frame_quat)
 
-            # TODO: Add to the outputs in the correct order
             self.y_act[:, output_idx:output_idx+3] = com_pos_local
             self.dy_act[:, output_idx:output_idx+3] = com_vel_local
             output_idx += 3
@@ -374,6 +373,12 @@ class TrajectoryCommand(CommandTerm):
                 idx: tensor of shape [num_bodies]
                 base_frame_pos: tensor of shape [3]
                 base_frame_quat: tensor of shape [4]
+
+            Returns:
+                frame_pos_rel_local: tensor of shape [N, num_bodies, 3]
+                frame_ori_rel: tensor of shape [N, num_bodies, 3]
+                frame_vel_local: tensor of shape [N, num_bodies, 3]
+                frame_ang_vel_local: tensor of shape [N, num_bodies, 3]
             """
             # TODO: Does this handle a tensor of idx correctly?
             base_frame_ori = get_euler_from_quat(base_frame_quat)
@@ -401,11 +406,9 @@ class TrajectoryCommand(CommandTerm):
                 frame_vel_local[:, i, :] = _transfer_to_local_frame(frame_lin_vel_w[:, i, :], base_frame_quat)
                 frame_ang_vel_local[:, i, :] = _transfer_to_local_frame(frame_ang_vel_w[:, i, :], base_frame_quat)
 
-            # TODO: Make sure the returned shape is [N, num_bodies, 3] for each
             return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
 
         if self.body_idx is not None:
-            # TODO: Does the root link need to be dealt with specially?
 
             body_pos_local, body_ori_local, body_vel_local, body_ang_vel_local = _get_pos_ori_vel_relative(
                 self.body_idx, ref_frame_pos_w, ref_frame_quat,)
@@ -415,7 +418,6 @@ class TrajectoryCommand(CommandTerm):
             ori_bodies = (self.body_type == 0) | (self.body_type == 2)
             num_ori_bodies = ori_bodies.sum()
 
-            # TODO: Make sure this is being added correctly
             # Add linear
             self.y_act[:, output_idx:output_idx+(3*num_pos_bodies)] = (
                 body_pos_local[:, pos_bodies, :].flatten(1))
@@ -437,7 +439,6 @@ class TrajectoryCommand(CommandTerm):
             joint_pos = self.robot.data.joint_pos[:, self.joint_idx]
             joint_vel = self.robot.data.joint_vel[:, self.joint_idx]
 
-            # TODO: Make sure this is being added correctly
             self.y_act[:, output_idx:output_idx+(joint_pos.shape[1])] = joint_pos
             self.dy_act[:, output_idx:output_idx+(joint_vel.shape[1])] = joint_vel
 

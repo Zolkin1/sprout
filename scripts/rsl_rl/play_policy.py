@@ -10,7 +10,7 @@ import cli_args
 import torch
 
 # Import plot_trajectories functions
-from plot_trajectories import plot_trajectories, plot_hzd_trajectories
+from plot_trajectories import plot_trajectories #, plot_hzd_trajectories
 from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
 
@@ -163,7 +163,7 @@ def extract_reference_trajectory(env, log_vars, command_name):
             else:
                 raise ValueError("[Extract Reference] Could not find the axis name!")
         else:
-            raise ValueError("[Extract Reference] No variable matching the given name found in the command!")
+            raise ValueError(f"[Extract Reference] No variable matching the given name [{var}] found in the command!")
     return results
 
 
@@ -346,29 +346,25 @@ def main():
 
     # Dynamically generate log variables based on the command type
     log_vars = [
-        'y_out',
-        'dy_out',
+        'y_des',
+        'dy_des',
         'base_velocity',
-        'cur_swing_time',
-        "stance_foot_pos",
-        "stance_foot_ori",
         'y_act',
         'dy_act',
         'v',
         'vdot',
-        'stance_foot_pos_0',
-        'stance_foot_ori_0',
-        'current_domains',
-        'phase_var',
-        'domain_durations',
-        'gait_indices',
+        'ordered_output_names',
+        # 'current_domains',
+        # 'phase_var',
+        # 'domain_durations',
+        # 'gait_indices',
     ]
     
     # Get the command term to determine what type of trajectory we're using
     if "lip" in args_cli.env_type:
         command_name = "hlip_ref"
     elif "clf" in args_cli.env_type:
-        command_name = "hzd_ref"
+        command_name = "traj_ref"
     elif args_cli.env_type == "vanilla":
         raise ValueError(f"Need to implement vanilla in the play policy!")
     else:
@@ -379,21 +375,21 @@ def main():
     # Add dynamic error metrics based on the command type
     trajectory_type = 'end_effector'
     
-    if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
-        # End effector trajectory case - add axis error metrics
-        trajectory_type = 'end_effector'
-        for axis_info in ref.ee_config.axis_names:
-            log_vars.append(axis_info['name'])
-        # Also log the axis names for plotting
-        log_vars.append('axis_names')
-    elif hasattr(ref,'gait_config'):
-        trajectory_type = 'end_effector'
-        key = list(ref.gait_config._gait_cache.keys())[0]
-        for axis_info in ref.gait_config._gait_cache[key].axis_names:
-            log_vars.append(axis_info['name'])
-        
-        # Also log the axis names for plotting
-        log_vars.append('axis_names')
+    # if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
+    #     # End effector trajectory case - add axis error metrics
+    #     trajectory_type = 'end_effector'
+    #     for axis_info in ref.ee_config.axis_names:
+    #         log_vars.append(axis_info['name'])
+    #     # Also log the axis names for plotting
+    #     log_vars.append('axis_names')
+    # elif hasattr(ref,'gait_config'):
+    #     trajectory_type = 'end_effector'
+    #     key = list(ref.gait_config._gait_cache.keys())[0]
+    #     for axis_info in ref.gait_config._gait_cache[key].axis_names:
+    #         log_vars.append(axis_info['name'])
+    #
+    #     # Also log the axis names for plotting
+    #     log_vars.append('axis_names')
 
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
@@ -421,7 +417,7 @@ def main():
             
             # Log data
             if args_cli.log_data:
-                data = extract_reference_trajectory(env, log_vars,command_name)
+                data = extract_reference_trajectory(env, log_vars, command_name)
                 logger.log_from_dict(data)
 
         timestep += 1
