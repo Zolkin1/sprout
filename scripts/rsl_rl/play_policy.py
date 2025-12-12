@@ -19,6 +19,7 @@ SIM_ENVIRONMENTS = {
     "lip_clf": "G1-lip-ref-play",
     "walking_clf": "G1-walking-clf-play",
     "running_clf": "G1-running-clf-play",
+    "waving_clf": "G1-waving-clf-play",
 }
 
 class DataLogger:

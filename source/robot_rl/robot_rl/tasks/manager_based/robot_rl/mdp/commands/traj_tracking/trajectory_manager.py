@@ -11,7 +11,7 @@ from hid import device
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
-    FULL_PERIODIC = "full_periodic"
+    FULL_PERIODIC = "periodic"
     EPISODIC = "episodic"
     PERPETUAL = "perpetual"
 
@@ -96,17 +96,22 @@ class TrajectoryManager:
         import shutil
 
         # Get the robot_rl root directory and go two folders above it
-        root = os.environ.get("ROBOT_RL_ROOT", os.getcwd())
-        hf_base = os.path.join(root, "..", "..")
+        root = os.getcwd()
+        hf_base = os.path.join(root)
         hf_base = os.path.abspath(hf_base)  # Resolve to absolute path
 
         # Create cache directory in the hf folder
-        cache_dir = os.path.join(hf_base, "hf", hf_repo.replace("/", "_"))
+        cache_dir = os.path.join(hf_base, "hf")
         os.makedirs(cache_dir, exist_ok=True)
+
+        hf_folder_path = str(Path(hf_path).parent)
+
+        # The local path to the trajectory folder
+        local_folder_path = os.path.join(cache_dir, hf_folder_path)
 
         # Extract filename from hf_path
         filename = os.path.basename(hf_path)
-        local_traj_path = os.path.join(cache_dir, filename)
+        local_traj_path = os.path.join(local_folder_path, filename)
 
         # Check if trajectory already exists locally
         if os.path.exists(local_traj_path):
@@ -115,20 +120,16 @@ class TrajectoryManager:
 
         # Download from Hugging Face
         try:
-            from huggingface_hub import hf_hub_download
+            from huggingface_hub import snapshot_download
 
-            print(f"Downloading trajectory {hf_path} from {hf_repo}...")
+            print(f"Downloading trajectory library {hf_path} from {hf_repo}...")
 
-            downloaded_path = hf_hub_download(
+            # Download the entire repo or specific folder
+            snapshot_download(
                 repo_id=hf_repo,
-                filename=hf_path,
-                cache_dir=cache_dir,
+                allow_patterns=f"{hf_path}/*",  # Download only files in the specified folder
                 local_dir=cache_dir,
             )
-
-            # If downloaded to a different location, copy to our expected path
-            if downloaded_path != local_traj_path:
-                shutil.copy2(downloaded_path, local_traj_path)
 
             print(f"Successfully downloaded trajectory to {local_traj_path}")
             return local_traj_path

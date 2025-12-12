@@ -17,6 +17,8 @@ from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
 import math
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
+from .g1_trajopt_obs import G1TrajOptObservationsCfg
+from .g1_trajopt_reward import G1TrajOptCLFRewards
 
 ##
 # Lyapunov Weights
@@ -70,16 +72,6 @@ WALKING_R_weights = [
 @configclass
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
-    # hzd_ref = GaitLibraryHZDCommandCfg(
-    #     trajectory_type="end_effector",
-    #     gait_library_path="source/robot_rl/robot_rl/assets/robots/walking_10_13",
-    #     config_name="walking",
-    #     gait_velocity_ranges=(0.0, 1.0, 0.1),
-    #
-    #     num_outputs=27,
-    #     Q_weights=WALKING_Q_weights,
-    #     R_weights=WALKING_R_weights,
-    # )
     traj_ref = TrajectoryCommandCfg(
         contact_bodies = [".*_ankle_roll_link"],
 
@@ -106,122 +98,13 @@ class G1WalkingCLFCurriculumCfg:
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
 
-##
-# Observations
-##
-@configclass
-class G1TrajOptObservationsCfg():
-    """Observation specifications for the G1 Flat environment."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Observations for critic group."""
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-        )
-        # root_quat = ObsTerm(func=mdp.root_quat)
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
-
-        contact_state = ObsTerm(
-            func=mdp.contact_state,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-        )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
-
-        height_scan = None  # Removed - not supported yet
-
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
-
-
-##
-# Rewards
-##
-@configclass
-class G1WalkingCLFRewards(HumanoidRewardCfg):
-    """Rewards specific to LIP Model"""
-
-    holonomic_constraint = RewTerm(
-        func=mdp.holonomic_constraint,
-        weight=4.0,
-        params={
-            "command_name": "traj_ref",
-            "z_offset": 0.036,
-        }
-    )
-
-    holonomic_constraint_vel = RewTerm(
-        func=mdp.holonomic_constraint_vel,
-        weight=2.0,
-        params={
-            "command_name": "traj_ref",
-        }
-    )
-
-
-    clf_reward = RewTerm(
-        func=mdp.clf_reward,
-        weight=10.0,
-        params={
-            "command_name": "traj_ref",
-            "max_eta_err": 0.25,
-        }
-    )
-
-    clf_decreasing_condition = RewTerm(
-        func=mdp.clf_decreasing_condition,
-        weight=-2.0,
-        params={
-            "command_name": "traj_ref",
-            "alpha": 0.5,
-            "eta_max": 0.2,
-            "eta_dot_max":0.3,
-        }
-    )
 
 @configclass
 class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 environment with gait library."""
     commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
     observations: G1TrajOptObservationsCfg = G1TrajOptObservationsCfg()
-    rewards: G1WalkingCLFRewards = G1WalkingCLFRewards()
+    rewards: G1TrajOptCLFRewards = G1TrajOptCLFRewards()
     curriculum: G1WalkingCLFCurriculumCfg = G1WalkingCLFCurriculumCfg()
 
     def __post_init__(self):
@@ -242,7 +125,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (0, 0) # TODO: put back: (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
 
-        self.commands.gait_period.gait_period_range = (0.71, 0.71)    # TODO: Remove?
+        self.commands.gait_period = None
 
         ##
         # Randomization

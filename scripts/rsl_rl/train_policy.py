@@ -15,6 +15,7 @@ ENVIRONMENTS = {
     "walking_clf": "G1-walking-clf",
     "walking_clf_ec": "G1-walking-clf-ec",
     "running_clf": "G1-running-clf",
+    "waving_clf": "G1-waving-clf",
 }
 
 EXPERIMENT_NAMES = {
@@ -27,6 +28,7 @@ EXPERIMENT_NAMES = {
     "walking_clf": "walking_clf",
     "walking_clf_ec": "walking_clf",
     "running_clf": "running_clf",
+    "waving_clf": "waving_clf",
 }
 
 
