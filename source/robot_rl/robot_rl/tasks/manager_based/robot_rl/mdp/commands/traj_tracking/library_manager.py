@@ -132,6 +132,9 @@ class LibraryManager:
     def get_reference_frames(self):
         return self.ref_frames
 
+    def get_num_domains(self):
+        return self.trajectory_managers[0].get_num_domains()
+
     def get_phasing_var(self, conditioner: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         indices = self.get_traj_indices(conditioner)
 

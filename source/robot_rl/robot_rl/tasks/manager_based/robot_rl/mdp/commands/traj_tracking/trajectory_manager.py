@@ -280,6 +280,9 @@ class TrajectoryManager:
     def get_output_names(self):
         return self.traj_data.output_names
 
+    def get_num_domains(self):
+        return self.expanded_num_domains
+
     def get_output(self, t: torch.Tensor     # [N]
                           ) -> torch.Tensor:
         """

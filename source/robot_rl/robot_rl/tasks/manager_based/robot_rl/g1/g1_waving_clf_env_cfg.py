@@ -43,14 +43,14 @@ WAVING_Q_weights = [
     150.0,    1.0,       # stance_ori_pitch pos, vel
     400.0,    10.0,     # swing_ori_yaw pos, vel
     100.0,    1.0,      # waist_yaw pos, vel
-    40.0,1.0, #left shoulder pitch
-    40.0,1.0, #left shoulder roll
+    50.0,1.0, #left shoulder pitch
+    50.0,1.0, #left shoulder roll
     50.0,1.0, #left shoulder yaw
-    30.0,1.0, #left elbow
-    40.0,1.0, #right shoulder pitch
-    40.0,1.0, #right shoulder roll
+    50.0,1.0, #left elbow
+    50.0,1.0, #right shoulder pitch
+    50.0,1.0, #right shoulder roll
     50.0,1.0, #right shoulder yaw
-    30.0,1.0, #right elbow
+    50.0,1.0, #right elbow
 ]
 
 
@@ -125,16 +125,19 @@ class G1WavingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Randomization
         ##
-        self.events.push_robot.params["velocity_range"] = {
-            "x": (-1, 1),
-            "y": (-1, 1),
-            "roll": (-0.4, 0.4),
-            "pitch": (-0.4, 0.4),
-            "yaw": (-0.4, 0.4),
-        }
-        self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
-        self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
-        self.events.add_base_mass.params["operation"] = "scale"
+        # self.events.push_robot.params["velocity_range"] = {
+        #     "x": (-1, 1),
+        #     "y": (-1, 1),
+        #     "roll": (-0.4, 0.4),
+        #     "pitch": (-0.4, 0.4),
+        #     "yaw": (-0.4, 0.4),
+        # }
+        self.events.push_robot = None
+
+        # self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
+        # self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
+        # self.events.add_base_mass.params["operation"] = "scale"
+        self.events.add_base_mass = None
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
@@ -167,6 +170,7 @@ class G1WavingCLFEnvCfg(HumanoidEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
+        # self.rewards.clf_decreasing_condition = None
 
         ##
         # Terminations

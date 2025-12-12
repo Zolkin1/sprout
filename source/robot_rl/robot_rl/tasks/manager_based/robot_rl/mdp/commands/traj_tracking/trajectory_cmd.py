@@ -303,6 +303,12 @@ class TrajectoryCommand(CommandTerm):
         # Check if the domains changed
         changed = new_domains != self.current_domain
 
+        # Note that domains never change for full periodic single domain trajectories, but I think we still want to update the position.
+        # The two options are (1) continually updating the position while in contact, (2) try to check based on the phasing variable
+        # TODO: Come back to this to see if this is the best way to do this. For now using option (1)
+        if self.manager.get_num_domains() == 1:
+            changed[:] = True
+
         # Update the list of current domains
         self.current_domain = new_domains
 
