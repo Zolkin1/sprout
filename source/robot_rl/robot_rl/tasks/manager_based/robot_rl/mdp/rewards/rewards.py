@@ -43,7 +43,7 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
     max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
 
     # reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
-    reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (100*max_clf))
+    reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (50*max_clf))
     return reward
 
 

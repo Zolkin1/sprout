@@ -11,6 +11,8 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensorCfg
 
 # TODO: Remove all of these dependencies
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (  # Inherit from the base envs
@@ -18,6 +20,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ( 
     LocomotionVelocityRoughEnvCfg,
     ObservationsCfg,
     RewardsCfg,
+    MySceneCfg,
 )
 
 from . import mdp
@@ -37,6 +40,22 @@ class HumanoidCommandsCfg(CommandsCfg):
     # Command for the set period
     gait_period = mdp.commands.GaitPeriodCfg(gait_period_range=(0.8, 0.8), resampling_time_range=(10.0, 10.0))
 
+# @configclass
+# class HumanoidSceneCfg(MySceneCfg):
+#     """Scene specifications for the MDP."""
+#     pass
+
+@configclass
+class HumanoidTerminationCfg:
+    """Handle the terminations."""
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    base_contact = None
+    base_height = DoneTerm(
+        func=mdp.root_height_below_minimum,
+        params={
+            "minimum_height": 0.25,
+        }
+    )
 
 @configclass
 class HumanoidObservationsCfg(ObservationsCfg):
@@ -200,8 +219,10 @@ class HumanoidRewardCfg:
 ##
 @configclass
 class HumanoidEnvCfg(LocomotionVelocityRoughEnvCfg):
+    # scene: HumanoidSceneCfg = HumanoidSceneCfg()
     # rewards: HumanoidRewardCfg = HumanoidRewardCfg()
     observations: HumanoidObservationsCfg = HumanoidObservationsCfg()
     events: HumanoidEventsCfg = HumanoidEventsCfg()
     actions: HumanoidActionsCfg = HumanoidActionsCfg()
     commands: HumanoidCommandsCfg = HumanoidCommandsCfg()
+    terminations: HumanoidTerminationCfg = HumanoidTerminationCfg()

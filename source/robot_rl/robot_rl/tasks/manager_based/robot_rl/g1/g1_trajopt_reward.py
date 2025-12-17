@@ -3,6 +3,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
                                                                     HumanoidRewardCfg)
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from isaaclab.managers import SceneEntityCfg
 
 ##
 # Rewards
@@ -47,4 +48,19 @@ class G1TrajOptCLFRewards(HumanoidRewardCfg):
             "eta_max": 0.2,
             "eta_dot_max":0.3,
         }
+    )
+
+    # Penalize unwanted self collisions
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    r"^(?!left_ankle_roll_link$)(?!right_ankle_roll_link$)(?!left_wrist_yaw_link$)(?!right_wrist_yaw_link$).+$"
+                ],
+            ),
+            "threshold": 1.0,
+        },
     )

@@ -516,6 +516,9 @@ class TrajectoryCommand(CommandTerm):
         for i, output in enumerate(self.ordered_output_names):
             self.metrics[output] = torch.abs(self.y_des[:, i] - self.y_act[:, i])
 
+        for i, output in enumerate(self.ordered_output_names):
+            self.metrics[output + "_vel"] = torch.abs(self.dy_des[:, i] - self.dy_act[:, i])
+
     def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[int]]:
         """
         Parse the output names to indices to be used for getting data from the robot in sim.

@@ -30,19 +30,19 @@ BOWING_Q_weights["com:pos_x"] = [5.0, 1.0]
 BOWING_Q_weights["com:pos_y"] = [5.0, 1.0]
 BOWING_Q_weights["com:pos_z"] = [5.0, 1.0]
 
-BOWING_Q_weights["left_ankle_roll_link:pos_x"] = [10.0, 1.0]
-BOWING_Q_weights["left_ankle_roll_link:pos_y"] = [10.0, 1.0]
-BOWING_Q_weights["left_ankle_roll_link:pos_z"] = [10.0, 1.0]
-BOWING_Q_weights["left_ankle_roll_link:ori_x"] = [10.0, 1.0]
-BOWING_Q_weights["left_ankle_roll_link:ori_y"] = [10.0, 1.0]
-BOWING_Q_weights["left_ankle_roll_link:ori_z"] = [10.0, 1.0]
+BOWING_Q_weights["left_ankle_roll_link:pos_x"] = [10.0, 2.0]
+BOWING_Q_weights["left_ankle_roll_link:pos_y"] = [10.0, 2.0]
+BOWING_Q_weights["left_ankle_roll_link:pos_z"] = [10.0, 2.0]
+BOWING_Q_weights["left_ankle_roll_link:ori_x"] = [10.0, 2.0]
+BOWING_Q_weights["left_ankle_roll_link:ori_y"] = [10.0, 2.0]
+BOWING_Q_weights["left_ankle_roll_link:ori_z"] = [10.0, 2.0]
 
-BOWING_Q_weights["right_ankle_roll_link:pos_x"] = [10.0, 1.0]
-BOWING_Q_weights["right_ankle_roll_link:pos_y"] = [10.0, 1.0]
-BOWING_Q_weights["right_ankle_roll_link:pos_z"] = [10.0, 1.0]
-BOWING_Q_weights["right_ankle_roll_link:ori_x"] = [10.0, 1.0]
-BOWING_Q_weights["right_ankle_roll_link:ori_y"] = [10.0, 1.0]
-BOWING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 1.0]
+BOWING_Q_weights["right_ankle_roll_link:pos_x"] = [10.0, 2.0]
+BOWING_Q_weights["right_ankle_roll_link:pos_y"] = [10.0, 2.0]
+BOWING_Q_weights["right_ankle_roll_link:pos_z"] = [10.0, 2.0]
+BOWING_Q_weights["right_ankle_roll_link:ori_x"] = [10.0, 2.0]
+BOWING_Q_weights["right_ankle_roll_link:ori_y"] = [10.0, 2.0]
+BOWING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 2.0]
 
 BOWING_Q_weights["pelvis_link:pos_x"] = [5.0, 1.0]
 BOWING_Q_weights["pelvis_link:pos_y"] = [5.0, 1.0]
@@ -61,19 +61,19 @@ BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [3.0, 1.0]
 BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [3.0, 1.0]
 BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [3.0, 1.0]
 
-BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [5.0, 1.0]
-BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [5.0, 1.0]
-BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [5.0, 1.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [5.0, 1.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [5.0, 1.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [5.0, 1.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [5.0, 3.0]
 
-BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [5.0, 1.0]
-BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [5.0, 1.0]
-BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [5.0, 1.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [5.0, 1.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [5.0, 1.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [5.0, 1.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [5.0, 3.0]
 # BOWING_Q_weights["com:pos_x"] = [25.0, 250.0]
 # BOWING_Q_weights["com:pos_y"] = [500.0, 20.0]
 # BOWING_Q_weights["com:pos_z"] = [250.0, 10.0]
@@ -339,13 +339,13 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
             "eta_max": 0.25,
             "eta_dot_max": 0.3,
         }
-        self.rewards.clf_decreasing_condition.weight = -1
+        self.rewards.clf_decreasing_condition.weight = 0 #-1
         # self.rewards.clf_decreasing_condition = None
 
         ##
         # Terminations
         ##
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
+        # self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
 
         ##
         # Curriculum

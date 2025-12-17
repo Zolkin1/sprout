@@ -29,6 +29,11 @@ class G1TrajOptObservationsCfg():
         sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
         cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
