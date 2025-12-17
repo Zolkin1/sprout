@@ -167,6 +167,32 @@ if not _registered:
         }
     )
 
+    ## =========================================
+    # Bowing Trajectory Optimization
+    ## =========================================
+    gym.register(
+        id="G1-bow_forward-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        }
+    )
+
+    # Play
+    gym.register(
+        id="G1-bow_forward-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        }
+    )
+
     _registered = True
 
 

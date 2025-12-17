@@ -122,12 +122,12 @@ class TrajectoryManager:
         try:
             from huggingface_hub import snapshot_download
 
-            print(f"Downloading trajectory library {hf_path} from {hf_repo}...")
+            print(f"Downloading trajectory folder {hf_folder_path} from {hf_repo}...")
 
-            # Download the entire repo or specific folder
+            # Download the entire folder containing the trajectory
             snapshot_download(
                 repo_id=hf_repo,
-                allow_patterns=f"{hf_path}/*",  # Download only files in the specified folder
+                allow_patterns=f"{hf_folder_path}/*",  # Download all files in the folder
                 local_dir=cache_dir,
             )
 
@@ -386,6 +386,7 @@ class TrajectoryManager:
                     elif frame in reflect_domain_contact_frames:
                         mask = (domain_indicies == domain_idx) & (phi >= 0.5)
 
+                # mask = mask.squeeze()
                 if mask is not None:
                     contact_states[mask, i] = 1.0
 
@@ -423,10 +424,6 @@ class TrajectoryManager:
         # Create a mapping tensor: domain_idx -> ref_frame_idx
         # This is done once per call, but it's O(num_domains) not O(num_envs)
         domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
-
-        frame_indices = torch.zeros(t.shape[0], dtype=torch.long, device=self.device)
-
-        phi = self.get_phasing_var(t)
 
         for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
             bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
@@ -770,6 +767,25 @@ class TrajectoryManager:
         R_dict["pelvis_link:ori_z"] = -1
 
         ##
+        # Arm Bodies
+        ##
+        R_dict["right_wrist_yaw_link:pos_x"] = 1
+        R_dict["right_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
+        R_dict["right_wrist_yaw_link:pos_z"] = 1
+
+        R_dict["right_wrist_yaw_link:ori_x"] = 1
+        R_dict["right_wrist_yaw_link:ori_y"] = 1
+        R_dict["right_wrist_yaw_link:ori_z"] = 1
+
+        R_dict["left_wrist_yaw_link:pos_x"] = 1
+        R_dict["left_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
+        R_dict["left_wrist_yaw_link:pos_z"] = 1
+
+        R_dict["left_wrist_yaw_link:ori_x"] = 1
+        R_dict["left_wrist_yaw_link:ori_y"] = 1
+        R_dict["left_wrist_yaw_link:ori_z"] = 1
+
+        ##
         # Arm Joints
         ##
 
@@ -789,7 +805,7 @@ class TrajectoryManager:
         R_dict["joint:waist_yaw_joint"] = -1
 
 
-        R = np.zeros((27, 27))
+        R = np.zeros((len(self.get_output_names), len(self.get_output_names)))
         for i, name in enumerate(self.get_output_names):
             if name not in R_dict:
                 raise ValueError("No corresponding entry for an output name in relabeling matrix!"

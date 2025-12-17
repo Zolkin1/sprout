@@ -101,17 +101,22 @@ class TrajectoryCommand(CommandTerm):
         self.clf = CLF(
             self.cfg.num_outputs, self.env.cfg.sim.dt,
             batch_size=self.num_envs,
-            Q_weights=np.array(self.cfg.Q_weights),
-            R_weights=np.array(self.cfg.R_weights),
+            ordered_output_names=self.ordered_output_names,
+            Q_weights=self.cfg.Q_weights,
+            R_weights=self.cfg.R_weights,
             device=self.device
         )
 
+        self.phasing_var = 0
+
     def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
         if self.manager_type == "trajectory":
-            return self.manager.get_phasing_var(t)
+            self.phasing_var = self.manager.get_phasing_var(t)
+            return self.phasing_var
         elif self.manager_type == "library":
             conditioner = self.get_conditioner_var()
-            return self.manager.get_phasing_var(conditioner, t)
+            self.phasing_var = self.manager.get_phasing_var(conditioner, t)
+            return self.phasing_var
         else:
             raise ValueError(f"Cannot get phasing variable for manager of type {self.manager_type}.")
 
@@ -371,14 +376,15 @@ class TrajectoryCommand(CommandTerm):
             self.dy_act[:, output_idx:output_idx+3] = com_vel_local
             output_idx += 3
 
-        def _get_pos_ori_vel_relative(idx, base_frame_pos, base_frame_quat):
+        def _get_pos_ori_vel_relative(ref_frame_pos, ref_frame_quat, frame_pos, frame_quad,
+                                      frame_lin_vel_w, frame_ang_vel_w):
             """
             Compute the position, orientation, and velocity relative to the reference frame.
 
             Args:
                 idx: tensor of shape [num_bodies]
-                base_frame_pos: tensor of shape [3]
-                base_frame_quat: tensor of shape [4]
+                ref_frame_pos: tensor of shape [3]
+                ref_frame_quat: tensor of shape [4]
 
             Returns:
                 frame_pos_rel_local: tensor of shape [N, num_bodies, 3]
@@ -386,38 +392,39 @@ class TrajectoryCommand(CommandTerm):
                 frame_vel_local: tensor of shape [N, num_bodies, 3]
                 frame_ang_vel_local: tensor of shape [N, num_bodies, 3]
             """
-            # TODO: Does this handle a tensor of idx correctly?
-            base_frame_ori = get_euler_from_quat(base_frame_quat)
+            base_frame_ori = get_euler_from_quat(ref_frame_quat)
 
-            frame_pos = self.robot.data.body_pos_w[:, idx, :]
-            frame_quat = self.robot.data.body_quat_w[:, idx, :]
-            frame_ori = torch.zeros(base_frame_pos.shape[0], len(idx), 3, device=base_frame_pos.device)
+            num_idx = len(self.body_idx)
+
+            frame_ori = torch.zeros(ref_frame_pos.shape[0], num_idx, 3, device=ref_frame_pos.device)
             frame_pos_rel = torch.zeros(frame_pos.shape, device=frame_pos.device)
             frame_pos_rel_local = torch.zeros(frame_pos.shape, device=frame_pos.device)
             frame_ori_rel = frame_ori
-            for i in range(len(idx)):
+            for i in range(num_idx):
                 frame_ori[:, i, :] = get_euler_from_quat(frame_quat[:, i, :])
-                frame_pos_rel[:, i, :] = frame_pos[:, i, :] - base_frame_pos
+                frame_pos_rel[:, i, :] = frame_pos[:, i, :] - ref_frame_pos
 
-                frame_pos_rel_local[:, i, :] = _transfer_to_local_frame(frame_pos_rel[:, i, :], base_frame_quat)
+                frame_pos_rel_local[:, i, :] = _transfer_to_local_frame(frame_pos_rel[:, i, :], ref_frame_quat)
 
                 frame_ori_rel[:, i, 2] = wrap_to_pi(frame_ori_rel[:, i, 2] - base_frame_ori[:, 2])
 
-            frame_lin_vel_w = self.robot.data.body_lin_vel_w[:, idx, :]
-            frame_ang_vel_w = self.robot.data.body_ang_vel_w[:, idx, :]
-
             frame_vel_local = torch.zeros(frame_lin_vel_w.shape, device=frame_lin_vel_w.device)
             frame_ang_vel_local = torch.zeros(frame_ang_vel_w.shape, device=frame_ang_vel_w.device)
-            for i in range(len(idx)):
-                frame_vel_local[:, i, :] = _transfer_to_local_frame(frame_lin_vel_w[:, i, :], base_frame_quat)
-                frame_ang_vel_local[:, i, :] = _transfer_to_local_frame(frame_ang_vel_w[:, i, :], base_frame_quat)
+            for i in range(num_idx):
+                frame_vel_local[:, i, :] = _transfer_to_local_frame(frame_lin_vel_w[:, i, :], ref_frame_quat)
+                frame_ang_vel_local[:, i, :] = _transfer_to_local_frame(frame_ang_vel_w[:, i, :], ref_frame_quat)
 
             return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
 
+        # Bodies
         if self.body_idx is not None:
+            frame_pos = self.robot.data.body_pos_w[:, self.body_idx, :]
+            frame_quat = self.robot.data.body_quat_w[:, self.body_idx, :]
+            frame_lin_vel_w = self.robot.data.body_lin_vel_w[:, self.body_idx, :]
+            frame_ang_vel_w = self.robot.data.body_ang_vel_w[:, self.body_idx, :]
 
             body_pos_local, body_ori_local, body_vel_local, body_ang_vel_local = _get_pos_ori_vel_relative(
-                self.body_idx, ref_frame_pos_w, ref_frame_quat,)
+                ref_frame_pos_w, ref_frame_quat, frame_pos, frame_quat, frame_lin_vel_w, frame_ang_vel_w)
 
             pos_bodies = (self.body_type == 1) | (self.body_type == 2)
             num_pos_bodies = pos_bodies.sum()
@@ -478,7 +485,7 @@ class TrajectoryCommand(CommandTerm):
     def _update_command(self):
         """Update the command values."""
         # Time in each env
-        t = self.env.sim.current_time * torch.ones(self.num_envs, device=self.device)
+        t = self.env.episode_length_buf * self.env.step_dt
 
         # Get conditioning variables (velocity, etc...)
         # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
@@ -521,6 +528,7 @@ class TrajectoryCommand(CommandTerm):
             body_idx: List of body indices (or None if no bodies)
             use_com: True if CoM is used, False otherwise
             ordered_output_names: List of output names in the order they appear in compute_measured_output (COM, bodies, joints)
+            body_type_list: List indicating type of each body (0=ori only, 1=pos only, 2=both)
         """
         joint_indices = []
         joint_names_list = []
@@ -569,7 +577,7 @@ class TrajectoryCommand(CommandTerm):
                 if frame_name in added_bodies:
                     continue
 
-                # Get the index of this body
+                # Try to get the index of this body
                 if frame_name in self.robot.body_names:
                     body_idx = self.robot.body_names.index(frame_name)
                     body_indices.append(body_idx)
@@ -598,6 +606,7 @@ class TrajectoryCommand(CommandTerm):
                 if "ori" in btype:
                     ordered_output_names.append(f"{body_name}:{btype}")
 
+        # Build body_type_list for bodies
         for body_name in body_names_list:
             ori = False
             pos = False

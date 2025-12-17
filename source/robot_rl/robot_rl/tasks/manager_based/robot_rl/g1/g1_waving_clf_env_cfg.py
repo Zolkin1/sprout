@@ -52,7 +52,35 @@ WAVING_Q_weights = [
     50.0,1.0, #right shoulder yaw
     50.0,1.0, #right elbow
 ]
-
+# WAVING_Q_weights = [
+#     5.0,    5.0,      # com_x pos, vel
+#     10.0,   1.0,      # com_y pos, vel
+#     10.0,   1.0,      # com_z pos, vel
+#     1.0,    1.0,     # pelvis_roll pos, vel
+#     1.0,    1.0,     # pelvis_pitch pos, vel
+#     1.0,    1.0,     # pelvis_yaw pos, vel
+#     10.0,   3.0,       # swing_x pos, vel
+#     10.0,   3.0,      # swing_y pos, vel
+#     10.0,   3.0,       # swing_z pos, vel
+#     1.0,    1.0,       # swing_ori_roll pos, vel
+#     1.0,    1.0,       # swing_ori_pitch pos, vel
+#     1.0,    1.0,     # swing_ori_yaw pos, vel
+#     10.0,   1.0,       # stance_x pos, vel
+#     10.0,   1.0,      # stance_y pos, vel
+#     10.0,   1.0,       # stance_z pos, vel
+#     1.0,    1.0,       # stance_ori_roll pos, vel
+#     1.0,    1.0,       # stance_ori_pitch pos, vel
+#     1.0,    1.0,     # swing_ori_yaw pos, vel
+#     1.0,    1.0,      # waist_yaw pos, vel
+#     5.0,    1.0, #left shoulder pitch
+#     5.0,    1.0, #left shoulder roll
+#     5.0,    1.0, #left shoulder yaw
+#     5.0,    1.0, #left elbow
+#     5.0,    1.0, #right shoulder pitch
+#     5.0,    1.0, #right shoulder roll
+#     5.0,    1.0, #right shoulder yaw
+#     5.0,    1.0, #right elbow
+# ]
 
 WAVING_R_weights = [
         0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort

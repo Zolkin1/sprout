@@ -34,7 +34,7 @@ class G1TrajOptCLFRewards(HumanoidRewardCfg):
         weight=10.0,
         params={
             "command_name": "traj_ref",
-            "max_eta_err": 0.25,
+            "max_eta_err": 0.8, #0.25,
         }
     )
 

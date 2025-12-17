@@ -325,14 +325,13 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 plt.savefig(os.path.join(save_dir, f'base_velocity_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
-        if 'phase_var' in processed_data:
-            phase_var = processed_data['phase_var']
-            domain_durations = processed_data['domain_durations']
-            current_domains = processed_data['current_domains']
-            gait_indices = processed_data['gait_indices']
-            vars = [phase_var,domain_durations,current_domains,gait_indices]
-            n_dims = 4
-            labels = ['phase var','domain durations', 'current domains','gait indices']
+        if 'phasing_var' in processed_data:
+            phase_var = processed_data['phasing_var']
+            # domain_durations = processed_data['domain_durations']
+            current_domains = processed_data['current_domain']
+            vars = [phase_var,current_domains]
+            n_dims = 2
+            labels = ['phasing var', 'current domain',]
             fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3))
             fig.suptitle(f'Domain Info (Env {env_id})', fontsize=16)
             for i in range(n_dims):

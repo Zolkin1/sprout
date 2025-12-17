@@ -20,6 +20,7 @@ SIM_ENVIRONMENTS = {
     "walking_clf": "G1-walking-clf-play",
     "running_clf": "G1-running-clf-play",
     "waving_clf": "G1-waving-clf-play",
+    "bow_forward_clf": "G1-bow_forward-clf-play",
 }
 
 class DataLogger:
@@ -355,8 +356,8 @@ def main():
         'v',
         'vdot',
         'ordered_output_names',
-        # 'current_domains',
-        # 'phase_var',
+        'current_domain',
+        'phasing_var',
         # 'domain_durations',
         # 'gait_indices',
     ]

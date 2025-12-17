@@ -86,7 +86,9 @@ RL Task list:
 | `lip_clf`     |     G1     | :white_check_mark: | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
 | `walking_clf` |     G1     | :white_check_mark: | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
 | `running_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
- | `waving_clf` | G1 | No | Robot stands still and waves. Uses trajectories and CLFs. |
+| `waving_clf` | G1 | No | Robot stands still and waves. Uses trajectories and CLFs. |
+| `bow_forward_clf` | G1 | No | Robot bows forward then holds its position. |
+
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
 

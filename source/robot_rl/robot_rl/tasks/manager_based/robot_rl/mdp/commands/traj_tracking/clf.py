@@ -1,3 +1,4 @@
+from typing import Dict
 import torch
 import numpy as np
 from scipy.linalg import solve_continuous_are
@@ -14,9 +15,10 @@ class CLF:
         n_outputs: int,
         sim_dt: float,
         batch_size: int,
+        ordered_output_names: list[str],
         device: torch.device = None,
-        Q_weights: np.ndarray = None,
-        R_weights: np.ndarray = None,
+        Q_weights: Dict = None,
+        R_weights: Dict = None,
         num_domain: int = 1,
         domain_scalar: list[float]|None = None
     ):
@@ -24,6 +26,7 @@ class CLF:
         self.device = device 
         self.sim_dt = sim_dt
         self.n_outputs = n_outputs
+        self.ordered_output_names = ordered_output_names
 
         # Set up default Q, R if not provided
         # Q_weights should be length = n_states, R_weights length = n_inputs
@@ -32,15 +35,25 @@ class CLF:
         n_states = 2 * n_outputs
         n_inputs = n_outputs
         if Q_weights is None:
-            Q_weights = np.ones(n_states)
+            Q = np.ones(n_states)
+        else:
+            # Create the matrix using the dict
+            Q = np.ones(n_states)
+            for i, name in enumerate(ordered_output_names):
+                Q[2*i] = Q_weights[name][0]
+                Q[2*i + 1] = Q_weights[name][1]
         if R_weights is None:
-            R_weights = 0.1 * np.ones(n_inputs)
+            R = 0.1 * np.ones(n_inputs)
+        else:
+            R = np.ones(n_inputs)
+            for i, name in enumerate(ordered_output_names):
+                R[i] = R_weights[name][0]
 
 
         if self.num_domain == 1: 
             
-            Q_np = np.diag(Q_weights)
-            R_np = np.diag(R_weights)
+            Q_np = np.diag(Q)
+            R_np = np.diag(R)
 
             # Solve for P and LQR gain K in NumPy
             P_np = self._compute_PK_np(Q_np,R_np)
@@ -56,8 +69,8 @@ class CLF:
             lambda_max = []
             norm_P = []
             for i in range(self.num_domain):
-                Q_np = np.diag(Q_weights)*domain_scalar[i*2]
-                R_np = np.diag(R_weights)*domain_scalar[i*2+1]
+                Q_np = np.diag(Q)*domain_scalar[i*2]
+                R_np = np.diag(R)*domain_scalar[i*2+1]
 
                 # Solve for P and LQR gain K in NumPy
                 P_np = self._compute_PK_np(Q_np,R_np)
