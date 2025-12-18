@@ -47,9 +47,9 @@ BOWING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 2.0]
 BOWING_Q_weights["pelvis_link:pos_x"] = [5.0, 1.0]
 BOWING_Q_weights["pelvis_link:pos_y"] = [5.0, 1.0]
 BOWING_Q_weights["pelvis_link:pos_z"] = [5.0, 1.0]
-BOWING_Q_weights["pelvis_link:ori_x"] = [5.0, 1.0]
-BOWING_Q_weights["pelvis_link:ori_y"] = [5.0, 1.0]
-BOWING_Q_weights["pelvis_link:ori_z"] = [5.0, 1.0]
+BOWING_Q_weights["pelvis_link:ori_x"] = [15.0, 3.0]
+BOWING_Q_weights["pelvis_link:ori_y"] = [15.0, 3.0]
+BOWING_Q_weights["pelvis_link:ori_z"] = [15.0, 3.0]
 
 BOWING_Q_weights["joint:waist_yaw_joint"] = [3.0, 1.0]
 BOWING_Q_weights["joint:left_elbow_joint"] = [3.0, 1.0]
@@ -231,7 +231,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/bowing/bow_forward_config_solution.yaml",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 31, #27,
+        num_outputs = 25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
     )

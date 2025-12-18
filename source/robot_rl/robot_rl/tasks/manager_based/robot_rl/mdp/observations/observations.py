@@ -66,7 +66,7 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     # Get the commanded vel
     commanded_velocity = env.command_manager.get_command("base_velocity")
 
-    t = env.episode_length_buf.unsqueeze(1) * env.step_dt
+    t = env.episode_length_buf * env.step_dt
 
     phase = 2*torch.pi * cmd.get_phasing_var(t)
 
@@ -87,7 +87,7 @@ def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     # Get the commanded vel
     commanded_velocity = env.command_manager.get_command("base_velocity")
 
-    t = env.episode_length_buf.unsqueeze(1) * env.step_dt
+    t = env.episode_length_buf * env.step_dt
 
     phase = 2*torch.pi * cmd.get_phasing_var(t)
 

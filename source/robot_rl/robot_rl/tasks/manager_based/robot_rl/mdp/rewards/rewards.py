@@ -43,7 +43,7 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
     max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
 
     # reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
-    reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (50*max_clf))
+    reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (10*max_clf))    # 200, 100
     return reward
 
 
@@ -300,21 +300,27 @@ def phase_contact(
             res += ~(contact ^ is_stance)
     return res
 
-def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, base_vel_cmd: str,
-                           sensor_cfg: SceneEntityCfg, weight_scalar: float, start_vel: float) -> torch.Tensor:
+# TODO: Test
+def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str,
+                           sensor_cfg: SceneEntityCfg, weight_scalar: float) -> torch.Tensor:
     """Penalize contacts while in the flight phase."""
     cmd = env.command_manager.get_term(command_name)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    flight_mask = cmd.get_flight_envs()
+    # Time into the episode
+    t = env.episode_length_buf * env.step_dt
 
-    # Only apply penalty when commanded velocity is 2.0 m/s or greater                                                                                                                                                                                                                                                                                                                                           │ │
-    command_vel = env.command_manager.get_command(base_vel_cmd)[:, :3]  # Get x,y,z velocity commands                                                                                                                                                                                                                                                                                                            │ │
-    speed_mask = command_vel[:, 0] >= start_vel #2.0  # Create mask for high speed commands
+    # Get bodies not in contact for each env
+    contact_states = cmd.get_contact_state(t)
+    contact_bodies = cmd.contact_frame_indices
 
-    contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
+    contact_forces = torch.zeros(t.shape[0], dtype=torch.float, device=env.device)
+    for i, body_idx in enumerate(contact_bodies):
+        if contact_states[i]:
+            contact_forces += contact_sensor.data.net_forces_w[:, body_idx, :].norm(dim=-1)  # Gets the most recent force only
+
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
-    return flight_mask * speed_mask * penalty
+    return penalty
 
 def track_lin_vel_y_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")

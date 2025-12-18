@@ -29,10 +29,14 @@ class G1TrajOptObservationsCfg():
         sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
         cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
+        ## Teacher only terms
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
         act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+
+        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -43,10 +47,10 @@ class G1TrajOptObservationsCfg():
         """Observations for critic group."""
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
+        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
         projected_gravity = ObsTerm(
             func=mdp.projected_gravity,
         )
-        # root_quat = ObsTerm(func=mdp.root_quat)
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
                                     scale=(2.0, 2.0, 2.0))
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -60,7 +64,6 @@ class G1TrajOptObservationsCfg():
             func=mdp.contact_state,
             params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
         )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
