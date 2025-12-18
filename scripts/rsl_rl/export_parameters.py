@@ -41,7 +41,7 @@ def export_policy_parameters(env, obs, actions, save_dir):
     robot = unwrapped_env.scene.articulations["robot"]
 
     params = {
-        "num_obs": obs.shape[1],
+        "num_obs": obs["policy"].shape[1],
         "num_actions": actions.shape[1],
         "dt": unwrapped_env.step_dt,
     }

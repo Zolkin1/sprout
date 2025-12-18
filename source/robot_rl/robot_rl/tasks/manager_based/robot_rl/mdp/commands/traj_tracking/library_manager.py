@@ -135,6 +135,9 @@ class LibraryManager:
     def get_num_domains(self):
         return self.trajectory_managers[0].get_num_domains()
 
+    def get_trajectory_type(self):
+        return self.trajectory_type
+
     def get_phasing_var(self, conditioner: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         indices = self.get_traj_indices(conditioner)
 

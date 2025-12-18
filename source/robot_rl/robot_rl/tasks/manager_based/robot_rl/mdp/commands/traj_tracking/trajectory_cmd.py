@@ -473,6 +473,11 @@ class TrajectoryCommand(CommandTerm):
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]
 
+        if self.manager.get_trajectory_type() == TrajectoryType.EPISODIC:
+            phi = self.get_phasing_var(t)
+
+            self.dy_des[phi == 1] *= 0
+
     @property
     def command(self):
         return self.y_des
