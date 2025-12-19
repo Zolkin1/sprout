@@ -14,7 +14,6 @@ def symmetric_data_augmentation(env, obs: tensordict.TensorDict, actions: torch.
     """
 
     # Can pull the remapping matrix R from the trajectory manager from the command from the env
-    obs
 
     if obs is not None:
         device = obs.device
@@ -23,58 +22,60 @@ def symmetric_data_augmentation(env, obs: tensordict.TensorDict, actions: torch.
 
         obs_aug = obs.repeat(2)
 
+        cmd = env.unwrapped.command_manager.get_term("traj_ref")
+
         # Original observations
         obs_aug["policy"][:batch_size] = obs["policy"][:batch_size]
 
-        for group in ["policy, critic"]:
+        for group in ["policy", "critic"]:
             obs_idx = 0
             for i, name in enumerate(env.unwrapped.observation_manager.active_terms[group]):
                 obs_size = 0
                 if name == "base_ang_vel":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
 
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        obs[group][:][obs_idx:obs_idx + obs_size] * torch.tensor([-1, 1, -1], device=device))
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([-1, 1, -1], device=device))
                 elif name == "base_lin_vel":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
 
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        obs[group][:][obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1], device=device)
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1], device=device)
                     )
                 elif name == "projected_gravity":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
 
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        obs[group][:][obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1], device=device)
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1], device=device)
                     )
                 elif name == "velocity_commands":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
 
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        obs[group][:][obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, -1], device=device)
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, -1], device=device)
                     )
                 elif name == "joint_pos" or name == "joint_vel" or name == "actions":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        _switch_g1_joints(obs[group][:][obs_idx:obs_idx + obs_size])
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        _switch_g1_joints(obs[group][:, obs_idx:obs_idx + obs_size])
                     )
                 elif name == "sin_phase" or name == "cos_phase":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = obs[group][:][obs_idx:obs_idx + obs_size]
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = obs[group][:, obs_idx:obs_idx + obs_size]
                 elif name == "ref_traj" or name == "act_traj" or name == "ref_traj_vel" or name == "act_traj_vel":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        cmd.get_symmetric_traj(obs[group][:][obs_idx:obs_idx + obs_size])
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size])
                     )
                 elif name == "root_quat":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        obs[group][:][obs_idx:obs_idx + obs_size] * torch.tensor([1, 1, -1, -1], device=device)
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, 1, -1, -1], device=device)
                     )
                 elif name == "contact_state":
-                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i].item()
-                    obs_aug[group][batch_size:][obs_idx:obs_idx + obs_size] = (
-                        cmd.get_symmetric_contacts(obs[group][:][obs_idx:obs_idx + obs_size])
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_contacts(obs[group][:, obs_idx:obs_idx + obs_size])
                     )
 
                 # TODO: Add height map support
@@ -117,17 +118,46 @@ def _switch_g1_joints(joints: torch.Tensor) -> torch.Tensor:
     Map all left -> right and right -> left
     Negate all roll and yaw joints.
 
-    Left legs:
+    Left leg:
     [0, 3, 7, 11, 15, 19]
 
-    Right Legs:
+    Right Leg:
     [1, 4, 8, 12, 16, 20]
 
-    Left Arms:
-    []
+    Left Arm:
+    [5, 9, 13, 17]
+
+    Right Arm:
+    [6, 10, 14, 18]
+
+    Waist Yaw:
+    [2]
 
     """
     joints_switched = torch.zeros_like(joints)
 
-    joints_switched[:, :2] = joints[:, :2]
+    left_leg = [0, 3, 7, 11, 15, 19]
+    right_leg = [1, 4, 8, 12, 16, 20]
+    left_arm = [5, 9, 13, 17]
+    right_arm = [6, 10, 14, 18]
+    waist_yaw = [2]
 
+    # left leg <-- right leg
+    joints_switched[:, left_leg] = joints[:, right_leg]
+
+    # left arm <-- right arm
+    joints_switched[:, left_arm] = joints[:, right_arm]
+
+    # right leg <-- left leg
+    joints_switched[:, right_leg] = joints[:, left_leg]
+
+    # right arm <-- left arm
+    joints_switched[:, right_arm] = joints[:, left_arm]
+
+    # Waist yaw
+    joints_switched[:, waist_yaw] = joints[:, waist_yaw]
+
+    # Negate roll and yaw joints
+    joints_switched[:, [2, 3, 4, 7, 8, 9, 10, 13, 14, 19, 20]] *= -1.0
+
+    return joints_switched

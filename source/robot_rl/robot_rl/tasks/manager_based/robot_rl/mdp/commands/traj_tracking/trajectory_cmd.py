@@ -185,6 +185,41 @@ class TrajectoryCommand(CommandTerm):
         else:
             return self.manager.get_contact_state(t, self.contact_bodies)
 
+    def get_symmetric_contacts(self, contacts):
+        """
+        Get the left-right symmetric reflection of the contacts.
+
+        If a left contact is a 1 then make it 0 and make the right contact 1. And vice-versa.
+
+        Args:
+            contacts: Tensor of shape [N, num_contacts] with contact states
+
+        Returns:
+            Symmetric contacts tensor of shape [N, num_contacts]
+        """
+        # Create a copy to avoid modifying the original
+        symmetric_contacts = contacts.clone()
+
+        # Create a mapping of contact indices to their symmetric counterparts
+        for i, frame_name in enumerate(self.contact_bodies):
+            # Find the symmetric frame
+            if "left" in frame_name:
+                symmetric_frame = frame_name.replace("left", "right")
+            elif "right" in frame_name:
+                symmetric_frame = frame_name.replace("right", "left")
+            else:
+                # No symmetry for this frame (e.g., center frame)
+                continue
+
+            # Find the index of the symmetric frame
+            if symmetric_frame in self.contact_bodies:
+                j = self.contact_bodies.index(symmetric_frame)
+                # Swap the contact states
+                symmetric_contacts[:, i] = contacts[:, j]
+
+        return symmetric_contacts
+
+
     def get_trajectory_type(self):
         """Gets the type of trajectory: periodic or episodic."""
         return self.trajectory_type
@@ -477,6 +512,52 @@ class TrajectoryCommand(CommandTerm):
             phi = self.get_phasing_var(t)
 
             self.dy_des[phi == 1] *= 0
+
+    def get_symmetric_traj(self, traj: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the symmetric version of the trajectory.
+
+        Goes through each of the output names and swaps the values if there is a corresponding right/left symmetric output.
+
+        Need to negate the values for any pos_y or ori_x, ori_z.
+
+        Args:
+            traj: Trajectory tensor of shape [N, num_outputs]
+
+        Returns:
+            Symmetric trajectory tensor of shape [N, num_outputs]
+
+        TODO: Does this work with any reference frame?
+        """
+        # Create a copy to avoid modifying the original
+        symmetric_traj = traj.clone()
+
+        # Create a mapping from each output to its symmetric counterpart
+        for i, output_name in enumerate(self.ordered_output_names):
+            # Find the symmetric output name
+            if "left" in output_name:
+                symmetric_name = output_name.replace("left", "right")
+            elif "right" in output_name:
+                symmetric_name = output_name.replace("right", "left")
+            else:
+                # No left/right symmetry (e.g., COM, waist), but may need sign flip
+                # Check if this axis needs negation
+                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z"]):
+                    symmetric_traj[:, i] = -traj[:, i]
+                continue
+
+            # Find the index of the symmetric output
+            if symmetric_name in self.ordered_output_names:
+                j = self.ordered_output_names.index(symmetric_name)
+
+                # Swap the values
+                symmetric_traj[:, i] = traj[:, j]
+
+                # Apply sign flip for specific axes
+                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z"]):
+                    symmetric_traj[:, i] = -symmetric_traj[:, i]
+
+        return symmetric_traj
 
     @property
     def command(self):
