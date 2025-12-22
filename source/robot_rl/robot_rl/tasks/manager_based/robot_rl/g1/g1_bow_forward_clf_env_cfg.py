@@ -44,6 +44,19 @@ BOWING_Q_weights["right_ankle_roll_link:ori_x"] = [10.0, 2.0]
 BOWING_Q_weights["right_ankle_roll_link:ori_y"] = [10.0, 2.0]
 BOWING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 2.0]
 
+BOWING_Q_weights["joint:left_hip_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_hip_pitch_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_hip_yaw_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_knee_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_ankle_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_ankle_pitch_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_hip_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_hip_pitch_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_hip_yaw_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_knee_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_ankle_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_ankle_pitch_joint"] = [4.0, 1.0]
+
 BOWING_Q_weights["pelvis_link:pos_x"] = [5.0, 1.0]
 BOWING_Q_weights["pelvis_link:pos_y"] = [5.0, 1.0]
 BOWING_Q_weights["pelvis_link:pos_z"] = [5.0, 1.0]
@@ -51,29 +64,29 @@ BOWING_Q_weights["pelvis_link:ori_x"] = [15.0, 3.0]
 BOWING_Q_weights["pelvis_link:ori_y"] = [15.0, 3.0]
 BOWING_Q_weights["pelvis_link:ori_z"] = [15.0, 3.0]
 
-BOWING_Q_weights["joint:waist_yaw_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:left_elbow_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_pitch_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_roll_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_yaw_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:right_elbow_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [3.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [3.0, 1.0]
+BOWING_Q_weights["joint:waist_yaw_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_elbow_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_pitch_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_yaw_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_elbow_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [4.0, 1.0]
 
-BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [5.0, 3.0]
-BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [5.0, 3.0]
-BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [5.0, 3.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [5.0, 3.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [5.0, 3.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [5.0, 3.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [10.0, 2.0]
 
-BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [5.0, 3.0]
-BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [5.0, 3.0]
-BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [5.0, 3.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [5.0, 3.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [5.0, 3.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [5.0, 3.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [10.0, 2.0]
 # BOWING_Q_weights["com:pos_x"] = [25.0, 250.0]
 # BOWING_Q_weights["com:pos_y"] = [500.0, 20.0]
 # BOWING_Q_weights["com:pos_z"] = [250.0, 10.0]
@@ -141,6 +154,19 @@ BOWING_R_weights["right_ankle_roll_link:pos_z"] = [0.05]
 BOWING_R_weights["right_ankle_roll_link:ori_x"] = [0.02]
 BOWING_R_weights["right_ankle_roll_link:ori_y"] = [0.02]
 BOWING_R_weights["right_ankle_roll_link:ori_z"] = [0.02]
+
+BOWING_R_weights["joint:left_hip_roll_joint"] = [0.01]
+BOWING_R_weights["joint:left_hip_pitch_joint"] = [0.01]
+BOWING_R_weights["joint:left_hip_yaw_joint"] = [0.01]
+BOWING_R_weights["joint:left_knee_joint"] = [0.01]
+BOWING_R_weights["joint:left_ankle_roll_joint"] = [0.01]
+BOWING_R_weights["joint:left_ankle_pitch_joint"] = [0.01]
+BOWING_R_weights["joint:right_hip_roll_joint"] = [0.01]
+BOWING_R_weights["joint:right_hip_pitch_joint"] = [0.01]
+BOWING_R_weights["joint:right_hip_yaw_joint"] = [0.01]
+BOWING_R_weights["joint:right_knee_joint"] = [0.01]
+BOWING_R_weights["joint:right_ankle_roll_joint"] = [0.01]
+BOWING_R_weights["joint:right_ankle_pitch_joint"] = [0.01]
 
 BOWING_R_weights["pelvis_link:pos_x"] = [0.05]
 BOWING_R_weights["pelvis_link:pos_y"] = [0.05]
@@ -231,7 +257,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/bowing/bow_forward_config_solution.yaml",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 25, #31, #27,
+        num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
     )
@@ -243,7 +269,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
 class G1BowingCLFCurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
+    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 10000, "min_max_err": (0.1, 0.1, 0.1), "scale": (0.05, 0.05, 0.05)})
 
 @configclass
 class G1BowingCLFEnvCfg(HumanoidEnvCfg):
@@ -264,30 +290,13 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        # Add frame transformer sensor for hand tracking
-        self.scene.hand_frame_transformer = FrameTransformerCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/pelvis_link",  # Source frame (world origin)
-            target_frames=[
-                FrameTransformerCfg.FrameCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/right_elbow_link",
-                    name="right_hand_palm_link",
-                    offset=OffsetCfg(pos=(0.2255, -0.00489, 0.0)),  # Offset to the palm
-                ),
-                FrameTransformerCfg.FrameCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/left_elbow_link",
-                    name="left_hand_palm_link",
-                    offset=OffsetCfg(pos=(0.2255, 0.00489, 0.0)),  # Offset to the palm
-                ),
-            ],
-        )
-
         ##
         # Commands
         ##
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.0)
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0, 0) # TODO: put back: (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
         self.commands.base_velocity.ranges.heading = (0,0)
 
         self.commands.gait_period = None
@@ -350,7 +359,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Curriculum
         ##
-        self.curriculum.clf_curriculum = None
+        # self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
@@ -374,7 +383,6 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         self.observations.policy.height_scan = None
         # no curriculum
         self.curriculum.terrain_levels = None
-        self.curriculum.clf_curriculum = None
 
 @configclass
 class G1BowingCLFECEnvCfg(G1BowingCLFEnvCfg):

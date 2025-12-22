@@ -542,7 +542,7 @@ class TrajectoryCommand(CommandTerm):
             else:
                 # No left/right symmetry (e.g., COM, waist), but may need sign flip
                 # Check if this axis needs negation
-                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z"]):
+                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z", "roll_joint", "yaw_joint"]):
                     symmetric_traj[:, i] = -traj[:, i]
                 continue
 
@@ -554,7 +554,7 @@ class TrajectoryCommand(CommandTerm):
                 symmetric_traj[:, i] = traj[:, j]
 
                 # Apply sign flip for specific axes
-                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z"]):
+                if any(axis in output_name for axis in ["pos_y", "ori_x", "ori_z", "roll_joint", "yaw_joint"]):
                     symmetric_traj[:, i] = -symmetric_traj[:, i]
 
         return symmetric_traj

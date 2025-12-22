@@ -759,6 +759,23 @@ class TrajectoryManager:
         R_dict["right_ankle_roll_link:ori_z"] = 1 #-1
 
         ##
+        # Leg Joints
+        ##
+        R_dict["joint:left_hip_roll_joint"] = -1
+        R_dict["joint:left_hip_pitch_joint"] = 1
+        R_dict["joint:left_hip_yaw_joint"] = -1
+        R_dict["joint:left_knee_joint"] = 1
+        R_dict["joint:left_ankle_roll_joint"] = -1
+        R_dict["joint:left_ankle_pitch_joint"] = 1
+
+        R_dict["joint:right_hip_roll_joint"] = -1
+        R_dict["joint:right_hip_pitch_joint"] = 1
+        R_dict["joint:right_hip_yaw_joint"] = -1
+        R_dict["joint:right_knee_joint"] = 1
+        R_dict["joint:right_ankle_roll_joint"] = -1
+        R_dict["joint:right_ankle_pitch_joint"] = 1
+
+        ##
         # Pelvis
         ##
         R_dict["pelvis_link:pos_x"] = 1
