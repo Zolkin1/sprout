@@ -353,6 +353,13 @@ class LibraryManager:
 
         return domain_times
 
+    def get_total_time(self):
+        """
+        Gets the total time for the trajectory. Assumes all trajectories in the library have the same total time.
+        """
+
+        return self.trajectory_managers[0].get_total_time()
+
     def order_outputs(self, order_output_names: list[str]):
         for manager in self.trajectory_managers:
             manager.order_outputs(order_output_names)

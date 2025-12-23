@@ -730,6 +730,9 @@ class TrajectoryManager:
 
         return self.T[domain_idx]
 
+    def get_total_time(self) -> torch.Tensor:
+        return torch.sum(self.T)
+
     # TODO: Clean
     def relable_ee_stance_coeffs(self):
         """Build a relabelling matrix for end effector coefficients including the stance foot."""

@@ -76,16 +76,30 @@ class RLPolicy:
                 obs_np[obs_idx:obs_idx+shape] = self.create_action_obs() * scale
                 obs_idx += shape
             elif term == "sin_phase":
-                if np.linalg.norm(cmd_vel) > 0.01:
-                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
+                    if np.linalg.norm(cmd_vel) > 0.01:
+                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                    else:
+                        obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                elif self.get_skill_type() == "episodic":
+                    phi = time % self.get_total_time()
+                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi) * scale
                 else:
-                    obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
+
                 obs_idx += shape
+
             elif term == "cos_phase":
-                if np.linalg.norm(cmd_vel) > 0.01:
-                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
+                    if np.linalg.norm(cmd_vel) > 0.01:
+                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                    else:
+                        obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                elif self.get_skill_type() == "episodic":
+                    phi = time % self.get_total_time()
+                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi) * scale
                 else:
-                    obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape
             else:
                 raise NotImplementedError("Observation term not implemented yet!")
@@ -260,3 +274,21 @@ class RLPolicy:
             term_info = self.policy_params['observation_terms']['policy'].get(term_name, {})
             return term_info.get('scale')
         return None
+
+    def get_skill_type(self):
+        """Get the skill type: episodic, periodic, half_periodic."""
+        skill_type = self.policy_params['skill_type']
+
+        if skill_type is not None:
+            return skill_type
+        else:
+            return None
+
+    def get_total_time(self) -> float:
+        """Get the total time from the policy_params file."""
+        total_time = self.policy_params['total_time']
+
+        if total_time is not None:
+            return total_time
+        else:
+            return None

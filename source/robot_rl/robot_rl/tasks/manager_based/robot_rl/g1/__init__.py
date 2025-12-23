@@ -188,7 +188,9 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1BowingDistillationRunnerCfg"
+            ),  # TODO: Test
         }
     )
 

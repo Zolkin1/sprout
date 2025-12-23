@@ -67,6 +67,14 @@ def export_policy_parameters(env, obs, actions, save_dir):
     except KeyError:
         pass
 
+    # Get skill type
+    try:
+        # TODO: Test
+        params["skill_type"] = unwrapped_env.command_manager.get_term("ref_traj").trajectory_type
+        params["total_time"] = unwrapped_env.command_manager.get_term("ref_traj").manager.get_total_time()
+    except KeyError:
+        pass
+
     # Add velocity command ranges
     try:
         base_vel_cfg = unwrapped_env.command_manager.get_term("base_velocity").cfg
