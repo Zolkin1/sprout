@@ -12,7 +12,7 @@ from isaaclab_rl.rsl_rl import (
     RslRlSymmetryCfg,
 )
 from .symmetry_functions import (
-    symmetric_data_augmentation
+    symmetric_data_augmentation_episodic
 )
 
 @configclass
@@ -76,7 +76,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     }
 
 @configclass
-class SymmetricPPORunnerCfg(PPORunnerCfg):
+class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
@@ -91,7 +91,7 @@ class SymmetricPPORunnerCfg(PPORunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation
+            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
         )
     )
 

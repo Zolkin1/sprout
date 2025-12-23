@@ -87,54 +87,6 @@ BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [10.0, 2.0]
 BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [10.0, 2.0]
 BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [10.0, 2.0]
 BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [10.0, 2.0]
-# BOWING_Q_weights["com:pos_x"] = [25.0, 250.0]
-# BOWING_Q_weights["com:pos_y"] = [500.0, 20.0]
-# BOWING_Q_weights["com:pos_z"] = [250.0, 10.0]
-#
-# BOWING_Q_weights["left_ankle_roll_link:pos_x"] = [1500.0, 50.0]
-# BOWING_Q_weights["left_ankle_roll_link:pos_y"] = [1500.0, 50.0]
-# BOWING_Q_weights["left_ankle_roll_link:pos_z"] = [2500.0, 50.0]
-# BOWING_Q_weights["left_ankle_roll_link:ori_x"] = [30.0, 1.0]
-# BOWING_Q_weights["left_ankle_roll_link:ori_y"] = [150.0, 1.0]
-# BOWING_Q_weights["left_ankle_roll_link:ori_z"] = [400.0, 10.0]
-#
-# BOWING_Q_weights["right_ankle_roll_link:pos_x"] = [1500.0, 50.0]
-# BOWING_Q_weights["right_ankle_roll_link:pos_y"] = [1500.0, 50.0]
-# BOWING_Q_weights["right_ankle_roll_link:pos_z"] = [2500.0, 50.0]
-# BOWING_Q_weights["right_ankle_roll_link:ori_x"] = [30.0, 1.0]
-# BOWING_Q_weights["right_ankle_roll_link:ori_y"] = [150.0, 1.0]
-# BOWING_Q_weights["right_ankle_roll_link:ori_z"] = [400.0, 10.0]
-#
-# BOWING_Q_weights["pelvis_link:pos_x"] = [25.0, 250.0]
-# BOWING_Q_weights["pelvis_link:pos_y"] = [500.0, 20.0]
-# BOWING_Q_weights["pelvis_link:pos_z"] = [250.0, 10.0]
-# BOWING_Q_weights["pelvis_link:ori_x"] = [300.0, 20.0]
-# BOWING_Q_weights["pelvis_link:ori_y"] = [250.0, 10.0]
-# BOWING_Q_weights["pelvis_link:ori_z"] = [300.0, 30.0]
-#
-# BOWING_Q_weights["joint:waist_yaw_joint"] = [100.0, 1.0]
-# BOWING_Q_weights["joint:left_elbow_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:left_shoulder_pitch_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:left_shoulder_roll_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:left_shoulder_yaw_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:right_elbow_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [50.0, 1.0]
-# BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [50.0, 1.0]
-#
-# BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [500.0, 50.0]
-# BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [500.0, 50.0]
-# BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [500.0, 50.0]
-# BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [150.0, 10.0]
-# BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [150.0, 10.0]
-# BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [150.0, 10.0]
-#
-# BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [500.0, 50.0]
-# BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [500.0, 50.0]
-# BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [500.0, 50.0]
-# BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [150.0, 10.0]
-# BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [150.0, 10.0]
-# BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [150.0, 10.0]
 
 BOWING_R_weights = {}
 BOWING_R_weights["com:pos_x"] = [0.1]
@@ -199,50 +151,6 @@ BOWING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
 BOWING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
 BOWING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
 
-# # TODO: Fix weight order
-# BOWING_Q_weights = [
-#     25.0,   250.0,      # com_x pos, vel
-#     500.0,   20.0,      # com_y pos, vel
-#     650.0,   10.0,      # com_z pos, vel
-#     300.0,    20.0,     # pelvis_roll pos, vel
-#     250.0,    10.0,     # pelvis_pitch pos, vel
-#     300.0,    30.0,     # pelvis_yaw pos, vel
-#     1500.0, 50.0,       # swing_x pos, vel
-#     1500.0,  50.0,      # swing_y pos, vel
-#     2500.0, 50.0,       # swing_z pos, vel
-#     30.0,    1.0,       # swing_ori_roll pos, vel
-#     150.0,    1.0,       # swing_ori_pitch pos, vel
-#     400.0,    10.0,     # swing_ori_yaw pos, vel
-#     1500.0, 50.0,       # stance_x pos, vel
-#     1500.0,  50.0,      # stance_y pos, vel
-#     2500.0, 50.0,       # stance_z pos, vel
-#     30.0,    1.0,       # stance_ori_roll pos, vel
-#     150.0,    1.0,       # stance_ori_pitch pos, vel
-#     400.0,    10.0,     # swing_ori_yaw pos, vel
-#     100.0,    1.0,      # waist_yaw pos, vel
-#     50.0,1.0, #left shoulder pitch
-#     50.0,1.0, #left shoulder roll
-#     50.0,1.0, #left shoulder yaw
-#     50.0,1.0, #left elbow
-#     50.0,1.0, #right shoulder pitch
-#     50.0,1.0, #right shoulder roll
-#     50.0,1.0, #right shoulder yaw
-#     50.0,1.0, #right elbow
-# ]
-
-
-# BOWING_R_weights = [
-#         0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort
-#         0.05,0.05,0.05,     # pelvis inputs: lower torque priority
-#         0.05,0.05,0.05,     # swing foot linear inputs
-#         0.02,0.02,0.02,     # swing foot orientation inputs: small adjustments
-#         0.05, 0.05, 0.05,   # stance foot linear inputs
-#         0.02, 0.02, 0.02,   # stance foot orientation inputs: small adjustments
-#         0.1,0.01,0.01,
-#         0.01,0.01,0.01,
-#         0.01,0.01,0.01,
-#     ]
-
 ##
 # Commands
 ##
@@ -269,7 +177,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
 class G1BowingCLFCurriculumCfg:
     """Curriculum terms for the MDP."""
 
-    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 10000, "min_max_err": (0.1, 0.1, 0.1), "scale": (0.05, 0.05, 0.05)})
+    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 15000, "min_max_err": (0.15, 0.15, 0.15), "scale": (0.05, 0.05, 0.05)})
 
 @configclass
 class G1BowingCLFEnvCfg(HumanoidEnvCfg):
@@ -313,11 +221,11 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         # }
         self.events.push_robot = None
 
-        # self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
-        # self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
-        # self.events.add_base_mass.params["operation"] = "scale"
-        self.events.add_base_mass = None
-        self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+        self.events.add_base_mass.params["asset_cfg"].body_names = ["waist_yaw_link"]
+        self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
+        self.events.add_base_mass.params["operation"] = "scale"
+        # self.events.add_base_mass = None
+        self.events.reset_robot_joints.params["position_range"] = (0.85, 1.15)
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
@@ -419,6 +327,8 @@ class G1BowingCLFEnvCfg_PLAY(G1BowingCLFEnvCfg):
         self.scene.terrain.num_cols = 2
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
+
+        self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
 
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None

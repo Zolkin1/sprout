@@ -324,6 +324,35 @@ class LibraryManager:
 
         return torch.clamp(indicies, 0, len(self.trajectory_managers) - 1)
 
+    def get_domain_times(self, conditioner: torch.Tensor,
+                         t: torch.Tensor) -> torch.Tensor:
+        """
+        Get the times for each domain.
+        """
+        traj_idx = self.get_traj_indices(conditioner)
+
+        # Get the unique managers (avoid repeats)
+        unique_indicies = torch.unique(traj_idx)
+
+        domain_times = torch.zeros(conditioner.shape[0], dtype=torch.long, device=self.device)
+
+        # Bin each conditioner by manager
+        for idx in unique_indicies:
+            # Find which environments use this trajectory
+            mask = traj_idx == idx
+            env_indices = torch.where(mask)[0]
+
+            # Get times for these environments
+            t_for_manager = t[env_indices]
+
+            # Call get_output for this manager
+            domain_time = self.trajectory_managers[idx.item()].get_domain_times(t_for_manager)
+
+            # Place outputs in the correct positions
+            domain_times[env_indices] = domain_time
+
+        return domain_times
+
     def order_outputs(self, order_output_names: list[str]):
         for manager in self.trajectory_managers:
             manager.order_outputs(order_output_names)

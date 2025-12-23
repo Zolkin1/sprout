@@ -19,6 +19,11 @@ class TrajectoryCommand(CommandTerm):
         self.env = env
         self.robot = env.scene[cfg.asset_name]
 
+        if cfg.heuristic_func is not None:
+            self.set_heuristic_func(cfg.heuristic_func)
+        else:
+            self.user_heuristic = None
+
         # Expand wildcards in contact frames
         self.contact_bodies = self._expand_wildcard_frames(cfg.contact_bodies)
 
@@ -505,6 +510,18 @@ class TrajectoryCommand(CommandTerm):
         else:
             y = self.manager.get_output(t)
 
+        # TODO: Apply optional heuristic modification
+        if self.user_heuristic is not None:
+            contact_states = self.get_contact_state(t)
+            if self.manager_type == "library":
+                conditioner = self.get_conditioner_var()
+                domain_times = self.manager.get_domain_times(conditioner, t)
+            else:
+                domain_times = self.manager.get_domain_times(t)
+
+            y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
+                                    contact_states, domain_times,)
+
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]
 
@@ -512,6 +529,12 @@ class TrajectoryCommand(CommandTerm):
             phi = self.get_phasing_var(t)
 
             self.dy_des[phi == 1] *= 0
+
+    def set_user_heuristic(self, heuristic_func):
+        """
+        Lets the user set a heuristic function to adjust the trajectories automatically.
+        """
+        self.user_heuristic = heuristic_func
 
     def get_symmetric_traj(self, traj: torch.Tensor) -> torch.Tensor:
         """
@@ -527,7 +550,7 @@ class TrajectoryCommand(CommandTerm):
         Returns:
             Symmetric trajectory tensor of shape [N, num_outputs]
 
-        TODO: Does this work with any reference frame?
+        TODO: Does this work with any reference frame? Specifically think about pos_y
         """
         # Create a copy to avoid modifying the original
         symmetric_traj = traj.clone()

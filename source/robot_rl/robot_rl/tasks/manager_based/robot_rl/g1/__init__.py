@@ -187,7 +187,7 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricPPORunnerCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )

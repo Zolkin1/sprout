@@ -1,3 +1,4 @@
+import torch
 from isaaclab.utils import configclass
 # from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
@@ -164,6 +165,92 @@ WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
 #         0.01,0.01,0.01,
 #         0.01,0.01,0.01,
 #     ]
+
+# TODO: Test
+def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, domain_times):
+    """
+    Heuristically modify the gait library to allow for sideways walking and turning.
+
+    See _apply_swing_modifications in gait_library_traj.py
+
+    Args:
+        env: Environment object.
+        output_names: Names of the output variables in order.
+        outputs: Output variables.
+        contact_bodies: Names of the contact bodies. Of shape [num_contact_bodies]
+        contact_states: tensor of shape [N, num_contact_bodies]
+        domain_times: tensor of shape [N] giving the total time for the current domain each env is in
+    """
+
+    # Get the commanded velocity
+    vel_cmd = env.command_manager.get_command("base_velocity")
+
+    # Iterate through the bodies not in contact
+    for i, body in enumerate(contact_bodies):
+        env_idx = torch.where(contact_states[:, i] == 0)[0]
+
+        # Determine yaw modification
+        delta_psi = vel_cmd[env_idx, 2] * domain_times[env_idx]
+
+        # Determine horizontal modification
+        delta_y = vel_cmd[env_idx, 1] * domain_times[env_idx]
+
+        ##
+        # Adjust this body
+        ##
+        def find_idx(strings, *substrings):
+            """Find index of first string containing all substrings."""
+            return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
+
+        # Apply yaw and horizontal modifications
+        # ori_z is the yaw
+        idx = find_idx(contact_bodies, "ori_z", body)
+        if idx is not None:
+            outputs[env_idx, idx] += delta_psi
+
+        idx = find_idx(contact_bodies, "ori_z", "vel", body)
+        if idx is not None:
+            outputs[env_idx, idx] += vel_cmd[env_idx, 2]
+
+        idx = find_idx(contact_bodies, "pos_y", body)
+        if idx is not None:
+            outputs[env_idx, idx] += delta_y
+
+        idx = find_idx(contact_bodies, "pos_y", "vel", body)
+        if idx is not None:
+            outputs[env_idx, idx] += vel_cmd[env_idx, 1]
+
+        # Adjust pelvis yaw
+        idx = find_idx(contact_bodies, "ori_z", "pelvis_link")
+        if idx is not None:
+            outputs[env_idx, idx] += delta_psi
+
+        # Adjust pelvis yaw
+        idx = find_idx(contact_bodies, "ori_z", "vel", "pelvis_link")
+        if idx is not None:
+            outputs[env_idx, idx] += vel_cmd[env_idx, 2]
+
+        # Adjust pelvis y
+        idx = find_idx(contact_bodies, "pos_y", "pelvis_link")
+        if idx is not None:
+            outputs[env_idx, idx] += delta_y
+
+        # Adjust pelvis y
+        idx = find_idx(contact_bodies, "pos_y", "vel", "pelvis_link")
+        if idx is not None:
+            outputs[env_idx, idx] += vel_cmd[env_idx, 1]
+
+        # Adjust COM y
+        idx = find_idx(contact_bodies, "pos_y", "com")
+        if idx is not None:
+            outputs[env_idx, idx] += delta_y
+
+        # Adjust COM y
+        idx = find_idx(contact_bodies, "pos_y", "vel", "com")
+        if idx is not None:
+            outputs[env_idx, idx] += vel_cmd[env_idx, 1]
+
+    return outputs
 
 ##
 # Commands

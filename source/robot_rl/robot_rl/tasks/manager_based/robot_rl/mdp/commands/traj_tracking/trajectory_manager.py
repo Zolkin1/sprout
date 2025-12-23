@@ -725,6 +725,11 @@ class TrajectoryManager:
 
         return num_outputs, output_names, ref_spline_order
 
+    def get_domain_times(self, t: torch.Tensor) -> torch.Tensor:
+        domain_idx = self.get_current_domains(t)
+
+        return self.T[domain_idx]
+
     # TODO: Clean
     def relable_ee_stance_coeffs(self):
         """Build a relabelling matrix for end effector coefficients including the stance foot."""

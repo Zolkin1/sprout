@@ -64,3 +64,13 @@ class G1TrajOptCLFRewards(HumanoidRewardCfg):
             "threshold": 1.0,
         },
     )
+
+    # Penalize missing the contact schedule
+    # TODO: Test
+    # contact_schedule_penalty = RewTerm(
+    #     func=mdp.contact_schedule_penalty,
+    #     weight=-3.0,
+    #     params={"command_name": "traj_ref",
+    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
+    #             "weight_scalar": 1.0,},
+    # )
