@@ -305,17 +305,17 @@ class StonesOutputCommandTerm(CommandTerm):
         # else:
         #     self.v_buffer = torch.cat([self.v_buffer[:, 1:], self.v.unsqueeze(-1)], dim=-1)
         #     self.vdot_buffer = torch.cat([self.vdot_buffer[:, 1:], self.vdot.unsqueeze(-1)], dim=-1)
-        with torch.no_grad():
-            if torch.sum(self.v_buffer) == 0:
-                # First step: fill everything
-                self.v_buffer[:] = self.v.unsqueeze(1)
-                self.vdot_buffer[:] = self.vdot.unsqueeze(1)
-            else:
-                # Shift left and append in place
-                self.v_buffer[:, :-1] = self.v_buffer[:, 1:]
-                self.v_buffer[:, -1] = self.v
-                self.vdot_buffer[:, :-1] = self.vdot_buffer[:, 1:]
-                self.vdot_buffer[:, -1] = self.vdot
+        # with torch.no_grad():
+        #     if torch.sum(self.v_buffer) == 0:
+        #         # First step: fill everything
+        #         self.v_buffer[:] = self.v.unsqueeze(1)
+        #         self.vdot_buffer[:] = self.vdot.unsqueeze(1)
+        #     else:
+        #         # Shift left and append in place
+        #         self.v_buffer[:, :-1] = self.v_buffer[:, 1:]
+        #         self.v_buffer[:, -1] = self.v
+        #         self.vdot_buffer[:, :-1] = self.vdot_buffer[:, 1:]
+        #         self.vdot_buffer[:, -1] = self.vdot
         from robot_rl.tasks.manager_based.robot_rl.constants import IS_DEBUG
         if IS_DEBUG:
             # Debug prints - show full tensors

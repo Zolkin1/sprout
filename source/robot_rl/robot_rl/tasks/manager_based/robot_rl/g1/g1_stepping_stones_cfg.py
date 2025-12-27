@@ -64,7 +64,7 @@ class G1RoughMlipCommandsCfg:
         rel_heading_envs=1.0,
         heading_command=True,
         heading_control_stiffness=0.5,
-        debug_vis=True,
+        debug_vis=False,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(0.6, 0.6), lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0), heading=(0.0, 0.0)
         ),
@@ -192,7 +192,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
             class_type=StonesTerrainGenerator,
             size=(STONES.terrain_size_x, STONES.terrain_size_y),
             curriculum=True,
-            border_width=1.0,
+            border_width=0.0,
             border_height=0.0,
             num_rows=10,  # difficulty levels
             num_cols=100,  # corresponds to terrain types, num of sub terrain envs = proportion * num_cols
@@ -238,7 +238,7 @@ class G1SteppingStonesEnvCfg(HumanoidEnvCfg):
             offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
             ray_alignment="yaw",
             pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.0, 1.0]),
-            debug_vis=True,
+            debug_vis=False,
             mesh_prim_paths=["/World/ground/terrain_stones"],
         )
 
@@ -440,17 +440,19 @@ class G1SteppingStonesEnvCfg_PLAY(G1SteppingStonesEnvCfg):
         self.observations.policy.enable_corruption = False
         # remove random pushing
         self.events.base_external_force_torque = None
-        # self.events.push_robot = None
-        self.events.push_robot.interval_range_s = (2.0, 2.0)
-        # self.events.reset_base.params["pose_range"] = {
-        #     "x": (-0.3, 0.0),
-        #     "y": (-0.1, 0.1),
-        #     "yaw": (-0.1, 0.1),
+        self.events.push_robot = None
+        # self.events.push_robot.interval_range_s = (2.0, 2.0)
+        # self.events.push_robot.params["velocity_range"] = {
+        #     "x": (-0.5, 0.5), 
+        #     "y": (-0.2, 0.2), 
+        #     "roll": (-0.4, 0.4),
+        #     "pitch": (-0.4, 0.4),
+        #     "yaw": (-0.4, 0.4),
         # }
         self.scene.terrain.max_init_terrain_level = 2
         self.scene.terrain.terrain_generator.num_rows = 1
         self.scene.terrain.terrain_generator.num_cols = 10
-        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 1.0)
+        self.scene.terrain.terrain_generator.difficulty_range = (1.0, 1.0)
         self.commands.hlip_ref.use_stance_foot_pos_as_ref = True
         
 class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_distillation):
@@ -465,8 +467,8 @@ class G1_custom_stepping_stones_distillation_PLAY(G1_custom_stepping_stones_dist
         self.observations.policy.enable_corruption = False
         # remove random pushing
         self.events.base_external_force_torque = None
-        self.events.push_robot = None
-        # self.events.push_robot.interval_range_s = (5.0, 5.0)
+        # self.events.push_robot = None
+        self.events.push_robot.interval_range_s = (5.0, 5.0)
         # self.events.reset_base.params["pose_range"] = {
         #     "x": (-0.3, 0.0),
         #     "y": (-0.1, 0.1),
@@ -497,7 +499,14 @@ class G1_custom_stepping_stones_finetune_PLAY(G1_custom_stepping_stones_finetune
         #     "yaw": (-0.1, 0.1),
         # }
         
+        self.scene.terrain.terrain_generator.sub_terrains = {
+            "upstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=True),
+            "downstairs": StairsTerrainCfg(proportion=0.1, is_upstairs=False),
+            "flat_stones": LongStonesFlatTerrainCfg(proportion=0.4),
+            "stones": LongStonesTerrainCfg(proportion=0.4),
+        }
+        
         self.scene.terrain.terrain_generator.num_rows = 1
-        self.scene.terrain.terrain_generator.num_cols = 10
-        self.scene.terrain.terrain_generator.difficulty_range = (0.7, 1.0)     
+        self.scene.terrain.terrain_generator.num_cols = 1
+        self.scene.terrain.terrain_generator.difficulty_range = (1.0, 1.0)     
  

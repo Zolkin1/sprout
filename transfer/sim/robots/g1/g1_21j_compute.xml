@@ -4,7 +4,7 @@ Position and velocity actuators added. -->
   <compiler angle="radian" meshdir="meshes"/>
 
   <option cone="elliptic" impratio="100" integrator="implicitfast" timestep="0.001"/>
-
+  
 
   <!-- TODO: Pyramidal actual maybe looks a little better in sim -->
   <!-- <option cone="pyramidal" impratio="100" integrator="implicitfast" timestep="0.0005"/> -->

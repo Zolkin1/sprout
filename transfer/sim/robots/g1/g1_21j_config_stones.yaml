@@ -1,6 +1,14 @@
 # G1_21j config
 robot_name: "g1_21j_compute_stones"
-checkpoint_path: "g1_policies/stepping_stone/stepping_stone/2025-12-06_15-29-36/exported/policy.pt"
+checkpoint_path: "g1_policies/stepping_stone/stepping_stone/2025-12-03_10-16-29/exported/policy.pt"
+# "g1_policies/stepping_stone_baseline/stepping_stone_baseline/2025-12-08_12-15-47/exported/policy.pt"
+# "g1_policies/stepping_stone/stepping_stone/2025-12-03_10-16-29/exported/policy.pt"
+# 
+# 
+#hardware 2025-12-03_10-16-29
+#fixed dzcomf 2025-12-07_14-30-23  , 2025-12-08_11-42-12
+#fixed T 2025-12-06_15-29-36
+#older policy: 2025-11-20_19-18-28FTS
 num_obs: 193 #ang_vel(3) + projected_grav(3) + vel_cmd(3) + joint_pos(21) + joint_vel(21) + last_action(21) + height_scan(121)
 num_action: 21
 period: 0.8                   # s

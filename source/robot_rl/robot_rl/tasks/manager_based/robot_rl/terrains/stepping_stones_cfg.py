@@ -23,13 +23,13 @@ class BasicStonesTerrainCfg(SubTerrainBaseCfg):
     
     stone_target_x: float = 0.2  # target size x between stones, used for curriculum
     
-    stone_length_min: float = 0.13
+    stone_length_min: float = 0.3
     stone_width_min: float = 0.75
-    stone_width_max: float = 1.25 #real stones 1.22
-    stone_height_min: float = 0.05 #thickness of the stones, should not matter too much
+    stone_width_max: float = 0.75 #real stones 1.22
+    stone_height_min: float = 0.15 #thickness of the stones, should not matter too much
     stone_height_max: float = 0.15
     underneath_platform_z_min: float = -1.0  # z pos of the underneath platform relative to stone top
-    underneath_platform_z_max: float = 0.0  # z pos of the underneath platform relative to stone top
+    underneath_platform_z_max: float = -1.0  # z pos of the underneath platform relative to stone top
     def resample_basic(self):
         """Resample parameters based on difficulty if needed."""
         stone_y = np.random.uniform(self.stone_width_min, self.stone_width_max)

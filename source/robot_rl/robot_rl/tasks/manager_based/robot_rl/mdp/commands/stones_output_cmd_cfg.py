@@ -89,7 +89,7 @@ class StonesOutputCommandCfg(CommandTermCfg):
 
     use_stance_foot_pos_as_ref: bool = False 
     yaw_idx: list[int] = [5, 11]
-    debug_vis: bool = True  # enable debug visualization
+    debug_vis: bool = False  # enable debug visualization
     z_sw_max: float = 0.2  # max swing foot z height (m); this is ankle height so different from actual foot position
     z_sw_min: float = 0.0
     v_history_len: int = 5

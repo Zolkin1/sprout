@@ -128,7 +128,7 @@ class Robot:
             #for stones, either 0.0 standing or 0.6 forward
             if self.mj_data.time < 1.0:
                 des_vel = np.array([0.0, 0.0, 0.0])
-            elif self.mj_data.time > 10.0:
+            elif self.mj_data.time > 50.0:
                 des_vel = np.array([0.0, 0.0, 0.0])    
         self.commanded_vel = des_vel  # Store the commanded velocity
         print(f"Commanded velocity: {des_vel}")
@@ -209,4 +209,4 @@ class Robot:
         mujoco.mj_step(self.mj_model, self.mj_data)
 
     def failed(self):
-        return self.mj_data.qpos[2] < -1
+        return self.mj_data.qpos[2] < -5

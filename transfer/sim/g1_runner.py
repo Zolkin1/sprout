@@ -11,7 +11,41 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 from rl_policy_wrapper import RLPolicy
 
 from transfer.sim.robot import Robot
-from transfer.sim.simulation import Simulation
+# from transfer.sim.simulation import Simulation
+from transfer.sim.simulation_recording import Simulation
+
+import numpy as np
+def my_force_disturbance(time: float) -> np.ndarray:
+    """
+    Apply a force disturbance based on simulation time.
+    
+    Args:
+        time: Current simulation time in seconds
+    
+    Returns:
+        6D wrench [fx, fy, fz, tx, ty, tz] to apply to the robot
+    """
+    # Example 1: Constant force in x-direction
+    # return np.array([50.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    
+    # Example 2: Impulse force at specific time
+    if 3.0 < time < 3.2:  # Apply force between 3.0 and 3.2 seconds
+        return np.array([-100.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    else:
+        return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    
+    # Example 3: Sinusoidal disturbance
+    # force_magnitude = 50.0
+    # frequency = 1.0  # Hz
+    # fx = force_magnitude * np.sin(2 * np.pi * frequency * time)
+    # return np.array([fx, 0.0, 0.0, 0.0, 0.0, 0.0])
+    
+    # Example 4: Random disturbance at intervals
+    # if int(time) % 3 == 0 and time % 1.0 < 0.01:  # Every 3 seconds
+    #     return np.random.randn(6) * 20.0
+    # else:
+    #     return np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
 
 
 def main():
@@ -66,16 +100,85 @@ def main():
     )
     print(config["log"])
 
-    # Create and run simulation
+    # # Create and run simulation
+    # sim = Simulation(
+    #     policy,
+    #     robot_instance,
+    #     log=config.get("log", False),
+    #     log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+    #     use_height_sensor=config.get("height_map_scale") is not None,
+    #     tracking_body_name="torso_link",
+    # )
+    
+    
     sim = Simulation(
         policy,
         robot_instance,
-        log=config.get("log", False),
-        log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+        # log=config.get("log", False),
+        # log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
         use_height_sensor=config.get("height_map_scale") is not None,
         tracking_body_name="torso_link",
+        record_video=True,
+        video_width=1080,
+        video_height=1080,
+        camera_config={
+                'type': 'tracking',
+                # 'lookat': [2.0, 0, 1],      # Point camera looks at [x, y, z]
+                'body_name': 'torso_link', 
+                'distance': 3.0,           # Distance from lookat point
+                'azimuth': 270,             # Horizontal rotation (degrees)
+                'elevation': 10          # Vertical angle (degrees)
+            }
     )
-    sim.run(-1)  # Run forever
+
+    # sim.run(10)  # Run for 5 seconds
+    
+    
+#     sim = Simulation(
+#        policy,
+#        robot_instance,
+#        # log=config.get("log", False),
+#        # log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+#        use_height_sensor=config.get("height_map_scale") is not None,
+#        record_video=True,
+#        video_width=5120,
+#        video_height=1440,
+#        camera_config={
+#         'type': 'fixed',
+#         'lookat': [10, 0, 1.0],     # Center of 20m terrain (x=10 if starts at 0)
+#         'distance': 7.0,             # Very far
+#         'azimuth': 90,
+#         'elevation': 0              # Slightly looking down
+#        },
+#    )
+
+#     sim = Simulation(
+#        policy,
+#        robot_instance,
+#        # log=config.get("log", False),
+#        # log_dir=config.get("log_dir", os.path.join(os.getcwd(), "logs")),
+#        use_height_sensor=config.get("height_map_scale") is not None,
+#        record_video=True,
+#        video_width=1920,
+#        video_height=1080,
+#        camera_config={
+#                'type': 'fixed',
+#                'lookat': [1.5, 0, 1],      # Point camera looks at [x, y, z]
+#                'distance': 3.2,           # Distance from lookat point
+#                'azimuth': 270,             # Horizontal rotation (degrees)
+#                'elevation': -30           # Vertical angle (degrees)
+#            }
+#    )
+
+
+
+    # sim.run(25)  # Run for 5 seconds
+    
+    sim.run(
+        total_time=5.0,  # Run for 10 seconds
+        force_disturbance=my_force_disturbance  # Pass the disturbance function
+    )
+
 
 
 if __name__ == "__main__":
