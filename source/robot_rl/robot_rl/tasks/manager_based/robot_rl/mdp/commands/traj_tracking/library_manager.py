@@ -1,14 +1,19 @@
 import os
 from pathlib import Path
 import torch
+from .manager_base import ManagerBase
 from .trajectory_manager import TrajectoryManager
 
+# TODO: Test with new changes
+class LibraryManager(ManagerBase):
+    """Manages a library of trajectories, selecting the appropriate one based on a conditioning variable."""
 
-class LibraryManager:
-
-    def __init__(self, library_folder_path: str, hf_repo: str, device):
+    def __init__(self, library_folder_path: str, hf_repo: str, device,
+                 env=None, conditioner_generator_name: str = None):
         self.folder_path = library_folder_path
         self.device = device
+        self.env = env
+        self.conditioner_generator_name = conditioner_generator_name
         self.trajectory_managers = []
         self.conditioning_vars = None
         self.num_outputs = None
@@ -125,6 +130,15 @@ class LibraryManager:
         except Exception as e:
             raise RuntimeError(f"Failed to download trajectory library from Hugging Face: {e}")
 
+    def get_conditioner_var(self) -> torch.Tensor:
+        """Get the conditioner variable from the environment's command manager.
+
+        Returns:
+            torch.Tensor: The conditioning variable for each environment, shape [N].
+        """
+        cond_term = self.env.command_manager.get_term(self.conditioner_generator_name)
+        return cond_term.command[:, 0]
+
     @property
     def get_output_names(self):
         return self.output_names
@@ -132,13 +146,30 @@ class LibraryManager:
     def get_reference_frames(self):
         return self.ref_frames
 
+    def get_num_outputs(self) -> int:
+        """Get the total number of outputs in the trajectory.
+
+        Returns:
+            The number of outputs.
+        """
+        return self.num_outputs
+
     def get_num_domains(self):
         return self.trajectory_managers[0].get_num_domains()
 
     def get_trajectory_type(self):
         return self.trajectory_type
 
-    def get_phasing_var(self, conditioner: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute the phasing variable for each environment.
+
+        Args:
+            t: Time tensor of shape [N].
+
+        Returns:
+            Phasing variable tensor of shape [N].
+        """
+        conditioner = self.get_conditioner_var()
         indices = self.get_traj_indices(conditioner)
 
         phasing_var = torch.zeros(t.shape[0], device=self.device)
@@ -163,19 +194,16 @@ class LibraryManager:
 
         return phasing_var
 
-    def get_output(self, t: torch.Tensor,         # shape [N] where N is the number of environments
-                   conditioner: torch.Tensor      # shape [N]
-                   ) -> torch.Tensor:
-        """
-        Compute the outputs to be tracked by the RL.
+    def get_output(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute the outputs to be tracked by the RL.
 
         Args:
-            t (torch.Tensor): time in each env. shape [N]
-            conditioner (torch.Tensor): conditioning variable for each env. shape [N]
+            t: Time in each env, shape [N].
 
         Returns:
-            outputs (torch.Tensor): outputs to be tracked by the RL. shape [N, 2, num_outputs]
+            Outputs to be tracked by the RL, shape [N, 2, num_outputs].
         """
+        conditioner = self.get_conditioner_var()
         indices = self.get_traj_indices(conditioner)
 
         # Initialize output tensor
@@ -202,20 +230,18 @@ class LibraryManager:
 
         return outputs
 
-    def get_ref_frames_in_use(self, conditioner: torch.Tensor,
-                              t: torch.Tensor,
+    def get_ref_frames_in_use(self, t: torch.Tensor,
                               ref_frames: list[str]) -> torch.Tensor:
-        """
-        Determine the reference frame in use for each environment.
+        """Determine the reference frame in use for each environment.
 
         Args:
-            conditioner (torch.Tensor): conditioning variable for each env. shape [N]
-            t (torch.Tensor): time in each env. shape [N]
-            ref_frames (list[str]): list of reference frame names
+            t: Time in each env, shape [N].
+            ref_frames: List of reference frame names.
 
         Returns:
-            frame_indices (torch.Tensor): indices into ref_frames for the active frame in each env. shape [N]
+            Frame indices into ref_frames for the active frame in each env, shape [N].
         """
+        conditioner = self.get_conditioner_var()
         indices = self.get_traj_indices(conditioner)
 
         # Initialize output tensor
@@ -242,22 +268,18 @@ class LibraryManager:
 
         return frame_indices
 
-    def get_contact_state(self, conditioner: torch.Tensor,     # shape: [N]
-                           t: torch.Tensor,                     # shape: [N]
-                           contact_frames: list[str]            # shape: [num_contacts]
-                           ) -> torch.Tensor:
-        """
-        Get the contact states for each frame from the trajectory
+    def get_contact_state(self, t: torch.Tensor,
+                          contact_frames: list[str]) -> torch.Tensor:
+        """Get the contact states for each frame from the trajectory.
 
         Args:
-            conditioner (torch.Tensor): conditioning variable for each env. shape [N]
-            t (torch.Tensor): time in each env. shape [N]
-            contact_frames (list[str]): list of contact frame names
+            t: Time in each env, shape [N].
+            contact_frames: List of contact frame names.
 
         Returns:
-            contact_states (torch.Tensor): contact states for each frame from the trajectory. shape [N, num_contacts]
+            Contact states for each frame from the trajectory, shape [N, num_contacts].
         """
-
+        conditioner = self.get_conditioner_var()
         indices = self.get_traj_indices(conditioner)
 
         # Initialize output tensor
@@ -284,9 +306,16 @@ class LibraryManager:
 
         return contact_states
 
-    def get_current_domains(self, conditioner: torch.Tensor,
-                            t: torch.Tensor) -> torch.Tensor:
-        """Return the domain index for each env."""
+    def get_current_domains(self, t: torch.Tensor) -> torch.Tensor:
+        """Return the domain index for each env.
+
+        Args:
+            t: Time in each env, shape [N].
+
+        Returns:
+            Domain indices, shape [N].
+        """
+        conditioner = self.get_conditioner_var()
         traj_idx = self.get_traj_indices(conditioner)
 
         # Get the unique managers (avoid repeats)
@@ -324,11 +353,16 @@ class LibraryManager:
 
         return torch.clamp(indicies, 0, len(self.trajectory_managers) - 1)
 
-    def get_domain_times(self, conditioner: torch.Tensor,
-                         t: torch.Tensor) -> torch.Tensor:
+    def get_domain_times(self, t: torch.Tensor) -> torch.Tensor:
+        """Get the duration of the current domain for each environment.
+
+        Args:
+            t: Time in each env, shape [N].
+
+        Returns:
+            Domain durations, shape [N].
         """
-        Get the times for each domain.
-        """
+        conditioner = self.get_conditioner_var()
         traj_idx = self.get_traj_indices(conditioner)
 
         # Get the unique managers (avoid repeats)

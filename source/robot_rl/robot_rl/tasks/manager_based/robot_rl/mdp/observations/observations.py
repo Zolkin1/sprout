@@ -140,3 +140,50 @@ def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     domain[standing] = 2
 
     return domain.unsqueeze(-1)
+
+def multiskill_phase(env: ManagerBasedRLEnv, command_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create a number of phasing variables at different frequencies to cover a range.
+    """
+
+    frequencies = torch.tensor([0.01, 0.1, 1, 10, 100], device=env.device)   # Hz
+    num_freq = len(frequencies)
+
+    cmd = env.command_manager.get_term(command_name)
+
+    t = env.episode_length_buf * env.step_dt
+
+    episodic = cmd.is_episodic()
+    phasing_var = cmd.get_phasing_var(t)
+
+    sp = torch.zeros(env.num_envs, num_freq, device=env.device)
+    cp = torch.zeros(env.num_envs, num_freq, device=env.device)
+
+    for i in range(num_freq):
+        sp[:, i] = torch.sin(2 * torch.pi * frequencies[i] * t)
+        cp[:, i] = torch.cos(2 * torch.pi * frequencies[i] * t)
+
+        # Overwrite the episodic envs to go from phase 0 to 1
+        sp[episodic, i] = torch.sin(2 * torch.pi * phasing_var[episodic])
+        cp[episodic, i] = torch.cos(2 * torch.pi * phasing_var[episodic])
+
+    return sp, cp
+
+def skill_selector(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """
+    Passes an encoding of the skill currently in use.
+
+    For now, we will use a 1 hot encoding.
+    """
+    # TODO: Check/test function
+
+    encoding = {"locomotion": 0, "bow_forward": 1}
+
+    cmd = env.command_manager.get_term(command_name)
+
+    skill_encoding = torch.zeros(env.num_envs, device=env.device)
+
+    for i in cmd.manager.traj_names:
+        skill_encoding[cmd.manager.manager_indices[i]] = encoding[cmd.manager.traj_names[i]]
+
+    return skill_encoding

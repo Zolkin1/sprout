@@ -1,6 +1,7 @@
 import numpy as np
 import re
 import torch
+import time
 from isaaclab.managers import CommandTerm
 
 from .clf import CLF
@@ -53,7 +54,8 @@ class TrajectoryCommand(CommandTerm):
             self.manager = TrajectoryManager(cfg.path, cfg.hf_repo, env.device)
             self.trajectory_type = self.manager.traj_data.trajectory_type
         elif cfg.manager_type == "library":
-            self.manager = LibraryManager(cfg.path, cfg.hf_repo, env.device)
+            self.manager = LibraryManager(cfg.path, cfg.hf_repo, env.device,
+                                           env=env, conditioner_generator_name=cfg.conditioner_generator_name)
             self.trajectory_type = self.manager.trajectory_type
         else:
             raise NotImplementedError(f"Manager Type {cfg.manager_type} is not implemented!")
@@ -114,26 +116,21 @@ class TrajectoryCommand(CommandTerm):
 
         self.phasing_var = 0
 
+        self.get_measured_output_time = 0.0
+        self.get_desired_output_time = 0.0
+        self.vdot_time = 0.0
+
     def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
-        if self.manager_type == "trajectory":
-            self.phasing_var = self.manager.get_phasing_var(t)
-            return self.phasing_var
-        elif self.manager_type == "library":
-            conditioner = self.get_conditioner_var()
-            self.phasing_var = self.manager.get_phasing_var(conditioner, t)
-            return self.phasing_var
-        else:
-            raise ValueError(f"Cannot get phasing variable for manager of type {self.manager_type}.")
+        """Get the phasing variable for the current trajectory.
 
-    def get_conditioner_var(self) -> torch.Tensor:
-        """Get the conditioner variable."""
-        cond_term = self.env.command_manager.get_term(self.conditioner_generator)
+        Args:
+            t: Time tensor of shape [N].
 
-        # TODO: For now just hard code the conditioning variable as velocity
-        condition_vars = cond_term.command[:, 0]
-
-        # condition_vars = cond_term.get_condition_vars() # TODO: Implement. This could come from a command or from terrain (i.e. stair height, slope)
-        return condition_vars
+        Returns:
+            Phasing variable tensor of shape [N].
+        """
+        self.phasing_var = self.manager.get_phasing_var(t)
+        return self.phasing_var
 
     def _expand_wildcard_frames(self, frame_patterns: list[str]) -> list[str]:
         """
@@ -174,21 +171,16 @@ class TrajectoryCommand(CommandTerm):
         return expanded_frames
 
     def get_contact_state(self, t: torch.Tensor):
-        """
-        Gets the desired contact state at the given time for the specified contact point.
+        """Gets the desired contact state at the given time for the specified contact point.
 
         Args:
-            t: shape [N] the times in each environment
+            t: Shape [N] the times in each environment.
 
         Returns:
-            contact_states: shape [N, num_contacts]. A tensor of binary values with a 1 indicating in contact and 0 otherwise.
+            Contact states of shape [N, num_contacts]. A tensor of binary values
+            with a 1 indicating in contact and 0 otherwise.
         """
-        # For a library we need the conditioner value too
-        if self.manager_type == "library":
-            conditioner = self.get_conditioner_var()
-            return self.manager.get_contact_state(conditioner, t, self.contact_bodies)
-        else:
-            return self.manager.get_contact_state(t, self.contact_bodies)
+        return self.manager.get_contact_state(t, self.contact_bodies)
 
     def get_symmetric_contacts(self, contacts):
         """
@@ -339,11 +331,7 @@ class TrajectoryCommand(CommandTerm):
         #   The self.ref_poses should be of shape [N, 7] and should just be holding the current in use reference frame.
 
         # Get the current domains
-        if self.manager_type == "library":
-            conditioner = self.get_conditioner_var()
-            new_domains = self.manager.get_current_domains(conditioner, t)
-        else:
-            new_domains = self.manager.get_current_domains(t)
+        new_domains = self.manager.get_current_domains(t)
 
         # Check if the domains changed
         changed = new_domains != self.current_domain
@@ -351,7 +339,7 @@ class TrajectoryCommand(CommandTerm):
         # Note that domains never change for full periodic single domain trajectories, but I think we still want to update the position.
         # The two options are (1) continually updating the position while in contact, (2) try to check based on the phasing variable
         # TODO: Come back to this to see if this is the best way to do this. For now using option (1)
-        if self.manager.get_num_domains() == 1:
+        if self.manager.get_num_domains() == 1:     # TODO: make this on a per-env basis so that we can have multiple domains in some envs and not others
             changed[:] = True
 
         # Update the list of current domains
@@ -366,10 +354,7 @@ class TrajectoryCommand(CommandTerm):
         self.desired_contact_poses = self.get_desired_contact_poses(changed, self.current_contact_poses)
 
         # Get the indices into self.ref_frames for the reference frame in use for each env
-        if self.manager_type == "trajectory":
-            ref_frame_indices = self.manager.get_ref_frames_in_use(t, self.ref_frames)  # Shape: [N]
-        else:
-            ref_frame_indices = self.manager.get_ref_frames_in_use(self.get_conditioner_var(), t, self.ref_frames)  # Shape: [N]
+        ref_frame_indices = self.manager.get_ref_frames_in_use(t, self.ref_frames)  # Shape: [N]
 
         # Map ref_frame_indices to contact_state indices
         # ref_frame_indices indexes into self.ref_frames, but contact_state uses self.contact_frames
@@ -498,27 +483,17 @@ class TrajectoryCommand(CommandTerm):
             output_idx += joint_vel
 
     def get_desired_outputs(self, t: torch.Tensor):
+        """Get the desired output to track from the trajectory.
+
+        Args:
+            t: Time tensor of shape [N].
         """
-        Get the desired output to track from the trajectory.
+        y = self.manager.get_output(t)
 
-        TODO: Need to support adjustments to the trajectory, such as yawing and lateral motion for locomoting.
-        """
-
-        if self.manager_type == "library":
-            conditioner = self.get_conditioner_var()
-            y = self.manager.get_output(t, conditioner)
-        else:
-            y = self.manager.get_output(t)
-
-        # TODO: Apply optional heuristic modification
+        # Apply optional heuristic modification
         if self.user_heuristic is not None:
             contact_states = self.get_contact_state(t)
-            if self.manager_type == "library":
-                conditioner = self.get_conditioner_var()
-                domain_times = self.manager.get_domain_times(conditioner, t)
-            else:
-                domain_times = self.manager.get_domain_times(t)
-
+            domain_times = self.manager.get_domain_times(t)
             y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
                                     contact_states, domain_times,)
 
@@ -600,12 +575,22 @@ class TrajectoryCommand(CommandTerm):
         # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
 
         # Update the measured outputs
+        start = time.perf_counter()
         self.get_measured_outputs(t)
+        end = time.perf_counter()
+        self.get_measured_output_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
         # Get desired output
+        start = time.perf_counter()
         self.get_desired_outputs(t)
+        end = time.perf_counter()
+        self.get_desired_output_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
+        start = time.perf_counter()
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des, self.yaw_output_idxs)
+        end = time.perf_counter()
+        self.vdot_time = (end - start) * torch.ones(self.num_envs, device=self.device)
+
         self.vdot = vdot
         self.v = vcur
 
@@ -627,6 +612,11 @@ class TrajectoryCommand(CommandTerm):
 
         for i, output in enumerate(self.ordered_output_names):
             self.metrics[output + "_vel"] = torch.abs(self.dy_des[:, i] - self.dy_act[:, i])
+
+        # Log times
+        self.metrics["get_measured_output_time"] = self.get_measured_output_time
+        self.metrics["get_desired_output_time"] = self.get_desired_output_time
+        self.metrics["vdot_time"] = self.vdot_time
 
     def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[int]]:
         """

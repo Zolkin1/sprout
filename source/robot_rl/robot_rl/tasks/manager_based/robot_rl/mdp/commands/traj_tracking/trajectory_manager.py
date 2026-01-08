@@ -8,6 +8,8 @@ import math
 import numpy as np
 from hid import device
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.manager_base import ManagerBase
+
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
@@ -39,7 +41,7 @@ class TrajectoryData:
     reference_frames: list[str]     # List of the bezier frames
 
 
-class TrajectoryManager:
+class TrajectoryManager(ManagerBase):
     """Manages a single trajectory. The trajectory is specified in a yaml file."""
 
     def __init__(self, traj_path: str, hf_repo: str, device):
@@ -283,6 +285,14 @@ class TrajectoryManager:
     def get_output_names(self):
         return self.traj_data.output_names
 
+    def get_num_outputs(self) -> int:
+        """Get the total number of outputs in the trajectory.
+
+        Returns:
+            The number of outputs.
+        """
+        return self.traj_data.num_outputs
+
     def get_num_domains(self):
         return self.expanded_num_domains
 
@@ -327,18 +337,21 @@ class TrajectoryManager:
         # Get the unique domains
         unique_domains = torch.unique(domain_indices)
 
+        # TODO: Speed up. This seems to be taking about 0.2-0.3 s per iteration
         for dom in unique_domains:
-            current_domains = domain_indices == unique_domains # TODO: Check
+            current_domains = domain_indices == dom
+            tau_dom = tau[current_domains]
+            T_dom = T[dom].expand(tau_dom.shape[0])
             if dom >= self.num_domains:
                 if bezier_coeffs_reflect is None:
                     raise ValueError(f"Issue indexing into the bezier coefficients due to the half period!")
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
-                                                                             T[domain_indices])
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
-                                                                             T[domain_indices])
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                                                                             T_dom)
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                                                                             T_dom)
             else:
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[dom, :, :].squeeze(), T[domain_indices])
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau, bezier_coeffs[dom, :, :].squeeze(), T[domain_indices])
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, :].squeeze(), T_dom)
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau_dom, bezier_coeffs[dom, :, :].squeeze(), T_dom)
 
         return outputs
 

@@ -27,133 +27,228 @@ from .g1_trajopt_reward import G1TrajOptCLFRewards
 # Lyapunov Weights
 ##
 WALKING_Q_weights = {}
-WALKING_Q_weights["com:pos_x"] = [25.0, 250.0]
-WALKING_Q_weights["com:pos_y"] = [500.0, 20.0]
-WALKING_Q_weights["com:pos_z"] = [250.0, 10.0]
+# WALKING_Q_weights["com:pos_x"] = [25.0, 250.0]
+# WALKING_Q_weights["com:pos_y"] = [500.0, 20.0]
+# WALKING_Q_weights["com:pos_z"] = [250.0, 10.0]
+#
+# WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [1500.0, 50.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [1500.0, 50.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [2500.0, 50.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [30.0, 1.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [150.0, 1.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [400.0, 10.0]
+#
+# WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [1500.0, 50.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [1500.0, 50.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [2500.0, 50.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [30.0, 1.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [150.0, 1.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [400.0, 10.0]
+#
+# WALKING_Q_weights["pelvis_link:pos_x"] = [25.0, 250.0]
+# WALKING_Q_weights["pelvis_link:pos_y"] = [500.0, 20.0]
+# WALKING_Q_weights["pelvis_link:pos_z"] = [250.0, 10.0]
+# WALKING_Q_weights["pelvis_link:ori_x"] = [300.0, 20.0]
+# WALKING_Q_weights["pelvis_link:ori_y"] = [250.0, 10.0]
+# WALKING_Q_weights["pelvis_link:ori_z"] = [300.0, 30.0]
+#
+# WALKING_Q_weights["joint:waist_yaw_joint"] = [100.0, 1.0]
+# WALKING_Q_weights["joint:left_elbow_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:right_elbow_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [50.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [50.0, 1.0]
+#
+# WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [500.0, 50.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [500.0, 50.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [500.0, 50.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [150.0, 10.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [150.0, 10.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [150.0, 10.0]
+#
+# WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [500.0, 50.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [500.0, 50.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [500.0, 50.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [150.0, 10.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [150.0, 10.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [150.0, 10.0]
 
-WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [1500.0, 50.0]
-WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [1500.0, 50.0]
-WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [2500.0, 50.0]
-WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [30.0, 1.0]
-WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [150.0, 1.0]
-WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [400.0, 10.0]
+WALKING_Q_weights["com:pos_x"] = [5.0, 10.0] # TODO: Try making the vel higher
+WALKING_Q_weights["com:pos_y"] = [5.0, 2.0]
+WALKING_Q_weights["com:pos_z"] = [5.0, 1.0]
 
-WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [1500.0, 50.0]
-WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [1500.0, 50.0]
-WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [2500.0, 50.0]
-WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [30.0, 1.0]
-WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [150.0, 1.0]
-WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [400.0, 10.0]
+WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [15.0, 2.0]
+WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [15.0, 2.0]
+WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [15.0, 2.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [10.0, 2.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [10.0, 2.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [10.0, 2.0]
 
-WALKING_Q_weights["pelvis_link:pos_x"] = [25.0, 250.0]
-WALKING_Q_weights["pelvis_link:pos_y"] = [500.0, 20.0]
-WALKING_Q_weights["pelvis_link:pos_z"] = [250.0, 10.0]
-WALKING_Q_weights["pelvis_link:ori_x"] = [300.0, 20.0]
-WALKING_Q_weights["pelvis_link:ori_y"] = [250.0, 10.0]
-WALKING_Q_weights["pelvis_link:ori_z"] = [300.0, 30.0]
+WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [15.0, 2.0]
+WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [15.0, 2.0]
+WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [15.0, 2.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [10.0, 2.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [10.0, 2.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 2.0]
 
-WALKING_Q_weights["joint:waist_yaw_joint"] = [100.0, 1.0]
-WALKING_Q_weights["joint:left_elbow_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:right_elbow_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [50.0, 1.0]
-WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_hip_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_hip_pitch_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_hip_yaw_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_knee_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_ankle_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_ankle_pitch_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_hip_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_hip_pitch_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_hip_yaw_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_knee_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_ankle_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_ankle_pitch_joint"] = [4.0, 1.0]
 
-WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [500.0, 50.0]
-WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [500.0, 50.0]
-WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [500.0, 50.0]
-WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [150.0, 10.0]
-WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [150.0, 10.0]
-WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [150.0, 10.0]
+WALKING_Q_weights["pelvis_link:pos_x"] = [5.0, 1.0]
+WALKING_Q_weights["pelvis_link:pos_y"] = [5.0, 1.0]
+WALKING_Q_weights["pelvis_link:pos_z"] = [5.0, 1.0]
+WALKING_Q_weights["pelvis_link:ori_x"] = [15.0, 3.0]
+WALKING_Q_weights["pelvis_link:ori_y"] = [15.0, 3.0]
+WALKING_Q_weights["pelvis_link:ori_z"] = [15.0, 3.0]
 
-WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [500.0, 50.0]
-WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [500.0, 50.0]
-WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [500.0, 50.0]
-WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [150.0, 10.0]
-WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [150.0, 10.0]
-WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [150.0, 10.0]
-# WALKING_Q_weights = [
-#     25.0,   250.0,      # com_x pos, vel
-#     500.0,   20.0,      # com_y pos, vel
-#     650.0,   10.0,      # com_z pos, vel
-#     300.0,    20.0,     # pelvis_roll pos, vel
-#     250.0,    10.0,     # pelvis_pitch pos, vel
-#     300.0,    30.0,     # pelvis_yaw pos, vel
-#     1500.0, 50.0,       # swing_x pos, vel
-#     1500.0,  50.0,      # swing_y pos, vel
-#     2500.0, 50.0,       # swing_z pos, vel
-#     30.0,    1.0,       # swing_ori_roll pos, vel
-#     150.0,    1.0,       # swing_ori_pitch pos, vel
-#     400.0,    10.0,     # swing_ori_yaw pos, vel
-#     1500.0, 50.0,       # stance_x pos, vel
-#     1500.0,  50.0,      # stance_y pos, vel
-#     2500.0, 50.0,       # stance_z pos, vel
-#     30.0,    1.0,       # stance_ori_roll pos, vel
-#     150.0,    1.0,       # stance_ori_pitch pos, vel
-#     400.0,    10.0,     # swing_ori_yaw pos, vel
-#     100.0,    1.0,      # waist_yaw pos, vel
-#     40.0,1.0, #left shoulder pitch
-#     40.0,1.0, #left shoulder roll
-#     50.0,1.0, #left shoulder yaw
-#     30.0,1.0, #left elbow
-#     40.0,1.0, #right shoulder pitch
-#     40.0,1.0, #right shoulder roll
-#     50.0,1.0, #right shoulder yaw
-#     30.0,1.0, #right elbow
-# ]
+WALKING_Q_weights["joint:waist_yaw_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_elbow_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_elbow_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [4.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [4.0, 1.0]
+
+WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+
+WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+
+# WALKING_Q_weights["com:pos_x"] = [0.1, 10.0]
+# WALKING_Q_weights["com:pos_y"] = [2.0, 0.8]
+# WALKING_Q_weights["com:pos_z"] = [1.0, 0.4]
+#
+# WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [6.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [6.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [0.12, 0.04]
+# WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [0.6, 0.04]
+# WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [1.6, 0.4]
+#
+# WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [6.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [6.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [0.12, 0.04]
+# WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [0.6, 0.04]
+# WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [1.6, 0.4]
+#
+# WALKING_Q_weights["pelvis_link:pos_x"] = [0.1, 10.0]
+# WALKING_Q_weights["pelvis_link:pos_y"] = [2.0, 0.8]
+# WALKING_Q_weights["pelvis_link:pos_z"] = [1.0, 0.4]
+# WALKING_Q_weights["pelvis_link:ori_x"] = [1.2, 0.8]
+# WALKING_Q_weights["pelvis_link:ori_y"] = [1.0, 0.4]
+# WALKING_Q_weights["pelvis_link:ori_z"] = [1.2, 1.2]
+#
+# WALKING_Q_weights["joint:waist_yaw_joint"] = [0.4, 0.04]
+# WALKING_Q_weights["joint:left_elbow_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_elbow_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [0.2, 0.04]
+#
+# WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [0.6, 0.4]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [0.6, 0.4]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [0.6, 0.4]
+#
+# WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [0.6, 0.4]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [0.6, 0.4]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [0.6, 0.4]
 
 WALKING_R_weights = {}
-WALKING_R_weights["com:pos_x"] = [0.1]
-WALKING_R_weights["com:pos_y"] = [0.1]
-WALKING_R_weights["com:pos_z"] = [0.1]
+WALKING_R_weights["com:pos_x"] = [0.001]
+WALKING_R_weights["com:pos_y"] = [0.001]
+WALKING_R_weights["com:pos_z"] = [0.001]
 
-WALKING_R_weights["left_ankle_roll_link:pos_x"] = [0.05]
-WALKING_R_weights["left_ankle_roll_link:pos_y"] = [0.05]
-WALKING_R_weights["left_ankle_roll_link:pos_z"] = [0.05]
-WALKING_R_weights["left_ankle_roll_link:ori_x"] = [0.02]
-WALKING_R_weights["left_ankle_roll_link:ori_y"] = [0.02]
-WALKING_R_weights["left_ankle_roll_link:ori_z"] = [0.02]
+WALKING_R_weights["left_ankle_roll_link:pos_x"] = [0.0005]
+WALKING_R_weights["left_ankle_roll_link:pos_y"] = [0.0005]
+WALKING_R_weights["left_ankle_roll_link:pos_z"] = [0.0005]
+WALKING_R_weights["left_ankle_roll_link:ori_x"] = [0.0002]
+WALKING_R_weights["left_ankle_roll_link:ori_y"] = [0.0002]
+WALKING_R_weights["left_ankle_roll_link:ori_z"] = [0.0002]
 
-WALKING_R_weights["right_ankle_roll_link:pos_x"] = [0.05]
-WALKING_R_weights["right_ankle_roll_link:pos_y"] = [0.05]
-WALKING_R_weights["right_ankle_roll_link:pos_z"] = [0.05]
-WALKING_R_weights["right_ankle_roll_link:ori_x"] = [0.02]
-WALKING_R_weights["right_ankle_roll_link:ori_y"] = [0.02]
-WALKING_R_weights["right_ankle_roll_link:ori_z"] = [0.02]
+WALKING_R_weights["right_ankle_roll_link:pos_x"] = [0.0005]
+WALKING_R_weights["right_ankle_roll_link:pos_y"] = [0.0005]
+WALKING_R_weights["right_ankle_roll_link:pos_z"] = [0.0005]
+WALKING_R_weights["right_ankle_roll_link:ori_x"] = [0.0002]
+WALKING_R_weights["right_ankle_roll_link:ori_y"] = [0.0002]
+WALKING_R_weights["right_ankle_roll_link:ori_z"] = [0.0002]
 
-WALKING_R_weights["pelvis_link:pos_x"] = [0.05]
-WALKING_R_weights["pelvis_link:pos_y"] = [0.05]
-WALKING_R_weights["pelvis_link:pos_z"] = [0.05]
-WALKING_R_weights["pelvis_link:ori_x"] = [0.05]
-WALKING_R_weights["pelvis_link:ori_y"] = [0.05]
-WALKING_R_weights["pelvis_link:ori_z"] = [0.05]
+WALKING_R_weights["joint:left_hip_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:left_hip_pitch_joint"] = [0.0001]
+WALKING_R_weights["joint:left_hip_yaw_joint"] = [0.0001]
+WALKING_R_weights["joint:left_knee_joint"] = [0.0001]
+WALKING_R_weights["joint:left_ankle_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:left_ankle_pitch_joint"] = [0.0001]
+WALKING_R_weights["joint:right_hip_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:right_hip_pitch_joint"] = [0.0001]
+WALKING_R_weights["joint:right_hip_yaw_joint"] = [0.0001]
+WALKING_R_weights["joint:right_knee_joint"] = [0.0001]
+WALKING_R_weights["joint:right_ankle_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:right_ankle_pitch_joint"] = [0.0001]
 
-WALKING_R_weights["joint:waist_yaw_joint"] = [0.01]
-WALKING_R_weights["joint:left_elbow_joint"] = [0.01]
-WALKING_R_weights["joint:left_shoulder_pitch_joint"] = [0.01]
-WALKING_R_weights["joint:left_shoulder_roll_joint"] = [0.01]
-WALKING_R_weights["joint:left_shoulder_yaw_joint"] = [0.01]
-WALKING_R_weights["joint:right_elbow_joint"] = [0.01]
-WALKING_R_weights["joint:right_shoulder_pitch_joint"] = [0.01]
-WALKING_R_weights["joint:right_shoulder_roll_joint"] = [0.01]
-WALKING_R_weights["joint:right_shoulder_yaw_joint"] = [0.01]
+WALKING_R_weights["pelvis_link:pos_x"] = [0.0005]
+WALKING_R_weights["pelvis_link:pos_y"] = [0.0005]
+WALKING_R_weights["pelvis_link:pos_z"] = [0.0005]
+WALKING_R_weights["pelvis_link:ori_x"] = [0.0005]
+WALKING_R_weights["pelvis_link:ori_y"] = [0.0005]
+WALKING_R_weights["pelvis_link:ori_z"] = [0.0005]
 
-WALKING_R_weights["right_wrist_yaw_link:pos_x"] = [0.05]
-WALKING_R_weights["right_wrist_yaw_link:pos_y"] = [0.05]
-WALKING_R_weights["right_wrist_yaw_link:pos_z"] = [0.05]
-WALKING_R_weights["right_wrist_yaw_link:ori_x"] = [0.05]
-WALKING_R_weights["right_wrist_yaw_link:ori_y"] = [0.05]
-WALKING_R_weights["right_wrist_yaw_link:ori_z"] = [0.05]
+WALKING_R_weights["joint:waist_yaw_joint"] = [0.0001]
+WALKING_R_weights["joint:left_elbow_joint"] = [0.0001]
+WALKING_R_weights["joint:left_shoulder_pitch_joint"] = [0.0001]
+WALKING_R_weights["joint:left_shoulder_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:left_shoulder_yaw_joint"] = [0.0001]
+WALKING_R_weights["joint:right_elbow_joint"] = [0.0001]
+WALKING_R_weights["joint:right_shoulder_pitch_joint"] = [0.0001]
+WALKING_R_weights["joint:right_shoulder_roll_joint"] = [0.0001]
+WALKING_R_weights["joint:right_shoulder_yaw_joint"] = [0.0001]
 
-WALKING_R_weights["left_wrist_yaw_link:pos_x"] = [0.05]
-WALKING_R_weights["left_wrist_yaw_link:pos_y"] = [0.05]
-WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
-WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
-WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
-WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:pos_x"] = [0.0005]
+WALKING_R_weights["right_wrist_yaw_link:pos_y"] = [0.0005]
+WALKING_R_weights["right_wrist_yaw_link:pos_z"] = [0.0005]
+WALKING_R_weights["right_wrist_yaw_link:ori_x"] = [0.0005]
+WALKING_R_weights["right_wrist_yaw_link:ori_y"] = [0.0005]
+WALKING_R_weights["right_wrist_yaw_link:ori_z"] = [0.0005]
+
+WALKING_R_weights["left_wrist_yaw_link:pos_x"] = [0.0005]
+WALKING_R_weights["left_wrist_yaw_link:pos_y"] = [0.0005]
+WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.0005]
+WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.0005]
+WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.0005]
+WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.0005]
 # WALKING_R_weights = [
 #         0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort
 #         0.05,0.05,0.05,     # pelvis inputs: lower torque priority
@@ -270,7 +365,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/walking",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 27,
+        num_outputs = 51, #31, #27,
         Q_weights = WALKING_Q_weights,
         R_weights = WALKING_R_weights,
     )
@@ -362,7 +457,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Terminations
         ##
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
+        # self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
 
         ##
         # Curriculum
@@ -445,7 +540,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         self.events.push_robot = None
         
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.75, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 
