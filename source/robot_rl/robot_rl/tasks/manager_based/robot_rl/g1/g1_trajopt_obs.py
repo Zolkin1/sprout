@@ -38,6 +38,10 @@ class G1TrajOptObservationsCfg():
         root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
+        # Try a trajectory error observation
+        # traj_error = ObsTerm(func=mdp.traj_error, params={"command_name": "traj_ref"})
+
+
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
