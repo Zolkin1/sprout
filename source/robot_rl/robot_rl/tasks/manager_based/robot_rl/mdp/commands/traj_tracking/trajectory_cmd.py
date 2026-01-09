@@ -116,13 +116,13 @@ class TrajectoryCommand(CommandTerm):
             device=self.device
         )
 
-        self.phasing_var = 0
+        self.phasing_var = torch.zeros(self.num_envs, device=self.device)
 
         self.get_measured_output_time = 0.0
         self.get_desired_output_time = 0.0
         self.vdot_time = 0.0
 
-    def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
+    def update_phasing_var(self, t: torch.Tensor):
         """Get the phasing variable for the current trajectory.
 
         Args:
@@ -131,16 +131,19 @@ class TrajectoryCommand(CommandTerm):
         Returns:
             Phasing variable tensor of shape [N].
         """
+        self.phasing_var = self.manager.get_phasing_var(t)
+        print(f"phasing var: {self.phasing_var}, t: {t}")
+        return self.phasing_var
 
-        # Can add a random start time to offset when the episodic trajectory starts
-        # Should only generate at the start of an episode
-        if self.cfg.random_start_time_max > 0:
-            mask = torch.where(self.env.episode_length_buf == 0)[0]
-            self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
+    def get_phasing_var(self) -> torch.Tensor:
+        """Get the phasing variable for the current trajectory.
 
-        t_offset = torch.maximum(t - self.time_offset, torch.zeros_like(t))
+        Args:
 
-        self.phasing_var = self.manager.get_phasing_var(t_offset)
+        Returns:
+            Phasing variable tensor of shape [N].
+        """
+
         return self.phasing_var
 
     def _expand_wildcard_frames(self, frame_patterns: list[str]) -> list[str]:
@@ -512,7 +515,7 @@ class TrajectoryCommand(CommandTerm):
         self.dy_des = y[:, 1, :]
 
         if self.manager.get_trajectory_type() == TrajectoryType.EPISODIC:
-            phi = self.get_phasing_var(t)
+            phi = self.update_phasing_var(t)
 
             self.dy_des[phi == 1] *= 0
 
@@ -581,6 +584,17 @@ class TrajectoryCommand(CommandTerm):
         """Update the command values."""
         # Time in each env
         t = self.env.episode_length_buf * self.env.step_dt
+
+        # Can add a random start time to offset when the episodic trajectory starts
+        # Should only generate at the start of an episode
+        if self.cfg.random_start_time_max > 0:
+            mask = torch.where(self.env.episode_length_buf == 0)[0]
+            self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
+            print(f"t: {torch.mean(t)}, time offset: {self.time_offset}")
+
+        print(f"t before: {t}")
+        t = torch.maximum(t - self.time_offset, torch.zeros_like(t))
+        print(f"t after: {t}")
 
         # Get conditioning variables (velocity, etc...)
         # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars

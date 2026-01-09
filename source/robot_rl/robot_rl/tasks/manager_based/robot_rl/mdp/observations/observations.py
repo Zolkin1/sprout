@@ -81,7 +81,7 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     t = env.episode_length_buf * env.step_dt
 
-    phase = 2*torch.pi * cmd.get_phasing_var(t)
+    phase = 2*torch.pi * cmd.get_phasing_var()
 
     # Zero the phase if we are standing (check all environments)
     standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
@@ -102,7 +102,7 @@ def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 
     t = env.episode_length_buf * env.step_dt
 
-    phase = 2*torch.pi * cmd.get_phasing_var(t)
+    phase = 2*torch.pi * cmd.get_phasing_var()
 
     # Zero the phase if we are standing (check all environments)
     standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
@@ -167,7 +167,7 @@ def multiskill_phase(env: ManagerBasedRLEnv, command_name: str) -> tuple[torch.T
     t = env.episode_length_buf * env.step_dt
 
     episodic = cmd.is_episodic()
-    phasing_var = cmd.get_phasing_var(t)
+    phasing_var = cmd.get_phasing_var()
 
     sp = torch.zeros(env.num_envs, num_freq, device=env.device)
     cp = torch.zeros(env.num_envs, num_freq, device=env.device)

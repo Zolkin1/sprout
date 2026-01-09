@@ -83,6 +83,7 @@ class RLPolicy:
                         obs_np[obs_idx:obs_idx+shape] = 0 * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    phi = 0
                     obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
@@ -97,6 +98,7 @@ class RLPolicy:
                         obs_np[obs_idx:obs_idx+shape] = 1 * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    phi = 0
                     print(f"phi: {phi}")
                     obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
                     print(f"cos phase: {self.create_sin_phase_obs(phi, 1.0)}")
