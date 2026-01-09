@@ -28,6 +28,9 @@ EXPERIMENT_NAMES = {
     "walking_clf": "walking_clf",
     "walking_clf_ec": "walking_clf",
     "running_clf": "running_clf",
+    "waving_clf": "waving_clf",
+    "bow_forward_clf": "bow_forward_clf",
+    "bow_forward_clf_sym": "bow_forward-clf-symmetric",
 }
 
 

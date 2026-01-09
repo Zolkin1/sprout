@@ -78,12 +78,12 @@ class RLPolicy:
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
                     if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time, 1.0/self.get_gait_period_range()[0]) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 0 * scale
                 elif self.get_skill_type() == "episodic":
-                    phi = time % self.get_total_time()
-                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi) * scale
+                    phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
 
@@ -92,12 +92,14 @@ class RLPolicy:
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
                     if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time, 1.0/self.get_gait_period_range()[0]) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 1 * scale
                 elif self.get_skill_type() == "episodic":
-                    phi = time % self.get_total_time()
-                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi) * scale
+                    phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    print(f"phi: {phi}")
+                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
+                    print(f"cos phase: {self.create_sin_phase_obs(phi, 1.0)}")
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape
@@ -162,13 +164,13 @@ class RLPolicy:
         """Create the action observation."""
         return self.action_isaac
 
-    def create_sin_phase_obs(self, time: float) -> np.ndarray:
+    def create_sin_phase_obs(self, time: float, freq: float) -> np.ndarray:
         """Create the sinusoidal phase observation."""
-        return np.sin(2 * np.pi * time / self.get_gait_period_range()[0])
+        return np.sin(2 * np.pi * time * freq)
 
-    def create_cos_phase_obs(self, time: float) -> np.ndarray:
+    def create_cos_phase_obs(self, time: float, freq: float) -> np.ndarray:
         """Create the cosine phase observation."""
-        return np.cos(2 * np.pi * time / self.get_gait_period_range()[0])
+        return np.cos(2 * np.pi * time * freq)
 
     ##
     # Joint Conversions

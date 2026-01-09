@@ -241,6 +241,15 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         self.events.base_external_force_torque = None
 
         ##
+        # Observations
+        ##
+        self.observations.policy.ref_traj = None
+        self.observations.policy.act_traj = None
+        self.observations.policy.ref_traj_vel = None
+        self.observations.policy.act_traj_vel = None
+        self.observations.policy.root_quat = None
+        self.observations.policy.base_lin_vel = None
+        ##
         # Rewards
         ##
         self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"

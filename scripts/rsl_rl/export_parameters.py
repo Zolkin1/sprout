@@ -70,10 +70,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
     # Get skill type
     try:
         # TODO: Test
-        params["skill_type"] = unwrapped_env.command_manager.get_term("ref_traj").trajectory_type
-        params["total_time"] = unwrapped_env.command_manager.get_term("ref_traj").manager.get_total_time()
+        params["skill_type"] = unwrapped_env.command_manager.get_term("traj_ref").trajectory_type.value
+        params["total_time"] = unwrapped_env.command_manager.get_term("traj_ref").manager.get_total_time()
     except KeyError:
-        pass
+        raise ValueError("Could not get skill_type and/or total_time while exporting parameters!")
+        # pass
 
     # Add velocity command ranges
     try:

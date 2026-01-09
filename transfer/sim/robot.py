@@ -117,7 +117,7 @@ class Robot:
         else:
             des_vel = np.array([0.5, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
-        print(f"Commanded velocity: {des_vel}")
+        # print(f"Commanded velocity: {des_vel}")
         return des_vel
 
     def create_observation(self, policy, height_map=None, sensor_pos=None):

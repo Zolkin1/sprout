@@ -3,6 +3,7 @@ import math
 import os
 from collections.abc import Callable
 from datetime import datetime
+import time
 
 import mujoco
 import mujoco.viewer
@@ -301,6 +302,8 @@ class Simulation:
 
                     # Step the sim
                     self.robot.step()
+
+                    time.sleep(0.01)
 
                     # Only log and sync viewer at viewer_rate intervals
                     if i % self.viewer_rate == 0:
