@@ -79,6 +79,8 @@ class TrajectoryCommand(CommandTerm):
             raise ValueError(f"Number of output names does not match number of outputs in the cfg! "
                              f"Len of names: {len(self.ordered_output_names)}, cfg len: {cfg.num_outputs} !")
 
+        self.time_offset = torch.zeros(self.num_envs, device=self.device)
+
         # For now assuming that all bodies have a yaw tracking
         self.yaw_output_idxs = []
         for body in range(len(self.body_idx)):
@@ -129,7 +131,16 @@ class TrajectoryCommand(CommandTerm):
         Returns:
             Phasing variable tensor of shape [N].
         """
-        self.phasing_var = self.manager.get_phasing_var(t)
+
+        # Can add a random start time to offset when the episodic trajectory starts
+        # Should only generate at the start of an episode
+        if self.cfg.random_start_time_max > 0:
+            mask = torch.where(self.env.episode_length_buf == 0)[0]
+            self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
+
+        t_offset = torch.maximum(t - self.time_offset, torch.zeros_like(t))
+
+        self.phasing_var = self.manager.get_phasing_var(t_offset)
         return self.phasing_var
 
     def _expand_wildcard_frames(self, frame_patterns: list[str]) -> list[str]:

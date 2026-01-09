@@ -168,6 +168,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
+        random_start_time_max = 1.0,
     )
 
 ##
@@ -191,7 +192,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         # Post init of parent
         super().__post_init__()
 
-        self.episode_length_s = 2.5
+        self.episode_length_s = 2.8
 
         ##
         # Scene
