@@ -58,6 +58,19 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
+def traj_error(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """
+    Make an observation using the error to the trajectory.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    ref_traj_vel = cmd.dy_des
+    act_traj_vel = cmd.dy_act
+
+    act_traj = cmd.y_act.clone()
+    ref_traj = cmd.y_des.clone()
+
+    traj_error = torch.cat([act_traj - ref_traj, act_traj_vel - ref_traj_vel], dim=-1)
+    return traj_error
 
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
