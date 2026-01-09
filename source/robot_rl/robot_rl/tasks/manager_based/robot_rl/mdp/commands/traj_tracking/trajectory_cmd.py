@@ -589,11 +589,8 @@ class TrajectoryCommand(CommandTerm):
         if self.cfg.random_start_time_max > 0:
             mask = torch.where(self.env.episode_length_buf == 0)[0]
             self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
-            print(f"t: {torch.mean(t)}, time offset: {self.time_offset}")
 
-        print(f"t before: {t}")
         t = torch.maximum(t - self.time_offset, torch.zeros_like(t))
-        print(f"t after: {t}")
 
         # Get conditioning variables (velocity, etc...)
         # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars
