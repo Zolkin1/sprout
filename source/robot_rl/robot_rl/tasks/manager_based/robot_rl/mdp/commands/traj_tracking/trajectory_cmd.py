@@ -132,7 +132,6 @@ class TrajectoryCommand(CommandTerm):
             Phasing variable tensor of shape [N].
         """
         self.phasing_var = self.manager.get_phasing_var(t)
-        print(f"phasing var: {self.phasing_var}, t: {t}")
         return self.phasing_var
 
     def get_phasing_var(self) -> torch.Tensor:
