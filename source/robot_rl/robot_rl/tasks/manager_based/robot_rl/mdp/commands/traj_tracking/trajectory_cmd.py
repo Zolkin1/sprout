@@ -117,6 +117,7 @@ class TrajectoryCommand(CommandTerm):
         )
 
         self.phasing_var = torch.zeros(self.num_envs, device=self.device)
+        self.hold_envs = torch.ones(self.num_envs, device=self.device)
 
         self.get_measured_output_time = 0.0
         self.get_desired_output_time = 0.0
@@ -591,6 +592,11 @@ class TrajectoryCommand(CommandTerm):
             self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
 
         t = torch.maximum(t - self.time_offset, torch.zeros_like(t))
+
+        if self.cfg.percent_hold_phi > 0:
+            mask = torch.where(self.env.episode_length_buf == 0)[0]
+            self.hold_envs[mask] = (torch.rand(len(mask), device=self.device) > self.cfg.percent_hold_phi).float()
+            t *= self.hold_envs
 
         # Get conditioning variables (velocity, etc...)
         # cond_vars = self.env.command_manager.get_command(self.conditioner_generator)[:, 0]  # TODO: Allow conditioners to be more than scalars

@@ -169,6 +169,7 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
         random_start_time_max = 1.0,
+        percent_hold_phi = 0.05,
     )
 
 ##

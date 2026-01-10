@@ -23,3 +23,4 @@ class TrajectoryCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (5.0, 15.0)    # TODO: How can I remove this?
     heuristic_func = None
     random_start_time_max: float = -1
+    percent_hold_phi: float = -1
