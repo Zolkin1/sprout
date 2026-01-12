@@ -98,8 +98,8 @@ class RLPolicy:
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
                     print(f"phi: {phi}")
-                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
-                    print(f"cos phase: {self.create_sin_phase_obs(phi, 1.0)}")
+                    obs_np[obs_idx:obs_idx + shape] = self.create_cos_phase_obs(phi, 1.0) * scale
+                    print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape

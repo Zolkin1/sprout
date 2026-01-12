@@ -193,12 +193,12 @@ class G1BowingTerminationsCfg(HumanoidTerminationCfg):
 @configclass
 class G1BowingTerminationsCfg(HumanoidTerminationCfg):
     """Termination terms for the MDP."""
-
-    base_orientation = TerminationTerm(func=mdp.base_orientation, params={
-        "cmd_name": "traj_ref",
-        "roll_limit_deg": 12,
-        "pitch_limit_deg": 12,
-    })
+    pass
+    # base_orientation = TerminationTerm(func=mdp.base_orientation, params={
+    #     "cmd_name": "traj_ref",
+    #     "roll_limit_deg": 12,
+    #     "pitch_limit_deg": 12,
+    # })
 
 
 ##
