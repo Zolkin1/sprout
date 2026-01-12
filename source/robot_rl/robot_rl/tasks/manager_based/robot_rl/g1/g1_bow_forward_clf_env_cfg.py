@@ -65,92 +65,92 @@ BOWING_Q_weights["pelvis_link:ori_x"] = [15.0, 3.0]
 BOWING_Q_weights["pelvis_link:ori_y"] = [15.0, 3.0]
 BOWING_Q_weights["pelvis_link:ori_z"] = [15.0, 3.0]
 
-BOWING_Q_weights["joint:waist_yaw_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:left_elbow_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_pitch_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_roll_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:left_shoulder_yaw_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:right_elbow_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [4.0, 1.0]
-BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [4.0, 1.0]
+BOWING_Q_weights["joint:waist_yaw_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:left_elbow_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_pitch_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_roll_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:left_shoulder_yaw_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:right_elbow_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_pitch_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_roll_joint"] = [8.0, 1.0]
+BOWING_Q_weights["joint:right_shoulder_yaw_joint"] = [8.0, 1.0]
 
 BOWING_Q_weights["right_wrist_yaw_link:pos_x"] = [10.0, 2.0]
 BOWING_Q_weights["right_wrist_yaw_link:pos_y"] = [10.0, 2.0]
 BOWING_Q_weights["right_wrist_yaw_link:pos_z"] = [10.0, 2.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [10.0, 2.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [10.0, 2.0]
-BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_x"] = [0.0, 0.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_y"] = [0.0, 0.0]
+BOWING_Q_weights["right_wrist_yaw_link:ori_z"] = [0.0, 0.0]
 
 BOWING_Q_weights["left_wrist_yaw_link:pos_x"] = [10.0, 2.0]
 BOWING_Q_weights["left_wrist_yaw_link:pos_y"] = [10.0, 2.0]
 BOWING_Q_weights["left_wrist_yaw_link:pos_z"] = [10.0, 2.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [10.0, 2.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [10.0, 2.0]
-BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_x"] = [0.0, 0.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_y"] = [0.0, 0.0]
+BOWING_Q_weights["left_wrist_yaw_link:ori_z"] = [0.0, 0.0]
 
 BOWING_R_weights = {}
-BOWING_R_weights["com:pos_x"] = [0.1]
-BOWING_R_weights["com:pos_y"] = [0.1]
-BOWING_R_weights["com:pos_z"] = [0.1]
+BOWING_R_weights["com:pos_x"] = [0.01]
+BOWING_R_weights["com:pos_y"] = [0.01]
+BOWING_R_weights["com:pos_z"] = [0.01]
 
-BOWING_R_weights["left_ankle_roll_link:pos_x"] = [0.05]
-BOWING_R_weights["left_ankle_roll_link:pos_y"] = [0.05]
-BOWING_R_weights["left_ankle_roll_link:pos_z"] = [0.05]
-BOWING_R_weights["left_ankle_roll_link:ori_x"] = [0.02]
-BOWING_R_weights["left_ankle_roll_link:ori_y"] = [0.02]
-BOWING_R_weights["left_ankle_roll_link:ori_z"] = [0.02]
+BOWING_R_weights["left_ankle_roll_link:pos_x"] = [0.005]
+BOWING_R_weights["left_ankle_roll_link:pos_y"] = [0.005]
+BOWING_R_weights["left_ankle_roll_link:pos_z"] = [0.005]
+BOWING_R_weights["left_ankle_roll_link:ori_x"] = [0.002]
+BOWING_R_weights["left_ankle_roll_link:ori_y"] = [0.002]
+BOWING_R_weights["left_ankle_roll_link:ori_z"] = [0.002]
 
-BOWING_R_weights["right_ankle_roll_link:pos_x"] = [0.05]
-BOWING_R_weights["right_ankle_roll_link:pos_y"] = [0.05]
-BOWING_R_weights["right_ankle_roll_link:pos_z"] = [0.05]
-BOWING_R_weights["right_ankle_roll_link:ori_x"] = [0.02]
-BOWING_R_weights["right_ankle_roll_link:ori_y"] = [0.02]
-BOWING_R_weights["right_ankle_roll_link:ori_z"] = [0.02]
+BOWING_R_weights["right_ankle_roll_link:pos_x"] = [0.005]
+BOWING_R_weights["right_ankle_roll_link:pos_y"] = [0.005]
+BOWING_R_weights["right_ankle_roll_link:pos_z"] = [0.005]
+BOWING_R_weights["right_ankle_roll_link:ori_x"] = [0.002]
+BOWING_R_weights["right_ankle_roll_link:ori_y"] = [0.002]
+BOWING_R_weights["right_ankle_roll_link:ori_z"] = [0.002]
 
-BOWING_R_weights["joint:left_hip_roll_joint"] = [0.01]
-BOWING_R_weights["joint:left_hip_pitch_joint"] = [0.01]
-BOWING_R_weights["joint:left_hip_yaw_joint"] = [0.01]
-BOWING_R_weights["joint:left_knee_joint"] = [0.01]
-BOWING_R_weights["joint:left_ankle_roll_joint"] = [0.01]
-BOWING_R_weights["joint:left_ankle_pitch_joint"] = [0.01]
-BOWING_R_weights["joint:right_hip_roll_joint"] = [0.01]
-BOWING_R_weights["joint:right_hip_pitch_joint"] = [0.01]
-BOWING_R_weights["joint:right_hip_yaw_joint"] = [0.01]
-BOWING_R_weights["joint:right_knee_joint"] = [0.01]
-BOWING_R_weights["joint:right_ankle_roll_joint"] = [0.01]
-BOWING_R_weights["joint:right_ankle_pitch_joint"] = [0.01]
+BOWING_R_weights["joint:left_hip_roll_joint"] = [0.001]
+BOWING_R_weights["joint:left_hip_pitch_joint"] = [0.001]
+BOWING_R_weights["joint:left_hip_yaw_joint"] = [0.001]
+BOWING_R_weights["joint:left_knee_joint"] = [0.001]
+BOWING_R_weights["joint:left_ankle_roll_joint"] = [0.001]
+BOWING_R_weights["joint:left_ankle_pitch_joint"] = [0.001]
+BOWING_R_weights["joint:right_hip_roll_joint"] = [0.001]
+BOWING_R_weights["joint:right_hip_pitch_joint"] = [0.001]
+BOWING_R_weights["joint:right_hip_yaw_joint"] = [0.001]
+BOWING_R_weights["joint:right_knee_joint"] = [0.001]
+BOWING_R_weights["joint:right_ankle_roll_joint"] = [0.001]
+BOWING_R_weights["joint:right_ankle_pitch_joint"] = [0.001]
 
-BOWING_R_weights["pelvis_link:pos_x"] = [0.05]
-BOWING_R_weights["pelvis_link:pos_y"] = [0.05]
-BOWING_R_weights["pelvis_link:pos_z"] = [0.05]
-BOWING_R_weights["pelvis_link:ori_x"] = [0.05]
-BOWING_R_weights["pelvis_link:ori_y"] = [0.05]
-BOWING_R_weights["pelvis_link:ori_z"] = [0.05]
+BOWING_R_weights["pelvis_link:pos_x"] = [0.005]
+BOWING_R_weights["pelvis_link:pos_y"] = [0.005]
+BOWING_R_weights["pelvis_link:pos_z"] = [0.005]
+BOWING_R_weights["pelvis_link:ori_x"] = [0.005]
+BOWING_R_weights["pelvis_link:ori_y"] = [0.005]
+BOWING_R_weights["pelvis_link:ori_z"] = [0.005]
 
-BOWING_R_weights["joint:waist_yaw_joint"] = [0.01]
-BOWING_R_weights["joint:left_elbow_joint"] = [0.01]
-BOWING_R_weights["joint:left_shoulder_pitch_joint"] = [0.01]
-BOWING_R_weights["joint:left_shoulder_roll_joint"] = [0.01]
-BOWING_R_weights["joint:left_shoulder_yaw_joint"] = [0.01]
-BOWING_R_weights["joint:right_elbow_joint"] = [0.01]
-BOWING_R_weights["joint:right_shoulder_pitch_joint"] = [0.01]
-BOWING_R_weights["joint:right_shoulder_roll_joint"] = [0.01]
-BOWING_R_weights["joint:right_shoulder_yaw_joint"] = [0.01]
+BOWING_R_weights["joint:waist_yaw_joint"] = [0.001]
+BOWING_R_weights["joint:left_elbow_joint"] = [0.001]
+BOWING_R_weights["joint:left_shoulder_pitch_joint"] = [0.001]
+BOWING_R_weights["joint:left_shoulder_roll_joint"] = [0.001]
+BOWING_R_weights["joint:left_shoulder_yaw_joint"] = [0.001]
+BOWING_R_weights["joint:right_elbow_joint"] = [0.001]
+BOWING_R_weights["joint:right_shoulder_pitch_joint"] = [0.001]
+BOWING_R_weights["joint:right_shoulder_roll_joint"] = [0.001]
+BOWING_R_weights["joint:right_shoulder_yaw_joint"] = [0.001]
 
-BOWING_R_weights["right_wrist_yaw_link:pos_x"] = [0.05]
-BOWING_R_weights["right_wrist_yaw_link:pos_y"] = [0.05]
-BOWING_R_weights["right_wrist_yaw_link:pos_z"] = [0.05]
-BOWING_R_weights["right_wrist_yaw_link:ori_x"] = [0.05]
-BOWING_R_weights["right_wrist_yaw_link:ori_y"] = [0.05]
-BOWING_R_weights["right_wrist_yaw_link:ori_z"] = [0.05]
+BOWING_R_weights["right_wrist_yaw_link:pos_x"] = [0.005]
+BOWING_R_weights["right_wrist_yaw_link:pos_y"] = [0.005]
+BOWING_R_weights["right_wrist_yaw_link:pos_z"] = [0.005]
+BOWING_R_weights["right_wrist_yaw_link:ori_x"] = [0.005]
+BOWING_R_weights["right_wrist_yaw_link:ori_y"] = [0.005]
+BOWING_R_weights["right_wrist_yaw_link:ori_z"] = [0.005]
 
-BOWING_R_weights["left_wrist_yaw_link:pos_x"] = [0.05]
-BOWING_R_weights["left_wrist_yaw_link:pos_y"] = [0.05]
-BOWING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
-BOWING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
-BOWING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
-BOWING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+BOWING_R_weights["left_wrist_yaw_link:pos_x"] = [0.005]
+BOWING_R_weights["left_wrist_yaw_link:pos_y"] = [0.005]
+BOWING_R_weights["left_wrist_yaw_link:pos_z"] = [0.005]
+BOWING_R_weights["left_wrist_yaw_link:ori_x"] = [0.005]
+BOWING_R_weights["left_wrist_yaw_link:ori_y"] = [0.005]
+BOWING_R_weights["left_wrist_yaw_link:ori_z"] = [0.005]
 
 ##
 # Commands
@@ -169,9 +169,23 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
-        random_start_time_max = 1.0,
-        percent_hold_phi = 0.05,
+        random_start_time_max = 4, #1.0,
+        percent_hold_phi = 0.05, #0.3, #0.05,
     )
+
+##
+# Terminations
+##
+@configclass
+class G1BowingTerminationsCfg(HumanoidTerminationCfg):
+    """Termination terms for the MDP."""
+
+    base_orientation = TerminationTerm(func=mdp.base_orientation, params={
+        "cmd_name": "traj_ref",
+        "roll_limit_deg": 12,
+        "pitch_limit_deg": 12,
+    })
+
 
 ##
 # Terminations
@@ -209,7 +223,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         # Post init of parent
         super().__post_init__()
 
-        self.episode_length_s = 2.8
+        self.episode_length_s = 10 #2.8
 
         ##
         # Scene
@@ -230,14 +244,14 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Randomization
         ##
-        # self.events.push_robot.params["velocity_range"] = {
-        #     "x": (-1, 1),
-        #     "y": (-1, 1),
-        #     "roll": (-0.4, 0.4),
-        #     "pitch": (-0.4, 0.4),
-        #     "yaw": (-0.4, 0.4),
-        # }
-        self.events.push_robot = None
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-1, 1),
+            "y": (-1, 1),
+            "roll": (-0.4, 0.4),
+            "pitch": (-0.4, 0.4),
+            "yaw": (-0.4, 0.4),
+        }
+        # self.events.push_robot = None
 
         self.events.add_base_mass.params["asset_cfg"].body_names = ["waist_yaw_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
@@ -257,6 +271,9 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         }
 
         self.events.base_external_force_torque = None
+        
+        self.events.base_com.params["asset_cfg"].body_names = "waist_yaw_link"
+        self.events.base_com.params["com_range"] = {"x": (-0.1, 0.1), "y": (-0.1, 0.1), "z": (-0.1, 0.1)}
 
         ##
         # Observations
@@ -283,7 +300,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
             "eta_max": 0.25,
             "eta_dot_max": 0.3,
         }
-        self.rewards.clf_decreasing_condition.weight = 0 #-1
+        self.rewards.clf_decreasing_condition.weight = -1 #0 #-1
         # self.rewards.clf_decreasing_condition = None
 
         ##
@@ -294,7 +311,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Curriculum
         ##
-        # self.curriculum.clf_curriculum = None
+        self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = None
 
         self.events.reset_base.params["pose_range"]["yaw"] = (0,0)

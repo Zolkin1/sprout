@@ -30,13 +30,13 @@ class G1TrajOptObservationsCfg():
         cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
         ## Teacher only terms
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+        # ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
+        # act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
+        # ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
+        # act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
 
-        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
+        # root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
+        # base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
 
         # Try a trajectory error observation
         # traj_error = ObsTerm(func=mdp.traj_error, params={"command_name": "traj_ref"})
