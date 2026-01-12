@@ -3,10 +3,11 @@ from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 # from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
-                                                                    HumanoidRewardCfg)
+                                                                    HumanoidRewardCfg, HumanoidTerminationCfg)
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import TerminationTermCfg as TerminationTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
@@ -173,6 +174,20 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
     )
 
 ##
+# Terminations
+##
+@configclass
+class G1BowingTerminationsCfg(HumanoidTerminationCfg):
+    """Termination terms for the MDP."""
+
+    base_orientation = TerminationTerm(func=mdp.base_orientation, params={
+        "cmd_name": "traj_ref",
+        "roll_limit_deg": 12,
+        "pitch_limit_deg": 12,
+    })
+
+
+##
 # Curriculums
 ##
 @configclass
@@ -188,6 +203,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
     observations: G1TrajOptObservationsCfg = G1TrajOptObservationsCfg()
     rewards: G1TrajOptCLFRewards = G1TrajOptCLFRewards()
     curriculum: G1BowingCLFCurriculumCfg = G1BowingCLFCurriculumCfg()
+    terminations = G1BowingTerminationsCfg = G1BowingTerminationsCfg()
 
     def __post_init__(self):
         # Post init of parent

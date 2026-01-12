@@ -1,7 +1,7 @@
 import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
 def no_progress(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """
@@ -30,3 +30,35 @@ def no_progress(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> tor
 
     return no_progress_flag
 
+def base_orientation(env, cmd_name: str, roll_limit_deg: float = 30.0, pitch_limit_deg: float = 30.0,
+                     base_link: str = "pelvis_link",
+                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """
+    Terminates the episode if the robot's base orientation exceeds certain limits.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(cmd_name)
+    ref_traj = cmd.y_des
+    output_names = cmd.ordered_output_names
+
+    pitch_idx = output_names.index(f"{base_link}:ori_y")
+    roll_idx = output_names.index(f"{base_link}:ori_x")
+
+    # Get base orientation in Euler angles
+    root_quat = asset.data.root_quat_w  # [num_envs, 4]
+    root_euler = euler_xyz_from_quat(root_quat, wrap_to_2pi=False)  # [num_envs, 3]
+
+    roll_error = root_euler[0][:] - ref_traj[:, roll_idx]
+    pitch_error = root_euler[1][:] - ref_traj[:, pitch_idx]
+
+    # Define orientation limits (in radians)
+    roll_limit = torch.deg2rad(torch.tensor(roll_limit_deg))  # ±30 degrees
+    pitch_limit = torch.deg2rad(torch.tensor(pitch_limit_deg))  # ±30 degrees
+
+    # Check if limits are exceeded
+    roll_exceeded = (roll_error.abs() > roll_limit)
+    pitch_exceeded = (pitch_error.abs() > pitch_limit)
+
+    orientation_flag = roll_exceeded | pitch_exceeded
+
+    return orientation_flag
