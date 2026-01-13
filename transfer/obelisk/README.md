@@ -100,6 +100,11 @@ Running:
 obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device=onboard bag=false
 ```
 
+Bow Forward:
+```
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/bow_forward/bow_forward_config.yaml device=onboard bag=false
+```
+
 <!-- HZD with optitrack logging:
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false
@@ -117,15 +122,17 @@ obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.ya
 ```
 
 The robot interface in Obelisk has a statemachine that we need to "navigate" to enter into low level control mode.
-For the G1, we will follow this diagram:
+For the G1, we will follow this diagram (can get to L1 by holding down Left Bumper, see Obelisk docs for more info):
 
 ```
-     dpad right          squares            dpad down
+    Left Trigger        L1 DPAD Left       L1 DPAD down
 init ----------> damping -------> user_pose ---------> low_level_ctrl
 ```
 At `user_pose`, the robot will snap to the default position specified by `user_pose` in `hardware_config.yaml` and hold that.
 
 At `low_level_ctrl`, the output from the controller node will be applied to robot.
+
+E-STOP is right trigger.
 
 # Setting up the Xbox remote
 You can now run the script:
