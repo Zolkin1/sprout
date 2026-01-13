@@ -76,28 +76,28 @@ source install/setup.bash
 
 Then finally we can run the stack in sim:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device=onboard bag=false
 ```
 
 ## Different Configs/Policies
 LIP:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device=onboard bag=false
 ```
 
 HZD:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device=onboard bag=false
 ```
 
 Baseline:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device=onboard bag=false
 ```
 
 Running:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device=onboard bag=false
 ```
 
 <!-- HZD with optitrack logging:

@@ -8,6 +8,7 @@ import time
 import csv
 import shutil
 from ament_index_python.packages import get_package_share_directory
+from .policy import RLPolicy
 from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
@@ -16,6 +17,14 @@ from obelisk_py.core.utils.ros import spin_obelisk
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 from sensor_msgs.msg import Joy
+
+# Changes TODO:
+# - Take a list of hugging face policies
+# - Also need to make sure we get the associated config files with the policies
+# - Make the observations modular to be built based on config file
+# - Handle holding multiple policies
+# - Add a generic state machine for multiple skills that can be extended in the future
+# - 
 
 
 class VelocityTrackingController(ObeliskController, ABC):
@@ -26,29 +35,18 @@ class VelocityTrackingController(ObeliskController, ABC):
         super().__init__(node_name, PDFeedForward, EstimatedState)
         # Load policy
         self.declare_parameter("local_policy_name", "")
-        self.declare_parameter("obs_type", "")
+        # self.declare_parameter("obs_type", "")
         self.declare_parameter("hf_repo_id", "")
-        self.declare_parameter("hf_policy_name", "")
+        self.declare_parameter("hf_policy_folder", "")
         
-        self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
-        policy_name = self.get_parameter("local_policy_name").get_parameter_value().string_value
+        # self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
+        # policy_name = self.get_parameter("local_policy_name").get_parameter_value().string_value
         hf_repo_id = self.get_parameter("hf_repo_id").get_parameter_value().string_value
-        hf_policy_name = self.get_parameter("hf_policy_name").get_parameter_value().string_value
+        hf_policy_folder = self.get_parameter("hf_policy_folder").get_parameter_value().string_value
         
-        pkg_path = get_package_share_directory("g1_control")
-        
-        # Determine policy path and load policy
-        if hf_repo_id and hf_policy_name:
-            # Try to load from Hugging Face
-            policy_path = self._load_policy_from_hf(pkg_path, hf_repo_id, hf_policy_name)
-        else:
-            # Load from local path
-            policy_path = os.path.join(pkg_path, f"resource/policies/{policy_name}")
-            if not os.path.exists(policy_path):
-                raise FileNotFoundError(f"Policy file not found at {policy_path}")
-        
-        self.policy = torch.jit.load(policy_path)
-        self.device = next(self.policy.parameters()).device
+        self.policy_wrapper = RLPolicy(hf_repo_id, hf_policy_folder)
+
+        self.get_logger().info(f"Loaded policy at {self.policy_wrapper.get_policy_path()}.")
 
         # Logging information
         self.declare_parameter("log", False)
@@ -85,8 +83,8 @@ class VelocityTrackingController(ObeliskController, ABC):
 
 
             # Copy the policy into the log directory
-            self.get_logger().info("Copying the policy to the log directory...")
-            shutil.copy2(policy_path, log_dir)
+            # self.get_logger().info("Copying the policy to the log directory...")
+            # shutil.copy2(self.policy_wrapper.get_policy_path(), log_dir)
 
             # Make a file with the log ordering
             header_path = os.path.join(log_dir, "fields.csv")
@@ -197,37 +195,40 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.num_motors = 21
 
-        # Set scales and defaults
-        self.declare_parameter("action_scale", 0.25)
-        self.action_scale = self.get_parameter("action_scale").get_parameter_value().double_value
+        # # Set scales and defaults
+        # self.declare_parameter("action_scale", 0.25)
+        # self.action_scale = self.get_parameter("action_scale").get_parameter_value().double_value
 
-        self.declare_parameter("cmd_scale", [2.0, 2.0, 0.25])
-        self.cmd_scale = self.get_parameter("cmd_scale").get_parameter_value().double_array_value
+        # self.declare_parameter("cmd_scale", [2.0, 2.0, 0.25])
+        # self.cmd_scale = self.get_parameter("cmd_scale").get_parameter_value().double_array_value
 
-        self.declare_parameter("period", 0.8)
-        self.period = self.get_parameter("period").get_parameter_value().double_value
+        # self.declare_parameter("period", 0.8)
+        # self.period = self.get_parameter("period").get_parameter_value().double_value
 
-        self.declare_parameter("num_actions", 0)
-        self.num_actions = self.get_parameter("num_actions").get_parameter_value().integer_value
+        # self.declare_parameter("num_actions", 0)
+        # self.num_actions = self.get_parameter("num_actions").get_parameter_value().integer_value
 
-        self.declare_parameter("default_angles", [0.0])
-        self.declare_parameter("default_angles_names", [""])
-        self.default_angles = self.get_parameter("default_angles").get_parameter_value().double_array_value
-        self.default_angles_names = self.get_parameter("default_angles_names").get_parameter_value().string_array_value
+        # self.declare_parameter("default_angles", [0.0])
+        # self.declare_parameter("default_angles_names", [""])
+        # self.default_angles = self.get_parameter("default_angles").get_parameter_value().double_array_value
+        # self.default_angles_names = self.get_parameter("default_angles_names").get_parameter_value().string_array_value
 
-        self.default_angles_isaac = self._convert_to_isaac(self.default_angles, self.default_angles_names)
+        # self.default_angles_isaac = self._convert_to_isaac(self.default_angles, self.default_angles_names)
 
-        self.declare_parameter("qvel_scale", 1.0)
-        self.qvel_scale = self.get_parameter("qvel_scale").get_parameter_value().double_value
+        # self.declare_parameter("qvel_scale", 1.0)
+        # self.qvel_scale = self.get_parameter("qvel_scale").get_parameter_value().double_value
 
-        self.declare_parameter("ang_vel_scale", 1.0)
-        self.ang_vel_scale = self.get_parameter("ang_vel_scale").get_parameter_value().double_value
+        # self.declare_parameter("ang_vel_scale", 1.0)
+        # self.ang_vel_scale = self.get_parameter("ang_vel_scale").get_parameter_value().double_value
 
-        # Set PD gains
-        self.declare_parameter("kps", [25.0] * self.num_motors)
-        self.declare_parameter("kds", [0.5] * self.num_motors)
-        self.kps = self.get_parameter("kps").get_parameter_value().double_array_value
-        self.kds = self.get_parameter("kds").get_parameter_value().double_array_value
+        # # Set PD gains
+        # self.declare_parameter("kps", [25.0] * self.num_motors)
+        # self.declare_parameter("kds", [0.5] * self.num_motors)
+        # self.kps = self.get_parameter("kps").get_parameter_value().double_array_value
+        # self.kds = self.get_parameter("kds").get_parameter_value().double_array_value
+
+        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(self.policy_wrapper.get_kp(self.joint_names_mujoco).tolist(),
+                                                            self.policy_wrapper.get_kd(self.joint_names_mujoco).tolist())
 
         # Declare subscriber to velocity commands
         self.register_obk_subscription(
@@ -247,69 +248,18 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.received_xhat = False
 
-        self.get_logger().info(f"Policy: {policy_path} loaded on {self.device}.")
-        self.get_logger().info("RL Velocity Tracking node constructor complete.")
-
-    def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_name: str) -> str:
-        """Load policy from Hugging Face with local caching.
-        
-        Args:
-            pkg_path: Package path for local storage
-            hf_repo_id: Hugging Face repository ID (e.g., 'username/repo-name')
-            hf_policy_name: Name of the policy file on Hugging Face (e.g., 'policy_v1.pt')
-        
-        Returns:
-            Local path to the downloaded policy file
-        """
-        # Create cache directory
-        cache_dir = os.path.join(pkg_path, "resource/policies/hf_cache", hf_repo_id.replace("/", "_"))
-        os.makedirs(cache_dir, exist_ok=True)
-        
-        # Local cache path
-        local_policy_path = os.path.join(cache_dir, hf_policy_name)
-        
-        # Check if policy already exists locally
-        if os.path.exists(local_policy_path):
-            self.get_logger().info(f"Using cached policy from {local_policy_path}")
-            return local_policy_path
-        
-        # Download from Hugging Face
-        try:
-            from huggingface_hub import hf_hub_download
-            
-            self.get_logger().info(f"Downloading policy {hf_policy_name} from {hf_repo_id}...")
-            
-            downloaded_path = hf_hub_download(
-                repo_id=hf_repo_id,
-                filename=hf_policy_name,
-                cache_dir=cache_dir,
-                local_dir=cache_dir,
-            )
-            
-            # If downloaded to a different location, copy to our expected path
-            if downloaded_path != local_policy_path:
-                import shutil
-                shutil.copy2(downloaded_path, local_policy_path)
-            
-            self.get_logger().info(f"Successfully downloaded policy to {local_policy_path}")
-            return local_policy_path
-            
-        except ImportError:
-            raise RuntimeError("huggingface_hub is required for downloading policies. Install with: pip install huggingface_hub")
-        except Exception as e:
-            raise RuntimeError(f"Failed to download policy from Hugging Face: {e}")
 
     def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
         """Configure the controller."""
         super().on_configure(state)
 
         self.cmd_vel = np.zeros((3,))
-        self.proj_g = np.zeros((3,))
-        self.proj_g[2] = -1
-        self.omega = np.zeros((3,))
-        self.phase = np.zeros((2,))
+        # self.proj_g = np.zeros((3,))
+        # self.proj_g[2] = -1
+        # self.omega = np.zeros((3,))
+        # self.phase = np.zeros((2,))
         self.zero_action = np.zeros((self.num_motors,))
-        self.action = self.zero_action.tolist()
+        # self.action = self.zero_action.tolist()
         self.t_start = None
 
         self.get_logger().info("RL Velocity Tracking node configuration complete.")
@@ -327,9 +277,11 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.joint_vel = np.array(x_hat_msg.v_joints)
 
-        self.proj_g = self.project_gravity(x_hat_msg.q_base[3:7])
+        # self.proj_g = self.project_gravity(x_hat_msg.q_base[3:7])
+        self.qfb = np.array(x_hat_msg.q_base[:7])
+        self.vfb_ang = np.array(x_hat_msg.v_base[3:6])
 
-        self.omega = np.array(x_hat_msg.v_base[3:6])
+        # self.omega = np.array(x_hat_msg.v_base[3:6])
 
         self.time = x_hat_msg.header.stamp.sec + x_hat_msg.header.stamp.nanosec * 1e-9
 
@@ -340,152 +292,6 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.cmd_vel[0] = cmd_msg.v_x
         self.cmd_vel[1] = cmd_msg.v_y
         self.cmd_vel[2] = cmd_msg.w_z
-
-    @staticmethod
-    def project_gravity(quat):
-        qx = quat[0]
-        qy = quat[1]
-        qz = quat[2]
-        qw = quat[3]
-
-        pg = np.zeros(3)
-
-        pg[0] = 2 * (-qz * qx + qw * qy)
-        pg[1] = -2 * (qz * qy + qw * qx)
-        pg[2] = 1 - 2 * (qw * qw + qz * qz)
-
-        return pg
-
-    def get_obs(self) -> np.ndarray:
-        """Create the observation from the estimated state."""
-        obs = np.zeros(self.num_obs, dtype=np.float32)
-
-        obs[:3] = self.omega * self.ang_vel_scale  # Angular velocity
-        obs[3:6] = self.proj_g  # Projected gravity
-        obs[6] = self.cmd_vel[0] * self.cmd_scale[0]  # Command velocity
-        obs[7] = self.cmd_vel[1] * self.cmd_scale[1]  # Command velocity
-        obs[8] = self.cmd_vel[2] * self.cmd_scale[2]  # Command velocity
-
-        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
-        nj = len(joint_pos_isaac)
-
-        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
-
-        obs[9 : 9 + nj] = joint_pos_isaac  # Joint pos
-        obs[9 + nj : 9 + 2 * nj] = joint_vel_isaac * self.qvel_scale  # Joint vel
-
-        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
-
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
-
-        # if height_map is not None:
-        #     height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
-        #     obs[9 + 3 * nj:9 + 3 * nj + height_obs.shape[0]] = height_obs
-        #     obs[9 + 3 * nj + height_obs.shape[0] : 9 + 3 * nj + height_obs.shape[0] + 2] = np.array([sin_phase, cos_phase])     # Phases
-
-        return obs
-
-    def get_gl_obs(self):
-      
-        obs = np.zeros(self.num_obs, dtype=np.float32)
-
-        obs[:3] = self.omega * self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = self.proj_g                                        # Projected gravity
-        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]     
-                                     # Command velocity
-
-        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
-        nj = len(joint_pos_isaac)
-
-        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
-        obs[9 : 9 + nj] = joint_vel_isaac* self.qvel_scale  # Joint vel
-        obs[9 + nj : 9 + 2 * nj] =  joint_pos_isaac
-     
-
-        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
-
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
-
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
-
-        obs_tensor = torch.from_numpy(obs).unsqueeze(0).float()
-        return obs_tensor
-
-    def get_cnn_obs(self):
-        """Create the observation vector from the sensor data"""
-        # height_obs = self.convert_height_map_to_obs(height_map, sensor_pos)
-
-        height_obs = np.ones(625)*0.2877
-        obs = np.zeros(self.num_obs - height_obs.shape[0], dtype=np.float32)
-
-        obs[:3] = self.omega * self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = self.proj_g                                        # Projected gravity
-        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]     
-                                     # Command velocity
-
-        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
-        nj = len(joint_pos_isaac)
-
-        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
-        obs[9 : 9 + nj] = joint_vel_isaac* self.qvel_scale  # Joint vel
-        obs[9 + nj : 9 + 2 * nj] =  joint_pos_isaac
-     
-
-        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
-
-        sin_phase = np.sin(2 * np.pi * self.time / self.period)
-        cos_phase = np.cos(2 * np.pi * self.time / self.period)
-
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
-        # obs[9 + 3 * nj : 9 + 3 * nj + 2 + 1] = self.period/2
-
-        final_obs = np.concatenate((height_obs, obs))
-
-        obs_tensor = torch.from_numpy(final_obs).unsqueeze(0).float()
-
-        return obs_tensor
-
-    def create_mlp_obs(self):
-        """Create the observation vector from the sensor data"""
-        obs = np.zeros(self.num_obs, dtype=np.float32)
-
-        obs[:3] = self.omega*self.ang_vel_scale                                                 # Angular velocity
-        obs[3:6] = self.proj_g                                        # Projected gravity
-        obs[6] = self.cmd_vel[0]*self.cmd_scale[0]                                   # Command velocity
-        obs[7] = self.cmd_vel[1]*self.cmd_scale[1]                                   # Command velocity
-        obs[8] = self.cmd_vel[2]*self.cmd_scale[2]
-                                     # Command velocity
-
-        joint_pos_isaac = self._convert_to_isaac(self.joint_pos, self.joint_names) - self.default_angles_isaac
-        nj = len(joint_pos_isaac)
-
-        joint_vel_isaac = self._convert_to_isaac(self.joint_vel, self.joint_names)
-        obs[9 : 9 + nj] = joint_pos_isaac  # Joint position
-        obs[9 + nj : 9 + 2 * nj] = joint_vel_isaac* self.qvel_scale # Joint velocity
-
-        obs[9 + 2 * nj : 9 + 3 * nj] = self.action  # Past action
-
-        if np.linalg.norm(self.cmd_vel) < 0.05:
-            sin_phase = 0.0
-            cos_phase = 1.0
-        else:
-            sin_phase = np.sin(2 * np.pi * self.time / self.period)
-            cos_phase = np.cos(2 * np.pi * self.time / self.period)
-
-        obs[9 + 3 * nj : 9 + 3 * nj + 2] = np.array([sin_phase, cos_phase])  # Phases
-
-        obs_tensor = torch.from_numpy(obs).unsqueeze(0)
-
-        # print(obs_tensor)
-
-        return obs_tensor
     
     def compute_control(self) -> PDFeedForward:
         """Compute the control signal for the dummy 2-link robot.
@@ -495,22 +301,24 @@ class VelocityTrackingController(ObeliskController, ABC):
         """
         # Generate input to RL model
         if self.received_xhat:
-            if self.obs_type == "cnn":
-                obs = self.get_cnn_obs()
-            elif self.obs_type == "gl":
-                obs = self.get_gl_obs()
-            elif self.obs_type == "mlp":
-                obs = self.create_mlp_obs()
-            else:
-                obs = self.get_obs()
+            # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
+            obs = self.policy_wrapper.create_obs(
+                self.qfb,
+                self.vfb_ang,
+                self.joint_pos,
+                self.joint_vel,
+                self.time - self.start_time,
+                self.cmd_vel,
+                self.joint_names,
+            )
 
             # Call RL model
-            self.action = self.policy(torch.tensor(obs).to(self.device).float()).detach().cpu().numpy().squeeze()
+            self.action = self.policy_wrapper.get_action(obs, self.joint_names_mujoco)
 
             # setting the message
             pd_ff_msg = PDFeedForward()
             pd_ff_msg.header.stamp = self.get_clock().now().to_msg()
-            pos_targ = self._convert_to_mujoco(self.action * self.action_scale + self.default_angles_isaac)
+            pos_targ = self.action #self._convert_to_mujoco(self.action)lo
             pd_ff_msg.pos_target = self._add_wrist_mujoco(pos_targ.tolist())
             pd_ff_msg.vel_target = self._add_wrist_mujoco(self.zero_action.tolist())
             pd_ff_msg.feed_forward = self._add_wrist_mujoco(self.zero_action.tolist())
@@ -523,8 +331,10 @@ class VelocityTrackingController(ObeliskController, ABC):
                 self._add_wrist_mujoco(self.zero_action.tolist()),
             ]).tolist()
             pd_ff_msg.joint_names = self.full_joint_names
+
             pd_ff_msg.kp = self.kps
             pd_ff_msg.kd = self.kds
+
             self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
 
             # Log observation and action
@@ -536,26 +346,26 @@ class VelocityTrackingController(ObeliskController, ABC):
             assert is_in_bound(type(pd_ff_msg), ObeliskControlMsg)
             return pd_ff_msg
     
-    def _convert_to_mujoco(self, vec):
-        mj_vec = np.zeros(21)
-        for isaac_index, mujoco_index in self.isaac_to_mujoco.items():
-            mj_vec[mujoco_index] = vec[isaac_index]
+    # def _convert_to_mujoco(self, vec):
+    #     mj_vec = np.zeros(21)
+    #     for isaac_index, mujoco_index in self.isaac_to_mujoco.items():
+    #         mj_vec[mujoco_index] = vec[isaac_index]
 
-        return mj_vec
+    #     return mj_vec
 
-    def _convert_to_isaac(self, joint_values, joint_names):
-        ordered_values = np.zeros(len(self.isaac_joints), dtype=np.float64)
-        name_to_index = {name: idx for idx, name in self.isaac_joints.items()}
+    # def _convert_to_isaac(self, joint_values, joint_names):
+    #     ordered_values = np.zeros(len(self.isaac_joints), dtype=np.float64)
+    #     name_to_index = {name: idx for idx, name in self.isaac_joints.items()}
 
-        for name, value in zip(joint_names, joint_values):
-            if name in name_to_index:
-                index = name_to_index[name]
-                ordered_values[index] = value
-            else:
-                self.get_logger().warning(f"Unknown joint name: {name}", once=True)
-                # raise ValueError(f"Unknown joint name: {name}")
+    #     for name, value in zip(joint_names, joint_values):
+    #         if name in name_to_index:
+    #             index = name_to_index[name]
+    #             ordered_values[index] = value
+    #         else:
+    #             self.get_logger().warning(f"Unknown joint name: {name}", once=True)
+    #             # raise ValueError(f"Unknown joint name: {name}")
 
-        return ordered_values
+    #     return ordered_values
 
     def _add_wrist_mujoco(self, joint_values):
         """Add 0's to the wrist in mujoco ordering."""
@@ -568,6 +378,27 @@ class VelocityTrackingController(ObeliskController, ABC):
         joint_values.insert(26, 0.0)
 
         return joint_values
+
+    def _add_wrist_kp_kd_mujoco(self, kp, kd):
+        """Add 0's to the wrist in mujoco ordering."""
+        kp.insert(17, 40.0)
+        kp.insert(18, 40.0)
+        kp.insert(19, 40.0)
+
+        kp.insert(24, 40.0)
+        kp.insert(25, 40.0)
+        kp.insert(26, 40.0)
+
+
+        kd.insert(17, 2.0)
+        kd.insert(18, 2.0)
+        kd.insert(19, 2.0)
+
+        kd.insert(24, 2.0)
+        kd.insert(25, 2.0)
+        kd.insert(26, 2.0)
+
+        return kp, kd
 
     def log_data(self, obs, action):
         log_time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
