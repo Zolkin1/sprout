@@ -169,8 +169,8 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
-        random_start_time_max = 4, #1.0,
-        percent_hold_phi = 0.05, #0.3, #0.05,
+        random_start_time_max = -1.0, #1.0,
+        percent_hold_phi = 0.0, #0.05,
     )
 
 ##
@@ -180,24 +180,11 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
 class G1BowingTerminationsCfg(HumanoidTerminationCfg):
     """Termination terms for the MDP."""
 
-    base_orientation = TerminationTerm(func=mdp.base_orientation, params={
-        "cmd_name": "traj_ref",
-        "roll_limit_deg": 12,
-        "pitch_limit_deg": 12,
-    })
-
-
-##
-# Terminations
-##
-@configclass
-class G1BowingTerminationsCfg(HumanoidTerminationCfg):
-    """Termination terms for the MDP."""
     pass
     # base_orientation = TerminationTerm(func=mdp.base_orientation, params={
     #     "cmd_name": "traj_ref",
-    #     "roll_limit_deg": 12,
-    #     "pitch_limit_deg": 12,
+    #     "roll_limit_deg": 20,
+    #     "pitch_limit_deg": 20,
     # })
 
 
@@ -223,7 +210,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
         # Post init of parent
         super().__post_init__()
 
-        self.episode_length_s = 10 #2.8
+        self.episode_length_s = 2.5 #2.8 #10
 
         ##
         # Scene
@@ -300,7 +287,7 @@ class G1BowingCLFEnvCfg(HumanoidEnvCfg):
             "eta_max": 0.25,
             "eta_dot_max": 0.3,
         }
-        self.rewards.clf_decreasing_condition.weight = -1 #0 #-1
+        self.rewards.clf_decreasing_condition.weight = 0 #-1
         # self.rewards.clf_decreasing_condition = None
 
         ##
