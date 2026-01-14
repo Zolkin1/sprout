@@ -67,7 +67,7 @@ WORKDIR /home/${USER}
 # RUN sudo apt-get update && sudo apt-get install -y python3-pip
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 RUN rm requirements.txt
 
 # # Lidar odometry
