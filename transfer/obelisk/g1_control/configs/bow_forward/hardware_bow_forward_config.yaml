@@ -165,30 +165,63 @@ onboard:
           "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
         ]
         default_kp: [
-          30., 30., 30.,    # L hip
-          30., 30., 30.,    # L knee, ankle
-          30., 30., 30.,    # R hip
-          30., 30., 30.,    # R knee, ankle
-          10.,              # Waist
-          5., 5., 5.,       # L shoulder
-          5., 5., 5., 5.,   # L elbow, wrist
-          5., 5., 5.,       # R shoulder
-          5., 5., 5., 5.,   # R elbow, wrist
+          100., 100., 100.,       # L hip
+          150., 100., 100.,       # L knee, ankle
+          100., 100., 100.,       # R hip
+          150., 100., 100.,       # R knee, ankle
+          100.,                   # Waist
+          50., 50., 40., 40.,  # L shoulder, elbow
+          30., 30., 30.,       # L wrist
+          50., 50., 40., 40.,  # R shoulder, elbow
+          30., 30., 30.,       # R wrist
         ]
         default_kd: [
-          3.,3.,3.,         # L hip
-          3.,3.,3.,         # L knee, ankle
-          3.,3.,3.,         # R hip
-          3.,3.,3.,         # R knee, ankle
-          1.,               # Waist
-          1., 1., 1.,       # L shoulder
-          1., 1., 1., 1.,   # L elbow, wrist
-          1., 1., 1.,       # R shoulder
-          1., 1., 1., 1.,   # R elbow, wrist
+          2., 2., 2.,       # L hip
+          4., 2., 2.,       # L knee, ankle
+          2., 2., 2.,       # R hip
+          4., 2., 2.,       # R knee, ankle
+          2.,               # Waist
+          2., 2., 2., 2.,   # L shoulder, elbow
+          2., 2., 2.,       # L wrist
+          2., 2., 2., 2.,   # R shoulder, elbow
+          2., 2., 2.,       # R wrist
+        ]
+        # default_kp: [
+        #   30., 30., 30.,    # L hip
+        #   30., 30., 30.,    # L knee, ankle
+        #   30., 30., 30.,    # R hip
+        #   30., 30., 30.,    # R knee, ankle
+        #   10.,              # Waist
+        #   5., 5., 5.,       # L shoulder
+        #   5., 5., 5., 5.,   # L elbow, wrist
+        #   5., 5., 5.,       # R shoulder
+        #   5., 5., 5., 5.,   # R elbow, wrist
+        # ]
+        # default_kd: [
+        #   3.,3.,3.,         # L hip
+        #   3.,3.,3.,         # L knee, ankle
+        #   3.,3.,3.,         # R hip
+        #   3.,3.,3.,         # R knee, ankle
+        #   1.,               # Waist
+        #   1., 1., 1.,       # L shoulder
+        #   1., 1., 1., 1.,   # L elbow, wrist
+        #   1., 1., 1.,       # R shoulder
+        #   1., 1., 1., 1.,   # R elbow, wrist
+        # ]
+        default_kd_damping: [
+          10.,10.,10.,         # L hip
+          10.,10.,10.,         # L knee, ankle
+          10.,10.,10.,         # R hip
+          10.,10.,10.,         # R knee, ankle
+          10.,               # Waist
+          10., 10., 10.,       # L shoulder
+          10., 10., 10., 10.,   # L elbow, wrist
+          10., 10., 10.,       # R shoulder
+          10., 10., 10., 10.,   # R elbow, wrist
         ]
         user_pose: [-0.25, 0, 0, 0.46, -0.25, 0,
                   -0.25, 0, 0, 0.46, -0.25, 0,
-                  0, 0, 0,
+                  0,
                   0.07, 0.24, 0, 0.1, 0, 0, 0,
                   0.07, -0.24, 0, 0.1, 0, 0, 0]
       # callback_groups:
@@ -208,7 +241,7 @@ onboard:
       subscribers:
       # ----- Control ----- #
         - ros_parameter: sub_ctrl_setting
-          topic: /obelisk/g1/ctrl
+          topic: /obelisk/g1/low_level_control
           history_depth: 10
           callback_group: None
       # ----- Execution FSM ----- #
@@ -220,23 +253,8 @@ onboard:
         - ros_parameter: sub_vel_cmd_setting
           topic: /obelisk/g1/vel_cmd
           history_depth: 10
-          callback_group: None      # timers:
-      subscribers:
-      # ----- Control ----- #
-        - ros_parameter: sub_ctrl_setting
-          topic: /obelisk/g1/ctrl
-          history_depth: 10
-          callback_group: None
-      # ----- Execution FSM ----- #
-        - ros_parameter: sub_fsm_setting
-          topic: /obelisk/g1/exec_fsm
-          history_depth: 10
-          callback_group: None
-      # ----- High Level Control ----- #
-        - ros_parameter: sub_vel_cmd_setting
-          topic: /obelisk/g1/vel_cmd
-          history_depth: 10
-          callback_group: None
+          callback_group: None      
+        # timers:
       sim:
         - ros_parameter: mujoco_setting
           robot_pkg: g1_model
