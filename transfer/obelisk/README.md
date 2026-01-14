@@ -32,6 +32,27 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
    - GPU-based (recommended for better performance)
    - No-GPU (if GPU is not available)
 
+## Pushing and Pulling from a Registry
+Login to your registry of choice (for now I am using github packages).
+(i.e. `docker login ghcr.io -u YOUR_GITHUB_USERNAME`)
+
+To push:
+```
+docker compose -f <compose_file>.yml build
+```
+then
+```
+docker compose -f <compose_file>.yml push
+```
+
+To pull (i.e. on the on-board computer):
+```
+docker pull ghcr.io/github_username/robot-rl-obk:no-gpu-latest```
+
+```
+docker compose -f <compose_file>.yaml up
+```
+
 # Quick start
 ```
 source scripts/build.sh
