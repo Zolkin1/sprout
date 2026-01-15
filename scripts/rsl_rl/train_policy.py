@@ -18,6 +18,7 @@ ENVIRONMENTS = {
     "waving_clf": "G1-waving-clf",
     "bow_forward_clf": "G1-bow_forward-clf",
     "bow_forward_clf_sym": "G1-bow_forward-clf-symmetric",
+    "bend_up_clf_sym": "G1-bend_up-clf-symmetric",
 }
 
 EXPERIMENT_NAMES = {
@@ -33,6 +34,7 @@ EXPERIMENT_NAMES = {
     "waving_clf": "waving_clf",
     "bow_forward_clf": "bow_forward_clf",
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+    "bend_up_clf_sym": "G1-bend_up-clf-symmetric",
 }
 
 
