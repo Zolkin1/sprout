@@ -368,7 +368,7 @@ class LibraryManager(ManagerBase):
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(traj_idx)
 
-        domain_times = torch.zeros(conditioner.shape[0], dtype=torch.long, device=self.device)
+        domain_times = torch.zeros(conditioner.shape[0], dtype=torch.float, device=self.device)
 
         # Bin each conditioner by manager
         for idx in unique_indicies:

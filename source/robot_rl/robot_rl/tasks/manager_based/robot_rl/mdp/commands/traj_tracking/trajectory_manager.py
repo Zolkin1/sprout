@@ -741,7 +741,7 @@ class TrajectoryManager(ManagerBase):
     def get_domain_times(self, t: torch.Tensor) -> torch.Tensor:
         domain_idx = self.get_current_domains(t)
 
-        return self.T[domain_idx]
+        return self.T[domain_idx % self.num_domains]
 
     def get_total_time(self) -> torch.Tensor:
         return torch.sum(self.T)

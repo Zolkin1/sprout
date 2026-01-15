@@ -21,7 +21,7 @@ class TrajectoryCommand(CommandTerm):
         self.robot = env.scene[cfg.asset_name]
 
         if cfg.heuristic_func is not None:
-            self.set_heuristic_func(cfg.heuristic_func)
+            self.set_user_heuristic(cfg.heuristic_func)
         else:
             self.user_heuristic = None
 
@@ -494,7 +494,7 @@ class TrajectoryCommand(CommandTerm):
             self.y_act[:, output_idx:output_idx+(joint_pos.shape[1])] = joint_pos
             self.dy_act[:, output_idx:output_idx+(joint_vel.shape[1])] = joint_vel
 
-            output_idx += joint_vel
+            output_idx += joint_vel.shape[1]
 
     def get_desired_outputs(self, t: torch.Tensor):
         """Get the desired output to track from the trajectory.
@@ -507,9 +507,9 @@ class TrajectoryCommand(CommandTerm):
         # Apply optional heuristic modification
         if self.user_heuristic is not None:
             contact_states = self.get_contact_state(t)
-            domain_times = self.manager.get_domain_times(t)
+            time_into_domain = torch.remainder(t, self.manager.get_domain_times(t))
             y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
-                                    contact_states, domain_times,)
+                                    contact_states, time_into_domain)
 
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]

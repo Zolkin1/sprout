@@ -275,7 +275,7 @@ WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.0005]
 #     ]
 
 # TODO: Test
-def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, domain_times):
+def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, time_into_domain):
     """
     Heuristically modify the gait library to allow for sideways walking and turning.
 
@@ -287,7 +287,7 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
         outputs: Output variables.
         contact_bodies: Names of the contact bodies. Of shape [num_contact_bodies]
         contact_states: tensor of shape [N, num_contact_bodies]
-        domain_times: tensor of shape [N] giving the total time for the current domain each env is in
+        time_into_domain: tensor of shape [N] giving the total time for the current domain each env is in
     """
 
     # Get the commanded velocity
@@ -297,11 +297,13 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
     for i, body in enumerate(contact_bodies):
         env_idx = torch.where(contact_states[:, i] == 0)[0]
 
+        # TODO: Need to make sure that domain_times are the time into the current domain, not the total times
+
         # Determine yaw modification
-        delta_psi = vel_cmd[env_idx, 2] * domain_times[env_idx]
+        delta_psi = vel_cmd[env_idx, 2] * time_into_domain[env_idx]
 
         # Determine horizontal modification
-        delta_y = vel_cmd[env_idx, 1] * domain_times[env_idx]
+        delta_y = vel_cmd[env_idx, 1] * time_into_domain[env_idx]
 
         ##
         # Adjust this body
@@ -333,7 +335,7 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
         if idx is not None:
             outputs[env_idx, idx] += delta_psi
 
-        # Adjust pelvis yaw
+        # Adjust pelvis yaw vel
         idx = find_idx(contact_bodies, "ori_z", "vel", "pelvis_link")
         if idx is not None:
             outputs[env_idx, idx] += vel_cmd[env_idx, 2]
@@ -343,7 +345,7 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
         if idx is not None:
             outputs[env_idx, idx] += delta_y
 
-        # Adjust pelvis y
+        # Adjust pelvis y vel
         idx = find_idx(contact_bodies, "pos_y", "vel", "pelvis_link")
         if idx is not None:
             outputs[env_idx, idx] += vel_cmd[env_idx, 1]
@@ -353,10 +355,13 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
         if idx is not None:
             outputs[env_idx, idx] += delta_y
 
-        # Adjust COM y
+        # Adjust COM y vel
         idx = find_idx(contact_bodies, "pos_y", "vel", "com")
         if idx is not None:
             outputs[env_idx, idx] += vel_cmd[env_idx, 1]
+
+        # TODO: Adjust hip yaw for the swing foot
+        # TODO: Should also adjust hip roll, but that's harder
 
     return outputs
 
@@ -381,6 +386,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 51, #31, #27,
         Q_weights = WALKING_Q_weights,
         R_weights = WALKING_R_weights,
+        heuristic_func=heuristic_modification,
     )
 
 ##
