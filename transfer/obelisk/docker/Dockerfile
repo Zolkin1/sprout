@@ -53,7 +53,7 @@ USER ${UID}
 RUN echo "Pulling Obelisk..."
 # clone Obelisk into this docker image at the $OBELISK_ROOT path
 # RUN git clone -b v0.3.0-alpha https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
-RUN git clone -b main https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
+RUN git clone -b v0.4.0-alpha https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
 ENV OBELISK_ROOT=/home/${USER}/obelisk
 
 # Install other dependencies here...

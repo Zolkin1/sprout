@@ -8,7 +8,8 @@ import time
 import csv
 import shutil
 from ament_index_python.packages import get_package_share_directory
-from .policy import RLPolicy
+
+from .behavior_manager import BehaviorManager
 from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
@@ -34,19 +35,30 @@ class VelocityTrackingController(ObeliskController, ABC):
         """Initialize the example position setpoint controller."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
         # Load policy
-        self.declare_parameter("local_policy_name", "")
-        # self.declare_parameter("obs_type", "")
-        self.declare_parameter("hf_repo_id", "")
-        self.declare_parameter("hf_policy_folder", "")
-        
-        # self.obs_type = self.get_parameter("obs_type").get_parameter_value().string_value
-        # policy_name = self.get_parameter("local_policy_name").get_parameter_value().string_value
-        hf_repo_id = self.get_parameter("hf_repo_id").get_parameter_value().string_value
-        hf_policy_folder = self.get_parameter("hf_policy_folder").get_parameter_value().string_value
-        
-        self.policy_wrapper = RLPolicy(hf_repo_id, hf_policy_folder)
+        self.declare_parameter("hf_repo_ids", [])
+        self.declare_parameter("hf_policy_folders", [])
+        self.declare_parameter("behavior_names", [])
+        self.declare_parameter("behavior_buttons", [])
+        self.declare_parameter("init_behavior", "")
 
-        self.get_logger().info(f"Loaded policy at {self.policy_wrapper.get_policy_path()}.")
+        hf_repo_ids = self.get_parameter("hf_repo_ids").get_parameter_value().string_array_value
+        hf_policy_folders = self.get_parameter("hf_policy_folders").get_parameter_value().string_array_value
+        behavior_names = self.get_parameter("behavior_names").get_parameter_value().string_array_value
+        behavior_buttons = self.get_parameter("behavior_buttons").get_parameter_value().integer_array_value
+        init_behavior = self.get_parameter("init_behavior").get_parameter_value().string_value
+
+        self.behavior_manager = BehaviorManager(
+            behavior_names=behavior_names,
+            behavior_buttons=behavior_buttons,
+            init_behavior=init_behavior,
+            hf_repo_ids=hf_repo_ids,
+            hf_policy_folders=hf_policy_folders,
+        )
+        self.active_behavior = self.behavior_manager.active_behavior
+
+        for policy, behavior_name in zip(self.behavior_manager.policies, self.behavior_manager.behavior_names):
+            self.get_logger().info(f"Loaded behavior {behavior_name} at {policy.get_policy_path()}.")
+
 
         # Logging information
         self.declare_parameter("log", False)
@@ -227,8 +239,9 @@ class VelocityTrackingController(ObeliskController, ABC):
         # self.kps = self.get_parameter("kps").get_parameter_value().double_array_value
         # self.kds = self.get_parameter("kds").get_parameter_value().double_array_value
 
-        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(self.policy_wrapper.get_kp(self.joint_names_mujoco).tolist(),
-                                                            self.policy_wrapper.get_kd(self.joint_names_mujoco).tolist())
+        active_policy = self.behavior_manager.get_active_policy()
+        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(active_policy.get_kp(self.joint_names_mujoco).tolist(),
+                                                            active_policy.get_kd(self.joint_names_mujoco).tolist())
 
         # Declare subscriber to velocity commands
         self.register_obk_subscription(
@@ -412,6 +425,15 @@ class VelocityTrackingController(ObeliskController, ABC):
         if joy_msg.axes[RIGHT_TRIGGER] <= 0.1:
             raise RuntimeError("[Controller] Joystick emergency stop triggered!!")
 
+        time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
+        new_behavior = self.behavior_manager.check_behavior_switch(joy_msg, time)
+
+        if new_behavior != self.active_behavior:
+            self.active_behavior = new_behavior
+            self.get_logger().info(f"[Controller] Switched to {self.active_behavior}!")
+            active_policy = self.behavior_manager.get_active_policy()
+            self.kps, self.kds = self._add_wrist_kp_kd_mujoco(active_policy.get_kp(self.joint_names_mujoco).tolist(),
+                                                                active_policy.get_kd(self.joint_names_mujoco).tolist())
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""

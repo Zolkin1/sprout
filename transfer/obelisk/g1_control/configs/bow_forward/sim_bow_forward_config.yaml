@@ -7,9 +7,22 @@ onboard:
   # ----- Low Level Controller ----- #
     - pkg: g1_control
       params:
-        hf_policy_folder: "bow_forward_clf_sym/2026-01-09_11-32-45_T3_bowing_more_dr_new_traj"
-        # hf_policy_folder: "bow_forward_clf_sym/2026-01-09_14-50-15_T4_bow_random_start_more_dr_new_traj"
-        hf_repo_id: "zolkin/robot_rl"
+        hf_policy_folders: [
+          "bow_forward_clf_sym/2026-01-09_11-32-45_T3_bowing_more_dr_new_traj",
+        ]
+        hf_repo_ids: [
+          "zolkin/robot_rl",
+        ]
+        behavior_names: [
+          "bow_forward"
+        ]
+        behavior_buttons: [
+          3,                  # x
+        ]
+        init_behavior: "bow_forward"
+#        hf_policy_folder: "bow_forward_clf_sym/2026-01-09_11-32-45_T3_bowing_more_dr_new_traj"
+#        # hf_policy_folder: "bow_forward_clf_sym/2026-01-09_14-50-15_T4_bow_random_start_more_dr_new_traj"
+#        hf_repo_id: "zolkin/robot_rl"
         log: true
         log_decimation: 100 # relative to the control callback
         config_name: "bow_forward/sim_bow_forward_config.yaml"
