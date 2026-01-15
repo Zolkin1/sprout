@@ -26,22 +26,46 @@ G1_CFG = ArticulationCfg(
         collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.01, rest_offset=0.0),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.785),  # TODO: Consider setting this higher if I init issues
+        # Bend up
+        pos=(0.0, 0.0, 0.6),
+        rot=(0.73, 0.0, 0.67, 0.0),
+
+        # Standing
+        # pos=(0.0, 0.0, 0.785),
+
         joint_pos={
-            ".*_hip_pitch_joint": -0.25,
+            # Bend up
+            ".*_hip_pitch_joint": -2.0,
             ".*_hip_roll_joint": 0.0,
             ".*_hip_yaw_joint": 0.0,
-            ".*_knee_joint": 0.46,
-            ".*_ankle_pitch_joint": -0.25,
+            ".*_knee_joint": 1.0,
+            ".*_ankle_pitch_joint": -0.48,
             ".*_ankle_roll_joint": 0.0,
             "waist_yaw_joint": 0.0,
             "left_shoulder_yaw_joint": 0.0,
-            "left_shoulder_pitch_joint": 0.07,
-            "left_shoulder_roll_joint": 0.24,
+            "left_shoulder_pitch_joint": 0.1,
+            "left_shoulder_roll_joint": 0.3,
             "right_shoulder_yaw_joint": 0.0,
-            "right_shoulder_pitch_joint": 0.07,
-            "right_shoulder_roll_joint": -0.24,
-            ".*_elbow_joint": 0.1, #1.39,
+            "right_shoulder_pitch_joint": 0.1,
+            "right_shoulder_roll_joint": -0.3,
+            ".*_elbow_joint": 0.7,  # 1.39,
+
+            # Standing
+            # ".*_hip_pitch_joint": -0.25,
+            # ".*_hip_roll_joint": 0.0,
+            # ".*_hip_yaw_joint": 0.0,
+            # ".*_knee_joint": 0.46,
+            # ".*_ankle_pitch_joint": -0.25,
+            # ".*_ankle_roll_joint": 0.0,
+            # "waist_yaw_joint": 0.0,
+            # "left_shoulder_yaw_joint": 0.0,
+            # "left_shoulder_pitch_joint": 0.07,
+            # "left_shoulder_roll_joint": 0.24,
+            # "right_shoulder_yaw_joint": 0.0,
+            # "right_shoulder_pitch_joint": 0.07,
+            # "right_shoulder_roll_joint": -0.24,
+            # ".*_elbow_joint": 0.1, #1.39,
+
             # ".*_wrist_roll_joint": 0.,
             # ".*_wrist_pitch_joint": 0.,
             # ".*_wrist_yaw_joint": 0.,
