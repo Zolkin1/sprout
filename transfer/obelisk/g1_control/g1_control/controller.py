@@ -35,10 +35,10 @@ class VelocityTrackingController(ObeliskController, ABC):
         """Initialize the example position setpoint controller."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
         # Load policy
-        self.declare_parameter("hf_repo_ids", [])
-        self.declare_parameter("hf_policy_folders", [])
-        self.declare_parameter("behavior_names", [])
-        self.declare_parameter("behavior_buttons", [])
+        self.declare_parameter("hf_repo_ids", [""])
+        self.declare_parameter("hf_policy_folders", [""])
+        self.declare_parameter("behavior_names", [""])
+        self.declare_parameter("behavior_buttons", [-1])
         self.declare_parameter("init_behavior", "")
 
         hf_repo_ids = self.get_parameter("hf_repo_ids").get_parameter_value().string_array_value
@@ -315,7 +315,7 @@ class VelocityTrackingController(ObeliskController, ABC):
         # Generate input to RL model
         if self.received_xhat:
             # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
-            obs = self.policy_wrapper.create_obs(
+            obs = self.behavior_manager.create_obs(
                 self.qfb,
                 self.vfb_ang,
                 self.joint_pos,
@@ -326,7 +326,7 @@ class VelocityTrackingController(ObeliskController, ABC):
             )
 
             # Call RL model
-            self.action = self.policy_wrapper.get_action(obs, self.joint_names_mujoco)
+            self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
 
             # setting the message
             pd_ff_msg = PDFeedForward()

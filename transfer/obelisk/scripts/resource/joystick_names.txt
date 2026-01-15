@@ -11,3 +11,4 @@ Logitech Gamepad F310
 Logitech Gamepad F710
 Sony Computer Entertainment Wireless Controller8BitDo Ultimate 2 Wireless Controller
 8BitDo Ultimate 2 Wireless Controller
+Microsoft Xbox Series S|X Controller

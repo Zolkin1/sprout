@@ -63,8 +63,8 @@ class BehaviorManager:
                    joint_names: list[str],
                    ):
         policy_idx = self.get_active_policy_idx()
-        return self.policies[policy_idx].create_obs(qfb, vfb_ang, qjoints, vjoints, time, cmd_vel, joint_names)
+        return self.policies[policy_idx].create_obs(qfb, vfb_ang, qjoints, vjoints, time - self.last_behavior_switch, cmd_vel, joint_names)
 
     def get_action(self, obs: torch.Tensor, joint_names_out: list[str]) -> np.ndarray:
         policy_idx = self.get_active_policy_idx()
-        return self.policies[policy_idx].get_action(obs)
+        return self.policies[policy_idx].get_action(obs, joint_names_out)

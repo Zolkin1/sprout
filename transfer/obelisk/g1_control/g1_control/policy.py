@@ -124,7 +124,7 @@ class RLPolicy:
         # Extract floating base quaternion
         quat = qfb[3:7]
 
-        time2 = max(time - 0.0, 0)  # Adjust time offset if needed
+        time2 = max(time - 10000000.0, 0)  # Adjust time offset if needed
 
         # Convert joint orders
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
