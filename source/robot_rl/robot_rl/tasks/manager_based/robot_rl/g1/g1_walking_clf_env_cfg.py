@@ -386,7 +386,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 51, #31, #27,
         Q_weights = WALKING_Q_weights,
         R_weights = WALKING_R_weights,
-        heuristic_func=heuristic_modification,
+        # heuristic_func=heuristic_modification,
     )
 
 ##

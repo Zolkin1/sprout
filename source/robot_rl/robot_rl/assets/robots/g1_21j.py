@@ -27,7 +27,7 @@ G1_CFG = ArticulationCfg(
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         # Bend up
-        pos=(0.0, 0.0, 0.6),
+        pos=(0.0, 0.0, 0.62), #0.63),
         rot=(0.73, 0.0, 0.67, 0.0),
 
         # Standing
@@ -44,10 +44,10 @@ G1_CFG = ArticulationCfg(
             "waist_yaw_joint": 0.0,
             "left_shoulder_yaw_joint": 0.0,
             "left_shoulder_pitch_joint": 0.1,
-            "left_shoulder_roll_joint": 0.3,
+            "left_shoulder_roll_joint": 0.5,
             "right_shoulder_yaw_joint": 0.0,
             "right_shoulder_pitch_joint": 0.1,
-            "right_shoulder_roll_joint": -0.3,
+            "right_shoulder_roll_joint": -0.5,
             ".*_elbow_joint": 0.7,  # 1.39,
 
             # Standing
