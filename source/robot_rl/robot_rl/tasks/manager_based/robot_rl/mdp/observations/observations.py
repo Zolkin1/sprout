@@ -84,8 +84,9 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     phase = 2*torch.pi * cmd.get_phasing_var()
 
     # Zero the phase if we are standing (check all environments)
-    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
-    phase[standing_mask] = 0
+    # TODO: only use for walking/running
+    # standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    # phase[standing_mask] = 0
 
     sphase = torch.sin(phase)
     if sphase.ndim == 1:
@@ -105,8 +106,9 @@ def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     phase = 2*torch.pi * cmd.get_phasing_var()
 
     # Zero the phase if we are standing (check all environments)
-    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
-    phase[standing_mask] = 0
+    # TODO: only use for walking/running
+    # standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
+    # phase[standing_mask] = 0
 
     cphase = torch.cos(phase)
     if cphase.ndim == 1:

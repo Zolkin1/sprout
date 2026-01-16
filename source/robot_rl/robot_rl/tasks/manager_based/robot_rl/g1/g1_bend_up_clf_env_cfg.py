@@ -171,7 +171,7 @@ class G1BendUpCommandsCfg(HumanoidCommandsCfg):
         num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
-        random_start_time_max = -1.0, #1.0,
+        random_start_time_max = 1.0, #1.0,
         percent_hold_phi = 0.0, #0.05,
     )
 
@@ -212,7 +212,7 @@ class G1BendUpCLFEnvCfg(HumanoidEnvCfg):
         # Post init of parent
         super().__post_init__()
 
-        self.episode_length_s = 1.75
+        self.episode_length_s = 3.5 #3.00
 
         ##
         # Scene
@@ -240,15 +240,16 @@ class G1BendUpCLFEnvCfg(HumanoidEnvCfg):
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
         }
+        # self.events.push_robot.interval_range = (5.0, 7.0)
         # self.events.push_robot = None
 
         self.events.add_base_mass.params["asset_cfg"].body_names = ["waist_yaw_link"]
-        self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
+        self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2) #(0.7, 1.3) #(0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
         # self.events.add_base_mass = None
         self.events.reset_robot_joints.params["position_range"] = (0.85, 1.15)
         self.events.reset_base.params = {
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14), "z": (-0.01, 0.01)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
