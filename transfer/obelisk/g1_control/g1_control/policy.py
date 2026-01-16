@@ -127,7 +127,7 @@ class RLPolicy:
         # Extract floating base quaternion
         quat = qfb[3:7]
 
-        time2 = max(time - 10000000.0, 0)  # Adjust time offset if needed
+        time2 = max(time - 0.0, 0)  # Adjust time offset if needed
 
         # Convert joint orders
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
@@ -156,10 +156,12 @@ class RLPolicy:
                 obs_idx += shape
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time2, 1.0/self.get_gait_period_range()[0]) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    # TODO: Put back later
+                    # if np.linalg.norm(cmd_vel) > 0.01:
+                    #     obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time2, 1.0/self.get_total_time()) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time2, 1.0/self.get_total_time()) * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time2) % self.get_total_time())/self.get_total_time()
                     # phi = 0
@@ -171,10 +173,12 @@ class RLPolicy:
 
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time2, 1.0/self.get_gait_period_range()[0]) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    # TODO: Put back later
+                    # if np.linalg.norm(cmd_vel) > 0.01:
+                    #     obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time2, 1.0/self.get_total_time()) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time2, 1.0/self.get_total_time()) * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time2) % self.get_total_time())/self.get_total_time()
                     # phi = 0
@@ -334,12 +338,12 @@ class RLPolicy:
             'w_z_min': self.policy_params.get('w_z_min'),
         }
 
-    def get_gait_period_range(self) -> tuple[float, float]:
-        """Get the gait period range from the policy_params file."""
-        period_range = self.policy_params.get('gait_period_range')
-        if period_range:
-            return tuple(period_range)
-        return None
+    # def get_gait_period_range(self) -> tuple[float, float]:
+    #     """Get the gait period range from the policy_params file."""
+    #     period_range = self.policy_params.get('total_time')
+    #     if period_range:
+    #         return tuple(period_range)
+    #     return None
 
     def get_obs_scale(self, term_name: str):
         """Get the observation scale for a specific term."""

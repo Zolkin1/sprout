@@ -347,31 +347,31 @@ class HighLevelController(ObeliskController, ABC):
             self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info("Joystick control enabled!")
 
-        B = 1
-        if msg.buttons[B] >= 0.9 and now - self.last_B_press > 0.5:
-            self.last_B_press = now
-            self.lin_vel_mode = "incremental"
-            self.cmd_vel = np.zeros((3,))
-            self.cmd_vel[0] = self.vel_increment_start     
-            self.get_logger().info("Joystick incremental velocity mode enabled!")
+        # B = 1
+        # if msg.buttons[B] >= 0.9 and now - self.last_B_press > 0.5:
+        #     self.last_B_press = now
+        #     self.lin_vel_mode = "incremental"
+        #     self.cmd_vel = np.zeros((3,))
+        #     self.cmd_vel[0] = self.vel_increment_start     
+        #     self.get_logger().info("Joystick incremental velocity mode enabled!")
 
-        X = 2
-        if msg.buttons[X] >= 0.9 and now - self.last_X_press > 0.5:
-            self.last_X_press = now
-            self.lin_vel_mode = "X_PD" #"function"
-            self.x_pd_ff = self.cmd_vel[0]
-            self.get_logger().info(f"X PD mode enabled! Feedforward set to {self.x_pd_ff:.3f} m/s.")
-            # self.get_logger().info("Function velocity mode enabled!")
+        # X = 2
+        # if msg.buttons[X] >= 0.9 and now - self.last_X_press > 0.5:
+        #     self.last_X_press = now
+        #     self.lin_vel_mode = "X_PD" #"function"
+        #     self.x_pd_ff = self.cmd_vel[0]
+        #     self.get_logger().info(f"X PD mode enabled! Feedforward set to {self.x_pd_ff:.3f} m/s.")
+        #     # self.get_logger().info("Function velocity mode enabled!")
 
-        Y = 3
-        if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.5:
-            if self.use_odom:
-                self.last_Y_press = now
-                self.ang_vel_mode = "joystick" if self.ang_vel_mode == "odom" else "odom"
-                if self.ang_vel_mode == "odom":
-                    self.get_logger().info("Odom correction enabled!")
-                else:
-                    self.get_logger().info("Odom correction disabled!")
+        # Y = 3
+        # if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.5:
+        #     if self.use_odom:
+        #         self.last_Y_press = now
+        #         self.ang_vel_mode = "joystick" if self.ang_vel_mode == "odom" else "odom"
+        #         if self.ang_vel_mode == "odom":
+        #             self.get_logger().info("Odom correction enabled!")
+        #         else:
+        #             self.get_logger().info("Odom correction disabled!")
 
         RIGHT_BUMPER = 5
         if msg.buttons[RIGHT_BUMPER] >= 0.9 and now - self.last_RB_press > 0.2:
