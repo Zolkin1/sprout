@@ -36,11 +36,13 @@ class BehaviorManager:
 
     def check_behavior_switch(self, joy_msg: Joy, time) -> str:
         if (time - self.last_behavior_switch) > 0.1:
-            self.last_behavior_switch = time
             for i, button in enumerate(self.behavior_buttons):
                 if joy_msg.buttons[button] == 1:
                     # TODO: Should also verify the validity of the transition
-                    self.active_behavior = self.behavior_names[i]
+                    if self.behavior_names[i] != self.active_behavior:
+                        self.last_behavior_switch = time
+                        self.active_behavior = self.behavior_names[i]
+                        self.policies[self.get_active_policy_idx()].reset_last_action()
 
         return self.active_behavior
 

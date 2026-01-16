@@ -106,6 +106,9 @@ class RLPolicy:
         return self.convert_joint_order(self.action_isaac * self.get_action_scale() + self.get_default_joint_angles(),
                                         self.get_joint_names(), joint_names_out)
 
+    def reset_last_action(self):
+        """Reset the last action to zeros."""
+        self.action_isaac = np.zeros(self.get_num_actions())
 
     def create_obs(self,
                    qfb: np.ndarray,
