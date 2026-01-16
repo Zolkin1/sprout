@@ -127,7 +127,12 @@ class RLPolicy:
         # Extract floating base quaternion
         quat = qfb[3:7]
 
-        time2 = max(time - 0.0, 0)  # Adjust time offset if needed
+        # TODO: Fix when I have updated policies
+        if self.get_skill_type() == "episodic":
+            time2 = max(time - 100000.0, 0)  # Adjust time offset if needed
+        else:
+            time2 = time
+
 
         # Convert joint orders
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())

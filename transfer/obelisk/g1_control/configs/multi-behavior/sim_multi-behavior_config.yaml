@@ -10,7 +10,8 @@ onboard:
         hf_policy_folders: [
           "bow_forward_clf_sym/2026-01-09_11-32-45_T3_bowing_more_dr_new_traj",
           # "bend_up_clf_sym/2026-01-15_09-13-23_T0_bend_up_ic",
-          "bend_up_clf_sym/2026-01-15_16-05-53_T3_bend_up_new_traj_slower",
+          # "bend_up_clf_sym/2026-01-15_16-05-53_T3_bend_up_new_traj_slower",
+          "bend_up_clf_sym/2026-01-16_11-20-58_T2_bend_up_random_base_height",
           "walking_clf_old/hzd_clf_minimum_reward",
         ]
         hf_repo_ids: [
