@@ -54,6 +54,7 @@ docker compose -f <compose_file>.yaml up
 ```
 
 # Quick start
+TODO: NOTE THE TWO STARTUP SCRIPTS ARE CAUSING ISSUES
 ```
 source scripts/build.sh
 bash scripts/joystick.sh
