@@ -31,6 +31,7 @@ EXPERIMENT_NAMES = {
     "waving_clf": "waving_clf",
     "bow_forward_clf": "bow_forward_clf",
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+    "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
 
 

@@ -106,6 +106,9 @@ class RLPolicy:
         return self.convert_joint_order(self.action_isaac * self.get_action_scale() + self.get_default_joint_angles(),
                                         self.get_joint_names(), joint_names_out)
 
+    def reset_last_action(self):
+        """Reset the last action to zeros."""
+        self.action_isaac = np.zeros(self.get_num_actions())
 
     def create_obs(self,
                    qfb: np.ndarray,
@@ -124,7 +127,7 @@ class RLPolicy:
         # Extract floating base quaternion
         quat = qfb[3:7]
 
-        time2 = max(time - 0.0, 0)  # Adjust time offset if needed
+        time2 = max(time - 10000000.0, 0)  # Adjust time offset if needed
 
         # Convert joint orders
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())

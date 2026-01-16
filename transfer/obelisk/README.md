@@ -54,6 +54,7 @@ docker compose -f <compose_file>.yaml up
 ```
 
 # Quick start
+TODO: NOTE THE TWO STARTUP SCRIPTS ARE CAUSING ISSUES
 ```
 source scripts/build.sh
 bash scripts/joystick.sh
@@ -124,6 +125,11 @@ obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml
 Bow Forward:
 ```
 obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/bow_forward/bow_forward_config.yaml device=onboard bag=false
+```
+
+Multi-behavior:
+```
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/multi-behavior/sim_multi-behavior_config.yaml device=onboard bag=false
 ```
 
 <!-- HZD with optitrack logging:
