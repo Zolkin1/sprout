@@ -118,7 +118,10 @@ onboard:
         v_x_scale: 1.0
         v_y_scale: 1.0
         w_z_scale: 1.0
-        # NOTE: Can add new button mappings if desired
+
+        # Button mappings
+        vel_cmd_yaw: 13  # RY
+
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #

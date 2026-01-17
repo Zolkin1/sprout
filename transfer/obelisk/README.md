@@ -199,6 +199,10 @@ To dettach from a tmux session
 
 To reattach to a tmux session
 ```tmux attach -t <id>```
+
+If you want to build the container with no cache:
+```docker compose -f docker-compose-no-gpu.yml build --no-cache```
+
 To create and start the container, run the following command:
 ```docker compose -f docker-compose-no-gpu.yml up ```
 Note this would also build the container if necessary.
@@ -232,6 +236,24 @@ python plot_ctrl.py
 
 You can also use `--start-time` and `--end-time` to specify and start and end time.
 
+## Setting the IP setting through the terminal
+
+Check the names:
+```
+nmcli con show
+```
+
+To set it to manual:
+```
+nmcli con mod “Wired connection 1” ipv4.addresses 192.168.123.222/24 ipv4.method manual
+nmcli con up “Wired connection 1"
+```
+
+To set to automatic:
+```
+nmcli con mod "Wired connection 1" ipv4.method auto ipv4.addresses ""
+nmcli con up "Wired connection 1"
+```
 
 # Using Optitrack
 We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.
