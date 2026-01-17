@@ -9,21 +9,28 @@ onboard:
       params:
         hf_policy_folders: [
           "bow_forward_clf_sym/2026-01-09_11-32-45_T3_bowing_more_dr_new_traj",
-          "bend_up_clf_sym/2026-01-15_09-13-23_T0_bend_up_ic",
+          # "bend_up_clf_sym/2026-01-15_09-13-23_T0_bend_up_ic",
+          "bend_up_clf_sym/2026-01-16_11-20-58_T2_bend_up_random_base_height",
+          # "walking_clf_old/hzd_clf_minimum_reward",
+          "walking_clf_old/8_1_alpha_2",
+          # "walking_clf_old/yaw_modification",
         ]
         hf_repo_ids: [
+          "zolkin/robot_rl",
           "zolkin/robot_rl",
           "zolkin/robot_rl",
         ]
         behavior_names: [
           "bow_forward",
-          "bend_up"
+          "bend_up",
+          "walking",
         ]
         behavior_buttons: [
           2,                  # x
           3,                  # y
+          1,                  # b
         ]
-        init_behavior: "bow_forward"
+        init_behavior: "walking"
         log: true
         log_decimation: 100 # relative to the control callback
         config_name: "multi-behavior/sim_multi-behavior_config.yaml"
@@ -52,53 +59,53 @@ onboard:
           timer_period_sec: 0.02    # 50 Hz
           callback_group: None
  # ----- High Level Controller ----- #
-    # - pkg: g1_control
-    #   executable: high_level_control
-    #   params:
-    #     v_x_min: -0.75
-    #     v_x_max: 0.75
-    #     v_y_max: 0.0
-    #     w_z_max: 1.0
-    #     vel_increment: 0.1
-    #     kp_yaw: 3.0
-    #     kd_yaw: 0.1
-    #     kp_y: 0.0
-    #     kd_y: 0.0
-    #     use_odom: True
-    #     log_odom: True
-    #     vel_increment_start: 0.0
-    #   # callback_groups:
-    #   publishers:
-    #     - ros_parameter: pub_ctrl_setting
-    #       topic: /obelisk/g1/high_level_ctrl
-    #       history_depth: 10
-    #       callback_group: None
-    #   subscribers:
-    #     # ----- Joint Encoder subscriber ----- #
-    #     - ros_parameter: sub_joint_encoders
-    #       topic: /obelisk/g1/joint_encoders
-    #       msg_type: ObkJointEncoders
-    #       history_depth: 10
-    #       callback_group: None
-    #     # ----- Joystick subscriber ----- #
-    #     - ros_parameter: sub_est_setting
-    #       topic: /obelisk/g1/joy
-    #       history_depth: 10
-    #       callback_group: None
-    #     # ----- Odom subscriber ----- #
-    #     - ros_parameter: sub_odom_setting
-    #       topic: /obelisk/g1/head_odom
-    #       history_depth: 10
-    #       callback_group: None
-    #     # ----- Unitree High Level subscriber ----- #
-    #     - ros_parameter: sub_vel_cmd_setting
-    #       topic: /obelisk/g1/unitree_high_level_ctrl
-    #       history_depth: 10
-    #       callback_group: None
-    #   timers:
-    #     - ros_parameter: timer_ctrl_setting
-    #       timer_period_sec: 0.05    # 20 Hz
-    #       callback_group: None
+    - pkg: g1_control
+      executable: high_level_control
+      params:
+        v_x_min: -0.75
+        v_x_max: 0.75
+        v_y_max: 0.0
+        w_z_max: 1.0
+        vel_increment: 0.1
+        kp_yaw: 3.0
+        kd_yaw: 0.1
+        kp_y: 0.0
+        kd_y: 0.0
+        use_odom: True
+        log_odom: True
+        vel_increment_start: 0.0
+      # callback_groups:
+      publishers:
+        - ros_parameter: pub_ctrl_setting
+          topic: /obelisk/g1/high_level_ctrl
+          history_depth: 10
+          callback_group: None
+      subscribers:
+        # ----- Joint Encoder subscriber ----- #
+        - ros_parameter: sub_joint_encoders
+          topic: /obelisk/g1/joint_encoders
+          msg_type: ObkJointEncoders
+          history_depth: 10
+          callback_group: None
+        # ----- Joystick subscriber ----- #
+        - ros_parameter: sub_est_setting
+          topic: /obelisk/g1/joy_passthrough
+          history_depth: 10
+          callback_group: None
+        # ----- Odom subscriber ----- #
+        - ros_parameter: sub_odom_setting
+          topic: /obelisk/g1/head_odom
+          history_depth: 10
+          callback_group: None
+        # ----- Unitree High Level subscriber ----- #
+        - ros_parameter: sub_vel_cmd_setting
+          topic: /obelisk/g1/unitree_high_level_ctrl
+          history_depth: 10
+          callback_group: None
+      timers:
+        - ros_parameter: timer_ctrl_setting
+          timer_period_sec: 0.05    # 20 Hz
+          callback_group: None
   # ----- High Level/Execution FSM Controller ----- #
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
@@ -233,11 +240,16 @@ onboard:
           10., 10., 10.,       # R shoulder
           10., 10., 10., 10.,   # R elbow, wrist
         ]
+        # user_pose: [-0.25, 0, 0, 0.46, -0.25, 0,
+        #           -0.25, 0, 0, 0.46, -0.25, 0,
+        #           0,
+        #           0.07, 0.24, 0, 0.1, 0, 0, 0,
+        #           0.07, -0.24, 0, 0.1, 0, 0, 0]
         user_pose: [-0.25, 0, 0, 0.46, -0.25, 0,
                   -0.25, 0, 0, 0.46, -0.25, 0,
                   0,
-                  0.07, 0.24, 0, 0.1, 0, 0, 0,
-                  0.07, -0.24, 0, 0.1, 0, 0, 0]
+                  0.07, 0.24, 0, 1.39, 0, 0, 0,
+                  0.07, -0.24, 0, 1.39, 0, 0, 0,]
       # callback_groups:
       publishers:
       # ----- Joints ----- #

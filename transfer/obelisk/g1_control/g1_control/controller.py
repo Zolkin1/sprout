@@ -248,10 +248,12 @@ class VelocityTrackingController(ObeliskController, ABC):
         # Time logging info
         N_log = 100
         self.print_time_decimation = 100
+        self.loop_rate_time = self.get_clock().now().nanoseconds / 1e9
         self.timing_dict = {"update_x_hat": deque(maxlen=N_log), 
                             "create_obs": deque(maxlen=N_log),
                             "get_action": deque(maxlen=N_log),
-                            "compute_control": deque(maxlen=N_log)}
+                            "compute_control": deque(maxlen=N_log),
+                            "loop_period": deque(maxlen=N_log),}
 
         # Declare subscriber to velocity commands
         self.register_obk_subscription(
@@ -329,8 +331,8 @@ class VelocityTrackingController(ObeliskController, ABC):
         Returns:
             obelisk_control_msg: The control message.
         """
-        start_compute_time = self.get_clock().now().nanoseconds / 1e9
         # Generate input to RL model
+        start_time = self.get_clock().now().nanoseconds / 1e9
         if self.received_xhat:
             # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
             start_obs_time = self.get_clock().now().nanoseconds / 1e9
@@ -350,6 +352,7 @@ class VelocityTrackingController(ObeliskController, ABC):
             self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
             end_action_time = self.get_clock().now().nanoseconds / 1e9
 
+            start_compute_time = self.get_clock().now().nanoseconds / 1e9
             # setting the message
             pd_ff_msg = PDFeedForward()
             pd_ff_msg.header.stamp = self.get_clock().now().to_msg()
@@ -373,13 +376,22 @@ class VelocityTrackingController(ObeliskController, ABC):
             self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
 
             # Log observation and action
-            if self.log and self.ctrl_count % self.log_decimation == 0:
-                self.log_data(obs, self.action)
+            # if self.log and self.ctrl_count % self.log_decimation == 0:
+            #     self.log_data(obs, self.action)
+
+            t = self.get_clock().now().nanoseconds / 1e9
+            self.log_time("loop_period", t - self.loop_rate_time)
+            # self.get_logger().info(f"loop time: {t - self.loop_rate_time} s.")
+            self.loop_rate_time = self.get_clock().now().nanoseconds / 1e9
+
+            end_time = self.get_clock().now().nanoseconds / 1e9
 
             end_compute_time = self.get_clock().now().nanoseconds / 1e9
             self.log_time("compute_control", end_compute_time - start_compute_time)
             self.log_time("create_obs", end_obs_time - start_obs_time)
             self.log_time("get_action", end_action_time - start_action_time)
+
+            # self.get_logger().info(f"total compute: {end_time - start_time} s.")
 
             if self.ctrl_count & self.print_time_decimation == 0:
                 avg_times = self.get_average_times()
@@ -387,7 +399,9 @@ class VelocityTrackingController(ObeliskController, ABC):
                     f"[Timing] update_x_hat: {avg_times['update_x_hat']:.4f} s, "
                     f"create_obs: {avg_times['create_obs']:.4f} s, "
                     f"get_action: {avg_times['get_action']:.4f} s, "
-                    f"compute_control: {avg_times['compute_control']:.4f} s"
+                    f"compute_control: {avg_times['compute_control']:.4f} s, "
+                    f"loop period: {avg_times['loop_period']:.4f}s, "
+                    f"total: {(avg_times['update_x_hat'] + avg_times['create_obs'] + avg_times['get_action'] + avg_times['compute_control']):.4f} s"
                 )
 
 
