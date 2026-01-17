@@ -245,8 +245,8 @@ nmcli con show
 
 To set it to manual:
 ```
-nmcli con mod “Wired connection 1” ipv4.addresses 192.168.123.222/24 ipv4.method manual
-nmcli con up “Wired connection 1"
+nmcli con mod "Wired connection 1" ipv4.addresses 192.168.123.222/24 ipv4.method manual
+nmcli con up "Wired connection 1"
 ```
 
 To set to automatic:
