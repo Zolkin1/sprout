@@ -7,6 +7,7 @@ from datetime import datetime
 import time
 import csv
 import shutil
+from collections import deque
 from ament_index_python.packages import get_package_share_directory
 
 from .behavior_manager import BehaviorManager
@@ -243,6 +244,15 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.kps, self.kds = self._add_wrist_kp_kd_mujoco(active_policy.get_kp(self.joint_names_mujoco).tolist(),
                                                             active_policy.get_kd(self.joint_names_mujoco).tolist())
 
+
+        # Time logging info
+        N_log = 100
+        self.print_time_decimation = 100
+        self.timing_dict = {"update_x_hat": deque(maxlen=N_log), 
+                            "create_obs": deque(maxlen=N_log),
+                            "get_action": deque(maxlen=N_log),
+                            "compute_control": deque(maxlen=N_log)}
+
         # Declare subscriber to velocity commands
         self.register_obk_subscription(
             "sub_vel_cmd_setting",
@@ -285,6 +295,8 @@ class VelocityTrackingController(ObeliskController, ABC):
         Parameters:
             x_hat_msg: The Obelisk message containing the state estimate.
         """
+        start_time = self.get_clock().now().nanoseconds / 1e9
+
         self.joint_pos = np.array(x_hat_msg.q_joints)
         self.joint_names = x_hat_msg.joint_names
 
@@ -300,6 +312,11 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         self.received_xhat = True
 
+        end_time = self.get_clock().now().nanoseconds / 1e9
+
+        self.log_time("update_x_hat", end_time - start_time)
+
+
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages."""
         self.cmd_vel[0] = cmd_msg.v_x
@@ -312,9 +329,11 @@ class VelocityTrackingController(ObeliskController, ABC):
         Returns:
             obelisk_control_msg: The control message.
         """
+        start_compute_time = self.get_clock().now().nanoseconds / 1e9
         # Generate input to RL model
         if self.received_xhat:
             # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
+            start_obs_time = self.get_clock().now().nanoseconds / 1e9
             obs = self.behavior_manager.create_obs(
                 self.qfb,
                 self.vfb_ang,
@@ -324,9 +343,12 @@ class VelocityTrackingController(ObeliskController, ABC):
                 self.cmd_vel,
                 self.joint_names,
             )
+            end_obs_time = self.get_clock().now().nanoseconds / 1e9
 
             # Call RL model
+            start_action_time = self.get_clock().now().nanoseconds / 1e9
             self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
+            end_action_time = self.get_clock().now().nanoseconds / 1e9
 
             # setting the message
             pd_ff_msg = PDFeedForward()
@@ -353,6 +375,21 @@ class VelocityTrackingController(ObeliskController, ABC):
             # Log observation and action
             if self.log and self.ctrl_count % self.log_decimation == 0:
                 self.log_data(obs, self.action)
+
+            end_compute_time = self.get_clock().now().nanoseconds / 1e9
+            self.log_time("compute_control", end_compute_time - start_compute_time)
+            self.log_time("create_obs", end_obs_time - start_obs_time)
+            self.log_time("get_action", end_action_time - start_action_time)
+
+            if self.ctrl_count & self.print_time_decimation == 0:
+                avg_times = self.get_average_times()
+                self.get_logger().info(
+                    f"[Timing] update_x_hat: {avg_times['update_x_hat']:.4f} s, "
+                    f"create_obs: {avg_times['create_obs']:.4f} s, "
+                    f"get_action: {avg_times['get_action']:.4f} s, "
+                    f"compute_control: {avg_times['compute_control']:.4f} s"
+                )
+
 
             self.ctrl_count += 1
 
@@ -418,6 +455,16 @@ class VelocityTrackingController(ObeliskController, ABC):
         obsaction = obs.tolist() + action.tolist()
         row = [log_time] + obsaction
         self.writer.writerow(row)
+    
+    def log_time(self, key: str, time: float):
+        """Log timing information."""
+        if key in self.timing_dict:
+            self.timing_dict[key].append(time)
+        else:
+            raise ValueError(f"Key {key} not in timing dictionary.")
+
+    def get_average_times(self) -> dict:
+        return {key: sum(times) / len(times) if times else 0 for key, times in self.timing_dict.items()}
 
     def joy_callback(self, joy_msg: Joy):
         """Callback to watch for E-stop from joystick."""
