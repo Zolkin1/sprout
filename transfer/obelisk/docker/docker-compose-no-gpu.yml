@@ -1,6 +1,6 @@
 services:
   robot_rl_obk:
-    image: ghcr.io/zolkin1/robot-rl-obk:no-gpu-latest
+    # image: ghcr.io/zolkin1/robot-rl-obk:no-gpu-latest   - Does not work due to user mismatch right now
     shm_size: '12gb'
     build:
       context: .

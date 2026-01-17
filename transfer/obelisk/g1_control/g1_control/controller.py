@@ -393,16 +393,16 @@ class VelocityTrackingController(ObeliskController, ABC):
 
             # self.get_logger().info(f"total compute: {end_time - start_time} s.")
 
-            if self.ctrl_count & self.print_time_decimation == 0:
-                avg_times = self.get_average_times()
-                self.get_logger().info(
-                    f"[Timing] update_x_hat: {avg_times['update_x_hat']:.4f} s, "
-                    f"create_obs: {avg_times['create_obs']:.4f} s, "
-                    f"get_action: {avg_times['get_action']:.4f} s, "
-                    f"compute_control: {avg_times['compute_control']:.4f} s, "
-                    f"loop period: {avg_times['loop_period']:.4f}s, "
-                    f"total: {(avg_times['update_x_hat'] + avg_times['create_obs'] + avg_times['get_action'] + avg_times['compute_control']):.4f} s"
-                )
+            # if self.ctrl_count & self.print_time_decimation == 0:
+            #     avg_times = self.get_average_times()
+            #     self.get_logger().info(
+            #         f"[Timing] update_x_hat: {avg_times['update_x_hat']:.4f} s, "
+            #         f"create_obs: {avg_times['create_obs']:.4f} s, "
+            #         f"get_action: {avg_times['get_action']:.4f} s, "
+            #         f"compute_control: {avg_times['compute_control']:.4f} s, "
+            #         f"loop period: {avg_times['loop_period']:.4f}s, "
+            #         f"total: {(avg_times['update_x_hat'] + avg_times['create_obs'] + avg_times['get_action'] + avg_times['compute_control']):.4f} s"
+            #     )
 
 
             self.ctrl_count += 1

@@ -19,7 +19,8 @@ joint_names_isaac: [left_hip_pitch_joint, right_hip_pitch_joint, waist_yaw_joint
   right_ankle_pitch_joint, left_elbow_joint, right_elbow_joint, left_ankle_roll_joint, right_ankle_roll_joint]
 kp: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 150.0, 150.0, 50.0, 50.0, 40.0, 40.0, 50.0,
   50.0, 40.0, 40.0]
-kd: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+# kd: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+kd: [4.0, 4.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
 observation_terms:
   policy:
     base_ang_vel:

@@ -32,7 +32,7 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
    - GPU-based (recommended for better performance)
    - No-GPU (if GPU is not available)
 
-## Pushing and Pulling from a Registry
+## Pushing and Pulling from a Registry - DOES NOT WORK RIGHT NOW
 Login to your registry of choice (for now I am using github packages).
 (i.e. `docker login ghcr.io -u YOUR_GITHUB_USERNAME`)
 
