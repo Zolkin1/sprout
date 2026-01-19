@@ -514,9 +514,9 @@ class TrajectoryCommand(CommandTerm):
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]
 
-        if self.manager.get_trajectory_type() == TrajectoryType.EPISODIC:
-            phi = self.update_phasing_var(t)
+        phi = self.update_phasing_var(t)
 
+        if self.manager.get_trajectory_type() == TrajectoryType.EPISODIC:
             self.dy_des[phi == 1] *= 0
 
     def set_user_heuristic(self, heuristic_func):
