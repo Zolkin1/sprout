@@ -437,9 +437,12 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
         }
-        self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
+        self.events.add_base_mass.params["asset_cfg"].body_names = ["waist_yaw_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
+
+        self.events.base_com.params["asset_cfg"].body_names = ["waist_yaw_link"]
+
         self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
@@ -559,7 +562,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         self.events.push_robot = None
         
         
-        self.commands.base_velocity.ranges.lin_vel_x = (0.75, 1.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0) #(0.75, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
         self.commands.base_velocity.ranges.ang_vel_z = (0,0)
 

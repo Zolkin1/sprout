@@ -744,7 +744,10 @@ class TrajectoryManager(ManagerBase):
         return self.T[domain_idx % self.num_domains]
 
     def get_total_time(self) -> torch.Tensor:
-        return torch.sum(self.T)
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            return torch.sum(self.T * 2)
+        else:
+            return torch.sum(self.T)
 
     # TODO: Clean
     def relable_ee_stance_coeffs(self):

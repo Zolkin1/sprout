@@ -78,7 +78,7 @@ class RLPolicy:
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
                     if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time, 1.0/self.get_gait_period_range()[0]) * scale
+                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time, 1.0/(self.get_total_time())) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 0 * scale
                 elif self.get_skill_type() == "episodic":
@@ -93,7 +93,7 @@ class RLPolicy:
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
                     if np.linalg.norm(cmd_vel) > 0.01:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time, 1.0/self.get_gait_period_range()[0]) * scale
+                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time, 1.0/(self.get_total_time())) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 1 * scale
                 elif self.get_skill_type() == "episodic":
@@ -147,6 +147,8 @@ class RLPolicy:
         clipped_cmd[0] = np.clip(cmd_vel[0], vel_ranges['v_x_min'], vel_ranges['v_x_max'])
         clipped_cmd[1] = np.clip(cmd_vel[1], vel_ranges['v_y_min'], vel_ranges['v_y_max'])
         clipped_cmd[2] = np.clip(cmd_vel[2], vel_ranges['w_z_min'], vel_ranges['w_z_max'])
+
+        print(f"clipped_cmd: {clipped_cmd}")
 
         return clipped_cmd
 
