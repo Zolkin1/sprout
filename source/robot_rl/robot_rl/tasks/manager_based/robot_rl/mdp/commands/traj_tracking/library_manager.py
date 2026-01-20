@@ -393,7 +393,7 @@ class LibraryManager(ManagerBase):
         Gets the total time for the trajectory. Assumes all trajectories in the library have the same total time.
         """
 
-        return self.trajectory_managers[0].get_total_time()
+        return self.trajectory_managers[-1].get_total_time()
 
     def order_outputs(self, order_output_names: list[str]):
         for manager in self.trajectory_managers:

@@ -77,7 +77,7 @@ class RLPolicy:
                 obs_idx += shape
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.01:
+                    if np.linalg.norm(cmd_vel) > 0.05:
                         obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time, 1.0/(self.get_total_time())) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 0 * scale
@@ -92,7 +92,7 @@ class RLPolicy:
 
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.01:
+                    if np.linalg.norm(cmd_vel) > 0.05:
                         obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time, 1.0/(self.get_total_time())) * scale
                     else:
                         obs_np[obs_idx:obs_idx+shape] = 1 * scale

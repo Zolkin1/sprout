@@ -17,6 +17,7 @@ EXPERIMENT_NAMES = {
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
     "walking_clf": "walking_clf",
+    "walking_clf_sym": "walking-clf-symmetric",
     "walking_clf_ec": "walking_clf",
     "running_clf": "running_clf",
     "waving_clf": "waving_clf",
