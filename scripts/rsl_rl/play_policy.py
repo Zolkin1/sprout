@@ -18,7 +18,7 @@ SIM_ENVIRONMENTS = {
     "vanilla": "G1-vanilla-walking",
     "lip_clf": "G1-lip-ref-play",
     "walking_clf": "G1-walking-clf-play",
-    "walking_clf_sym": "G1-walking-clf-symmetric",
+    "walking_clf_sym": "G1-walking-clf-play",
     "running_clf": "G1-running-clf-play",
     "waving_clf": "G1-waving-clf-play",
     "bow_forward_clf": "G1-bow_forward-clf-play",

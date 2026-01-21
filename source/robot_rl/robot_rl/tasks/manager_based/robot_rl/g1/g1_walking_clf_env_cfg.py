@@ -383,7 +383,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/walking",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 45, #51, #31, #27,
+        num_outputs = 45, #27, #45, #51, #31, #27,
         Q_weights = WALKING_Q_weights,
         R_weights = WALKING_R_weights,
         # heuristic_func=heuristic_modification,

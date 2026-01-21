@@ -817,6 +817,7 @@ class TrajectoryManager(ManagerBase):
         R_dict["right_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
         R_dict["right_wrist_yaw_link:pos_z"] = 1
 
+        # TODO: I think this is wrong?
         R_dict["right_wrist_yaw_link:ori_x"] = 1
         R_dict["right_wrist_yaw_link:ori_y"] = 1
         R_dict["right_wrist_yaw_link:ori_z"] = 1
@@ -825,6 +826,7 @@ class TrajectoryManager(ManagerBase):
         R_dict["left_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
         R_dict["left_wrist_yaw_link:pos_z"] = 1
 
+        # TODO: I think this is wrong?
         R_dict["left_wrist_yaw_link:ori_x"] = 1
         R_dict["left_wrist_yaw_link:ori_y"] = 1
         R_dict["left_wrist_yaw_link:ori_z"] = 1

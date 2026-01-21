@@ -189,6 +189,19 @@ class HumanoidEventsCfg:
         params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 
+    # PD Gain randomization
+    gain_randomization = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (-7., 7.),
+            "damping_distribution_params": (-1., 1.),
+            "operation": "add",
+            "distribution": "uniform"
+        },
+    )
+
 
 @configclass
 class HumanoidRewardCfg:
