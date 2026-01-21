@@ -83,11 +83,10 @@ class TrajectoryCommand(CommandTerm):
 
         # For now assuming that all bodies have a yaw tracking
         self.yaw_output_idxs = []
-        for body in range(len(self.body_idx)):
-            start = 0
-            if self.use_com:
-                start += 2
-            self.yaw_output_idxs = start + 5*body
+
+        for i, name in enumerate(self.ordered_output_names):
+            if "ori_z" in name:
+                self.yaw_output_idxs.append(i)
 
         # Create a list of indices for the reference frames
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(self.manager.get_reference_frames())
