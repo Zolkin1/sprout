@@ -837,13 +837,13 @@ class TrajectoryManager(ManagerBase):
         R_dict["joint:left_elbow_joint"] = 1
         R_dict["joint:left_shoulder_pitch_joint"] = 1
         R_dict["joint:left_shoulder_roll_joint"] = -1
-        R_dict["joint:left_shoulder_yaw_joint"] = 1
+        R_dict["joint:left_shoulder_yaw_joint"] = -1
 
         # Right
         R_dict["joint:right_elbow_joint"] = 1
         R_dict["joint:right_shoulder_pitch_joint"] = 1
         R_dict["joint:right_shoulder_roll_joint"] = -1
-        R_dict["joint:right_shoulder_yaw_joint"] = 1
+        R_dict["joint:right_shoulder_yaw_joint"] = -1
 
         # Waist
         R_dict["joint:waist_yaw_joint"] = -1

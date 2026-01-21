@@ -467,7 +467,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "traj_ref",
-            "max_eta_err": 0.25,
+            "max_eta_err": 0.15, #0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "traj_ref",
@@ -476,6 +476,8 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
+
+        # self.rewards.undesired_contacts.weight = 0.0
 
         ##
         # Terminations
