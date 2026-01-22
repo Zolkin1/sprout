@@ -24,3 +24,4 @@ class TrajectoryCommandCfg(CommandTermCfg):
     heuristic_func = None
     random_start_time_max: float = -1
     percent_hold_phi: float = -1
+    hold_phi_threshold: float = -1
