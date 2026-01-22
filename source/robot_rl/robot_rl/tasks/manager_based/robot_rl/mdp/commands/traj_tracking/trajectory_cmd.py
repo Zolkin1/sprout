@@ -131,7 +131,21 @@ class TrajectoryCommand(CommandTerm):
         Returns:
             Phasing variable tensor of shape [N].
         """
+        prev_phi = self.phasing_var
         self.phasing_var = self.manager.get_phasing_var(t)
+
+        # Now hold phi on standing envs
+        cmd_vel = self.env.command_manager.get_command("base_velocity")
+        self.should_hold = torch.norm(cmd_vel, dim=1) < self.cfg.hold_phi_threshold
+
+        mask = torch.logical_or((self.phasing_var < prev_phi), prev_phi == 0.0)
+        mask = torch.logical_and(mask, self.should_hold)
+        self.phasing_var[mask] *= 0
+
+        mask = ((prev_phi < 0.5) & (self.phasing_var > 0.5)) | (prev_phi == 0.5)
+        mask = torch.logical_and(mask, self.should_hold)
+        self.phasing_var[mask] = 0.5
+
         return self.phasing_var
 
     def get_phasing_var(self) -> torch.Tensor:
@@ -352,8 +366,8 @@ class TrajectoryCommand(CommandTerm):
         # Note that domains never change for full periodic single domain trajectories, but I think we still want to update the position.
         # The two options are (1) continually updating the position while in contact, (2) try to check based on the phasing variable
         # TODO: Come back to this to see if this is the best way to do this. For now using option (1)
-        if self.manager.get_num_domains() == 1:     # TODO: make this on a per-env basis so that we can have multiple domains in some envs and not others
-            changed[:] = True
+        single_dom_mask = self.manager.get_num_domains() == 1
+        changed[single_dom_mask] = True
 
         # Update the list of current domains
         self.current_domain = new_domains

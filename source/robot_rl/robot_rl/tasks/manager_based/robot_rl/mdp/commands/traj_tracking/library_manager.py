@@ -57,15 +57,15 @@ class LibraryManager(ManagerBase):
         self.conditioning_vars = torch.tensor(conditioner_list, device=self.device)
 
         # Verify the trajectories are compatible (num_outputs, type, reference_frames)
-        num_ouputs = self.trajectory_managers[0].traj_data.num_outputs
-        output_names = self.trajectory_managers[0].traj_data.output_names
-        trajectory_type = self.trajectory_managers[0].traj_data.trajectory_type
-        ref_frames = self.trajectory_managers[0].traj_data.reference_frames
+        num_ouputs = self.trajectory_managers[-1].traj_data.num_outputs
+        output_names = self.trajectory_managers[-1].traj_data.output_names
+        trajectory_type = self.trajectory_managers[-1].traj_data.trajectory_type
+        ref_frames = self.trajectory_managers[-1].traj_data.reference_frames
         for manager in self.trajectory_managers:
             if manager.traj_data.num_outputs != num_ouputs:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying number of outputs!")
-            if manager.traj_data.trajectory_type != trajectory_type:
-                raise ValueError(f"Trajectories in the library are not compatible! Varying trajectory_type!")
+            # if manager.traj_data.trajectory_type != trajectory_type:
+            #     raise ValueError(f"Trajectories in the library are not compatible! Varying trajectory_type!")
             if manager.traj_data.output_names != output_names:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying output_names!"
                                  f"Expected names (first traj): {manager.traj_data.output_names}, \ngot: {output_names}")
@@ -156,7 +156,23 @@ class LibraryManager(ManagerBase):
         return self.num_outputs
 
     def get_num_domains(self):
-        return self.trajectory_managers[0].get_num_domains()
+        conditioner = self.get_conditioner_var()
+        indices = self.get_traj_indices(conditioner)
+
+        unique_indicies = torch.unique(indices)
+
+        domains = torch.zeros(conditioner.shape[0], device=self.device)
+
+        for idx in unique_indicies:
+            # Find which environments use this trajectory
+            mask = indices == idx
+            env_indices = torch.where(mask)[0]
+
+            manager_domains = self.trajectory_managers[idx.item()].get_num_domains()
+
+            domains[env_indices] = manager_domains
+
+        return domains
 
     def get_trajectory_type(self):
         return self.trajectory_type

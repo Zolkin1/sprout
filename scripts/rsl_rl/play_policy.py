@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--video",
         action="store_true",
-        default=True,
+        default=False,
         help="Record videos during playback."
     )
     parser.add_argument(
@@ -428,8 +428,6 @@ def main():
             if timestep == args_cli.video_length:
                 break
 
-        if timestep > max(100, args_cli.video_length):
-            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
