@@ -135,7 +135,7 @@ class TrajectoryCommand(CommandTerm):
 
         # Now hold phi on standing envs
         cmd_vel = self.env.command_manager.get_command("base_velocity")
-        self.should_hold = torch.norm(cmd_vel, dim=1) < self.cfg.hold_phi_threshold
+        self.should_hold = torch.abs(cmd_vel[:, 0]) < self.cfg.hold_phi_threshold
 
         mask = torch.logical_or((self.phasing_var < prev_phi), prev_phi == 0.0)
         mask = torch.logical_and(mask, self.should_hold)
@@ -521,7 +521,7 @@ class TrajectoryCommand(CommandTerm):
             contact_states = self.get_contact_state(t)
             time_into_domain = torch.remainder(t, self.manager.get_domain_times(t))
             y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
-                                    contact_states, time_into_domain)
+                                    contact_states, time_into_domain, self.cfg.hold_phi_threshold)
 
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]
