@@ -290,7 +290,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 ax = get_ax(axs, i, n_cols)
                 ax.plot(time_steps, processed_data['dy_des'][:, env_id, i], label='Reference', linewidth=2)
                 ax.plot(time_steps, processed_data['dy_act'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
-                label = state_labels['dy_des'][i] if i < len(state_labels['dy_des']) else f'Dimension {i}'
+                label = processed_data['ordered_output_names'][0, i]
                 unit = units['dy_des'][i] if i < len(units['dy_des']) else ''
                 ax.set_title(label, fontsize=10)
                 ax.set_xlabel('Time Steps')

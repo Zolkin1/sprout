@@ -64,10 +64,10 @@ class TrajectoryManager(ManagerBase):
 
 
         self.T = torch.zeros(self.num_domains, device=self.device)
-        self.bezier_coeffs = torch.zeros(self.num_domains, self.traj_data.num_outputs, self.traj_data.spline_order + 1, device=self.device)
+        self.bezier_coeffs = torch.zeros(self.num_domains, self.traj_data.num_outputs, 2, self.traj_data.spline_order + 1, device=self.device)
         for i, domain in enumerate(self.traj_data.domain_order):
             self.T[i] = self.traj_data.domain_data[domain].time
-            self.bezier_coeffs[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+            self.bezier_coeffs[i, :, :, :] = self.traj_data.domain_data[domain].bezier_tensor
 
         if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
             self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
@@ -345,13 +345,13 @@ class TrajectoryManager(ManagerBase):
             if dom >= self.num_domains:
                 if bezier_coeffs_reflect is None:
                     raise ValueError(f"Issue indexing into the bezier coefficients due to the half period!")
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 0, :].squeeze(),
                                                                              T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, :].squeeze(),
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 1, :].squeeze(),
                                                                              T_dom)
             else:
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, :].squeeze(), T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(1, tau_dom, bezier_coeffs[dom, :, :].squeeze(), T_dom)
+                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 0, :].squeeze(), T_dom)
+                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 1, :].squeeze(), T_dom)
 
         return outputs
 
@@ -473,12 +473,15 @@ class TrajectoryManager(ManagerBase):
 
     def remap_trajectory(self) -> torch.Tensor:
         """
-        Remap the trajectory
-        """
-        # Apply relabeling: left_coeffs = R @ right_coeffs
-        remap_coeffs = self.R_relabel @ self.bezier_coeffs
+        Remap the trajectory by applying the relabeling matrix.
 
-        # self.generate_axis_names()
+        Returns:
+            remap_coeffs: Shape [num_domains, num_outputs, 2, degree+1] with relabeled coefficients.
+        """
+        # self.bezier_coeffs shape: [num_domains, num_outputs, 2, degree+1]
+        # R_relabel shape: [num_outputs, num_outputs]
+        # Apply relabeling to both position and velocity coefficients
+        remap_coeffs = torch.einsum('ij,djkl->dikl', self.R_relabel, self.bezier_coeffs)
 
         return remap_coeffs
 
@@ -499,7 +502,7 @@ class TrajectoryManager(ManagerBase):
             dom.bezier_tensor = self._create_bezier_tensor(dom.bezier_coeffs, self.traj_data.output_names)
 
         for i, domain in enumerate(self.traj_data.domain_order):
-            self.bezier_coeffs[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+            self.bezier_coeffs[i, :, :, :] = self.traj_data.domain_data[domain].bezier_tensor
 
         # Regenerate the relabeling matrix
         self.R_relabel = torch.from_numpy(self.relable_ee_stance_coeffs()).to(device=self.device, dtype=self.bezier_coeffs.dtype)
@@ -612,30 +615,47 @@ class TrajectoryManager(ManagerBase):
         Create a tensor of bezier coefficients in the order specified by output_names.
 
         Args:
-            bezier_coeffs: Dictionary containing 'frames' and 'joints' with their bezier coefficients
+            bezier_coeffs: Dictionary containing 'frames', 'joints', 'frame_vels', and 'joint_vels'
+                with their bezier coefficients
             output_names: List of output names in the format "frame:axis" or "joint:name"
 
         Returns:
-            bezier_tensor: Shape [num_outputs, degree+1] containing coefficients for each output
+            bezier_tensor: Shape [num_outputs, 2, degree+1] containing coefficients for each output.
+                [:, 0, :] are positions while [:, 1, :] are the velocities.
         """
-        coefficient_lists = []
+        pos_coefficient_lists = []
+        vel_coefficient_lists = []
 
         for output_name in output_names:
             if output_name.startswith('joint:'):
                 # Joint output
                 joint_name = output_name.split(':', 1)[1]
+
                 if joint_name not in bezier_coeffs['joints']:
-                    raise ValueError("Joint is missing from bezier coefficient!")
-                coefficient_lists.append(bezier_coeffs['joints'][joint_name])
+                    raise ValueError(f"Joint '{joint_name}' missing from bezier coefficients!")
+                if joint_name not in bezier_coeffs['joint_vels']:
+                    raise ValueError(f"Joint '{joint_name}' missing from velocity coefficients!")
+
+                pos_coefficient_lists.append(bezier_coeffs['joints'][joint_name])
+                vel_coefficient_lists.append(bezier_coeffs['joint_vels'][joint_name])
             else:
                 # Frame output (format: "frame_name:axis")
                 frame_name, axis = output_name.split(':', 1)
-                if frame_name not in bezier_coeffs['frames']:
-                    raise ValueError("Frame is missing from bezier coefficient!")
-                coefficient_lists.append(bezier_coeffs['frames'][frame_name][axis])
 
-        # Stack into tensor: [num_outputs, degree+1]
-        bezier_tensor = torch.tensor(coefficient_lists, dtype=torch.float32, device=self.device)
+                if frame_name not in bezier_coeffs['frames']:
+                    raise ValueError(f"Frame '{frame_name}' missing from bezier coefficients!")
+                if frame_name not in bezier_coeffs['frame_vels']:
+                    raise ValueError(f"Frame '{frame_name}' missing from velocity coefficients!")
+
+                pos_coefficient_lists.append(bezier_coeffs['frames'][frame_name][axis])
+                vel_coefficient_lists.append(bezier_coeffs['frame_vels'][frame_name][axis])
+
+        # Stack into tensors: [num_outputs, degree+1]
+        pos_tensor = torch.tensor(pos_coefficient_lists, dtype=torch.float32, device=self.device)
+        vel_tensor = torch.tensor(vel_coefficient_lists, dtype=torch.float32, device=self.device)
+
+        # Stack along new dimension: [num_outputs, 2, degree+1]
+        bezier_tensor = torch.stack([pos_tensor, vel_tensor], dim=1)
 
         return bezier_tensor
 
@@ -721,6 +741,23 @@ class TrajectoryManager(ManagerBase):
                     f"  Missing: {sorted(ref_joints - curr_joints)}\n"
                     f"  Extra: {sorted(curr_joints - ref_joints)}"
                 )
+
+        # Verify velocity coefficients exist and match position structure
+        ref_frame_vels = set(ref_bezier.get('frame_vels', {}).keys())
+        if ref_frame_vels != ref_frames:
+            raise ValueError(
+                f"Domain '{reference_domain}' has mismatched frame_vels.\n"
+                f"  Expected frames: {sorted(ref_frames)}\n"
+                f"  Got frame_vels: {sorted(ref_frame_vels)}"
+            )
+
+        ref_joint_vels = set(ref_bezier.get('joint_vels', {}).keys())
+        if ref_joint_vels != ref_joints:
+            raise ValueError(
+                f"Domain '{reference_domain}' has mismatched joint_vels.\n"
+                f"  Expected joints: {sorted(ref_joints)}\n"
+                f"  Got joint_vels: {sorted(ref_joint_vels)}"
+            )
 
         # Build output names list and count outputs (preserving YAML order)
         output_names = []
