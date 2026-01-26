@@ -151,6 +151,7 @@ class RLPolicy:
         elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
             self.phi = 0.5
 
+
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:

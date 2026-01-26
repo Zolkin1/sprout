@@ -103,9 +103,9 @@ class HumanoidEventsCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
-            "static_friction_range": (0.25, 1.25),
-            "dynamic_friction_range": (0.25, 1.25),
-            "restitution_range": (0.0, 0.0),
+            "static_friction_range": (0.3, 1.6),
+            "dynamic_friction_range": (0.3, 1.2),
+            "restitution_range": (0.0, 0.2),    # Consider upping this
             "num_buckets": 64,
             "make_consistent": True,  # ensures dynamic friction <= static friction
         },
@@ -239,3 +239,6 @@ class HumanoidEnvCfg(LocomotionVelocityRoughEnvCfg):
     actions: HumanoidActionsCfg = HumanoidActionsCfg()
     commands: HumanoidCommandsCfg = HumanoidCommandsCfg()
     terminations: HumanoidTerminationCfg = HumanoidTerminationCfg()
+
+    # def __post_init__(self):
+    #     super().__post_init__()
