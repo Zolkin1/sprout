@@ -8,7 +8,7 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "walking_clf_sym/2026-01-22_09-26-54_T0_walking_new_gait_sym",
+          "walking_clf_sym/2026-01-24_10-06-39_T1_walking_new_smooth_gait_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -54,8 +54,8 @@ onboard:
       params:
         v_x_min: -1.0
         v_x_max: 1.0
-        v_y_max: 0.0
-        w_z_max: 0.0
+        v_y_max: 0.3
+        w_z_max: 1.0
         vel_increment: 0.1
         kp_yaw: 3.0
         kd_yaw: 0.1
@@ -101,7 +101,7 @@ onboard:
       executable: obelisk_unitree_joystick
       params:
         v_x_scale: 1.0
-        v_y_scale: 1.0
+        v_y_scale: 0.3
         w_z_scale: 1.0
       # callback_groups:
       publishers:

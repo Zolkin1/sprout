@@ -27,6 +27,9 @@ class RLPolicy:
         self.policy = torch.jit.load(self.policy_path)
         self.device = next(self.policy.parameters()).device
 
+        self.phi = 0.0
+        self.prev_phi = 0.0
+
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_folder: str) -> tuple[str, str]:
         """Load policy from Hugging Face with local caching.
 
@@ -138,6 +141,16 @@ class RLPolicy:
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
         vjoints_isaac = self.convert_joint_order(vjoints, joint_names, self.get_joint_names())
 
+        self.prev_phi = self.phi
+        self.phi = (time % self.get_total_time()) / self.get_total_time()
+
+        if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
+            self.phi = self.prev_phi
+        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi > self.phi):
+            self.phi = 0.0
+        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
+            self.phi = 0.5
+
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:
@@ -161,10 +174,10 @@ class RLPolicy:
                 obs_idx += shape
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.1:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time2, 1.0/self.get_total_time()) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(self.phi, 1.0) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 0 * scale
                     # obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time2, 1.0/self.get_total_time()) * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time2) % self.get_total_time())/self.get_total_time()
@@ -177,10 +190,10 @@ class RLPolicy:
 
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.1:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time2, 1.0/self.get_total_time()) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(self.phi, 1.0) #time2, 1.0/self.get_total_time()) * scale
+                    # else:
+                        # obs_np[obs_idx:obs_idx+shape] = 1 * scale
                     # obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time2, 1.0/self.get_total_time()) * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time2) % self.get_total_time())/self.get_total_time()

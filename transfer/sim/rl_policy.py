@@ -19,6 +19,9 @@ class RLPolicy:
 
         self.action_isaac = np.zeros(self.get_num_actions())
 
+        self.phi = 0.0
+        self.prev_phi = 0.0
+
     def load(self):
         """Load RL Policy"""
         # Get the cwd and get the logs dir relative to this.
@@ -54,6 +57,18 @@ class RLPolicy:
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
         vjoints_isaac = self.convert_joint_order(vjoints, joint_names, self.get_joint_names())
 
+        self.prev_phi = self.phi
+        self.phi = (time % self.get_total_time()) / self.get_total_time()
+
+        if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
+            self.phi = self.prev_phi
+        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi > self.phi):
+            self.phi = 0.0
+        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
+            self.phi = 0.5
+
+        print(f"phi: {self.phi}")
+
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:
@@ -77,10 +92,10 @@ class RLPolicy:
                 obs_idx += shape
             elif term == "sin_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.1:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time, 1.0/(self.get_total_time())) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(self.phi, 1.0) #time, 1.0/(self.get_total_time())) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 0 * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
                     # phi = 0
@@ -92,10 +107,10 @@ class RLPolicy:
 
             elif term == "cos_phase":
                 if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
-                    if np.linalg.norm(cmd_vel) > 0.1:
-                        obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time, 1.0/(self.get_total_time())) * scale
-                    else:
-                        obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(self.phi, 1.0) #time, 1.0/(self.get_total_time())) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 1 * scale
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
                     # phi = 0

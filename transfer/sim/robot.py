@@ -112,8 +112,8 @@ class Robot:
             vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3))
 
             des_vel[0] = vx
-            des_vel[1] = min(max(vy, -0.2), 0.2)
-            des_vel[2] = min(max(vyaw, -0.5), 0.5)
+            des_vel[1] = min(max(vy, -0.3), 0.3)
+            des_vel[2] = min(max(vyaw, -1.0), 1.0)
         else:
             des_vel = np.array([0.5, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
