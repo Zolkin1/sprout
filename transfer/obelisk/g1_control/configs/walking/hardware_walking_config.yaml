@@ -198,28 +198,6 @@ onboard:
           2., 2., 2., 2.,   # R shoulder, elbow
           2., 2., 2.,       # R wrist
         ]
-        # default_kp: [
-        #   30., 30., 30.,    # L hip
-        #   30., 30., 30.,    # L knee, ankle
-        #   30., 30., 30.,    # R hip
-        #   30., 30., 30.,    # R knee, ankle
-        #   10.,              # Waist
-        #   5., 5., 5.,       # L shoulder
-        #   5., 5., 5., 5.,   # L elbow, wrist
-        #   5., 5., 5.,       # R shoulder
-        #   5., 5., 5., 5.,   # R elbow, wrist
-        # ]
-        # default_kd: [
-        #   3.,3.,3.,         # L hip
-        #   3.,3.,3.,         # L knee, ankle
-        #   3.,3.,3.,         # R hip
-        #   3.,3.,3.,         # R knee, ankle
-        #   1.,               # Waist
-        #   1., 1., 1.,       # L shoulder
-        #   1., 1., 1., 1.,   # L elbow, wrist
-        #   1., 1., 1.,       # R shoulder
-        #   1., 1., 1., 1.,   # R elbow, wrist
-        # ]
         default_kd_damping: [
           10.,10.,10.,         # L hip
           10.,10.,10.,         # L knee, ankle
@@ -236,11 +214,11 @@ onboard:
         #           0,
         #           0.07, 0.24, 0, 0.1, 0, 0, 0,
         #           0.07, -0.24, 0, 0.1, 0, 0, 0]
-        user_pose: [-0.25, 0, 0, 0.46, -0.25, 0,
-                  -0.25, 0, 0, 0.46, -0.25, 0,
+        user_pose: [-0.25, 0.01, -0.005, 0.45, -0.25, 0.0,
+                  -0.25, -0.01, -0.005, 0.45, -0.25, 0.0,
                   0,
-                  0.07, 0.24, 0, 1.39, 0, 0, 0,
-                  0.07, -0.24, 0, 1.39, 0, 0, 0,]
+                  0.47, 0.24, 0, 0.8, 0, 0, 0,
+                  0.47, -0.24, 0, 0.8, 0, 0, 0,]
       # callback_groups:
       publishers:
       # ----- Joints ----- #
