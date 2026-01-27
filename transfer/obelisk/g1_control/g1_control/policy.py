@@ -30,6 +30,7 @@ class RLPolicy:
 
         self.phi = 0.0
         self.prev_phi = 0.0
+        self.last_zero_time = 0.0
 
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_folder: str) -> tuple[str, str]:
         """Load policy from Hugging Face with local caching.
@@ -146,8 +147,11 @@ class RLPolicy:
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
         vjoints_isaac = self.convert_joint_order(vjoints, joint_names, self.get_joint_names())
 
+        if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
+            self.last_zero_time = time + (self.get_total_time()/4)
+
         self.prev_phi = self.phi
-        self.phi = (time % self.get_total_time()) / self.get_total_time()
+        self.phi = ((time - self.last_zero_time) % self.get_total_time()) / self.get_total_time()
 
         if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
             self.phi = self.prev_phi
@@ -155,8 +159,7 @@ class RLPolicy:
             self.phi = 0.0
         elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
             self.phi = 0.5
-
-
+            
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:

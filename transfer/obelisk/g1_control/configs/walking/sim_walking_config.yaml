@@ -103,6 +103,8 @@ onboard:
         v_x_scale: 1.0
         v_y_scale: 0.2
         w_z_scale: 0.5
+
+        vel_cmd_yaw: 13  # RY
       # callback_groups:
       publishers:
       # ----- Execution FSM ----- #
