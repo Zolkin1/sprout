@@ -467,18 +467,6 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         super().__post_init__()
 
         self.actions.joint_pos.scale = G1_ACTION_SCALE
-        print(f"Action scale: {G1_ACTION_SCALE}")
-
-        print(f"arm stiffness: {G1_MINIMAL_CFG.actuators['arms'].stiffness}")
-        print(f"legs stiffness: {G1_MINIMAL_CFG.actuators['legs'].stiffness}")
-        print(f"feet stiffness: {G1_MINIMAL_CFG.actuators['feet'].stiffness}")
-        print(f"waist yaw stiffness: {G1_MINIMAL_CFG.actuators['waist'].stiffness}")
-
-
-        print(f"arm damping: {G1_MINIMAL_CFG.actuators['arms'].damping}")
-        print(f"legs damping: {G1_MINIMAL_CFG.actuators['legs'].damping}")
-        print(f"feet damping: {G1_MINIMAL_CFG.actuators['feet'].damping}")
-        print(f"waist yaw damping: {G1_MINIMAL_CFG.actuators['waist'].damping}")
 
         ##
         # Scene
@@ -490,8 +478,8 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0) # TODO: put back: (-0.5, 0.5)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5) # TODO: put back: (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0,0)
 
         self.commands.gait_period = None
@@ -630,8 +618,8 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
 
         
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0) #(0.75, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 
         # self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
         # self.events.reset_base.params["pose_range"]["x"] = (-3,3)

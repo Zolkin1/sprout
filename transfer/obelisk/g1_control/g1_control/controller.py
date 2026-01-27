@@ -61,52 +61,6 @@ class VelocityTrackingController(ObeliskController, ABC):
             self.get_logger().info(f"Loaded behavior {behavior_name} at {policy.get_policy_path()}.")
 
 
-        # Logging information
-        self.declare_parameter("log", False)
-        self.declare_parameter("log_decimation", 1)
-        self.log = self.get_parameter("log").get_parameter_value().bool_value
-        self.log_decimation = self.get_parameter("log_decimation").get_parameter_value().integer_value
-        self.ctrl_count = 0
-
-        self.start_time = self.get_clock().now().nanoseconds / 1e9
-
-        if self.log:
-            self.get_logger().info(f"Logging enabled. Decimation: {self.log_decimation}.")
-
-            # Create log directory relative to $ROBOT_RL_ROOT
-            root = os.environ.get("ROBOT_RL_ROOT", "")
-
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            log_dir = os.path.join(root, "ctrl_logs", timestamp)
-            os.makedirs(log_dir, exist_ok=True)
-
-            self.log_file = os.path.join(log_dir, "g1_control.csv")
-            self.file = open(self.log_file, "w", buffering=8192)
-            self.writer = csv.writer(self.file)
-            self._lines_written = 0
-            self._file_index = 0
-
-            # Copy the config into the log directory
-            self.declare_parameter("config_name", "")
-            config_name = self.get_parameter("config_name").get_parameter_value().string_value
-            if config_name != "":
-                self.get_logger().info(f"Copying the config to the log directory ({config_name})...")
-                config_path = os.path.join(root, "g1_control", "configs", config_name)
-                shutil.copy2(config_path, log_dir)
-
-
-            # Copy the policy into the log directory
-            # self.get_logger().info("Copying the policy to the log directory...")
-            # shutil.copy2(self.policy_wrapper.get_policy_path(), log_dir)
-
-            # Make a file with the log ordering
-            header_path = os.path.join(log_dir, "fields.csv")
-            with open(header_path, "w") as f:
-                f.write("time,observation,action\n")
-
-        # Policy information
-        self.declare_parameter("num_obs", 74)
-        self.num_obs = self.get_parameter("num_obs").get_parameter_value().integer_value
         self.isaac_to_mujoco = {
             0: 0,  # left_hip_pitch
             1: 6,  # right_hip_pitch
@@ -207,6 +161,65 @@ class VelocityTrackingController(ObeliskController, ABC):
         ]
 
         self.num_motors = 21
+
+        # Logging information
+        self.declare_parameter("log", False)
+        self.declare_parameter("log_decimation", 1)
+        self.log = self.get_parameter("log").get_parameter_value().bool_value
+        self.log_decimation = self.get_parameter("log_decimation").get_parameter_value().integer_value
+        self.ctrl_count = 0
+
+        self.start_time = self.get_clock().now().nanoseconds / 1e9
+
+        if self.log:
+            self.get_logger().info(f"Logging enabled. Decimation: {self.log_decimation}.")
+
+            # Create log directory relative to $ROBOT_RL_ROOT
+            root = os.environ.get("ROBOT_RL_ROOT", "")
+
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            log_dir = os.path.join(root, "ctrl_logs", timestamp)
+            os.makedirs(log_dir, exist_ok=True)
+
+            self.log_file = os.path.join(log_dir, "g1_control.csv")
+            self.file = open(self.log_file, "w", buffering=8192)
+            self.writer = csv.writer(self.file)
+            self._lines_written = 0
+            self._file_index = 0
+
+            # Copy the config into the log directory
+            self.declare_parameter("config_name", "")
+            config_name = self.get_parameter("config_name").get_parameter_value().string_value
+            if config_name != "":
+                self.get_logger().info(f"Copying the config to the log directory ({config_name})...")
+                config_path = os.path.join(root, "g1_control", "configs", config_name)
+                shutil.copy2(config_path, log_dir)
+
+
+            # Copy the policy into the log directory
+            # self.get_logger().info("Copying the policy to the log directory...")
+            # shutil.copy2(self.policy_wrapper.get_policy_path(), log_dir)
+
+            # Copy the policy_parameters.yaml files to the log directory
+            for policy, behavior_name in zip(self.behavior_manager.policies, self.behavior_manager.behavior_names):
+                policy_params_path = policy.get_policy_params_path()
+                if os.path.exists(policy_params_path):
+                    dest_name = f"policy_parameters_{behavior_name}.yaml"
+                    shutil.copy2(policy_params_path, os.path.join(log_dir, dest_name))
+                    self.get_logger().info(f"Copied policy parameters for {behavior_name} to log directory.")
+
+            # Make a file with the log ordering (explicit column names for plotting)
+            # Note: pos/vel come from estimator (27 joints), action from policy (21 joints)
+            header_path = os.path.join(log_dir, "fields.csv")
+            with open(header_path, "w") as f:
+                columns = ["time"]
+                columns += ["quat_x", "quat_y", "quat_z", "quat_w"]
+                columns += ["ang_vel_x", "ang_vel_y", "ang_vel_z"]
+                columns += ["cmd_vx", "cmd_vy", "cmd_wz"]
+                columns += [f"pos_{name}" for name in self.full_joint_names]
+                columns += [f"vel_{name}" for name in self.full_joint_names]
+                columns += [f"act_{name}" for name in self.joint_names_mujoco]
+                f.write(",".join(columns) + "\n")
 
         # # Set scales and defaults
         # self.declare_parameter("action_scale", 0.25)
@@ -375,9 +388,18 @@ class VelocityTrackingController(ObeliskController, ABC):
 
             self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
 
-            # Log observation and action
-            # if self.log and self.ctrl_count % self.log_decimation == 0:
-            #     self.log_data(obs, self.action)
+            # Log data
+            if self.log and self.ctrl_count % self.log_decimation == 0:
+                self.log_data({
+                    "time": self.time - self.start_time,
+                    "quaternion": self.qfb[3:7].tolist(),
+                    "angular_velocity": self.vfb_ang.tolist(),
+                    "commanded_velocity": self.cmd_vel.tolist(),
+                    "joint_positions": self.joint_pos.tolist(),
+                    "joint_velocities": self.joint_vel.tolist(),
+                    "action": self.action.tolist(),
+                })
+
 
             t = self.get_clock().now().nanoseconds / 1e9
             self.log_time("loop_period", t - self.loop_rate_time)
@@ -464,10 +486,28 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         return kp, kd
 
-    def log_data(self, obs, action):
-        log_time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
-        obsaction = obs.tolist() + action.tolist()
-        row = [log_time] + obsaction
+    def log_data(self, data: dict):
+        """Log data to CSV file.
+
+        Args:
+            data: Dictionary containing the following keys:
+                - time: Current time
+                - quaternion: Base quaternion (4 values)
+                - angular_velocity: Base angular velocity (3 values)
+                - commanded_velocity: Commanded velocity (3 values)
+                - joint_positions: Joint positions (21 values)
+                - joint_velocities: Joint velocities (21 values)
+                - action: Policy action output (21 values)
+        """
+        row = [
+            data["time"],
+            *data["quaternion"],
+            *data["angular_velocity"],
+            *data["commanded_velocity"],
+            *data["joint_positions"],
+            *data["joint_velocities"],
+            *data["action"],
+        ]
         self.writer.writerow(row)
     
     def log_time(self, key: str, time: float):

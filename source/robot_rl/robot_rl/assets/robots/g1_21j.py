@@ -222,7 +222,7 @@ for a in G1_CFG.actuators.values():
         s = {n: s for n in names}
     for n in names:
         if n in e and n in s and s[n]:
-            G1_ACTION_SCALE[n] = 0.25 * e[n] / s[n]
+            G1_ACTION_SCALE[n] = 0.125 * e[n] / s[n]
 
 G1_MINIMAL_CFG = G1_CFG.copy()
 # G1_MINIMAL_CFG.spawn.usd_path = f"{G1_CUSTOM_DIR}/Robots/Unitree/G1/g1_23dof_minimal.usda"

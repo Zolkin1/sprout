@@ -166,6 +166,8 @@ class Simulation:
 
         success = True
 
+        self.robot.set_pd_gains_from_policy(self.policy)
+
         while self.robot.mj_data.time < total_time:
             # Get observation and compute action
             if self.use_height_sensor:
@@ -223,6 +225,8 @@ class Simulation:
         )
 
         success = True
+
+        self.robot.set_pd_gains_from_policy(self.policy)
 
         with mujoco.viewer.launch_passive(self.robot.mj_model, self.robot.mj_data) as viewer:
             if self.tracking_body_name != "":

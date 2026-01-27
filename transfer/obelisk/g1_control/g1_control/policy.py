@@ -3,6 +3,7 @@ import os
 import numpy as np
 import torch
 import yaml
+import re
 from ament_index_python.packages import get_package_share_directory
 
 class RLPolicy:
@@ -98,6 +99,10 @@ class RLPolicy:
         """Get the policy .pt file path."""
         return self.policy_path
 
+    def get_policy_params_path(self) -> str:
+        """Get the policy parameters YAML file path."""
+        return self.policy_params_path
+
     def get_action(self, obs: torch.Tensor, joint_names_out) -> np.ndarray:
         """Get action from RL Policy"""
         # if torch.cuda.is_available():
@@ -106,7 +111,7 @@ class RLPolicy:
         # else:
         self.action_isaac = self.policy(obs).detach().numpy().squeeze()
 
-        return self.convert_joint_order(self.action_isaac * self.get_action_scale() + self.get_default_joint_angles(),
+        return self.convert_joint_order(self.action_isaac * self.action_scale + self.default_joint_angles,
                                         self.get_joint_names(), joint_names_out)
 
     def reset_last_action(self):
@@ -244,7 +249,7 @@ class RLPolicy:
         """Create the joint position observation.
         Assumes qjoints in isaac order.
         """
-        return qjoints - self.get_default_joint_angles()
+        return qjoints - self.default_joint_angles
 
     def create_joint_vel_obs(self, vjoints: np.ndarray) -> np.ndarray:
         """Create the joint velocity observation.
@@ -300,6 +305,9 @@ class RLPolicy:
         with open(self.policy_params_path, 'r') as f:
             self.policy_params = yaml.safe_load(f)
 
+        self.action_scale = self.get_action_scale()
+        self.default_joint_angles = self.get_default_joint_angles()
+
     def get_num_obs(self) -> int:
         """Get the number of observations from the policy_params file."""
         return self.policy_params['num_obs']
@@ -324,9 +332,33 @@ class RLPolicy:
         """Get the control dt from the policy_params file."""
         return self.policy_params['dt']
 
-    def get_action_scale(self) -> float:
-        """Get the action scale from the policy_params file."""
-        return self.policy_params.get('action_scale', 1.0)
+    def get_action_scale(self) -> np.ndarray:
+        """Get the action scale from the policy_params file.
+
+        Expands wildcard patterns and orders the action scale according to joint_names_isaac.
+
+        Returns:
+            Array of action scale values ordered by joint_names_isaac.
+        """
+        action_scale_dict = self.policy_params.get('action_scale', {})
+        joint_names = self.get_joint_names()
+
+        action_scale = np.zeros(len(joint_names))
+
+        for i, joint_name in enumerate(joint_names):
+            # Find matching pattern
+            matched = False
+            for pattern, scale in action_scale_dict.items():
+                if re.fullmatch(pattern, joint_name):
+                    action_scale[i] = scale
+                    matched = True
+                    break
+
+            if not matched:
+                raise ValueError(f"No action scale pattern matches joint '{joint_name}'")
+
+        return action_scale
+
 
     def get_kp(self, joint_order: list[str]) -> list[float]:
         """Get the kp gains from the policy_params file."""
