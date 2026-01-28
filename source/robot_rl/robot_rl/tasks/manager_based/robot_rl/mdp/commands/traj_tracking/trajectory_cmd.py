@@ -115,6 +115,8 @@ class TrajectoryCommand(CommandTerm):
         )
 
         self.phasing_var = torch.zeros(self.num_envs, device=self.device)
+        self.unmasked_phasing_var = torch.zeros(self.num_envs, device=self.device)
+        self.prev_unmasked_phasing_var = torch.zeros(self.num_envs, device=self.device)
         self.hold_envs = torch.ones(self.num_envs, device=self.device)
 
         self.get_measured_output_time = 0.0
@@ -131,7 +133,9 @@ class TrajectoryCommand(CommandTerm):
             Phasing variable tensor of shape [N].
         """
         prev_phi = self.phasing_var
+        self.prev_unmasked_phasing_var = self.unmasked_phasing_var
         self.phasing_var = self.manager.get_phasing_var(t)
+        self.unmasked_phasing_var = self.phasing_var
 
         # Now hold phi on standing envs
         cmd_vel = self.env.command_manager.get_command("base_velocity")
@@ -364,8 +368,10 @@ class TrajectoryCommand(CommandTerm):
 
         # Note that domains never change for full periodic single domain trajectories, but I think we still want to update the position.
         # The two options are (1) continually updating the position while in contact, (2) try to check based on the phasing variable
-        # TODO: Come back to this to see if this is the best way to do this. For now using option (1)
-        single_dom_mask = self.manager.get_num_domains() == 1
+
+        # So if we are in a standing then update the reference position at the normal stepping cadence
+        single_dom_mask = (self.manager.get_num_domains() == 1) & ((self.prev_unmasked_phasing_var > self.unmasked_phasing_var) |
+                                                                   ((self.prev_unmasked_phasing_var < 0.5) & (0.5 < self.unmasked_phasing_var)))
         changed[single_dom_mask] = True
 
         # Update the list of current domains

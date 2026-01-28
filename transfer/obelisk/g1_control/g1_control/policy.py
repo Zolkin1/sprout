@@ -159,7 +159,7 @@ class RLPolicy:
             self.phi = 0.0
         elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
             self.phi = 0.5
-            
+
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:
@@ -339,13 +339,19 @@ class RLPolicy:
         """Get the action scale from the policy_params file.
 
         Expands wildcard patterns and orders the action scale according to joint_names_isaac.
+        If action_scale is a single scalar, it is applied uniformly to all joints.
 
         Returns:
             Array of action scale values ordered by joint_names_isaac.
         """
-        action_scale_dict = self.policy_params.get('action_scale', {})
+        action_scale_raw = self.policy_params.get('action_scale', {})
         joint_names = self.get_joint_names()
 
+        # Handle scalar action scale (single float applied to all joints)
+        if isinstance(action_scale_raw, (int, float)):
+            return np.full(len(joint_names), action_scale_raw)
+
+        action_scale_dict = action_scale_raw
         action_scale = np.zeros(len(joint_names))
 
         for i, joint_name in enumerate(joint_names):
