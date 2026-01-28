@@ -481,7 +481,9 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5) # TODO: put back: (-0.5, 0.5)
-        self.commands.base_velocity.ranges.heading = (0,0)
+        self.commands.base_velocity.ranges.heading = (-3.14,3.14)
+        self.commands.base_velocity.rel_heading_envs = 0.5
+        self.commands.base_velocity.resampling_time_range = (4.0, 8.0)
 
         self.commands.gait_period = None
 
