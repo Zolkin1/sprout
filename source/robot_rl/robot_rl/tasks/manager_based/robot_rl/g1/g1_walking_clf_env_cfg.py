@@ -442,6 +442,7 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         R_weights = WALKING_R_weights,
         hold_phi_threshold = 0.1,
         heuristic_func=heuristic_modification,
+        phasing_boundaries=4,
     )
 
 ##

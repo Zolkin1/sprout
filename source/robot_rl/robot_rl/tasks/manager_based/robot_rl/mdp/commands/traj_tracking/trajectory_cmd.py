@@ -171,8 +171,8 @@ class TrajectoryCommand(CommandTerm):
         self.boundaries_crossed[crosses_any] += 1
 
         # Lock hold on the second boundary crossing
-        lock_at_zero = crosses_zero & (self.boundaries_crossed >= 2)
-        lock_at_half = crosses_half & (self.boundaries_crossed >= 2)
+        lock_at_zero = crosses_zero & (self.boundaries_crossed >= self.cfg.phasing_boundaries)
+        lock_at_half = crosses_half & (self.boundaries_crossed >= self.cfg.phasing_boundaries)
         self.hold_phi_value[lock_at_zero] = 0.0
         self.hold_phi_value[lock_at_half] = 0.5
 

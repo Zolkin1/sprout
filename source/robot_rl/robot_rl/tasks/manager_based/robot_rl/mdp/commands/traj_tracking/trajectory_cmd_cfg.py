@@ -25,3 +25,4 @@ class TrajectoryCommandCfg(CommandTermCfg):
     random_start_time_max: float = -1
     percent_hold_phi: float = -1
     hold_phi_threshold: float = -1
+    phasing_boundaries: float = 1
