@@ -32,6 +32,11 @@ class RLPolicy:
         self.prev_phi = 0.0
         self.last_zero_time = 0.0
 
+        # State for phasing variable hold logic (hold at second boundary, not first)
+        self.should_hold = False
+        self.boundaries_crossed = 0
+        self.hold_phi_value = -1.0  # -1 means not locked
+
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_folder: str) -> tuple[str, str]:
         """Load policy from Hugging Face with local caching.
 
@@ -147,18 +152,51 @@ class RLPolicy:
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
         vjoints_isaac = self.convert_joint_order(vjoints, joint_names, self.get_joint_names())
 
+        # Compute raw phi from time
         if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
             self.last_zero_time = time + (self.get_total_time()/4)
-
+            
         self.prev_phi = self.phi
-        self.phi = ((time - self.last_zero_time) % self.get_total_time()) / self.get_total_time()
+        raw_phi = ((time - self.last_zero_time) % self.get_total_time()) / self.get_total_time()
 
-        if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
-            self.phi = self.prev_phi
-        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi > self.phi):
-            self.phi = 0.0
-        elif np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi < 0.5 and self.phi > 0.5):
-            self.phi = 0.5
+        # Determine if we should hold
+        prev_should_hold = self.should_hold
+        self.should_hold = np.abs(cmd_vel[0]) < 0.1
+
+        # Reset tracking when newly holding
+        if self.should_hold and not prev_should_hold:
+            self.boundaries_crossed = 0
+            self.hold_phi_value = -1.0
+
+        # Hold at start: if this is the first call and velocity is low, lock at 0.0
+        if self.should_hold and self.prev_phi == 0.0 and self.phi == 0.0:
+            self.hold_phi_value = 0.0
+
+        # Release hold when no longer should hold
+        if not self.should_hold:
+            self.hold_phi_value = -1.0
+            self.boundaries_crossed = 0
+
+        # Detect boundary crossings (only if should hold and not locked yet)
+        if self.should_hold and self.hold_phi_value < 0:
+            crosses_zero = (raw_phi < self.prev_phi) and (self.prev_phi > 0)
+            crosses_half = (self.prev_phi < 0.5) and (raw_phi >= 0.5)
+
+            if crosses_zero or crosses_half:
+                self.boundaries_crossed += 1
+
+            # Lock hold on second boundary crossing
+            if self.boundaries_crossed >= 3:
+                if crosses_zero:
+                    self.hold_phi_value = 0.0
+                elif crosses_half:
+                    self.hold_phi_value = 0.5
+
+        # Apply hold or use raw phi
+        if self.hold_phi_value >= 0:
+            self.phi = self.hold_phi_value
+        else:
+            self.phi = raw_phi
 
         # Create the observation
         obs_idx = 0
