@@ -119,12 +119,20 @@ class TrajectoryCommand(CommandTerm):
         self.prev_unmasked_phasing_var = torch.zeros(self.num_envs, device=self.device)
         self.hold_envs = torch.ones(self.num_envs, device=self.device)
 
+        # State for phasing variable hold logic (hold at second boundary, not first)
+        self.should_hold = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.boundaries_crossed = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
+        self.hold_phi_value = -1.0 * torch.ones(self.num_envs, device=self.device)  # -1 means not locked
+
         self.get_measured_output_time = 0.0
         self.get_desired_output_time = 0.0
         self.vdot_time = 0.0
 
     def update_phasing_var(self, t: torch.Tensor):
         """Get the phasing variable for the current trajectory.
+
+        Holds phi at the second boundary crossing (0.0 or 0.5) rather than the first,
+        allowing a full phase to complete before stopping when velocity is low.
 
         Args:
             t: Time tensor of shape [N].
@@ -137,17 +145,40 @@ class TrajectoryCommand(CommandTerm):
         self.phasing_var = self.manager.get_phasing_var(t)
         self.unmasked_phasing_var = self.phasing_var
 
-        # Now hold phi on standing envs
+        # Determine which envs should hold
         cmd_vel = self.env.command_manager.get_command("base_velocity")
+        prev_should_hold = self.should_hold.clone()
         self.should_hold = torch.abs(cmd_vel[:, 0]) < self.cfg.hold_phi_threshold
 
-        mask = torch.logical_or((self.phasing_var < prev_phi), prev_phi == 0.0)
-        mask = torch.logical_and(mask, self.should_hold)
-        self.phasing_var[mask] *= 0
+        # Reset tracking on newly holding envs or episode resets
+        newly_holding = self.should_hold & ~prev_should_hold
+        reset_mask = newly_holding | (self.env.episode_length_buf == 0)
+        self.boundaries_crossed[reset_mask] = 0
+        self.hold_phi_value[reset_mask] = -1.0
 
-        mask = ((prev_phi < 0.5) & (self.phasing_var > 0.5)) | (prev_phi == 0.5)
-        mask = torch.logical_and(mask, self.should_hold)
-        self.phasing_var[mask] = 0.5
+        # Release hold when no longer should hold
+        released = ~self.should_hold
+        self.hold_phi_value[released] = -1.0
+        self.boundaries_crossed[released] = 0
+
+        # Detect boundary crossings (only for envs that should hold but aren't locked yet)
+        active = self.should_hold & (self.hold_phi_value < 0)
+
+        crosses_zero = active & (self.phasing_var < prev_phi) & (prev_phi > 0)
+        crosses_half = active & (prev_phi < 0.5) & (self.phasing_var >= 0.5)
+
+        crosses_any = crosses_zero | crosses_half
+        self.boundaries_crossed[crosses_any] += 1
+
+        # Lock hold on the second boundary crossing
+        lock_at_zero = crosses_zero & (self.boundaries_crossed >= 2)
+        lock_at_half = crosses_half & (self.boundaries_crossed >= 2)
+        self.hold_phi_value[lock_at_zero] = 0.0
+        self.hold_phi_value[lock_at_half] = 0.5
+
+        # Apply hold for all locked envs
+        holding = self.hold_phi_value >= 0
+        self.phasing_var[holding] = self.hold_phi_value[holding]
 
         return self.phasing_var
 
