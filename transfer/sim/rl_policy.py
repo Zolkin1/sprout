@@ -98,7 +98,7 @@ class RLPolicy:
                 self.boundaries_crossed += 1
 
             # Lock hold on second boundary crossing
-            if self.boundaries_crossed >= 3:
+            if self.boundaries_crossed >= 4:
                 if crosses_zero:
                     self.hold_phi_value = 0.0
                 elif crosses_half:

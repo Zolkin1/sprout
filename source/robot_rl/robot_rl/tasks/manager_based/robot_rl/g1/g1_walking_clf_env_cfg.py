@@ -480,7 +480,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5) # TODO: put back: (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-3.14,3.14)
         self.commands.base_velocity.rel_heading_envs = 0.5
         self.commands.base_velocity.resampling_time_range = (4.0, 8.0)
@@ -502,6 +502,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         self.events.add_base_mass.params["operation"] = "scale"
 
         self.events.base_com.params["asset_cfg"].body_names = ["waist_yaw_link"]
+        self.events.base_com.params["com_range"] = {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)}
 
         # self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
 
@@ -528,7 +529,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
 
         self.rewards.clf_reward.params = {
             "command_name": "traj_ref",
-            "max_eta_err": 0.15, #0.25,
+            "max_eta_err": 0.2, #0.15, #0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "traj_ref",
@@ -622,7 +623,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0) #(0.75, 1.0)  # Allow full range
         self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 
         # self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
         # self.events.reset_base.params["pose_range"]["x"] = (-3,3)

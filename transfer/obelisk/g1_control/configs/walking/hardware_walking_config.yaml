@@ -8,7 +8,8 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "walking_clf_sym/2026-01-27_07-40-51_walking_small_scale_new_gait_less_cmd_sym",
+          "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"  # Best hardware walking policy so far
+          #          "walking_clf_sym/2026-01-27_07-40-51_walking_small_scale_new_gait_less_cmd_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
