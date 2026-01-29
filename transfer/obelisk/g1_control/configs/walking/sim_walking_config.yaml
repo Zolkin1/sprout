@@ -8,7 +8,7 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "walking_clf_sym/2026-01-27_18-35-19_T4_walking_4_crosses_higher_eta_sym",
+          "walking_clf_sym/2026-01-28_11-49-24_T6_walking_higher_cmd_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -54,8 +54,8 @@ onboard:
       params:
         v_x_min: -1.0
         v_x_max: 1.0
-        v_y_max: 0.2
-        w_z_max: 0.5
+        v_y_max: 0.0
+        w_z_max: 1.0
         vel_increment: 0.1
         kp_yaw: 3.0
         kd_yaw: 0.1
@@ -102,7 +102,7 @@ onboard:
       params:
         v_x_scale: 1.0
         v_y_scale: 0.2
-        w_z_scale: 0.5
+        w_z_scale: 1.0
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:
