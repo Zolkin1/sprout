@@ -58,7 +58,7 @@ To play the most recently trained policy for a given task run:
 python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --headless
 ```
 
-for a speicifc run you can pass in additional config such as `--load_run=<run_dir>`
+for a specific run you can pass in additional config such as `--load_run=<run_dir>`
 If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<checkpoint>` (`<checkpoint>` is something like "model_1800").
 
 For both `train` and `play` you can also specify a number of envs with `--num_envs=###`.
@@ -80,16 +80,20 @@ These policies are automatically downloaded in the `transfer/obelisk` controller
 
 RL Task list:
 
-| Env. Type     |   Robot    |  Hardware Tested?  | Description                                                      |
-|---------------|:----------:|:------------------:|------------------------------------------------------------------|
-| `vanilla`     |     G1     | :white_check_mark: | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground. |
-| `lip_clf`     |     G1     | :white_check_mark: | Basic, LIP CLF RL walking on the G1 humanoid on flat ground. |
-| `walking_clf` |     G1     | :white_check_mark: | with more torso mass; A HZD gait library; CLF RL walking on the G1 humanoid on flat ground. |
-| `running_clf` | G1 | :white_check_mark: | Running controller using a gait library. |
+| Env. Type             |   Robot    |      Hardware Tested?      | Description                                                                          |
+|-----------------------|:----------:|:--------------------------:|--------------------------------------------------------------------------------------|
+| `vanilla`             |     G1     |     :white_check_mark:     | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground.                     |
+| `lip_clf`             |     G1     |     :white_check_mark:     | Basic, LIP CLF RL walking on the G1 humanoid on flat ground.                         |
+| `walking_clf`         |     G1     |             No             | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground.                |
+| `walking_clf_sym`     |     G1     |     :white_check_mark:     | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground, uses symmetry. |
+| `running_clf`         | G1 |     :white_check_mark:     | Running controller using a gait library.                                             |
+| `waving_clf`          | G1 |             No             | Robot stands still and waves. Uses trajectories and CLFs.                            |
+| `bow_forward_clf_sym` | G1 |     :white_check_mark:     | Robot bows forward then holds its position. Uses symmetry.                           |
+| `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
 
-## Copying checkpoitns from remote server 
+## Copying checkpoints from remote server 
 First mount the server to your local desktop
  
 ```

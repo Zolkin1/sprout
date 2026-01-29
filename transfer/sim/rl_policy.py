@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,15 @@ class RLPolicy:
         self._load_policy_params()
 
         self.action_isaac = np.zeros(self.get_num_actions())
+
+        self.phi = 0.0
+        self.prev_phi = 0.0
+        self.last_zero_time = 0.0
+
+        # State for phasing variable hold logic (hold at second boundary, not first)
+        self.should_hold = False
+        self.boundaries_crossed = 0
+        self.hold_phi_value = -1.0  # -1 means not locked
 
     def load(self):
         """Load RL Policy"""
@@ -54,6 +64,54 @@ class RLPolicy:
         qjoints_isaac = self.convert_joint_order(qjoints, joint_names, self.get_joint_names())
         vjoints_isaac = self.convert_joint_order(vjoints, joint_names, self.get_joint_names())
 
+        # Compute raw phi from time
+        if np.abs(cmd_vel[0]) < 0.1 and (self.prev_phi == 0.0 or self.prev_phi == 0.5):
+            self.last_zero_time = time + (self.get_total_time() / 4)
+
+        self.prev_phi = self.phi
+        raw_phi = ((time - self.last_zero_time) % self.get_total_time()) / self.get_total_time()
+
+        # Determine if we should hold
+        prev_should_hold = self.should_hold
+        self.should_hold = np.abs(cmd_vel[0]) < 0.1
+
+        # Reset tracking when newly holding
+        if self.should_hold and not prev_should_hold:
+            self.boundaries_crossed = 0
+            self.hold_phi_value = -1.0
+
+        # Hold at start: if this is the first call and velocity is low, lock at 0.0
+        if self.should_hold and self.prev_phi == 0.0 and self.phi == 0.0:
+            self.hold_phi_value = 0.0
+
+        # Release hold when no longer should hold
+        if not self.should_hold:
+            self.hold_phi_value = -1.0
+            self.boundaries_crossed = 0
+
+        # Detect boundary crossings (only if should hold and not locked yet)
+        if self.should_hold and self.hold_phi_value < 0:
+            crosses_zero = (raw_phi < self.prev_phi) and (self.prev_phi > 0)
+            crosses_half = (self.prev_phi < 0.5) and (raw_phi >= 0.5)
+
+            if crosses_zero or crosses_half:
+                self.boundaries_crossed += 1
+
+            # Lock hold on second boundary crossing
+            if self.boundaries_crossed >= 4:
+                if crosses_zero:
+                    self.hold_phi_value = 0.0
+                elif crosses_half:
+                    self.hold_phi_value = 0.5
+
+        # Apply hold or use raw phi
+        if self.hold_phi_value >= 0:
+            self.phi = self.hold_phi_value
+        else:
+            self.phi = raw_phi
+
+        print(f"phi: {self.phi}")
+
         # Create the observation
         obs_idx = 0
         for term, shape, scale in obs_terms:
@@ -76,16 +134,34 @@ class RLPolicy:
                 obs_np[obs_idx:obs_idx+shape] = self.create_action_obs() * scale
                 obs_idx += shape
             elif term == "sin_phase":
-                if np.linalg.norm(cmd_vel) > 0.01:
-                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(time) * scale
+                if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_sin_phase_obs(self.phi, 1.0) #time, 1.0/(self.get_total_time())) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                elif self.get_skill_type() == "episodic":
+                    phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    # phi = 0
+                    obs_np[obs_idx:obs_idx + shape] = self.create_sin_phase_obs(phi, 1.0) * scale
                 else:
-                    obs_np[obs_idx:obs_idx+shape] = 0 * scale
+                    raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
+
                 obs_idx += shape
+
             elif term == "cos_phase":
-                if np.linalg.norm(cmd_vel) > 0.01:
-                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(time) * scale
+                if self.get_skill_type() == "periodic" or self.get_skill_type() == "half_periodic":
+                    # if np.linalg.norm(cmd_vel) > 0.1:
+                    obs_np[obs_idx:obs_idx+shape] = self.create_cos_phase_obs(self.phi, 1.0) #time, 1.0/(self.get_total_time())) * scale
+                    # else:
+                    #     obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                elif self.get_skill_type() == "episodic":
+                    phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
+                    # phi = 0
+                    print(f"phi: {phi}, time: {time}")
+                    obs_np[obs_idx:obs_idx + shape] = self.create_cos_phase_obs(phi, 1.0) * scale
+                    print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
                 else:
-                    obs_np[obs_idx:obs_idx+shape] = 1 * scale
+                    raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape
             else:
                 raise NotImplementedError("Observation term not implemented yet!")
@@ -100,7 +176,7 @@ class RLPolicy:
         else:
             self.action_isaac = self.policy(obs).detach().numpy().squeeze()
 
-        return self.convert_joint_order(self.action_isaac * self.get_action_scale() + self.get_default_joint_angles(),
+        return self.convert_joint_order(self.action_isaac * self.action_scale + self.default_joint_angles,
                                         self.get_joint_names(), joint_names_out)
 
     ##
@@ -130,13 +206,15 @@ class RLPolicy:
         clipped_cmd[1] = np.clip(cmd_vel[1], vel_ranges['v_y_min'], vel_ranges['v_y_max'])
         clipped_cmd[2] = np.clip(cmd_vel[2], vel_ranges['w_z_min'], vel_ranges['w_z_max'])
 
+        print(f"clipped_cmd: {clipped_cmd}")
+
         return clipped_cmd
 
     def create_joint_pos_obs(self, qjoints: np.ndarray) -> np.ndarray:
         """Create the joint position observation.
         Assumes qjoints in isaac order.
         """
-        return qjoints - self.get_default_joint_angles()
+        return qjoints - self.default_joint_angles
 
     def create_joint_vel_obs(self, vjoints: np.ndarray) -> np.ndarray:
         """Create the joint velocity observation.
@@ -148,13 +226,13 @@ class RLPolicy:
         """Create the action observation."""
         return self.action_isaac
 
-    def create_sin_phase_obs(self, time: float) -> np.ndarray:
+    def create_sin_phase_obs(self, time: float, freq: float) -> np.ndarray:
         """Create the sinusoidal phase observation."""
-        return np.sin(2 * np.pi * time / self.get_gait_period_range()[0])
+        return np.sin(2 * np.pi * time * freq)
 
-    def create_cos_phase_obs(self, time: float) -> np.ndarray:
+    def create_cos_phase_obs(self, time: float, freq: float) -> np.ndarray:
         """Create the cosine phase observation."""
-        return np.cos(2 * np.pi * time / self.get_gait_period_range()[0])
+        return np.cos(2 * np.pi * time * freq)
 
     ##
     # Joint Conversions
@@ -192,6 +270,9 @@ class RLPolicy:
         with open(self.policy_params_path, 'r') as f:
             self.policy_params = yaml.safe_load(f)
 
+        self.action_scale = self.get_action_scale()
+        self.default_joint_angles = self.get_default_joint_angles()
+
     def get_num_obs(self) -> int:
         """Get the number of observations from the policy_params file."""
         return self.policy_params['num_obs']
@@ -216,9 +297,33 @@ class RLPolicy:
         """Get the control dt from the policy_params file."""
         return self.policy_params['dt']
 
-    def get_action_scale(self) -> float:
-        """Get the action scale from the policy_params file."""
-        return self.policy_params.get('action_scale', 1.0)
+    def get_action_scale(self) -> np.ndarray:
+        """Get the action scale from the policy_params file.
+
+        Expands wildcard patterns and orders the action scale according to joint_names_isaac.
+
+        Returns:
+            Array of action scale values ordered by joint_names_isaac.
+        """
+        action_scale_dict = self.policy_params.get('action_scale', {})
+        joint_names = self.get_joint_names()
+
+        action_scale = np.zeros(len(joint_names))
+
+        for i, joint_name in enumerate(joint_names):
+            # Find matching pattern
+            matched = False
+            for pattern, scale in action_scale_dict.items():
+                if re.fullmatch(pattern, joint_name):
+                    action_scale[i] = scale
+                    matched = True
+                    break
+
+            if not matched:
+                raise ValueError(f"No action scale pattern matches joint '{joint_name}'")
+
+        return action_scale
+
 
     def get_kp(self) -> list[float]:
         """Get the kp gains from the policy_params file."""
@@ -260,3 +365,21 @@ class RLPolicy:
             term_info = self.policy_params['observation_terms']['policy'].get(term_name, {})
             return term_info.get('scale')
         return None
+
+    def get_skill_type(self):
+        """Get the skill type: episodic, periodic, half_periodic."""
+        skill_type = self.policy_params['skill_type']
+
+        if skill_type is not None:
+            return skill_type
+        else:
+            return None
+
+    def get_total_time(self) -> float:
+        """Get the total time from the policy_params file."""
+        total_time = self.policy_params['total_time']
+
+        if total_time is not None:
+            return total_time
+        else:
+            return None

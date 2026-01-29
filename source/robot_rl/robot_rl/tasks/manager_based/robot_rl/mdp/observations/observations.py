@@ -18,7 +18,6 @@ def contact_state(env: ManagerBasedRLEnv, sensor_cfg, threshold: float = 50.0) -
     #reshape from num_env, num_bodies, 3 to num_env, num_bodies*3
     return contact_flag.reshape(env.num_envs, -1)
 
-
 def foot_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     left_foot_vel = cmd.robot.data.body_lin_vel_w[:,cmd.feet_bodies_idx[0],:]
@@ -39,29 +38,19 @@ def foot_ang_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
 
 def ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    ref_traj = cmd.y_out.clone()
-    ref_traj[:,8] *= 50.0
+    ref_traj = cmd.y_des.clone()
+    # ref_traj[:,8] *= 50.0       # TODO: What is this?
     return ref_traj
 
 def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
     act_traj = cmd.y_act.clone()
-    act_traj[:,8] *= 50.0
+    # act_traj[:,8] *= 50.0   # TODO: What is this?
     return act_traj
-
-# def foot_ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     ref_traj = cmd.y_out[:,8]
-#     return ref_traj.unsqueeze(-1)
-
-# def foot_act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-#     cmd = env.command_manager.get_term(command_name)
-#     act_traj = cmd.y_act[:,8]
-#     return act_traj.unsqueeze(-1)
 
 def ref_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
-    ref_traj_vel = cmd.dy_out
+    ref_traj_vel = cmd.dy_des
     return ref_traj_vel
 
 def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
@@ -69,19 +58,25 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
+def traj_error(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """
+    Make an observation using the error to the trajectory.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    ref_traj_vel = cmd.dy_des
+    act_traj_vel = cmd.dy_act
+
+    act_traj = cmd.y_act.clone()
+    ref_traj = cmd.y_des.clone()
+
+    traj_error = torch.cat([act_traj - ref_traj, act_traj_vel - ref_traj_vel], dim=-1)
+    return traj_error
 
 
 def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
 
-    # Get the commanded vel
-    commanded_velocity = env.command_manager.get_command("base_velocity")
-
-    phase = 2*torch.pi * cmd.gait_cycle_prop
-
-    # Zero the phase if we are standing (check all environments)
-    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
-    phase[standing_mask] = 0
+    phase = 2*torch.pi * cmd.get_phasing_var()
 
     sphase = torch.sin(phase)
     if sphase.ndim == 1:
@@ -93,14 +88,7 @@ def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
 def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     cmd = env.command_manager.get_term(command_name)
 
-    # Get the commanded vel
-    commanded_velocity = env.command_manager.get_command("base_velocity")
-
-    phase = 2*torch.pi * cmd.gait_cycle_prop
-
-    # Zero the phase if we are standing (check all environments)
-    standing_mask = torch.norm(commanded_velocity, dim=1) < 0.05
-    phase[standing_mask] = 0
+    phase = 2*torch.pi * cmd.get_phasing_var()
 
     cphase = torch.cos(phase)
     if cphase.ndim == 1:
@@ -147,3 +135,50 @@ def domain_flag(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
     domain[standing] = 2
 
     return domain.unsqueeze(-1)
+
+def multiskill_phase(env: ManagerBasedRLEnv, command_name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create a number of phasing variables at different frequencies to cover a range.
+    """
+
+    frequencies = torch.tensor([0.01, 0.1, 1, 10, 100], device=env.device)   # Hz
+    num_freq = len(frequencies)
+
+    cmd = env.command_manager.get_term(command_name)
+
+    t = env.episode_length_buf * env.step_dt
+
+    episodic = cmd.is_episodic()
+    phasing_var = cmd.get_phasing_var()
+
+    sp = torch.zeros(env.num_envs, num_freq, device=env.device)
+    cp = torch.zeros(env.num_envs, num_freq, device=env.device)
+
+    for i in range(num_freq):
+        sp[:, i] = torch.sin(2 * torch.pi * frequencies[i] * t)
+        cp[:, i] = torch.cos(2 * torch.pi * frequencies[i] * t)
+
+        # Overwrite the episodic envs to go from phase 0 to 1
+        sp[episodic, i] = torch.sin(2 * torch.pi * phasing_var[episodic])
+        cp[episodic, i] = torch.cos(2 * torch.pi * phasing_var[episodic])
+
+    return sp, cp
+
+def skill_selector(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """
+    Passes an encoding of the skill currently in use.
+
+    For now, we will use a 1 hot encoding.
+    """
+    # TODO: Check/test function
+
+    encoding = {"locomotion": 0, "bow_forward": 1}
+
+    cmd = env.command_manager.get_term(command_name)
+
+    skill_encoding = torch.zeros(env.num_envs, device=env.device)
+
+    for i in cmd.manager.traj_names:
+        skill_encoding[cmd.manager.manager_indices[i]] = encoding[cmd.manager.traj_names[i]]
+
+    return skill_encoding

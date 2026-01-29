@@ -104,7 +104,7 @@ def clf_curriculum(
             clf_cfg.params["max_eta_err"] = clf_max_eta_err
             env.reward_manager.set_term_cfg("clf_reward", clf_cfg)
 
-    return new_max_eta_err
+    return clf_max_eta_err
 
 def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float,
                        update_interval: int = 100) -> float:

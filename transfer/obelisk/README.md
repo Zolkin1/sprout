@@ -32,7 +32,29 @@ We recommend using VSCode's devcontainer feature to run the Docker environment.
    - GPU-based (recommended for better performance)
    - No-GPU (if GPU is not available)
 
+## Pushing and Pulling from a Registry - DOES NOT WORK RIGHT NOW
+Login to your registry of choice (for now I am using github packages).
+(i.e. `docker login ghcr.io -u YOUR_GITHUB_USERNAME`)
+
+To push:
+```
+docker compose -f <compose_file>.yml build
+```
+then
+```
+docker compose -f <compose_file>.yml push
+```
+
+To pull (i.e. on the on-board computer):
+```
+docker pull ghcr.io/github_username/robot-rl-obk:no-gpu-latest```
+
+```
+docker compose -f <compose_file>.yaml up
+```
+
 # Quick start
+TODO: NOTE THE TWO STARTUP SCRIPTS ARE CAUSING ISSUES
 ```
 source scripts/build.sh
 bash scripts/joystick.sh
@@ -76,28 +98,38 @@ source install/setup.bash
 
 Then finally we can run the stack in sim:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device=onboard bag=false
 ```
 
 ## Different Configs/Policies
 LIP:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device=onboard bag=false
 ```
 
 HZD:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device=onboard bag=false
 ```
 
 Baseline:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device=onboard bag=false
 ```
 
 Running:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device=onboard bag=false
+```
+
+Bow Forward:
+```
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/bow_forward/bow_forward_config.yaml device=onboard bag=false
+```
+
+Multi-behavior:
+```
+obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/multi-behavior/sim_multi-behavior_config.yaml device=onboard bag=false
 ```
 
 <!-- HZD with optitrack logging:
@@ -117,15 +149,17 @@ obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.ya
 ```
 
 The robot interface in Obelisk has a statemachine that we need to "navigate" to enter into low level control mode.
-For the G1, we will follow this diagram:
+For the G1, we will follow this diagram (can get to L1 by holding down Left Bumper, see Obelisk docs for more info):
 
 ```
-     dpad right          squares            dpad down
+    Left Trigger        L1 DPAD Left       L1 DPAD down
 init ----------> damping -------> user_pose ---------> low_level_ctrl
 ```
 At `user_pose`, the robot will snap to the default position specified by `user_pose` in `hardware_config.yaml` and hold that.
 
 At `low_level_ctrl`, the output from the controller node will be applied to robot.
+
+E-STOP is right trigger.
 
 # Setting up the Xbox remote
 You can now run the script:
@@ -165,6 +199,10 @@ To dettach from a tmux session
 
 To reattach to a tmux session
 ```tmux attach -t <id>```
+
+If you want to build the container with no cache:
+```docker compose -f docker-compose-no-gpu.yml build --no-cache```
+
 To create and start the container, run the following command:
 ```docker compose -f docker-compose-no-gpu.yml up ```
 Note this would also build the container if necessary.
@@ -198,6 +236,24 @@ python plot_ctrl.py
 
 You can also use `--start-time` and `--end-time` to specify and start and end time.
 
+## Setting the IP setting through the terminal
+
+Check the names:
+```
+nmcli con show
+```
+
+To set it to manual:
+```
+nmcli con mod "Wired connection 1" ipv4.addresses 192.168.123.222/24 ipv4.method manual
+nmcli con up "Wired connection 1"
+```
+
+To set to automatic:
+```
+nmcli con mod "Wired connection 1" ipv4.method auto ipv4.addresses ""
+nmcli con up "Wired connection 1"
+```
 
 # Using Optitrack
 We are using the natnet driver located [here](https://github.com/L2S-lab/natnet_ros2). In the docker it is installed to /home/{USER}.

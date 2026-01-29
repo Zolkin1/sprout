@@ -1,5 +1,6 @@
+import torch
 from isaaclab.utils import configclass
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
+# from robot_rl.tasks.manager_based.robot_rl.mdp.commands.clf_cmd.hzd_cfg import GaitLibraryHZDCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
 # from robot_rl.tasks.manager_based.robot_rl.g1.g1_flat_env_hzd_cfg import G1FlatHZDEnvCfg
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,
@@ -13,54 +14,410 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FO
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
-from robot_rl.assets.robots.g1_21j import G1_MINIMAL_CFG  # isort: skip
+from robot_rl.assets.robots.g1_21j import (G1_MINIMAL_CFG, G1_ACTION_SCALE,)  # isort: skip
 import math
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
+
+from .g1_bow_forward_clf_env_cfg import BOWING_Q_weights
+from .g1_trajopt_obs import G1TrajOptObservationsCfg
+from .g1_trajopt_reward import G1TrajOptCLFRewards
 
 ##
 # Lyapunov Weights
 ##
-WALKING_Q_weights = [
-    25.0,   250.0,      # com_x pos, vel
-    500.0,   20.0,      # com_y pos, vel
-    650.0,   10.0,      # com_z pos, vel
-    300.0,    20.0,     # pelvis_roll pos, vel
-    250.0,    10.0,     # pelvis_pitch pos, vel
-    300.0,    30.0,     # pelvis_yaw pos, vel
-    1500.0, 50.0,       # swing_x pos, vel
-    1500.0,  50.0,      # swing_y pos, vel
-    2500.0, 50.0,       # swing_z pos, vel
-    30.0,    1.0,       # swing_ori_roll pos, vel
-    150.0,    1.0,       # swing_ori_pitch pos, vel
-    400.0,    10.0,     # swing_ori_yaw pos, vel
-    1500.0, 50.0,       # stance_x pos, vel
-    1500.0,  50.0,      # stance_y pos, vel
-    2500.0, 50.0,       # stance_z pos, vel
-    30.0,    1.0,       # stance_ori_roll pos, vel
-    150.0,    1.0,       # stance_ori_pitch pos, vel
-    400.0,    10.0,     # swing_ori_yaw pos, vel
-    100.0,    1.0,      # waist_yaw pos, vel
-    40.0,1.0, #left shoulder pitch
-    40.0,1.0, #left shoulder roll
-    50.0,1.0, #left shoulder yaw
-    30.0,1.0, #left elbow
-    40.0,1.0, #right shoulder pitch
-    40.0,1.0, #right shoulder roll
-    50.0,1.0, #right shoulder yaw
-    30.0,1.0, #right elbow
-]
+WALKING_Q_weights = {}
+WALKING_Q_weights["com:pos_x"] = [25.0, 250.0]
+WALKING_Q_weights["com:pos_y"] = [500.0, 20.0]
+WALKING_Q_weights["com:pos_z"] = [250.0, 10.0]
+
+WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [1500.0, 50.0]
+WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [1500.0, 50.0]
+WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [1500.0, 50.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [30.0, 1.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [50.0, 1.0]
+WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [400.0, 10.0]
+
+WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [1500.0, 50.0]
+WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [1500.0, 50.0]
+WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [1500.0, 50.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [30.0, 1.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [50.0, 1.0]
+WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [400.0, 10.0]
+
+WALKING_Q_weights["joint:left_hip_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_hip_pitch_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_hip_yaw_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_knee_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_ankle_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_ankle_pitch_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_hip_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_hip_pitch_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_hip_yaw_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_knee_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_ankle_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_ankle_pitch_joint"] = [50.0, 1.0]
+
+WALKING_Q_weights["pelvis_link:pos_x"] = [25.0, 250.0]
+WALKING_Q_weights["pelvis_link:pos_y"] = [500.0, 20.0]
+WALKING_Q_weights["pelvis_link:pos_z"] = [250.0, 10.0]
+WALKING_Q_weights["pelvis_link:ori_x"] = [300.0, 20.0]
+WALKING_Q_weights["pelvis_link:ori_y"] = [250.0, 10.0]
+WALKING_Q_weights["pelvis_link:ori_z"] = [300.0, 30.0]
+
+WALKING_Q_weights["joint:waist_yaw_joint"] = [100.0, 1.0]
+WALKING_Q_weights["joint:left_elbow_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_elbow_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [50.0, 1.0]
+WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [50.0, 1.0]
+
+WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [50.0, 1.0]
+WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [50.0, 1.0]
+WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [50.0, 1.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [15.0, 1.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [15.0, 1.0]
+WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [15.0, 1.0]
+
+WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [50.0, 1.0]
+WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [50.0, 1.0]
+WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [50.0, 1.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [15.0, 1.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [15.0, 1.0]
+WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [15.0, 1.0]
+
+# WALKING_Q_weights["com:pos_x"] = [5.0, 10.0] # TODO: Try making the vel higher
+# WALKING_Q_weights["com:pos_y"] = [5.0, 2.0]
+# WALKING_Q_weights["com:pos_z"] = [5.0, 1.0]
+
+# WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [15.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [15.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [15.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [10.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [10.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [10.0, 2.0]
+
+# WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [15.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [15.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [15.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [10.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [10.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [10.0, 2.0]
+
+# WALKING_Q_weights["joint:left_hip_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_hip_pitch_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_hip_yaw_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_knee_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_ankle_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_ankle_pitch_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_hip_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_hip_pitch_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_hip_yaw_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_knee_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_ankle_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_ankle_pitch_joint"] = [4.0, 1.0]
+
+# WALKING_Q_weights["pelvis_link:pos_x"] = [5.0, 1.0]
+# WALKING_Q_weights["pelvis_link:pos_y"] = [5.0, 1.0]
+# WALKING_Q_weights["pelvis_link:pos_z"] = [5.0, 1.0]
+# WALKING_Q_weights["pelvis_link:ori_x"] = [15.0, 3.0]
+# WALKING_Q_weights["pelvis_link:ori_y"] = [15.0, 3.0]
+# WALKING_Q_weights["pelvis_link:ori_z"] = [15.0, 3.0]
+
+# WALKING_Q_weights["joint:waist_yaw_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_elbow_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_elbow_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [4.0, 1.0]
+# WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [4.0, 1.0]
+
+# WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+
+# WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [10.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [10.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [10.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [10.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [10.0, 2.0]
+
+# WALKING_Q_weights["com:pos_x"] = [0.1, 10.0]
+# WALKING_Q_weights["com:pos_y"] = [2.0, 0.8]
+# WALKING_Q_weights["com:pos_z"] = [1.0, 0.4]
+#
+# WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [6.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [6.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["left_ankle_roll_link:ori_x"] = [0.12, 0.04]
+# WALKING_Q_weights["left_ankle_roll_link:ori_y"] = [0.6, 0.04]
+# WALKING_Q_weights["left_ankle_roll_link:ori_z"] = [1.6, 0.4]
+#
+# WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [6.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [6.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [10.0, 2.0]
+# WALKING_Q_weights["right_ankle_roll_link:ori_x"] = [0.12, 0.04]
+# WALKING_Q_weights["right_ankle_roll_link:ori_y"] = [0.6, 0.04]
+# WALKING_Q_weights["right_ankle_roll_link:ori_z"] = [1.6, 0.4]
+#
+# WALKING_Q_weights["pelvis_link:pos_x"] = [0.1, 10.0]
+# WALKING_Q_weights["pelvis_link:pos_y"] = [2.0, 0.8]
+# WALKING_Q_weights["pelvis_link:pos_z"] = [1.0, 0.4]
+# WALKING_Q_weights["pelvis_link:ori_x"] = [1.2, 0.8]
+# WALKING_Q_weights["pelvis_link:ori_y"] = [1.0, 0.4]
+# WALKING_Q_weights["pelvis_link:ori_z"] = [1.2, 1.2]
+#
+# WALKING_Q_weights["joint:waist_yaw_joint"] = [0.4, 0.04]
+# WALKING_Q_weights["joint:left_elbow_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_pitch_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_roll_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:left_shoulder_yaw_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_elbow_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [0.2, 0.04]
+# WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [0.2, 0.04]
+#
+# WALKING_Q_weights["right_wrist_yaw_link:pos_x"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_y"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:pos_z"] = [2.0, 2.0]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_x"] = [0.6, 0.4]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_y"] = [0.6, 0.4]
+# WALKING_Q_weights["right_wrist_yaw_link:ori_z"] = [0.6, 0.4]
+#
+# WALKING_Q_weights["left_wrist_yaw_link:pos_x"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_y"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:pos_z"] = [2.0, 2.0]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [0.6, 0.4]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [0.6, 0.4]
+# WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [0.6, 0.4]
+
+WALKING_R_weights = {}
+WALKING_R_weights["com:pos_x"] = [0.1]
+WALKING_R_weights["com:pos_y"] = [0.1]
+WALKING_R_weights["com:pos_z"] = [0.1]
+
+WALKING_R_weights["left_ankle_roll_link:pos_x"] = [0.05]
+WALKING_R_weights["left_ankle_roll_link:pos_y"] = [0.05]
+WALKING_R_weights["left_ankle_roll_link:pos_z"] = [0.05]
+WALKING_R_weights["left_ankle_roll_link:ori_x"] = [0.02]
+WALKING_R_weights["left_ankle_roll_link:ori_y"] = [0.02]
+WALKING_R_weights["left_ankle_roll_link:ori_z"] = [0.02]
+
+WALKING_R_weights["right_ankle_roll_link:pos_x"] = [0.05]
+WALKING_R_weights["right_ankle_roll_link:pos_y"] = [0.05]
+WALKING_R_weights["right_ankle_roll_link:pos_z"] = [0.05]
+WALKING_R_weights["right_ankle_roll_link:ori_x"] = [0.02]
+WALKING_R_weights["right_ankle_roll_link:ori_y"] = [0.02]
+WALKING_R_weights["right_ankle_roll_link:ori_z"] = [0.02]
+
+WALKING_R_weights["joint:left_hip_roll_joint"] = [0.01]
+WALKING_R_weights["joint:left_hip_pitch_joint"] = [0.01]
+WALKING_R_weights["joint:left_hip_yaw_joint"] = [0.01]
+WALKING_R_weights["joint:left_knee_joint"] = [0.01]
+WALKING_R_weights["joint:left_ankle_roll_joint"] = [0.01]
+WALKING_R_weights["joint:left_ankle_pitch_joint"] = [0.01]
+WALKING_R_weights["joint:right_hip_roll_joint"] = [0.01]
+WALKING_R_weights["joint:right_hip_pitch_joint"] = [0.01]
+WALKING_R_weights["joint:right_hip_yaw_joint"] = [0.01]
+WALKING_R_weights["joint:right_knee_joint"] = [0.01]
+WALKING_R_weights["joint:right_ankle_roll_joint"] = [0.01]
+WALKING_R_weights["joint:right_ankle_pitch_joint"] = [0.01]
+
+WALKING_R_weights["pelvis_link:pos_x"] = [0.05]
+WALKING_R_weights["pelvis_link:pos_y"] = [0.05]
+WALKING_R_weights["pelvis_link:pos_z"] = [0.05]
+WALKING_R_weights["pelvis_link:ori_x"] = [0.05]
+WALKING_R_weights["pelvis_link:ori_y"] = [0.05]
+WALKING_R_weights["pelvis_link:ori_z"] = [0.05]
+
+WALKING_R_weights["joint:waist_yaw_joint"] = [0.1]
+WALKING_R_weights["joint:left_elbow_joint"] = [0.01]
+WALKING_R_weights["joint:left_shoulder_pitch_joint"] = [0.01]
+WALKING_R_weights["joint:left_shoulder_roll_joint"] = [0.01]
+WALKING_R_weights["joint:left_shoulder_yaw_joint"] = [0.01]
+WALKING_R_weights["joint:right_elbow_joint"] = [0.01]
+WALKING_R_weights["joint:right_shoulder_pitch_joint"] = [0.01]
+WALKING_R_weights["joint:right_shoulder_roll_joint"] = [0.01]
+WALKING_R_weights["joint:right_shoulder_yaw_joint"] = [0.01]
+
+WALKING_R_weights["right_wrist_yaw_link:pos_x"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:pos_y"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:pos_z"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:ori_x"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:ori_y"] = [0.05]
+WALKING_R_weights["right_wrist_yaw_link:ori_z"] = [0.05]
+
+WALKING_R_weights["left_wrist_yaw_link:pos_x"] = [0.05]
+WALKING_R_weights["left_wrist_yaw_link:pos_y"] = [0.05]
+WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
+WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
+WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
+WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+# WALKING_R_weights = [
+#         0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort
+#         0.05,0.05,0.05,     # pelvis inputs: lower torque priority
+#         0.05,0.05,0.05,     # swing foot linear inputs
+#         0.02,0.02,0.02,     # swing foot orientation inputs: small adjustments
+#         0.05, 0.05, 0.05,   # stance foot linear inputs
+#         0.02, 0.02, 0.02,   # stance foot orientation inputs: small adjustments
+#         0.1,0.01,0.01,
+#         0.01,0.01,0.01,
+#         0.01,0.01,0.01,
+#     ]
+
+# TODO: Test
+def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, time_into_domain, threshold):
+    """
+    Heuristically modify the gait library to allow for sideways walking and turning.
+
+    See _apply_swing_modifications in gait_library_traj.py
+
+    Args:
+        env: Environment object.
+        output_names: Names of the output variables in order.
+        outputs: Output variables.
+        contact_bodies: Names of the contact bodies. Of shape [num_contact_bodies]
+        contact_states: tensor of shape [N, num_contact_bodies]
+        time_into_domain: tensor of shape [N] giving the total time for the current domain each env is in
+    """
+
+    # Get the commanded velocity
+    vel_cmd = env.command_manager.get_command("base_velocity").clone()
+
+    # Don't apply modifications when in standing
+    standing_mask = torch.abs(vel_cmd[:, 0]) < threshold
+    vel_cmd[standing_mask, :] *= 0.0
+
+    def find_idx(strings, *substrings):
+        """Find index of first string containing all substrings."""
+        return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
+
+    # Determine yaw modification
+    delta_psi = vel_cmd[:, 2] * time_into_domain
+
+    # Determine horizontal modification
+    delta_y = vel_cmd[:, 1] * time_into_domain
+
+    # TODO: Deal with forward vs backward direction
+
+    # Iterate through the bodies not in contact
+    for i, body in enumerate(contact_bodies):
+        env_idx = torch.where(contact_states[:, i] == 0)[0]
+
+        ##
+        # Adjust this body
+        ##
+        # Apply yaw and horizontal modifications
+        # ori_z is the yaw
+        # TODO: Need to search NOT contact_bodies but the output names
+        idx = find_idx(output_names, "ori_z", body)
+        if idx is not None:
+            outputs[env_idx, 0, idx] += delta_psi[env_idx]
+            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
 
 
-WALKING_R_weights = [
-        0.1, 0.1, 0.1,      # CoM inputs: allow moderate effort
-        0.05,0.05,0.05,     # pelvis inputs: lower torque priority
-        0.05,0.05,0.05,     # swing foot linear inputs
-        0.02,0.02,0.02,     # swing foot orientation inputs: small adjustments
-        0.05, 0.05, 0.05,   # stance foot linear inputs
-        0.02, 0.02, 0.02,   # stance foot orientation inputs: small adjustments
-        0.1,0.01,0.01,
-        0.01,0.01,0.01,
-        0.01,0.01,0.01,
-    ]
+        idx = find_idx(output_names, "pos_y", body)
+        if idx is not None:
+            outputs[env_idx, 0, idx] += delta_y[env_idx]
+            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1]
+
+
+        # Adjust the hip yaw
+        if "left" in body:
+            idx = find_idx(output_names, "yaw", "left_hip_yaw_joint")
+        else:
+            idx = find_idx(output_names, "yaw", "right_hip_yaw_joint")
+
+        if idx is not None:
+            outputs[env_idx, 0, idx] += delta_psi[env_idx]
+            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
+
+        ##
+        # Hip Roll
+        ##
+        # Adjust hip roll based on the height of the foot
+        if "left" in body:
+            hip_roll_link_name = "left_hip_roll_link"
+            hip_roll_joint_name = "left_hip_roll_joint"
+            ankle_link_name = "left_ankle_roll_link"
+        else:
+            hip_roll_link_name = "right_hip_roll_link"
+            hip_roll_joint_name = "right_hip_roll_joint"
+            ankle_link_name = "right_ankle_roll_link"
+
+        # Get the height of the hip roll link and the foot
+        robot = env.scene["robot"]
+        hip_roll_idx = robot.body_names.index(hip_roll_link_name)
+        ankle_idx = robot.body_names.index(ankle_link_name)
+
+        hip_roll_height = robot.data.body_pos_w[:, hip_roll_idx, 2]
+        foot_height = robot.data.body_pos_w[:, ankle_idx, 2]
+
+        # Vertical distance from hip roll to foot (adjacent side of right triangle)
+        vertical_distance = torch.abs(hip_roll_height - foot_height)
+
+        # Use trig: tan(theta) = opposite / adjacent = delta_y / vertical_distance
+        # Therefore: theta = atan(delta_y / vertical_distance)
+        required_roll_angle = torch.atan2(delta_y, vertical_distance)
+
+        # Find and update the hip roll joint output
+        idx = find_idx(output_names, hip_roll_joint_name)
+        if idx is not None:
+            outputs[env_idx, 0, idx] += required_roll_angle[env_idx]
+            # Velocity: d(theta)/dt = (1 / vertical_distance) * d(delta_y)/dt for small angles
+            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1] / vertical_distance[env_idx]
+
+
+    # Adjust hands yaw
+    idx = find_idx(output_names, "ori_z", "right_wrist_yaw_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_psi
+        outputs[:, 1, idx] += vel_cmd[:, 2]
+
+    idx = find_idx(output_names, "ori_z", "left_wrist_yaw_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_psi
+        outputs[:, 1, idx] += vel_cmd[:, 2]
+
+    # Adjust hands y
+    idx = find_idx(output_names, "pos_y", "right_wrist_yaw_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_y
+        outputs[:, 1, idx] += vel_cmd[:, 1]
+
+    idx = find_idx(output_names, "pos_y", "left_wrist_yaw_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_y
+        outputs[:, 1, idx] += vel_cmd[:, 1]
+
+    # Adjust pelvis yaw
+    idx = find_idx(output_names, "ori_z", "pelvis_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_psi
+        outputs[:, 1, idx] += vel_cmd[:, 2]
+
+    # Adjust pelvis y
+    idx = find_idx(output_names, "pos_y", "pelvis_link")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_y
+        outputs[:, 1, idx] += vel_cmd[:, 1]
+
+    # Adjust COM y
+    idx = find_idx(output_names, "pos_y", "com")
+    if idx is not None:
+        outputs[:, 0, idx] += delta_y
+        outputs[:, 1, idx] += vel_cmd[:, 1]
+
+    return outputs
 
 ##
 # Commands
@@ -68,15 +425,24 @@ WALKING_R_weights = [
 @configclass
 class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
-    hzd_ref = GaitLibraryHZDCommandCfg(
-        trajectory_type="end_effector",
-        gait_library_path="source/robot_rl/robot_rl/assets/robots/walking_10_13",
-        config_name="walking",
-        gait_velocity_ranges=(0.0, 1.0, 0.1),
+    traj_ref = TrajectoryCommandCfg(
+        contact_bodies = [".*_ankle_roll_link"],
 
-        num_outputs=27,
-        Q_weights=WALKING_Q_weights,
-        R_weights=WALKING_R_weights,
+        # manager_type = "trajectory",
+        # path="source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
+
+        manager_type="library",
+        # path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
+        hf_repo = "zolkin/robot_rl",
+        path = "trajectories/walking",
+
+        conditioner_generator_name = "base_velocity",
+        num_outputs = 45, #27, #45, #51, #31, #27,
+        Q_weights = WALKING_Q_weights,
+        R_weights = WALKING_R_weights,
+        hold_phi_threshold = 0.1,
+        heuristic_func=heuristic_modification,
+        phasing_boundaries=4,
     )
 
 ##
@@ -88,128 +454,20 @@ class G1WalkingCLFCurriculumCfg:
 
     clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 1000, "min_val": 20.0})
 
-##
-# Observations
-##
-@configclass
-class G1TrajOptObservationsCfg():
-    """Observation specifications for the G1 Flat environment."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5), scale=0.05)
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Observations for critic group."""
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-        )
-        # root_quat = ObsTerm(func=mdp.root_quat)
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
-        actions = ObsTerm(func=mdp.last_action)
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "hzd_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "hzd_ref"})
-
-        contact_state = ObsTerm(
-            func=mdp.contact_state,
-            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link")},
-        )
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        foot_vel = ObsTerm(func=mdp.foot_vel, params={"command_name": "hzd_ref"}, scale=1.0)
-        foot_ang_vel = ObsTerm(func=mdp.foot_ang_vel, params={"command_name": "hzd_ref"}, scale=1.0)
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "hzd_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "hzd_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "hzd_ref"}, clip=(-20.0, 20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "hzd_ref"}, clip=(-20.0, 20.0,))
-
-        height_scan = None  # Removed - not supported yet
-
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
-
-
-##
-# Rewards
-##
-@configclass
-class G1WalkingCLFRewards(HumanoidRewardCfg):
-    """Rewards specific to LIP Model"""
-
-    holonomic_constraint = RewTerm(
-        func=mdp.holonomic_constraint,
-        weight=4.0,
-        params={
-            "command_name": "hlip_ref",
-            "z_offset": 0.036,
-        }
-    )
-
-    holonomic_constraint_vel = RewTerm(
-        func=mdp.holonomic_constraint_vel,
-        weight=2.0,
-        params={
-            "command_name": "hlip_ref",
-        }
-    )
-
-
-    clf_reward = RewTerm(
-        func=mdp.clf_reward,
-        weight=10.0,
-        params={
-            "command_name": "hlip_ref",
-            "max_eta_err": 0.25,
-        }
-    )
-
-    clf_decreasing_condition = RewTerm(
-        func=mdp.clf_decreasing_condition,
-        weight=-2.0,
-        params={
-            "command_name": "hlip_ref",
-            "alpha": 0.5,
-            "eta_max": 0.2,
-            "eta_dot_max":0.3,
-        }
-    )
 
 @configclass
 class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
     """Configuration for the G1 environment with gait library."""
     commands: G1GaitLibraryCommandsCfg = G1GaitLibraryCommandsCfg()
     observations: G1TrajOptObservationsCfg = G1TrajOptObservationsCfg()
-    rewards: G1WalkingCLFRewards = G1WalkingCLFRewards()
+    rewards: G1TrajOptCLFRewards = G1TrajOptCLFRewards()
     curriculum: G1WalkingCLFCurriculumCfg = G1WalkingCLFCurriculumCfg()
 
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
+
+        self.actions.joint_pos.scale = G1_ACTION_SCALE
 
         ##
         # Scene
@@ -220,12 +478,14 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         # Commands
         ##
         # Configure velocity ranges for different gaits
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
-        self.commands.base_velocity.ranges.heading = (0,0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.heading = (-3.14,3.14)
+        self.commands.base_velocity.rel_heading_envs = 0.5
+        self.commands.base_velocity.resampling_time_range = (4.0, 8.0)
 
-        self.commands.gait_period.gait_period_range = (0.71, 0.71)    # TODO: Remove?
+        self.commands.gait_period = None
 
         ##
         # Randomization
@@ -237,10 +497,15 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
             "pitch": (-0.4, 0.4),
             "yaw": (-0.4, 0.4),
         }
-        self.events.add_base_mass.params["asset_cfg"].body_names = ["pelvis_link"]
+        self.events.add_base_mass.params["asset_cfg"].body_names = ["waist_yaw_link"]
         self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
         self.events.add_base_mass.params["operation"] = "scale"
-        self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+
+        self.events.base_com.params["asset_cfg"].body_names = ["waist_yaw_link"]
+        self.events.base_com.params["com_range"] = {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)}
+
+        # self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+
         self.events.reset_base.params = {
             "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
             "velocity_range": {
@@ -254,29 +519,32 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         }
 
         self.events.base_external_force_torque = None
+        self.events.gain_randomization = None   # At least to start
 
         ##
         # Rewards
         ##
-        self.rewards.holonomic_constraint.params["command_name"] = "hzd_ref"
-        self.rewards.holonomic_constraint_vel.params["command_name"] = "hzd_ref"
+        self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
+        self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
 
         self.rewards.clf_reward.params = {
-            "command_name": "hzd_ref",
-            "max_eta_err": 0.25,
+            "command_name": "traj_ref",
+            "max_eta_err": 0.2, #0.15, #0.25,
         }
         self.rewards.clf_decreasing_condition.params = {
-            "command_name": "hzd_ref",
+            "command_name": "traj_ref",
             "alpha": 0.5,
             "eta_max": 0.25,
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
 
+        # self.rewards.undesired_contacts.weight = 0.0
+
         ##
         # Terminations
         ##
-        self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
+        # self.terminations.base_contact.params["sensor_cfg"].body_names = "waist_yaw_link"
 
         ##
         # Curriculum
@@ -284,7 +552,7 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         self.curriculum.clf_curriculum = None
         self.curriculum.terrain_levels = None
 
-        self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
+        # self.events.reset_base.params["pose_range"]["yaw"] = (0,0)
 
         # self.curriculum.clf_curriculum.params = {
         #     "min_max_err": (0.1,0.1),
@@ -292,14 +560,6 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         #     "update_interval": 20000
         # }
 
-        # self.rewards.vdot_tanh = RewTerm(
-        #     func=mdp.vdot_tanh,
-        #     weight= 2.0,
-        #     params={
-        #         "command_name": "hzd_ref",
-        #         "alpha": 1.0,
-        #     }
-        # )
 
         # self.rewards.clf_decreasing_condition = None
 
@@ -357,11 +617,13 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         self.events.base_com = None
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+        self.events.gain_randomization = None
+        self.events.reset_robot_joints.params["position_range"] = (1.0, 1.0)
+
         
-        
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0,0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0) #(0.75, 1.0)  # Allow full range
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
 
         # self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
         # self.events.reset_base.params["pose_range"]["x"] = (-3,3)

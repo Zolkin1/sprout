@@ -11,6 +11,8 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensorCfg
 
 # TODO: Remove all of these dependencies
 from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (  # Inherit from the base envs
@@ -18,6 +20,7 @@ from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import ( 
     LocomotionVelocityRoughEnvCfg,
     ObservationsCfg,
     RewardsCfg,
+    MySceneCfg,
 )
 
 from . import mdp
@@ -37,6 +40,22 @@ class HumanoidCommandsCfg(CommandsCfg):
     # Command for the set period
     gait_period = mdp.commands.GaitPeriodCfg(gait_period_range=(0.8, 0.8), resampling_time_range=(10.0, 10.0))
 
+# @configclass
+# class HumanoidSceneCfg(MySceneCfg):
+#     """Scene specifications for the MDP."""
+#     pass
+
+@configclass
+class HumanoidTerminationCfg:
+    """Handle the terminations."""
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    base_contact = None
+    base_height = DoneTerm(
+        func=mdp.root_height_below_minimum,
+        params={
+            "minimum_height": 0.25,
+        }
+    )
 
 @configclass
 class HumanoidObservationsCfg(ObservationsCfg):
@@ -84,9 +103,9 @@ class HumanoidEventsCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
-            "static_friction_range": (0.25, 1.25),
-            "dynamic_friction_range": (0.25, 1.25),
-            "restitution_range": (0.0, 0.0),
+            "static_friction_range": (0.3, 1.6),
+            "dynamic_friction_range": (0.3, 1.2),
+            "restitution_range": (0.0, 0.2),    # Consider upping this
             "num_buckets": 64,
             "make_consistent": True,  # ensures dynamic friction <= static friction
         },
@@ -170,6 +189,19 @@ class HumanoidEventsCfg:
         params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 
+    # PD Gain randomization
+    gain_randomization = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (-7., 7.),
+            "damping_distribution_params": (-1., 1.),
+            "operation": "add",
+            "distribution": "uniform"
+        },
+    )
+
 
 @configclass
 class HumanoidRewardCfg:
@@ -200,8 +232,13 @@ class HumanoidRewardCfg:
 ##
 @configclass
 class HumanoidEnvCfg(LocomotionVelocityRoughEnvCfg):
+    # scene: HumanoidSceneCfg = HumanoidSceneCfg()
     # rewards: HumanoidRewardCfg = HumanoidRewardCfg()
     observations: HumanoidObservationsCfg = HumanoidObservationsCfg()
     events: HumanoidEventsCfg = HumanoidEventsCfg()
     actions: HumanoidActionsCfg = HumanoidActionsCfg()
     commands: HumanoidCommandsCfg = HumanoidCommandsCfg()
+    terminations: HumanoidTerminationCfg = HumanoidTerminationCfg()
+
+    # def __post_init__(self):
+    #     super().__post_init__()

@@ -10,7 +10,7 @@ import cli_args
 import torch
 
 # Import plot_trajectories functions
-from plot_trajectories import plot_trajectories, plot_hzd_trajectories
+from plot_trajectories import plot_trajectories #, plot_hzd_trajectories
 from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
 
@@ -18,7 +18,12 @@ SIM_ENVIRONMENTS = {
     "vanilla": "G1-vanilla-walking",
     "lip_clf": "G1-lip-ref-play",
     "walking_clf": "G1-walking-clf-play",
+    "walking_clf_sym": "G1-walking-clf-play",
     "running_clf": "G1-running-clf-play",
+    "waving_clf": "G1-waving-clf-play",
+    "bow_forward_clf": "G1-bow_forward-clf-play",
+    "bow_forward_clf_sym": "G1-bow_forward-clf-symmetric",    # TODO: make this a play
+    "bend_up_clf_sym": "G1-bend_up-clf-play",
 }
 
 class DataLogger:
@@ -81,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--video",
         action="store_true",
-        default=True,
+        default=False,
         help="Record videos during playback."
     )
     parser.add_argument(
@@ -163,7 +168,7 @@ def extract_reference_trajectory(env, log_vars, command_name):
             else:
                 raise ValueError("[Extract Reference] Could not find the axis name!")
         else:
-            raise ValueError("[Extract Reference] No variable matching the given name found in the command!")
+            raise ValueError(f"[Extract Reference] No variable matching the given name [{var}] found in the command!")
     return results
 
 
@@ -189,9 +194,23 @@ def find_latest_checkpoint(log_root_path):
     
     return run_name, checkpoint_num
 
+# Before main
+args_cli, hydra_args = parse_args()
+
+# always enable cameras to record video
+if args_cli.video:
+    args_cli.enable_cameras = True
+
+# clear out sys.argv for Hydra
+sys.argv = [sys.argv[0]] + hydra_args
+
+print("[DEBUG] Launching Omniverse app")
+# launch omniverse app
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
 
 def main():
-    args_cli, hydra_args = parse_args()
+    # args_cli, hydra_args = parse_args()
     
     if not args_cli.env_type:
         print("Please specify an environment type using --env_type")
@@ -206,24 +225,12 @@ def main():
     # Get experiment name (use override if provided, otherwise use default)
     experiment_name = args_cli.exp_name or EXPERIMENT_NAMES[args_cli.env_type]
     print(f"[DEBUG] Using experiment name: {experiment_name}")
-    
-    # always enable cameras to record video
-    if args_cli.video:
-        args_cli.enable_cameras = True
-
-    # clear out sys.argv for Hydra
-    sys.argv = [sys.argv[0]] + hydra_args
-
-    print("[DEBUG] Launching Omniverse app")
-    # launch omniverse app
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
 
     # Import necessary modules after app launch
     import gymnasium as gym
     import torch
-    # from rsl_rl.runners import OnPolicyRunner
-    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
+    from rsl_rl.runners import OnPolicyRunner, DistillationRunner
+    # from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
 
     from isaaclab.envs import (
         DirectMARLEnv,
@@ -288,8 +295,6 @@ def main():
     print(f"[DEBUG] Play log directory: {play_log_dir}")
 
     # create isaac environment
-    if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
-        env_cfg.__prepare_tensors__()
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # convert to single-agent instance if required
@@ -313,32 +318,49 @@ def main():
 
     print(f"[DEBUG] Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    ppo_runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    if agent_cfg.class_name == "OnPolicyRunner":
+        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    elif agent_cfg.class_name == "DistillationRunner":
+        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    else:
+        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    runner.load(resume_path)
+
+    # TODO: Delete
+    # ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    # ppo_runner.load(resume_path)
 
     # obtain the trained policy for inference
-    policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
+    policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     # Export policy if requested
     if args_cli.export_policy:
-        if ppo_runner.alg.policy.__class__.__name__ == "ActorCriticCNN":
+        if runner.alg.policy.__class__.__name__ == "ActorCriticCNN":
             from robot_rl.network.exporter import export_policy_as_jit, export_policy_as_onnx
           
 
         print("[DEBUG] Exporting policy to ONNX and JIT formats")
         try:
             # version 2.3 onwards
-            policy_nn = ppo_runner.alg.policy
+            policy_nn = runner.alg.policy
         except AttributeError:
             # version 2.2 and below
-            policy_nn = ppo_runner.alg.actor_critic
+            policy_nn = runner.alg.actor_critic
+
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
         # export policy to onnx/jit
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
         os.makedirs(export_model_dir, exist_ok=True)
-        export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
         export_policy_as_onnx(
-            policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
+            policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx"
         )
         print(f"[DEBUG] Policy exported to {export_model_dir}")
 
@@ -346,60 +368,35 @@ def main():
 
     # Dynamically generate log variables based on the command type
     log_vars = [
-        'y_out',
-        'dy_out',
+        'y_des',
+        'dy_des',
         'base_velocity',
-        'cur_swing_time',
-        "stance_foot_pos",
-        "stance_foot_ori",
         'y_act',
         'dy_act',
         'v',
         'vdot',
-        'stance_foot_pos_0',
-        'stance_foot_ori_0',
-        'current_domains',
-        'phase_var',
-        'domain_durations',
-        'gait_indices',
+        'ordered_output_names',
+        'current_domain',
+        'phasing_var',
+        # 'domain_durations',
+        # 'gait_indices',
     ]
     
     # Get the command term to determine what type of trajectory we're using
     if "lip" in args_cli.env_type:
         command_name = "hlip_ref"
     elif "clf" in args_cli.env_type:
-        command_name = "hzd_ref"
+        command_name = "traj_ref"
     elif args_cli.env_type == "vanilla":
         raise ValueError(f"Need to implement vanilla in the play policy!")
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
-    
-    ref = env.unwrapped.command_manager.get_term(command_name)
-    
-    # Add dynamic error metrics based on the command type
-    trajectory_type = 'end_effector'
-    
-    if hasattr(ref, 'ee_config') and hasattr(ref.ee_config, 'axis_names'):
-        # End effector trajectory case - add axis error metrics
-        trajectory_type = 'end_effector'
-        for axis_info in ref.ee_config.axis_names:
-            log_vars.append(axis_info['name'])
-        # Also log the axis names for plotting
-        log_vars.append('axis_names')
-    elif hasattr(ref,'gait_config'):
-        trajectory_type = 'end_effector'
-        key = list(ref.gait_config._gait_cache.keys())[0]
-        for axis_info in ref.gait_config._gait_cache[key].axis_names:
-            log_vars.append(axis_info['name'])
-        
-        # Also log the axis names for plotting
-        log_vars.append('axis_names')
 
     # Setup logging
     logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
 
     # reset environment
-    obs, _ = env.get_observations()
+    obs = env.get_observations()
     action = policy(obs)
 
     # Export information to a yaml
@@ -409,6 +406,7 @@ def main():
     timestep = 0
     print("[DEBUG] Starting simulation loop")
 
+    obs = env.get_observations()
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -421,7 +419,7 @@ def main():
             
             # Log data
             if args_cli.log_data:
-                data = extract_reference_trajectory(env, log_vars,command_name)
+                data = extract_reference_trajectory(env, log_vars, command_name)
                 logger.log_from_dict(data)
 
         timestep += 1
@@ -430,8 +428,6 @@ def main():
             if timestep == args_cli.video_length:
                 break
 
-        if timestep > max(100, args_cli.video_length):
-            break
 
         # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
@@ -452,7 +448,7 @@ def main():
         print(f"[DEBUG] Generating plots in directory: {plot_dir}")
         
         # Determine trajectory type based on command type
-        plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type=trajectory_type)
+        plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type="end_effector")
 
     # Ensure simulation app is closed
     if simulation_app is not None:

@@ -3,14 +3,6 @@ from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 from typing import Union
 
-
-
-
-
-
-
-
-
 HZD_EE_Q_weights_GL = [
     25.0,   250.0,    # com_x pos, vel
     300.0,   50.0,   # com_y pos, vel

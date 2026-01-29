@@ -43,6 +43,7 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
     max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
 
     reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
+    # reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (10*max_clf))    # 200, 100   # NOTE: Used for bend over (10*max_clf is normal)
     return reward
 
 
@@ -118,15 +119,20 @@ def holonomic_constraint_vel(
     """
     cmd = env.command_manager.get_term(command_name)
 
-    # linear velocity [B,3] and yaw rate [B,1]
-    v = cmd.stance_foot_vel  # [vx, vy, vz]
-    wz = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1)  # [ω_z]
+    # Get the velocities
+    v = cmd.current_contact_vels
 
-    # stack into [B,4] error vector
-    e_vel = torch.cat([v, wz], dim=-1)
+    # # linear velocity [B,3] and yaw rate [B,1]
+    # v = cmd.stance_foot_vel  # [vx, vy, vz]
+    # wz = cmd.stance_foot_ang_vel[:, 2].unsqueeze(-1)  # [ω_z]
+    #
+    # # stack into [B,4] error vector
+    # e_vel = torch.cat([v, wz], dim=-1)
+    #
+    # not_flight_mask = cmd.get_not_flight_envs()
+    # return not_flight_mask * torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
 
-    not_flight_mask = cmd.get_not_flight_envs()
-    return not_flight_mask * torch.exp(- (e_vel**2).sum(dim=-1) / sigma_vel**2)
+    return torch.exp(-(v.sum(dim=-1).sum(dim=-1)**2) / sigma_vel**2)
 
 def holonomic_constraint(
     env: ManagerBasedRLEnv,
@@ -146,29 +152,42 @@ def holonomic_constraint(
 
     cmd = env.command_manager.get_term(command_name)
 
-    # planar position error [B,2]
-    p0_xy = cmd.stance_foot_pos_0[:, :2]
-    p_xy = cmd.stance_foot_pos[:, :2]
-    delta_xy = p_xy - p0_xy
+    # TODO: Re-write to handle arbitrary contacts
 
-    # vertical error to the floor plane [B,1]
-    z_cur = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
-    delta_z = z_cur - cmd.stance_foot_pos_0[:, 2].unsqueeze(-1)
+    # Get the current pose
+    des_contact_poses = cmd.desired_contact_poses
+    contact_poses = cmd.current_contact_poses
 
-    # roll error [B,1]
-    roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
+    # Compute error
+    pose_err = contact_poses - des_contact_poses
 
-    # yaw error wrapped to [–π, π] [B,1]
-    psi0 = cmd.stance_foot_ori_0[:, 2]
-    psi = cmd.stance_foot_ori[:, 2]
-    delta_psi = ((psi - psi0 + torch.pi) % (2 * torch.pi) - torch.pi).unsqueeze(-1)
+    # Wrap yaw error
+    pose_err = wrap_to_pi(pose_err[:, -1])
 
-    # stack into [B,5] error vector
-    e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
+    # # planar position error [B,2]
+    # p0_xy = cmd.stance_foot_pos_0[:, :2]
+    # p_xy = cmd.stance_foot_pos[:, :2]
+    # delta_xy = p_xy - p0_xy
+    #
+    # # vertical error to the floor plane [B,1]
+    # z_cur = cmd.stance_foot_pos[:, 2].unsqueeze(-1)
+    # delta_z = z_cur - cmd.stance_foot_pos_0[:, 2].unsqueeze(-1)
+    #
+    # # roll error [B,1]
+    # roll = cmd.stance_foot_ori[:, 0].unsqueeze(-1)
+    #
+    # # yaw error wrapped to [–π, π] [B,1]
+    # psi0 = cmd.stance_foot_ori_0[:, 2]
+    # psi = cmd.stance_foot_ori[:, 2]
+    # delta_psi = ((psi - psi0 + torch.pi) % (2 * torch.pi) - torch.pi).unsqueeze(-1)
+    #
+    # # stack into [B,5] error vector
+    # e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)
+    #
+    # not_flight_mask = cmd.get_not_flight_envs()
+    # return not_flight_mask * torch.exp(- (e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
 
-    not_flight_mask = cmd.get_not_flight_envs()
-    return not_flight_mask * torch.exp(- (e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
-
+    return torch.exp(-(pose_err**2).sum(dim=-1) / sigma_pose ** 2)
 
 def reference_tracking(
     env: ManagerBasedRLEnv,
@@ -281,21 +300,27 @@ def phase_contact(
             res += ~(contact ^ is_stance)
     return res
 
-def flight_contact_penalty(env: ManagerBasedRLEnv, command_name: str, base_vel_cmd: str,
-                           sensor_cfg: SceneEntityCfg, weight_scalar: float, start_vel: float) -> torch.Tensor:
+# TODO: Test
+def contact_schedule_penalty(env: ManagerBasedRLEnv, command_name: str,
+                           sensor_cfg: SceneEntityCfg, weight_scalar: float) -> torch.Tensor:
     """Penalize contacts while in the flight phase."""
     cmd = env.command_manager.get_term(command_name)
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    flight_mask = cmd.get_flight_envs()
+    # Time into the episode
+    t = env.episode_length_buf * env.step_dt
 
-    # Only apply penalty when commanded velocity is 2.0 m/s or greater                                                                                                                                                                                                                                                                                                                                           │ │
-    command_vel = env.command_manager.get_command(base_vel_cmd)[:, :3]  # Get x,y,z velocity commands                                                                                                                                                                                                                                                                                                            │ │
-    speed_mask = command_vel[:, 0] >= start_vel #2.0  # Create mask for high speed commands
+    # Get bodies not in contact for each env
+    contact_states = cmd.get_contact_state(t)
+    contact_bodies = cmd.contact_frame_indices
 
-    contact_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :].norm(dim=-1).sum(dim=-1)     # Gets the most recent force only
+    contact_forces = torch.zeros(t.shape[0], dtype=torch.float, device=env.device)
+    for i, body_idx in enumerate(contact_bodies):
+        if contact_states[i]:
+            contact_forces += contact_sensor.data.net_forces_w[:, body_idx, :].norm(dim=-1)  # Gets the most recent force only
+
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
-    return flight_mask * speed_mask * penalty
+    return penalty
 
 def track_lin_vel_y_exp(
     env: ManagerBasedRLEnv, std: float, command_name: str, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")

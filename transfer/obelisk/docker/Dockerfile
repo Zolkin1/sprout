@@ -52,8 +52,7 @@ USER ${UID}
 
 RUN echo "Pulling Obelisk..."
 # clone Obelisk into this docker image at the $OBELISK_ROOT path
-# RUN git clone -b v0.3.0-alpha https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
-RUN git clone -b unitree-debug https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
+RUN git clone -b v0.4.0-alpha https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
 ENV OBELISK_ROOT=/home/${USER}/obelisk
 
 # Install other dependencies here...
@@ -61,83 +60,81 @@ ENV OBELISK_ROOT=/home/${USER}/obelisk
 # you must run the setup script from a directory where the user has permissions
 # run docker setup script in Dockerfile
 WORKDIR /home/${USER}
-RUN source /home/${USER}/obelisk/setup.sh --install-sys-deps --cyclone-perf --obk-aliases --basic --unitree
-
+RUN source /home/${USER}/obelisk/setup.sh --downstream-setup --mujoco --unitree
 WORKDIR /home/${USER}
 
 COPY requirements.txt .
-RUN pip install --retries 5 --timeout=1000 -r requirements.txt
-# RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 RUN rm requirements.txt
 
-# Lidar odometry
-# Install PCL and other dependencies for the lidar
-RUN sudo apt-get update && sudo apt-get install -y \
-    libpcl-dev \
-    pcl-tools \
-    ros-humble-pcl-ros \
-    ros-humble-pcl-conversions
+# # Lidar odometry
+# # Install PCL and other dependencies for the lidar
+# RUN sudo apt-get update && sudo apt-get install -y \
+#     libpcl-dev \
+#     pcl-tools \
+#     ros-humble-pcl-ros \
+#     ros-humble-pcl-conversions
     
-WORKDIR /home/${USER}
-RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
-    cd Livox-SDK2 && \
-    mkdir build && cd build && \
-    cmake .. && \
-    make -j && \
-    sudo make install && \
-    cd /home/${USER} && \
-    mkdir -p livox_driver_ws/src && \
-    cd livox_driver_ws/src && \
-    git clone https://github.com/Livox-SDK/livox_ros_driver2.git && cd livox_ros_driver2 && \
-    cat > config/MID360_config.json << 'EOF'
-{
-  "lidar_summary_info" : {
-    "lidar_type": 8
-  },
-  "MID360": {
-    "lidar_net_info" : {
-      "cmd_data_port": 56100,
-      "push_msg_port": 56200,
-      "point_data_port": 56300,
-      "imu_data_port": 56400,
-      "log_data_port": 56500
-    },
-    "host_net_info" : {
-      "cmd_data_ip" : "192.168.123.222",
-      "cmd_data_port": 56101,
-      "push_msg_ip": "192.168.123.222",
-      "push_msg_port": 56201,
-      "point_data_ip": "192.168.123.222",
-      "point_data_port": 56301,
-      "imu_data_ip" : "192.168.123.222",
-      "imu_data_port": 56401,
-      "log_data_ip" : "",
-      "log_data_port": 56501
-    }
-  },
-  "lidar_configs" : [
-    {
-      "ip" : "192.168.123.120",
-      "pcl_data_type" : 1,
-      "pattern_mode" : 0,
-      "extrinsic_parameter" : {
-        "roll": 0.0,
-        "pitch": 0.0,
-        "yaw": 0.0,
-        "x": 0,
-        "y": 0,
-        "z": 0
-      }
-    }
-  ]
-}
-EOF
-RUN cd /home/${USER}/livox_driver_ws/src/livox_ros_driver2 && \
-    source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh && \
-    cd /home/${USER} && mkdir -p lidar_odom_ws/src && cd lidar_odom_ws/src && \
-    git clone -b ROS2 https://github.com/wdc3iii/FAST_LIO_vel.git --recursive && cd .. && \
-    sudo rosdep init && \
-    rosdep update && \
-    rosdep install --from-paths src --ignore-src -r -y && \
-    colcon build --symlink-install && \
-    echo "source /home/${USER}/lidar_odom_ws/install/setup.bash" >> /home/${USER}/.bashrc
+# WORKDIR /home/${USER}
+# RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
+#     cd Livox-SDK2 && \
+#     mkdir build && cd build && \
+#     cmake .. && \
+#     make -j && \
+#     sudo make install && \
+#     cd /home/${USER} && \
+#     mkdir -p livox_driver_ws/src && \
+#     cd livox_driver_ws/src && \
+#     git clone https://github.com/Livox-SDK/livox_ros_driver2.git && cd livox_ros_driver2 && \
+#     cat > config/MID360_config.json << 'EOF'
+# {
+#   "lidar_summary_info" : {
+#     "lidar_type": 8
+#   },
+#   "MID360": {
+#     "lidar_net_info" : {
+#       "cmd_data_port": 56100,
+#       "push_msg_port": 56200,
+#       "point_data_port": 56300,
+#       "imu_data_port": 56400,
+#       "log_data_port": 56500
+#     },
+#     "host_net_info" : {
+#       "cmd_data_ip" : "192.168.123.222",
+#       "cmd_data_port": 56101,
+#       "push_msg_ip": "192.168.123.222",
+#       "push_msg_port": 56201,
+#       "point_data_ip": "192.168.123.222",
+#       "point_data_port": 56301,
+#       "imu_data_ip" : "192.168.123.222",
+#       "imu_data_port": 56401,
+#       "log_data_ip" : "",
+#       "log_data_port": 56501
+#     }
+#   },
+#   "lidar_configs" : [
+#     {
+#       "ip" : "192.168.123.120",
+#       "pcl_data_type" : 1,
+#       "pattern_mode" : 0,
+#       "extrinsic_parameter" : {
+#         "roll": 0.0,
+#         "pitch": 0.0,
+#         "yaw": 0.0,
+#         "x": 0,
+#         "y": 0,
+#         "z": 0
+#       }
+#     }
+#   ]
+# }
+# EOF
+# RUN cd /home/${USER}/livox_driver_ws/src/livox_ros_driver2 && \
+#     source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh && \
+#     cd /home/${USER} && mkdir -p lidar_odom_ws/src && cd lidar_odom_ws/src && \
+#     git clone -b ROS2 https://github.com/wdc3iii/FAST_LIO_vel.git --recursive && cd .. && \
+#     sudo rosdep init && \
+#     rosdep update && \
+#     rosdep install --from-paths src --ignore-src -r -y && \
+#     colcon build --symlink-install && \
+#     echo "source /home/${USER}/lidar_odom_ws/install/setup.bash" >> /home/${USER}/.bashrc

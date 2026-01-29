@@ -1,0 +1,49 @@
+num_obs: 74
+num_actions: 21
+dt: 0.02
+action_scale: 0.25
+skill_type: periodic
+total_time: 0.8
+v_x_max: 0.75
+v_x_min: -0.75
+v_y_max: 0
+v_y_min: 0
+w_z_max: 1.0
+w_z_min: -1.0
+default_joint_angles: [-0.25, -0.25, 0.0, 0.0, 0.0, 0.07000000029802322, 0.07000000029802322, 0.0, 0.0, 0.23999999463558197,
+  -0.23999999463558197, 0.46000000834465027, 0.46000000834465027, 0.0, 0.0, -0.25, -0.25, 1.39, 1.39,
+  0.0, 0.0]
+joint_names_isaac: [left_hip_pitch_joint, right_hip_pitch_joint, waist_yaw_joint, left_hip_roll_joint, right_hip_roll_joint,
+  left_shoulder_pitch_joint, right_shoulder_pitch_joint, left_hip_yaw_joint, right_hip_yaw_joint, left_shoulder_roll_joint,
+  right_shoulder_roll_joint, left_knee_joint, right_knee_joint, left_shoulder_yaw_joint, right_shoulder_yaw_joint, left_ankle_pitch_joint,
+  right_ankle_pitch_joint, left_elbow_joint, right_elbow_joint, left_ankle_roll_joint, right_ankle_roll_joint]
+kp: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 150.0, 150.0, 50.0, 50.0, 40.0, 40.0, 50.0,
+  50.0, 40.0, 40.0]
+# kd: [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+kd: [5.0, 5.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 5.0, 5.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+observation_terms:
+  policy:
+    base_ang_vel:
+      shape: 3
+      scale: 1.0
+    projected_gravity:
+      shape: 3
+      scale: 1.0
+    velocity_commands:
+      shape: 3
+      scale: [2.0, 2.0, 2.0]
+    joint_vel:
+      shape: 21
+      scale: 0.05000000074505806
+    joint_pos:
+      shape: 21
+      scale: 1.0
+    actions:
+      shape: 21
+      scale: 1.0
+    sin_phase:
+      shape: 1
+      scale: 1.0
+    cos_phase:
+      shape: 1
+      scale: 1.0

@@ -557,7 +557,7 @@ Position and velocity actuators added. -->
 
     <!-- Right Arm -->
     <position name="right_shoulder_pitch_joint_pos" class="shoulder_pitch_pos" joint="right_shoulder_pitch_joint"/>
-    <position name="right_shoulder_roll_join_post" class="shoulder_roll_pos" joint="right_shoulder_roll_joint"/>
+    <position name="right_shoulder_roll_joint_pos" class="shoulder_roll_pos" joint="right_shoulder_roll_joint"/>
     <position name="right_shoulder_yaw_joint_pos" class="shoulder_yaw_pos" joint="right_shoulder_yaw_joint"/>
     <position name="right_elbow_joint_pos" class="elbow_pos" joint="right_elbow_joint"/>
 
@@ -671,21 +671,48 @@ Position and velocity actuators added. -->
   </sensor>
 
   <keyframe>
-    <key name="standing" 
+    <key name="standing"
       qpos="0 0 0.79
             1 0 0 0
             -0.25 0 0 0.46 -0.25 0
             -0.25 0 0 0.46 -0.25 0
             0
-            0.07 0.24 0 1.39
-            0.07 -0.24 0 1.39"
-      ctrl="-0.1 0 0 0.3 -0.2 0
-            -0.1 0 0 0.3 -0.2 0
+            0.31 0.24 0 0.8
+            0.31 -0.24 0 0.8"
+      ctrl="-0.25 0 0 0.46 -0.25 0
+            -0.25 0 0 0.46 -0.25 0
             0
-            0.15 0.7 -0.45 0.5
-            0.15 -0.7 0.45 0.5
+            0.31 0.24 0 0.8
+            0.31 -0.24 0 0.8
             "/>
-
+<!--    <key name="bow_start"-->
+<!--      qpos="0 0 0.79-->
+<!--            1 0 0 0-->
+<!--            -0.25 0 0 0.46 -0.25 0-->
+<!--            -0.25 0 0 0.46 -0.25 0-->
+<!--            0-->
+<!--            0.07  0.24 0 0.1-->
+<!--            0.07 -0.24 0 0.1"-->
+<!--      ctrl="-0.25 0 0 0.46 -0.25 0-->
+<!--            -0.25 0 0 0.46 -0.25 0-->
+<!--            0-->
+<!--            0.07  0.24 0 0.1-->
+<!--            0.07 -0.24 0 0.1-->
+<!--            "/>-->
+<!--    <key name="bend_up_start"-->
+<!--      qpos="0 0 0.62-->
+<!--            0.73 0 0.67 0-->
+<!--            -2.0 0 0 1.0 -0.48 0-->
+<!--            -2.0 0 0 1.0 -0.48 0-->
+<!--            0-->
+<!--            0.1  0.5 0 0.7-->
+<!--            0.1 -0.5 0 0.7"-->
+<!--      ctrl="-2.0 0 0 1.0 -0.48 0-->
+<!--            -2.0 0 0 1.0 -0.48 0-->
+<!--            0-->
+<!--            0.1  0.5 0 0.7-->
+<!--            0.1 -0.5 0 0.7-->
+<!--            "/>-->
       <!-- <key name="standing" 
       qpos="0 0 0.75
             0.707106781 0 0 -0.707106781

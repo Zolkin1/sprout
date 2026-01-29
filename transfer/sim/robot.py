@@ -1,6 +1,9 @@
 import os
 from collections.abc import Callable
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
+
+if TYPE_CHECKING:
+    from transfer.sim.rl_policy import RLPolicy
 
 import mujoco
 import numpy as np
@@ -112,12 +115,12 @@ class Robot:
             vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3))
 
             des_vel[0] = vx
-            des_vel[1] = vy
-            des_vel[2] = vyaw
+            des_vel[1] = min(max(vy, -0.3), 0.3)
+            des_vel[2] = min(max(vyaw, -1.0), 1.0)
         else:
             des_vel = np.array([0.5, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
-        print(f"Commanded velocity: {des_vel}")
+        # print(f"Commanded velocity: {des_vel}")
         return des_vel
 
     def create_observation(self, policy, height_map=None, sensor_pos=None):
@@ -220,3 +223,37 @@ class Robot:
             if joint_name:
                 joint_names.append(joint_name)
         return joint_names
+
+    def set_pd_gains_from_policy(self, policy) -> None:
+        """Set PD gains on MuJoCo actuators from the RLPolicy gains.
+
+        Args:
+            policy: The RLPolicy object containing kp and kd gains in Isaac order.
+
+        Raises:
+            ValueError: If an actuator for a joint is not found in the MuJoCo model.
+        """
+        kp_isaac = policy.get_kp()
+        kd_isaac = policy.get_kd()
+        isaac_joint_names = policy.get_joint_names()
+
+        for i, joint_name in enumerate(isaac_joint_names):
+            actuator_name = f"{joint_name}_pos"
+            actuator_id = mujoco.mj_name2id(
+                self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator_name
+            )
+
+            if actuator_id == -1:
+                raise ValueError(
+                    f"Actuator '{actuator_name}' for joint '{joint_name}' not found in MuJoCo model"
+                )
+
+            kp = kp_isaac[i]
+            kd = kd_isaac[i]
+
+            # For position actuators: force = kp*(ctrl-pos) - kd*vel
+            self.mj_model.actuator_gainprm[actuator_id, 0] = kp
+            self.mj_model.actuator_biasprm[actuator_id, 1] = -kp
+            self.mj_model.actuator_biasprm[actuator_id, 2] = -kd
+
+            print(f"Set gains for '{joint_name}': kp={kp}, kd={kd}")

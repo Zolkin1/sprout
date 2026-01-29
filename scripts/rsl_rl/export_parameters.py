@@ -41,7 +41,7 @@ def export_policy_parameters(env, obs, actions, save_dir):
     robot = unwrapped_env.scene.articulations["robot"]
 
     params = {
-        "num_obs": obs.shape[1],
+        "num_obs": obs["policy"].shape[1],
         "num_actions": actions.shape[1],
         "dt": unwrapped_env.step_dt,
     }
@@ -66,6 +66,15 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params["action_scale"] = unwrapped_env.action_manager.get_term("joint_pos").cfg.scale
     except KeyError:
         pass
+
+    # Get skill type
+    try:
+        # TODO: Test
+        params["skill_type"] = unwrapped_env.command_manager.get_term("traj_ref").trajectory_type.value
+        params["total_time"] = unwrapped_env.command_manager.get_term("traj_ref").manager.get_total_time()
+    except KeyError:
+        raise ValueError("Could not get skill_type and/or total_time while exporting parameters!")
+        # pass
 
     # Add velocity command ranges
     try:

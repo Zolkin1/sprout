@@ -13,8 +13,13 @@ ENVIRONMENTS = {
     "lip_clf": "G1-lip-clf",
     "lip_clf_ec": "G1-lip-clf-ec",
     "walking_clf": "G1-walking-clf",
+    "walking_clf_sym": "G1-walking-clf-symmetric",
     "walking_clf_ec": "G1-walking-clf-ec",
     "running_clf": "G1-running-clf",
+    "waving_clf": "G1-waving-clf",
+    "bow_forward_clf": "G1-bow_forward-clf",
+    "bow_forward_clf_sym": "G1-bow_forward-clf-symmetric",
+    "bend_up_clf_sym": "G1-bend_up-clf-symmetric",
 }
 
 EXPERIMENT_NAMES = {
@@ -25,8 +30,13 @@ EXPERIMENT_NAMES = {
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
     "walking_clf": "walking_clf",
+    "walking_clf_sym": "walking-clf-symmetric",
     "walking_clf_ec": "walking_clf",
     "running_clf": "running_clf",
+    "waving_clf": "waving_clf",
+    "bow_forward_clf": "bow_forward_clf",
+    "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+    "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
 
 
@@ -53,6 +63,25 @@ def parse_args():
     # append AppLauncher cli args
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_known_args()
+
+import importlib.metadata as metadata
+import platform
+
+from packaging import version
+
+RSL_RL_VERSION = "3.0.1"
+installed_version = metadata.version("rsl-rl-lib")
+if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
+    if platform.system() == "Windows":
+        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    else:
+        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
+    print(
+        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
+        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
+        f"\n\n\t{' '.join(cmd)}\n"
+    )
+    exit(1)
 
 def main():
     args_cli, hydra_args = parse_args()
@@ -81,7 +110,6 @@ def main():
     import gymnasium as gym
     import torch
     from rsl_rl.runners import OnPolicyRunner
-    from robot_rl.network.custom_policy_runner import CustomOnPolicyRunner
     from isaaclab.envs import (
         DirectMARLEnv,
         DirectMARLEnvCfg,
@@ -90,8 +118,9 @@ def main():
         multi_agent_to_single_agent,
     )
     from isaaclab.utils.dict import print_dict
-    from isaaclab.utils.io import dump_pickle, dump_yaml
+    from isaaclab.utils.io import dump_yaml
     from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+    from rsl_rl.runners import DistillationRunner, OnPolicyRunner
     from isaaclab_tasks.utils import get_checkpoint_path
     from isaaclab_tasks.utils.hydra import hydra_task_config
     import robot_rl.tasks  # noqa: F401
@@ -138,9 +167,11 @@ def main():
             log_dir += f"_{agent_cfg.run_name}"
         log_dir = os.path.join(log_root_path, log_dir)
 
+        env_cfg.log_dir = log_dir
+
         # Create environment
-        if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
-            env_cfg.__prepare_tensors__()
+        # if hasattr(env_cfg, "__prepare_tensors__") and callable(getattr(env_cfg, "__prepare_tensors__")):
+        #     env_cfg.__prepare_tensors__()
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
         # Convert to single-agent if needed
@@ -169,7 +200,15 @@ def main():
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
         # Create and configure runner
-        runner = CustomOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        # create runner from rsl-rl
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+
+        # runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         runner.add_git_repo_to_log(__file__)
 
         # Load checkpoint if resuming
@@ -180,8 +219,8 @@ def main():
         # Save configurations
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-        dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
-        dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
+        # dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
+        # dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
         # Run training
         runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
