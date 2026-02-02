@@ -69,9 +69,10 @@ class LibraryManager(ManagerBase):
             if manager.traj_data.output_names != output_names:
                 raise ValueError(f"Trajectories in the library are not compatible! Varying output_names!"
                                  f"Expected names (first traj): {manager.traj_data.output_names}, \ngot: {output_names}")
-            if manager.traj_data.reference_frames != ref_frames:
-                raise ValueError(f"Trajectories in the library are not compatible! Varying reference_frames!")
-
+            # TODO: Consider putting back!
+            # if manager.traj_data.reference_frames != ref_frames:
+            #     raise ValueError(f"Trajectories in the library are not compatible! Varying reference_frames!"
+            #                      f"Expected frames (first traj): {manager.traj_data.reference_frames}, \ngot: {ref_frames}")
         self.trajectory_type = trajectory_type
         self.num_outputs = num_ouputs
         self.output_names = output_names

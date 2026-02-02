@@ -16,13 +16,19 @@ EXPERIMENT_NAMES = {
     "lip_clf": "lip",
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
+
     "walking_clf": "walking_clf",
     "walking_clf_sym": "walking-clf-symmetric",
     "walking_clf_ec": "walking_clf",
+
     "running_clf": "running_clf",
+    "running_clf_sym": "running-clf-symmetric",
+
     "waving_clf": "waving_clf",
+
     "bow_forward_clf": "bow_forward_clf",
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+
     "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
 

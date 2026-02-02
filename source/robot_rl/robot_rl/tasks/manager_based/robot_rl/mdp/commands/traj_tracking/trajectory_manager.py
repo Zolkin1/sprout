@@ -218,7 +218,7 @@ class TrajectoryManager(ManagerBase):
                 bezier_coeffs=domain_yaml['bezier_coeffs'],
                 bezier_tensor=bezier_tensor,
                 time=domain_yaml['T'][0],
-                contact_bodies=domain_yaml['contact_bodies'],
+                contact_bodies=domain_yaml.get('contact_bodies', []),
                 bezier_frame=domain_yaml['ref_frame'],
                 bezier_frame_domain=domain_yaml['ref_frame_domain']
             )
@@ -340,7 +340,9 @@ class TrajectoryManager(ManagerBase):
         # TODO: Speed up. This seems to be taking about 0.2-0.3 s per iteration
         for dom in unique_domains:
             current_domains = domain_indices == dom
-            tau_dom = tau[current_domains]
+            dom_in_half = dom % self.num_domains
+            rel_prev_domains = torch.sum(self.T[:dom_in_half]) / torch.sum(self.T)
+            tau_dom = (tau[current_domains] - rel_prev_domains) * torch.sum(self.T) / T[dom]
             T_dom = T[dom].expand(tau_dom.shape[0])
             if dom >= self.num_domains:
                 if bezier_coeffs_reflect is None:

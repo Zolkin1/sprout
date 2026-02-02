@@ -17,12 +17,18 @@ from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 SIM_ENVIRONMENTS = {
     "vanilla": "G1-vanilla-walking",
     "lip_clf": "G1-lip-ref-play",
+
     "walking_clf": "G1-walking-clf-play",
     "walking_clf_sym": "G1-walking-clf-play",
+
     "running_clf": "G1-running-clf-play",
+    "running_clf_sym": "G1-running-clf-play",
+
     "waving_clf": "G1-waving-clf-play",
+
     "bow_forward_clf": "G1-bow_forward-clf-play",
     "bow_forward_clf_sym": "G1-bow_forward-clf-symmetric",    # TODO: make this a play
+
     "bend_up_clf_sym": "G1-bend_up-clf-play",
 }
 
