@@ -6,6 +6,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 import math
 from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -265,11 +266,9 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
     flight_contact_penalty = RewTerm(
         func=mdp.contact_schedule_penalty,
         weight=-3.0,
-        params={"command_name": "hzd_ref",
-                "base_vel_cmd": "base_velocity",
+        params={"command_name": "traj_ref",
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_ankle_roll_link"),
-                "weight_scalar": 0.0,
-                "start_vel": 2.0},
+                "weight_scalar": 0.0},
     )
 
     torque_lims = RewTerm(
@@ -281,10 +280,10 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
 class G1RunningCurriculumCfg:
     pass
     # TODO: Put back
-    # contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-    #                                       params={"update_interval": 20000,
-    #                                                "max_weight": 1.0,
-    #                                                "update_amnt": 0.1})
+    contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
+                                          params={"update_interval": 20000,
+                                                   "max_weight": 1.0,
+                                                   "update_amnt": 0.1})
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
