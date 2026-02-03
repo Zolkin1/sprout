@@ -103,20 +103,20 @@ class Robot:
 
         self.mj_model.body_ipos[body_id] += self.torso_ipos
 
-    def get_joystick_command(self):
+    def get_joystick_command(self, policy):
         """Get velocity commands from joystick."""
         des_vel = np.zeros(3)
         if self.joystick is not None:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(self.joystick_scaling[0]*self.joystick.get_axis(0))
-            vx = -(self.joystick_scaling[0]*self.joystick.get_axis(1)) * 3
-            vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3))
+            vy = -(self.joystick_scaling[0]*self.joystick.get_axis(0)) * policy.get_max_vy()
+            vx = -(self.joystick_scaling[0]*self.joystick.get_axis(1)) * policy.get_max_vx()
+            vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3)) * policy.get_max_vyaw()
 
             des_vel[0] = vx
-            des_vel[1] = min(max(vy, 0.), 0.)
-            des_vel[2] = min(max(vyaw, 0), 0)
+            des_vel[1] = vy
+            des_vel[2] = vyaw
         else:
             des_vel = np.array([0.5, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
@@ -130,7 +130,7 @@ class Robot:
         sim_time = self.mj_data.time
         # pg = self.get_projected_gravity(qpos[3:7])
         if self.input_function is None:
-            self.commanded_vel = self.get_joystick_command()
+            self.commanded_vel = self.get_joystick_command(policy)
         else:
             self.commanded_vel = self.input_function(sim_time)
 

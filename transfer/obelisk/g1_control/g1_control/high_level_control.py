@@ -47,9 +47,10 @@ class HighLevelController(ObeliskController, ABC):
         self.last_LB_press = self.get_clock().now().nanoseconds / 1e9
         self.last_X_press = self.get_clock().now().nanoseconds / 1e9
         self.last_Y_press = self.get_clock().now().nanoseconds / 1e9
+        self.last_DPAD_UP_press = self.get_clock().now().nanoseconds / 1e9
+        self.last_DPAD_DOWN_press = self.get_clock().now().nanoseconds / 1e9
 
-        self.lin_vel_mode = "joystick"  # joystick, incremental, function
-        self.ang_vel_mode = "joystick"  # joystick, odom
+        self.control_mode = "joystick"  # joystick, feedback
 
         self.rec_joystick = False
 
@@ -246,7 +247,7 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # Yaw Control
         ##
-        target_dist = 3 # m
+        # target_dist = 3 # m
         # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist) + self.yaw_init
 
         ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
@@ -280,23 +281,24 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # X Control
         ##
-        x_vel_avg = sum(self.x_vel_window)/len(self.x_vel_window)
-
-        self.x_cmd = self.cmd_vel[0]
-
-        if self.lin_vel_mode == "X_PD":
-            self.x_cmd = -self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel_avg) + self.x_pd_ff
-            self.x_cmd = np.clip(self.x_cmd, self.v_x_min, self.v_x_max)
+        # TODO: Consider bringing back
+        # x_vel_avg = sum(self.x_vel_window)/len(self.x_vel_window)
+        #
+        # self.x_cmd = self.cmd_vel[0]
+        #
+        # if self.lin_vel_mode == "X_PD":
+        #     self.x_cmd = -self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel_avg) + self.x_pd_ff
+        #     self.x_cmd = np.clip(self.x_cmd, self.v_x_min, self.v_x_max)
 
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
-        if self.lin_vel_mode == "joystick":
+        if self.control_mode == "joystick":
             self.cmd_vel[0] = min(
                 max(cmd_msg.v_x, self.v_x_min), self.v_x_max)
             self.cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
             self.cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
-        elif self.lin_vel_mode == "function":
+        elif self.control_mode == "function":
             RAMP_TIME = 2.0
             slope = self.v_x_max / RAMP_TIME
 
@@ -306,21 +308,25 @@ class HighLevelController(ObeliskController, ABC):
             self.cmd_vel[2] = 0
 
             if now - self.joystick_exited > 8:
-                self.lin_vel_mode = "joystick"
+                self.control_mode = "joystick"
                 self.get_logger().info("Joystick control re-enabled after timeout.")
-        elif self.lin_vel_mode == "incremental":
+        elif self.control_mode == "incremental":
             self.cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
             self.cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
             
     def update_x_hat(self, msg):
         """Receive the joystick message."""
         self.rec_joystick = True
-
+        RIGHT_BUMPER = 5
+        Y = 3
+        A = 0
         RIGHT_TRIGGER = 5
+        MENU = 6
+        DPAD_UP_DOWN = 7
+
         if msg.axes[RIGHT_TRIGGER] <= 0.1:
             raise RuntimeError("[High Level] Joystick emergency stop triggered!!")
 
-        MENU = 7
         now = self.get_clock().now().nanoseconds / 1e9
         if msg.buttons[MENU] >= 0.9 and now - self.last_menu_press > 0.5:
             self.last_menu_press = now
@@ -328,81 +334,50 @@ class HighLevelController(ObeliskController, ABC):
             " E-STOP: Right Trigger. \n " \
             " Forward/Backward: Left Stick. \n " \
             " Turning: Right Stick. \n" \
-            " Damping: Right D-Pad. \n" \
-            " Low Level Ctrl: Bottom D-Pad. \n" \
-            " User Pose: Squares. \n" \
-            " Joystick Mode: A. \n" \
-            " Incremental Velocity Mode: B. \n" \
-            " X PD Mode: X. \n" \
-            # " Function Velocity Mode: X. \n" \
-            " Increase Incremental Velocity: Right Bumper. \n" \
-            " Decrease Incremental Velocity: Left Bumper. \n" \
-            " Toggle Odom Correction: Y. \n" \
+            " Joystick Mode: D-Pad Up. \n" \
+            " Feedback Correction Mode: D-Pad Down. \n" \
+                                   # TODO: Add back in the X position feedback?
+            " Increase Incremental Velocity: Right Bumper + Y. \n" \
+            " Decrease Incremental Velocity: Right Bumper + A. \n" \
             " Zero odom targets: Right Bumper (while not in incremental mode).")
 
-        A = 0
-        if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.5:
-            self.last_A_press = now
-            self.lin_vel_mode = "joystick"
+        if msg.axes[DPAD_UP_DOWN] >= 0.9 and now - self.last_DPAD_UP_press > 0.5:
+            self.last_DPAD_UP_press = now
+            self.control_mode = "joystick"
             self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info("Joystick control enabled!")
 
-        # B = 1
-        # if msg.buttons[B] >= 0.9 and now - self.last_B_press > 0.5:
-        #     self.last_B_press = now
-        #     self.lin_vel_mode = "incremental"
-        #     self.cmd_vel = np.zeros((3,))
-        #     self.cmd_vel[0] = self.vel_increment_start     
-        #     self.get_logger().info("Joystick incremental velocity mode enabled!")
+        if msg.axes[DPAD_UP_DOWN] <= -0.9 and now - self.last_DPAD_DOWN_press > 0.5:
+            self.last_DPAD_DOWN_press = now
+            self.control_mode = "feedback"
+            self.get_logger().info("Feedback control enabled!")
 
-        # X = 2
-        # if msg.buttons[X] >= 0.9 and now - self.last_X_press > 0.5:
-        #     self.last_X_press = now
-        #     self.lin_vel_mode = "X_PD" #"function"
-        #     self.x_pd_ff = self.cmd_vel[0]
-        #     self.get_logger().info(f"X PD mode enabled! Feedforward set to {self.x_pd_ff:.3f} m/s.")
-        #     # self.get_logger().info("Function velocity mode enabled!")
-
-        # Y = 3
-        # if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.5:
-        #     if self.use_odom:
-        #         self.last_Y_press = now
-        #         self.ang_vel_mode = "joystick" if self.ang_vel_mode == "odom" else "odom"
-        #         if self.ang_vel_mode == "odom":
-        #             self.get_logger().info("Odom correction enabled!")
-        #         else:
-        #             self.get_logger().info("Odom correction disabled!")
-
-        RIGHT_BUMPER = 5
-        if msg.buttons[RIGHT_BUMPER] >= 0.9 and now - self.last_RB_press > 0.2:
-            if self.lin_vel_mode == "incremental":
+        if msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "feedback":
+            if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.2:
                 self.cmd_vel[0] += self.vel_increment
                 vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
                 if self.cmd_vel[0] > vx_max:
                     self.cmd_vel[0] = vx_max
-
                 self.get_logger().info(f"----- INCREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
-            elif self.use_odom:
-                self.yaw_init = self.yaw_cur
-                self.yaw_target = self.yaw_cur
-                x, y = rotate_into_yaw(self.yaw_init, self.x_pos_cur, self.y_pos_cur)
-                self.y_pos_target = y
-                self.get_logger().info(f"Odom targets zeroed at: Y position: {self.y_pos_target}, yaw target: {self.yaw_target}!")
+                self.last_Y_press = now
+            if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.2:
+                self.cmd_vel[0] -= self.vel_increment
+                vx_min = self.get_parameter("v_x_min").get_parameter_value().double_value
+                if self.cmd_vel[0] < vx_min:
+                    self.cmd_vel[0] = vx_min
 
-                self.x_target = self.x_pos_cur
-                self.get_logger().info(f"X position target set to current X position: {self.x_target}.")
+                self.get_logger().info(f"----- DECREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
+                self.last_A_press = now
+        elif msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "joystick" and now - self.last_RB_press > 0.5:
+            self.yaw_init = self.yaw_cur
+            self.yaw_target = self.yaw_cur
+            x, y = rotate_into_yaw(self.yaw_init, self.x_pos_cur, self.y_pos_cur)
+            self.y_pos_target = y
+            self.get_logger().info(f"Odom targets zeroed at: Y position: {self.y_pos_target}, yaw target: {self.yaw_target}!")
+
+            self.x_target = self.x_pos_cur
+            self.get_logger().info(f"X position target set to current X position: {self.x_target}.")
             self.last_RB_press = now
-
-
-        LEFT_BUMPER = 4
-        if self.lin_vel_mode == "incremental" and msg.buttons[LEFT_BUMPER] >= 0.9 and now - self.last_LB_press > 0.2:
-            self.cmd_vel[0] -= self.vel_increment
-            vx_min = self.get_parameter("v_x_min").get_parameter_value().double_value
-            if self.cmd_vel[0] < vx_min:
-                self.cmd_vel[0] = vx_min
-
-            self.get_logger().info(f"----- DECREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
-            self.last_LB_press = now
 
     def compute_control(self):
         """Return the commanded velocity."""
@@ -413,17 +388,17 @@ class HighLevelController(ObeliskController, ABC):
 
             msg.w_z = float(self.cmd_vel[2])
             
-            if self.use_odom and self.ang_vel_mode == "odom":
+            if self.control_mode == "feedback": #self.use_odom and self.ang_vel_mode == "odom":
                 self.compute_odom_control()
 
                 msg.w_z = float(self.yaw_rate_cmd)
 
                 msg.v_y = float(self.y_cmd)
 
-                # TODO: Add option to set cmd vel with the x PD controller
 
-            if self.lin_vel_mode == "X_PD":
-                msg.v_x = self.x_cmd
+            # TODO: Consider bringing this back
+            # if self.lin_vel_mode == "X_PD":
+            #     msg.v_x = self.x_cmd
 
             self.obk_publishers["pub_ctrl"].publish(msg)
 

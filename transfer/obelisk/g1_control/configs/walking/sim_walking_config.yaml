@@ -55,13 +55,13 @@ onboard:
       params:
         v_x_min: -1.0
         v_x_max: 1.0
-        v_y_max: 0.0
-        w_z_max: 1.0
+        v_y_max: 0.2
+        w_z_max: 0.5
         vel_increment: 0.1
         kp_yaw: 3.0
         kd_yaw: 0.1
-        kp_y: 0.0
-        kd_y: 0.0
+        kp_y: 3.0
+        kd_y: 0.1
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0

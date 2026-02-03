@@ -430,11 +430,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
 @configclass
 class G1RunningCurriculumCfg:
     pass
-    # TODO: Put back
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-                                          params={"update_interval": 20000,
+                                          params={"update_interval": 40000, #20000,
                                                    "max_weight": 1.0,
                                                    "update_amnt": 0.1})
+
+    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 30000, "min_max_err": (0.25, 0.3, 0.2) })
+
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
