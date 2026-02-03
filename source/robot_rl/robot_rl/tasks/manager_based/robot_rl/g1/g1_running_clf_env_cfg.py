@@ -189,12 +189,58 @@ RUNNING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
 #         0.01,0.01,0.01,
 #     ]
 
+def _find_idx(strings, *substrings):
+    """Find index of first string containing all substrings."""
+    return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
+
+
+def _build_heuristic_cache(output_names, contact_bodies, env):
+    """Build all index lookups once for the heuristic function."""
+    cache = {}
+    robot = env.scene["robot"]
+
+    # Cache per-body output indices
+    cache['body_output_indices'] = {}
+    cache['body_robot_indices'] = {}
+
+    for body in contact_bodies:
+        side = "left" if "left" in body else "right"
+
+        # Output indices for this body
+        cache['body_output_indices'][body] = {
+            'ori_z': _find_idx(output_names, "ori_z", body),
+            'pos_y': _find_idx(output_names, "pos_y", body),
+            'hip_yaw': _find_idx(output_names, "yaw", f"{side}_hip_yaw_joint"),
+            'hip_roll': _find_idx(output_names, f"{side}_hip_roll_joint"),
+        }
+
+        # Robot body indices for this contact body
+        cache['body_robot_indices'][body] = {
+            'hip_roll': robot.body_names.index(f"{side}_hip_roll_link"),
+            'ankle': robot.body_names.index(f"{side}_ankle_roll_link"),
+        }
+
+    # Cache global output indices (applied to all envs)
+    cache['pelvis_ori_z'] = _find_idx(output_names, "ori_z", "pelvis_link")
+    cache['pelvis_pos_y'] = _find_idx(output_names, "pos_y", "pelvis_link")
+    cache['com_pos_y'] = _find_idx(output_names, "pos_y", "com")
+    cache['right_wrist_ori_z'] = _find_idx(output_names, "ori_z", "right_wrist_yaw_link")
+    cache['left_wrist_ori_z'] = _find_idx(output_names, "ori_z", "left_wrist_yaw_link")
+    cache['right_wrist_pos_y'] = _find_idx(output_names, "pos_y", "right_wrist_yaw_link")
+    cache['left_wrist_pos_y'] = _find_idx(output_names, "pos_y", "left_wrist_yaw_link")
+
+    return cache
+
+
+# Module-level cache for heuristic function (Hydra requires function to be findable by name)
+_HEURISTIC_CACHE = {}
+
+
 def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states,
                            phi, total_time, threshold):
-    """
-    Heuristically modify the gait library to allow for sideways walking and turning.
+    """Heuristically modify the gait library for sideways walking and turning.
 
-    See _apply_swing_modifications in gait_library_traj.py
+    Indices are cached on first call for performance.
 
     Args:
         env: Environment object.
@@ -202,8 +248,15 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
         outputs: Output variables.
         contact_bodies: Names of the contact bodies. Of shape [num_contact_bodies]
         contact_states: tensor of shape [N, num_contact_bodies]
-        time_into_domain: tensor of shape [N] giving the total time for the current domain each env is in
+        phi: Phasing variable tensor of shape [N]
+        total_time: Total time for the trajectory
+        threshold: Velocity threshold for standing detection
     """
+    global _HEURISTIC_CACHE
+
+    # Initialize cache on first call
+    if not _HEURISTIC_CACHE:
+        _HEURISTIC_CACHE.update(_build_heuristic_cache(output_names, contact_bodies, env))
 
     # Get the commanded velocity
     vel_cmd = env.command_manager.get_command("base_velocity").clone()
@@ -217,127 +270,98 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
     time_half = total_time / 2.0
     time_into_step = time_half * phi_half
 
-    def find_idx(strings, *substrings):
-        """Find index of first string containing all substrings."""
-        return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
-
-    # Determine yaw modification
+    # Determine yaw and horizontal modifications
     delta_psi = vel_cmd[:, 2] * time_into_step
-
-    # Determine horizontal modification
     delta_y = vel_cmd[:, 1] * time_into_step
 
-    # TODO: Deal with forward vs backward direction
+    # Get robot reference once
+    robot = env.scene["robot"]
 
     # Iterate through the bodies not in contact
     for i, body in enumerate(contact_bodies):
         env_idx = torch.where(contact_states[:, i] == 0)[0]
+        if len(env_idx) == 0:
+            continue
 
-        ##
-        # Adjust this body
-        ##
-        # Apply yaw and horizontal modifications
-        # ori_z is the yaw
-        # TODO: Need to search NOT contact_bodies but the output names
-        idx = find_idx(output_names, "ori_z", body)
+        body_indices = _HEURISTIC_CACHE['body_output_indices'][body]
+        robot_indices = _HEURISTIC_CACHE['body_robot_indices'][body]
+
+        # Apply yaw modification (ori_z)
+        idx = body_indices['ori_z']
         if idx is not None:
             outputs[env_idx, 0, idx] += delta_psi[env_idx]
             outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
 
-
-        idx = find_idx(output_names, "pos_y", body)
+        # Apply horizontal modification (pos_y)
+        idx = body_indices['pos_y']
         if idx is not None:
             outputs[env_idx, 0, idx] += delta_y[env_idx]
             outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1]
 
-
-        # Adjust the hip yaw
-        if "left" in body:
-            idx = find_idx(output_names, "yaw", "left_hip_yaw_joint")
-        else:
-            idx = find_idx(output_names, "yaw", "right_hip_yaw_joint")
-
+        # Adjust hip yaw
+        idx = body_indices['hip_yaw']
         if idx is not None:
             outputs[env_idx, 0, idx] += delta_psi[env_idx]
             outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
 
-        ##
-        # Hip Roll
-        ##
-        # Adjust hip roll based on the height of the foot
-        if "left" in body:
-            hip_roll_link_name = "left_hip_roll_link"
-            hip_roll_joint_name = "left_hip_roll_joint"
-            ankle_link_name = "left_ankle_roll_link"
-        else:
-            hip_roll_link_name = "right_hip_roll_link"
-            hip_roll_joint_name = "right_hip_roll_joint"
-            ankle_link_name = "right_ankle_roll_link"
-
-        # Get the height of the hip roll link and the foot
-        robot = env.scene["robot"]
-        hip_roll_idx = robot.body_names.index(hip_roll_link_name)
-        ankle_idx = robot.body_names.index(ankle_link_name)
+        # Adjust hip roll based on foot height
+        hip_roll_idx = robot_indices['hip_roll']
+        ankle_idx = robot_indices['ankle']
 
         hip_roll_height = robot.data.body_pos_w[:, hip_roll_idx, 2]
         foot_height = robot.data.body_pos_w[:, ankle_idx, 2]
-
-        # Vertical distance from hip roll to foot (adjacent side of right triangle)
         vertical_distance = torch.abs(hip_roll_height - foot_height)
 
-        # Use trig: tan(theta) = opposite / adjacent = delta_y / vertical_distance
-        # Therefore: theta = atan(delta_y / vertical_distance)
         required_roll_angle = torch.atan2(delta_y, vertical_distance)
 
-        # Find and update the hip roll joint output
-        idx = find_idx(output_names, hip_roll_joint_name)
+        idx = body_indices['hip_roll']
         if idx is not None:
             outputs[env_idx, 0, idx] += required_roll_angle[env_idx]
-            # Velocity: d(theta)/dt = (1 / vertical_distance) * d(delta_y)/dt for small angles
             outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1] / vertical_distance[env_idx]
 
-
-    # Adjust hands yaw
-    idx = find_idx(output_names, "ori_z", "right_wrist_yaw_link")
+    # Apply global modifications (all envs)
+    # Hands yaw
+    idx = _HEURISTIC_CACHE['right_wrist_ori_z']
     if idx is not None:
         outputs[:, 0, idx] += delta_psi
         outputs[:, 1, idx] += vel_cmd[:, 2]
 
-    idx = find_idx(output_names, "ori_z", "left_wrist_yaw_link")
+    idx = _HEURISTIC_CACHE['left_wrist_ori_z']
     if idx is not None:
         outputs[:, 0, idx] += delta_psi
         outputs[:, 1, idx] += vel_cmd[:, 2]
 
-    # Adjust hands y
-    idx = find_idx(output_names, "pos_y", "right_wrist_yaw_link")
+    # Hands y
+    idx = _HEURISTIC_CACHE['right_wrist_pos_y']
     if idx is not None:
         outputs[:, 0, idx] += delta_y
         outputs[:, 1, idx] += vel_cmd[:, 1]
 
-    idx = find_idx(output_names, "pos_y", "left_wrist_yaw_link")
+    idx = _HEURISTIC_CACHE['left_wrist_pos_y']
     if idx is not None:
         outputs[:, 0, idx] += delta_y
         outputs[:, 1, idx] += vel_cmd[:, 1]
 
-    # Adjust pelvis yaw
-    idx = find_idx(output_names, "ori_z", "pelvis_link")
+    # Pelvis yaw
+    idx = _HEURISTIC_CACHE['pelvis_ori_z']
     if idx is not None:
         outputs[:, 0, idx] += delta_psi
         outputs[:, 1, idx] += vel_cmd[:, 2]
 
-    # Adjust pelvis y
-    idx = find_idx(output_names, "pos_y", "pelvis_link")
+    # Pelvis y
+    idx = _HEURISTIC_CACHE['pelvis_pos_y']
     if idx is not None:
         outputs[:, 0, idx] += delta_y
         outputs[:, 1, idx] += vel_cmd[:, 1]
 
-    # Adjust COM y
-    idx = find_idx(output_names, "pos_y", "com")
+    # COM y
+    idx = _HEURISTIC_CACHE['com_pos_y']
     if idx is not None:
         outputs[:, 0, idx] += delta_y
         outputs[:, 1, idx] += vel_cmd[:, 1]
 
     return outputs
+
 
 @configclass
 class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):

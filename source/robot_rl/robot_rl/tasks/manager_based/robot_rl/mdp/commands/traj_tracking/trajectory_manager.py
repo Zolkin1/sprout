@@ -82,6 +82,39 @@ class TrajectoryManager(ManagerBase):
         # TODO: Make the R to remap programatic instead of hard-coded
         # TODO: Why are the z height values never at zero when the foot is in stance?
 
+        # Pre-compute binomial coefficients for batched bezier interpolation
+        # (doesn't depend on bezier_coeffs order, so computed once here)
+        max_degree = self.traj_data.spline_order
+        self._binomial_coeffs = {}
+        for d in range(max_degree + 1):
+            self._binomial_coeffs[d] = torch.tensor(
+                [math.comb(d, i) for i in range(d + 1)],
+                dtype=torch.float32, device=self.device
+            )
+
+        # Initialize precomputed coefficients (will be updated by order_outputs if called)
+        self._update_precomputed_coefficients()
+
+    def _update_precomputed_coefficients(self):
+        """Recompute cached values after bezier_coeffs change.
+
+        This must be called whenever bezier_coeffs are modified (e.g., by order_outputs).
+        """
+        # Pre-stack coefficients for efficient batched lookup
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            self._bezier_coeffs_reflected = self.remap_trajectory()
+            self._all_coeffs = torch.cat([self.bezier_coeffs, self._bezier_coeffs_reflected], dim=0)
+            self._T_all = torch.cat([self.T, self.T])
+        else:
+            self._all_coeffs = self.bezier_coeffs
+            self._T_all = self.T
+
+        # Pre-compute cumulative domain times for tau normalization
+        self._cumsum_T = torch.cumsum(
+            torch.cat([torch.zeros(1, device=self.device), self.T[:-1]]), dim=0
+        )
+        self._total_T = self.T.sum()
+
     def _get_from_hugging_face(self, hf_repo: str, hf_path: str) -> str:
         """
         Load the trajectories from hugging face. Download it into the run folder /hf/ folder.
@@ -296,10 +329,78 @@ class TrajectoryManager(ManagerBase):
     def get_num_domains(self):
         return self.expanded_num_domains
 
-    def get_output(self, t: torch.Tensor     # [N]
-                          ) -> torch.Tensor:
+    def _compute_normalized_tau(self, t: torch.Tensor, domain_indices: torch.Tensor) -> torch.Tensor:
+        """Compute tau normalized to [0,1] within each domain.
+
+        Args:
+            t: shape [N] times
+            domain_indices: shape [N] domain index for each time
+
+        Returns:
+            tau_normalized: shape [N] normalized time in [0,1] within domain
         """
-        Compute the bezier values at a given time.
+        tau = self.get_phasing_var(t)
+
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            tau = tau.clone()
+            tau[tau >= 0.5] -= 0.5
+            tau /= 0.5
+
+        # Get domain index within original (non-reflected) domains
+        dom_in_half = domain_indices % self.num_domains
+
+        # Compute relative start of each domain using pre-computed values
+        rel_prev_domains = self._cumsum_T[dom_in_half] / self._total_T
+
+        # Get the domain duration for each environment
+        T_dom = self._T_all[domain_indices]
+
+        # Normalize tau to [0,1] within the domain
+        tau_normalized = (tau - rel_prev_domains) * self._total_T / T_dom
+        return torch.clamp(tau_normalized, 0.0, 1.0)
+
+    def _compute_bezier_batched(self, tau: torch.Tensor, ctrl_pts: torch.Tensor,
+                                T: torch.Tensor, derivative: bool) -> torch.Tensor:
+        """Batched bezier interpolation for all environments at once.
+
+        Args:
+            tau: [N] normalized time in [0,1]
+            ctrl_pts: [N, num_outputs, degree+1] control points for each env
+            T: [N] domain durations for each env
+            derivative: True for velocity, False for position
+
+        Returns:
+            [N, num_outputs] interpolated values
+        """
+        degree = ctrl_pts.shape[-1] - 1
+
+        if not derivative:
+            # Position: Bernstein polynomial B(tau) = sum_i C(n,i) * tau^i * (1-tau)^(n-i) * P_i
+            coefs = self._binomial_coeffs[degree]  # [degree+1]
+            i_vec = torch.arange(degree + 1, device=ctrl_pts.device)
+
+            tau_pow = tau.unsqueeze(1) ** i_vec  # [N, degree+1]
+            one_minus_pow = (1 - tau).unsqueeze(1) ** (degree - i_vec)  # [N, degree+1]
+            weights = coefs * tau_pow * one_minus_pow  # [N, degree+1]
+
+            # Batched weighted sum: [N, degree+1] @ [N, num_outputs, degree+1] -> [N, num_outputs]
+            return torch.einsum('nd,nod->no', weights, ctrl_pts)
+        else:
+            # Velocity: derivative of Bernstein polynomial
+            coefs = self._binomial_coeffs[degree - 1]  # [degree]
+            i_vec = torch.arange(degree, device=ctrl_pts.device)
+
+            tau_pow = tau.unsqueeze(1) ** i_vec  # [N, degree]
+            one_minus_pow = (1 - tau).unsqueeze(1) ** (degree - 1 - i_vec)
+            weights = degree * coefs * tau_pow * one_minus_pow  # [N, degree]
+
+            # Control point differences: [N, num_outputs, degree]
+            cp_diff = ctrl_pts[:, :, 1:] - ctrl_pts[:, :, :-1]
+            result = torch.einsum('nd,nod->no', weights, cp_diff)
+            return result / T.unsqueeze(1)
+
+    def get_output(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute the bezier values at a given time using batched operations.
 
         Args:
             t: shape [N] where N is the number of times that need to be queried.
@@ -308,52 +409,26 @@ class TrajectoryManager(ManagerBase):
             outputs: shape [N, 2, num_outputs] where num_outputs is the number of outputs of the trajectory,
                 and we have one for the position and one for the velocity.
 
-        To compute this value, we first determine which domain the times are in then we compute the values in a batched manner.
+        This implementation uses fully vectorized operations to avoid per-domain loops.
         """
-        bezier_coeffs = self.bezier_coeffs
+        N = t.shape[0]
 
-        # Map time based on trajectory time
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            bezier_coeffs_reflect = self.remap_trajectory() # TODO: Fix remap to be flexible in the ordering
+        # Get domain indices for all environments
+        domain_indices = self.get_current_domains(t)  # [N]
 
-        # Determine the domain for each time
+        # Compute normalized tau for each environment
+        tau = self._compute_normalized_tau(t, domain_indices)  # [N]
 
-        domain_indices = self.get_current_domains(t)
+        # Gather coefficients for each env using advanced indexing: [N, num_outputs, 2, degree+1]
+        env_coeffs = self._all_coeffs[domain_indices]
 
-        # Normalize the time relative to the domain
-        domain_start_times = self.domain_boundaries[domain_indices]
-        tau = self.get_phasing_var(t)
-        T = self.T
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            # Normalize
-            tau[tau >= 0.5] -= 0.5
-            tau /= 0.5
-            T = torch.cat((self.T, self.T))
+        # Get domain durations for each environment
+        env_T = self._T_all[domain_indices]
 
-        # Compute outputs
-        outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs, device=self.device)
-        # outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[0, :, :].squeeze(), T[domain_indices])
-
-        # Get the unique domains
-        unique_domains = torch.unique(domain_indices)
-
-        # TODO: Speed up. This seems to be taking about 0.2-0.3 s per iteration
-        for dom in unique_domains:
-            current_domains = domain_indices == dom
-            dom_in_half = dom % self.num_domains
-            rel_prev_domains = torch.sum(self.T[:dom_in_half]) / torch.sum(self.T)
-            tau_dom = (tau[current_domains] - rel_prev_domains) * torch.sum(self.T) / T[dom]
-            T_dom = T[dom].expand(tau_dom.shape[0])
-            if dom >= self.num_domains:
-                if bezier_coeffs_reflect is None:
-                    raise ValueError(f"Issue indexing into the bezier coefficients due to the half period!")
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 0, :].squeeze(),
-                                                                             T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 1, :].squeeze(),
-                                                                             T_dom)
-            else:
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 0, :].squeeze(), T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 1, :].squeeze(), T_dom)
+        # Compute outputs in two batched calls (position and velocity)
+        outputs = torch.zeros(N, 2, self.traj_data.num_outputs, device=self.device)
+        outputs[:, 0, :] = self._compute_bezier_batched(tau, env_coeffs[:, :, 0, :], env_T, derivative=False)
+        outputs[:, 1, :] = self._compute_bezier_batched(tau, env_coeffs[:, :, 1, :], env_T, derivative=False)
 
         return outputs
 
@@ -508,6 +583,9 @@ class TrajectoryManager(ManagerBase):
 
         # Regenerate the relabeling matrix
         self.R_relabel = torch.from_numpy(self.relable_ee_stance_coeffs()).to(device=self.device, dtype=self.bezier_coeffs.dtype)
+
+        # Regenerate precomputed coefficients for batched operations
+        self._update_precomputed_coefficients()
 
     @staticmethod
     def _compute_bezier_interp(derivative: int,         # 0 -> position, 1 -> velocity

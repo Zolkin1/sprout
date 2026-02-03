@@ -8,18 +8,23 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "running_clf_sym/2026-02-02_19-52-32_running_longer_curriculum_sym"
+          "running_clf_sym/2026-02-02_19-52-32_running_longer_curriculum_sym",
+          "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
+
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
+          "zolkin/robot_rl",
         ]
         behavior_names: [
-          "running"
+          "running",
+          "walking",
         ]
         behavior_buttons: [
-          3,                  # x
+          2,                  # x
+          1,                  # b
         ]
-        init_behavior: "running"
+        init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
         log: true
         log_decimation: 1 # relative to the control callback
