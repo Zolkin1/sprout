@@ -266,8 +266,7 @@ WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
 #         0.01,0.01,0.01,
 #     ]
 
-# TODO: Test
-def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, time_into_domain, threshold):
+def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states, phi, total_time, threshold):
     """
     Heuristically modify the gait library to allow for sideways walking and turning.
 
@@ -289,15 +288,20 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
     standing_mask = torch.abs(vel_cmd[:, 0]) < threshold
     vel_cmd[standing_mask, :] *= 0.0
 
+    # Time into half period
+    phi_half = torch.remainder(phi, 0.5)
+    time_half = total_time / 2.0
+    time_into_step = time_half * phi_half
+
     def find_idx(strings, *substrings):
         """Find index of first string containing all substrings."""
         return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
 
     # Determine yaw modification
-    delta_psi = vel_cmd[:, 2] * time_into_domain
+    delta_psi = vel_cmd[:, 2] * time_into_step
 
     # Determine horizontal modification
-    delta_y = vel_cmd[:, 1] * time_into_domain
+    delta_y = vel_cmd[:, 1] * time_into_step
 
     # TODO: Deal with forward vs backward direction
 

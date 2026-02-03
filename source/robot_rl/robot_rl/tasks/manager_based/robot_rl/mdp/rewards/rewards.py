@@ -312,12 +312,14 @@ def contact_schedule_penalty(env: ManagerBasedRLEnv, command_name: str,
 
     # Get bodies not in contact for each env
     contact_states = cmd.get_contact_state(t)
-    contact_bodies = cmd.contact_frame_indices
+    contact_body_names = cmd.contact_bodies
 
     contact_forces = torch.zeros(t.shape[0], dtype=torch.float, device=env.device)
-    for i, body_idx in enumerate(contact_bodies):
-        if contact_states[i]:
-            contact_forces += contact_sensor.data.net_forces_w[:, body_idx, :].norm(dim=-1)  # Gets the most recent force only
+    for i, body_name in enumerate(contact_body_names):
+        contact_mask = contact_states[:, i] == 1
+        indices = torch.tensor([i for i, v in enumerate(sensor_cfg.body_names) if v == body_name])
+        body_id = sensor_cfg.body_ids[indices]
+        contact_forces[contact_mask] += contact_sensor.data.net_forces_w[contact_mask, body_id, :].norm(dim=-1)  # Gets the most recent force only
 
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
     return penalty

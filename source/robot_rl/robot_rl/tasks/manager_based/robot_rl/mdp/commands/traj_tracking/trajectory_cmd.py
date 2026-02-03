@@ -556,9 +556,15 @@ class TrajectoryCommand(CommandTerm):
         # Apply optional heuristic modification
         if self.user_heuristic is not None:
             contact_states = self.get_contact_state(t)
-            time_into_domain = torch.remainder(t, self.manager.get_domain_times(t))
+            # Get the phasing variable and the total time
+            phi = self.get_phasing_var()
+            total_time = self.manager.get_total_time()
             y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
-                                    contact_states, time_into_domain, self.cfg.hold_phi_threshold)
+                                    contact_states, phi, total_time, self.cfg.hold_phi_threshold)
+
+            # time_into_domain = torch.remainder(t, self.manager.get_domain_times(t))
+            # y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
+            #                         contact_states, time_into_domain, self.cfg.hold_phi_threshold)
 
         self.y_des = y[:, 0, :]
         self.dy_des = y[:, 1, :]
