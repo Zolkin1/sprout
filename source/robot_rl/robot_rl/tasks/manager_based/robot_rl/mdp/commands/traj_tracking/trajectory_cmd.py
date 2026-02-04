@@ -128,6 +128,8 @@ class TrajectoryCommand(CommandTerm):
         self.get_desired_output_time = 0.0
         self.vdot_time = 0.0
 
+        self.init_time_offset = torch.zeros(self.num_envs, device=self.device)
+
     def update_phasing_var(self, t: torch.Tensor):
         """Get the phasing variable for the current trajectory.
 
@@ -647,6 +649,8 @@ class TrajectoryCommand(CommandTerm):
             self.time_offset[mask] = torch.rand(mask.shape, device=self.device) * self.cfg.random_start_time_max
 
         t = torch.maximum(t - self.time_offset, torch.zeros_like(t))
+
+        t = t + self.init_time_offset
 
         if self.cfg.percent_hold_phi > 0:
             mask = torch.where(self.env.episode_length_buf == 0)[0]

@@ -212,7 +212,7 @@ class LibraryManager(ManagerBase):
 
         return phasing_var
 
-    def get_output(self, t: torch.Tensor) -> torch.Tensor:
+    def get_output(self, t: torch.Tensor, env_ids = None) -> torch.Tensor:
         """Compute the outputs to be tracked by the RL.
 
         Args:
@@ -223,6 +223,9 @@ class LibraryManager(ManagerBase):
         """
         conditioner = self.get_conditioner_var()
         indices = self.get_traj_indices(conditioner)
+
+        if env_ids is not None:
+            indices = indices[env_ids]
 
         # Initialize output tensor
         N = t.shape[0]

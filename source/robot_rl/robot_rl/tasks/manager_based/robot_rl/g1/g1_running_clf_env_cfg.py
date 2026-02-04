@@ -398,6 +398,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         phasing_boundaries=4,
     )
 
+    # TODO: Consider tuning this
     base_velocity = TreadmillVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
@@ -453,7 +454,6 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
 
 @configclass
 class G1RunningCurriculumCfg:
-    pass
     contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
                                           params={"update_interval": 40000, #20000,
                                                    "max_weight": 1.0,
@@ -464,7 +464,16 @@ class G1RunningCurriculumCfg:
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
-    pass
+    reset_on_ref = EventTerm(
+        func=mdp.reset_on_reference,
+        mode="reset",
+        params={"command_name": "traj_ref",
+                "base_frame_name": "pelvis_link",
+                "rel_envs_on_ref": 0.5}
+    )
+
+    reset_base = None
+    reset_robot_joints = None
 
 @configclass
 class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
@@ -486,17 +495,17 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
 
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)  # Note the curriculum for increasing
 
-        self.events.reset_base.params = {
-            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},
-            "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "z": (0.0, 0.0),
-                "roll": (0.0, 0.0),
-                "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0),
-            },
-        }
+        # self.events.reset_base.params = {
+        #     "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},
+        #     "velocity_range": {
+        #         "x": (0.0, 0.0),
+        #         "y": (0.0, 0.0),
+        #         "z": (0.0, 0.0),
+        #         "roll": (0.0, 0.0),
+        #         "pitch": (0.0, 0.0),
+        #         "yaw": (0.0, 0.0),
+        #     },
+        # }
 
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
@@ -601,6 +610,9 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
         self.commands.base_velocity.debug_vis = False
+
+        self.episode_length_s = 4.0
+
 
         self.scene.num_envs = 2
         self.scene.env_spacing = 2.5
