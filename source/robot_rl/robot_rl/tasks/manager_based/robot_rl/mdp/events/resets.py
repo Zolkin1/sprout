@@ -15,6 +15,7 @@ def reset_on_reference(
         env: ManagerBasedEnv,
         env_ids: torch.Tensor,
         command_name: str,
+        conditioner_command_name: str,
         base_frame_name: str,
         joint_scale_range: tuple[float, float] = (1.0, 1.0),
         rel_envs_on_ref: float = 0.5,
@@ -44,7 +45,12 @@ def reset_on_reference(
     # Get the robot asset and trajectory command
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
+    # cond_cmd = env.command_manager.get_term(conditioner_command_name)
+    # print(f"cond_vel: {env.command_manager.get_command(conditioner_command_name)}")
     num_env = len(env_ids)
+
+    if num_env == 0:
+        return
 
     r = torch.empty(len(env_ids), device=env.device)
 
@@ -57,8 +63,9 @@ def reset_on_reference(
     nonref_ids = env_ids[nonref_env]
     num_nonref_envs = len(nonref_ids)
 
-    if num_env == 0:
-        return
+    # Resample the command
+
+
 
     # Validate base frame exists in trajectory outputs
     pos_indices = _find_output_indices(cmd.ordered_output_names, base_frame_name, "pos_")

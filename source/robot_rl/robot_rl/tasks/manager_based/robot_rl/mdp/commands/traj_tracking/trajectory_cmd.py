@@ -680,6 +680,8 @@ class TrajectoryCommand(CommandTerm):
         self.vdot = vdot
         self.v = vcur
 
+        self.manager.log_v_on_phasing_var(self.get_phasing_var(), self.v)
+
     def _update_metrics(self):
         """
         Update the metrics.
@@ -703,6 +705,11 @@ class TrajectoryCommand(CommandTerm):
         self.metrics["get_measured_output_time"] = self.get_measured_output_time
         self.metrics["get_desired_output_time"] = self.get_desired_output_time
         self.metrics["vdot_time"] = self.vdot_time
+
+        # Log per-reference tracking
+        v_mean = self.manager.get_v_log_avg().squeeze(-1)
+        for i in range(len(v_mean)):
+            self.metrics[f"CLF_EMA_{i}"] = v_mean[i].expand(self.num_envs)
 
     def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[int]]:
         """

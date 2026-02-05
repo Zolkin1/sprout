@@ -95,6 +95,12 @@ class TrajectoryManager(ManagerBase):
         # Initialize precomputed coefficients (will be updated by order_outputs if called)
         self._update_precomputed_coefficients()
 
+        # Logging tracking
+        phi_keys = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        self.phi_keys = torch.tensor(phi_keys, device=self.device)
+        self.v_log = torch.zeros_like(self.phi_keys)
+        self.num_v_log = torch.zeros_like(self.phi_keys)
+
     def _update_precomputed_coefficients(self):
         """Recompute cached values after bezier_coeffs change.
 
@@ -1047,6 +1053,35 @@ class TrajectoryManager(ManagerBase):
                     })
 
                 current_idx += len(axes)
+
+    def log_v_on_phasing_var(self, phi: torch.Tensor, v: torch.Tensor):
+        """
+        Log the value of the CLF at its value in the phasing variable.
+
+        Args:
+            phi: [N] phasing variable values.
+            v: [N] CLF values to log.
+        """
+        # Get the bin that the phasing variable fits in
+        bin_indices = torch.searchsorted(self.phi_keys, phi, right=False)
+        bin_indices = torch.clamp(bin_indices, 0, len(self.phi_keys) - 1)
+
+        # Count how many values fall into each bin and sum the v values per bin
+        batch_counts = torch.zeros_like(self.num_v_log)
+        batch_sums = torch.zeros_like(self.v_log)
+        batch_counts.scatter_add_(0, bin_indices, torch.ones_like(v))
+        batch_sums.scatter_add_(0, bin_indices, v)
+
+        alpha = 0.005
+
+        # Exponential moving average: update only bins that received new data
+        mask = batch_counts > 0
+        batch_means = batch_sums[mask] / batch_counts[mask]
+        self.v_log[mask] = (1 - alpha) * self.v_log[mask] + alpha * batch_means
+        self.num_v_log += batch_counts
+
+    def get_v_log(self):
+        return self.v_log, self.phi_keys
 
 def _ncr(n, r):
     return math.comb(n, r)

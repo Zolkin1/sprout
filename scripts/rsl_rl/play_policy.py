@@ -173,6 +173,12 @@ def extract_reference_trajectory(env, log_vars, command_name):
                 results[var] = ref.gait_config._gait_cache[list(ref.gait_config._gait_cache.keys())[0]].axis_names
             else:
                 raise ValueError("[Extract Reference] Could not find the axis name!")
+        elif var in ("v_log", "phi_keys"):
+            # Get v_log and phi_keys from manager's get_v_log() method
+            if "v_log" not in results:  # Only call once for both variables
+                v_log, phi_keys = ref.manager.get_v_log()
+                results["v_log"] = v_log.clone() if isinstance(v_log, torch.Tensor) else v_log
+                results["phi_keys"] = phi_keys.clone() if isinstance(phi_keys, torch.Tensor) else phi_keys
         else:
             raise ValueError(f"[Extract Reference] No variable matching the given name [{var}] found in the command!")
     return results
@@ -384,6 +390,19 @@ def main():
         'ordered_output_names',
         'current_domain',
         'phasing_var',
+        'v_log',
+        'phi_keys',
+        'CLF_EMA_0',
+        'CLF_EMA_1',
+        'CLF_EMA_2',
+        'CLF_EMA_3',
+        'CLF_EMA_4',
+        'CLF_EMA_5',
+        'CLF_EMA_6',
+        'CLF_EMA_7',
+        'CLF_EMA_8',
+        'CLF_EMA_9',
+        'CLF_EMA_10',
         # 'domain_durations',
         # 'gait_indices',
     ]

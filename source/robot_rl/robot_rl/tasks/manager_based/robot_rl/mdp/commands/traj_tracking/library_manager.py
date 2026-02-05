@@ -1,6 +1,11 @@
 import os
 from pathlib import Path
+from typing import Any
+
 import torch
+from pyglet.media.drivers.pulse.lib_pulseaudio import pa_context_get_client_info
+from torch import Tensor
+
 from .manager_base import ManagerBase
 from .trajectory_manager import TrajectoryManager
 
@@ -418,3 +423,57 @@ class LibraryManager(ManagerBase):
     def order_outputs(self, order_output_names: list[str]):
         for manager in self.trajectory_managers:
             manager.order_outputs(order_output_names)
+
+    def log_v_on_phasing_var(self, phi, v):
+        """
+        Log the value of the CLF at its value in the phasing variable.
+        """
+        conditioner = self.get_conditioner_var()
+        traj_idx = self.get_traj_indices(conditioner)
+
+        # Get the unique managers (avoid repeats)
+        unique_indicies = torch.unique(traj_idx)
+
+        # Bin each conditioner by manager
+        for idx in unique_indicies:
+            # Find which environments use this trajectory
+            mask = traj_idx == idx
+            env_indices = torch.where(mask)[0]
+
+            # Call get_output for this manager
+            self.trajectory_managers[idx.item()].log_v_on_phasing_var(phi[env_indices], v[env_indices])
+
+
+    def get_v_log(self) -> tuple[Tensor, Any]:
+        conditioner = self.get_conditioner_var()
+        traj_idx = self.get_traj_indices(conditioner)
+
+        # Get the unique managers (avoid repeats)
+        unique_indicies = torch.unique(traj_idx)
+
+        phi_keys = self.trajectory_managers[0].phi_keys
+        v_log = torch.zeros(conditioner.shape[0], len(phi_keys), dtype=torch.float, device=self.device)
+
+        # Bin each conditioner by manager
+        for idx in unique_indicies:
+            # Find which environments use this trajectory
+            mask = traj_idx == idx
+            env_indices = torch.where(mask)[0]
+
+            # Call get_output for this manager
+            v_log[env_indices, :] = self.trajectory_managers[idx.item()].v_log
+
+        return v_log, phi_keys
+
+    def get_v_log_avg(self) -> torch.Tensor:
+        """
+        Compute the average V value for each of the references
+        """
+
+        v_mean = torch.zeros(len(self.trajectory_managers), device=self.device)
+
+        for i, manager in enumerate(self.trajectory_managers):
+            v = manager.v_log
+            v_mean[i] = torch.mean(v)
+
+        return v_mean

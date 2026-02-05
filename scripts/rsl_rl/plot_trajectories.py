@@ -327,20 +327,43 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
 
         if 'phasing_var' in processed_data:
             phase_var = processed_data['phasing_var']
-            # domain_durations = processed_data['domain_durations']
             current_domains = processed_data['current_domain']
-            vars = [phase_var,current_domains]
-            n_dims = 2
-            labels = ['phasing var', 'current domain',]
+
+            # Check if v_log data is available
+            has_v_log = 'v_log' in processed_data and 'phi_keys' in processed_data
+            n_dims = 3 if has_v_log else 2
+
+            vars = [phase_var, current_domains]
+            labels = ['Phasing Var', 'Current Domain']
             fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3))
             fig.suptitle(f'Domain Info (Env {env_id})', fontsize=16)
-            for i in range(n_dims):
+
+            # Plot phasing var and current domain
+            for i in range(2):
                 ax = axs[i] if n_dims > 1 else axs
                 ax.plot(time_steps, vars[i][:, env_id], linewidth=2)
-                label = labels[i]
-                ax.set_title(label)
+                ax.set_title(labels[i])
                 ax.set_xlabel('Time Steps')
                 ax.grid(True, alpha=0.3)
+
+            # Plot V moving average vs phasing variable
+            if has_v_log:
+                ax = axs[2]
+                phi_keys = processed_data['phi_keys'][-1]  # Take final snapshot
+                v_log = processed_data['v_log'][-1]        # Take final snapshot
+                if isinstance(phi_keys, torch.Tensor):
+                    phi_keys = phi_keys.cpu().numpy()
+                if isinstance(v_log, torch.Tensor):
+                    v_log = v_log.cpu().numpy()
+                # Handle LibraryManager case where v_log is [num_envs, num_bins]
+                if v_log.ndim > 1:
+                    v_log = v_log[env_id]
+                ax.bar(phi_keys, v_log, width=0.08, alpha=0.7)
+                ax.set_title('V Moving Avg vs Phase')
+                ax.set_xlabel('Phasing Variable')
+                ax.set_ylabel('V (EMA)')
+                ax.grid(True, alpha=0.3)
+
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'domain_info_env{env_id}.png'), dpi=300, bbox_inches='tight')
 
@@ -407,6 +430,29 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             if save_dir:
                 plt.savefig(os.path.join(save_dir, f'error_metrics_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
+
+    # --- CLF EMA Plot (not per-env) ---
+    NUM_EMA = 11
+    clf_ema_keys = [f'CLF_EMA_{i}' for i in range(NUM_EMA)]
+    if all(key in processed_data for key in clf_ema_keys):
+        fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+        fig.suptitle('CLF EMA vs Phase Index', fontsize=16)
+
+        # Get the last logged value for each CLF_EMA_X
+        clf_values = [float(processed_data[f'CLF_EMA_{i}'][-1][-1]) for i in range(NUM_EMA)]
+
+        indices = list(range(NUM_EMA))
+        ax.bar(indices, clf_values, width=0.7, alpha=0.7)
+        ax.set_title('CLF EMA Values')
+        ax.set_xlabel('Phase Index')
+        ax.set_ylabel('CLF Value (EMA)')
+        ax.set_xticks(indices)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_dir:
+            plt.savefig(os.path.join(save_dir, 'clf_ema.png'), dpi=300, bbox_inches='tight')
+        plt.close(fig)
 
     # Generate focused COM and ankle plot
     plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)

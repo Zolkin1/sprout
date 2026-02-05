@@ -469,6 +469,7 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
         mode="reset",
         params={"command_name": "traj_ref",
                 "base_frame_name": "pelvis_link",
+                "conditioner_command_name": "base_velocity",
                 "rel_envs_on_ref": 0.5}
     )
 
@@ -605,7 +606,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (3.0, 3.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
