@@ -19,7 +19,7 @@ class CLF:
         device: torch.device = None,
         Q_weights: Dict = None,
         R_weights: Dict = None,
-        num_domain: int = 1,
+        num_domain: int = 1,    # TODO: Do I even want this?
         domain_scalar: list[float]|None = None
     ):
         # Initialize device and basic parameters
@@ -81,7 +81,52 @@ class CLF:
                 norm_P.append(torch.linalg.norm(self.P, ord=2))
             self.P = P
 
-        
+        # TODO: Go back to before
+        # self.P = [torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32),
+        #     torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)]
+        self.P = torch.from_numpy(np.eye(2*self.n_outputs)).to(self.device).to(torch.float32)
+
+        # Build eta-state indices for each subgroup.
+        # For output i, eta has position at 2*i and velocity at 2*i+1.
+        subgroup_eta_indices: dict[str, list[int]] = {
+            "pelvis_pos": [],
+            "pelvis_lin_vel": [],
+            "pelvis_ori": [],
+            "pelvis_ang_vel": [],
+            "joint_pos": [],
+            "joint_vel": [],
+            "other_body_pos": [],
+            "other_body_lin_vel": [],
+            "other_body_ori": [],
+            "other_body_ang_vel": [],
+        }
+        for i, name in enumerate(ordered_output_names):
+            if name.startswith("pelvis_link:pos_"):
+                pos_key = "pelvis_pos"
+                vel_key = "pelvis_lin_vel"
+            elif name.startswith("pelvis_link:ori_"):
+                pos_key = "pelvis_ori"
+                vel_key = "pelvis_ang_vel"
+            elif name.startswith("joint:"):
+                pos_key = "joint_pos"
+                vel_key = "joint_vel"
+            elif ":pos_" in name:
+                pos_key = "other_body_pos"
+                vel_key = "other_body_lin_vel"
+            elif ":ori_" in name:
+                pos_key = "other_body_ori"
+                vel_key = "other_body_ang_vel"
+            else:
+                continue
+            subgroup_eta_indices[pos_key].append(2 * i)
+            subgroup_eta_indices[vel_key].append(2 * i + 1)
+
+        self.subgroup_indices: dict[str, torch.Tensor] = {
+            k: torch.tensor(v, dtype=torch.long, device=self.device)
+            for k, v in subgroup_eta_indices.items()
+        }
+        self.v_subgroups: dict[str, torch.Tensor] = {}
+
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0
         
@@ -140,6 +185,15 @@ class CLF:
             P = self.P[domain_idx]
         else:
             P = self.P
+
+        # Compute per-subgroup V contributions (self-contribution, excluding cross-terms)
+        self.v_subgroups = {}
+        for name, idx in self.subgroup_indices.items():
+            if idx.numel() > 0:
+                eta_sub = eta[:, idx].contiguous()
+                P_sub = P[idx][:, idx].contiguous()
+                self.v_subgroups[name] = (torch.matmul(eta_sub, P_sub) * eta_sub).sum(dim=-1)
+
         V = torch.einsum('bi,ij,bj->b', eta, P, eta)
 
         self.v_buffer[:, 2] = self.v_buffer[:, 1]

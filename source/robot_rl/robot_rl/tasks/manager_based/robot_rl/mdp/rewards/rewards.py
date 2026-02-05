@@ -17,6 +17,8 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
+KAPPA = 0.5
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -46,6 +48,65 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
     # reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (10*max_clf))    # 200, 100   # NOTE: Used for bend over (10*max_clf is normal)
     return reward
 
+def base_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_pos = cmd_term.clf.v_subgroups["pelvis_pos"]
+
+    return torch.exp(-KAPPA * v_base_pos / sigma)
+
+def base_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_lin_vel = cmd_term.clf.v_subgroups["pelvis_lin_vel"]
+
+    return torch.exp(-KAPPA * v_base_lin_vel / sigma)
+
+def base_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_ori = cmd_term.clf.v_subgroups["pelvis_ori"]
+
+    return torch.exp(-KAPPA * v_base_ori / sigma)
+
+def base_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_ang_vel = cmd_term.clf.v_subgroups["pelvis_ang_vel"]
+
+    return torch.exp(-KAPPA * v_base_ang_vel / sigma)
+
+def joint_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_joint_pos = cmd_term.clf.v_subgroups["joint_pos"]
+
+    return torch.exp(-KAPPA * v_joint_pos / sigma)
+
+def joint_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_joint_vel = cmd_term.clf.v_subgroups["joint_vel"]
+
+    return torch.exp(-KAPPA * v_joint_vel / sigma)
+
+def body_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_pos = cmd_term.clf.v_subgroups["other_body_pos"]
+
+    return torch.exp(-KAPPA * v_body_pos / sigma)
+
+def body_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_lin_vel = cmd_term.clf.v_subgroups["other_body_lin_vel"]
+
+    return torch.exp(-KAPPA * v_body_lin_vel / sigma)
+
+def body_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_ori = cmd_term.clf.v_subgroups["other_body_ori"]
+
+    return torch.exp(-KAPPA * v_body_ori / sigma)
+
+def body_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_ang_vel = cmd_term.clf.v_subgroups["other_body_ang_vel"]
+
+    return torch.exp(-KAPPA * v_body_ang_vel / sigma)
 
 def clf_decreasing_condition(
     env: ManagerBasedRLEnv,

@@ -439,28 +439,97 @@ class G1RunningObservationCfg(G1TrajOptObservationsCfg):
 @configclass
 class G1RunningRewardCfg(G1TrajOptCLFRewards):
     # TODO: Update flight contact penalty
-    flight_contact_penalty = RewTerm(
-        func=mdp.contact_schedule_penalty,
-        weight=-3.0,
-        params={"command_name": "traj_ref",
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-                "weight_scalar": 0.0},
-    )
+    # flight_contact_penalty = RewTerm(
+    #     func=mdp.contact_schedule_penalty,
+    #     weight=-3.0,
+    #     params={"command_name": "traj_ref",
+    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
+    #             "weight_scalar": 0.0},
+    # )
 
     torque_lims = RewTerm(
         func=mdp.torque_limits,
         weight=-1.0,
     )
 
+    # Base
+    base_pos = RewTerm(
+        func=mdp.base_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.4}
+    )
+    base_ori = RewTerm(
+        func=mdp.base_ori_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.5}
+    )
+    base_lin_vel = RewTerm(
+        func=mdp.base_lin_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.6}
+    )
+    base_ang_vel = RewTerm(
+        func=mdp.base_ang_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 1.5}
+    )
+
+    # Joints
+    joint_pos = RewTerm(
+        func=mdp.joint_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.3*math.sqrt(21)}
+    )
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_reward,
+        weight=0.5, #0.0, #1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 1.5*math.sqrt(21)}
+    )
+
+    # Bodies
+    body_pos = RewTerm(
+        func=mdp.body_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.2*math.sqrt(4)}
+    )
+    body_ori = RewTerm(
+        func=mdp.body_ori_reward,
+        weight=0.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.4 * math.sqrt(4)}
+    )
+    body_lin_vel = RewTerm(
+        func=mdp.body_lin_vel_reward,
+        weight=0.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.2 * math.sqrt(4)}
+    )
+    body_ang_vel = RewTerm(
+        func=mdp.body_ang_vel_reward,
+        weight=0.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.2 * math.sqrt(4)}
+    )
+
+    clf_reward = None
+
+
 @configclass
 class G1RunningCurriculumCfg:
-    contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-                                          params={"update_interval": 40000, #20000,
-                                                   "max_weight": 1.0,
-                                                   "update_amnt": 0.1})
+    # contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
+    #                                       params={"update_interval": 40000, #20000,
+    #                                                "max_weight": 1.0,
+    #                                                "update_amnt": 0.1})
 
-    clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 30000, "min_max_err": (0.25, 0.3, 0.2) })
-
+    # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 30000, "min_max_err": (0.25, 0.3, 0.2) })
+    pass
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
@@ -516,10 +585,10 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
 
-        self.rewards.clf_reward.params = {
-            "command_name": "traj_ref",
-            "max_eta_err": 0.3,
-        }
+        # self.rewards.clf_reward.params = {
+        #     "command_name": "traj_ref",
+        #     "max_eta_err": 0.3,
+        # }
         self.rewards.clf_decreasing_condition.params = {
             "command_name": "traj_ref",
             "alpha": 0.5,
@@ -527,6 +596,8 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
             "eta_dot_max": 0.3,
         }
         self.rewards.clf_decreasing_condition.weight = -1
+
+
         # self.curriculum.clf_curriculum = None
         # self.curriculum.clf_curriculum.params = {
         #     "min_max_err": (0.1,0.1,0.2),
