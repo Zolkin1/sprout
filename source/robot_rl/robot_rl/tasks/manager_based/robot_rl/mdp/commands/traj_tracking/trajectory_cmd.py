@@ -449,6 +449,9 @@ class TrajectoryCommand(CommandTerm):
         """Get the measured state."""
         # TODO: Make more general. For now assuming CoM then bodies then joints always
 
+        # TODO: Make sure that the velocities are computed in the LOCAL_WORLD_ALIGNED frame
+        # TODO: Make sure positions are in the stance foot frame
+
         output_idx = 0
 
         # Get the relevant end effector positions (in global frame)

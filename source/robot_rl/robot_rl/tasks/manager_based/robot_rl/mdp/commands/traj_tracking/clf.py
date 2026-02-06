@@ -138,7 +138,7 @@ class CLF:
 
         # Assume each output has a double integrator model:
         #   [ẋ] = [0 1][x] + [0] u
-        #        [0 0]     [1]
+        #         [0 0]      [1]
 
         n_outputs = self.n_outputs  # total number of output dimensions (e.g., com x/y/z, foot x/y/z, etc.)
 
@@ -240,3 +240,8 @@ class CLF:
 
 
         return vdot_raw, v_curr
+
+    # TODO: Compute vdot via measuring the correct acclerations
+    # Can get the joint accelerations via asset.data.joint_acc. See: https://github.com/isaac-sim/IsaacLab/blob/c943628cbb9d7a39a0fa3e147a3965ee56fe389d/source/isaaclab/isaaclab/envs/mdp/rewards.py#L177
+    # Can get body accelerations in the world frame by using body_acc_w. See: https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.assets.html#isaaclab.assets.RigidObjectData.body_com_acc_w
+
