@@ -11,7 +11,6 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 import math
 from ..humanoid_env_cfg import HumanoidEventsCfg
 from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
-from ..mdp.events.physical_randomization import randomize_joint_parameters_multi_friction
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 from .g1_trajopt_reward import G1TrajOptCLFRewards
 from .g1_trajopt_obs import G1TrajOptObservationsCfg
@@ -738,6 +737,17 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
         },
     )
 
+    # Adjust torso mass
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+            "mass_distribution_params": (0.85, 1.15), #(-5.0, 5.0),
+            "operation": "scale",
+        },
+    )
+
     reset_base = None
     reset_robot_joints = None
 
@@ -827,8 +837,7 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
 
         # Make the COM randomization on the torso rather than the pelvis
         self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
-        self.events.add_base_mass.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
-        
+
         ##
         # Episode length
         ##

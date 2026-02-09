@@ -135,7 +135,6 @@ class HumanoidEventsCfg:
         },
     )
 
-    # TODO: Decide if we want to keep this
     base_com = EventTerm(
         func=mdp.randomize_rigid_body_com,
         mode="startup",
