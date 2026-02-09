@@ -7,6 +7,8 @@ import numpy as np
 
 import yaml
 
+from plot_from_sim import create_plots
+
 # Add the project root to the Python path
 # sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -151,6 +153,11 @@ def main():
         tracking_body_name="torso_link",
     )
     sim.run(-1)  # Run forever
+
+    # Generate plots after simulation if logging was enabled
+    if args.log and sim.new_log_folder:
+        print(f"[INFO] Generating plots from: {sim.new_log_folder}")
+        create_plots(sim.new_log_folder)
 
 
 if __name__ == "__main__":
