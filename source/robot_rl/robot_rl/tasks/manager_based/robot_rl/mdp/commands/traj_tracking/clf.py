@@ -2,6 +2,7 @@ from typing import Dict
 import torch
 import numpy as np
 from scipy.linalg import solve_continuous_are
+from isaaclab.utils.math import quat_box_minus
 
 class CLF:
     """
@@ -12,79 +13,79 @@ class CLF:
     """
     def __init__(
         self,
-        n_outputs: int,
         sim_dt: float,
         batch_size: int,
-        ordered_output_names: list[str],
+        ordered_vel_output_names: list[str],
+        ordered_pos_output_names: list[str],
         device: torch.device = None,
         Q_weights: Dict = None,
         R_weights: Dict = None,
-        num_domain: int = 1,    # TODO: Do I even want this?
-        domain_scalar: list[float]|None = None
+        # domain_scalar: list[float]|None = None
     ):
         # Initialize device and basic parameters
         self.device = device 
         self.sim_dt = sim_dt
-        self.n_outputs = n_outputs
-        self.ordered_output_names = ordered_output_names
+        self.n_outputs = 2*len(ordered_vel_output_names)
+        self.ordered_pos_output_names = ordered_pos_output_names
+        self.ordered_vel_output_names = ordered_vel_output_names
 
         # Set up default Q, R if not provided
         # Q_weights should be length = n_states, R_weights length = n_inputs
-        self.num_domain = num_domain
+        # self.num_domain = num_domain
 
-        n_states = 2 * n_outputs
-        n_inputs = n_outputs
+        n_states = self.n_outputs
+        self.n_inputs = int(self.n_outputs/2)
         if Q_weights is None:
             Q = np.ones(n_states)
         else:
             # Create the matrix using the dict
             Q = np.ones(n_states)
-            for i, name in enumerate(ordered_output_names):
+            for i, name in enumerate(ordered_vel_output_names):
                 Q[2*i] = Q_weights[name][0]
                 Q[2*i + 1] = Q_weights[name][1]
         if R_weights is None:
-            R = 0.1 * np.ones(n_inputs)
+            R = 0.1 * np.ones(self.n_inputs)
         else:
-            R = np.ones(n_inputs)
-            for i, name in enumerate(ordered_output_names):
+            R = np.ones(self.n_inputs)
+            for i, name in enumerate(ordered_vel_output_names):
                 R[i] = R_weights[name][0]
 
 
-        if self.num_domain == 1: 
-            
-            Q_np = np.diag(Q)
-            R_np = np.diag(R)
+    # if self.num_domain == 1:
 
-            # Solve for P and LQR gain K in NumPy
-            P_np = self._compute_PK_np(Q_np,R_np)
+        Q_np = np.diag(Q)
+        R_np = np.diag(R)
 
-            # Cache as torch tensors
-            self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
-            self.lambda_max = torch.linalg.eigvalsh(self.P)[-1]
-            self.norm_P = torch.linalg.norm(self.P, ord=2)
+        # Solve for P and LQR gain K in NumPy
+        P_np = self._compute_PK_np(Q_np,R_np)
+
+        # Cache as torch tensors
+        self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
+        self.lambda_max = torch.linalg.eigvalsh(self.P)[-1]
+        self.norm_P = torch.linalg.norm(self.P, ord=2)
 
 
-        else:
-            P = []
-            lambda_max = []
-            norm_P = []
-            for i in range(self.num_domain):
-                Q_np = np.diag(Q)*domain_scalar[i*2]
-                R_np = np.diag(R)*domain_scalar[i*2+1]
-
-                # Solve for P and LQR gain K in NumPy
-                P_np = self._compute_PK_np(Q_np,R_np)
-
-                # Cache as torch tensors
-                P.append(torch.from_numpy(P_np).to(self.device).to(torch.float32))
-                lambda_max.append(torch.linalg.eigvalsh(self.P)[-1])
-                norm_P.append(torch.linalg.norm(self.P, ord=2))
-            self.P = P
+        # else:
+        #     P = []
+        #     lambda_max = []
+        #     norm_P = []
+        #     for i in range(self.num_domain):
+        #         Q_np = np.diag(Q)*domain_scalar[i*2]
+        #         R_np = np.diag(R)*domain_scalar[i*2+1]
+        #
+        #         # Solve for P and LQR gain K in NumPy
+        #         P_np = self._compute_PK_np(Q_np,R_np)
+        #
+        #         # Cache as torch tensors
+        #         P.append(torch.from_numpy(P_np).to(self.device).to(torch.float32))
+        #         lambda_max.append(torch.linalg.eigvalsh(self.P)[-1])
+        #         norm_P.append(torch.linalg.norm(self.P, ord=2))
+        #     self.P = P
 
         # TODO: Go back to before
         # self.P = [torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32),
         #     torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)]
-        self.P = torch.from_numpy(np.eye(2*self.n_outputs)).to(self.device).to(torch.float32)
+        self.P = torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)
 
         # Build eta-state indices for each subgroup.
         # For output i, eta has position at 2*i and velocity at 2*i+1.
@@ -100,7 +101,7 @@ class CLF:
             "other_body_ori": [],
             "other_body_ang_vel": [],
         }
-        for i, name in enumerate(ordered_output_names):
+        for i, name in enumerate(ordered_vel_output_names):
             if name.startswith("pelvis_link:pos_"):
                 pos_key = "pelvis_pos"
                 vel_key = "pelvis_lin_vel"
@@ -127,6 +128,35 @@ class CLF:
         }
         self.v_subgroups: dict[str, torch.Tensor] = {}
 
+        # Build mapping from body name to [ori_x_idx, ori_y_idx, ori_z_idx, ori_w_idx] in y tensor
+        self.ori_body_indices_manifold: dict[str, list[int]] = {}
+        self.ori_body_indices_tangent: dict[str, list[int]] = {}
+
+        self.not_quat_mask_manifold = torch.ones(len(ordered_pos_output_names), dtype=torch.bool, device=self.device)
+        self.not_quat_mask_tangent = torch.ones(len(ordered_vel_output_names), dtype=torch.bool, device=self.device)
+
+        for i, name in enumerate(ordered_pos_output_names):
+            for ori_axis in [":ori_x", ":ori_y", ":ori_z", ":ori_w"]:
+                if ori_axis in name:
+                    body_name = name.split(ori_axis)[0]
+
+                    if body_name in self.ori_body_indices_manifold:
+                        self.ori_body_indices_manifold[body_name].append(i)
+                    else:
+                        self.ori_body_indices_manifold[body_name] = [i]
+                    self.not_quat_mask_manifold[i] = False
+
+        for i, name in enumerate(ordered_vel_output_names):
+            for ori_axis in [":ori_x", ":ori_y", ":ori_z"]:
+                if ori_axis in name:
+                    body_name = name.split(ori_axis)[0]
+
+                    self.not_quat_mask_tangent[i] = False
+                    if body_name in self.ori_body_indices_tangent:
+                        self.ori_body_indices_tangent[body_name].append(i)
+                    else:
+                        self.ori_body_indices_tangent[body_name] = [i]
+
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0
         
@@ -140,14 +170,13 @@ class CLF:
         #   [ẋ] = [0 1][x] + [0] u
         #         [0 0]      [1]
 
-        n_outputs = self.n_outputs  # total number of output dimensions (e.g., com x/y/z, foot x/y/z, etc.)
 
         # 1) Build block-diagonal A and B matrices (double integrators)
         A_blk = np.array([[0.0, 1.0], [0.0, 0.0]])  # (2x2)
         B_blk = np.array([[0.0], [1.0]])           # (2x1)
 
-        A_full = np.kron(np.eye(n_outputs), A_blk)   # (2n x 2n)
-        B_full = np.kron(np.eye(n_outputs), B_blk)   # (2n x n)
+        A_full = np.kron(np.eye(self.n_inputs), A_blk)   # (2n x 2n)    # n_inputs is totaly number of double integrator systems
+        B_full = np.kron(np.eye(self.n_inputs), B_blk)   # (2n x n)
 
 
         # 2) Solve CARE: A^T P + P A - P B R^{-1} B^T P + Q = 0
@@ -168,10 +197,12 @@ class CLF:
         """
         Evaluate V = (y_act - y_nom)^T P (y_act - y_nom).
         """
-        y_err = y_act - y_nom
+
+        y_err = self.compute_y_err(y_act, y_nom)
+
         dy_err = dy_act - dy_nom
         batch_size = y_act.shape[0]
-        eta = torch.zeros(batch_size,2*self.n_outputs, device=y_act.device)
+        eta = torch.zeros(batch_size,self.n_outputs, device=y_act.device)
         eta[:,0::2] = y_err      # even indices: positions
         eta[:,1::2] = dy_err     # odd indices: velocities
 
@@ -181,10 +212,10 @@ class CLF:
         wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
         eta[:,yaw_idx] = wrapped_yaw_err
 
-        if self.num_domain > 1:
-            P = self.P[domain_idx]
-        else:
-            P = self.P
+        # if self.num_domain > 1:
+        #     P = self.P[domain_idx]
+        # else:
+        P = self.P
 
         # Compute per-subgroup V contributions (self-contribution, excluding cross-terms)
         self.v_subgroups = {}
@@ -238,10 +269,115 @@ class CLF:
             # step_count == 1 → no previous sample; just return zero
             vdot_raw = torch.zeros((B,), device=self.device)
 
+        # Clamp unreasonably large vdot values (e.g., after resets)
+        vdot_raw = torch.where(torch.abs(vdot_raw) > 10000, torch.zeros_like(vdot_raw), vdot_raw)
 
         return vdot_raw, v_curr
 
-    # TODO: Compute vdot via measuring the correct acclerations
-    # Can get the joint accelerations via asset.data.joint_acc. See: https://github.com/isaac-sim/IsaacLab/blob/c943628cbb9d7a39a0fa3e147a3965ee56fe389d/source/isaaclab/isaaclab/envs/mdp/rewards.py#L177
-    # Can get body accelerations in the world frame by using body_acc_w. See: https://isaac-sim.github.io/IsaacLab/main/source/api/lab/isaaclab.assets.html#isaaclab.assets.RigidObjectData.body_com_acc_w
 
+    def compute_vdot_analytic(
+        self,
+        y_act: torch.Tensor,
+        y_nom: torch.Tensor,
+        dy_act: torch.Tensor,
+        dy_nom: torch.Tensor,
+        ddy_act: torch.Tensor,
+        ddy_nom: torch.Tensor,
+        yaw_idx: list[int],
+        domain_idx: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute V_dot analytically using acceleration information.
+
+        Uses the formula: Vdot = 2 * eta^T * P * eta_dot
+
+        where:
+            eta = [y_err_0, dy_err_0, y_err_1, dy_err_1, ...] (interleaved pos/vel errors)
+            eta_dot = [dy_err_0, ddy_err_0, dy_err_1, ddy_err_1, ...] (interleaved vel/acc errors)
+
+        Args:
+            y_act: [B, n_outputs] actual positions.
+            y_nom: [B, n_outputs] nominal/desired positions.
+            dy_act: [B, n_outputs] actual velocities.
+            dy_nom: [B, n_outputs] nominal/desired velocities.
+            ddy_act: [B, n_outputs] actual accelerations (from simulation).
+            ddy_nom: [B, n_outputs] nominal/desired accelerations (from trajectory).
+            yaw_idx: list of indices for yaw outputs that need angle wrapping.
+            domain_idx: domain index for multi-domain P matrices.
+
+        Returns:
+            (vdot, v_curr): tuple of Vdot and V values, each shape [B].
+        """
+        # Compute errors
+        y_err = y_act - y_nom
+        dy_err = dy_act - dy_nom
+        ddy_err = ddy_act - ddy_nom
+
+        batch_size = y_act.shape[0]
+
+        # Build eta: [y_err_0, dy_err_0, y_err_1, dy_err_1, ...]
+        eta = torch.zeros(batch_size, self.n_outputs, device=y_act.device)
+        eta[:, 0::2] = y_err      # even indices: position errors
+        eta[:, 1::2] = dy_err     # odd indices: velocity errors
+
+        # Wrap yaw errors to [-pi, pi]
+        yaw_err = y_err[:, yaw_idx]
+        two_pi = 2.0 * torch.pi
+        wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
+        # Update the position error slots for yaw indices in eta
+        yaw_eta_indices = [2 * i for i in yaw_idx]
+        eta[:, yaw_eta_indices] = wrapped_yaw_err
+
+        # Build eta_dot: [dy_err_0, ddy_err_0, dy_err_1, ddy_err_1, ...]
+        eta_dot = torch.zeros(batch_size, self.n_outputs, device=y_act.device)
+        eta_dot[:, 0::2] = dy_err     # even indices: velocity errors (d/dt of position error)
+        eta_dot[:, 1::2] = ddy_err    # odd indices: acceleration errors (d/dt of velocity error)
+
+        # Select P matrix based on domain
+        # if self.num_domain > 1:
+        #     P = self.P[domain_idx]
+        # else:
+        P = self.P
+
+        # Compute V = eta^T P eta
+        V = torch.einsum('bi,ij,bj->b', eta, P, eta)
+
+        # Compute per-subgroup V contributions (for logging/debugging)
+        self.v_subgroups = {}
+        for name, idx in self.subgroup_indices.items():
+            if idx.numel() > 0:
+                eta_sub = eta[:, idx].contiguous()
+                P_sub = P[idx][:, idx].contiguous()
+                self.v_subgroups[name] = (torch.matmul(eta_sub, P_sub) * eta_sub).sum(dim=-1)
+
+        # Compute Vdot = 2 * eta^T * P * eta_dot
+        # First compute P @ eta_dot: [B, 2n]
+        P_eta_dot = torch.matmul(eta_dot, P.T)  # [B, 2n]
+        # Then compute eta^T @ (P @ eta_dot): scalar per batch
+        vdot = 2.0 * torch.einsum('bi,bi->b', eta, P_eta_dot)
+
+        # Update V buffer for consistency with finite differencing method
+        self.v_buffer[:, 2] = self.v_buffer[:, 1]
+        self.v_buffer[:, 1] = self.v_buffer[:, 0]
+        self.v_buffer[:, 0] = V.detach()
+        self.step_count += 1
+
+        return vdot, V
+
+    def compute_y_err(self, y_act, y_des):
+        """
+        Compute the error between the measured values and the desired values.
+
+        Must respect the quaternion orientation by using the box minus operator.
+        """
+        y_err = torch.zeros((y_act.shape[0], len(self.ordered_vel_output_names)), device=self.device)
+
+        # Subtract all the non-quaternions normally
+        y_err[:, self.not_quat_mask_tangent] = y_act[:, self.not_quat_mask_manifold] - y_des[:, self.not_quat_mask_manifold]
+
+        # Subtract quats with box minus operator
+        for body_name, indices in self.ori_body_indices_manifold.items():
+            tangent_indices = self.ori_body_indices_tangent[body_name]
+            y_err[:, tangent_indices] = quat_box_minus(y_act[:, indices], y_des[:, indices])
+
+        return y_err

@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
+
+import torch
+
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
+from isaaclab.envs.mdp.events import _validate_scale_range, _randomize_prop_by_op
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedEnv
+
+class randomize_joint_parameters_multi_friction(ManagerTermBase):
+    """Randomize the simulated joint parameters of an articulation by adding, scaling, or setting random values.
+
+    This function allows randomizing the joint parameters of the asset. These correspond to the physics engine
+    joint properties that affect the joint behavior. The properties include the joint friction coefficient, armature,
+    and joint position limits.
+
+    The function samples random values from the given distribution parameters and applies the operation to the
+    joint properties. It then sets the values into the physics simulation. If the distribution parameters are
+    not provided for a particular property, the function does not modify the property.
+
+    .. tip::
+        This function uses CPU tensors to assign the joint properties. It is recommended to use this function
+        only during the initialization of the environment.
+    """
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
+        """Initialize the term.
+
+        Args:
+            cfg: The configuration of the event term.
+            env: The environment instance.
+
+        Raises:
+            TypeError: If `params` is not a tuple of two numbers.
+            ValueError: If the operation is not supported.
+            ValueError: If the lower bound is negative or zero when not allowed.
+            ValueError: If the upper bound is less than the lower bound.
+        """
+        super().__init__(cfg, env)
+
+        # extract the used quantities (to enable type-hinting)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: RigidObject | Articulation = env.scene[self.asset_cfg.name]
+        # check for valid operation
+        if cfg.params["operation"] == "scale":
+            if "friction_distribution_params" in cfg.params:
+                _validate_scale_range(cfg.params["friction_distribution_params"], "friction_distribution_params")
+            if "armature_distribution_params" in cfg.params:
+                _validate_scale_range(cfg.params["armature_distribution_params"], "armature_distribution_params")
+        elif cfg.params["operation"] not in ("abs", "add"):
+            raise ValueError(
+                "Randomization term 'randomize_fixed_tendon_parameters' does not support operation:"
+                f" '{cfg.params['operation']}'."
+            )
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        static_friction_distribution_params: tuple[float, float] | None = None,
+        dynamic_friction_distribution_params: tuple[float, float] | None = None,
+        viscous_friction_distribution_params: tuple[float, float] | None = None,
+        armature_distribution_params: tuple[float, float] | None = None,
+        lower_limit_distribution_params: tuple[float, float] | None = None,
+        upper_limit_distribution_params: tuple[float, float] | None = None,
+        operation: Literal["add", "scale", "abs"] = "abs",
+        distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
+    ):
+        # resolve environment ids
+        if env_ids is None:
+            env_ids = torch.arange(env.scene.num_envs, device=self.asset.device)
+
+        # resolve joint indices
+        if self.asset_cfg.joint_ids == slice(None):
+            joint_ids = slice(None)  # for optimization purposes
+        else:
+            joint_ids = torch.tensor(self.asset_cfg.joint_ids, dtype=torch.int, device=self.asset.device)
+
+        # sample joint properties from the given ranges and set into the physics simulation
+        # joint friction coefficient
+        if static_friction_distribution_params and dynamic_friction_distribution_params and viscous_friction_distribution_params is not None:
+            friction_coeff = _randomize_prop_by_op(
+                self.asset.data.default_joint_friction_coeff.clone(),
+                static_friction_distribution_params,
+                env_ids,
+                joint_ids,
+                operation=operation,
+                distribution=distribution,
+            )
+
+            # ensure the friction coefficient is non-negative
+            friction_coeff = torch.clamp(friction_coeff, min=0.0)
+
+            # Always set static friction (indexed once)
+            static_friction_coeff = friction_coeff[env_ids[:, None], joint_ids]
+
+            # if isaacsim version is lower than 5.0.0 we can set only the static friction coefficient
+            major_version = int(env.sim.get_version()[0])
+            if major_version >= 5:
+                # Randomize raw tensors
+                dynamic_friction_coeff = _randomize_prop_by_op(
+                    self.asset.data.default_joint_dynamic_friction_coeff.clone(),
+                    dynamic_friction_distribution_params,
+                    env_ids,
+                    joint_ids,
+                    operation=operation,
+                    distribution=distribution,
+                )
+
+                viscous_friction_coeff = _randomize_prop_by_op(
+                    self.asset.data.default_joint_viscous_friction_coeff.clone(),
+                    viscous_friction_distribution_params,
+                    env_ids,
+                    joint_ids,
+                    operation=operation,
+                    distribution=distribution,
+                )
+
+                # Clamp to non-negative
+                dynamic_friction_coeff = torch.clamp(dynamic_friction_coeff, min=0.0)
+                viscous_friction_coeff = torch.clamp(viscous_friction_coeff, min=0.0)
+
+                # Ensure dynamic ≤ static (same shape before indexing)
+                dynamic_friction_coeff = torch.minimum(dynamic_friction_coeff, friction_coeff)
+
+                # Index once at the end
+                dynamic_friction_coeff = dynamic_friction_coeff[env_ids[:, None], joint_ids]
+                viscous_friction_coeff = viscous_friction_coeff[env_ids[:, None], joint_ids]
+            else:
+                # For versions < 5.0.0, we do not set these values
+                dynamic_friction_coeff = None
+                viscous_friction_coeff = None
+
+            # Single write call for all versions
+            self.asset.write_joint_friction_coefficient_to_sim(
+                joint_friction_coeff=static_friction_coeff,
+                joint_dynamic_friction_coeff=dynamic_friction_coeff,
+                joint_viscous_friction_coeff=viscous_friction_coeff,
+                joint_ids=joint_ids,
+                env_ids=env_ids,
+            )
+
+        # joint armature
+        if armature_distribution_params is not None:
+            armature = _randomize_prop_by_op(
+                self.asset.data.default_joint_armature.clone(),
+                armature_distribution_params,
+                env_ids,
+                joint_ids,
+                operation=operation,
+                distribution=distribution,
+            )
+            self.asset.write_joint_armature_to_sim(
+                armature[env_ids[:, None], joint_ids], joint_ids=joint_ids, env_ids=env_ids
+            )
+
+        # joint position limits
+        if lower_limit_distribution_params is not None or upper_limit_distribution_params is not None:
+            joint_pos_limits = self.asset.data.default_joint_pos_limits.clone()
+            # -- randomize the lower limits
+            if lower_limit_distribution_params is not None:
+                joint_pos_limits[..., 0] = _randomize_prop_by_op(
+                    joint_pos_limits[..., 0],
+                    lower_limit_distribution_params,
+                    env_ids,
+                    joint_ids,
+                    operation=operation,
+                    distribution=distribution,
+                )
+            # -- randomize the upper limits
+            if upper_limit_distribution_params is not None:
+                joint_pos_limits[..., 1] = _randomize_prop_by_op(
+                    joint_pos_limits[..., 1],
+                    upper_limit_distribution_params,
+                    env_ids,
+                    joint_ids,
+                    operation=operation,
+                    distribution=distribution,
+                )
+
+            # extract the position limits for the concerned joints
+            joint_pos_limits = joint_pos_limits[env_ids[:, None], joint_ids]
+            if (joint_pos_limits[..., 0] > joint_pos_limits[..., 1]).any():
+                raise ValueError(
+                    "Randomization term 'randomize_joint_parameters' is setting lower joint limits that are greater"
+                    " than upper joint limits. Please check the distribution parameters for the joint position limits."
+                )
+            # set the position limits into the physics simulation
+            self.asset.write_joint_position_limit_to_sim(
+                joint_pos_limits, joint_ids=joint_ids, env_ids=env_ids, warn_limit_violation=False
+            )

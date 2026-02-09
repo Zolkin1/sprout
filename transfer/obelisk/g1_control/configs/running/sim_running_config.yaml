@@ -8,7 +8,7 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "running_clf_sym/2026-02-02_19-52-32_running_longer_curriculum_sym",
+          "running_clf_sym/2026-02-05_14-55-10_running_new_traj_test_sym",
           "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
 
         ]

@@ -1,7 +1,7 @@
 import torch
 from isaaclab.utils import configclass
-from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import HumanoidCommandsCfg
-from robot_rl.tasks.manager_based.robot_rl.g1.g1_walking_clf_env_cfg import (G1TrajOptObservationsCfg,)
+from isaaclab.utils.math import quat_from_euler_xyz, quat_mul, quat_apply
+
 from robot_rl.tasks.manager_based.robot_rl.humanoid_env_cfg import (HumanoidEnvCfg, HumanoidCommandsCfg,)
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -9,10 +9,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 import math
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..humanoid_env_cfg import HumanoidEventsCfg
 from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
+from ..mdp.events.physical_randomization import randomize_joint_parameters_multi_friction
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 from .g1_trajopt_reward import G1TrajOptCLFRewards
 from .g1_trajopt_obs import G1TrajOptObservationsCfg
@@ -277,7 +276,7 @@ def _find_idx(strings, *substrings):
     return next((i for i, s in enumerate(strings) if all(sub in s for sub in substrings)), None)
 
 
-def _build_heuristic_cache(output_names, contact_bodies, env):
+def _build_heuristic_cache(output_pos_names, output_vel_names, contact_bodies, env):
     """Build all index lookups once for the heuristic function."""
     cache = {}
     robot = env.scene["robot"]
@@ -291,10 +290,30 @@ def _build_heuristic_cache(output_names, contact_bodies, env):
 
         # Output indices for this body
         cache['body_output_indices'][body] = {
-            'ori_z': _find_idx(output_names, "ori_z", body),
-            'pos_y': _find_idx(output_names, "pos_y", body),
-            'hip_yaw': _find_idx(output_names, "yaw", f"{side}_hip_yaw_joint"),
-            'hip_roll': _find_idx(output_names, f"{side}_hip_roll_joint"),
+            'quat': [_find_idx(output_pos_names, "ori_w", body),
+                     _find_idx(output_pos_names, "ori_x", body),
+                     _find_idx(output_pos_names, "ori_y", body),
+                     _find_idx(output_pos_names, "ori_z", body)],
+
+            # 'ori_z_vel': _find_idx(output_vel_names, "ori_z", body),
+
+            'pos': [_find_idx(output_pos_names, "pos_x", body),
+                    _find_idx(output_pos_names, "pos_y", body),
+                    _find_idx(output_pos_names, "pos_z", body)],
+
+            'lin_vel': [_find_idx(output_vel_names, "pos_x", body),
+                        _find_idx(output_vel_names, "pos_y", body),
+                        _find_idx(output_vel_names, "pos_z", body)],
+
+            'ang_vel': [_find_idx(output_vel_names, "ori_x", body),
+                        _find_idx(output_vel_names, "ori_y", body),
+                        _find_idx(output_vel_names, "ori_z", body)],
+
+            'hip_yaw': _find_idx(output_pos_names, "yaw", f"{side}_hip_yaw_joint"),
+            'hip_yaw_vel': _find_idx(output_vel_names, "yaw", f"{side}_hip_yaw_joint"),
+
+            'hip_roll': _find_idx(output_pos_names, f"{side}_hip_roll_joint"),
+            'hip_roll_vel': _find_idx(output_vel_names, f"{side}_hip_roll_joint"),
         }
 
         # Robot body indices for this contact body
@@ -303,14 +322,30 @@ def _build_heuristic_cache(output_names, contact_bodies, env):
             'ankle': robot.body_names.index(f"{side}_ankle_roll_link"),
         }
 
-    # Cache global output indices (applied to all envs)
-    cache['pelvis_ori_z'] = _find_idx(output_names, "ori_z", "pelvis_link")
-    cache['pelvis_pos_y'] = _find_idx(output_names, "pos_y", "pelvis_link")
-    cache['com_pos_y'] = _find_idx(output_names, "pos_y", "com")
-    cache['right_wrist_ori_z'] = _find_idx(output_names, "ori_z", "right_wrist_yaw_link")
-    cache['left_wrist_ori_z'] = _find_idx(output_names, "ori_z", "left_wrist_yaw_link")
-    cache['right_wrist_pos_y'] = _find_idx(output_names, "pos_y", "right_wrist_yaw_link")
-    cache['left_wrist_pos_y'] = _find_idx(output_names, "pos_y", "left_wrist_yaw_link")
+    cache['com_pos_y'] = _find_idx(output_pos_names, "pos_y", "com")
+    cache['com_pos_y_vel'] = _find_idx(output_vel_names, "pos_y", "com")
+
+    for body in ["pelvis_link", "right_wrist_yaw_link", "left_wrist_yaw_link"]:
+        if _find_idx(output_pos_names, "ori_w", body) is not None:
+            cache[body + '_quat'] = [_find_idx(output_pos_names, "ori_w", body),
+                                     _find_idx(output_pos_names, "ori_x", body),
+                                     _find_idx(output_pos_names, "ori_y", body),
+                                     _find_idx(output_pos_names, "ori_z", body)]
+
+            # cache[body + '_ori_z_vel'] = _find_idx(output_vel_names, "ori_z", body),
+
+            cache[body + '_ang_vel'] = [_find_idx(output_vel_names, "ori_x", body),
+                                        _find_idx(output_vel_names, "ori_y", body),
+                                        _find_idx(output_vel_names, "ori_z", body)],
+
+        if _find_idx(output_pos_names, "pos_y", body) is not None:
+            cache[body + '_pos'] = [_find_idx(output_pos_names, "pos_x", body),
+                                    _find_idx(output_pos_names, "pos_y", body),
+                                    _find_idx(output_pos_names, "pos_z", body)],
+
+            cache[body + '_lin_vel'] = [_find_idx(output_vel_names, "pos_x", body),
+                                        _find_idx(output_vel_names, "pos_y", body),
+                                        _find_idx(output_vel_names, "pos_z", body)],
 
     return cache
 
@@ -319,16 +354,27 @@ def _build_heuristic_cache(output_names, contact_bodies, env):
 _HEURISTIC_CACHE = {}
 
 
-def heuristic_modification(env, output_names, outputs, contact_bodies, contact_states,
-                           phi, total_time, threshold):
+def heuristic_modification(env,
+                           output_pos_names,
+                           output_vel_names,
+                           pos_outputs,
+                           vel_outputs,
+                           contact_bodies,
+                           contact_states,
+                           phi,
+                           total_time,
+                           env_ids,
+                           threshold):
     """Heuristically modify the gait library for sideways walking and turning.
 
     Indices are cached on first call for performance.
 
     Args:
         env: Environment object.
-        output_names: Names of the output variables in order.
-        outputs: Output variables.
+        output_pos_names: Names of the output variables in order.
+        output_vel_names: Names of the output variables in order.
+        pos_outputs: Output variables.
+        vel_outputs: Output variables.
         contact_bodies: Names of the contact bodies. Of shape [num_contact_bodies]
         contact_states: tensor of shape [N, num_contact_bodies]
         phi: Phasing variable tensor of shape [N]
@@ -339,133 +385,164 @@ def heuristic_modification(env, output_names, outputs, contact_bodies, contact_s
 
     # Initialize cache on first call
     if not _HEURISTIC_CACHE:
-        _HEURISTIC_CACHE.update(_build_heuristic_cache(output_names, contact_bodies, env))
+        _HEURISTIC_CACHE.update(_build_heuristic_cache(output_pos_names, output_vel_names, contact_bodies, env))
 
     # Get the commanded velocity
     vel_cmd = env.command_manager.get_command("base_velocity").clone()
 
-    # Don't apply modifications when in standing
-    standing_mask = torch.abs(vel_cmd[:, 0]) < threshold
-    vel_cmd[standing_mask, :] *= 0.0
+    # TODO: Do I need to account for total time in the air so that the stance phase is accounted for
+    if env_ids is None:
+        # Don't apply modifications when in standing
+        standing_mask = torch.abs(vel_cmd[:, 0]) < threshold
+        vel_cmd[standing_mask, :] *= 0.0
 
-    # Time into half period
-    phi_half = torch.remainder(phi, 0.5)
-    time_half = total_time / 2.0
-    time_into_step = time_half * phi_half
+        # Time into half period
+        phi_half = torch.remainder(phi, 0.5) / 0.5
+        time_half = total_time / 2.0
+        time_into_step = time_half * phi_half
 
-    # Determine yaw and horizontal modifications
-    delta_psi = vel_cmd[:, 2] * time_into_step
-    delta_y = vel_cmd[:, 1] * time_into_step
+
+        # Determine yaw modifications
+        delta_psi = vel_cmd[:, 2] * time_into_step
+
+        # Create yaw quaternion
+        delta_psi_quat = quat_from_euler_xyz(torch.zeros_like(delta_psi), torch.zeros_like(delta_psi), delta_psi)
+
+        # Horizontal modification
+        delta_y = vel_cmd[:, 1] * time_into_step
+
+    else:
+        # Don't apply modifications when in standing
+        standing_mask = torch.abs(vel_cmd[:, 0]) < threshold
+        vel_cmd[standing_mask, :] *= 0.0
+
+        # Time into half period
+        phi_half = torch.remainder(phi, 0.5) / 0.5
+        time_half = total_time / 2.0
+        time_into_step = time_half * phi_half
+
+        # Determine yaw modifications
+        delta_psi = vel_cmd[env_ids, 2] * time_into_step
+
+        # Create yaw quaternion
+        delta_psi_quat = quat_from_euler_xyz(torch.zeros_like(delta_psi), torch.zeros_like(delta_psi), delta_psi)
+
+        # Horizontal modification
+        delta_y = vel_cmd[env_ids, 1] * time_into_step
 
     # Get robot reference once
-    robot = env.scene["robot"]
+    # robot = env.scene["robot"]
 
     # Iterate through the bodies not in contact
     for i, body in enumerate(contact_bodies):
         env_idx = torch.where(contact_states[:, i] == 0)[0]
-        if len(env_idx) == 0:
-            continue
+        if len(env_idx) != 0:
 
-        body_indices = _HEURISTIC_CACHE['body_output_indices'][body]
-        robot_indices = _HEURISTIC_CACHE['body_robot_indices'][body]
+            body_indices = _HEURISTIC_CACHE['body_output_indices'][body]
+            robot_indices = _HEURISTIC_CACHE['body_robot_indices'][body]
 
-        # Apply yaw modification (ori_z)
-        idx = body_indices['ori_z']
-        if idx is not None:
-            outputs[env_idx, 0, idx] += delta_psi[env_idx]
-            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
+            # Apply yaw modification
+            quat_idx = body_indices['quat']
+            ang_vel_idx = body_indices['ang_vel']
 
-        # Apply horizontal modification (pos_y)
-        idx = body_indices['pos_y']
-        if idx is not None:
-            outputs[env_idx, 0, idx] += delta_y[env_idx]
-            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1]
+            pos_outputs[env_idx, quat_idx[0]:quat_idx[-1]+1] = quat_mul(delta_psi_quat[env_idx, :], pos_outputs[env_idx, quat_idx[0]:quat_idx[-1]+1])
+            # Use global indices for vel_cmd when in subset mode
+            if env_ids is None:
+                vel_outputs[env_idx, ang_vel_idx[2]] += vel_cmd[env_idx, 2]
+            else:
+                vel_outputs[env_idx, ang_vel_idx[2]] += vel_cmd[env_ids[env_idx], 2]
+            # vel_outputs[env_idx, ang_vel_idx[0]:ang_vel_idx[-1]+1] = quat_apply(delta_psi_quat, )
 
-        # Adjust hip yaw
-        idx = body_indices['hip_yaw']
-        if idx is not None:
-            outputs[env_idx, 0, idx] += delta_psi[env_idx]
-            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 2]
+            # Apply horizontal modification (pos_y)
+            pos_idx = body_indices['pos']
+            lin_vel_idx = body_indices['lin_vel']
 
-        # Adjust hip roll based on foot height
-        hip_roll_idx = robot_indices['hip_roll']
-        ankle_idx = robot_indices['ankle']
+            pos_outputs[env_idx, pos_idx[1]] += delta_y[env_idx]
+            if env_ids is None:
+                vel_outputs[env_idx, lin_vel_idx[1]] += vel_cmd[env_idx, 1]
+            else:
+                vel_outputs[env_idx, lin_vel_idx[1]] += vel_cmd[env_ids[env_idx], 1]
 
-        hip_roll_height = robot.data.body_pos_w[:, hip_roll_idx, 2]
-        foot_height = robot.data.body_pos_w[:, ankle_idx, 2]
-        vertical_distance = torch.abs(hip_roll_height - foot_height)
+            # Apply yaw modification to position and linear vel
+            pos_outputs[env_idx, pos_idx[0]:pos_idx[-1]+1] = quat_apply(delta_psi_quat[env_idx], pos_outputs[env_idx, pos_idx[0]:pos_idx[-1]+1])
 
-        required_roll_angle = torch.atan2(delta_y, vertical_distance)
+            # # Add cross product term?
+            # omega = vel_outputs[env_idx, ang_vel_idx]
+            # vel_outputs[env_idx, lin_vel_idx] += torch.cross(omega, pos_outputs[env_idx, pos_idx], dim=1)#[env_idx].squeeze(0)
 
-        idx = body_indices['hip_roll']
-        if idx is not None:
-            outputs[env_idx, 0, idx] += required_roll_angle[env_idx]
-            outputs[env_idx, 1, idx] += vel_cmd[env_idx, 1] / vertical_distance[env_idx]
+        # TODO: Try with and without the yaw compensation on the stance leg joint
+        # env_idx = torch.where(contact_states[:, i] == 1)[0]
+        # if len(env_idx) != 0:
+        #     body_indices = _HEURISTIC_CACHE['body_output_indices'][body]
+        #     robot_indices = _HEURISTIC_CACHE['body_robot_indices'][body]
+        #
+        #     # Adjust hip yaw
+        #     idx = body_indices['hip_yaw']
+        #     idx_vel = body_indices['hip_yaw_vel']
+        #     if idx is not None:
+        #         pos_outputs[env_idx, idx] -= delta_psi[env_idx]
+        #         vel_outputs[env_idx, idx_vel] -= vel_cmd[env_idx, 2]
+
+            # # Adjust hip roll based on foot height
+            # hip_roll_idx = robot_indices['hip_roll']
+            # ankle_idx = robot_indices['ankle']
+            #
+            # hip_roll_height = robot.data.body_pos_w[:, hip_roll_idx, 2]
+            # foot_height = robot.data.body_pos_w[:, ankle_idx, 2]
+            # vertical_distance = torch.abs(hip_roll_height - foot_height)
+            #
+            # required_roll_angle = torch.atan2(delta_y, vertical_distance)
+            #
+            # idx = body_indices['hip_roll']
+            # if idx is not None:
+            #     pos_outputs[env_idx, idx] -= required_roll_angle[env_idx]
+            #     vel_outputs[env_idx, idx] -= vel_cmd[env_idx, 1] / vertical_distance[env_idx]
 
     # Apply global modifications (all envs)
-    # Hands yaw
-    idx = _HEURISTIC_CACHE['right_wrist_ori_z']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_psi
-        outputs[:, 1, idx] += vel_cmd[:, 2]
+    for body in ["pelvis_link", "right_wrist_yaw_link", "left_wrist_yaw_link"]:
+        # Yaw
+        if body + '_quat' in _HEURISTIC_CACHE:
+            quat_idx = _HEURISTIC_CACHE[body + '_quat']
+            vel_idx = _HEURISTIC_CACHE[body + '_ang_vel']
 
-    idx = _HEURISTIC_CACHE['left_wrist_ori_z']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_psi
-        outputs[:, 1, idx] += vel_cmd[:, 2]
+            if env_ids is None:
+                pos_outputs[:, quat_idx[0]:quat_idx[-1]+1] = quat_mul(delta_psi_quat, pos_outputs[:, quat_idx[0]:quat_idx[-1]+1])
+                vel_outputs[:, vel_idx[0][2]] += vel_cmd[:, 2]
+            else:
+                # Subset mode: pos_outputs/vel_outputs are subset-sized, use : for them; vel_cmd is full-sized, use env_ids
+                pos_outputs[:, quat_idx[0]:quat_idx[-1]+1] = quat_mul(delta_psi_quat, pos_outputs[:, quat_idx[0]:quat_idx[-1]+1])
+                vel_outputs[:, vel_idx[0][2]] += vel_cmd[env_ids, 2]
 
-    # Hands y
-    idx = _HEURISTIC_CACHE['right_wrist_pos_y']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_y
-        outputs[:, 1, idx] += vel_cmd[:, 1]
+        # Position/linear vel
+        if body + '_pos' in _HEURISTIC_CACHE:
+            pos_idx = _HEURISTIC_CACHE[body + '_pos']
+            lin_vel_idx = _HEURISTIC_CACHE[body + '_lin_vel']
 
-    idx = _HEURISTIC_CACHE['left_wrist_pos_y']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_y
-        outputs[:, 1, idx] += vel_cmd[:, 1]
+            if env_ids is None:
+                # Lateral velocity
+                pos_outputs[:, pos_idx[0][1]] += delta_y
+                vel_outputs[:, lin_vel_idx[0][1]] += vel_cmd[:, 1]
 
-    # Pelvis yaw
-    idx = _HEURISTIC_CACHE['pelvis_ori_z']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_psi
-        outputs[:, 1, idx] += vel_cmd[:, 2]
+                # Adjustment due to yaw
+                pos_outputs[:, pos_idx[0][0]:pos_idx[0][-1]+1] = quat_apply(delta_psi_quat, pos_outputs[:, pos_idx[0][0]:pos_idx[0][-1]+1])
+                vel_outputs[:, lin_vel_idx[0][0]:lin_vel_idx[0][-1]+1] = quat_apply(delta_psi_quat, vel_outputs[:, lin_vel_idx[0][0]:lin_vel_idx[0][-1]+1])
+            else:
+                # Subset mode: pos_outputs/vel_outputs are subset-sized, vel_cmd is full-sized
+                pos_outputs[:, pos_idx[0][1]] += delta_y
+                vel_outputs[:, lin_vel_idx[0][1]] += vel_cmd[env_ids, 1]
 
-    # Pelvis y
-    idx = _HEURISTIC_CACHE['pelvis_pos_y']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_y
-        outputs[:, 1, idx] += vel_cmd[:, 1]
+                # Adjustment due to yaw
+                pos_outputs[:, pos_idx[0][0]:pos_idx[0][-1]+1] = quat_apply(delta_psi_quat, pos_outputs[:, pos_idx[0][0]:pos_idx[0][-1]+1])
+                vel_outputs[:, lin_vel_idx[0][0]:lin_vel_idx[0][-1]+1] = quat_apply(delta_psi_quat, vel_outputs[:, lin_vel_idx[0][0]:lin_vel_idx[0][-1]+1])
 
-    # COM y
-    idx = _HEURISTIC_CACHE['com_pos_y']
-    if idx is not None:
-        outputs[:, 0, idx] += delta_y
-        outputs[:, 1, idx] += vel_cmd[:, 1]
-
-    return outputs
+    return pos_outputs, vel_outputs
 
 
 @configclass
 class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
-    # hzd_ref = GaitLibraryHZDCommandCfg(
-    #     trajectory_type="end_effector",
-    #     gait_library_path="source/robot_rl/robot_rl/assets/robots/running_library_v7",
-    #     config_name="full",
-    #
-    #     gait_velocity_ranges=(1.1, 3.0, 0.1),
-    #     use_standing=True,
-    #
-    #     num_outputs=27,
-    #     Q_weights = RUNNING_EE_Q_weights_GL,
-    #     R_weights = RUNNING_EE_R_weights_GL
-    # )
     traj_ref = TrajectoryCommandCfg(
         contact_bodies = [".*_ankle_roll_link"],
-
-        # manager_type = "trajectory",
-        # path="source/robot_rl/robot_rl/assets/robots/test_walking_trajectories",
 
         manager_type="library",
         # path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
@@ -473,7 +550,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/running",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 39, #45, #27, #45, #51, #31, #27,
+        num_outputs = 48, #45, #27, #45, #51, #31, #27,
         Q_weights = RUNNING_Q_weights,
         R_weights = RUNNING_R_weights,
         hold_phi_threshold = 0.1,
@@ -485,7 +562,8 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     base_velocity = TreadmillVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
+        # rel_standing_envs=0.02,
+        rel_standing_envs=0.0,
         rel_heading_envs=0.6,
         rel_y_envs=0.6,
         heading_command=True,
@@ -570,9 +648,9 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
     )
     joint_vel = RewTerm(
         func=mdp.joint_vel_reward,
-        weight=0.5, #0.0, #1.0,
+        weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 1.5*math.sqrt(21)}
+                "sigma": 6.5*math.sqrt(21)}
     )
 
     # Bodies
@@ -584,15 +662,15 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
     )
     body_ori = RewTerm(
         func=mdp.body_ori_reward,
-        weight=0.0,
+        weight=1.0,
         params={"command_name": "traj_ref",
                 "sigma": 0.4 * math.sqrt(4)}
     )
     body_lin_vel = RewTerm(
         func=mdp.body_lin_vel_reward,
-        weight=0.0,
+        weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.2 * math.sqrt(4)}
+                "sigma": 2.0 * math.sqrt(4)}
     )
     body_ang_vel = RewTerm(
         func=mdp.body_ang_vel_reward,
@@ -616,6 +694,7 @@ class G1RunningCurriculumCfg:
 
 @configclass
 class G1RunningEventsCfg(HumanoidEventsCfg):
+    # Reset on the trajectory
     reset_on_ref = EventTerm(
         func=mdp.reset_on_reference,
         mode="reset",
@@ -623,6 +702,40 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
                 "rel_envs_on_ref": 0.5}
+    )
+
+    # Randomize joint friction
+    joint_friction_params = EventTerm(
+        func=mdp.randomize_joint_parameters_multi_friction,
+        mode="startup",
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+                "static_friction_distribution_params": (0.3, 1.6),
+                "dynamic_friction_distribution_params": (0.3, 1.2),
+                "viscous_friction_distribution_params": (0.01, 0.1),
+                "armature_distribution_params": (0.95, 1.05),
+                "operation": "add"},
+    )
+
+    # Randomize armature
+    joint_armature_params = EventTerm(
+        func=mdp.randomize_joint_parameters_multi_friction,
+        mode="startup",
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+                "armature_distribution_params": (0.95, 1.05),
+                "operation": "scale"},
+    )
+
+    # PD Gain randomization
+    gain_randomization = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
+            "operation": "scale",
+            "distribution": "uniform"
+        },
     )
 
     reset_base = None
@@ -704,11 +817,7 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         ##
         # Domain randomization
         ##
-        # self.events.randomize_ground_contact_friction = None
-        # self.events.add_base_mass = None
-        # self.events.base_com = None
         self.events.base_external_force_torque = None
-        # self.events.push_robot = None
 
         # Update the ground restitution range
         self.events.randomize_ground_contact_friction.params['restitution_range'] = (0.0, 0.2)
@@ -719,34 +828,6 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         # Make the COM randomization on the torso rather than the pelvis
         self.events.base_com.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
         self.events.add_base_mass.params['asset_cfg'] = SceneEntityCfg("robot", body_names="waist_yaw_link")
-
-
-        # randomize joint parameters and actuator gains
-        # self.events.actuator_gain = EventTerm(
-        #     func=mdp.randomize_actuator_gains,
-        #     mode="startup",
-        #     params={
-        #             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-        #             "stiffness_distribution_params": (-10, 10.),
-        #             "damping_distribution_params": (-2., 2.),
-        #             "operation": "add",
-        #             "distribution": "uniform"
-        #     },
-        # )
-        self.events.gain_randomization.params['operation'] = "scale"
-        self.events.gain_randomization.params['stiffness_distribution_params'] = (0.9,1.1)
-        self.events.gain_randomization.params['damping_distribution_params'] = (0.9,1.1)
-
-        self.events.joint_params = EventTerm(
-            func=mdp.randomize_joint_parameters,
-            mode="startup",
-            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
-                    "lower_limit_distribution_params": (1.0,1.0),
-                    "upper_limit_distribution_params": (1.0,1.0),
-                    "friction_distribution_params": (0.95, 1.05),
-                    "armature_distribution_params":(0.95,1.05),
-                    "operation": "scale"},
-        )
         
         ##
         # Episode length
@@ -760,7 +841,8 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0

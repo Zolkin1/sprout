@@ -257,7 +257,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 ax.plot(time_steps, processed_data['y_des'][:, env_id, i], label='Reference', linewidth=2)
                 ax.plot(time_steps, processed_data['y_act'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
                 # label = state_labels['y_des'][i] if i < len(state_labels['y_des']) else f'Dimension {i}'
-                label = processed_data['ordered_output_names'][0, i]
+                label = processed_data['ordered_pos_output_names'][0, i]
                 print(f"using label {label}, i: {i}, n_dims: {n_dims}")
                 unit = units['y_des'][i] if i < len(units['y_des']) else ''
                 ax.set_title(label, fontsize=10)
@@ -290,7 +290,7 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 ax = get_ax(axs, i, n_cols)
                 ax.plot(time_steps, processed_data['dy_des'][:, env_id, i], label='Reference', linewidth=2)
                 ax.plot(time_steps, processed_data['dy_act'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
-                label = processed_data['ordered_output_names'][0, i]
+                label = processed_data['ordered_vel_output_names'][0, i]
                 unit = units['dy_des'][i] if i < len(units['dy_des']) else ''
                 ax.set_title(label, fontsize=10)
                 ax.set_xlabel('Time Steps')

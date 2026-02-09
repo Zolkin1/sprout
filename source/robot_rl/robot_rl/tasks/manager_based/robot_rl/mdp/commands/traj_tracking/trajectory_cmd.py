@@ -9,7 +9,7 @@ from .library_manager import LibraryManager
 from .trajectory_manager import TrajectoryManager
 from .trajectory_manager import TrajectoryType
 
-from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi, yaw_quat, quat_inv
+from isaaclab.utils.math import wrap_to_pi, quat_apply, quat_mul, quat_from_euler_xyz,euler_xyz_from_quat, wrap_to_pi, yaw_quat, quat_inv
 
 class TrajectoryCommand(CommandTerm):
     """Trajectory command term. This keeps track of the underlying single trajectory or library as well as CLF for tracking."""
@@ -43,12 +43,6 @@ class TrajectoryCommand(CommandTerm):
         self.manager_type = cfg.manager_type
         self.conditioner_generator = cfg.conditioner_generator_name
 
-        self.y_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
-        self.dy_act = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
-
-        self.y_des = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
-        self.dy_des = torch.zeros((self.num_envs, cfg.num_outputs), device=self.device)
-
         # Create trajectory/library manager
         if cfg.manager_type == "trajectory":
             self.manager = TrajectoryManager(cfg.path, cfg.hf_repo, env.device)
@@ -63,29 +57,45 @@ class TrajectoryCommand(CommandTerm):
         self.verify_contact_frames()
 
         # Hold a list of current domains for each env
-        self.current_domain = -1 * torch.ones(self.num_envs, device=self.device)
+        self.current_domain = -1 * torch.ones(self.num_envs, dtype=torch.long, device=self.device)
 
         # Create a list of indices to be used
-        self.joint_idx, self.body_idx, self.use_com, self.ordered_output_names, self.body_type = self._parse_outputs(self.manager.get_output_names)
+        # Parse outputs using position output names (superset that includes ori_w)
+        result = self._parse_outputs(self.manager.get_pos_output_names)
+        self.joint_idx, self.body_idx, self.use_com, self.ordered_pos_output_names, self.ordered_vel_output_names, self.body_type = result
 
-        # Order the manager to match the order here
-        self.manager.order_outputs(self.ordered_output_names)
+        self.y_act = torch.zeros((self.num_envs, len(self.ordered_pos_output_names)), device=self.device)
+        self.dy_act = torch.zeros((self.num_envs, len(self.ordered_vel_output_names)), device=self.device)
+
+        self.y_des = torch.zeros((self.num_envs, len(self.ordered_pos_output_names)), device=self.device)
+        self.dy_des = torch.zeros((self.num_envs, len(self.ordered_vel_output_names)), device=self.device)
+
+        # Order the manager to match the order here (pass both pos and vel names)
+        self.manager.order_outputs(self.ordered_pos_output_names, self.ordered_vel_output_names)
 
         self.body_type = torch.tensor(self.body_type, dtype=torch.int, device=self.device)
 
-        print(f"Order output names: {self.ordered_output_names}")
-
-        if cfg.num_outputs != len(self.ordered_output_names):
-            raise ValueError(f"Number of output names does not match number of outputs in the cfg! "
-                             f"Len of names: {len(self.ordered_output_names)}, cfg len: {cfg.num_outputs} !")
+        print(f"Ordered pos output names: {self.ordered_pos_output_names}")
+        print(f"Ordered vel output names: {self.ordered_vel_output_names}")
 
         self.time_offset = torch.zeros(self.num_envs, device=self.device)
 
         # For now assuming that all bodies have a yaw tracking
+        # Use velocity output names since CLF uses velocity dimensions
         self.yaw_output_idxs = []
-        for i, name in enumerate(self.ordered_output_names):
+        for i, name in enumerate(self.ordered_vel_output_names):
             if "ori_z" in name:
                 self.yaw_output_idxs.append(i)
+
+        # Create a mapping from vel output indices to pos output indices
+        # This is needed to extract position values that match velocity dimensions
+        # (pos includes ori_w, vel excludes it)
+        self.vel_to_pos_idx = torch.zeros(len(self.ordered_vel_output_names), dtype=torch.long, device=self.device)
+        for i, vel_name in enumerate(self.ordered_vel_output_names):
+            if vel_name in self.ordered_pos_output_names:
+                self.vel_to_pos_idx[i] = self.ordered_pos_output_names.index(vel_name)
+            else:
+                raise ValueError(f"Velocity output name '{vel_name}' not found in position output names.")
 
         # Create a list of indices for the reference frames
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(self.manager.get_reference_frames())
@@ -104,11 +114,12 @@ class TrajectoryCommand(CommandTerm):
         # Current reference frame poses
         self.ref_poses = torch.zeros((self.num_envs, 7), device=self.device)    # [N, [position, quat]]
 
-        # Create CLF
+        # Create CLF using velocity output names (which exclude ori_w)
         self.clf = CLF(
-            self.cfg.num_outputs, self.env.cfg.sim.dt,
+            sim_dt=self.env.cfg.sim.dt,
             batch_size=self.num_envs,
-            ordered_output_names=self.ordered_output_names,
+            ordered_vel_output_names=self.ordered_vel_output_names,
+            ordered_pos_output_names=self.ordered_pos_output_names,
             Q_weights=self.cfg.Q_weights,
             R_weights=self.cfg.R_weights,
             device=self.device
@@ -130,7 +141,7 @@ class TrajectoryCommand(CommandTerm):
 
         self.init_time_offset = torch.zeros(self.num_envs, device=self.device)
 
-    def update_phasing_var(self, t: torch.Tensor):
+    def update_phasing_var(self, t: torch.Tensor, env_ids: torch.Tensor = None):
         """Get the phasing variable for the current trajectory.
 
         Holds phi at the second boundary crossing (0.0 or 0.5) rather than the first,
@@ -138,10 +149,20 @@ class TrajectoryCommand(CommandTerm):
 
         Args:
             t: Time tensor of shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only update
+                the phasing var for those environments (skips hold logic).
 
         Returns:
             Phasing variable tensor of shape [N].
         """
+        if env_ids is not None:
+            # Subset update - just update phasing var, skip hold logic
+            new_phi = self.manager.get_phasing_var(t, env_ids)
+            self.phasing_var[env_ids] = new_phi
+            self.unmasked_phasing_var[env_ids] = new_phi
+            return new_phi
+
+        # Full update with hold/boundary tracking
         prev_phi = self.phasing_var
         self.prev_unmasked_phasing_var = self.unmasked_phasing_var
         self.phasing_var = self.manager.get_phasing_var(t)
@@ -233,17 +254,19 @@ class TrajectoryCommand(CommandTerm):
 
         return expanded_frames
 
-    def get_contact_state(self, t: torch.Tensor):
+    def get_contact_state(self, t: torch.Tensor, env_ids: torch.Tensor = None):
         """Gets the desired contact state at the given time for the specified contact point.
 
         Args:
             t: Shape [N] the times in each environment.
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments.
 
         Returns:
             Contact states of shape [N, num_contacts]. A tensor of binary values
             with a 1 indicating in contact and 0 otherwise.
         """
-        return self.manager.get_contact_state(t, self.contact_bodies)
+        return self.manager.get_contact_state(t, self.contact_bodies, env_ids)
 
     def get_symmetric_contacts(self, contacts):
         """
@@ -381,9 +404,14 @@ class TrajectoryCommand(CommandTerm):
 
         return vels
 
-    def get_measured_outputs(self, t: torch.Tensor):
+    def get_measured_outputs(self, t: torch.Tensor, env_ids: torch.Tensor = None):
         """
         Get the measured state then compute the measured outputs.
+
+        Args:
+            t: Time tensor of shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only update
+                state for those environments.
         """
         ref_poses = self.get_ref_frame_poses()        # Get the pose of every frame that should be in contact
 
@@ -394,55 +422,87 @@ class TrajectoryCommand(CommandTerm):
         #   The self.ref_poses should be of shape [N, 7] and should just be holding the current in use reference frame.
 
         # Get the current domains
-        new_domains = self.manager.get_current_domains(t)
+        new_domains = self.manager.get_current_domains(t, env_ids)
 
         # Check if the domains changed
-        changed = new_domains != self.current_domain
+        if env_ids is None:
+            changed = new_domains != self.current_domain
+        else:
+            changed = new_domains != self.current_domain[env_ids]
 
         # Note that domains never change for full periodic single domain trajectories, but I think we still want to update the position.
         # The two options are (1) continually updating the position while in contact, (2) try to check based on the phasing variable
 
         # So if we are in a standing then update the reference position at the normal stepping cadence
-        single_dom_mask = (self.manager.get_num_domains() == 1) & ((self.prev_unmasked_phasing_var > self.unmasked_phasing_var) |
-                                                                   ((self.prev_unmasked_phasing_var < 0.5) & (0.5 < self.unmasked_phasing_var)))
-        changed[single_dom_mask] = True
+        if env_ids is None:
+            single_dom_mask = (self.manager.get_num_domains() == 1) & ((self.prev_unmasked_phasing_var > self.unmasked_phasing_var) |
+                                                                       ((self.prev_unmasked_phasing_var < 0.5) & (0.5 < self.unmasked_phasing_var)))
+            changed[single_dom_mask] = True
 
-        # Update the list of current domains
-        self.current_domain = new_domains
+            # Update the list of current domains
+            self.current_domain = new_domains
+        else:
+            single_dom_mask = (self.manager.get_num_domains()[env_ids] == 1) & \
+                              ((self.prev_unmasked_phasing_var[env_ids] > self.unmasked_phasing_var[env_ids]) |
+                               ((self.prev_unmasked_phasing_var[env_ids] < 0.5) & (0.5 < self.unmasked_phasing_var[env_ids])))
+            changed[single_dom_mask] = True
+
+            # Update the list of current domains for the subset
+            self.current_domain[env_ids] = new_domains
 
         # Determine which reference frames/bodies are in contact
-        contact_state = self.get_contact_state(t)  # Shape: [N, num_contact_frames]
+        contact_state = self.get_contact_state(t, env_ids)  # Shape: [N, num_contact_frames]
         # print(f"contact_state: {contact_state}, contact_frames: {self.contact_bodies}")
 
-        self.current_contact_poses = self.get_contact_poses(contact_state)
-        self.current_contact_vels = self.get_contact_vels(contact_state)
-        self.desired_contact_poses = self.get_desired_contact_poses(changed, self.current_contact_poses)
+        if env_ids is None:
+            self.current_contact_poses = self.get_contact_poses(contact_state)
+            self.current_contact_vels = self.get_contact_vels(contact_state)
+            self.desired_contact_poses = self.get_desired_contact_poses(changed, self.current_contact_poses)
 
-        # Get the indices into self.ref_frames for the reference frame in use for each env
-        ref_frame_indices = self.manager.get_ref_frames_in_use(t, self.ref_frames)  # Shape: [N]
+            # Get the indices into self.ref_frames for the reference frame in use for each env
+            ref_frame_indices = self.manager.get_ref_frames_in_use(t, self.ref_frames)  # Shape: [N]
 
-        # Map ref_frame_indices to contact_state indices
-        # ref_frame_indices indexes into self.ref_frames, but contact_state uses self.contact_frames
-        # Use the mapping to convert: ref_frame_idx -> contact_frame_idx
-        contact_frame_indices = self.ref_to_contact_idx[ref_frame_indices]  # Shape: [N]
+            # Map ref_frame_indices to contact_state indices
+            contact_frame_indices = self.ref_to_contact_idx[ref_frame_indices]  # Shape: [N]
 
-        # Check if the reference frames are in contact
-        # Gather the contact state for the specific frames we're interested in
-        ref_frames_in_contact = torch.gather(contact_state, 1, contact_frame_indices.unsqueeze(1)).squeeze(1)  # Shape: [N]
+            # Check if the reference frames are in contact
+            ref_frames_in_contact = torch.gather(contact_state, 1, contact_frame_indices.unsqueeze(1)).squeeze(1)
 
-        # Now index only envs where we are in contact and domains changed
-        changed_and_contact = changed & (ref_frames_in_contact > 0)     # Shape: [N]
+            # Now index only envs where we are in contact and domains changed
+            changed_and_contact = changed & (ref_frames_in_contact > 0)
 
-        # Get the correct reference frame to pass
-        # Use ref_frame_indices to select the appropriate pose for each environment
-        if torch.any(changed_and_contact):
-            # Get environment indices where the condition is true
-            env_indices = torch.where(changed_and_contact)[0]
-            # Index ref_poses using advanced indexing: [env_idx, frame_idx, :]
-            self.ref_poses[env_indices, :] = ref_poses[env_indices, ref_frame_indices[env_indices], :]
+            # Get the correct reference frame to pass
+            if torch.any(changed_and_contact):
+                env_indices = torch.where(changed_and_contact)[0]
+                self.ref_poses[env_indices, :] = ref_poses[env_indices, ref_frame_indices[env_indices], :]
 
-        # Compute the measured outputs
-        self.compute_measured_output(self.ref_poses[:, :3], self.ref_poses[:, 3:])
+            # Compute the measured outputs
+            self.compute_measured_output(self.ref_poses[:, :3], self.ref_poses[:, 3:])
+        else:
+            # Subset update - simplified version for reset/debug use case
+            # For subset updates, we skip contact pose/vel updates (they require full-sized tensors)
+            # and just update ref_poses and compute measured outputs
+
+            # Get the indices into self.ref_frames for the reference frame in use for subset
+            ref_frame_indices = self.manager.get_ref_frames_in_use(t, self.ref_frames, env_ids)
+
+            # Map ref_frame_indices to contact_state indices
+            contact_frame_indices = self.ref_to_contact_idx[ref_frame_indices]
+
+            # Check if the reference frames are in contact
+            ref_frames_in_contact = torch.gather(contact_state, 1, contact_frame_indices.unsqueeze(1)).squeeze(1)
+
+            # Now index only envs where we are in contact and domains changed
+            changed_and_contact = changed & (ref_frames_in_contact > 0)
+
+            # Get the correct reference frame to pass
+            if torch.any(changed_and_contact):
+                subset_indices = torch.where(changed_and_contact)[0]
+                global_env_indices = env_ids[subset_indices]
+                self.ref_poses[global_env_indices, :] = ref_poses[global_env_indices, ref_frame_indices[subset_indices], :]
+
+            # Compute the measured outputs for all envs (using updated ref_poses)
+            self.compute_measured_output(self.ref_poses[:, :3], self.ref_poses[:, 3:])
 
 
     def compute_measured_output(self, ref_frame_pos_w, ref_frame_quat) -> tuple[torch.Tensor, torch.Tensor]:
@@ -452,7 +512,8 @@ class TrajectoryCommand(CommandTerm):
         # TODO: Make sure that the velocities are computed in the LOCAL_WORLD_ALIGNED frame
         # TODO: Make sure positions are in the stance foot frame
 
-        output_idx = 0
+        pos_output_idx = 0
+        vel_output_idx = 0
 
         # Get the relevant end effector positions (in global frame)
         if self.use_com:
@@ -461,60 +522,100 @@ class TrajectoryCommand(CommandTerm):
             com_vel_w = self.robot.data.root_com_vel_w[:, :3]
 
             # Put into the reference frame
-            com_pos_local = _transfer_to_local_frame(com_pos_w - ref_frame_pos_w, ref_frame_quat)
+            com_pos_local = _align_yaw(com_pos_w - ref_frame_pos_w, ref_frame_quat)
             # import pdb; pdb.set_trace()
-            com_vel_local = _transfer_to_local_frame(com_vel_w, ref_frame_quat)
+            com_vel_local = _align_yaw(com_vel_w, ref_frame_quat)
 
-            self.y_act[:, output_idx:output_idx+3] = com_pos_local
-            self.dy_act[:, output_idx:output_idx+3] = com_vel_local
-            output_idx += 3
+            self.y_act[:, pos_output_idx:pos_output_idx+3] = com_pos_local
+            self.dy_act[:, vel_output_idx:vel_output_idx+3] = com_vel_local
+            pos_output_idx += 3
+            vel_output_idx += 3
 
-        def _get_pos_ori_vel_relative(ref_frame_pos, ref_frame_quat, frame_pos, frame_quad,
+        def _get_pos_ori_vel_relative(ref_frame_pos_w, ref_frame_quat_w, frame_pos_w, frame_quat_w,
                                       frame_lin_vel_w, frame_ang_vel_w):
             """
             Compute the position, orientation, and velocity relative to the reference frame.
 
+            # TODO: Think about benefits of just yaw aligning and roll-pitch algining
+            #   If I roll-pitch align it should work better on slopes, but then maybe we are more
+            #   sensitive to the orientation of the reference frame, especially if the reference isn't perfect,
+            #       then we just generate more error
+
+            # TODO: For now just going with yaw aligned
+            # NOTE: All positions should be in the yaw-aligned frame centered at the reference frame.
+            #   All orientation should be in the yaw-aligned frame.
+            #   All velocities should be in the yaw-aligned frame.
+            #   All angular velocities should be in the yaw-aligned frame.
+
             Args:
                 idx: tensor of shape [num_bodies]
-                ref_frame_pos: tensor of shape [3]
-                ref_frame_quat: tensor of shape [4]
+                frame_pos_w: tensor of shape [3]
+                ref_frame_quat_w: tensor of shape [4]
 
             Returns:
-                frame_pos_rel_local: tensor of shape [N, num_bodies, 3]
-                frame_ori_rel: tensor of shape [N, num_bodies, 3]
+                frame_pos_rel_yaw_aligned: tensor of shape [N, num_bodies, 3]
+                frame_ori_yaw_aligned: tensor of shape [N, num_bodies, 3]
                 frame_vel_local: tensor of shape [N, num_bodies, 3]
                 frame_ang_vel_local: tensor of shape [N, num_bodies, 3]
             """
-            base_frame_ori = get_euler_from_quat(ref_frame_quat)
+            # Compute reference orientation as euler
+            # base_frame_ori_w = get_euler_from_quat(ref_frame_quat_w)
 
             num_idx = len(self.body_idx)
 
-            frame_ori = torch.zeros(ref_frame_pos.shape[0], num_idx, 3, device=ref_frame_pos.device)
-            frame_pos_rel = torch.zeros(frame_pos.shape, device=frame_pos.device)
-            frame_pos_rel_local = torch.zeros(frame_pos.shape, device=frame_pos.device)
-            frame_ori_rel = frame_ori
+            ##
+            # Positions
+            ##
+            # Make buffers
+            frame_ori_euler = torch.zeros(ref_frame_pos_w.shape[0], num_idx, 3, device=ref_frame_pos_w.device)
+            frame_pos_rel_world_aligned = torch.zeros(frame_pos_w.shape, device=frame_pos_w.device)
+            frame_pos_rel_yaw_aligned = torch.zeros(frame_pos_w.shape, device=frame_pos_w.device)
+            frame_ori_yaw_aligned = torch.zeros(ref_frame_pos_w.shape[0], num_idx, 4, device=ref_frame_pos_w.device)
+
             for i in range(num_idx):
-                frame_ori[:, i, :] = get_euler_from_quat(frame_quat[:, i, :])
-                frame_pos_rel[:, i, :] = frame_pos[:, i, :] - ref_frame_pos
+                # Get the frame orientation as euler from the quat
+                frame_ori_euler[:, i, :] = get_euler_from_quat(frame_quat[:, i, :])
 
-                frame_pos_rel_local[:, i, :] = _transfer_to_local_frame(frame_pos_rel[:, i, :], ref_frame_quat)
+                # Translate the frame to be relative to reference in world-aligned coords
+                frame_pos_rel_world_aligned[:, i, :] = frame_pos_w[:, i, :] - ref_frame_pos_w
 
-                frame_ori_rel[:, i, 2] = wrap_to_pi(frame_ori_rel[:, i, 2] - base_frame_ori[:, 2])
+                # Align the position in the yaw frame
+                frame_pos_rel_yaw_aligned[:, i, :] = _align_yaw(frame_pos_rel_world_aligned[:, i, :],
+                                                                ref_frame_quat_w)
 
-            frame_vel_local = torch.zeros(frame_lin_vel_w.shape, device=frame_lin_vel_w.device)
+                # # Align yaw and wrap to pi
+                # frame_ori_yaw_aligned[:, i, 2] = wrap_to_pi(frame_ori_euler[:, i, 2] - base_frame_ori_w[:, 2])
+                #
+                # # Use global roll and pitch
+                # frame_ori_yaw_aligned[:, i, :2] = frame_ori_euler[:, i, :2]
+
+                frame_ori_yaw_aligned[:, i, :] = _align_quat_to_yaw(frame_quat_w[:, i, :], ref_frame_quat_w)
+
+            ##
+            # Velocities
+            ##
+            # Make buffers
+            frame_vel_yaw_aligned = torch.zeros(frame_lin_vel_w.shape, device=frame_lin_vel_w.device)
             frame_ang_vel_local = torch.zeros(frame_ang_vel_w.shape, device=frame_ang_vel_w.device)
-            for i in range(num_idx):
-                frame_vel_local[:, i, :] = _transfer_to_local_frame(frame_lin_vel_w[:, i, :], ref_frame_quat)
-                frame_ang_vel_local[:, i, :] = _transfer_to_local_frame(frame_ang_vel_w[:, i, :], ref_frame_quat)
 
-            return frame_pos_rel_local, frame_ori_rel, frame_vel_local, frame_ang_vel_local
+            for i in range(num_idx):
+                frame_vel_yaw_aligned[:, i, :] = _align_yaw(frame_lin_vel_w[:, i, :], ref_frame_quat)
+                frame_ang_vel_local[:, i, :] = _align_yaw(frame_ang_vel_w[:, i, :], ref_frame_quat)
+
+            return frame_pos_rel_yaw_aligned, frame_ori_yaw_aligned, frame_vel_yaw_aligned, frame_ang_vel_local
 
         # Bodies
         if self.body_idx is not None:
             frame_pos = self.robot.data.body_pos_w[:, self.body_idx, :]
             frame_quat = self.robot.data.body_quat_w[:, self.body_idx, :]
-            frame_lin_vel_w = self.robot.data.body_lin_vel_w[:, self.body_idx, :]
-            frame_ang_vel_w = self.robot.data.body_ang_vel_w[:, self.body_idx, :]
+
+            # Get the frame vels, not the COM vels
+            frame_lin_vel_w = self.robot.data.body_link_vel_w[:, self.body_idx, :3]
+            frame_ang_vel_w = self.robot.data.body_link_vel_w[:, self.body_idx, 3:]
+
+            # These pull the COM velocities in the world frame - want the frame velocities
+            # frame_lin_vel_w = self.robot.data.body_lin_vel_w[:, self.body_idx, :]
+            # frame_ang_vel_w = self.robot.data.body_ang_vel_w[:, self.body_idx, :]
 
             body_pos_local, body_ori_local, body_vel_local, body_ang_vel_local = _get_pos_ori_vel_relative(
                 ref_frame_pos_w, ref_frame_quat, frame_pos, frame_quat, frame_lin_vel_w, frame_ang_vel_w)
@@ -525,59 +626,154 @@ class TrajectoryCommand(CommandTerm):
             num_ori_bodies = ori_bodies.sum()
 
             # Add linear
-            self.y_act[:, output_idx:output_idx+(3*num_pos_bodies)] = (
+            self.y_act[:, pos_output_idx:pos_output_idx+(3*num_pos_bodies)] = (
                 body_pos_local[:, pos_bodies, :].flatten(1))
-            self.dy_act[:, output_idx:output_idx+(3*num_pos_bodies)] = (
+            self.dy_act[:, vel_output_idx:vel_output_idx+(3*num_pos_bodies)] = (
                 body_vel_local[:, pos_bodies, :].flatten(1))
 
-            output_idx += (3*num_pos_bodies.item())
+            pos_output_idx += (3*num_pos_bodies.item())
+            vel_output_idx += (3*num_pos_bodies.item())
 
             # Add angles
-            self.y_act[:, output_idx:output_idx+(3*num_ori_bodies)] = (
+            self.y_act[:, pos_output_idx:pos_output_idx+(4*num_ori_bodies)] = (
                 body_ori_local[:, ori_bodies, :].flatten(1))
-            self.dy_act[:, output_idx:output_idx+(3*num_ori_bodies)] = (
+            self.dy_act[:, vel_output_idx:vel_output_idx+(3*num_ori_bodies)] = (
                 body_ang_vel_local[:, ori_bodies, :].flatten(1))
 
-            output_idx += (3*num_ori_bodies.item())
+            pos_output_idx += (4*num_ori_bodies.item())
+            vel_output_idx += (3*num_ori_bodies.item())
 
         # Get the relevant joint angles
         if self.joint_idx is not None:
             joint_pos = self.robot.data.joint_pos[:, self.joint_idx]
             joint_vel = self.robot.data.joint_vel[:, self.joint_idx]
 
-            self.y_act[:, output_idx:output_idx+(joint_pos.shape[1])] = joint_pos
-            self.dy_act[:, output_idx:output_idx+(joint_vel.shape[1])] = joint_vel
+            self.y_act[:, pos_output_idx:pos_output_idx+(joint_pos.shape[1])] = joint_pos
+            self.dy_act[:, vel_output_idx:vel_output_idx+(joint_vel.shape[1])] = joint_vel
 
-            output_idx += joint_vel.shape[1]
+            pos_output_idx += joint_pos.shape[1]
+            vel_output_idx += joint_vel.shape[1]
 
-    def get_desired_outputs(self, t: torch.Tensor):
+    def compute_measured_acceleration(
+        self, ref_frame_pos_w: torch.Tensor, ref_frame_quat: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute measured accelerations from the robot in the same order as outputs.
+
+        This method extracts accelerations from the robot articulation data
+        (COM, body, and joint accelerations) and transforms them to the local
+        reference frame.
+
+        Args:
+            ref_frame_pos_w: [N, 3] reference frame positions in world frame.
+            ref_frame_quat: [N, 4] reference frame quaternions.
+
+        Returns:
+            ddy_act: [N, num_outputs] measured accelerations in local frame.
+        """
+        ddy_act = torch.zeros((self.num_envs, len(self.ordered_vel_output_names)), device=self.device)
+        output_idx = 0
+
+        # COM accelerations
+        if self.use_com:
+            # Get COM acceleration in world frame (linear acceleration only)
+            com_acc_w = self.robot.data.root_com_acc_w[:, :3]
+
+            # Transform to local frame
+            com_acc_local = _align_yaw(com_acc_w, ref_frame_quat)
+
+            ddy_act[:, output_idx:output_idx + 3] = com_acc_local
+            output_idx += 3
+
+        # Body accelerations
+        if self.body_idx is not None:
+            # Get body accelerations in world frame
+            # body_acc_w contains [linear_acc (3), angular_acc (3)] per body
+            body_lin_acc_w = self.robot.data.body_acc_w[:, self.body_idx, :3]
+            body_ang_acc_w = self.robot.data.body_acc_w[:, self.body_idx, 3:]
+
+            num_idx = len(self.body_idx)
+
+            # Transform to local frame (same pattern as velocities)
+            body_lin_acc_local = torch.zeros(body_lin_acc_w.shape, device=self.device)
+            body_ang_acc_local = torch.zeros(body_ang_acc_w.shape, device=self.device)
+            for i in range(num_idx):
+                body_lin_acc_local[:, i, :] = _align_yaw(
+                    body_lin_acc_w[:, i, :], ref_frame_quat
+                )
+                body_ang_acc_local[:, i, :] = _align_yaw(
+                    body_ang_acc_w[:, i, :], ref_frame_quat
+                )
+
+            pos_bodies = (self.body_type == 1) | (self.body_type == 2)
+            num_pos_bodies = pos_bodies.sum()
+            ori_bodies = (self.body_type == 0) | (self.body_type == 2)
+            num_ori_bodies = ori_bodies.sum()
+
+            # Add linear accelerations
+            ddy_act[:, output_idx:output_idx + (3 * num_pos_bodies)] = (
+                body_lin_acc_local[:, pos_bodies, :].flatten(1)
+            )
+            output_idx += (3 * num_pos_bodies.item())
+
+            # Add angular accelerations
+            ddy_act[:, output_idx:output_idx + (3 * num_ori_bodies)] = (
+                body_ang_acc_local[:, ori_bodies, :].flatten(1)
+            )
+            output_idx += (3 * num_ori_bodies.item())
+
+        # Joint accelerations
+        if self.joint_idx is not None:
+            joint_acc = self.robot.data.joint_acc[:, self.joint_idx]
+            ddy_act[:, output_idx:output_idx + joint_acc.shape[1]] = joint_acc
+            output_idx += joint_acc.shape[1]
+
+        return ddy_act
+
+    def get_desired_outputs(self, t: torch.Tensor, env_ids: torch.Tensor = None):
         """Get the desired output to track from the trajectory.
 
         Args:
             t: Time tensor of shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only update
+                state for those environments.
         """
-        y = self.manager.get_output(t)
+        phi = self.update_phasing_var(t, env_ids)
+
+        # get_output returns (pos_outputs, vel_outputs) tuple
+        # pos_outputs: [N, num_pos_outputs] includes ori_w
+        # vel_outputs: [N, num_vel_outputs] excludes ori_w
+        y_pos, y_vel = self.manager.get_output(t, env_ids)
 
         # Apply optional heuristic modification
+        # TODO: Put back and fix for quat and global orientation
         if self.user_heuristic is not None:
-            contact_states = self.get_contact_state(t)
-            # Get the phasing variable and the total time
-            phi = self.get_phasing_var()
+            # Get current contact state
+            contact_states = self.get_contact_state(t, env_ids)
+
+            # Get the phasing variable for these environments
+            phi_for_heuristic = phi if env_ids is None else self.phasing_var[env_ids]
             total_time = self.manager.get_total_time()
-            y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
-                                    contact_states, phi, total_time, self.cfg.hold_phi_threshold)
 
-            # time_into_domain = torch.remainder(t, self.manager.get_domain_times(t))
-            # y = self.user_heuristic(self.env, self.ordered_output_names, y, self.contact_bodies,
-            #                         contact_states, time_into_domain, self.cfg.hold_phi_threshold)
+            # Pass both pos and vel to heuristic - heuristic should return (y_pos, y_vel) tuple
+            y_pos, y_vel = self.user_heuristic(self.env, self.ordered_pos_output_names, self.ordered_vel_output_names,
+                                               y_pos, y_vel, self.contact_bodies,
+                                               contact_states, phi_for_heuristic, total_time, env_ids, self.cfg.hold_phi_threshold)
 
-        self.y_des = y[:, 0, :]
-        self.dy_des = y[:, 1, :]
-
-        phi = self.update_phasing_var(t)
+        # Update state - use slice if env_ids provided
+        if env_ids is None:
+            self.y_des = y_pos
+            self.dy_des = y_vel
+        else:
+            self.y_des[env_ids] = y_pos
+            self.dy_des[env_ids] = y_vel
 
         if self.manager.get_trajectory_type() == TrajectoryType.EPISODIC:
-            self.dy_des[phi == 1] *= 0
+            if env_ids is None:
+                self.dy_des[phi == 1] *= 0
+            else:
+                episodic_mask = phi == 1
+                self.dy_des[env_ids[episodic_mask]] *= 0
 
     def set_user_heuristic(self, heuristic_func):
         """
@@ -585,7 +781,7 @@ class TrajectoryCommand(CommandTerm):
         """
         self.user_heuristic = heuristic_func
 
-    def get_symmetric_traj(self, traj: torch.Tensor) -> torch.Tensor:
+    def get_symmetric_traj(self, traj: torch.Tensor, traj_type: str) -> torch.Tensor:
         """
         Computes the symmetric version of the trajectory.
 
@@ -604,8 +800,14 @@ class TrajectoryCommand(CommandTerm):
         # Create a copy to avoid modifying the original
         symmetric_traj = traj.clone()
 
+        # Use velocity output names since this is typically used with CLF
+        if traj_type == "vel":
+            output_names = self.ordered_vel_output_names
+        else:
+            output_names = self.ordered_pos_output_names
+
         # Create a mapping from each output to its symmetric counterpart
-        for i, output_name in enumerate(self.ordered_output_names):
+        for i, output_name in enumerate(output_names):
             # Find the symmetric output name
             if "left" in output_name:
                 symmetric_name = output_name.replace("left", "right")
@@ -619,8 +821,8 @@ class TrajectoryCommand(CommandTerm):
                 continue
 
             # Find the index of the symmetric output
-            if symmetric_name in self.ordered_output_names:
-                j = self.ordered_output_names.index(symmetric_name)
+            if symmetric_name in output_names:
+                j = output_names.index(symmetric_name)
 
                 # Swap the values
                 symmetric_traj[:, i] = traj[:, j]
@@ -698,10 +900,12 @@ class TrajectoryCommand(CommandTerm):
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
 
-        for i, output in enumerate(self.ordered_output_names):
+        # Log position tracking errors (using pos output names)
+        for i, output in enumerate(self.ordered_pos_output_names):
             self.metrics[output] = torch.abs(self.y_des[:, i] - self.y_act[:, i])
 
-        for i, output in enumerate(self.ordered_output_names):
+        # Log velocity tracking errors (using vel output names)
+        for i, output in enumerate(self.ordered_vel_output_names):
             self.metrics[output + "_vel"] = torch.abs(self.dy_des[:, i] - self.dy_act[:, i])
 
         # Log times
@@ -712,22 +916,27 @@ class TrajectoryCommand(CommandTerm):
         # Log per-reference tracking
         v_mean = self.manager.get_v_log_avg().squeeze(-1)
         for i in range(len(v_mean)):
-            self.metrics[f"CLF_EMA_{i}"] = v_mean[i].expand(self.num_envs)
+            # Use repeat() instead of expand() to create a contiguous tensor that
+            # can be safely modified in-place by the command manager
+            self.metrics[f"CLF_EMA_{i}"] = v_mean[i].repeat(self.num_envs)
 
-    def _parse_outputs(self, output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[int]]:
+    def _parse_outputs(self, pos_output_names: list[str]) -> tuple[list[int], list[int], bool, list[str], list[str], list[int]]:
         """
         Parse the output names to indices to be used for getting data from the robot in sim.
 
         Args:
-            output_names: List of output names in the format "frame:axis" or "joint:joint_name"
+            pos_output_names: List of position output names in the format "frame:axis" or "joint:joint_name"
+                             (includes ori_w for quaternions)
 
         Returns:
             joint_idx: List of joint indices (or None if no joints)
             body_idx: List of body indices (or None if no bodies)
             use_com: True if CoM is used, False otherwise
-            ordered_output_names: List of output names in the order they appear in compute_measured_output (COM, bodies, joints)
+            ordered_pos_output_names: List of position output names in the order they appear in compute_measured_output
+            ordered_vel_output_names: List of velocity output names (excludes ori_w)
             body_type_list: List indicating type of each body (0=ori only, 1=pos only, 2=both)
         """
+        output_names = pos_output_names  # Use pos names as the superset
         joint_indices = []
         joint_names_list = []
         body_indices = []
@@ -785,24 +994,31 @@ class TrajectoryCommand(CommandTerm):
                     raise ValueError(f"Body frame '{frame_name}' not found in robot body names.")
 
         # Build ordered output names in the order: COM, bodies, joints
-        ordered_output_names = []
+        # Position output names include ori_w, velocity output names exclude it
+        ordered_pos_output_names = []
+        ordered_vel_output_names = []
 
         # Add COM outputs first
         if use_com:
             for axis in com_axes:
-                ordered_output_names.append(f"com:{axis}")
+                ordered_pos_output_names.append(f"com:{axis}")
+                ordered_vel_output_names.append(f"com:{axis}")
 
         # Add body outputs - start with all positions
         for body_name in body_names_list:
             for btype in body_type[body_name]:
                 if "pos" in btype:
-                    ordered_output_names.append(f"{body_name}:{btype}")
+                    ordered_pos_output_names.append(f"{body_name}:{btype}")
+                    ordered_vel_output_names.append(f"{body_name}:{btype}")
 
         # Add body outputs - then do orientations
         for body_name in body_names_list:
             for btype in body_type[body_name]:
                 if "ori" in btype:
-                    ordered_output_names.append(f"{body_name}:{btype}")
+                    ordered_pos_output_names.append(f"{body_name}:{btype}")
+                    # Exclude ori_w from velocity output names
+                    if "ori_w" not in btype:
+                        ordered_vel_output_names.append(f"{body_name}:{btype}")
 
         # Build body_type_list for bodies
         for body_name in body_names_list:
@@ -822,13 +1038,14 @@ class TrajectoryCommand(CommandTerm):
 
         # Add joint outputs
         for joint_name in joint_names_list:
-            ordered_output_names.append(f"joint:{joint_name}")
+            ordered_pos_output_names.append(f"joint:{joint_name}")
+            ordered_vel_output_names.append(f"joint:{joint_name}")
 
         # Convert to None if empty
         joint_idx_result = joint_indices if len(joint_indices) > 0 else None
         body_idx_result = body_indices if len(body_indices) > 0 else None
 
-        return joint_idx_result, body_idx_result, use_com, ordered_output_names, body_type_list
+        return joint_idx_result, body_idx_result, use_com, ordered_pos_output_names, ordered_vel_output_names, body_type_list
 
     def _parse_ref_frames(self, reference_frames: list[str]) -> tuple[list[int], list[str]]:
         """
@@ -877,8 +1094,11 @@ class TrajectoryCommand(CommandTerm):
         return frame_indices, expanded_frames
 
 
-def _transfer_to_local_frame(vec, root_quat):
+def _align_yaw(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
+
+def _align_quat_to_yaw(quat, root_quat):
+    return quat_mul(yaw_quat(quat_inv(root_quat)), quat)
 
 def get_euler_from_quat(quat):
     """

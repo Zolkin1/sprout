@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -17,6 +17,7 @@ def reset_on_reference(
         command_name: str,
         conditioner_command_name: str,
         base_frame_name: str,
+        base_z_offset: float = 0.03,
         joint_scale_range: tuple[float, float] = (1.0, 1.0),
         rel_envs_on_ref: float = 0.5,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -45,8 +46,9 @@ def reset_on_reference(
     # Get the robot asset and trajectory command
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
-    # cond_cmd = env.command_manager.get_term(conditioner_command_name)
-    # print(f"cond_vel: {env.command_manager.get_command(conditioner_command_name)}")
+    env.command_manager.get_term(conditioner_command_name)._resample(env_ids)
+    cmd_vel = env.command_manager.get_command(conditioner_command_name)
+    # print(f"cond_vel: {cmd_vel}")
     num_env = len(env_ids)
 
     if num_env == 0:
@@ -68,23 +70,23 @@ def reset_on_reference(
 
 
     # Validate base frame exists in trajectory outputs
-    pos_indices = _find_output_indices(cmd.ordered_output_names, base_frame_name, "pos_")
-    ori_indices = _find_output_indices(cmd.ordered_output_names, base_frame_name, "ori_")
+    pos_indices = _find_output_indices(cmd.ordered_pos_output_names, base_frame_name, "pos_")
+    ori_indices = _find_output_indices(cmd.ordered_pos_output_names, base_frame_name, "ori_")
 
     if len(pos_indices) != 3:
         raise ValueError(
             f"Base frame '{base_frame_name}' must have pos_x, pos_y, pos_z in trajectory outputs. "
             f"Found {len(pos_indices)} position outputs."
         )
-    if len(ori_indices) != 3:
+    if len(ori_indices) != 4:
         raise ValueError(
-            f"Base frame '{base_frame_name}' must have ori_x, ori_y, ori_z in trajectory outputs. "
+            f"Base frame '{base_frame_name}' must have ori_x, ori_y, ori_z, ori_w in trajectory outputs. "
             f"Found {len(ori_indices)} orientation outputs."
         )
 
     # Validate all robot joints are in trajectory outputs
     traj_joint_names = set()
-    for name in cmd.ordered_output_names:
+    for name in cmd.ordered_pos_output_names:
         if name.startswith("joint:"):
             traj_joint_names.add(name.split(":", 1)[1])
 
@@ -103,31 +105,34 @@ def reset_on_reference(
     random_times = torch.rand(num_ref_envs, device=env.device) * total_time
 
     # Get trajectory outputs at sampled times
-    outputs = cmd.manager.get_output(random_times, ref_ids)  # Shape: [num_env, 2, num_outputs]
-    y_sampled = outputs[:, 0, :]  # Position outputs
+    cmd.get_desired_outputs(random_times, env_ids=ref_ids)
+    des_outputs = cmd.y_des
+    y_sampled = des_outputs[ref_ids]  # Position outputs
 
     # Extract base frame position and orientation from outputs
     base_pos_rel = y_sampled[:, pos_indices]  # Shape: [num_env, 3]
-    base_ori_euler = y_sampled[:, ori_indices]  # Shape: [num_env, 3] - roll, pitch, yaw
+    base_ori_quat_w = y_sampled[:, ori_indices]  # Shape: [num_env, 3] - roll, pitch, yaw
+
+    # Add the ground->ankle_roll_link offset
+    base_pos_rel[:, 2] += base_z_offset
 
     # Compute world-frame base pose
     base_pos_w = base_pos_rel + env.scene.env_origins[ref_ids]
 
-    # Convert euler angles (roll, pitch, yaw) to quaternion (wxyz format)
-    base_quat = quat_from_euler_xyz(
-        base_ori_euler[:, 0],  # roll
-        base_ori_euler[:, 1],  # pitch
-        base_ori_euler[:, 2],  # yaw
-    )
-
     # Build pose tensor: [x, y, z, qw, qx, qy, qz]
-    base_pose = torch.cat([base_pos_w, base_quat], dim=-1)
+    base_pose = torch.cat([base_pos_w, base_ori_quat_w], dim=-1)
 
     # Extract Base Vel
-    dy_sampled = outputs[:, 1, :]  # Velocity outputs (not used for now)
+    des_doutputs = cmd.dy_des
+    dy_sampled = des_doutputs[ref_ids]  # Velocity outputs (not used for now)
+
+    lin_vel_indices = _find_output_indices(cmd.ordered_vel_output_names, base_frame_name, "pos_")
+    ang_vel_indices = _find_output_indices(cmd.ordered_vel_output_names, base_frame_name, "ori_")
+
 
     # Set base velocity
-    base_vel = torch.cat([dy_sampled[:, pos_indices], dy_sampled[:, ori_indices]], dim=-1) #torch.zeros(num_env, 6, device=env.device)
+    base_vel = torch.cat([dy_sampled[:, lin_vel_indices], dy_sampled[:, ang_vel_indices]], dim=-1) #torch.zeros(num_env, 6, device=env.device)
+
 
     # Set the reference frame position
     cmd.ref_poses[ref_ids, :3] = env.scene.env_origins[ref_ids]
@@ -140,9 +145,11 @@ def reset_on_reference(
 
     for i, joint_name in enumerate(asset.joint_names):
         traj_output_name = f"joint:{joint_name}"
-        traj_idx = cmd.ordered_output_names.index(traj_output_name)
-        joint_pos[:, i] = y_sampled[:, traj_idx]
-        joint_vel[:, i] = dy_sampled[:, traj_idx]
+        pos_traj_idx = cmd.ordered_pos_output_names.index(traj_output_name)
+        vel_traj_idx = cmd.ordered_vel_output_names.index(traj_output_name)
+
+        joint_pos[:, i] = y_sampled[:, pos_traj_idx]
+        joint_vel[:, i] = dy_sampled[:, vel_traj_idx]
 
     # Apply optional uniform scaling to joint positions
     min_scale, max_scale = joint_scale_range
@@ -156,8 +163,35 @@ def reset_on_reference(
 
     # Write states to simulation
     asset.write_root_pose_to_sim(base_pose, env_ids=ref_ids)
-    asset.write_root_velocity_to_sim(base_vel, env_ids=ref_ids)
+    asset.write_root_link_velocity_to_sim(base_vel, env_ids=ref_ids)
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=ref_ids)
+
+    # # Compute the measured outputs and print
+    # cmd.get_measured_outputs(random_times, env_ids=ref_ids)
+    #
+    # # Get the desired outputs and print
+    # cmd.get_desired_outputs(random_times, env_ids=ref_ids)
+    #
+    # # Compute V
+    # vdot, v = cmd.clf.compute_vdot(cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des, cmd.yaw_output_idxs)
+
+    # Pretty print the output names, desired values, and measured values
+    # _pretty_print_reset_state(
+    #     cmd.ordered_pos_output_names,
+    #     cmd.ordered_vel_output_names,
+    #     cmd.y_des,
+    #     cmd.y_act,
+    #     cmd.dy_des,
+    #     cmd.dy_act,
+    #     random_times,
+    #     v,
+    #     vdot,
+    #     cmd.clf.v_subgroups,
+    #     cmd_vel,
+    #     cmd.clf,
+    #     env_idx=0,
+    # )
+
 
     if num_nonref_envs != 0:
         # Non reference resets
@@ -198,3 +232,83 @@ def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_patte
         if name.startswith(f"{frame_name}:") and suffix_pattern in name:
             indices.append(i)
     return indices
+
+
+def _pretty_print_reset_state(
+    output_pos_names: list[str],
+    output_vel_names: list[str],
+    y_des: torch.Tensor,
+    y_act: torch.Tensor,
+    dy_des: torch.Tensor,
+    dy_act: torch.Tensor,
+    times: torch.Tensor,
+    v: torch.Tensor,
+    vdot: torch.Tensor,
+    v_subgroups: dict[str, torch.Tensor],
+    cmd_vel: torch.Tensor,
+    clf,
+    env_idx: int = 0,
+):
+    """
+    Pretty print the desired and measured outputs in a table format.
+
+    Args:
+        output_names: List of output names.
+        y_des: Desired position outputs, shape [num_envs, num_outputs].
+        y_act: Measured position outputs, shape [num_envs, num_outputs].
+        dy_des: Desired velocity outputs, shape [num_envs, num_outputs].
+        dy_act: Measured velocity outputs, shape [num_envs, num_outputs].
+        times: Sampled times, shape [num_envs].
+        v: Lyapunov function value, shape [num_envs].
+        vdot: Lyapunov derivative, shape [num_envs].
+        v_subgroups: Dict mapping subgroup names to their V contributions, each shape [num_envs].
+        cmd_vel: Commanded velocity, shape [num_envs, vel_dim].
+        env_idx: Index of the environment to print (default 0).
+    """
+    # Header
+    print(f"\n{'='*94}")
+    print(f"Reset State for Environment {env_idx}")
+    print(f"Time: {times[env_idx].item():.4f} s")
+    print(f"Commanded Velocity: {cmd_vel[env_idx].tolist()} m/s")
+    print(f"{'='*94}")
+
+    # Position table header
+    print(f"\n{'--- Positions ---':^94}")
+    print(f"{'Output Name':<30} {'Desired':>12} {'Measured':>12} {'Error':>12}")
+    print(f"{'-'*30} {'-'*12} {'-'*12} {'-'*12}")
+
+    # Position table rows
+    err_val = clf.compute_y_err(y_act, y_des)[env_idx]
+    err_idx = 0
+    for i, name in enumerate(output_pos_names):
+        des_val = y_des[env_idx, i].item()
+        act_val = y_act[env_idx, i].item()
+        if ":ori_w" in output_pos_names[i]:
+            print(f"{name:<30} {des_val:>12.5f} {act_val:>12.5f}")
+        else:
+            print(f"{name:<30} {des_val:>12.5f} {act_val:>12.5f} {err_val[err_idx]:>12.5f}")
+            err_idx += 1
+
+
+    # Velocity table header
+    print(f"\n{'--- Velocities ---':^94}")
+    print(f"{'Output Name':<30} {'Desired':>12} {'Measured':>12} {'Error':>12}")
+    print(f"{'-'*30} {'-'*12} {'-'*12} {'-'*12}")
+
+    # Velocity table rows
+    for i, name in enumerate(output_vel_names):
+        des_val = dy_des[env_idx, i].item()
+        act_val = dy_act[env_idx, i].item()
+        err_val = act_val - des_val
+        print(f"{name:<30} {des_val:>12.5f} {act_val:>12.5f} {err_val:>12.5f}")
+
+    # V subgroups section
+    print(f"\n{'V Subgroups':<30} {'Value':>12}")
+    print(f"{'-'*30} {'-'*12}")
+    for name, values in v_subgroups.items():
+        print(f"{name:<30} {values[env_idx].item():>12.6f}")
+
+    # Footer with V and vdot
+    print(f"{'-'*94}")
+    print(f"V: {v[env_idx].item():.6f}    Vdot: {vdot[env_idx].item():.6f}")
+    print(f"{'='*94}\n")

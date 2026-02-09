@@ -354,13 +354,6 @@ class RLPolicy:
             'w_z_min': self.policy_params.get('w_z_min'),
         }
 
-    def get_gait_period_range(self) -> tuple[float, float]:
-        """Get the gait period range from the policy_params file."""
-        period_range = self.policy_params.get('gait_period_range')
-        if period_range:
-            return tuple(period_range)
-        return None
-
     def get_obs_scale(self, term_name: str):
         """Get the observation scale for a specific term."""
         if 'observation_terms' in self.policy_params and 'policy' in self.policy_params['observation_terms']:

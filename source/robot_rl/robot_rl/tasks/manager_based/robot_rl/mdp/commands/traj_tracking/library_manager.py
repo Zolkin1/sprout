@@ -21,7 +21,8 @@ class LibraryManager(ManagerBase):
         self.conditioner_generator_name = conditioner_generator_name
         self.trajectory_managers = []
         self.conditioning_vars = None
-        self.num_outputs = None
+        self.num_pos_outputs = None
+        self.num_vel_outputs = None
 
         self.load_library(hf_repo)
 
@@ -62,25 +63,35 @@ class LibraryManager(ManagerBase):
         self.conditioning_vars = torch.tensor(conditioner_list, device=self.device)
 
         # Verify the trajectories are compatible (num_outputs, type, reference_frames)
-        num_ouputs = self.trajectory_managers[-1].traj_data.num_outputs
-        output_names = self.trajectory_managers[-1].traj_data.output_names
-        trajectory_type = self.trajectory_managers[-1].traj_data.trajectory_type
-        ref_frames = self.trajectory_managers[-1].traj_data.reference_frames
+        ref_manager = self.trajectory_managers[-1]
+        num_pos_outputs = ref_manager.traj_data.num_pos_outputs
+        num_vel_outputs = ref_manager.traj_data.num_vel_outputs
+        pos_output_names = ref_manager.traj_data.pos_output_names
+        vel_output_names = ref_manager.traj_data.vel_output_names
+        trajectory_type = ref_manager.traj_data.trajectory_type
+        ref_frames = ref_manager.traj_data.reference_frames
         for manager in self.trajectory_managers:
-            if manager.traj_data.num_outputs != num_ouputs:
-                raise ValueError(f"Trajectories in the library are not compatible! Varying number of outputs!")
+            if manager.traj_data.num_pos_outputs != num_pos_outputs:
+                raise ValueError(f"Trajectories in the library are not compatible! Varying number of pos outputs!")
+            if manager.traj_data.num_vel_outputs != num_vel_outputs:
+                raise ValueError(f"Trajectories in the library are not compatible! Varying number of vel outputs!")
             # if manager.traj_data.trajectory_type != trajectory_type:
             #     raise ValueError(f"Trajectories in the library are not compatible! Varying trajectory_type!")
-            if manager.traj_data.output_names != output_names:
-                raise ValueError(f"Trajectories in the library are not compatible! Varying output_names!"
-                                 f"Expected names (first traj): {manager.traj_data.output_names}, \ngot: {output_names}")
+            if manager.traj_data.pos_output_names != pos_output_names:
+                raise ValueError(f"Trajectories in the library are not compatible! Varying pos_output_names!"
+                                 f"Expected names: {pos_output_names}, \ngot: {manager.traj_data.pos_output_names}")
+            if manager.traj_data.vel_output_names != vel_output_names:
+                raise ValueError(f"Trajectories in the library are not compatible! Varying vel_output_names!"
+                                 f"Expected names: {vel_output_names}, \ngot: {manager.traj_data.vel_output_names}")
             # TODO: Consider putting back!
             # if manager.traj_data.reference_frames != ref_frames:
             #     raise ValueError(f"Trajectories in the library are not compatible! Varying reference_frames!"
-            #                      f"Expected frames (first traj): {manager.traj_data.reference_frames}, \ngot: {ref_frames}")
+            #                      f"Expected frames: {manager.traj_data.reference_frames}, \ngot: {ref_frames}")
         self.trajectory_type = trajectory_type
-        self.num_outputs = num_ouputs
-        self.output_names = output_names
+        self.num_pos_outputs = num_pos_outputs
+        self.num_vel_outputs = num_vel_outputs
+        self.pos_output_names = pos_output_names
+        self.vel_output_names = vel_output_names
         self.ref_frames = ref_frames
 
     def _get_from_hugging_face(self, hf_repo: str, hf_path: str) -> Path:
@@ -148,18 +159,45 @@ class LibraryManager(ManagerBase):
 
     @property
     def get_output_names(self):
-        return self.output_names
+        """Get position output names (for backwards compatibility)."""
+        return self.pos_output_names
+
+    @property
+    def get_pos_output_names(self):
+        """Get position output names (includes ori_w)."""
+        return self.pos_output_names
+
+    @property
+    def get_vel_output_names(self):
+        """Get velocity output names (excludes ori_w)."""
+        return self.vel_output_names
 
     def get_reference_frames(self):
         return self.ref_frames
 
     def get_num_outputs(self) -> int:
-        """Get the total number of outputs in the trajectory.
+        """Get the total number of position outputs in the trajectory.
 
         Returns:
-            The number of outputs.
+            The number of position outputs (includes ori_w).
         """
-        return self.num_outputs
+        return self.num_pos_outputs
+
+    def get_num_pos_outputs(self) -> int:
+        """Get the total number of position outputs in the trajectory.
+
+        Returns:
+            The number of position outputs (includes ori_w).
+        """
+        return self.num_pos_outputs
+
+    def get_num_vel_outputs(self) -> int:
+        """Get the total number of velocity outputs in the trajectory.
+
+        Returns:
+            The number of velocity outputs (excludes ori_w).
+        """
+        return self.num_vel_outputs
 
     def get_num_domains(self):
         conditioner = self.get_conditioner_var()
@@ -183,16 +221,20 @@ class LibraryManager(ManagerBase):
     def get_trajectory_type(self):
         return self.trajectory_type
 
-    def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
+    def get_phasing_var(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
         """Compute the phasing variable for each environment.
 
         Args:
             t: Time tensor of shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
             Phasing variable tensor of shape [N].
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         indices = self.get_traj_indices(conditioner)
 
         phasing_var = torch.zeros(t.shape[0], device=self.device)
@@ -217,24 +259,27 @@ class LibraryManager(ManagerBase):
 
         return phasing_var
 
-    def get_output(self, t: torch.Tensor, env_ids = None) -> torch.Tensor:
+    def get_output(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute the outputs to be tracked by the RL.
 
         Args:
             t: Time in each env, shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
-            Outputs to be tracked by the RL, shape [N, 2, num_outputs].
+            pos_outputs: shape [N, num_pos_outputs] position outputs
+            vel_outputs: shape [N, num_vel_outputs] velocity outputs
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         indices = self.get_traj_indices(conditioner)
 
-        if env_ids is not None:
-            indices = indices[env_ids]
-
-        # Initialize output tensor
+        # Initialize output tensors (separate for pos and vel)
         N = t.shape[0]
-        outputs = torch.zeros(N, 2, self.num_outputs, device=self.device)
+        pos_outputs = torch.zeros(N, self.num_pos_outputs, device=self.device)
+        vel_outputs = torch.zeros(N, self.num_vel_outputs, device=self.device)
 
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(indices)
@@ -248,26 +293,31 @@ class LibraryManager(ManagerBase):
             # Get times for these environments
             t_for_manager = t[env_indices]
 
-            # Call get_output for this manager
-            manager_outputs = self.trajectory_managers[idx.item()].get_output(t_for_manager)
+            # Call get_output for this manager - returns (pos, vel) tuple
+            manager_pos_outputs, manager_vel_outputs = self.trajectory_managers[idx.item()].get_output(t_for_manager)
 
             # Place outputs in the correct positions
-            outputs[env_indices] = manager_outputs
+            pos_outputs[env_indices] = manager_pos_outputs
+            vel_outputs[env_indices] = manager_vel_outputs
 
-        return outputs
+        return pos_outputs, vel_outputs
 
     def get_ref_frames_in_use(self, t: torch.Tensor,
-                              ref_frames: list[str]) -> torch.Tensor:
+                              ref_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
         """Determine the reference frame in use for each environment.
 
         Args:
             t: Time in each env, shape [N].
             ref_frames: List of reference frame names.
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
             Frame indices into ref_frames for the active frame in each env, shape [N].
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         indices = self.get_traj_indices(conditioner)
 
         # Initialize output tensor
@@ -295,17 +345,21 @@ class LibraryManager(ManagerBase):
         return frame_indices
 
     def get_contact_state(self, t: torch.Tensor,
-                          contact_frames: list[str]) -> torch.Tensor:
+                          contact_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
         """Get the contact states for each frame from the trajectory.
 
         Args:
             t: Time in each env, shape [N].
             contact_frames: List of contact frame names.
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
             Contact states for each frame from the trajectory, shape [N, num_contacts].
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         indices = self.get_traj_indices(conditioner)
 
         # Initialize output tensor
@@ -332,22 +386,26 @@ class LibraryManager(ManagerBase):
 
         return contact_states
 
-    def get_current_domains(self, t: torch.Tensor) -> torch.Tensor:
+    def get_current_domains(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
         """Return the domain index for each env.
 
         Args:
             t: Time in each env, shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
             Domain indices, shape [N].
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         traj_idx = self.get_traj_indices(conditioner)
 
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(traj_idx)
 
-        domain_idx = torch.zeros(conditioner.shape[0], dtype=torch.long, device=self.device)
+        domain_idx = torch.zeros(t.shape[0], dtype=torch.long, device=self.device)
 
         # Bin each conditioner by manager
         for idx in unique_indicies:
@@ -379,22 +437,26 @@ class LibraryManager(ManagerBase):
 
         return torch.clamp(indicies, 0, len(self.trajectory_managers) - 1)
 
-    def get_domain_times(self, t: torch.Tensor) -> torch.Tensor:
+    def get_domain_times(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
         """Get the duration of the current domain for each environment.
 
         Args:
             t: Time in each env, shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
 
         Returns:
             Domain durations, shape [N].
         """
         conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
         traj_idx = self.get_traj_indices(conditioner)
 
         # Get the unique managers (avoid repeats)
         unique_indicies = torch.unique(traj_idx)
 
-        domain_times = torch.zeros(conditioner.shape[0], dtype=torch.float, device=self.device)
+        domain_times = torch.zeros(t.shape[0], dtype=torch.float, device=self.device)
 
         # Bin each conditioner by manager
         for idx in unique_indicies:
@@ -420,9 +482,21 @@ class LibraryManager(ManagerBase):
 
         return self.trajectory_managers[-1].get_total_time()
 
-    def order_outputs(self, order_output_names: list[str]):
+    def order_outputs(self, pos_output_names: list[str], vel_output_names: list[str]):
+        """Order outputs for all trajectory managers in the library.
+
+        Args:
+            pos_output_names: Ordered list of position output names (includes ori_w).
+            vel_output_names: Ordered list of velocity output names (excludes ori_w).
+        """
         for manager in self.trajectory_managers:
-            manager.order_outputs(order_output_names)
+            manager.order_outputs(pos_output_names, vel_output_names)
+
+        # Update the library's output name lists
+        self.pos_output_names = pos_output_names
+        self.vel_output_names = vel_output_names
+        self.num_pos_outputs = len(pos_output_names)
+        self.num_vel_outputs = len(vel_output_names)
 
     def log_v_on_phasing_var(self, phi, v):
         """
