@@ -561,8 +561,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     base_velocity = TreadmillVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(10.0, 10.0),
-        # rel_standing_envs=0.02,
-        rel_standing_envs=0.0,
+        rel_standing_envs=0.02,
         rel_heading_envs=0.6,
         rel_y_envs=0.6,
         heading_command=True,
