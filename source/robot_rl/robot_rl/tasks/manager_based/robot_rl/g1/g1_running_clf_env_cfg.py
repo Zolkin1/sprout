@@ -10,7 +10,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 import math
 from ..humanoid_env_cfg import HumanoidEventsCfg
-from ..mdp.commands.treadmill_velocity_command_cfg import TreadmillVelocityCommandCfg
+from ..mdp.commands.velocity_commands_cfg import VelocityTrackingCommandCfg
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 from .g1_trajopt_reward import G1TrajOptCLFRewards
 from .g1_trajopt_obs import G1TrajOptObservationsCfg
@@ -557,21 +557,34 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         phasing_boundaries=4,
     )
 
-    # TODO: Consider tuning this
-    base_velocity = TreadmillVelocityCommandCfg(
+    # TODO: Debug
+    base_velocity = VelocityTrackingCommandCfg(
         asset_name="robot",
-        resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.02,
-        rel_heading_envs=0.6,
-        rel_y_envs=0.6,
-        heading_command=True,
-        heading_control_stiffness=0.5,
-        y_pos_kp=1.5, #0.4,
-        y_pos_kd=0.3,
+        resampling_time_range=(7.0, 10.0), #(10.0, 10.0),
+        rel_standing_envs=0.0, #0.05, #0.02,
+        rel_closed_loop=0.55,
+        rel_closed_loop_yaw=0.25,
+        rel_open_loop=0.2,
         debug_vis=True,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+        ranges=VelocityTrackingCommandCfg.VelRanges(
+            lin_vel_x=(-1.0, 1.0),
+            lin_vel_y=(-1.0, 1.0),
+            ang_vel_z=(-1.0, 1.0),
+            heading=(-math.pi, math.pi),
+            y_pos_offset=(-0.5, 0.5),
+            y_kp=(1.2, 1.8),
+            y_kd=(0.2, 0.4),
         ))
+        # rel_heading_envs=0.6,
+        # rel_y_envs=0.6,
+        # heading_command=True,
+        # heading_control_stiffness=0.5,
+        # y_pos_kp=1.5, #0.4,
+        # y_pos_kd=0.3,
+        # debug_vis=True,
+        # ranges=mdp.UniformVelocityCommandCfg.Ranges(
+        #     lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+        # ))
 
 @configclass
 class G1RunningObservationCfg(G1TrajOptObservationsCfg):
@@ -710,7 +723,6 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
                 "static_friction_distribution_params": (0.3, 1.6),
                 "dynamic_friction_distribution_params": (0.3, 1.2),
                 "viscous_friction_distribution_params": (0.01, 0.1),
-                "armature_distribution_params": (0.95, 1.05),
                 "operation": "add"},
     )
 
@@ -768,7 +780,7 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.6)  # Note the curriculum for increasing
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)  # Note the curriculum for increasing
 
         # self.events.reset_base.params = {
         #     "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},

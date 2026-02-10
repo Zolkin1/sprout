@@ -186,8 +186,9 @@ def plot_velocity_comparison(data, save_dir):
     fig, axes = plt.subplots(3, 1, figsize=(10, 12))
     fig.suptitle("Commanded vs Actual Velocities")
 
-    # Plot x velocity
-    axes[0].plot(time, commanded_vel[:, 0], "r--", label="Commanded")
+    # Plot x velocity (round commanded to nearest 0.2)
+    commanded_x_vel_rounded = np.round(commanded_vel[:, 0] / 0.2) * 0.2
+    axes[0].plot(time, commanded_x_vel_rounded, "r--", label="Commanded")
     axes[0].plot(time, base_vel[:, 0], "b-", alpha=0.3, label="Actual")
     axes[0].plot(time_ma, moving_average(base_vel[:, 0], window_size), "b-", label="Actual (avg)")
     axes[0].set_ylabel("X Velocity (m/s)")
