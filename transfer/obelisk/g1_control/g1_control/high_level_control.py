@@ -1,5 +1,7 @@
 import os
 from abc import ABC
+from typing import Tuple
+from dataclasses import dataclass, field, asdict
 
 import numpy as np
 import torch
@@ -21,6 +23,27 @@ from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
 from sensor_msgs.msg import Joy
 from geometry_msgs.msg import TransformStamped
+
+@dataclass
+class OdomLog:
+    pos_w: np.ndarray = np.zeros(3)
+    quat_w: np.ndarray = np.zeros(4)
+    lin_vel_w: np.ndarray = np.zeros(3)
+    ang_vel_w: np.ndarray = np.zeros(3)
+    yaw_w: float = 0.0
+    world_yaw: float = 0.0
+    world_origin: np.ndarray = np.zeros(3)
+    y_error: float = 0.0
+    yaw_error: float = 0.0
+    y_target_w: float = 0.0
+    yaw_target_w: float = 0.0
+    target_x_vel: float = 0.0
+    time: float = 0.0
+    yaw_cmd: float = 0.0
+    y_cmd: float = 0.0
+    y_local_error: float = 0.0
+    target_pos_w: np.ndarray = np.zeros(2)
+
 
 class HighLevelController(ObeliskController, ABC):
     """High level controller. This is responsible for converting input and some sensors into commanded velocities."""
@@ -49,10 +72,14 @@ class HighLevelController(ObeliskController, ABC):
         self.last_Y_press = self.get_clock().now().nanoseconds / 1e9
         self.last_DPAD_UP_press = self.get_clock().now().nanoseconds / 1e9
         self.last_DPAD_DOWN_press = self.get_clock().now().nanoseconds / 1e9
+        self.last_DPAD_RIGHT_press = self.get_clock().now().nanoseconds / 1e9
+        self.last_DPAD_LEFT_press = self.get_clock().now().nanoseconds / 1e9
 
         self.control_mode = "joystick"  # joystick, feedback
 
         self.rec_joystick = False
+
+        self.joy_cmd_vel = np.zeros(3)
 
         # Incremental velocity parameters
         self.declare_parameter("vel_increment", 0.1)
@@ -79,34 +106,46 @@ class HighLevelController(ObeliskController, ABC):
             self.kp_y = self.get_parameter("kp_y").get_parameter_value().double_value
             self.kd_y = self.get_parameter("kd_y").get_parameter_value().double_value
 
-            self.yaw_target = 0.0
-            self.yaw_rate_cmd = 0.0
-            self.y_pos_target = 0.0
-            self.y_vel_target = 0.0
-            self.yaw_init = 0.0
-            self.x_target = 0.0
-            self.x_cmd = 0.0
-            self.y_cmd = 0.0
+            # Feedback control parameters
+            self.target_line_start = np.zeros(2, dtype=float)
+            self.yaw_target_w = 0.0
+            self.yaw_cur_w = 0.0
 
-            self.x_pd_ff = 0.0
+            self.yaw_world = 0.0
+            self.world_origin = np.zeros(3)
+
+            self.y_vel_target = 0.0
+
+            self.incremental_vel = 0.0
 
             self.ang_z_window = deque(maxlen=20)
-            self.y_pos_window = deque(maxlen=10)
-            self.y_vel_window = deque(maxlen=10)
-            self.x_vel_window = deque(maxlen=10)
+            self.pos_w_window = deque(maxlen=10)
+            self.vel_w_window = deque(maxlen=10)
 
-            self.yaw_cur = 0.0
-            self.y_pos_cur = 0.0
+            self.lin_vel_w = np.zeros(3)
+            self.pos_w = np.zeros(3)
+
+            # self.y_pos_window = deque(maxlen=10)
+            # self.y_vel_window = deque(maxlen=10)
+            # self.x_vel_window = deque(maxlen=10)
+
+            # self.yaw_cur = 0.0
+            # self.y_pos_cur = 0.0
 
             self.odom_count = 0
 
             # Odometry logging setup
             self.declare_parameter("log_odom", False)
-            self.log_odom = self.get_parameter("log_odom").get_parameter_value().bool_value
+            self.log_odom_flag = self.get_parameter("log_odom").get_parameter_value().bool_value
             
-            if self.log_odom:
+            if self.log_odom_flag:
                 self.get_logger().info("Odometry logging enabled.")
-                
+
+                self.declare_parameter("joy_rate", 0.05)
+                self.joy_rate = self.get_parameter("joy_rate").get_parameter_value().double_value
+
+                self.log_odom = OdomLog()
+
                 # Create odom log directory relative to $ROBOT_RL_ROOT
                 root = os.environ.get("ROBOT_RL_ROOT", "")
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -119,12 +158,32 @@ class HighLevelController(ObeliskController, ABC):
                 
                 # Write CSV header
                 self.odom_writer.writerow([
-                    "time", "pos_x", "pos_y", "pos_z", 
-                    "quat_x", "quat_y", "quat_z", "quat_w",
-                    "vel_x", "vel_y", "vel_z",
-                    "ang_vel_x", "ang_vel_y", "ang_vel_z", "ang_z_filtered",
-                    "yaw", "yaw_target", "yaw_error", "yaw_rate_cmd",
-                    "x_cmd", "y_cmd", "y_vel_avg", "y_pos_target", "x_pos_target"
+                    "time",
+                    "pos_w_x",
+                    "pos_w_y",
+                    "pos_w_z",
+                    "quat_w_w",
+                    "quat_w_x",
+                    "quat_w_y",
+                    "quat_w_z",
+                    "lin_vel_w_x",
+                    "lin_vel_w_y",
+                    "lin_vel_w_z",
+                    "ang_vel_w_x",
+                    "ang_vel_w_y",
+                    "ang_vel_w_z",
+                    "yaw_w",
+                    "yaw_target_w",
+                    "yaw_error",
+                    "yaw_cmd",
+                    "x_vel_cmd",
+                    "y_cmd",
+                    "y_local_error",
+                    "target_pos_w_x",
+                    "target_pos_w_y",
+                    "world_yaw",
+                    "world_origin_x",
+                    "world_origin_y",
                 ])
                 
                 self.odom_start_time = self.get_clock().now().nanoseconds / 1e9
@@ -183,8 +242,8 @@ class HighLevelController(ObeliskController, ABC):
         # Get the yaw from the quaternion
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = np.arctan2(siny_cosp, cosy_cosp)
-        self.yaw_cur = yaw - self.waist_joint_angle # TODO: Check sign/put back
+        yaw = np.arctan2(siny_cosp, cosy_cosp) - self.yaw_world
+        self.yaw_cur_w = yaw - self.waist_joint_angle # TODO: Check sign/put back
 
 
         # Angular z moving avg:
@@ -194,65 +253,49 @@ class HighLevelController(ObeliskController, ABC):
         ##
         # Get Position Values
         ##
-        self.x_pos_cur, self.y_pos_cur = rotate_into_yaw(self.yaw_init, pos.x, pos.y)
-        self.z_pos_cur = pos.z
+        # self.get_logger().info(f"World origin: {self.world_origin}")
+        # self.get_logger().info(f"Position: {pos.x}, {pos.y}")
 
-        self.y_pos_window.append(self.y_pos_cur)
+        self.pos_w[0], self.pos_w[1] = rotate_into_yaw(self.yaw_world,
+                                                       pos.x - self.world_origin[0],
+                                                       pos.y - self.world_origin[1])
+        self.pos_w[2] = pos.z - self.world_origin[2]   # TODO: Add offset so its not at 0?
+
+        self.pos_w_window.append(self.pos_w)
 
 
         ##
         # Get Velocities
         ##
         # Put them into the track frame
-        self.x_vel_cur, self.y_vel_cur = rotate_into_yaw(self.yaw_init, twist_w.linear.x, twist_w.linear.y)
+        self.lin_vel_w[0], self.lin_vel_w[1] = rotate_into_yaw(self.yaw_world, twist_w.linear.x, twist_w.linear.y)
+        self.lin_vel_w[2] = twist_w.linear.z
 
-        # Flip z to the correct frame
-        self.z_vel_cur = twist_w.linear.z
+        self.vel_w_window.append(self.lin_vel_w)
 
-        self.y_vel_window.append(self.y_vel_cur)
-        self.x_vel_window.append(self.x_vel_cur)
-
-        # Log odometry data if enabled
-        if self.log_odom and self.odom_count % 1 == 0:
-            current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
-            
-            # Extract orientation (quaternion)
-            orient = msg.pose.pose.orientation
-                        
-            # Extract angular velocity
-            ang_vel = msg.twist.twist.angular
-
-            yaw_error = self.yaw_cur - self.yaw_target
-            y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
-            ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
-
-            # Write row to CSV
-            # TODO: Make it easier to add stuff to the plots, add y vel to the plots
-            self.odom_writer.writerow([
-                current_time,
-                self.x_pos_cur, self.y_pos_cur, self.z_pos_cur,
-                orient.x, orient.y, orient.z, orient.w,
-                self.x_vel_cur, self.y_vel_cur, self.z_vel_cur,
-                ang_vel.x, ang_vel.y, self.ang_z_vel, ang_z_filtered,
-                self.yaw_cur, self.yaw_target, yaw_error, self.yaw_rate_cmd,
-                self.x_cmd, self.y_cmd, y_vel_avg, self.y_pos_target, self.x_target
-            ])
+        if self.log_odom_flag:
+            self.log_odom.pos_w = self.pos_w
+            self.log_odom.lin_vel_w = self.lin_vel_w
+            self.log_odom.quat_w = np.array([q.w, q.x, q.y, q.z])
+            self.log_odom.ang_vel_w = np.array([twist_w.angular.x, twist_w.angular.y, twist_w.angular.z])
+            self.log_odom.yaw_w = self.yaw_cur_w
 
         self.odom_count += 1
 
-    def compute_odom_control(self):
+    def compute_odom_control(self, target_point) -> Tuple[float, float]:
+        """
+        Use the odometry measurements to compute PD feedback to the target.
 
-        y_pos_avg = sum(self.y_pos_window)/len(self.y_pos_window)
+        For now assuming that the target point is always the closest point to the desired line.
+        In the yaw-target aligned frame this target point only has error in y. We only use feedforward for x for now.
+        """
 
         ##
         # Yaw Control
         ##
-        # target_dist = 3 # m
-        # self.yaw_target = np.atan2(y_pos_avg - self.y_pos_target, target_dist) + self.yaw_init
-
         ang_z_filtered = sum(self.ang_z_window)/len(self.ang_z_window)
 
-        yaw_error = self.yaw_cur - self.yaw_target
+        yaw_error = self.yaw_cur_w - self.yaw_target_w
         if yaw_error > np.pi:
             yaw_error -= 2 * np.pi
         elif yaw_error < -np.pi:
@@ -260,59 +303,40 @@ class HighLevelController(ObeliskController, ABC):
         yaw_rate_cmd = -self.kp_yaw * yaw_error - self.kd_yaw * ang_z_filtered
 
         # Clamp the yaw rate command
-        self.yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
+        yaw_rate_cmd = np.clip(yaw_rate_cmd, -self.w_z_max, self.w_z_max)
 
         ##
         # Y Control
         ##
-        y_vel_avg = sum(self.y_vel_window)/len(self.y_vel_window)
+        # Compute position error in global frame
+        error_w = self.pos_w[:2] - target_point
 
-        # TODO: Remove/debug the gain sign
-        # gain_sign = 1.0 if (self.yaw_cur - self.yaw_init) >= -np.pi/2 and (self.yaw_cur - self.yaw_init) <= np.pi/2 else -1.0
-        self.y_cmd = -self.kp_y * (y_pos_avg - self.y_pos_target) - self.kd_y * (y_vel_avg - self.y_vel_target)
-        # self.y_cmd *= gain_sign
-        self.y_cmd = np.clip(self.y_cmd, -self.v_y_max, self.v_y_max)
-        # TODO: How can y_cmd be positive when both errors are positive? Gain sign error? Logging error?
-        # TODO: Try moving logging here
+        # Rotate position error into target yaw frame
+        error_local = np.zeros(2)
+        error_local[0], error_local[1] = rotate_into_yaw(self.yaw_target_w, error_w[0], error_w[1])
 
-        # self.y_cmd = 0.0
+        # Rotate y velocity into target yaw frame
+        vel_local = np.zeros(2)
+        vel_local[0], vel_local[1] = rotate_into_yaw(self.yaw_target_w, self.lin_vel_w[0], self.lin_vel_w[1])
+
+        # Compute control
+        y_vel_local_cmd = -self.kp_y * error_local[1] - self.kd_y * (vel_local[1] - self.y_vel_target)
+        y_vel_local_cmd = np.clip(y_vel_local_cmd, -self.v_y_max, self.v_y_max)
+
         # self.get_logger().info(f"y: {self.y_pos_cur}")
 
-        ##
-        # X Control
-        ##
-        # TODO: Consider bringing back
-        # x_vel_avg = sum(self.x_vel_window)/len(self.x_vel_window)
-        #
-        # self.x_cmd = self.cmd_vel[0]
-        #
-        # if self.lin_vel_mode == "X_PD":
-        #     self.x_cmd = -self.kp_x * (self.x_pos_cur - self.x_target) - self.kd_x * (x_vel_avg) + self.x_pd_ff
-        #     self.x_cmd = np.clip(self.x_cmd, self.v_x_min, self.v_x_max)
+        if self.log_odom_flag:
+            self.log_odom.yaw_error = yaw_error
+            self.log_odom.y_error = error_local[1]
+
+        return y_vel_local_cmd, yaw_rate_cmd
 
 
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
-        if self.control_mode == "joystick":
-            self.cmd_vel[0] = min(
-                max(cmd_msg.v_x, self.v_x_min), self.v_x_max)
-            self.cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
-            self.cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
-        elif self.control_mode == "function":
-            RAMP_TIME = 2.0
-            slope = self.v_x_max / RAMP_TIME
-
-            now = self.get_clock().now().nanoseconds / 1e9
-            self.cmd_vel[0] = min(slope * (now - self.joystick_exited), self.v_x_max)
-            self.cmd_vel[1] = 0
-            self.cmd_vel[2] = 0
-
-            if now - self.joystick_exited > 8:
-                self.control_mode = "joystick"
-                self.get_logger().info("Joystick control re-enabled after timeout.")
-        elif self.control_mode == "incremental":
-            self.cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
-            self.cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
+        self.joy_cmd_vel[0] = min(max(cmd_msg.v_x, self.v_x_min), self.v_x_max)
+        self.joy_cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
+        self.joy_cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
             
     def update_x_hat(self, msg):
         """Receive the joystick message."""
@@ -322,6 +346,7 @@ class HighLevelController(ObeliskController, ABC):
         A = 0
         RIGHT_TRIGGER = 5
         MENU = 6
+        DPAD_LEFT_RIGHT = 6
         DPAD_UP_DOWN = 7
 
         if msg.axes[RIGHT_TRIGGER] <= 0.1:
@@ -335,8 +360,7 @@ class HighLevelController(ObeliskController, ABC):
             " Forward/Backward: Left Stick. \n " \
             " Turning: Right Stick. \n" \
             " Joystick Mode: D-Pad Up. \n" \
-            " Feedback Correction Mode: D-Pad Down. \n" \
-                                   # TODO: Add back in the X position feedback?
+            " Integrated Joystick + Feedback Mode: D-Pad Right. \n" \
             " Increase Incremental Velocity: Right Bumper + Y. \n" \
             " Decrease Incremental Velocity: Right Bumper + A. \n" \
             " Zero odom targets: Right Bumper (while not in incremental mode).")
@@ -347,63 +371,170 @@ class HighLevelController(ObeliskController, ABC):
             self.joystick_exited = self.get_clock().now().nanoseconds / 1e9
             self.get_logger().info("Joystick control enabled!")
 
-        if msg.axes[DPAD_UP_DOWN] <= -0.9 and now - self.last_DPAD_DOWN_press > 0.5:
-            self.last_DPAD_DOWN_press = now
-            self.control_mode = "feedback"
-            self.get_logger().info("Feedback control enabled!")
+        if msg.axes[DPAD_LEFT_RIGHT] <= -0.9 and now - self.last_DPAD_RIGHT_press > 0.5:
+            self.last_DPAD_RIGHT_press = now
+            self.control_mode = "integrated_joystick"
+            self.get_logger().info("Integrated joystick control enabled!")
+            # TODO: need to think more about how this mode will work
 
-        if msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "feedback":
+        if msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "integrated_joystick":
             if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.2:
-                self.cmd_vel[0] += self.vel_increment
+                self.incremental_vel += self.vel_increment
                 vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
-                if self.cmd_vel[0] > vx_max:
-                    self.cmd_vel[0] = vx_max
-                self.get_logger().info(f"----- INCREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
+                if self.incremental_vel > vx_max:
+                    self.incremental_vel = vx_max
+                self.get_logger().info(f"----- INCREASING VELOCITY TO {self.incremental_vel:.3f} m/s -----")
                 self.last_Y_press = now
             if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.2:
-                self.cmd_vel[0] -= self.vel_increment
+                self.incremental_vel -= self.vel_increment
                 vx_min = self.get_parameter("v_x_min").get_parameter_value().double_value
-                if self.cmd_vel[0] < vx_min:
-                    self.cmd_vel[0] = vx_min
+                if self.incremental_vel < vx_min:
+                    self.incremental_vel = vx_min
 
-                self.get_logger().info(f"----- DECREASING VELOCITY TO {self.cmd_vel[0]:.3f} m/s -----")
+                self.get_logger().info(f"----- DECREASING VELOCITY TO {self.incremental_vel:.3f} m/s -----")
                 self.last_A_press = now
-        elif msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "joystick" and now - self.last_RB_press > 0.5:
-            self.yaw_init = self.yaw_cur
-            self.yaw_target = self.yaw_cur
-            x, y = rotate_into_yaw(self.yaw_init, self.x_pos_cur, self.y_pos_cur)
-            self.y_pos_target = y
-            self.get_logger().info(f"Odom targets zeroed at: Y position: {self.y_pos_target}, yaw target: {self.yaw_target}!")
 
-            self.x_target = self.x_pos_cur
-            self.get_logger().info(f"X position target set to current X position: {self.x_target}.")
+        elif msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "joystick" and now - self.last_RB_press > 0.5:
+            self.yaw_world = self.yaw_cur_w
+            self.yaw_target_w = 0.0
+            self.world_origin = self.pos_w.copy()
+            self.target_line_start = np.zeros(2)
+
+            self.get_logger().info(f"World origin set to {self.world_origin} with yaw {self.yaw_world}.")
+
             self.last_RB_press = now
 
     def compute_control(self):
         """Return the commanded velocity."""
         if self.rec_joystick:
             msg = VelocityCommand()
-            msg.v_x = float(self.cmd_vel[0])
-            msg.v_y = float(self.cmd_vel[1])
 
-            msg.w_z = float(self.cmd_vel[2])
-            
-            if self.control_mode == "feedback": #self.use_odom and self.ang_vel_mode == "odom":
-                self.compute_odom_control()
+            msg.v_x = float(self.joy_cmd_vel[0])
+            msg.v_y = float(self.joy_cmd_vel[1])
+            msg.w_z = float(self.joy_cmd_vel[2])
 
-                msg.w_z = float(self.yaw_rate_cmd)
+            if self.control_mode == "integrated_joystick":
+                target = self.set_feedback_targets()
+                y_cmd, yaw_cmd = self.compute_odom_control(target)
 
-                msg.v_y = float(self.y_cmd)
+                msg.w_z = float(yaw_cmd)
+                msg.v_y = float(y_cmd)
+                msg.v_x = float(self.incremental_vel)
 
-
-            # TODO: Consider bringing this back
-            # if self.lin_vel_mode == "X_PD":
-            #     msg.v_x = self.x_cmd
+            elif self.control_mode != "joystick":
+                raise ValueError("Unsupported control mode!")
 
             self.obk_publishers["pub_ctrl"].publish(msg)
 
+            # TODO: Viz the trajectory and commands
+
+
+            if self.log_odom_flag:
+                self.log_odom.y_cmd = msg.v_y
+                self.log_odom.yaw_cmd = msg.w_z
+                self.log_odom.target_x_vel = msg.v_x
+
+            # Log odometry data if enabled
+            if self.log_odom_flag and self.odom_count % 1 == 0:
+                self.write_log()
+
             return msg
-    
+
+    def set_feedback_targets(self):
+        """
+        Sets the global frame position targets for feedback.
+
+        For now only doing yaw and y.
+        """
+        # Integrate the yaw target
+        prev_yaw = self.yaw_target_w
+        yaw_change = self.joy_rate*self.joy_cmd_vel[2]
+        self.yaw_target_w = prev_yaw + yaw_change
+
+        target = np.zeros(2, dtype=np.float64)
+
+        second_point = self.target_line_start + np.array([np.cos(prev_yaw), np.sin(prev_yaw)])
+
+        AB = second_point - self.target_line_start
+        AC = self.pos_w[:2] - self.target_line_start
+
+        AD = AB * np.dot(AB, AC)/np.dot(AB, AB)
+        projection = self.target_line_start + AD
+
+        if abs(self.joy_cmd_vel[2]) > 0.01:
+            # projection = self.pos_w[:2]
+
+            # # Compute the projected point
+            # d = second_point - self.target_line_start
+            # t = np.dot((self.pos_w[:2] - self.target_line_start), d)/np.dot(d,d)
+            # projection = self.target_line_start + t*d
+
+            # Need to compute the offset for the new target line
+            self.target_line_start[0] = projection[0] + self.joy_rate * self.incremental_vel*(np.cos(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.sin(self.yaw_target_w) - np.sin(prev_yaw))
+
+            self.target_line_start[1] = projection[1] + self.joy_rate * self.incremental_vel*(np.sin(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.cos(prev_yaw) - np.cos(self.yaw_target_w))
+
+            target = self.target_line_start
+
+            self.get_logger().info(f"y update: {self.incremental_vel*(np.sin(yaw_change))}")
+            self.get_logger().info(f"Target line start: {self.target_line_start}")
+            self.get_logger().info(f"Target position set to {target}")
+            self.get_logger().info(f"Projected point is {projection}")
+            self.get_logger().info(f"Yaw change is {yaw_change}")
+            self.get_logger().info(f"joy yaw rate is {self.joy_cmd_vel[2]}")
+            self.get_logger().info(f"Yaw target: {self.yaw_target_w}")
+            self.get_logger().info(f"Yaw: {self.yaw_cur_w}\n")
+        else:
+            # # Just project - no yaw adjustments
+            # # Compute the projected point
+            # d = second_point - self.target_line_start
+            # t = np.dot((self.pos_w[:2] - self.target_line_start), d) / np.dot(d, d)
+            # target = self.target_line_start + t * d
+
+            target = projection
+
+        if self.log_odom_flag:
+            self.log_odom.target_pos_w[:2] = target.copy()
+            self.log_odom.yaw_target_w = self.yaw_target_w
+
+        return target
+
+    def write_log(self):
+        """Write teh log."""
+        current_time = self.get_clock().now().nanoseconds / 1e9 - self.odom_start_time
+
+        self.log_odom.time = current_time
+
+        # Write row to CSV
+        self.odom_writer.writerow([
+            self.log_odom.time,
+            self.log_odom.pos_w[0],
+            self.log_odom.pos_w[1],
+            self.log_odom.pos_w[2],
+            self.log_odom.quat_w[0],
+            self.log_odom.quat_w[1],
+            self.log_odom.quat_w[2],
+            self.log_odom.quat_w[3],
+            self.log_odom.lin_vel_w[0],
+            self.log_odom.lin_vel_w[1],
+            self.log_odom.lin_vel_w[2],
+            self.log_odom.ang_vel_w[0],
+            self.log_odom.ang_vel_w[1],
+            self.log_odom.ang_vel_w[2],
+            self.log_odom.yaw_w,
+            self.log_odom.yaw_target_w,
+            self.log_odom.yaw_error,
+            self.log_odom.yaw_cmd,
+            self.log_odom.target_x_vel,
+            self.log_odom.y_cmd,
+            self.log_odom.y_local_error,
+            self.log_odom.target_pos_w[0],
+            self.log_odom.target_pos_w[1],
+            self.log_odom.world_yaw,
+            self.log_odom.world_origin[0],
+            self.log_odom.world_origin[1],
+        ])
+
 def rotate_into_yaw(yaw, x, y) -> tuple[float, float]:
     x_new = np.cos(yaw)*x + np.sin(yaw)*y
     y_new = -np.sin(yaw)*x + np.cos(yaw)*y

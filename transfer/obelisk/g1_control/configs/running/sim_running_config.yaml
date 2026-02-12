@@ -10,7 +10,6 @@ onboard:
         hf_policy_folders: [
           "running_clf_sym/2026-02-05_14-55-10_running_new_traj_test_sym",
           "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
-
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -338,7 +337,7 @@ onboard:
           #     torso_camera_gyro: gyro
           # ---------- Head Lidar Odometry ---------- #
           - topic: /obelisk/g1/head_odom
-            dt: 0.02
+            dt: 0.1
             msg_type: Odometry
             sensor_names:
               head_lidar_pos_sensor: framepos
