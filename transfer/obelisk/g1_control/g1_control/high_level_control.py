@@ -379,6 +379,7 @@ class HighLevelController(ObeliskController, ABC):
         if self.log_odom_flag:
             self.log_odom.yaw_error = yaw_error
             self.log_odom.y_error = error_local[1]
+            self.log_odom.y_local_error = error_local[1]
 
         return y_vel_local_cmd, yaw_rate_cmd
 
@@ -515,14 +516,18 @@ class HighLevelController(ObeliskController, ABC):
             # t = np.dot((self.pos_w[:2] - self.target_line_start), d)/np.dot(d,d)
             # projection = self.target_line_start + t*d
 
-            # Need to compute the offset for the new target line
-            self.target_line_start[0] = projection[0] + self.joy_rate * self.incremental_vel*(np.cos(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.sin(self.yaw_target_w) - np.sin(prev_yaw))
+            # dp_local = self.joy_rate * self.incremental_vel * np.array([np.cos(prev_yaw), np.sin(prev_yaw)])
+            dp_w = self.joy_rate * self.incremental_vel * np.array([np.cos(self.yaw_target_w), np.sin(self.yaw_target_w)])
 
-            self.target_line_start[1] = projection[1] + self.joy_rate * self.incremental_vel*(np.sin(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.cos(prev_yaw) - np.cos(self.yaw_target_w))
+            # Need to compute the offset for the new target line
+            self.target_line_start = projection + dp_w
+
+            # self.target_line_start[0] = projection[0] + self.joy_rate * self.incremental_vel*(np.cos(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.sin(self.yaw_target_w) - np.sin(prev_yaw))
+            # self.target_line_start[1] = projection[1] + self.joy_rate * self.incremental_vel*(np.sin(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.cos(prev_yaw) - np.cos(self.yaw_target_w))
 
             target = self.target_line_start
 
-            self.get_logger().info(f"y update: {self.incremental_vel*(np.sin(yaw_change))}")
+            self.get_logger().info(f"dp_w: {dp_w}")
             self.get_logger().info(f"Target line start: {self.target_line_start}")
             self.get_logger().info(f"Target position set to {target}")
             self.get_logger().info(f"Projected point is {projection}")

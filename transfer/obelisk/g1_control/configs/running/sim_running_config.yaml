@@ -8,8 +8,10 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          "running_clf_sym/2026-02-05_14-55-10_running_new_traj_test_sym",
-          "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
+          # "running_clf_sym/2026-02-05_14-55-10_running_new_traj_test_sym",
+          # "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
+          "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
+          "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -57,14 +59,14 @@ onboard:
       executable: high_level_control
       params:
         v_x_min: 0.0
-        v_x_max: 3.0
-        v_y_max: 0.5
-        w_z_max: 0.5
+        v_x_max: 3.6
+        v_y_max: 0.75
+        w_z_max: 1.0
         vel_increment: 0.1
-        kp_yaw: 3.0
-        kd_yaw: 0.1
-        kp_y: 5.0
-        kd_y: 0.3
+        kp_yaw: 3.5 #3.0
+        kd_yaw: 0.0 #0.1
+        kp_y: 2.0 #5.0
+        kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
@@ -112,7 +114,7 @@ onboard:
       params:
         v_x_scale: 3.0
         v_y_scale: 0.5
-        w_z_scale: 0.5
+        w_z_scale: 0.2
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:
