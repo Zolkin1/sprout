@@ -2,20 +2,21 @@ import os
 from abc import ABC
 from typing import Tuple
 from dataclasses import dataclass, field, asdict
-
+from scipy.spatial.transform import Rotation
 import numpy as np
 import torch
 from datetime import datetime
 import time
 import csv
 import shutil
+from tf2_ros import StaticTransformBroadcaster
 from collections import deque
 from ament_index_python.packages import get_package_share_directory
 from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
 from obelisk_py.core.obelisk_typing import ObeliskControlMsg, is_in_bound
-from obelisk_sensor_msgs.msg import ObkJointEncoders
+from obelisk_sensor_msgs.msg import ObkJointEncoders, ObkImu
 from obelisk_py.core.utils.ros import spin_obelisk
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
@@ -124,13 +125,22 @@ class HighLevelController(ObeliskController, ABC):
 
             self.lin_vel_w = np.zeros(3)
             self.pos_w = np.zeros(3)
+            self.quat_camera_init = np.zeros(4)
+            self.R_odom_camera_init = None
+            self.body_heading = np.array([1.0, 0.0, 0.0])
+            self.tf_static_broadcaster = StaticTransformBroadcaster(self)
+
+            self.declare_parameter("odom_frame", "odom_frame")
+            self.declare_parameter("camera_init_frame", "camera_init_frame")
+            self.odom_frame_str = self.get_parameter("odom_frame").get_parameter_value().string_value
+            self.camera_init_frame_str = self.get_parameter("camera_init_frame").get_parameter_value().string_value
 
             # self.y_pos_window = deque(maxlen=10)
             # self.y_vel_window = deque(maxlen=10)
             # self.x_vel_window = deque(maxlen=10)
 
-            # self.yaw_cur = 0.0
-            # self.y_pos_cur = 0.0
+            self.lidar_imu_acc_hist = deque(maxlen=15)
+            self.rec_lidar_imu = False
 
             self.odom_count = 0
 
@@ -208,6 +218,15 @@ class HighLevelController(ObeliskController, ABC):
                 msg_type=Odometry,
             )
 
+
+            # Declare subscriber to lidar IMU
+            self.register_obk_subscription(
+                "sub_lidar_imu",
+                self.lidar_imu_callback,  # type: ignore
+                key="sub_lidar_imu_key",  # key can be specified here or in the config file
+                msg_type=ObkImu,
+            )
+
         # Declare subscriber to velocity commands from the Untiree joystick node
         self.register_obk_subscription(
             "sub_vel_cmd_setting",
@@ -222,6 +241,14 @@ class HighLevelController(ObeliskController, ABC):
         """Callback for the joint encoders."""
         self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
 
+    def lidar_imu_callback(self, msg: ObkImu) -> None:
+        """Callback for the lidar imu."""
+        # Store acceleration vectors
+        lin_acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
+        self.lidar_imu_acc_hist.append(lin_acc)
+
+        self.rec_lidar_imu = True
+
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
         # All positions should be in the z-up world aligned frame
@@ -230,43 +257,67 @@ class HighLevelController(ObeliskController, ABC):
         q = msg.pose.pose.orientation
         pos = msg.pose.pose.position
 
+        # Note: FAST-LIO doesn't actually provide the velocities by default
         twist_w = msg.twist.twist
 
-        # # negate the twist z vels
-        # twist_w.angular.z = -msg.twist.twist.angular.z
-        # twist_w.linear.z = -msg.twist.twist.linear.z
+        # TODO: Can sim without velocity feedback
+
+        # Orientation in camera init frame
+        self.quat_camera_init[3] = q.w
+        self.quat_camera_init[0] = q.x
+        self.quat_camera_init[1] = q.y
+        self.quat_camera_init[2] = q.z
+
+        # Get the values in the camera init frame
+        position_camera_init = np.array([pos.x, pos.y, pos.z])
+        quat_camera_init = np.array([q.x, q.y, q.z, q.w])  # scipy format [x,y,z,w]
+        R_camera_init = Rotation.from_quat(quat_camera_init)
+
+        if self.R_odom_camera_init is not None:
+            # Transform the data from the camera init frame into the world (odom) frame.
+
+            # Transform position: p_odom = R @ p_camera_init + t
+            self.pos_w = self.R_odom_camera_init.apply(position_camera_init) + self.t_odom_camera_init
+
+            # Transform orientation: R_odom = R_transform @ R_camera_init
+            R_odom = self.R_odom_camera_init * R_camera_init
+
+            # Extract yaw from transformed orientation
+            heading = R_odom.apply(self.body_heading)
+            yaw = np.atan2(heading[1], heading[0])
+
+            self.start = np.array([self.pos_w[0], self.pos_w[1], yaw])
+            self.z0 = self.pos_w[2]
+            self.frame_id = self.get_parameter("odom_frame").get_parameter_value().string_value
+        else:
+            # Get the yaw from the quaternion
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+            # Use raw position values
+            self.pos_w[0] = pos.x
+            self.pos_w[1] = pos.y
+            self.pos_w[2] = pos.z
 
         ##
-        # Get Yaw
+        # Adjust Yaw
         ##
-        # Get the yaw from the quaternion
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        yaw = np.arctan2(siny_cosp, cosy_cosp) - self.yaw_world
         self.yaw_cur_w = yaw - self.waist_joint_angle # TODO: Check sign/put back
 
-
-        # Angular z moving avg:
-        self.ang_z_vel = twist_w.angular.z
-        self.ang_z_window.append(self.ang_z_vel)
-
         ##
-        # Get Position Values
+        # Record position
         ##
-        # self.get_logger().info(f"World origin: {self.world_origin}")
-        # self.get_logger().info(f"Position: {pos.x}, {pos.y}")
-
-        self.pos_w[0], self.pos_w[1] = rotate_into_yaw(self.yaw_world,
-                                                       pos.x - self.world_origin[0],
-                                                       pos.y - self.world_origin[1])
-        self.pos_w[2] = pos.z - self.world_origin[2]   # TODO: Add offset so its not at 0?
-
         self.pos_w_window.append(self.pos_w)
 
 
         ##
         # Get Velocities
         ##
+        # Angular z moving avg:
+        self.ang_z_vel = twist_w.angular.z
+        self.ang_z_window.append(self.ang_z_vel)
+
         # Put them into the track frame
         self.lin_vel_w[0], self.lin_vel_w[1] = rotate_into_yaw(self.yaw_world, twist_w.linear.x, twist_w.linear.y)
         self.lin_vel_w[2] = twist_w.linear.z
@@ -378,14 +429,14 @@ class HighLevelController(ObeliskController, ABC):
             # TODO: need to think more about how this mode will work
 
         if msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "integrated_joystick":
-            if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.2:
+            if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.1:
                 self.incremental_vel += self.vel_increment
                 vx_max = self.get_parameter("v_x_max").get_parameter_value().double_value
                 if self.incremental_vel > vx_max:
                     self.incremental_vel = vx_max
                 self.get_logger().info(f"----- INCREASING VELOCITY TO {self.incremental_vel:.3f} m/s -----")
                 self.last_Y_press = now
-            if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.2:
+            if msg.buttons[A] >= 0.9 and now - self.last_A_press > 0.1:
                 self.incremental_vel -= self.vel_increment
                 vx_min = self.get_parameter("v_x_min").get_parameter_value().double_value
                 if self.incremental_vel < vx_min:
@@ -395,13 +446,8 @@ class HighLevelController(ObeliskController, ABC):
                 self.last_A_press = now
 
         elif msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "joystick" and now - self.last_RB_press > 0.5:
-            self.yaw_world = self.yaw_cur_w
-            self.yaw_target_w = 0.0
-            self.world_origin = self.pos_w.copy()
-            self.target_line_start = np.zeros(2)
-
-            self.get_logger().info(f"World origin set to {self.world_origin} with yaw {self.yaw_world}.")
-
+            self.get_logger().info(f"Initializing Zeroing")
+            self.zero_world()
             self.last_RB_press = now
 
     def compute_control(self):
@@ -534,6 +580,129 @@ class HighLevelController(ObeliskController, ABC):
             self.log_odom.world_origin[0],
             self.log_odom.world_origin[1],
         ])
+
+    def zero_world(self):
+        self._zeroing_compute_transform()
+
+        self.yaw_target_w = 0.0
+        self.target_line_start = np.zeros(2)
+
+        self.get_logger().info(f"World origin set to {self.world_origin} with yaw {self.yaw_world}.")
+
+    def _zeroing_compute_transform(self) -> None:
+        """Compute gravity-aligned, yaw-zeroed, position-zeroed transform."""
+        if self.odom_count == 0:
+            self.get_logger().warn("ZEROING: No odometry available!")
+            raise ValueError("ZEROING: No odometry available!")
+
+        if not self.rec_lidar_imu:
+            self.get_logger().warn("ZEROING: No IMU available! Zeroing failed.")
+            raise ValueError("ZEROING: No IMU available!")
+        else:
+            oR_b = self._compute_gravity_alignment()  # Compute the transform from aligns the gravity vector with the z axis
+
+        # Get current pose
+        cp_b = self.pos_w #self.odom_msg.pose.pose.position  # position of the body frame in the camera_init frame
+        cquat_b = self.quat_camera_init #self.odom_msg.pose.pose.orientation  # orientation of the body frame in the camera_init frame
+
+        cR_b = Rotation.from_quat(
+            cquat_b)  # Rotation matrix describing orientation of body frame in the camera_init frame
+
+        # Apply gravity alignment first to get gravity-aligned orientation
+        oR_c = oR_b * cR_b.inv()
+
+        # Compute rotation to zero yaw (in gravity-aligned frame)
+        heading = oR_b.apply(self.body_heading)
+        initial_yaw = np.atan2(heading[1], heading[0])
+        R_zero_yaw = Rotation.from_euler('z', -initial_yaw)
+
+        # Combined rotation: first apply gravity alignment, then yaw zeroing
+        self.R_odom_camera_init = R_zero_yaw * oR_c
+
+        # Translation: move initial position to origin in xy
+        # p_odom = R @ p_camera_init + t
+        # We want p_odom = [0, 0, z_offset] when p_camera_init = initial_position
+        op_b = self.R_odom_camera_init.apply(cp_b)
+        self.t_odom_camera_init = np.array([
+            -op_b[0],
+            -op_b[1],
+            0.0  # Keep z offset from gravity-aligned frame
+        ])
+
+        self.get_logger().info(f"ZEROING: Transform computed. Initial yaw was {np.degrees(initial_yaw):.1f} deg")
+
+        # Publish static transform
+        self._publish_odom_camera_init_transform()
+
+    def _compute_gravity_alignment(self) -> Rotation:
+        """Compute rotation to align z-axis with up (opposite gravity).
+
+        When robot is stationary, accelerometer reads reaction to gravity,
+        which points UP (opposite to gravity). We compute rotation R such that
+        R @ accel_reading = [0, 0, +1] (i.e., z-axis points up).
+
+        Returns:
+            Rotation that aligns sensor frame z-axis with world up.
+        """
+
+        # Compute mean of the measured accelerations
+        mean_acc = np.zeros(3)
+        for acc in self.lidar_imu_acc_hist:
+            mean_acc += acc
+
+        mean_acc /= len(self.lidar_imu_acc_hist)
+        accel_mag = np.linalg.norm(mean_acc)
+
+        if accel_mag < 0.1:
+            self.get_logger().warn("ZEROING: Accelerometer reading too small!")
+            raise ValueError("ZEROING: Accelerometer reading too small!")
+
+        # Normalize accelerometer reading (points UP when stationary)
+        g_b = mean_acc / accel_mag  # gravity in the body frame
+
+        # Target: accelerometer (pointing up) should align with +z
+        e_z = np.array([0.0, 0.0, 1.0])
+
+        # Compute rotation from accel_normalized to target
+        a = np.cross(g_b, e_z)
+        s = np.linalg.norm(a)
+        c = np.dot(g_b, e_z)
+
+        if s < 1e-6:
+            # Vectors are parallel
+            if c > 0:
+                return Rotation.identity()
+            else:
+                # 180 degree rotation around x-axis
+                return Rotation.from_euler('x', np.pi)
+
+        # Axis-angle approach
+        axis = a / s
+        angle = np.atan2(s, c)
+
+        return Rotation.from_rotvec(axis * angle)
+
+    def _publish_odom_camera_init_transform(self) -> None:
+        """Publish odom -> camera_init static transform."""
+        if self.tf_static_broadcaster is None:
+            return
+
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = self.odom_frame_str
+        t.child_frame_id = self.camera_init_frame_str
+
+        quat = self.R_odom_camera_init.as_quat()
+        t.transform.translation.x = self.t_odom_camera_init[0]
+        t.transform.translation.y = self.t_odom_camera_init[1]
+        t.transform.translation.z = self.t_odom_camera_init[2]
+        t.transform.rotation.x = quat[0]
+        t.transform.rotation.y = quat[1]
+        t.transform.rotation.z = quat[2]
+        t.transform.rotation.w = quat[3]
+
+        self.tf_static_broadcaster.sendTransform(t)
+        self.get_logger().info("ZEROING: Published static transform odom -> camera_init")
 
 def rotate_into_yaw(yaw, x, y) -> tuple[float, float]:
     x_new = np.cos(yaw)*x + np.sin(yaw)*y

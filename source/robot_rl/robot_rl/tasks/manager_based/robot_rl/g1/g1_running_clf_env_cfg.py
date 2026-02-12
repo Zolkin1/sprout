@@ -685,9 +685,24 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
     )
     body_ang_vel = RewTerm(
         func=mdp.body_ang_vel_reward,
-        weight=0.0,
+        weight=1.0, #0.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.2 * math.sqrt(4)}
+                "sigma": 1.0 * math.sqrt(4)}
+    )
+
+    # Goal conditioned rewards
+    xy_vel = RewTerm(
+        func=mdp.track_lin_vel_xy_exp,
+        weight=1.0,
+        params={"command_name": "base_velocity",
+                "std": 0.75,}
+    )
+
+    yaw_vel = RewTerm(
+        func=mdp.track_ang_vel_z_exp,
+        weight=1.0,
+        params={"command_name": "base_velocity",
+                "std": 0.75,}
     )
 
     clf_reward = None

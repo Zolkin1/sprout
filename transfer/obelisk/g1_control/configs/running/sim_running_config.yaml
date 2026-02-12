@@ -96,6 +96,12 @@ onboard:
           topic: /obelisk/g1/unitree_high_level_ctrl
           history_depth: 10
           callback_group: None
+        # ----- Lidar IMU subscriber ----- #
+        - ros_parameter: sub_lidar_imu
+          topic: /obelisk/g1/lidar_imu
+          msg_type: ObkIMU
+          history_depth: 10
+          callback_group: None
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
@@ -296,14 +302,14 @@ onboard:
               # right_hand_middle_1_joint_vel_sensor: jointvel
               # right_hand_index_0_joint_vel_sensor: jointvel
               # right_hand_index_1_joint_vel_sensor: jointvel
-          # ---------- Torso IMU ---------- #
-          - topic: /obelisk/g1/torso_imu
-            dt: 0.001
-            msg_type: ObkImu
-            sensor_names:
-              torso_imu_acc_sensor: accelerometer
-              torso_imu_gyro_sensor: gyro
-              torso_imu_quat_sensor: framequat
+          # # ---------- Torso IMU ---------- #
+          # - topic: /obelisk/g1/torso_imu
+          #   dt: 0.001
+          #   msg_type: ObkImu
+          #   sensor_names:
+          #     torso_imu_acc_sensor: accelerometer
+          #     torso_imu_gyro_sensor: gyro
+          #     torso_imu_quat_sensor: framequat
           # ---------- Pelvis IMU ---------- #
           - topic: /obelisk/g1/pelvis_imu
             dt: 0.001
@@ -312,20 +318,20 @@ onboard:
               pelvis_imu_acc_sensor: accelerometer
               pelvis_imu_gyro_sensor: gyro
               pelvis_imu_quat_sensor: framequat
-          # ---------- Pelvis Mocap ---------- #
-          - topic: /obelisk/g1/pelvis_pose
-            dt: 0.00416   # 240 Hz
-            msg_type: PoseStamped
-            sensor_names:
-              base_mocap_pos_sensor: framepos
-              base_mocap_quat_sensor: framequat
-          # ---------- Torso Mocap ---------- #
-          - topic: /obelisk/g1/torso_pose
-            dt: 0.00416   # 240 Hz
-            msg_type: PoseStamped
-            sensor_names:
-              torso_mocap_pos_sensor: framepos
-              torso_mocap_quat_sensor: framequat
+          # # ---------- Pelvis Mocap ---------- #
+          # - topic: /obelisk/g1/pelvis_pose
+          #   dt: 0.00416   # 240 Hz
+          #   msg_type: PoseStamped
+          #   sensor_names:
+          #     base_mocap_pos_sensor: framepos
+          #     base_mocap_quat_sensor: framequat
+          # # ---------- Torso Mocap ---------- #
+          # - topic: /obelisk/g1/torso_pose
+          #   dt: 0.00416   # 240 Hz
+          #   msg_type: PoseStamped
+          #   sensor_names:
+          #     torso_mocap_pos_sensor: framepos
+          #     torso_mocap_quat_sensor: framequat
           # # ---------- Torso Camera Odometry ---------- #
           # - topic: /obelisk/g1/torso_odom
           #   dt: 0.005
@@ -344,6 +350,14 @@ onboard:
               head_lidar_orientation_sensor: framequat
               head_lidar_velocimeter: velocimeter
               head_lidar_gyro: gyro
+          # ---------- Lidar IMU ---------- #
+          - topic: /obelisk/g1/lidar_imu
+            dt: 0.001
+            msg_type: ObkImu
+            sensor_names:
+              lidar_imu_acc_sensor: accelerometer
+              lidar_imu_gyro_sensor: gyro
+              lidar_imu_quat_sensor: framequat
           # viz_geoms:
           #   dt: 1
           #   # ----- Stair scene ----- #

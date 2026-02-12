@@ -1,7 +1,7 @@
 {
-    "name": "Robot RL GPU Dev Container",
-    "dockerComposeFile": "../../docker/docker-compose.yml",
-    "service": "robot_rl_obk",
+    "name": "Robot RL No-GPU Simulation Dev Container",
+    "dockerComposeFile": "../../docker/docker-compose-no-gpu.yml",
+    "service": "sim",
     "workspaceFolder": "${localWorkspaceFolder}",
     "shutdownAction": "stopCompose",
     "customizations": {
