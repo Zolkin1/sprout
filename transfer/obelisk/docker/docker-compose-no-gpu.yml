@@ -24,7 +24,6 @@ x-common: &common
   ports:
     - 7007:7007
     - 10000:10000
-  runtime: nvidia
   working_dir: $ROBOT_RL_ROOT
   stdin_open: true
   tty: true
