@@ -98,7 +98,7 @@ RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
 RUN cd /home/${USER}/livox_driver_ws/src/livox_ros_driver2 && \
     source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh && \
     cd /home/${USER} && mkdir -p lidar_odom_ws/src && cd lidar_odom_ws/src && \
-    git clone -b ROS2 https://github.com/wdc3iii/FAST_LIO_vel.git --recursive && cd .. && \
+    git clone -b ROS2 https://github.com/hku-mars/FAST_LIO.git --recursive && cd .. && \
     sudo rosdep init && \
     rosdep update && \
     rosdep install --from-paths src --ignore-src -r -y && \

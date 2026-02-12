@@ -47,22 +47,11 @@ docker compose -f <compose_file>.yml push
 
 To pull (i.e. on the on-board computer):
 ```
-docker pull ghcr.io/github_username/robot-rl-obk:no-gpu-latest```
+docker pull ghcr.io/github_username/robot-rl-obk:no-gpu-latest
+```
 
 ```
 docker compose -f <compose_file>.yaml up
-```
-
-# Quick start
-TODO: NOTE THE TWO STARTUP SCRIPTS ARE CAUSING ISSUES
-```
-source scripts/build.sh
-bash scripts/joystick.sh
-
-# Seperate terminal
-bash scripts/launch_lidar_odom.sh
-
-# obk-luanch...
 ```
 
 # Setup within the Docker
@@ -136,6 +125,14 @@ obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/multi-behavior/sim_multi-beh
 ```
 obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false
 ``` -->
+
+# Run the Lidar
+```
+source /home/${USER}/lidar_odom_ws/install/setup.bash
+```
+```
+ros2 launch lidar_scan fastlio_launch.py 
+```
 
 # Running on hardware
 Follow the above steps to make sure everything work in simulation.
