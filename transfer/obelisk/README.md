@@ -127,6 +127,11 @@ obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hz
 ``` -->
 
 # Run the Lidar
+May need to run
+```
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+```
+
 ```
 source /home/${USER}/lidar_odom_ws/install/setup.bash
 ```
