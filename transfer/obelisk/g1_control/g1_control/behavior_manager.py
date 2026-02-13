@@ -33,18 +33,68 @@ class BehaviorManager:
         self.active_behavior = init_behavior
 
         self.last_behavior_switch = 0.0
+        self.pending_behavior: str | None = None
 
-    def check_behavior_switch(self, joy_msg: Joy, time) -> str:
+    def check_behavior_switch(self, joy_msg: Joy, time: float) -> str:
+        """Check for behavior switch request and queue if valid.
+
+        The actual switch is deferred until phi is near 0 or 0.5.
+
+        Args:
+            joy_msg: Joystick message containing button states.
+            time: Current time.
+
+        Returns:
+            The currently active behavior name.
+        """
         if (time - self.last_behavior_switch) > 0.1:
             for i, button in enumerate(self.behavior_buttons):
                 if joy_msg.buttons[button] == 1:
-                    # TODO: Should also verify the validity of the transition
-                    if self.behavior_names[i] != self.active_behavior:
-                        self.last_behavior_switch = time
-                        self.active_behavior = self.behavior_names[i]
-                        self.policies[self.get_active_policy_idx()].reset_last_action()
+                    requested_behavior = self.behavior_names[i]
+                    # Queue if different from active and not already pending
+                    if requested_behavior != self.active_behavior and requested_behavior != self.pending_behavior:
+                        self.pending_behavior = requested_behavior
 
         return self.active_behavior
+
+    def try_execute_pending_switch(self, time: float) -> bool:
+        """Execute pending switch if phi is near 0 or 0.5.
+
+        Should be called after create_obs() where phi is computed.
+
+        Args:
+            time: Current time for updating last_behavior_switch.
+
+        Returns:
+            True if a switch was executed, False otherwise.
+        """
+        if self.pending_behavior is None:
+            return False
+
+        current_policy = self.get_active_policy()
+        phi = current_policy.get_phi()
+
+        # Check if phi is near 0 (including wrap-around) or 0.5
+        PHI_TOLERANCE = 0.05
+        at_zero = phi < PHI_TOLERANCE or phi > (1.0 - PHI_TOLERANCE)
+        at_half = abs(phi - 0.5) < PHI_TOLERANCE
+
+        if at_zero or at_half:
+            self.active_behavior = self.pending_behavior
+            self.last_behavior_switch = time
+            self.pending_behavior = None
+            self.policies[self.get_active_policy_idx()].reset_last_action()
+            return True
+
+        return False
+
+    def is_switch_pending(self) -> bool:
+        """Check if a behavior switch is pending."""
+        return self.pending_behavior is not None
+
+    def get_pending_behavior(self) -> str | None:
+        """Get the name of the pending behavior, if any."""
+        return self.pending_behavior
 
     def get_active_behavior(self):
         return self.active_behavior

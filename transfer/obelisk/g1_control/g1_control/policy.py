@@ -37,6 +37,10 @@ class RLPolicy:
         self.boundaries_crossed = 0
         self.hold_phi_value = -1.0  # -1 means not locked
 
+    def get_phi(self) -> float:
+        """Get the current phase variable value."""
+        return self.phi
+
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_folder: str) -> tuple[str, str]:
         """Load policy from Hugging Face with local caching.
 

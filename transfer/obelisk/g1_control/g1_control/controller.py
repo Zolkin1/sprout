@@ -358,6 +358,20 @@ class VelocityTrackingController(ObeliskController, ABC):
                 self.cmd_vel,
                 self.joint_names,
             )
+
+            # Check if we should execute a pending behavior switch (phi-gated)
+            switched = self.behavior_manager.try_execute_pending_switch(self.time - self.start_time)
+            if switched:
+                new_behavior = self.behavior_manager.get_active_behavior()
+                if new_behavior != self.active_behavior:
+                    self.active_behavior = new_behavior
+                    self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phase boundary!")
+                    active_policy = self.behavior_manager.get_active_policy()
+                    self.kps, self.kds = self._add_wrist_kp_kd_mujoco(
+                        active_policy.get_kp(self.joint_names_mujoco).tolist(),
+                        active_policy.get_kd(self.joint_names_mujoco).tolist()
+                    )
+
             end_obs_time = self.get_clock().now().nanoseconds / 1e9
 
             # Call RL model
@@ -527,14 +541,7 @@ class VelocityTrackingController(ObeliskController, ABC):
             raise RuntimeError("[Controller] Joystick emergency stop triggered!!")
 
         time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
-        new_behavior = self.behavior_manager.check_behavior_switch(joy_msg, time)
-
-        if new_behavior != self.active_behavior:
-            self.active_behavior = new_behavior
-            self.get_logger().info(f"[Controller] Switched to {self.active_behavior}!")
-            active_policy = self.behavior_manager.get_active_policy()
-            self.kps, self.kds = self._add_wrist_kp_kd_mujoco(active_policy.get_kp(self.joint_names_mujoco).tolist(),
-                                                                active_policy.get_kd(self.joint_names_mujoco).tolist())
+        self.behavior_manager.check_behavior_switch(joy_msg, time)
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""
