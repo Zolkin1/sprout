@@ -22,7 +22,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
-from sensor_msgs.msg import Joy
+from sensor_msgs.msg import Joy, Imu
 from geometry_msgs.msg import TransformStamped
 
 @dataclass
@@ -224,7 +224,7 @@ class HighLevelController(ObeliskController, ABC):
                 "sub_lidar_imu",
                 self.lidar_imu_callback,  # type: ignore
                 key="sub_lidar_imu_key",  # key can be specified here or in the config file
-                msg_type=ObkImu,
+                msg_type=Imu, #ObkImu,
             )
 
         # Declare subscriber to velocity commands from the Untiree joystick node
@@ -241,7 +241,7 @@ class HighLevelController(ObeliskController, ABC):
         """Callback for the joint encoders."""
         self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
 
-    def lidar_imu_callback(self, msg: ObkImu) -> None:
+    def lidar_imu_callback(self, msg) -> None:
         """Callback for the lidar imu."""
         # Store acceleration vectors
         lin_acc = np.array([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z])
