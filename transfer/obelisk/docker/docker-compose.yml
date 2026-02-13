@@ -21,6 +21,7 @@ x-common: &common
     - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
+    - /dev/input:/dev/input
   ports:
     - 7007:7007
     - 10000:10000
