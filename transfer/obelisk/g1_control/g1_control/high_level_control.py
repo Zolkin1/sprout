@@ -334,7 +334,7 @@ class HighLevelController(ObeliskController, ABC):
             self.log_odom.pos_w = self.pos_w
             self.log_odom.lin_vel_w = self.lin_vel_w
             self.log_odom.quat_w = np.array([q.w, q.x, q.y, q.z])
-            self.log_odom.ang_vel_w = np.array([twist_w.angular.x, twist_w.angular.y, twist_w.angular.z])
+            self.log_odom.ang_vel_w = np.array([0.0, 0.0, ang_z_vel])
             self.log_odom.yaw_w = self.yaw_cur_w
 
         self.odom_count += 1
