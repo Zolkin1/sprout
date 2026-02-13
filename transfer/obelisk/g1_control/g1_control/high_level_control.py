@@ -123,6 +123,10 @@ class HighLevelController(ObeliskController, ABC):
             self.pos_w_window = deque(maxlen=10)
             self.vel_w_window = deque(maxlen=10)
 
+            # Timestamped history for finite difference velocity estimation
+            self.pos_time_history = deque(maxlen=4)
+            self.yaw_time_history = deque(maxlen=4)
+
             self.lin_vel_w = np.zeros(3)
             self.pos_w = np.zeros(3)
             self.quat_camera_init = np.zeros(4)
@@ -312,17 +316,19 @@ class HighLevelController(ObeliskController, ABC):
 
 
         ##
-        # Get Velocities
+        # Get Velocities via finite difference
         ##
-        # Angular z moving avg:
-        self.ang_z_vel = twist_w.angular.z
-        self.ang_z_window.append(self.ang_z_vel)
+        # Get timestamp from message header
+        current_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # Put them into the track frame
-        self.lin_vel_w[0], self.lin_vel_w[1] = rotate_into_yaw(self.yaw_world, twist_w.linear.x, twist_w.linear.y)
-        self.lin_vel_w[2] = twist_w.linear.z
+        # Store position and yaw with timestamp
+        self.pos_time_history.append((current_time, self.pos_w.copy()))
+        self.yaw_time_history.append((current_time, self.yaw_cur_w))
 
-        self.vel_w_window.append(self.lin_vel_w)
+        # Compute velocities via finite difference
+        self.lin_vel_w = self._compute_linear_velocity()
+        ang_z_vel = self._compute_yaw_rate()
+        self.ang_z_window.append(ang_z_vel)
 
         if self.log_odom_flag:
             self.log_odom.pos_w = self.pos_w
@@ -332,6 +338,54 @@ class HighLevelController(ObeliskController, ABC):
             self.log_odom.yaw_w = self.yaw_cur_w
 
         self.odom_count += 1
+
+    def _wrap_angle_diff(self, angle_diff: float) -> float:
+        """Wrap angle difference to [-pi, pi]."""
+        while angle_diff > np.pi:
+            angle_diff -= 2 * np.pi
+        while angle_diff < -np.pi:
+            angle_diff += 2 * np.pi
+        return angle_diff
+
+    def _compute_linear_velocity(self) -> np.ndarray:
+        """Compute linear velocity from position history using finite difference with moving average."""
+        if len(self.pos_time_history) < 2:
+            return np.zeros(3)
+
+        # Compute velocity from oldest to newest for smoothing
+        vel_local = np.zeros(3)
+        velocities = []
+        history = list(self.pos_time_history)
+        for i in range(1, len(history)):
+            dt = history[i][0] - history[i-1][0]
+            if dt > 1e-6:
+                vel = (history[i][1] - history[i-1][1]) / dt
+                vel_local[:2] = rotate_into_yaw(self.yaw_cur_w, vel[0], vel[1])
+                vel_local[2] = vel[2]
+                velocities.append(vel_local)
+
+        if not velocities:
+            return np.zeros(3)
+
+        return np.mean(velocities, axis=0)
+
+    def _compute_yaw_rate(self) -> float:
+        """Compute yaw rate from yaw history using finite difference with moving average."""
+        if len(self.yaw_time_history) < 2:
+            return 0.0
+
+        rates = []
+        history = list(self.yaw_time_history)
+        for i in range(1, len(history)):
+            dt = history[i][0] - history[i-1][0]
+            if dt > 1e-6:
+                dyaw = self._wrap_angle_diff(history[i][1] - history[i-1][1])
+                rates.append(dyaw / dt)
+
+        if not rates:
+            return 0.0
+
+        return float(np.mean(rates))
 
     def compute_odom_control(self, target_point) -> Tuple[float, float]:
         """
