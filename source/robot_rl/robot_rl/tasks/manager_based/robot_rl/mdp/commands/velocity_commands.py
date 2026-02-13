@@ -46,6 +46,33 @@ class VelocityTrackingCommand(UniformVelocityCommand):
 
         return msg
 
+    def reset(self, env_ids: Sequence[int] | None = None):
+        """
+        Resets the command, but still respects the resample time.
+        """
+        # resolve the environment IDs
+        if env_ids is None:
+            env_ids = slice(None)
+
+        # add logging metrics
+        extras = {}
+        for metric_name, metric_value in self.metrics.items():
+            # compute the mean metric value
+            extras[metric_name] = torch.mean(metric_value[env_ids]).item()
+            # reset the metric value
+            metric_value[env_ids] = 0.0
+
+        # set the command counter to zero
+        self.command_counter[env_ids] = 0
+
+
+        # resample the command, but only ones that should be resampled
+        resample_env_ids = (self.time_left[env_ids] <= 0.0).nonzero().flatten()
+        if len(resample_env_ids) > 0:
+            self._resample(env_ids[resample_env_ids])
+
+        return extras
+
     def _resample_command(self, env_ids: Sequence[int]):
         """Resample the command."""
         r = torch.empty(len(env_ids), device=self.device)

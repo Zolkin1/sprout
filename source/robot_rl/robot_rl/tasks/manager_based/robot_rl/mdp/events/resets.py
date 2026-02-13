@@ -174,8 +174,8 @@ def reset_on_reference(
     #
     # # Compute V
     # vdot, v = cmd.clf.compute_vdot(cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des, cmd.yaw_output_idxs)
-
-    # Pretty print the output names, desired values, and measured values
+    #
+    # # Pretty print the output names, desired values, and measured values
     # _pretty_print_reset_state(
     #     cmd.ordered_pos_output_names,
     #     cmd.ordered_vel_output_names,

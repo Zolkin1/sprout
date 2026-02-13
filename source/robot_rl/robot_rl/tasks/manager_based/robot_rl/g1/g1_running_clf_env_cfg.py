@@ -554,7 +554,7 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         R_weights = RUNNING_R_weights,
         hold_phi_threshold = 0.1,
         heuristic_func=heuristic_modification,
-        phasing_boundaries=4,
+        phasing_boundaries = 4,
     )
 
     # TODO: Debug
@@ -876,9 +876,9 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.1, 3.7) #(1.1, 3.7)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
         self.commands.base_velocity.debug_vis = False
