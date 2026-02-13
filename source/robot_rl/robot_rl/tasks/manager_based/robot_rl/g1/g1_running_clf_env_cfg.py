@@ -561,8 +561,8 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     base_velocity = VelocityTrackingCommandCfg(
         asset_name="robot",
         resampling_time_range=(7.0, 10.0), #(10.0, 10.0),
-        rel_standing_envs=0.0, #0.05, #0.02,
-        rel_closed_loop=0.55,
+        rel_standing_envs=0.05, #0.05, #0.02,
+        rel_closed_loop=0.5, #0.55,
         rel_closed_loop_yaw=0.25,
         rel_open_loop=0.2,
         debug_vis=True,
