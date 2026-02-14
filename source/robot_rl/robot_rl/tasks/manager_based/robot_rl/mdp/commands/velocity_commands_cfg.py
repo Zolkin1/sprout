@@ -29,6 +29,7 @@ class VelocityTrackingCommandCfg(UniformVelocityCommandCfg):
 
     rel_standing_envs: float = MISSING
 
+    max_acc: float = 100.0
 
     @configclass
     class VelRanges(UniformVelocityCommandCfg.Ranges):
