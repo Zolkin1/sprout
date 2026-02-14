@@ -149,11 +149,12 @@ class VelocityTrackingCommand(UniformVelocityCommand):
         # standing
         self.vel_command_b[standing_env_ids, :] = 0.0
 
-        self.vel_command_b = torch.clamp(
-            self.vel_command_b,
-            min=self.current_vel_b - self.cfg.max_acc * self.command_dt,
-            max=self.current_vel_b + self.cfg.max_acc * self.command_dt,
-        )
+        # TODO: This needs more testing to see if needed
+        # self.vel_command_b = torch.clamp(
+        #     self.vel_command_b,
+        #     min=self.current_vel_b - self.cfg.max_acc * self.command_dt,
+        #     max=self.current_vel_b + self.cfg.max_acc * self.command_dt,
+        # )
 
         self.current_vel_b = self.vel_command_b
 

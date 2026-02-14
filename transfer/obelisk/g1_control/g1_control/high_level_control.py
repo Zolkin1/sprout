@@ -228,7 +228,7 @@ class HighLevelController(ObeliskController, ABC):
                 "sub_lidar_imu",
                 self.lidar_imu_callback,  # type: ignore
                 key="sub_lidar_imu_key",  # key can be specified here or in the config file
-                msg_type=Imu, #ObkImu,
+                msg_type=ObkImu, #Imu, #ObkImu,
             )
 
         # Declare subscriber to velocity commands from the Untiree joystick node

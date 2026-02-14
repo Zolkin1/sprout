@@ -557,15 +557,13 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         phasing_boundaries = 4,
     )
 
-    # TODO: Debug
     base_velocity = VelocityTrackingCommandCfg(
         asset_name="robot",
         resampling_time_range=(7.0, 10.0), #(10.0, 10.0),
-        rel_standing_envs=0.05, #0.05, #0.02,
-        rel_closed_loop=0.5, #0.55,
+        rel_standing_envs=0.0, #0.05, #0.02,
+        rel_closed_loop=0.55, #0.55,
         rel_closed_loop_yaw=0.25,
         rel_open_loop=0.2,
-        max_acc=1.0,
         debug_vis=True,
         ranges=VelocityTrackingCommandCfg.VelRanges(
             lin_vel_x=(-1.0, 1.0),
@@ -877,14 +875,14 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.1, 3.7) #(1.1, 3.7)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7) #(1.1, 3.7)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.resampling_time_range=(3.0, 4.0)
+        self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0) #(3.0, 4.0)
         self.commands.base_velocity.rel_y_envs = 1.0
         self.commands.base_velocity.debug_vis = False
 
-        self.episode_length_s = 6.0
+        self.episode_length_s = 4.0 #6.0
 
 
         self.scene.num_envs = 2

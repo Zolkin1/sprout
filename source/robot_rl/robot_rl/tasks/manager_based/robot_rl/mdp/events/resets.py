@@ -20,6 +20,8 @@ def reset_on_reference(
         base_z_offset: float = 0.03,
         joint_scale_range: tuple[float, float] = (1.0, 1.0),
         rel_envs_on_ref: float = 0.5,
+        special_val: float = 1.0,
+        rel_envs_on_special: float = 0.4,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
     """
@@ -47,8 +49,6 @@ def reset_on_reference(
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
     env.command_manager.get_term(conditioner_command_name)._resample(env_ids)
-    cmd_vel = env.command_manager.get_command(conditioner_command_name)
-    # print(f"cond_vel: {cmd_vel}")
     num_env = len(env_ids)
 
     if num_env == 0:
@@ -61,12 +61,16 @@ def reset_on_reference(
     ref_ids = env_ids[ref_env]
     num_ref_envs = len(ref_ids)
 
+    # Temporarily adjust the commands to be in the special range
+    r_on_ref = torch.empty(num_ref_envs, device=env.device)
+    special_envs = r_on_ref.uniform_(0.0, 1.0) <= rel_envs_on_special
+    command = env.command_manager.get_term(conditioner_command_name).command
+    command_clone = command.clone()
+    command[ref_ids[special_envs], 0] = special_val * torch.ones(len(ref_ids[special_envs]), device=env.device)
+
     nonref_env = ref_env == False
     nonref_ids = env_ids[nonref_env]
     num_nonref_envs = len(nonref_ids)
-
-    # Resample the command
-
 
 
     # Validate base frame exists in trajectory outputs
@@ -165,6 +169,9 @@ def reset_on_reference(
     asset.write_root_pose_to_sim(base_pose, env_ids=ref_ids)
     asset.write_root_link_velocity_to_sim(base_vel, env_ids=ref_ids)
     asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=ref_ids)
+
+    # Restore command
+    env.command_manager.get_term(conditioner_command_name).command[:] = command_clone
 
     # # Compute the measured outputs and print
     # cmd.get_measured_outputs(random_times, env_ids=ref_ids)
