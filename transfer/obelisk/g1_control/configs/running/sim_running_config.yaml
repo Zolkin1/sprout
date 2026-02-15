@@ -102,7 +102,7 @@ onboard:
         # ----- Lidar IMU subscriber ----- #
         - ros_parameter: sub_lidar_imu
           topic: /obelisk/g1/lidar_imu
-          msg_type: ObkIMU
+          msg_type: Imu
           history_depth: 10
           callback_group: None
       timers:
@@ -162,7 +162,7 @@ onboard:
           callback_group: None
         - ros_parameter: sub_pelvis_imu
           topic: /obelisk/g1/pelvis_imu
-          msg_type: ObkIMU
+          msg_type: Imu
           history_depth: 10
           callback_group: None
       timers:
@@ -316,7 +316,7 @@ onboard:
           # ---------- Pelvis IMU ---------- #
           - topic: /obelisk/g1/pelvis_imu
             dt: 0.001
-            msg_type: ObkImu
+            msg_type: Imu
             sensor_names:
               pelvis_imu_acc_sensor: accelerometer
               pelvis_imu_gyro_sensor: gyro
@@ -356,7 +356,7 @@ onboard:
           # ---------- Lidar IMU ---------- #
           - topic: /obelisk/g1/lidar_imu
             dt: 0.001
-            msg_type: ObkImu
+            msg_type: Imu
             sensor_names:
               lidar_imu_acc_sensor: accelerometer
               lidar_imu_gyro_sensor: gyro
@@ -381,7 +381,7 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: True
+    on: False
     viz_tool: foxglove
     viz_nodes:
       - pkg: obelisk_viz_cpp

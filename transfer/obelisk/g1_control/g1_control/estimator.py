@@ -3,11 +3,12 @@ from typing import List, Optional
 import numpy as np
 
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import Imu
 
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.estimation import ObeliskEstimator
 from obelisk_py.core.utils.ros import spin_obelisk
-from obelisk_sensor_msgs.msg import ObkImu, ObkJointEncoders
+from obelisk_sensor_msgs.msg import ObkJointEncoders
 from rclpy.executors import SingleThreadedExecutor
 
 
@@ -28,7 +29,7 @@ class G1Estimator(ObeliskEstimator):
         self.register_obk_subscription(
             "sub_pelvis_imu",
             self.pelvis_imu_callback,  # type: ignore
-            ObkImu,
+            Imu,
             key="sub_pelivs_imu",  # key can be specified here or in the config file
         )
 
@@ -59,7 +60,7 @@ class G1Estimator(ObeliskEstimator):
 
         self.received_joint_encoders = True
 
-    def pelvis_imu_callback(self, msg: ObkImu) -> None:
+    def pelvis_imu_callback(self, msg: Imu) -> None:
         """Callback for the pelvis IMU."""
         self.base_quat = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
 

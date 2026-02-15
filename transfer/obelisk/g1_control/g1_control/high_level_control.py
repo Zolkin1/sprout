@@ -16,7 +16,7 @@ from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
 from obelisk_py.core.obelisk_typing import ObeliskControlMsg, is_in_bound
-from obelisk_sensor_msgs.msg import ObkJointEncoders, ObkImu
+from obelisk_sensor_msgs.msg import ObkJointEncoders
 from obelisk_py.core.utils.ros import spin_obelisk
 from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
@@ -228,7 +228,7 @@ class HighLevelController(ObeliskController, ABC):
                 "sub_lidar_imu",
                 self.lidar_imu_callback,  # type: ignore
                 key="sub_lidar_imu_key",  # key can be specified here or in the config file
-                msg_type=ObkImu, #Imu, #ObkImu,
+                msg_type=Imu,
             )
 
         # Declare subscriber to velocity commands from the Untiree joystick node

@@ -41,6 +41,7 @@ x-common: &common
 services:
   sim:
     <<: *common
+    privileged: true
     build:
       context: .
       dockerfile: Dockerfile
