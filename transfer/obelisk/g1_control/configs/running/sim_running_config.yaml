@@ -8,9 +8,10 @@ onboard:
     - pkg: g1_control
       params:
         hf_policy_folders: [
-          # "running_clf_sym/2026-02-05_14-55-10_running_new_traj_test_sym",
-          # "walking_clf_sym/2026-01-28_18-37-10_walking_servo_backpack_joint_vel_noise_sym"
-          "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
+          # "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
+          # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
+          "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+
           "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [

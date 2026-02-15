@@ -76,10 +76,13 @@ class BehaviorManager:
 
         # Check if phi is near 0 (including wrap-around) or 0.5
         PHI_TOLERANCE = 0.05
-        at_zero = phi < PHI_TOLERANCE or phi > (1.0 - PHI_TOLERANCE)
-        at_half = abs(phi - 0.5) < PHI_TOLERANCE
+        # at_zero = phi < PHI_TOLERANCE or phi > (1.0 - PHI_TOLERANCE)
+        # at_half = abs(phi - 0.5) < PHI_TOLERANCE
 
-        if at_zero or at_half:
+        val = 0.164
+        at_val = abs(phi - val) < PHI_TOLERANCE
+
+        if at_val: #at_zero or at_half:
             self.active_behavior = self.pending_behavior
             self.last_behavior_switch = time
             self.pending_behavior = None
@@ -87,6 +90,18 @@ class BehaviorManager:
             return True
 
         return False
+
+        ## For debugging:
+        # current_policy = self.get_active_policy()
+        # phi = current_policy.get_phi()
+        # print(f"PHI: {phi}")
+        #
+        # self.active_behavior = self.pending_behavior
+        # self.last_behavior_switch = time
+        # self.pending_behavior = None
+        # self.policies[self.get_active_policy_idx()].reset_last_action()
+        #
+        # return True
 
     def is_switch_pending(self) -> bool:
         """Check if a behavior switch is pending."""
