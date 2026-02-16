@@ -1,4 +1,4 @@
-config: hzd_gl_policy
+config: hardware_running
 onboard:
   # --------------------------------- #
   # ----------- Controller ---------- #
@@ -29,7 +29,7 @@ onboard:
         hf_repo_id: "zolkin/robot_rl"
         log: true
         log_decimation: 1 # relative to the control callback
-        config_name: "sim_config_hzd_gl.yaml"
+        config_name: "running/hardware_running_config.yaml"
       executable: g1_controller
       # callback_groups:
       publishers:
@@ -161,7 +161,7 @@ onboard:
           callback_group: None
         - ros_parameter: sub_pelvis_imu
           topic: /obelisk/g1/pelvis_imu
-          msg_type: ObkIMU
+          msg_type: Imu #ObkIMU
           history_depth: 10
           callback_group: None
       timers:
@@ -177,6 +177,7 @@ onboard:
       pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_g1_hardware
       params:
+        logging: True
         default_joint_names: [
           "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
           "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
@@ -261,6 +262,10 @@ onboard:
           topic: /obelisk/g1/vel_cmd
           history_depth: 10
           callback_group: None      
+      timers:
+        - ros_parameter: timer_logging_setting
+          timer_period_sec: 0.01  # 100 Hz logging
+          callback_group: None
       sim:
         - ros_parameter: mujoco_setting
           robot_pkg: g1_model
@@ -382,7 +387,7 @@ onboard:
           # ---------- Pelvis IMU ---------- #
           - topic: /obelisk/g1/pelvis_imu
             dt: 0.001
-            msg_type: ObkImu
+            msg_type: Imu
             sensor_names:
               pelvis_imu_acc_sensor: accelerometer
               pelvis_imu_gyro_sensor: gyro
@@ -422,7 +427,7 @@ onboard:
           # ---------- Lidar IMU ---------- #
           - topic: /obelisk/g1/lidar_imu
             dt: 0.001
-            msg_type: ObkImu
+            msg_type: Imu
             sensor_names:
               lidar_imu_acc_sensor: accelerometer
               lidar_imu_gyro_sensor: gyro
