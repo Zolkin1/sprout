@@ -73,12 +73,19 @@ onboard:
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
+        # Temperature thresholding
+        temp_safety_threshold: 120.0
+        temp_lower_start: 105.0
+        safe_temp_speed: 1.2
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
           topic: /obelisk/g1/high_level_ctrl
           history_depth: 10
           callback_group: None
+        - ros_parameter: pub_joy_feedback
+          topic: /obelisk/g1/joy_feedback
+          history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
         - ros_parameter: sub_joint_encoders
@@ -180,6 +187,7 @@ onboard:
       pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_g1_hardware
       params:
+        pub_motor_temp: True
         logging: True
         default_joint_names: [
           "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",

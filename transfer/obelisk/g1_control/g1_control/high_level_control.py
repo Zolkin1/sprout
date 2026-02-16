@@ -84,8 +84,10 @@ class HighLevelController(ObeliskController, ABC):
 
         self.declare_parameter("temp_safety_threshold", 110.0)
         self.declare_parameter("temp_lower_start", 80.0)
+        self.declare_parameter("safe_temp_speed", 1.1)
         self.temp_safety_threshold = self.get_parameter("temp_safety_threshold").get_parameter_value().double_value
         self.temp_lower_start = self.get_parameter("temp_lower_start").get_parameter_value().double_value
+        self.safe_temp_speed = self.get_parameter("safe_temp_speed").get_parameter_value().double_value
         self.winding_temps = None
         self.temp_override = False
         self.temp_override_change_time = 0.0
