@@ -11,6 +11,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from robot_rl.assets.robots.g1_21j import (G1_MINIMAL_CFG, G1_ACTION_SCALE,)  # isort: skip
 import math
+from ..mdp.commands.velocity_commands_cfg import VelocityTrackingCommandCfg
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 
@@ -587,6 +588,24 @@ class G1GaitLibraryCommandsCfg(HumanoidCommandsCfg):
         phasing_boundaries=4,
     )
 
+    base_velocity = VelocityTrackingCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(7.0, 10.0), #(10.0, 10.0),
+        rel_standing_envs=0.05, #0.05, #0.02,
+        rel_closed_loop=0.5, #0.55,
+        rel_closed_loop_yaw=0.25,
+        rel_open_loop=0.2,
+        debug_vis=True,
+        ranges=VelocityTrackingCommandCfg.VelRanges(
+            lin_vel_x=(-1.0, 1.0),
+            lin_vel_y=(-1.0, 1.0),
+            ang_vel_z=(-1.0, 1.0),
+            heading=(-math.pi, math.pi),
+            y_pos_offset=(-0.5, 0.5),
+            y_kp=(1.2, 1.8),
+            y_kd=(0.2, 0.4),
+        ))
+
 ##
 # Curriculums
 ##
@@ -605,6 +624,7 @@ class G1WalkingEventsCfg(HumanoidEventsCfg):
         params={"command_name": "traj_ref",
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
+                "special_val": 1.2,     # Sometimes start on the running traj
                 "rel_envs_on_ref": 0.5}
     )
 
@@ -668,25 +688,25 @@ class G1WalkingRewardCfg(G1TrajOptCLFRewards):
         func=mdp.base_pos_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.4}
+                "sigma": 0.2}
     )
     base_ori = RewTerm(
         func=mdp.base_ori_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.5}
+                "sigma": 0.3}
     )
     base_lin_vel = RewTerm(
         func=mdp.base_lin_vel_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.6}
+                "sigma": 0.3}
     )
     base_ang_vel = RewTerm(
         func=mdp.base_ang_vel_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 1.5}
+                "sigma": 1.0}
     )
 
     # Joints
@@ -694,13 +714,13 @@ class G1WalkingRewardCfg(G1TrajOptCLFRewards):
         func=mdp.joint_pos_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.3 * math.sqrt(21)}
+                "sigma": 0.2 * math.sqrt(21)}
     )
     joint_vel = RewTerm(
         func=mdp.joint_vel_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 6.5 * math.sqrt(21)}
+                "sigma": 3.0 * math.sqrt(21)}
     )
 
     # Bodies
@@ -708,25 +728,25 @@ class G1WalkingRewardCfg(G1TrajOptCLFRewards):
         func=mdp.body_pos_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.2 * math.sqrt(4)}
+                "sigma": 0.1 * math.sqrt(4)}
     )
     body_ori = RewTerm(
         func=mdp.body_ori_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.4 * math.sqrt(4)}
+                "sigma": 0.2 * math.sqrt(4)}
     )
     body_lin_vel = RewTerm(
         func=mdp.body_lin_vel_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 2.0 * math.sqrt(4)}
+                "sigma": 1.0 * math.sqrt(4)}
     )
     body_ang_vel = RewTerm(
         func=mdp.body_ang_vel_reward,
         weight=1.0,  # 0.0,
         params={"command_name": "traj_ref",
-                "sigma": 1.0 * math.sqrt(4)}
+                "sigma": 0.5 * math.sqrt(4)}
     )
 
     # Goal conditioned rewards
@@ -734,14 +754,14 @@ class G1WalkingRewardCfg(G1TrajOptCLFRewards):
         func=mdp.track_lin_vel_xy_exp,
         weight=1.0,
         params={"command_name": "base_velocity",
-                "std": 0.75, }
+                "std": 0.25, }
     )
 
     yaw_vel = RewTerm(
         func=mdp.track_ang_vel_z_exp,
         weight=1.0,
         params={"command_name": "base_velocity",
-                "std": 0.75, }
+                "std": 0.25, }
     )
 
     clf_reward = None
@@ -771,10 +791,9 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         ##
         # Configure velocity ranges for different gaits
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5) #(-0.2, 0.2)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75) #(-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-3.14,3.14)
-        self.commands.base_velocity.rel_heading_envs = 0.5
         self.commands.base_velocity.resampling_time_range = (4.0, 8.0)
 
         self.commands.gait_period = None
@@ -905,6 +924,8 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
 
+        self.episode_length_s = 4.0
+
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
         self.events.base_com = None
@@ -915,8 +936,8 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
 
         
         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0) #(0.75, 1.0)  # Allow full range
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.2, 0.2)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
 
         # self.events.reset_base.params["pose_range"]["yaw"] = (-3.14,3.14)
         # self.events.reset_base.params["pose_range"]["x"] = (-3,3)

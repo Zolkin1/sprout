@@ -83,9 +83,7 @@ class CLF:
         #     self.P = P
 
         # TODO: Go back to before
-        # self.P = [torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32),
-        #     torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)]
-        self.P = torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)
+        # self.P = torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)
 
         # Build eta-state indices for each subgroup.
         # For output i, eta has position at 2*i and velocity at 2*i+1.
