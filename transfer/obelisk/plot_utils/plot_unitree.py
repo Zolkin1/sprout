@@ -28,7 +28,7 @@ def find_most_recent_unitree_folder() -> Optional[str]:
         print("Error: ROBOT_RL_ROOT environment variable not set")
         return None
     
-    unitree_logs_dir = os.path.join(robot_rl_root, "unitree_logs")
+    unitree_logs_dir = os.path.join(robot_rl_root, "unitree_g1_logs")
     if not os.path.exists(unitree_logs_dir):
         print(f"Error: unitree_logs directory not found at {unitree_logs_dir}")
         return None
@@ -56,7 +56,7 @@ def load_joint_names(folder_path: str) -> List[str]:
     if not os.path.exists(joint_names_path):
         print(f"Warning: joint_names.txt not found in {folder_path}")
         # Return default joint names based on G1 robot
-        return [f"joint_{i}" for i in range(28)]  # G1_27DOF + G1_EXTRA_WAIST
+        return [f"joint_{i}" for i in range(29)]  # G1 29 DOF
     
     try:
         with open(joint_names_path, 'r') as f:
@@ -69,7 +69,7 @@ def load_joint_names(folder_path: str) -> List[str]:
         print(f"Loaded {len(joint_names)} joint names from {joint_names_path}")
     except Exception as e:
         print(f"Error reading joint names file: {e}")
-        joint_names = [f"joint_{i}" for i in range(28)]
+        joint_names = [f"joint_{i}" for i in range(29)]
     
     return joint_names
 
@@ -180,10 +180,7 @@ def plot_temperatures(times: np.ndarray, motor_data: Dict[str, np.ndarray],
         ax.set_ylabel('Temperature (°C)')
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=8)
-        
-        # Set reasonable temperature limits
-        ax.set_ylim([0, 100])
-    
+
     # Hide unused subplots
     for i in range(num_joints, len(axes_flat)):
         axes_flat[i].set_visible(False)
