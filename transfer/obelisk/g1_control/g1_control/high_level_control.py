@@ -22,7 +22,7 @@ from nav_msgs.msg import Odometry
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
-from sensor_msgs.msg import Joy, Imu
+from sensor_msgs.msg import Joy, Imu, JoyFeedback
 from geometry_msgs.msg import TransformStamped
 
 @dataclass
@@ -81,6 +81,14 @@ class HighLevelController(ObeliskController, ABC):
         self.rec_joystick = False
 
         self.joy_cmd_vel = np.zeros(3)
+
+        self.declare_parameter("temp_safety_threshold", 110.0)
+        self.declare_parameter("temp_lower_start", 80.0)
+        self.temp_safety_threshold = self.get_parameter("temp_safety_threshold").get_parameter_value().double_value
+        self.temp_lower_start = self.get_parameter("temp_lower_start").get_parameter_value().double_value
+        self.winding_temps = None
+        self.temp_override = False
+        self.temp_override_change_time = 0.0
 
         # Incremental velocity parameters
         self.declare_parameter("vel_increment", 0.1)
@@ -239,11 +247,19 @@ class HighLevelController(ObeliskController, ABC):
             msg_type=VelocityCommand,
         )
 
+        self.register_obk_publisher(
+            "pub_joy_feedback",
+            key="pub_joy_feedback_key",
+            msg_type=JoyFeedback,
+        )
+
         self.cmd_vel = np.zeros((3,))
 
     def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
         """Callback for the joint encoders."""
         self.waist_joint_angle = msg.joint_pos[msg.joint_names.index("waist_yaw_joint")]
+        if len(msg.motor_winding_temps) > 0:
+            self.winding_temps = msg.motor_winding_temps
 
     def lidar_imu_callback(self, msg) -> None:
         """Callback for the lidar imu."""
@@ -525,6 +541,27 @@ class HighLevelController(ObeliskController, ABC):
             elif self.control_mode != "joystick":
                 raise ValueError("Unsupported control mode!")
 
+
+            ##
+            # Temperature Control
+            ##
+            if self.winding_temps is not None:
+                if np.max(self.winding_temps) >= self.temp_safety_threshold:
+                    self.get_logger().warn("Winding temperature exceeds safety threshold! Overriding target speed!")
+                    self.temp_override_change_time = self.get_clock().now().nanoseconds / 1e9
+                    self.temp_override = True
+
+                if self.temp_override:
+                    msg.v_x = min(msg.v_x, self.safe_temp_speed)
+                    self.incremental_vel = msg.v_x  # Reset the incremental vel for an easier reset
+
+                    if np.max(self.winding_temps) <= self.temp_lower_start:
+                        self.get_logger().warn("Winding temperatures have cooled down. Allowing user control again.")
+                        self.temp_override = False
+                        self.temp_override_change_time = self.get_clock().now().nanoseconds / 1e9
+
+                self.joy_feedback()
+
             self.obk_publishers["pub_ctrl"].publish(msg)
 
             # TODO: Viz the trajectory and commands
@@ -762,6 +799,19 @@ class HighLevelController(ObeliskController, ABC):
 
         self.tf_static_broadcaster.sendTransform(t)
         self.get_logger().info("ZEROING: Published static transform odom -> camera_init")
+
+    def joy_feedback(self) -> None:
+        """
+        Rumble the controller whenever the temperature override changes state.
+        """
+        if (self.get_clock().now().nanoseconds / 1e9) - self.temp_override_change_time <= 1.0:
+            msg = JoyFeedback()
+            msg.intensity = 1.0
+            msg.id = 0
+            msg.type = JoyFeedback.TYPE_RUMBLE
+
+            self.obk_publishers["pub_joy_feedback_key"].publish(msg)
+
 
 def rotate_into_yaw(yaw, x, y) -> tuple[float, float]:
     x_new = np.cos(yaw)*x + np.sin(yaw)*y

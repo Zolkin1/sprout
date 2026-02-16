@@ -77,6 +77,9 @@ onboard:
           topic: /obelisk/g1/high_level_ctrl
           history_depth: 10
           callback_group: None
+        - ros_parameter: pub_joy_feedback
+          topic: /obelisk/g1/joy_feedback
+          history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
         - ros_parameter: sub_joint_encoders
