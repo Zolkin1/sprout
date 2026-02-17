@@ -701,7 +701,7 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
         params={"command_name": "traj_ref",
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
-                "rel_envs_on_ref": 0.5}
+                "rel_envs_on_ref": 1.0} # No need to start from standing with the walking policy
     )
 
     # Randomize joint friction
