@@ -557,7 +557,7 @@ Position and velocity actuators added. -->
 
     <!-- Right Arm -->
     <position name="right_shoulder_pitch_joint_pos" class="shoulder_pitch_pos" joint="right_shoulder_pitch_joint"/>
-    <position name="right_shoulder_roll_join_post" class="shoulder_roll_pos" joint="right_shoulder_roll_joint"/>
+    <position name="right_shoulder_roll_joint_pos" class="shoulder_roll_pos" joint="right_shoulder_roll_joint"/>
     <position name="right_shoulder_yaw_joint_pos" class="shoulder_yaw_pos" joint="right_shoulder_yaw_joint"/>
     <position name="right_elbow_joint_pos" class="elbow_pos" joint="right_elbow_joint"/>
 

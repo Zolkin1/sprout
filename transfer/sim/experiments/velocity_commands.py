@@ -9,13 +9,25 @@ def step_to_max(sim_time):
 
 def smooth_ramp_running(sim_time):
     """Compute a ramp input over a few seconds up to max speed."""
-    RAMP_TIME = 1.0
+    RAMP_TIME = 3.0 #1.0
 
-    MAX_SPEED = 2.5
+    MAX_SPEED = 3.6 #2.5
 
     slope = MAX_SPEED / RAMP_TIME
 
-    return np.array([min(slope * sim_time, MAX_SPEED),0.0,0.0])
+    y_vel = 0.0
+    if sim_time > 6.0 and sim_time < 8.0:
+        y_vel = -0.75
+    elif sim_time > 8.0 and sim_time < 10.0:
+        y_vel = 0.75
+
+    yaw_vel = 0.0
+    if sim_time > 10.0 and sim_time < 12.0:
+        yaw_vel = -0.75
+    elif sim_time > 12.0 and sim_time < 14.0:
+        yaw_vel = 0.75
+
+    return np.array([min(slope * sim_time, MAX_SPEED),y_vel,yaw_vel])
 
 def smooth_ramp(sim_time):
     """Compute a ramp input over a few seconds up to max speed."""
