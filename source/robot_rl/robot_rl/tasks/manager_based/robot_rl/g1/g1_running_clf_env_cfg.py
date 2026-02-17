@@ -544,7 +544,6 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         contact_bodies = [".*_ankle_roll_link"],
 
         manager_type="library",
-        # path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
         hf_repo = "zolkin/robot_rl",
         path = "trajectories/running",
 
@@ -574,16 +573,6 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
             y_kp=(1.2, 1.8),
             y_kd=(0.2, 0.4),
         ))
-        # rel_heading_envs=0.6,
-        # rel_y_envs=0.6,
-        # heading_command=True,
-        # heading_control_stiffness=0.5,
-        # y_pos_kp=1.5, #0.4,
-        # y_pos_kd=0.3,
-        # debug_vis=True,
-        # ranges=mdp.UniformVelocityCommandCfg.Ranges(
-        #     lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
-        # ))
 
 @configclass
 class G1RunningObservationCfg(G1TrajOptObservationsCfg):
@@ -609,18 +598,9 @@ class G1RunningObservationCfg(G1TrajOptObservationsCfg):
 
 @configclass
 class G1RunningRewardCfg(G1TrajOptCLFRewards):
-    # TODO: Update flight contact penalty
-    # flight_contact_penalty = RewTerm(
-    #     func=mdp.contact_schedule_penalty,
-    #     weight=-3.0,
-    #     params={"command_name": "traj_ref",
-    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-    #             "weight_scalar": 0.0},
-    # )
-
     torque_lims = RewTerm(
         func=mdp.torque_limits,
-        weight=-1.0,
+        weight=-1.0,    # Can got to -10 for slightly more endurance
     )
 
     # Base
@@ -709,11 +689,6 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
 
 @configclass
 class G1RunningCurriculumCfg:
-    # contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-    #                                       params={"update_interval": 40000, #20000,
-    #                                                "max_weight": 1.0,
-    #                                                "update_amnt": 0.1})
-
     # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 30000, "min_max_err": (0.25, 0.3, 0.2) })
     pass
 
@@ -796,18 +771,6 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
 
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)  # Note the curriculum for increasing
 
-        # self.events.reset_base.params = {
-        #     "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},
-        #     "velocity_range": {
-        #         "x": (0.0, 0.0),
-        #         "y": (0.0, 0.0),
-        #         "z": (0.0, 0.0),
-        #         "roll": (0.0, 0.0),
-        #         "pitch": (0.0, 0.0),
-        #         "yaw": (0.0, 0.0),
-        #     },
-        # }
-
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.heading = (0, 0)
@@ -828,14 +791,6 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         }
         self.rewards.clf_decreasing_condition.weight = -1
 
-
-        # self.curriculum.clf_curriculum = None
-        # self.curriculum.clf_curriculum.params = {
-        #     "min_max_err": (0.1,0.1,0.2),
-        #     "scale": (0.005,0.005,0.005), #0.001
-        #     "update_interval": 20000
-        # }
-
         self.curriculum.terrain_levels = None
 
         self.rewards.dof_acc_l2 = None
@@ -847,7 +802,7 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
         # Other rewards
-        self.rewards.dof_torques_l2.weight = -1.0e-5
+        self.rewards.dof_torques_l2.weight = -1.0e-5    # -1e-4 for reduced torque at slightly worse tracking
 
         ##
         # Domain randomization
