@@ -482,71 +482,71 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         weight=-1.0,    # Can got to -10 for slightly more endurance
     )
 
-    # # Base
-    # base_pos = RewTerm(
-    #     func=mdp.base_pos_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.4}
-    # )
-    # base_ori = RewTerm(
-    #     func=mdp.base_ori_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.5}
-    # )
-    # base_lin_vel = RewTerm(
-    #     func=mdp.base_lin_vel_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.6}
-    # )
-    # base_ang_vel = RewTerm(
-    #     func=mdp.base_ang_vel_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 1.5}
-    # )
-    #
-    # # Joints
-    # joint_pos = RewTerm(
-    #     func=mdp.joint_pos_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.3*math.sqrt(21)}
-    # )
-    # joint_vel = RewTerm(
-    #     func=mdp.joint_vel_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 6.5*math.sqrt(21)}
-    # )
-    #
-    # # Bodies
-    # body_pos = RewTerm(
-    #     func=mdp.body_pos_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.2*math.sqrt(4)}
-    # )
-    # body_ori = RewTerm(
-    #     func=mdp.body_ori_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.4 * math.sqrt(4)}
-    # )
-    # body_lin_vel = RewTerm(
-    #     func=mdp.body_lin_vel_reward,
-    #     weight=1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 2.0 * math.sqrt(4)}
-    # )
-    # body_ang_vel = RewTerm(
-    #     func=mdp.body_ang_vel_reward,
-    #     weight=1.0, #0.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 1.0 * math.sqrt(4)}
-    # )
+    # Base
+    base_pos = RewTerm(
+        func=mdp.base_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.4}
+    )
+    base_ori = RewTerm(
+        func=mdp.base_ori_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.5}
+    )
+    base_lin_vel = RewTerm(
+        func=mdp.base_lin_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.6}
+    )
+    base_ang_vel = RewTerm(
+        func=mdp.base_ang_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 1.5}
+    )
+
+    # Joints
+    joint_pos = RewTerm(
+        func=mdp.joint_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.3*math.sqrt(21)}
+    )
+    joint_vel = RewTerm(
+        func=mdp.joint_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 6.5*math.sqrt(21)}
+    )
+
+    # Bodies
+    body_pos = RewTerm(
+        func=mdp.body_pos_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.2*math.sqrt(4)}
+    )
+    body_ori = RewTerm(
+        func=mdp.body_ori_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 0.4 * math.sqrt(4)}
+    )
+    body_lin_vel = RewTerm(
+        func=mdp.body_lin_vel_reward,
+        weight=1.0,
+        params={"command_name": "traj_ref",
+                "sigma": 2.0 * math.sqrt(4)}
+    )
+    body_ang_vel = RewTerm(
+        func=mdp.body_ang_vel_reward,
+        weight=1.0, #0.0,
+        params={"command_name": "traj_ref",
+                "sigma": 1.0 * math.sqrt(4)}
+    )
 
     # Goal conditioned rewards
     xy_vel = RewTerm(
@@ -563,15 +563,15 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
                 "std": 0.75,}
     )
 
-    # clf_reward = None
-    clf_reward = RewTerm(
-        func=mdp.clf_reward,
-        weight=10.0,
-        params={
-            "command_name": "traj_ref",
-            "max_eta_err": 12.0, #16.0,
-        }
-    )
+    clf_reward = None
+    # clf_reward = RewTerm(
+    #     func=mdp.clf_reward,
+    #     weight=10.0,
+    #     params={
+    #         "command_name": "traj_ref",
+    #         "max_eta_err": 12.0, #16.0,
+    #     }
+    # )
 
 @configclass
 class G1RunningCurriculumCfg:
