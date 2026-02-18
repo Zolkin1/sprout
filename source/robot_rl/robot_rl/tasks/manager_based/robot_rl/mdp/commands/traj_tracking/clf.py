@@ -189,7 +189,6 @@ class CLF:
         y_nom: torch.Tensor,
         dy_act: torch.Tensor,
         dy_nom: torch.Tensor,
-        yaw_idx: list[int],
         domain_idx: int = 0,
     ) -> torch.Tensor:
         """
@@ -204,11 +203,12 @@ class CLF:
         eta[:,0::2] = y_err      # even indices: positions
         eta[:,1::2] = dy_err     # odd indices: velocities
 
+        # TODO: Need to remove yaw wrapping as quats are used now.
         #need to wrap around yaw error, 
-        yaw_err = y_err[:,yaw_idx]
-        two_pi = 2.0 * torch.pi
-        wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
-        eta[:,yaw_idx] = wrapped_yaw_err
+        # yaw_err = y_err[:,yaw_idx]
+        # two_pi = 2.0 * torch.pi
+        # wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
+        # eta[:,yaw_idx] = wrapped_yaw_err
 
         # if self.num_domain > 1:
         #     P = self.P[domain_idx]
@@ -239,12 +239,12 @@ class CLF:
         y_nom: torch.Tensor,
         dy_act: torch.Tensor,
         dy_nom: torch.Tensor,
-        yaw_idx: list[int],
+        # yaw_idx: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute V_dot = (V_curr - V_prev) / sim_dt, returns (vdot, V_curr).
         """
-        v_curr = self.compute_v(y_act, y_nom, dy_act, dy_nom, yaw_idx)
+        v_curr = self.compute_v(y_act, y_nom, dy_act, dy_nom,)# yaw_idx)
        
         dt = self.sim_dt
         B = v_curr.shape[0]
@@ -281,8 +281,6 @@ class CLF:
         dy_nom: torch.Tensor,
         ddy_act: torch.Tensor,
         ddy_nom: torch.Tensor,
-        yaw_idx: list[int],
-        domain_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute V_dot analytically using acceleration information.
@@ -318,13 +316,13 @@ class CLF:
         eta[:, 0::2] = y_err      # even indices: position errors
         eta[:, 1::2] = dy_err     # odd indices: velocity errors
 
-        # Wrap yaw errors to [-pi, pi]
-        yaw_err = y_err[:, yaw_idx]
-        two_pi = 2.0 * torch.pi
-        wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
-        # Update the position error slots for yaw indices in eta
-        yaw_eta_indices = [2 * i for i in yaw_idx]
-        eta[:, yaw_eta_indices] = wrapped_yaw_err
+        # # Wrap yaw errors to [-pi, pi]
+        # yaw_err = y_err[:, yaw_idx]
+        # two_pi = 2.0 * torch.pi
+        # wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
+        # # Update the position error slots for yaw indices in eta
+        # yaw_eta_indices = [2 * i for i in yaw_idx]
+        # eta[:, yaw_eta_indices] = wrapped_yaw_err
 
         # Build eta_dot: [dy_err_0, ddy_err_0, dy_err_1, ddy_err_1, ...]
         eta_dot = torch.zeros(batch_size, self.n_outputs, device=y_act.device)
@@ -352,7 +350,7 @@ class CLF:
         # First compute P @ eta_dot: [B, 2n]
         P_eta_dot = torch.matmul(eta_dot, P.T)  # [B, 2n]
         # Then compute eta^T @ (P @ eta_dot): scalar per batch
-        vdot = 2.0 * torch.einsum('bi,bi->b', eta, P_eta_dot)
+        vdot = 2.0 * torch.einsum('bi,bi->b', eta, P_eta_dot)   # TODO: Check this
 
         # Update V buffer for consistency with finite differencing method
         self.v_buffer[:, 2] = self.v_buffer[:, 1]

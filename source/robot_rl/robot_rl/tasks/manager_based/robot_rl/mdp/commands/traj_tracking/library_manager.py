@@ -315,6 +315,30 @@ class LibraryManager(ManagerBase):
 
         return pos_outputs, vel_outputs
 
+    def get_acceleration(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Compute the acceleration outputs for each environment.
+
+        Args:
+            t: Time in each env, shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
+
+        Returns:
+            Acceleration outputs, shape [N, num_vel_outputs].
+        """
+        self._ensure_cache(env_ids)
+
+        N = t.shape[0]
+        accelerations = torch.zeros(N, self.num_vel_outputs, device=self.device)
+
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
+            t_for_manager = t[env_indices]
+            manager_accelerations = self.trajectory_managers[idx].get_acceleration(t_for_manager)
+            accelerations[env_indices] = manager_accelerations
+
+        return accelerations
+
     def get_ref_frames_in_use(self, t: torch.Tensor,
                               ref_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
         """Determine the reference frame in use for each environment.

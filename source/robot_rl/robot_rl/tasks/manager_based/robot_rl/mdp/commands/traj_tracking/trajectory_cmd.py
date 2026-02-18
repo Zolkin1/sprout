@@ -82,10 +82,10 @@ class TrajectoryCommand(CommandTerm):
 
         # For now assuming that all bodies have a yaw tracking
         # Use velocity output names since CLF uses velocity dimensions
-        self.yaw_output_idxs = []
-        for i, name in enumerate(self.ordered_vel_output_names):
-            if "ori_z" in name:
-                self.yaw_output_idxs.append(i)
+        # self.yaw_output_idxs = []
+        # for i, name in enumerate(self.ordered_vel_output_names):
+        #     if "ori_z" in name:
+        #         self.yaw_output_idxs.append(i)
 
         # Create a mapping from vel output indices to pos output indices
         # This is needed to extract position values that match velocity dimensions
@@ -621,7 +621,7 @@ class TrajectoryCommand(CommandTerm):
             vel_output_idx += joint_vel.shape[1]
 
     def compute_measured_acceleration(
-        self, ref_frame_pos_w: torch.Tensor, ref_frame_quat: torch.Tensor
+        self, ref_frame_quat: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute measured accelerations from the robot in the same order as outputs.
@@ -631,7 +631,6 @@ class TrajectoryCommand(CommandTerm):
         reference frame.
 
         Args:
-            ref_frame_pos_w: [N, 3] reference frame positions in world frame.
             ref_frame_quat: [N, 4] reference frame quaternions.
 
         Returns:
@@ -839,7 +838,12 @@ class TrajectoryCommand(CommandTerm):
         self.get_desired_output_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
         start = time.perf_counter()
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des, self.yaw_output_idxs)
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
+
+        # # TODO: Test
+        # ddy_act = self.compute_measured_acceleration(self.ref_poses[:, :-4])
+        # ddy_nom = self.manager.get_acceleration(t)
+        # vdot, vcur = self.clf.compute_vdot_analytic(self.y_act, self.y_des, self.dy_act, self.dy_des, ddy_act, ddy_nom)
         end = time.perf_counter()
         self.vdot_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
