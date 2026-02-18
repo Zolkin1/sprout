@@ -422,8 +422,12 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         hf_repo = "zolkin/robot_rl",
         path = "trajectories/running",
 
+        # path = "trajectories/run2_subject1"
+        # path = "trajectories/running_tracking_kinematics"
+        # path = "trajectories/running_tracking"
+
         conditioner_generator_name = "base_velocity",
-        num_outputs = 48, #45, #27, #45, #51, #31, #27,
+        num_outputs = 48, # 48 for the old ones, 54 for including wrist orientation
         Q_weights = RUNNING_Q_weights,
         R_weights = RUNNING_R_weights,
         hold_phi_threshold = 0.1,
