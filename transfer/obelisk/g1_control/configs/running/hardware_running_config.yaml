@@ -14,7 +14,8 @@ onboard:
           "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
 
           # Walking
-          "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
+          "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",  # Should be able to do running -> walking
+          # "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -27,6 +28,10 @@ onboard:
         behavior_buttons: [
           2,                  # x
           1,                  # b
+        ]
+        vel_thresholds: [
+          10.0, 1.1,
+          1.1, -1.1
         ]
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
@@ -61,10 +66,10 @@ onboard:
     - pkg: g1_control
       executable: high_level_control
       params:
-        v_x_min: 0.0
-        v_x_max: 3.6
+        v_x_min: -1.1
+        v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 1.0
+        w_z_max: 0.75
         vel_increment: 0.1
         kp_yaw: 2.5 #3.0
         kd_yaw: 0.0 #0.1
@@ -122,7 +127,7 @@ onboard:
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_scale: 3.0
+        v_x_scale: 3.6
         v_y_scale: 0.5
         w_z_scale: 0.2
 
