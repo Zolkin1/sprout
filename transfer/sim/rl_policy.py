@@ -112,7 +112,7 @@ class RLPolicy:
 
         # self.phi = raw_phi
 
-        print(f"phi: {self.phi}")
+        # print(f"phi: {self.phi}")
 
         # Create the observation
         obs_idx = 0
@@ -159,9 +159,9 @@ class RLPolicy:
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
                     # phi = 0
-                    print(f"phi: {phi}, time: {time}")
+                    # print(f"phi: {phi}, time: {time}")
                     obs_np[obs_idx:obs_idx + shape] = self.create_cos_phase_obs(phi, 1.0) * scale
-                    print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
+                    # print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape
@@ -208,7 +208,7 @@ class RLPolicy:
         clipped_cmd[1] = np.clip(cmd_vel[1], vel_ranges['v_y_min'], vel_ranges['v_y_max'])
         clipped_cmd[2] = np.clip(cmd_vel[2], vel_ranges['w_z_min'], vel_ranges['w_z_max'])
 
-        print(f"clipped_cmd: {clipped_cmd}")
+        # print(f"clipped_cmd: {clipped_cmd}")
 
         return clipped_cmd
 

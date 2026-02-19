@@ -144,8 +144,16 @@ class Simulation:
         self,
         total_time: float,
         force_disturbance: Callable[[float], np.array] = None,
+        skip_gain_setup: bool = False,
     ):
-        """Run the simulation without a viewer."""
+        """Run the simulation without a viewer.
+
+        Args:
+            total_time: Total simulation time in seconds.
+            force_disturbance: Optional callable returning force vector at each timestep.
+            skip_gain_setup: If True, skip calling set_pd_gains_from_policy. Use this
+                when gains have been manually set and scaled before running.
+        """
         print(
             f"Starting mujoco simulation with robot {self.robot.robot_name}.\n"
             f"Policy dt set to {self.policy.get_dt()} s ({self.sim_steps_per_policy_update} steps per policy update.)\n"
@@ -166,7 +174,8 @@ class Simulation:
 
         success = True
 
-        self.robot.set_pd_gains_from_policy(self.policy)
+        if not skip_gain_setup:
+            self.robot.set_pd_gains_from_policy(self.policy)
 
         while self.robot.mj_data.time < total_time:
             # Get observation and compute action
@@ -180,7 +189,7 @@ class Simulation:
                 obs = self.robot.create_observation(self.policy, height_map=height_map, sensor_pos=sensor_pos)
             else:
                 obs = self.robot.create_observation(self.policy)
-            action = self.policy.get_action(obs)
+            action = self.policy.get_action(obs, self.robot.joint_names)
             self.robot.apply_action(action)
 
             if self.robot.failed():

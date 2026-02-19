@@ -103,6 +103,38 @@ class Robot:
 
         self.mj_model.body_ipos[body_id] += self.torso_ipos
 
+    def scale_torso_mass(self, scale: float) -> None:
+        """Scale the torso mass by the given factor.
+
+        Args:
+            scale: Multiplicative factor for the torso mass.
+        """
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        self.mj_model.body_mass[body_id] *= scale
+        print(f"Scaling torso mass by {scale}. New mass: {self.mj_model.body_mass[body_id]}")
+
+    def set_torso_mass_pos_offset(self, offset: np.ndarray) -> None:
+        """Set the torso COM position offset to an exact value.
+
+        Args:
+            offset: 3D offset vector [x, y, z] in meters.
+        """
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        self.mj_model.body_ipos[body_id] = self.torso_ipos + offset
+        print(f"Setting torso COM offset to: {offset}")
+
+    def scale_kd_gains(self, scale: float) -> None:
+        """Scale all actuator kd gains by the given factor.
+
+        Args:
+            scale: Multiplicative factor for kd gains.
+        """
+        for i in range(self.mj_model.nu):
+            self.mj_model.actuator_biasprm[i, 2] *= scale
+        print(f"Scaling all kd gains by {scale}")
+
     def get_joystick_command(self, policy):
         """Get velocity commands from joystick."""
         des_vel = np.zeros(3)
@@ -198,7 +230,7 @@ class Robot:
         angular_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_yaw * yaw + -kd_yaw * qvel[5], -0.5, 0.5)
         self.commanded_vel[2] = angular_vel
 
-        print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
+        # print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
 
     def apply_action(self, action):
         """Apply control action to the robot."""

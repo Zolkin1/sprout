@@ -544,7 +544,6 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
         contact_bodies = [".*_ankle_roll_link"],
 
         manager_type="library",
-        # path="source/robot_rl/robot_rl/assets/robots/test_walking_library",
         hf_repo = "zolkin/robot_rl",
         path = "trajectories/running",
 
@@ -574,16 +573,6 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
             y_kp=(1.2, 1.8),
             y_kd=(0.2, 0.4),
         ))
-        # rel_heading_envs=0.6,
-        # rel_y_envs=0.6,
-        # heading_command=True,
-        # heading_control_stiffness=0.5,
-        # y_pos_kp=1.5, #0.4,
-        # y_pos_kd=0.3,
-        # debug_vis=True,
-        # ranges=mdp.UniformVelocityCommandCfg.Ranges(
-        #     lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
-        # ))
 
 @configclass
 class G1RunningObservationCfg(G1TrajOptObservationsCfg):
@@ -609,85 +598,76 @@ class G1RunningObservationCfg(G1TrajOptObservationsCfg):
 
 @configclass
 class G1RunningRewardCfg(G1TrajOptCLFRewards):
-    # TODO: Update flight contact penalty
-    # flight_contact_penalty = RewTerm(
-    #     func=mdp.contact_schedule_penalty,
-    #     weight=-3.0,
-    #     params={"command_name": "traj_ref",
-    #             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["left_ankle_roll_link", "right_ankle_roll_link"]),
-    #             "weight_scalar": 0.0},
-    # )
-
     torque_lims = RewTerm(
         func=mdp.torque_limits,
-        weight=-1.0,
+        weight=-1.0,    # Can got to -10 for slightly more endurance
     )
 
-    # Base
-    base_pos = RewTerm(
-        func=mdp.base_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.4}
-    )
-    base_ori = RewTerm(
-        func=mdp.base_ori_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.5}
-    )
-    base_lin_vel = RewTerm(
-        func=mdp.base_lin_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.6}
-    )
-    base_ang_vel = RewTerm(
-        func=mdp.base_ang_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 1.5}
-    )
-
-    # Joints
-    joint_pos = RewTerm(
-        func=mdp.joint_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.3*math.sqrt(21)}
-    )
-    joint_vel = RewTerm(
-        func=mdp.joint_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 6.5*math.sqrt(21)}
-    )
-
-    # Bodies
-    body_pos = RewTerm(
-        func=mdp.body_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.2*math.sqrt(4)}
-    )
-    body_ori = RewTerm(
-        func=mdp.body_ori_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.4 * math.sqrt(4)}
-    )
-    body_lin_vel = RewTerm(
-        func=mdp.body_lin_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 2.0 * math.sqrt(4)}
-    )
-    body_ang_vel = RewTerm(
-        func=mdp.body_ang_vel_reward,
-        weight=1.0, #0.0,
-        params={"command_name": "traj_ref",
-                "sigma": 1.0 * math.sqrt(4)}
-    )
+    # # Base
+    # base_pos = RewTerm(
+    #     func=mdp.base_pos_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.4}
+    # )
+    # base_ori = RewTerm(
+    #     func=mdp.base_ori_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.5}
+    # )
+    # base_lin_vel = RewTerm(
+    #     func=mdp.base_lin_vel_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.6}
+    # )
+    # base_ang_vel = RewTerm(
+    #     func=mdp.base_ang_vel_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 1.5}
+    # )
+    #
+    # # Joints
+    # joint_pos = RewTerm(
+    #     func=mdp.joint_pos_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.3*math.sqrt(21)}
+    # )
+    # joint_vel = RewTerm(
+    #     func=mdp.joint_vel_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 6.5*math.sqrt(21)}
+    # )
+    #
+    # # Bodies
+    # body_pos = RewTerm(
+    #     func=mdp.body_pos_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.2*math.sqrt(4)}
+    # )
+    # body_ori = RewTerm(
+    #     func=mdp.body_ori_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.4 * math.sqrt(4)}
+    # )
+    # body_lin_vel = RewTerm(
+    #     func=mdp.body_lin_vel_reward,
+    #     weight=1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 2.0 * math.sqrt(4)}
+    # )
+    # body_ang_vel = RewTerm(
+    #     func=mdp.body_ang_vel_reward,
+    #     weight=1.0, #0.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 1.0 * math.sqrt(4)}
+    # )
 
     # Goal conditioned rewards
     xy_vel = RewTerm(
@@ -704,16 +684,18 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
                 "std": 0.75,}
     )
 
-    clf_reward = None
-
+    # clf_reward = None
+    clf_reward = RewTerm(
+        func=mdp.clf_reward,
+        weight=10.0,
+        params={
+            "command_name": "traj_ref",
+            "max_eta_err": 12.0, #16.0,
+        }
+    )
 
 @configclass
 class G1RunningCurriculumCfg:
-    # contact_penalty_curriculum = CurrTerm(func=mdp.contact_curriculum,
-    #                                       params={"update_interval": 40000, #20000,
-    #                                                "max_weight": 1.0,
-    #                                                "update_amnt": 0.1})
-
     # clf_curriculum = CurrTerm(func=mdp.clf_curriculum, params={"update_interval": 30000, "min_max_err": (0.25, 0.3, 0.2) })
     pass
 
@@ -726,7 +708,7 @@ class G1RunningEventsCfg(HumanoidEventsCfg):
         params={"command_name": "traj_ref",
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
-                "rel_envs_on_ref": 0.5}
+                "rel_envs_on_ref": 1.0} # No need to start from standing with the walking policy
     )
 
     # Randomize joint friction
@@ -796,18 +778,6 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
 
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)  # Note the curriculum for increasing
 
-        # self.events.reset_base.params = {
-        #     "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-0.2, 0.2)},
-        #     "velocity_range": {
-        #         "x": (0.0, 0.0),
-        #         "y": (0.0, 0.0),
-        #         "z": (0.0, 0.0),
-        #         "roll": (0.0, 0.0),
-        #         "pitch": (0.0, 0.0),
-        #         "yaw": (0.0, 0.0),
-        #     },
-        # }
-
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.heading = (0, 0)
@@ -828,14 +798,6 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         }
         self.rewards.clf_decreasing_condition.weight = -1
 
-
-        # self.curriculum.clf_curriculum = None
-        # self.curriculum.clf_curriculum.params = {
-        #     "min_max_err": (0.1,0.1,0.2),
-        #     "scale": (0.005,0.005,0.005), #0.001
-        #     "update_interval": 20000
-        # }
-
         self.curriculum.terrain_levels = None
 
         self.rewards.dof_acc_l2 = None
@@ -847,7 +809,7 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         # self.scene.terrain.terrain_generator = ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 
         # Other rewards
-        self.rewards.dof_torques_l2.weight = -1.0e-5
+        self.rewards.dof_torques_l2.weight = -1.0e-5    # -1e-4 for reduced torque at slightly worse tracking
 
         ##
         # Domain randomization
