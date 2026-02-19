@@ -33,6 +33,10 @@ onboard:
           2,                  # x
           1,                  # b
         ]
+        vel_thresholds: [
+          10.0, 1.1,
+          1.1, -1.1
+        ]
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
         log: true

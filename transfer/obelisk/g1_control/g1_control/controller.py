@@ -41,17 +41,20 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.declare_parameter("behavior_names", [""])
         self.declare_parameter("behavior_buttons", [-1])
         self.declare_parameter("init_behavior", "")
+        self.declare_parameter("vel_thresholds", [0.0])
 
         hf_repo_ids = self.get_parameter("hf_repo_ids").get_parameter_value().string_array_value
         hf_policy_folders = self.get_parameter("hf_policy_folders").get_parameter_value().string_array_value
         behavior_names = self.get_parameter("behavior_names").get_parameter_value().string_array_value
         behavior_buttons = self.get_parameter("behavior_buttons").get_parameter_value().integer_array_value
         init_behavior = self.get_parameter("init_behavior").get_parameter_value().string_value
+        vel_thresholds = self.get_parameter("vel_thresholds").get_parameter_value().double_array_value
 
         self.behavior_manager = BehaviorManager(
             behavior_names=behavior_names,
             behavior_buttons=behavior_buttons,
             init_behavior=init_behavior,
+            vel_thresholds=vel_thresholds,
             hf_repo_ids=hf_repo_ids,
             hf_policy_folders=hf_policy_folders,
         )
@@ -360,12 +363,13 @@ class VelocityTrackingController(ObeliskController, ABC):
             )
 
             # Check if we should execute a pending behavior switch (phi-gated)
+            old_phi = self.behavior_manager.get_active_policy().get_phi()
             switched = self.behavior_manager.try_execute_pending_switch(self.time - self.start_time)
             if switched:
                 new_behavior = self.behavior_manager.get_active_behavior()
                 if new_behavior != self.active_behavior:
                     self.active_behavior = new_behavior
-                    self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phase boundary!")
+                    self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phi = {old_phi}!")
                     active_policy = self.behavior_manager.get_active_policy()
                     self.kps, self.kds = self._add_wrist_kp_kd_mujoco(
                         active_policy.get_kp(self.joint_names_mujoco).tolist(),
@@ -541,7 +545,7 @@ class VelocityTrackingController(ObeliskController, ABC):
             raise RuntimeError("[Controller] Joystick emergency stop triggered!!")
 
         time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
-        self.behavior_manager.check_behavior_switch(joy_msg, time)
+        self.behavior_manager.check_behavior_switch(joy_msg, self.cmd_vel, time)
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""
