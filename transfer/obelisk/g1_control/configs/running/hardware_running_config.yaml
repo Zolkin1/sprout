@@ -10,8 +10,13 @@ onboard:
         hf_policy_folders: [
           # Running
           # "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
+
+          # Works well
           # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
           "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+          
+          # "running_clf_sym/2026-02-15_11-20-21_T2_running_higher_tor_l2_higher_tor_lim_sym",
+          # "running_clf_sym/2026-02-15_11-25-13_T1_running_higher_l2_10_lim_sym",
 
           # Walking
           "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
