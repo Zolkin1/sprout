@@ -716,11 +716,10 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7) #(1.1, 3.7)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0) #(3.0, 4.0)
-        self.commands.base_velocity.rel_y_envs = 1.0
         self.commands.base_velocity.debug_vis = False
 
         self.episode_length_s = 4.0 #6.0
@@ -740,4 +739,34 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.events.add_base_mass = None
         self.events.base_com = None
         self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.events.gain_randomization = None
+        self.events.joint_friction_params = None
+        self.events.arm_friction_params = None
+
+@configclass
+class G1RunningGaitLibraryEnvCfgExperiment(G1RunningGaitLibraryEnvCfg):
+    """Configuration for the G1 running gait library play environment."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0) #(-0.75, 0.75)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0) #(-0.75, 0.75)
+        self.commands.base_velocity.ranges.resampling_time_range=(20.0, 20.0)
+        self.commands.base_velocity.debug_vis = False
+
+        # TODO: Can play with this
+        self.commands.base_velocity.rel_open_loop = 1.0
+        self.commands.base_velocity.rel_closed_loop = 0.0
+        self.commands.base_velocity.rel_closed_loop_yaw = 0.0
+        self.commands.base_velocity.rel_standing_envs = 0.0
+
+        self.scene.num_envs = 2
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+
+        # self.events.add_base_mass = None
+        # self.events.base_com = None
         self.events.push_robot = None

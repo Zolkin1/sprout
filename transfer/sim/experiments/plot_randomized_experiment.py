@@ -26,6 +26,7 @@ from matplotlib.legend_handler import HandlerBase
 from sim.log_utils import extract_data
 
 START_IDX = 150
+MA_WINDOW = 30
 
 # Environment experiment names mapping (same as in g1_runner.py / train_policy.py)
 EXPERIMENT_NAMES = {
@@ -45,6 +46,20 @@ EXPERIMENT_NAMES = {
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
     "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
+
+
+def moving_average(data: np.ndarray, window_size: int) -> np.ndarray:
+    """Compute moving average of a 1D array.
+
+    Args:
+        data: 1D input array.
+        window_size: Number of samples in the averaging window.
+
+    Returns:
+        Smoothed array of length ``len(data) - window_size + 1``.
+    """
+    kernel = np.ones(window_size) / window_size
+    return np.convolve(data, kernel, mode='valid')
 
 
 class HandlerOverlay(HandlerBase):
@@ -178,6 +193,46 @@ def _interpolate_to_common_grid(runs: list, key: str, time_key: str = "time"):
     return common_time, np.stack(interpolated, axis=0)
 
 
+def _interpolate_and_smooth(
+    runs: list,
+    key: str,
+    window_size: int = MA_WINDOW,
+    time_key: str = "time",
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Interpolate runs to a common grid and apply per-run moving average.
+
+    Args:
+        runs: List of run dicts.
+        key: Data key to interpolate and smooth.
+        window_size: Moving average window size.
+        time_key: Key for the time array.
+
+    Returns:
+        Tuple of (smoothed_time, raw_stacked, smoothed_stacked).
+        ``smoothed_time`` is trimmed to match the moving-average output length.
+        ``raw_stacked`` has shape (num_runs, num_timesteps, num_columns).
+        ``smoothed_stacked`` has shape (num_runs, num_timesteps - window + 1, num_columns).
+    """
+    common_time, raw_stack = _interpolate_to_common_grid(runs, key, time_key)
+    if common_time is None or raw_stack is None:
+        return None, None, None
+
+    # Apply moving average per-run, per-column
+    smoothed_runs = []
+    for run_idx in range(raw_stack.shape[0]):
+        run_data = raw_stack[run_idx]
+        if run_data.ndim == 1:
+            smoothed_runs.append(moving_average(run_data, window_size))
+        else:
+            cols = []
+            for col_idx in range(run_data.shape[1]):
+                cols.append(moving_average(run_data[:, col_idx], window_size))
+            smoothed_runs.append(np.stack(cols, axis=1))
+
+    smoothed_time = common_time[window_size - 1:]
+    return smoothed_time, raw_stack, np.stack(smoothed_runs, axis=0)
+
+
 def plot_velocity_comparison(
     grouped_data: OrderedDict,
     save_path: str | None = None,
@@ -212,22 +267,39 @@ def plot_velocity_comparison(
             continue
 
         color = colors[i % len(colors)]
-        common_time, vel_stack = _interpolate_to_common_grid(runs, "actual_vel")
-        if common_time is None:
+        smooth_time, raw_stack, smooth_stack = _interpolate_and_smooth(
+            runs, "actual_vel"
+        )
+        if smooth_time is None:
             continue
+
+        # Also get the raw common_time for the raw overlay
+        common_time, _ = _interpolate_to_common_grid(runs, "actual_vel")
 
         for dim in range(3):
             ax = axes[dim]
-            dim_stack = vel_stack[:, :, actual_vel_dims[dim]]
-            mean_val = np.mean(dim_stack, axis=0)
-            std_val = np.std(dim_stack, axis=0)
+            a_dim = actual_vel_dims[dim]
 
-            ax.plot(common_time[start_idx:], mean_val[start_idx:],
+            # Raw mean (light overlay)
+            raw_dim = raw_stack[:, :, a_dim]
+            raw_mean = np.mean(raw_dim, axis=0)
+            ax.plot(common_time[start_idx:], raw_mean[start_idx:],
+                    color=color, alpha=0.3, linewidth=1.0)
+
+            # Smoothed mean +/- std
+            sm_dim = smooth_stack[:, :, a_dim]
+            sm_mean = np.mean(sm_dim, axis=0)
+            sm_std = np.std(sm_dim, axis=0)
+
+            # Adjust start index for the shorter smoothed array
+            sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+
+            ax.plot(smooth_time[sm_start:], sm_mean[sm_start:],
                     color=color, linewidth=2.5)
             ax.fill_between(
-                common_time[start_idx:],
-                mean_val[start_idx:] - std_val[start_idx:],
-                mean_val[start_idx:] + std_val[start_idx:],
+                smooth_time[sm_start:],
+                sm_mean[sm_start:] - sm_std[sm_start:],
+                sm_mean[sm_start:] + sm_std[sm_start:],
                 color=color, alpha=0.2,
             )
 
@@ -445,12 +517,15 @@ def plot_force_success_histogram(
 def print_stats_table(
     grouped_data: OrderedDict,
     start_idx: int = START_IDX,
-) -> None:
+) -> str:
     """Pretty-print a statistics table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict.
         start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
     """
     vel_dim_names = ["vx", "vy", "vyaw"]
     vel_units = ["m/s", "m/s", "rad/s"]
@@ -476,6 +551,17 @@ def print_stats_table(
         cmd = cmd_stack[:, start_idx:, :]
         torque = torque_stack[:, start_idx:, :]
 
+        # Smoothed velocity and commanded stacks
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(
+            runs, "actual_vel"
+        )
+        _, _, smooth_cmd = _interpolate_and_smooth(
+            runs, "commanded_vel"
+        )
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :] if smooth_vel is not None else None
+        smooth_cmd_trimmed = smooth_cmd[:, sm_start:, :] if smooth_cmd is not None else None
+
         stats = {}
         for dim, (dim_name, unit) in enumerate(zip(vel_dim_names, vel_units)):
             actual = vel[:, :, actual_vel_dims[dim]]
@@ -486,6 +572,16 @@ def print_stats_table(
             stats[f"Mean {dim_name} err ({unit})"] = np.mean(error)
             stats[f"Std {dim_name} err ({unit})"] = np.std(error)
 
+            # MA-smoothed stats
+            if smooth_vel_trimmed is not None and smooth_cmd_trimmed is not None:
+                sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+                sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+                sm_error = np.abs(sm_actual - sm_commanded)
+
+                stats[f"Mean {dim_name} MA ({unit})"] = np.mean(sm_actual)
+                stats[f"Mean {dim_name} err MA ({unit})"] = np.mean(sm_error)
+                stats[f"Std {dim_name} err MA ({unit})"] = np.std(sm_error)
+
         # Torque stats: mean of absolute values across all joints and runs
         abs_torque = np.abs(torque)
         stats["Mean |torque| (Nm)"] = np.mean(abs_torque)
@@ -495,7 +591,7 @@ def print_stats_table(
 
     if not policy_stats:
         print("[Warning] No data to compute stats.")
-        return
+        return ""
 
     # Build table
     metric_names = list(next(iter(policy_stats.values())).keys())
@@ -513,38 +609,46 @@ def print_stats_table(
     for _ in policy_names:
         sep_line += "-+-" + "-" * val_col_w
 
-    print(f"\n{'=' * len(sep_line)}")
-    print("EXPERIMENT STATISTICS")
-    print(f"{'=' * len(sep_line)}")
-    print(header_line)
-    print(sep_line)
+    lines = []
+    lines.append(f"\n{'=' * len(sep_line)}")
+    lines.append("EXPERIMENT STATISTICS")
+    lines.append(f"{'=' * len(sep_line)}")
+    lines.append(header_line)
+    lines.append(sep_line)
 
     for metric in metric_names:
         row = f"{metric:<{metric_col_w}}"
         for pname in policy_names:
             val = policy_stats[pname][metric]
             row += f" | {val:^{val_col_w}.4f}"
-        print(row)
+        lines.append(row)
 
-    print(f"{'=' * len(sep_line)}\n")
+    lines.append(f"{'=' * len(sep_line)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
 def print_torque_stats_table(
     grouped_data: OrderedDict,
     start_idx: int = START_IDX,
-) -> None:
+) -> str:
     """Pretty-print a per-motor torque statistics table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict.
         start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
     """
     # Get joint names from first policy
     first_data = next(iter(grouped_data.values()))
     joint_names = first_data.get("joint_names", [])
     if not joint_names:
         print("[Warning] No joint names found, skipping per-motor torque stats.")
-        return
+        return ""
 
     policy_names = list(grouped_data.keys())
 
@@ -575,7 +679,7 @@ def print_torque_stats_table(
 
     if not policy_joint_stats:
         print("[Warning] No data to compute per-motor torque stats.")
-        return
+        return ""
 
     # Build table
     joint_col_w = max(len(j) for j in joint_names) + 2
@@ -594,12 +698,13 @@ def print_torque_stats_table(
     for _ in policy_names:
         sep_line += "-+-" + "-" * policy_header_w
 
-    print(f"\n{'=' * len(sep_line)}")
-    print("PER-MOTOR TORQUE STATISTICS (|torque| in Nm)")
-    print(f"{'=' * len(sep_line)}")
-    print(header_line)
-    print(sub_header_line)
-    print(sep_line)
+    lines = []
+    lines.append(f"\n{'=' * len(sep_line)}")
+    lines.append("PER-MOTOR TORQUE STATISTICS (|torque| in Nm)")
+    lines.append(f"{'=' * len(sep_line)}")
+    lines.append(header_line)
+    lines.append(sub_header_line)
+    lines.append(sep_line)
 
     for j_idx, j_name in enumerate(joint_names):
         row = f"{j_name:<{joint_col_w}}"
@@ -608,17 +713,24 @@ def print_torque_stats_table(
             m = stats["mean"][j_idx]
             s = stats["std"][j_idx]
             row += f" | {m:^{sub_col_w}.4f} {s:^{sub_col_w}.4f}"
-        print(row)
+        lines.append(row)
 
-    print(f"{'=' * len(sep_line)}\n")
+    lines.append(f"{'=' * len(sep_line)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
-def print_success_table(grouped_data: OrderedDict) -> None:
+def print_success_table(grouped_data: OrderedDict) -> str:
     """Pretty-print a success rate table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict
             (as returned by load_experiment_data, must contain "successes" key).
+
+    Returns:
+        The formatted table as a string.
     """
     policy_names = list(grouped_data.keys())
 
@@ -634,11 +746,12 @@ def print_success_table(grouped_data: OrderedDict) -> None:
     )
     sep = "-" * len(header)
 
-    print(f"\n{'=' * len(sep)}")
-    print("SUCCESS STATISTICS")
-    print(f"{'=' * len(sep)}")
-    print(header)
-    print(sep)
+    lines = []
+    lines.append(f"\n{'=' * len(sep)}")
+    lines.append("SUCCESS STATISTICS")
+    lines.append(f"{'=' * len(sep)}")
+    lines.append(header)
+    lines.append(sep)
 
     for name in policy_names:
         successes = grouped_data[name].get("successes", [])
@@ -650,14 +763,18 @@ def print_success_table(grouped_data: OrderedDict) -> None:
             num_success = 0
             rate = 0.0
 
-        print(
+        lines.append(
             f"{name:<{name_col_w}}"
             f" | {total:^{num_col_w}}"
             f" | {num_success:^{num_col_w}}"
             f" | {rate:^{num_col_w}.1f}"
         )
 
-    print(f"{'=' * len(sep)}\n")
+    lines.append(f"{'=' * len(sep)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
 def _resolve_experiment_dirs(
@@ -778,10 +895,16 @@ def main():
         plot_velocity_comparison(grouped_data, save_path=comparison_vel_path)
         plot_torque_comparison(grouped_data, save_path=comparison_torque_path)
 
-    # Print stats tables
-    print_stats_table(grouped_data)
-    print_torque_stats_table(grouped_data)
-    print_success_table(grouped_data)
+    # Print stats tables and save to file
+    stats_text = print_stats_table(grouped_data)
+    stats_text += print_torque_stats_table(grouped_data)
+    stats_text += print_success_table(grouped_data)
+
+    for name, exp_dir in experiment_dirs.items():
+        stats_path = os.path.join(exp_dir, "experiment_stats.txt")
+        with open(stats_path, "w") as f:
+            f.write(stats_text)
+        print(f"Saved stats to {stats_path}")
 
     # Generate force-magnitude success histogram if any policy has force data
     has_force = any(

@@ -454,8 +454,8 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             plt.savefig(os.path.join(save_dir, 'clf_ema.png'), dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-    # Generate focused COM and ankle plot
-    plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)
+    # # Generate focused COM and ankle plot
+    # plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)
 
 
 def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
@@ -644,16 +644,178 @@ def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
         
         plt.close(fig)
 
+def compute_and_save_stats(data: dict, save_dir: str | None = None,
+                           start_idx: int | None = None, end_idx: int | None = None) -> None:
+    """Compute summary statistics (mean V, position/velocity errors) and save to file.
+
+    Computes per-env means first, then reports the mean and std across envs.
+
+    Args:
+        data: Raw data dict from load_data (values may be torch tensors or lists).
+        save_dir: Directory to save play_stats.txt. If None, only prints.
+        start_idx: Start timestep index (inclusive). Defaults to 0.
+        end_idx: End timestep index (exclusive). Defaults to last timestep.
+    """
+    # Convert to numpy
+    processed: dict[str, np.ndarray] = {}
+    for key, values in data.items():
+        if isinstance(values[0], torch.Tensor):
+            processed[key] = np.array([v.cpu().numpy() for v in values])
+        else:
+            processed[key] = np.array(values)
+
+    # Determine timestep range
+    sample_key = next(iter(processed))
+    n_timesteps = processed[sample_key].shape[0]
+    si = start_idx if start_idx is not None else 0
+    ei = end_idx if end_idx is not None else n_timesteps
+
+    lines: list[str] = []
+
+    def _log(text: str = "") -> None:
+        print(text)
+        lines.append(text)
+
+    _log("=" * 60)
+    _log("  Play Statistics")
+    _log("=" * 60)
+    _log(f"Timestep range: [{si}, {ei}) of {n_timesteps} total")
+
+    # --- Number of envs ---
+    # Infer from a 2D+ array
+    n_envs = None
+    for arr in processed.values():
+        if arr.ndim >= 2:
+            n_envs = arr.shape[1]
+            break
+    if n_envs is not None:
+        _log(f"Number of envs: {n_envs}")
+
+    # --- Commanded velocity ranges ---
+    if 'base_velocity' in processed:
+        bv = processed['base_velocity'][si:ei]  # [T, envs, 3]
+        vel_labels = ['Linear X', 'Linear Y', 'Angular Z']
+        vel_units = ['m/s', 'm/s', 'rad/s']
+        _log("")
+        _log("Commanded Velocity Ranges:")
+        for i in range(min(bv.shape[2], 3)):
+            v_min = bv[:, :, i].min()
+            v_max = bv[:, :, i].max()
+            _log(f"  {vel_labels[i]:>12s}: [{v_min:+.4f}, {v_max:+.4f}] {vel_units[i]}")
+
+    # --- Mean V (Lyapunov) ---
+    if 'v' in processed:
+        v_data = processed['v'][si:ei]  # [T, envs] or [T, envs, 1]
+        if v_data.ndim == 3:
+            v_data = v_data.squeeze(-1)
+        per_env_mean = v_data.mean(axis=0)  # [envs]
+        _log("")
+        _log("Lyapunov Function (V):")
+        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
+        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+
+    # --- Position errors ---
+    if 'y_des' in processed and 'y_act' in processed:
+        y_des = processed['y_des'][si:ei]  # [T, envs, dims]
+        y_act = processed['y_act'][si:ei]
+        pos_err = np.abs(y_des - y_act)  # [T, envs, dims]
+        n_dims = pos_err.shape[2]
+
+        # Get labels
+        pos_names: list[str] = []
+        if 'ordered_pos_output_names' in processed:
+            for i in range(n_dims):
+                pos_names.append(str(processed['ordered_pos_output_names'][0, i]))
+        else:
+            pos_names = [f"Dim {i}" for i in range(n_dims)]
+
+        per_env_mean_err = pos_err.mean(axis=0)  # [envs, dims]
+        mean_over_envs = per_env_mean_err.mean(axis=0)  # [dims]
+        std_over_envs = per_env_mean_err.std(axis=0)    # [dims]
+
+        _log("")
+        _log("Position Errors (|y_des - y_act|):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            _log(f"  {pos_names[i]:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        # Group summaries for position errors
+        groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
+        _log("")
+        _log("  Position Error Group Summaries:")
+        _log(f"  {'Group':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for group_name, pattern in groups.items():
+            idxs = [i for i, name in enumerate(pos_names) if pattern in name]
+            if idxs:
+                group_means = mean_over_envs[idxs]
+                group_stds = std_over_envs[idxs]
+                _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+
+    # --- Velocity errors ---
+    if 'dy_des' in processed and 'dy_act' in processed:
+        dy_des = processed['dy_des'][si:ei]
+        dy_act = processed['dy_act'][si:ei]
+        vel_err = np.abs(dy_des - dy_act)
+        n_dims = vel_err.shape[2]
+
+        vel_names: list[str] = []
+        if 'ordered_vel_output_names' in processed:
+            for i in range(n_dims):
+                vel_names.append(str(processed['ordered_vel_output_names'][0, i]))
+        else:
+            vel_names = [f"Dim {i}" for i in range(n_dims)]
+
+        per_env_mean_err = vel_err.mean(axis=0)
+        mean_over_envs = per_env_mean_err.mean(axis=0)
+        std_over_envs = per_env_mean_err.std(axis=0)
+
+        _log("")
+        _log("Velocity Errors (|dy_des - dy_act|):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            _log(f"  {vel_names[i]:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        # Group summaries for velocity errors
+        groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
+        _log("")
+        _log("  Velocity Error Group Summaries:")
+        _log(f"  {'Group':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for group_name, pattern in groups.items():
+            idxs = [i for i, name in enumerate(vel_names) if pattern in name]
+            if idxs:
+                group_means = mean_over_envs[idxs]
+                group_stds = std_over_envs[idxs]
+                _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+
+    _log("")
+    _log("=" * 60)
+
+    # Save to file
+    if save_dir:
+        stats_path = os.path.join(save_dir, "play_stats.txt")
+        with open(stats_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"\nStats saved to: {stats_path}")
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Plot trajectory data from log files')
     parser.add_argument('--log_dir', type=str, help='Specific log directory to plot (optional)')
-    parser.add_argument('--trajectory_type', type=str, 
-                       choices=['joint', 'end_effector', 'auto'], 
+    parser.add_argument('--trajectory_type', type=str,
+                       choices=['joint', 'end_effector', 'auto'],
                        default='auto', help='Type of trajectory to plot (default: auto-detect)')
-    parser.add_argument('--base_path', type=str, default='logs/play', 
+    parser.add_argument('--base_path', type=str, default='logs/play',
                        help='Base path to search for log directories (default: logs/play)')
-    
+    parser.add_argument('--start_idx', type=int, default=None,
+                       help='Start timestep index for stats computation (default: 0)')
+    parser.add_argument('--end_idx', type=int, default=None,
+                       help='End timestep index for stats computation (default: last)')
+
     args = parser.parse_args()
     
     # Find the log directory
@@ -679,6 +841,10 @@ def main():
     
     # Plot the data with specified or auto-detected trajectory type
     plot_trajectories(data, save_dir=plot_dir, trajectory_type=trajectory_type)
+
+    # Compute and save stats
+    compute_and_save_stats(data, save_dir=plot_dir,
+                           start_idx=args.start_idx, end_idx=args.end_idx)
 
 
 if __name__ == "__main__":

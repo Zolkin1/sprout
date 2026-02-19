@@ -926,7 +926,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
 
-        self.episode_length_s = 4.0
+        self.episode_length_s = 8.0
 
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
