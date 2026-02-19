@@ -456,19 +456,25 @@ def main():
                 save_path=os.path.join(exp_folder, "comparison_torques"),
             )
 
-    # Print stats tables for all policies
+    # Print stats tables and save to file
     if len(experiment_folders) > 1:
-        print_stats_table(grouped_data)
-        print_torque_stats_table(grouped_data)
-        print_success_table(grouped_data)
+        stats_text = print_stats_table(grouped_data)
+        stats_text += print_torque_stats_table(grouped_data)
+        stats_text += print_success_table(grouped_data)
     else:
         # Single policy — still print stats
         single_grouped = OrderedDict()
         for name, exp_folder in experiment_folders.items():
             single_grouped[name] = load_experiment_data(exp_folder)
-        print_stats_table(single_grouped)
-        print_torque_stats_table(single_grouped)
-        print_success_table(single_grouped)
+        stats_text = print_stats_table(single_grouped)
+        stats_text += print_torque_stats_table(single_grouped)
+        stats_text += print_success_table(single_grouped)
+
+    for name, exp_folder in experiment_folders.items():
+        stats_path = os.path.join(exp_folder, "experiment_stats.txt")
+        with open(stats_path, "w") as f:
+            f.write(stats_text)
+        print(f"Saved stats to {stats_path}")
 
     # Generate force-magnitude success histogram if force push was enabled
     if args.force_push:

@@ -420,14 +420,14 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
 
         manager_type="library",
         hf_repo = "zolkin/robot_rl",
-        path = "trajectories/running",
 
-        # path = "trajectories/run2_subject1"
-        # path = "trajectories/running_tracking_kinematics"
-        # path = "trajectories/running_tracking"
+        # path = "trajectories/running",
+        # path = "trajectories/run2_subject1",
+        # path = "trajectories/running_tracking_kinematics",
+        path = "trajectories/running_tracking",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 48, # 48 for the old ones, 54 for including wrist orientation
+        num_outputs = 54, #48, # 48 for the old ones, 54 for including wrist orientation
         Q_weights = RUNNING_Q_weights,
         R_weights = RUNNING_R_weights,
         hold_phi_threshold = 0.1,
@@ -495,6 +495,10 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         params={"command_name": "traj_ref",
                 "sigma": 0.5}
     )
+
+    ##
+    # With goal conditioning
+    ##
     base_lin_vel = RewTerm(
         func=mdp.base_lin_vel_reward,
         weight=1.0,
@@ -507,6 +511,22 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         params={"command_name": "traj_ref",
                 "sigma": 1.5}
     )
+
+    ##
+    # No goal conditioning
+    ##
+    # base_lin_vel = RewTerm(
+    #     func=mdp.base_lin_vel_reward,
+    #     weight=2.0, #1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.4} #0.6}
+    # )
+    # base_ang_vel = RewTerm(
+    #     func=mdp.base_ang_vel_reward,
+    #     weight=2.0, #1.0,
+    #     params={"command_name": "traj_ref",
+    #             "sigma": 0.75} #1.5}
+    # )
 
     # Joints
     joint_pos = RewTerm(
@@ -548,20 +568,20 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
                 "sigma": 1.0 * math.sqrt(4)}
     )
 
-    # Goal conditioned rewards
-    xy_vel = RewTerm(
-        func=mdp.track_lin_vel_xy_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity",
-                "std": 0.75,}
-    )
-
-    yaw_vel = RewTerm(
-        func=mdp.track_ang_vel_z_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity",
-                "std": 0.75,}
-    )
+    # # Goal conditioned rewards
+    # xy_vel = RewTerm(
+    #     func=mdp.track_lin_vel_xy_exp,
+    #     weight=1.0,
+    #     params={"command_name": "base_velocity",
+    #             "std": 0.75,}
+    # )
+    #
+    # yaw_vel = RewTerm(
+    #     func=mdp.track_ang_vel_z_exp,
+    #     weight=1.0,
+    #     params={"command_name": "base_velocity",
+    #             "std": 0.75,}
+    # )
 
     clf_reward = None
     # clf_reward = RewTerm(
@@ -655,7 +675,15 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)  # Note the curriculum for increasing
+        ##
+        # Normal
+        ##
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+
+        ##
+        # Single speed
+        ##
+        # self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
 
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
