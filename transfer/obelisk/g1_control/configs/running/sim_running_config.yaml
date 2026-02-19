@@ -70,10 +70,10 @@ onboard:
     - pkg: g1_control
       executable: high_level_control
       params:
-        v_x_min: 0.0
-        v_x_max: 3.6
+        v_x_min: -1.1
+        v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 1.0
+        w_z_max: 0.75
         vel_increment: 0.1
         kp_yaw: 3.5 #3.0
         kd_yaw: 0.0 #0.1
@@ -127,9 +127,9 @@ onboard:
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_scale: 3.0
-        v_y_scale: 0.5
-        w_z_scale: 0.2
+        v_x_scale: 3.6
+        v_y_scale: 0.75
+        w_z_scale: 0.75
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:
