@@ -50,6 +50,12 @@ class VelocityTrackingController(ObeliskController, ABC):
         init_behavior = self.get_parameter("init_behavior").get_parameter_value().string_value
         vel_thresholds = self.get_parameter("vel_thresholds").get_parameter_value().double_array_value
 
+        self.declare_parameter("START_IN_SIM", False)
+        self.activate_policy = self.get_parameter("START_IN_SIM").get_parameter_value().bool_value
+
+        if self.activate_policy:
+            self.get_logger().warn("STARTING IN POLICY - BEWARE!")
+
         self.behavior_manager = BehaviorManager(
             behavior_names=behavior_names,
             behavior_buttons=behavior_buttons,
@@ -383,6 +389,9 @@ class VelocityTrackingController(ObeliskController, ABC):
             self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
             end_action_time = self.get_clock().now().nanoseconds / 1e9
 
+            if not self.activate_policy:
+                self.action *= 0.0
+
             start_compute_time = self.get_clock().now().nanoseconds / 1e9
             # setting the message
             pd_ff_msg = PDFeedForward()
@@ -546,6 +555,11 @@ class VelocityTrackingController(ObeliskController, ABC):
 
         time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
         self.behavior_manager.check_behavior_switch(joy_msg, self.cmd_vel, time)
+
+        A = 0
+        if joy_msg.buttons[A] >= 0.9:
+            self.activate_policy = True
+            self.get_logger().warn("Policy activated!")
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""

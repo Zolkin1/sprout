@@ -387,6 +387,20 @@ def plot_orientation(data: Dict[str, np.ndarray], save_dir: str) -> None:
     print(f"Saved: {output_path}")
 
 
+def print_actions_at_time(data: Dict[str, np.ndarray], target_time: float) -> None:
+    """Print all control action values at the given time."""
+    time = data["time"]
+    idx = np.argmin(np.abs(time - target_time))
+    actual_time = time[idx]
+
+    joint_names = get_joint_names_act(data)
+    print(f"\nControl actions at t = {actual_time:.4f}s (requested t = {target_time}s):")
+    for joint_name in joint_names:
+        act_key = f"act_{joint_name}"
+        short_name = joint_name.replace("_joint", "")
+        print(f"  {short_name:30s}: {data[act_key][idx]:.6f}")
+
+
 def filter_time_range(data: Dict[str, np.ndarray], start_time: float,
                       end_time: Optional[float]) -> Dict[str, np.ndarray]:
     """Filter data to a specific time range."""
@@ -433,6 +447,9 @@ def main():
     # Apply time filtering
     if args.start_time > 0.0 or args.end_time is not None:
         data = filter_time_range(data, args.start_time, args.end_time)
+
+    # Print actions at t = 1
+    # print_actions_at_time(data, target_time=94)
 
     # Generate all plots
     plot_joint_positions(data, folder_path)      # 21 joints with action targets

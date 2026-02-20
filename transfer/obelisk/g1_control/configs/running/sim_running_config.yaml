@@ -37,6 +37,7 @@ onboard:
           10.0, 1.1,
           1.1, -1.1
         ]
+        START_IN_SIM: true
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
         log: true

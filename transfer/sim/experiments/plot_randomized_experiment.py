@@ -555,12 +555,9 @@ def print_stats_table(
         smooth_time, _, smooth_vel = _interpolate_and_smooth(
             runs, "actual_vel"
         )
-        _, _, smooth_cmd = _interpolate_and_smooth(
-            runs, "commanded_vel"
-        )
         sm_start = max(start_idx - (MA_WINDOW - 1), 0)
         smooth_vel_trimmed = smooth_vel[:, sm_start:, :] if smooth_vel is not None else None
-        smooth_cmd_trimmed = smooth_cmd[:, sm_start:, :] if smooth_cmd is not None else None
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :] if cmd_stack is not None else None
 
         stats = {}
         for dim, (dim_name, unit) in enumerate(zip(vel_dim_names, vel_units)):
