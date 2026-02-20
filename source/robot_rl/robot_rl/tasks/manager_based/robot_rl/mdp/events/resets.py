@@ -18,7 +18,7 @@ def reset_on_reference(
         conditioner_command_name: str,
         base_frame_name: str,
         base_z_offset: float = 0.03,
-        joint_scale_range: tuple[float, float] = (1.0, 1.0),
+        joint_add_range: tuple[float, float] = (0.0, 0.0),
         rel_envs_on_ref: float = 0.5,
         special_val: float = 1.0,
         rel_envs_on_special: float = 0.4,
@@ -156,11 +156,12 @@ def reset_on_reference(
         joint_vel[:, i] = dy_sampled[:, vel_traj_idx]
 
     # Apply optional uniform scaling to joint positions
-    min_scale, max_scale = joint_scale_range
-    if min_scale != 1.0 or max_scale != 1.0:
-        scale_factors = torch.rand(num_ref_envs, 1, device=env.device) * (max_scale - min_scale) + min_scale
-        joint_pos = joint_pos * scale_factors
-        joint_vel = joint_vel * scale_factors
+    # TODO: Can put back for the on reference reset
+    # min_scale, max_scale = joint_scale_range
+    # if min_scale != 1.0 or max_scale != 1.0:
+    #     scale_factors = torch.rand(num_ref_envs, 1, device=env.device) * (max_scale - min_scale) + min_scale
+    #     joint_pos = joint_pos * scale_factors
+    #     joint_vel = joint_vel * scale_factors
 
     # Store time offset in command so it knows the current phase
     cmd.init_time_offset[ref_ids] = random_times
@@ -204,7 +205,6 @@ def reset_on_reference(
         # Non reference resets
         root_states = asset.data.default_root_state[nonref_ids].clone()
 
-        # TODO: Consider adding some amount of noise
         base_pose = root_states[:, 0:7]
         base_pose[:, :3] += env.scene.env_origins[nonref_ids]
         base_vel = root_states[:, 7:]
@@ -212,6 +212,11 @@ def reset_on_reference(
         # get default joint state
         joint_pos = asset.data.default_joint_pos[nonref_ids, asset_cfg.joint_ids].clone()
         joint_vel = asset.data.default_joint_vel[nonref_ids, asset_cfg.joint_ids].clone()
+
+        # Add noise
+        r = torch.empty(num_nonref_envs, len(asset.joint_names), device=env.device)
+        r.uniform_(joint_add_range[0], joint_add_range[1])
+        joint_pos += r
 
         asset.write_root_pose_to_sim(base_pose, env_ids=nonref_ids)
         asset.write_root_velocity_to_sim(base_vel, env_ids=nonref_ids)

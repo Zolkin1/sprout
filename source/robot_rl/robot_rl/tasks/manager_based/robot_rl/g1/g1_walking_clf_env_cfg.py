@@ -625,7 +625,8 @@ class G1WalkingEventsCfg(HumanoidEventsCfg):
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
                 "special_val": 1.2,     # Sometimes start on the running traj
-                "rel_envs_on_ref": 0.5}
+                "rel_envs_on_ref": 0.5,
+                "joint_add_range": [-0.1, 0.1]}
     )
 
     #TODO: Consider moving the common stuff to another cfg
@@ -671,6 +672,17 @@ class G1WalkingEventsCfg(HumanoidEventsCfg):
             "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
             "mass_distribution_params": (0.85, 1.15),  # (-5.0, 5.0),
             "operation": "scale",
+        },
+    )
+
+    # Randomize calibration errors
+    add_joint_default_pos = EventTerm(
+        func=mdp.randomize_joint_default_pos,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "pos_distribution_params": (-0.01, 0.01),
+            "operation": "add",
         },
     )
 
