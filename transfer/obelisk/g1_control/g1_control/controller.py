@@ -306,7 +306,7 @@ class VelocityTrackingController(ObeliskController, ABC):
         # self.omega = np.zeros((3,))
         # self.phase = np.zeros((2,))
         self.zero_action = np.zeros((self.num_motors,))
-        # self.action = self.zero_action.tolist()
+        self.action = np.zeros((self.num_motors,))
         self.t_start = None
 
         self.get_logger().info("RL Velocity Tracking node configuration complete.")
@@ -356,41 +356,39 @@ class VelocityTrackingController(ObeliskController, ABC):
         # Generate input to RL model
         start_time = self.get_clock().now().nanoseconds / 1e9
         if self.received_xhat:
-            # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
-            start_obs_time = self.get_clock().now().nanoseconds / 1e9
-            obs = self.behavior_manager.create_obs(
-                self.qfb,
-                self.vfb_ang,
-                self.joint_pos,
-                self.joint_vel,
-                self.time - self.start_time,
-                self.cmd_vel,
-                self.joint_names,
-            )
+            if self.activate_policy:
+                # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
+                start_obs_time = self.get_clock().now().nanoseconds / 1e9
+                obs = self.behavior_manager.create_obs(
+                    self.qfb,
+                    self.vfb_ang,
+                    self.joint_pos,
+                    self.joint_vel,
+                    self.time - self.start_time,
+                    self.cmd_vel,
+                    self.joint_names,
+                )
 
-            # Check if we should execute a pending behavior switch (phi-gated)
-            old_phi = self.behavior_manager.get_active_policy().get_phi()
-            switched = self.behavior_manager.try_execute_pending_switch(self.time - self.start_time)
-            if switched:
-                new_behavior = self.behavior_manager.get_active_behavior()
-                if new_behavior != self.active_behavior:
-                    self.active_behavior = new_behavior
-                    self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phi = {old_phi}!")
-                    active_policy = self.behavior_manager.get_active_policy()
-                    self.kps, self.kds = self._add_wrist_kp_kd_mujoco(
-                        active_policy.get_kp(self.joint_names_mujoco).tolist(),
-                        active_policy.get_kd(self.joint_names_mujoco).tolist()
-                    )
+                # Check if we should execute a pending behavior switch (phi-gated)
+                old_phi = self.behavior_manager.get_active_policy().get_phi()
+                switched = self.behavior_manager.try_execute_pending_switch(self.time - self.start_time)
+                if switched:
+                    new_behavior = self.behavior_manager.get_active_behavior()
+                    if new_behavior != self.active_behavior:
+                        self.active_behavior = new_behavior
+                        self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phi = {old_phi}!")
+                        active_policy = self.behavior_manager.get_active_policy()
+                        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(
+                            active_policy.get_kp(self.joint_names_mujoco).tolist(),
+                            active_policy.get_kd(self.joint_names_mujoco).tolist()
+                        )
 
-            end_obs_time = self.get_clock().now().nanoseconds / 1e9
+                end_obs_time = self.get_clock().now().nanoseconds / 1e9
 
-            # Call RL model
-            start_action_time = self.get_clock().now().nanoseconds / 1e9
-            self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
-            end_action_time = self.get_clock().now().nanoseconds / 1e9
-
-            if not self.activate_policy:
-                self.action *= 0.0
+                # Call RL model
+                start_action_time = self.get_clock().now().nanoseconds / 1e9
+                self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
+                end_action_time = self.get_clock().now().nanoseconds / 1e9
 
             start_compute_time = self.get_clock().now().nanoseconds / 1e9
             # setting the message
@@ -437,8 +435,9 @@ class VelocityTrackingController(ObeliskController, ABC):
 
             end_compute_time = self.get_clock().now().nanoseconds / 1e9
             self.log_time("compute_control", end_compute_time - start_compute_time)
-            self.log_time("create_obs", end_obs_time - start_obs_time)
-            self.log_time("get_action", end_action_time - start_action_time)
+            if self.activate_policy:
+                self.log_time("create_obs", end_obs_time - start_obs_time)
+                self.log_time("get_action", end_action_time - start_action_time)
 
             # self.get_logger().info(f"total compute: {end_time - start_time} s.")
 
@@ -557,7 +556,7 @@ class VelocityTrackingController(ObeliskController, ABC):
         self.behavior_manager.check_behavior_switch(joy_msg, self.cmd_vel, time)
 
         A = 0
-        if joy_msg.buttons[A] >= 0.9:
+        if joy_msg.buttons[A] >= 0.9 and not self.activate_policy:
             self.activate_policy = True
             self.get_logger().warn("Policy activated!")
 

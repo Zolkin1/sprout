@@ -98,7 +98,7 @@ class BehaviorManager:
         elif self.active_behavior == "running":
             val = 0.5
         else:
-            val = 0.0
+            raise ValueError(f"Invalid active behavior: {self.active_behavior}")
 
         at_val = abs(phi - val) < PHI_TOLERANCE
 
