@@ -680,20 +680,25 @@ def print_torque_stats_table(
 
     # Build table
     joint_col_w = max(len(j) for j in joint_names) + 2
-    # Two columns per policy: mean and std
+    # Two columns per policy: mean and std, width adapts to policy name
     sub_col_w = 10
-    policy_header_w = 2 * sub_col_w + 3  # "mean | std"
+    min_policy_w = 2 * sub_col_w + 1  # "mean" + space + "std"
+    # Per-policy header width must fit both sub-columns and the policy name
+    policy_header_ws = [max(min_policy_w, len(pname) + 2) for pname in policy_names]
 
     # Header
     header_line = f"{'Joint':<{joint_col_w}}"
     sub_header_line = f"{'':<{joint_col_w}}"
-    for pname in policy_names:
-        header_line += f" | {pname:^{policy_header_w}}"
-        sub_header_line += f" | {'mean':^{sub_col_w}} {'std':^{sub_col_w}}"
+    for pname, phw in zip(policy_names, policy_header_ws):
+        header_line += f" | {pname:^{phw}}"
+        # Distribute sub-column widths within the policy header width
+        left_w = phw // 2
+        right_w = phw - left_w
+        sub_header_line += f" | {'mean':^{left_w}}{'std':^{right_w}}"
 
     sep_line = "-" * joint_col_w
-    for _ in policy_names:
-        sep_line += "-+-" + "-" * policy_header_w
+    for phw in policy_header_ws:
+        sep_line += "-+-" + "-" * phw
 
     lines = []
     lines.append(f"\n{'=' * len(sep_line)}")
@@ -705,11 +710,13 @@ def print_torque_stats_table(
 
     for j_idx, j_name in enumerate(joint_names):
         row = f"{j_name:<{joint_col_w}}"
-        for pname in policy_names:
+        for pname, phw in zip(policy_names, policy_header_ws):
             stats = policy_joint_stats[pname]
             m = stats["mean"][j_idx]
             s = stats["std"][j_idx]
-            row += f" | {m:^{sub_col_w}.4f} {s:^{sub_col_w}.4f}"
+            left_w = phw // 2
+            right_w = phw - left_w
+            row += f" | {m:^{left_w}.4f}{s:^{right_w}.4f}"
         lines.append(row)
 
     lines.append(f"{'=' * len(sep_line)}\n")

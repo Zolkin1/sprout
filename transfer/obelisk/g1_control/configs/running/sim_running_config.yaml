@@ -17,7 +17,8 @@ onboard:
           # "running_clf_sym/2026-02-15_11-25-13_T1_running_higher_l2_10_lim_sym",
 
           # Walking
-          "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",
+          "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
+          # "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",
           # "walking_clf_sym/2026-02-15_18-02-52_walking_some_start_run_sym",
           # "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
@@ -129,7 +130,7 @@ onboard:
       executable: obelisk_unitree_joystick
       params:
         v_x_scale: 3.6
-        v_y_scale: 0.75
+        v_y_scale: 0.5
         w_z_scale: 0.75
 
         vel_cmd_yaw: 13  # RY
