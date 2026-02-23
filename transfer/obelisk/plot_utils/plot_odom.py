@@ -54,6 +54,8 @@ def load_odom_data(csv_path: str) -> Dict[str, np.ndarray]:
             reader = csv.DictReader(f)
             # Initialize lists for each column
             for row in reader:
+                if any(v is None for v in row.values()):
+                    continue  # Skip incomplete rows (e.g., truncated last line)
                 for key, value in row.items():
                     if key not in data:
                         data[key] = []

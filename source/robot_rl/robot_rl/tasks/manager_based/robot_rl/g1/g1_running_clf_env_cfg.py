@@ -1,4 +1,5 @@
 import torch
+from isaaclab.terrains import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz, quat_mul, quat_apply
 
@@ -15,6 +16,12 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory
 from .g1_trajopt_reward import G1TrajOptCLFRewards
 from .g1_trajopt_obs import G1TrajOptObservationsCfg
 from robot_rl.assets.robots.g1_21j import (G1_MINIMAL_CFG, G1_ACTION_SCALE,)  # isort: skip
+from ..terrains.rough import ROUGH_FOR_BASIC_LOCOMOTION_CFG, ROUGH_SLOPED_FOR_BASIC_LOCOMOTION_CFG, ROBUSTNESS_TEST_FOR_BASIC_LOCOMOTION_CFG
+
+REWARD_TYPE = "MIMIC"                 # CLF, MIMIC (TODO: SHOULD I ADJUST THESE TO BE EXACTLY ZEST?)
+TRACKING_REW_TYPE = "ADJ"      # GOAL, ADJ, GOAL_ADJ
+TRAJECTORY_TYPE = "DYNAMIC_HD"      # DYNAMIC_HD, KINEMATIC_HD, HD, DYNAMIC
+SPEED_RANGE = "SINGLE"              # SINGLE, ALL
 
 ##
 # Lyapunov Weights
@@ -38,35 +45,67 @@ RUNNING_Q_weights["right_ankle_roll_link:ori_x"] = [1.0, 1.0]
 RUNNING_Q_weights["right_ankle_roll_link:ori_y"] = [1.0, 1.0]
 RUNNING_Q_weights["right_ankle_roll_link:ori_z"] = [1.0, 1.0]
 
-RUNNING_Q_weights["joint:left_hip_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_hip_pitch_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_hip_yaw_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_knee_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_ankle_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_ankle_pitch_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_hip_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_hip_pitch_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_hip_yaw_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_knee_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_ankle_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_ankle_pitch_joint"] = [1.5, 0.1]
+if REWARD_TYPE == "CLF":
+    RUNNING_Q_weights["joint:left_hip_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_hip_pitch_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_hip_yaw_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_knee_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_ankle_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_ankle_pitch_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_hip_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_hip_pitch_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_hip_yaw_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_knee_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_ankle_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_ankle_pitch_joint"] = [3.0, 0.1]
 
-RUNNING_Q_weights["pelvis_link:pos_x"] = [1.0, 1.0]
-RUNNING_Q_weights["pelvis_link:pos_y"] = [1.0, 1.0]
-RUNNING_Q_weights["pelvis_link:pos_z"] = [1.0, 1.0]
-RUNNING_Q_weights["pelvis_link:ori_x"] = [1.0, 1.0]
-RUNNING_Q_weights["pelvis_link:ori_y"] = [1.0, 1.0]
-RUNNING_Q_weights["pelvis_link:ori_z"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:waist_yaw_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_elbow_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_shoulder_pitch_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_shoulder_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:left_shoulder_yaw_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_elbow_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_shoulder_pitch_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_shoulder_roll_joint"] = [3.0, 0.1]
+    RUNNING_Q_weights["joint:right_shoulder_yaw_joint"] = [3.0, 0.1]
 
-RUNNING_Q_weights["joint:waist_yaw_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_elbow_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_shoulder_pitch_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_shoulder_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:left_shoulder_yaw_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_elbow_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_shoulder_pitch_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_shoulder_roll_joint"] = [1.5, 0.1]
-RUNNING_Q_weights["joint:right_shoulder_yaw_joint"] = [1.5, 0.1]
+    RUNNING_Q_weights["pelvis_link:pos_x"] = [1.0, 10.0]
+    RUNNING_Q_weights["pelvis_link:pos_y"] = [1.0, 10.0]
+    RUNNING_Q_weights["pelvis_link:pos_z"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_x"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_y"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_z"] = [1.0, 10.0]
+else:
+    RUNNING_Q_weights["joint:left_hip_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_hip_pitch_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_hip_yaw_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_knee_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_ankle_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_ankle_pitch_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_hip_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_hip_pitch_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_hip_yaw_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_knee_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_ankle_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_ankle_pitch_joint"] = [1.0, 1.0]
+
+    RUNNING_Q_weights["joint:waist_yaw_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_elbow_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_shoulder_pitch_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_shoulder_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:left_shoulder_yaw_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_elbow_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_shoulder_pitch_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_shoulder_roll_joint"] = [1.0, 1.0]
+    RUNNING_Q_weights["joint:right_shoulder_yaw_joint"] = [1.0, 1.0]
+
+    RUNNING_Q_weights["pelvis_link:pos_x"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:pos_y"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:pos_z"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_x"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_y"] = [1.0, 1.0]
+    RUNNING_Q_weights["pelvis_link:ori_z"] = [1.0, 1.0]
+
 
 RUNNING_Q_weights["right_wrist_yaw_link:pos_x"] = [1.0, 1.0]
 RUNNING_Q_weights["right_wrist_yaw_link:pos_y"] = [1.0, 1.0]
@@ -114,12 +153,20 @@ RUNNING_R_weights["joint:right_knee_joint"] = [0.05]
 RUNNING_R_weights["joint:right_ankle_roll_joint"] = [0.05]
 RUNNING_R_weights["joint:right_ankle_pitch_joint"] = [0.05]
 
-RUNNING_R_weights["pelvis_link:pos_x"] = [0.05]
-RUNNING_R_weights["pelvis_link:pos_y"] = [0.05]
-RUNNING_R_weights["pelvis_link:pos_z"] = [0.05]
-RUNNING_R_weights["pelvis_link:ori_x"] = [0.05]
-RUNNING_R_weights["pelvis_link:ori_y"] = [0.05]
-RUNNING_R_weights["pelvis_link:ori_z"] = [0.05]
+if REWARD_TYPE == "CLF":
+    RUNNING_R_weights["pelvis_link:pos_x"] = [1.0]
+    RUNNING_R_weights["pelvis_link:pos_y"] = [1.0]
+    RUNNING_R_weights["pelvis_link:pos_z"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_x"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_y"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_z"] = [1.0]
+else:
+    RUNNING_R_weights["pelvis_link:pos_x"] = [0.05]
+    RUNNING_R_weights["pelvis_link:pos_y"] = [0.05]
+    RUNNING_R_weights["pelvis_link:pos_z"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_x"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_y"] = [0.05]
+    RUNNING_R_weights["pelvis_link:ori_z"] = [0.05]
 
 RUNNING_R_weights["joint:waist_yaw_joint"] = [0.05]
 RUNNING_R_weights["joint:left_elbow_joint"] = [0.05]
@@ -412,6 +459,25 @@ def heuristic_modification(env,
     return pos_outputs, vel_outputs
 
 
+if TRAJECTORY_TYPE == "HD":
+    traj_path = "trajectories/run2_subject1"
+elif TRAJECTORY_TYPE == "KINEMATIC_HD":
+    traj_path = "trajectories/running_tracking_kinematics"
+elif TRAJECTORY_TYPE == "DYNAMIC_HD":
+    traj_path = "trajectories/running_tracking"
+else:
+    raise NotImplementedError(f"Trajectory type {TRAJECTORY_TYPE} is not supported yet!")
+
+# path = "trajectories/run2_subject1",
+# path = "trajectories/running_tracking_kinematics",
+# path = "trajectories/running_tracking",
+# path = "trajectories/running/2026-02-20_12-53-44_running_tracking_kinematics_config",         # Single kinematic, periodic constraint only
+# path = "trajectories/running/2026-02-20_13-05-36_running_tracking_kinematics_config",         # Single kinematic, no periodic, no heuristic constraints
+# path = "trajectories/running/2026-02-20_15-26-16_running_tracking_kinematics_config",         # Single kinematic, heuristic constraints only
+# path = "trajectories/running/2026-02-20_15-47-26_running_tracking_config",                    # Single dynamic, periodic constraints only
+# path = "trajectories/running/2026-02-20_16-01-23_running_tracking_config",                    # Single dynamic, no periodic, only heuristic constraints
+# path = "trajectories/running/2026-02-20_16-10-08_running_tracking_config",                    # Single dynamic, no periodic, no heuristic constraints
+
 @configclass
 class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
@@ -420,18 +486,13 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
 
         manager_type="library",
         hf_repo = "zolkin/robot_rl",
-
-        # path = "trajectories/running",
-        # path = "trajectories/run2_subject1",
-        # path = "trajectories/running_tracking_kinematics",
-        path = "trajectories/running_tracking",
-
+        path = traj_path,
         conditioner_generator_name = "base_velocity",
         num_outputs = 54, #48, # 48 for the old ones, 54 for including wrist orientation
         Q_weights = RUNNING_Q_weights,
         R_weights = RUNNING_R_weights,
         hold_phi_threshold = 0.1,
-        heuristic_func=heuristic_modification,
+        heuristic_func=heuristic_modification if TRACKING_REW_TYPE == "GOAL_ADJ" or TRACKING_REW_TYPE == "ADJ" else None,
         phasing_boundaries = 4,
     )
 
@@ -457,141 +518,150 @@ class G1RunningGaitLibraryCommandsCfg(HumanoidCommandsCfg):
 class G1RunningObservationCfg(G1TrajOptObservationsCfg):
     """Configuration for running gait library observations."""
     pass
-    # @configclass
-    # class G1RunningPolicyCfg(G1HZDObservationsCfg.PolicyCfg):
-    #     # Add the domain flag
-    #     domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
-    #     root_quat_w = ObsTerm(func=mdp.root_quat_w, noise=Unoise(n_min=-0.2, n_max=0.2))
-    #     # base_z = ObsTerm(func=mdp.base_z, noise=Unoise(n_min=-0.2, n_max=0.2))
-    #
-    #
-    # @configclass
-    # class G1RunningCriticCfg(G1HZDObservationsCfg.CriticCfg):
-    #     # Add the domain flag
-    #     domain_flag = ObsTerm(func=mdp.domain_flag, params={"command_name": "hzd_ref"}, history_length=0)
-    #     root_quat_w = ObsTerm(func=mdp.root_quat_w)
 
-    # observation groups
-    # policy: G1RunningPolicyCfg = G1RunningPolicyCfg()
-    # critic: G1RunningCriticCfg = G1RunningCriticCfg()
+
+if TRACKING_REW_TYPE == "GOAL_ADJ" or TRACKING_REW_TYPE == "GOAL":
+    CLF_WEIGHT = 10.0
+else:
+    CLF_WEIGHT = 12.0
 
 @configclass
 class G1RunningRewardCfg(G1TrajOptCLFRewards):
     torque_lims = RewTerm(
         func=mdp.torque_limits,
-        weight=-1.0,    # Can got to -10 for slightly more endurance
+        weight=-1.0,    # Can go to -10 for slightly more endurance
     )
 
-    # Base
-    base_pos = RewTerm(
-        func=mdp.base_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.4}
-    )
-    base_ori = RewTerm(
-        func=mdp.base_ori_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.5}
-    )
+    # TODO: Try removing the holonomic rewards
 
-    ##
-    # With goal conditioning
-    ##
-    base_lin_vel = RewTerm(
-        func=mdp.base_lin_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.6}
-    )
-    base_ang_vel = RewTerm(
-        func=mdp.base_ang_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 1.5}
-    )
+    if REWARD_TYPE == "CLF":
+        clf_reward = RewTerm(
+            func=mdp.clf_reward,
+            weight=CLF_WEIGHT,
+            params={
+                "command_name": "traj_ref",
+                "max_eta_err": 12.0,
+            }
+        )
 
-    ##
-    # No goal conditioning
-    ##
-    # base_lin_vel = RewTerm(
-    #     func=mdp.base_lin_vel_reward,
-    #     weight=2.0, #1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.4} #0.6}
-    # )
-    # base_ang_vel = RewTerm(
-    #     func=mdp.base_ang_vel_reward,
-    #     weight=2.0, #1.0,
-    #     params={"command_name": "traj_ref",
-    #             "sigma": 0.75} #1.5}
-    # )
+        clf_decreasing_condition = RewTerm(
+            func=mdp.clf_decreasing_condition,
+            weight = -1.0,
+            params = {
+            "command_name": "traj_ref",
+            "alpha": 0.5,
+            "eta_max": 0.25,
+            "eta_dot_max": 0.3,
+            }
+        )
 
-    # Joints
-    joint_pos = RewTerm(
-        func=mdp.joint_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.3*math.sqrt(21)}
-    )
-    joint_vel = RewTerm(
-        func=mdp.joint_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 6.5*math.sqrt(21)}
-    )
+    else:
+        # Base
+        base_pos = RewTerm(
+            func=mdp.base_pos_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 0.4}
+        )
+        base_ori = RewTerm(
+            func=mdp.base_ori_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 0.5}
+        )
 
-    # Bodies
-    body_pos = RewTerm(
-        func=mdp.body_pos_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.2*math.sqrt(4)}
-    )
-    body_ori = RewTerm(
-        func=mdp.body_ori_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 0.4 * math.sqrt(4)}
-    )
-    body_lin_vel = RewTerm(
-        func=mdp.body_lin_vel_reward,
-        weight=1.0,
-        params={"command_name": "traj_ref",
-                "sigma": 2.0 * math.sqrt(4)}
-    )
-    body_ang_vel = RewTerm(
-        func=mdp.body_ang_vel_reward,
-        weight=1.0, #0.0,
-        params={"command_name": "traj_ref",
-                "sigma": 1.0 * math.sqrt(4)}
-    )
+        if TRACKING_REW_TYPE == "GOAL" or TRACKING_REW_TYPE == "GOAL_ADJ":
+            ##
+            # With goal conditioning
+            ##
+            base_lin_vel = RewTerm(
+                func=mdp.base_lin_vel_reward,
+                weight=1.0,
+                params={"command_name": "traj_ref",
+                        "sigma": 0.6}
+            )
+            base_ang_vel = RewTerm(
+                func=mdp.base_ang_vel_reward,
+                weight=1.0,
+                params={"command_name": "traj_ref",
+                        "sigma": 1.5}
+            )
+        else:
+            ##
+            # No goal conditioning
+            ##
+            base_lin_vel = RewTerm(
+                func=mdp.base_lin_vel_reward,
+                weight=2.0, #1.0,
+                params={"command_name": "traj_ref",
+                        "sigma": 0.4} #0.6}
+            )
+            base_ang_vel = RewTerm(
+                func=mdp.base_ang_vel_reward,
+                weight=2.0, #1.0,
+                params={"command_name": "traj_ref",
+                        "sigma": 0.75} #1.5}
+            )
 
-    # # Goal conditioned rewards
-    # xy_vel = RewTerm(
-    #     func=mdp.track_lin_vel_xy_exp,
-    #     weight=1.0,
-    #     params={"command_name": "base_velocity",
-    #             "std": 0.75,}
-    # )
-    #
-    # yaw_vel = RewTerm(
-    #     func=mdp.track_ang_vel_z_exp,
-    #     weight=1.0,
-    #     params={"command_name": "base_velocity",
-    #             "std": 0.75,}
-    # )
+        # Joints
+        joint_pos = RewTerm(
+            func=mdp.joint_pos_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 0.3*math.sqrt(21)}
+        )
+        joint_vel = RewTerm(
+            func=mdp.joint_vel_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 6.5*math.sqrt(21)}
+        )
 
-    clf_reward = None
-    # clf_reward = RewTerm(
-    #     func=mdp.clf_reward,
-    #     weight=10.0,
-    #     params={
-    #         "command_name": "traj_ref",
-    #         "max_eta_err": 12.0, #16.0,
-    #     }
-    # )
+        # Bodies
+        body_pos = RewTerm(
+            func=mdp.body_pos_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 0.2*math.sqrt(4)}
+        )
+        body_ori = RewTerm(
+            func=mdp.body_ori_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 0.4 * math.sqrt(4)}
+        )
+        body_lin_vel = RewTerm(
+            func=mdp.body_lin_vel_reward,
+            weight=1.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 2.0 * math.sqrt(4)}
+        )
+        body_ang_vel = RewTerm(
+            func=mdp.body_ang_vel_reward,
+            weight=1.0, #0.0,
+            params={"command_name": "traj_ref",
+                    "sigma": 1.0 * math.sqrt(4)}
+        )
+
+        # No CLF rewards here
+        clf_reward = None
+        clf_decreasing_condition = None
+
+    if TRACKING_REW_TYPE == "GOAL" or TRACKING_REW_TYPE == "GOAL_ADJ":
+        # Goal conditioned rewards
+        xy_vel = RewTerm(
+            func=mdp.track_lin_vel_xy_exp,
+            weight=1.0,
+            params={"command_name": "base_velocity",
+                    "std": 0.75, }
+        )
+
+        yaw_vel = RewTerm(
+            func=mdp.track_ang_vel_z_exp,
+            weight=1.0,
+            params={"command_name": "base_velocity",
+                    "std": 0.75, }
+        )
 
 @configclass
 class G1RunningCurriculumCfg:
@@ -675,35 +745,26 @@ class G1RunningGaitLibraryEnvCfg(HumanoidEnvCfg):
         ##
         self.scene.robot = G1_MINIMAL_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-        ##
-        # Normal
-        ##
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+        if SPEED_RANGE == "ALL":
+            ##
+            # Normal
+            ##
+            self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+            self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
+            self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
+        else:
+            ##
+            # Single speed
+            ##
+            self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+            self.commands.base_velocity.ranges.lin_vel_y = (0, 0)
+            self.commands.base_velocity.ranges.ang_vel_z = (0, 0)
 
-        ##
-        # Single speed
-        ##
-        # self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
-
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.heading = (0, 0)
 
-
-        self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
-        self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
-
-        # self.rewards.clf_reward.params = {
-        #     "command_name": "traj_ref",
-        #     "max_eta_err": 0.3,
-        # }
-        self.rewards.clf_decreasing_condition.params = {
-            "command_name": "traj_ref",
-            "alpha": 0.5,
-            "eta_max": 0.25,
-            "eta_dot_max": 0.3,
-        }
-        self.rewards.clf_decreasing_condition.weight = -1
+        if self.rewards.holonomic_constraint is not None:
+            self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
+            self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
 
         self.curriculum.terrain_levels = None
 
@@ -747,10 +808,10 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
-        self.commands.base_velocity.ranges.resampling_time_range=(4.0, 4.0) #(3.0, 4.0)
+        self.commands.base_velocity.ranges.resampling_time_range=(5.0, 5.0) #(4.0, 4.0) #(3.0, 4.0)
         self.commands.base_velocity.debug_vis = False
 
-        self.episode_length_s = 4.0 #6.0
+        self.episode_length_s = 10.0 #4.0 #6.0
 
 
         self.scene.num_envs = 2
@@ -760,8 +821,11 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.scene.terrain.border_width = 0.0
         self.scene.terrain.num_rows = 3
         self.scene.terrain.num_cols = 2
+
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
+        # self.scene.terrain.terrain_type = "generator"
+        # self.scene.terrain.terrain_generator = ROBUSTNESS_TEST_FOR_BASIC_LOCOMOTION_CFG
 
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None

@@ -82,8 +82,8 @@ class CLF:
         #         norm_P.append(torch.linalg.norm(self.P, ord=2))
         #     self.P = P
 
-        # TODO: Go back to before
-        # self.P = torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)
+        # For ablations
+        self.P_ID = torch.from_numpy(np.eye(self.n_outputs)).to(self.device).to(torch.float32)
 
         # Build eta-state indices for each subgroup.
         # For output i, eta has position at 2*i and velocity at 2*i+1.
@@ -203,27 +203,15 @@ class CLF:
         eta[:,0::2] = y_err      # even indices: positions
         eta[:,1::2] = dy_err     # odd indices: velocities
 
-        # TODO: Need to remove yaw wrapping as quats are used now.
-        #need to wrap around yaw error, 
-        # yaw_err = y_err[:,yaw_idx]
-        # two_pi = 2.0 * torch.pi
-        # wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
-        # eta[:,yaw_idx] = wrapped_yaw_err
-
-        # if self.num_domain > 1:
-        #     P = self.P[domain_idx]
-        # else:
-        P = self.P
-
         # Compute per-subgroup V contributions (self-contribution, excluding cross-terms)
         self.v_subgroups = {}
         for name, idx in self.subgroup_indices.items():
             if idx.numel() > 0:
                 eta_sub = eta[:, idx].contiguous()
-                P_sub = P[idx][:, idx].contiguous()
+                P_sub = self.P_ID[idx][:, idx].contiguous()     # Use identity P for these to just compute errors, not Lyap values
                 self.v_subgroups[name] = (torch.matmul(eta_sub, P_sub) * eta_sub).sum(dim=-1)
 
-        V = torch.einsum('bi,ij,bj->b', eta, P, eta)
+        V = torch.einsum('bi,ij,bj->b', eta, self.P, eta)
 
         self.v_buffer[:, 2] = self.v_buffer[:, 1]
         self.v_buffer[:, 1] = self.v_buffer[:, 0]
