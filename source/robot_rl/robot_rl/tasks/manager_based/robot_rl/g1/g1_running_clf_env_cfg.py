@@ -546,12 +546,12 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
 
         clf_decreasing_condition = RewTerm(
             func=mdp.clf_decreasing_condition,
-            weight = -1.0,
+            weight = -5.0,
             params = {
             "command_name": "traj_ref",
             "alpha": 0.5,
-            "eta_max": 0.25,
-            "eta_dot_max": 0.3,
+            "eta_max": 12,
+            "eta_dot_max": 24,
             }
         )
 
