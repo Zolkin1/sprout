@@ -23,7 +23,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
 from sensor_msgs.msg import Joy, Imu, JoyFeedback
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PoseArray, Pose
 
 @dataclass
 class OdomLog:
@@ -117,10 +117,16 @@ class HighLevelController(ObeliskController, ABC):
             self.kp_y = self.get_parameter("kp_y").get_parameter_value().double_value
             self.kd_y = self.get_parameter("kd_y").get_parameter_value().double_value
 
+            self.declare_parameter("traj_dt", 0.1)
+            self.declare_parameter("traj_nodes", 10)
+            self.traj_dt = self.get_parameter("traj_dt").get_parameter_value().double_value
+            self.traj_nodes = self.get_parameter("traj_nodes").get_parameter_value().integer_value
+
             # Feedback control parameters
             self.target_line_start = np.zeros(2, dtype=float)
             self.yaw_target_w = 0.0
             self.yaw_cur_w = 0.0
+            self.quat_w = np.zeros(4)
 
             self.yaw_world = 0.0
             self.world_origin = np.zeros(3)
@@ -143,6 +149,7 @@ class HighLevelController(ObeliskController, ABC):
             self.R_odom_camera_init = None
             self.body_heading = np.array([1.0, 0.0, 0.0])
             self.tf_static_broadcaster = StaticTransformBroadcaster(self)
+            self.tf_static_odom_world_broadcaster = StaticTransformBroadcaster(self)
 
             self.declare_parameter("odom_frame", "odom_frame")
             self.declare_parameter("camera_init_frame", "camera_init_frame")
@@ -255,6 +262,18 @@ class HighLevelController(ObeliskController, ABC):
             msg_type=JoyFeedback,
         )
 
+        self.register_obk_publisher(
+            "pub_odom_data",
+            key="pub_odom_data_key",
+            msg_type=Odometry,
+        )
+
+        self.register_obk_publisher(
+            "pub_traj_data",
+            key="pub_traj_data_key",
+            msg_type=PoseArray,
+        )
+
         self.cmd_vel = np.zeros((3,))
 
     def joint_encoders_callback(self, msg: ObkJointEncoders) -> None:
@@ -270,6 +289,31 @@ class HighLevelController(ObeliskController, ABC):
         self.lidar_imu_acc_hist.append(lin_acc)
 
         self.rec_lidar_imu = True
+
+    def pub_odom(self) -> None:
+        """
+        Callback for the timer to publish the odom data.
+
+        Publishes odom data in the zeroed world frame.
+        """
+        # Publish the correct frame odom data
+        msg = Odometry()
+        msg.pose.pose.position.x = self.pos_w[0]
+        msg.pose.pose.position.y = self.pos_w[1]
+        msg.pose.pose.position.z = self.pos_w[2]
+
+        msg.pose.pose.orientation.w = self.quat_w[3]
+        msg.pose.pose.orientation.x = self.quat_w[0]
+        msg.pose.pose.orientation.y = self.quat_w[1]
+        msg.pose.pose.orientation.z = self.quat_w[2]
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.odom_frame_str   # TODO: Check
+        msg.child_frame_id = "pelvis"   # Is it the pelvis or the head?
+
+        # No twist because I don't have it
+
+        self.obk_publishers["pub_odom_data_key"].publish(msg)
 
     def odom_callback(self, msg: Odometry) -> None:
         """Callback for odometry messages."""
@@ -303,6 +347,8 @@ class HighLevelController(ObeliskController, ABC):
 
             # Transform orientation: R_odom = R_transform @ R_camera_init
             R_odom = self.R_odom_camera_init * R_camera_init
+
+            self.quat_w = R_odom.as_quat(scalar_first=False)
 
             # Extract yaw from transformed orientation
             heading = R_odom.apply(self.body_heading)
@@ -347,6 +393,8 @@ class HighLevelController(ObeliskController, ABC):
         self.lin_vel_w = self._compute_linear_velocity()
         ang_z_vel = self._compute_yaw_rate()
         self.ang_z_window.append(ang_z_vel)
+
+        self.pub_odom()     # Publish the zeroed odom
 
         if self.log_odom_flag:
             self.log_odom.pos_w = self.pos_w
@@ -568,6 +616,8 @@ class HighLevelController(ObeliskController, ABC):
 
             # TODO: Viz the trajectory and commands
 
+            # Publish the desired trajectory
+            self.pub_traj()
 
             if self.log_odom_flag:
                 self.log_odom.y_cmd = msg.v_y
@@ -580,6 +630,52 @@ class HighLevelController(ObeliskController, ABC):
 
             return msg
 
+    def pub_traj(self) -> None:
+        """
+        Publish the trajectory we want to track.
+        """
+        msg = PoseArray()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.odom_frame_str
+
+        for i in range(self.traj_nodes):
+            point = Pose()
+
+            # Compute time into traj
+            t = i*self.traj_dt
+
+            # Get the commanded velocity in the local x - no support for joy-sticking right now
+            vel_world = self.incremental_vel * np.array([np.cos(self.yaw_target_w), np.sin(self.yaw_target_w)])
+
+            # Get current point on the target line
+            projection = self.project_position_onto_line(self.yaw_target_w)
+
+            point.position.x = projection[0] + (t * vel_world[0])
+            point.position.y = projection[1] + (t * vel_world[1])
+            point.position.z = self.pos_w[2]
+
+            # Convert yaw into a quaternion
+            rot = Rotation.from_euler('z', self.yaw_target_w, degrees=False)
+            quat = rot.as_quat(scalar_first=False)
+            point.orientation.w = quat[3]
+            point.orientation.x = quat[0]
+            point.orientation.y = quat[1]
+            point.orientation.z = quat[2]
+
+            # # Velocities in the world frame
+            # point.velocity.linear.x = vel_world[0]
+            # point.velocity.linear.y = vel_world[1]
+            # point.velocity.linear.z = 0.0
+            #
+            # point.velocity.angular.x = 0.0
+            # point.velocity.angular.y = 0.0
+            # point.velocity.angular.z = 0.0      # On the line there is no commanded yaw
+
+            msg.poses.append(point)
+
+        self.obk_publishers["pub_traj_data_key"].publish(msg)
+
     def set_feedback_targets(self):
         """
         Sets the global frame position targets for feedback.
@@ -589,34 +685,17 @@ class HighLevelController(ObeliskController, ABC):
         # Integrate the yaw target
         prev_yaw = self.yaw_target_w
         yaw_change = self.joy_rate*self.joy_cmd_vel[2]
-        self.yaw_target_w = prev_yaw + yaw_change
+        self.yaw_target_w = (prev_yaw + yaw_change) % (2*np.pi)
 
         target = np.zeros(2, dtype=np.float64)
 
-        second_point = self.target_line_start + np.array([np.cos(prev_yaw), np.sin(prev_yaw)])
-
-        AB = second_point - self.target_line_start
-        AC = self.pos_w[:2] - self.target_line_start
-
-        AD = AB * np.dot(AB, AC)/np.dot(AB, AB)
-        projection = self.target_line_start + AD
+        projection = self.project_position_onto_line(prev_yaw)
 
         if abs(self.joy_cmd_vel[2]) > 0.01:
-            # projection = self.pos_w[:2]
-
-            # # Compute the projected point
-            # d = second_point - self.target_line_start
-            # t = np.dot((self.pos_w[:2] - self.target_line_start), d)/np.dot(d,d)
-            # projection = self.target_line_start + t*d
-
-            # dp_local = self.joy_rate * self.incremental_vel * np.array([np.cos(prev_yaw), np.sin(prev_yaw)])
             dp_w = self.joy_rate * self.incremental_vel * np.array([np.cos(self.yaw_target_w), np.sin(self.yaw_target_w)])
 
             # Need to compute the offset for the new target line
             self.target_line_start = projection + dp_w
-
-            # self.target_line_start[0] = projection[0] + self.joy_rate * self.incremental_vel*(np.cos(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.sin(self.yaw_target_w) - np.sin(prev_yaw))
-            # self.target_line_start[1] = projection[1] + self.joy_rate * self.incremental_vel*(np.sin(yaw_change)) #(self.joy_cmd_vel[0]/self.joy_cmd_vel[2])*(np.cos(prev_yaw) - np.cos(self.yaw_target_w))
 
             target = self.target_line_start
 
@@ -629,12 +708,6 @@ class HighLevelController(ObeliskController, ABC):
             self.get_logger().info(f"Yaw target: {self.yaw_target_w}")
             self.get_logger().info(f"Yaw: {self.yaw_cur_w}\n")
         else:
-            # # Just project - no yaw adjustments
-            # # Compute the projected point
-            # d = second_point - self.target_line_start
-            # t = np.dot((self.pos_w[:2] - self.target_line_start), d) / np.dot(d, d)
-            # target = self.target_line_start + t * d
-
             target = projection
 
         if self.log_odom_flag:
@@ -642,6 +715,19 @@ class HighLevelController(ObeliskController, ABC):
             self.log_odom.yaw_target_w = self.yaw_target_w
 
         return target
+
+    def project_position_onto_line(self, yaw):
+        """Project the current position onto the ray starting at target_line_start in the direction of yaw."""
+        second_point = self.target_line_start + np.array([np.cos(yaw), np.sin(yaw)])
+
+        AB = second_point - self.target_line_start
+        AC = self.pos_w[:2] - self.target_line_start
+
+        t = np.dot(AB, AC) / np.dot(AB, AB)
+        t = max(t, 0.0)  # Clamp to ray: don't project behind the start point
+        projection = self.target_line_start + AB * t
+
+        return projection
 
     def write_log(self):
         """Write teh log."""
@@ -801,6 +887,27 @@ class HighLevelController(ObeliskController, ABC):
 
         self.tf_static_broadcaster.sendTransform(t)
         self.get_logger().info("ZEROING: Published static transform odom -> camera_init")
+
+        ##
+        # World -> odom frame tf
+        ##
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = "world"
+        t.child_frame_id = self.odom_frame_str
+
+        quat = self.R_odom_camera_init.as_quat()
+        t.transform.translation.x = 0.0
+        t.transform.translation.y = 0.0
+        t.transform.translation.z = 0.0
+        t.transform.rotation.x = 0.0
+        t.transform.rotation.y = 0.0
+        t.transform.rotation.z = 0.0
+        t.transform.rotation.w = 1.0
+
+        self.tf_static_odom_world_broadcaster.sendTransform(t)
+        self.get_logger().info("ZEROING: Published static transform odom -> world")
+
 
     def joy_feedback(self) -> None:
         """

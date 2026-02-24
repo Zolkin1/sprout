@@ -79,6 +79,8 @@ def parse_play_stats(filepath: str) -> dict:
     result = {
         "v_mean": None,
         "v_std": None,
+        "norm_sq_mean": None,
+        "norm_sq_std": None,
         "pos_error_groups": OrderedDict(),
         "vel_error_groups": OrderedDict(),
     }
@@ -90,6 +92,12 @@ def parse_play_stats(filepath: str) -> dict:
         result["v_mean"] = float(v_mean_match.group(1))
     if v_std_match:
         result["v_std"] = float(v_std_match.group(1))
+
+    # Parse norm squared error
+    norm_sq_section = re.search(r"Norm Squared Error.*?Mean across envs:\s+([\d.]+).*?Std\s+across envs:\s+([\d.]+)", text, re.DOTALL)
+    if norm_sq_section:
+        result["norm_sq_mean"] = float(norm_sq_section.group(1))
+        result["norm_sq_std"] = float(norm_sq_section.group(2))
 
     # Parse group summaries using section-aware parsing
     def _parse_group_summaries(section_text: str) -> OrderedDict:
@@ -160,6 +168,57 @@ def plot_v_histogram(
         fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
         fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
         print(f"Saved V histogram to {save_path}.png")
+
+    plt.close(fig)
+
+
+def plot_norm_sq_error_histogram(
+    policy_data: OrderedDict,
+    save_path: str | None = None,
+) -> None:
+    """Plot a histogram of norm squared error (dot(e,e)) with error bars across policies.
+
+    Args:
+        policy_data: OrderedDict mapping policy name -> parsed play_stats dict.
+        save_path: If provided, save plot to this path (without extension).
+    """
+    _setup_plot_style()
+    colors = plt.cm.tab10.colors
+
+    names = list(policy_data.keys())
+    means = [policy_data[n]["norm_sq_mean"] for n in names]
+    stds = [policy_data[n]["norm_sq_std"] for n in names]
+
+    if any(m is None for m in means):
+        print("Norm squared error data not available for all policies, skipping plot.")
+        return
+
+    x = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(names)), 6))
+
+    ax.bar(
+        x, means, yerr=stds,
+        width=0.6,
+        color=[colors[i % len(colors)] for i in range(len(names))],
+        capsize=6,
+        alpha=0.85,
+        edgecolor="black",
+        linewidth=0.5,
+    )
+
+    ax.set_ylabel(r"Norm Squared Error ($\dot{e}^T e$)", fontsize=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, fontsize=16, rotation=15, ha="right")
+    ax.tick_params(labelsize=16)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
+        fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
+        print(f"Saved norm squared error histogram to {save_path}.png")
 
     plt.close(fig)
 
@@ -256,16 +315,16 @@ def generate_latex_table(policy_data: OrderedDict) -> str:
     lines.append(r"\caption{Lyapunov function and tracking error comparison.}")
     lines.append(r"\label{tab:play_stats}")
 
-    # Column spec: Policy | V Mean +/- Std | Pos groups (mean +/- std) | Vel groups (mean +/- std)
-    lines.append(r"\begin{tabular}{l c c c c c c c}")
+    # Column spec: Policy | V | dot(e,e) | Pos groups | Vel groups
+    lines.append(r"\begin{tabular}{l c c c c c c c c}")
     lines.append(r"\toprule")
     lines.append(
-        r"Policy & $V$ & "
+        r"Policy & $V$ & $\|e\|^2$ & "
         r"\multicolumn{3}{c}{Position Error} & "
         r"\multicolumn{3}{c}{Velocity Error} \\"
     )
     lines.append(
-        r" & (mean $\pm$ std) & "
+        r" & (mean $\pm$ std) & (mean $\pm$ std) & "
         r"Pos. & Ori. & Joints & "
         r"Pos. & Ori. & Joints \\"
     )
@@ -276,6 +335,12 @@ def generate_latex_table(policy_data: OrderedDict) -> str:
 
         # V value
         v_str = f"${d['v_mean']:.2f} \\pm {d['v_std']:.2f}$"
+
+        # Norm squared error
+        if d["norm_sq_mean"] is not None:
+            norm_sq_str = f"${d['norm_sq_mean']:.4f} \\pm {d['norm_sq_std']:.4f}$"
+        else:
+            norm_sq_str = "--"
 
         # Position error groups
         pos_groups = d["pos_error_groups"]
@@ -299,7 +364,7 @@ def generate_latex_table(policy_data: OrderedDict) -> str:
 
         # Escape underscores in policy name for LaTeX
         escaped_name = name.replace("_", r"\_")
-        row = f"{escaped_name} & {v_str} & " + " & ".join(pos_strs) + " & " + " & ".join(vel_strs) + r" \\"
+        row = f"{escaped_name} & {v_str} & {norm_sq_str} & " + " & ".join(pos_strs) + " & " + " & ".join(vel_strs) + r" \\"
         lines.append(row)
 
     lines.append(r"\bottomrule")
@@ -394,6 +459,10 @@ def main() -> None:
             policy_data,
             error_type="vel",
             save_path=os.path.join(exp_folder, "velocity_error_histogram"),
+        )
+        plot_norm_sq_error_histogram(
+            policy_data,
+            save_path=os.path.join(exp_folder, "norm_sq_error_histogram"),
         )
 
     # Generate LaTeX table

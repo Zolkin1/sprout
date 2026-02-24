@@ -84,6 +84,8 @@ onboard:
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
+        traj_dt: 0.1
+        traj_nodes: 10
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -92,6 +94,13 @@ onboard:
           callback_group: None
         - ros_parameter: pub_joy_feedback
           topic: /obelisk/g1/joy_feedback
+          history_depth: 10
+        - ros_parameter: pub_odom_data
+          topic: /obelisk/g1/odom
+          history_depth: 10
+        - ros_parameter: pub_traj_data
+          topic: /obelisk/g1/traj_data
+          msg_type: Trajectory
           history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
@@ -179,6 +188,11 @@ onboard:
         - ros_parameter: sub_pelvis_imu
           topic: /obelisk/g1/pelvis_imu
           msg_type: Imu
+          history_depth: 10
+          callback_group: None
+        - ros_parameter: sub_odom
+          topic: /obelisk/g1/odom
+          msg_type: Odometry
           history_depth: 10
           callback_group: None
       timers:
@@ -397,11 +411,11 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: False
+    on: True
     viz_tool: foxglove
     viz_nodes:
-      - pkg: obelisk_viz_cpp
-        executable: default_robot_viz
+      - pkg: robot_viz
+        executable: robot_viz
         robot_pkg: g1_model
         urdf: g1_hand.urdf
         robot_topic: robot_description
