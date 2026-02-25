@@ -26,6 +26,8 @@ ROBOT_ASSETS = "robot_assets/g1"
 G1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{ROBOT_ASSETS}/g1_21j_self_col.usd",
+        # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_default.usd",   # TODO: Test/verify
+
         # usd_path=f"{ROBOT_ASSETS}/g1_21j_urdf_v4_min_contacts.usd",
         # usd_path=f"{ROBOT_ASSETS}/g1_21j_servo_backpack.usd",
         activate_contact_sensors=True,

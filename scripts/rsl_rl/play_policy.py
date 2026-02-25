@@ -420,8 +420,8 @@ def main():
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
 
-    # Setup logging
-    logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
+    # Setup logging (include actions/joint_names separately since they don't come from extract_reference_trajectory)
+    logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars + ['action_targets', 'joint_pos', 'applied_torque', 'joint_names'])
 
     # reset environment
     obs = env.get_observations()
@@ -448,6 +448,12 @@ def main():
             # Log data
             if args_cli.log_data:
                 data = extract_reference_trajectory(env, log_vars, command_name)
+                action_term = env.unwrapped.action_manager.get_term("joint_pos")
+                robot = env.unwrapped.scene.articulations["robot"]
+                data['action_targets'] = action_term._processed_actions.clone()
+                data['joint_pos'] = robot.data.joint_pos.clone()
+                data['applied_torque'] = robot.data.applied_torque.clone()
+                data['joint_names'] = list(robot.data.joint_names)
                 logger.log_from_dict(data)
 
         timestep += 1
