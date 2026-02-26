@@ -206,7 +206,7 @@ def plot_norm_sq_error_histogram(
         linewidth=0.5,
     )
 
-    ax.set_ylabel(r"Norm Squared Error ($\dot{e}^T e$)", fontsize=20)
+    ax.set_ylabel(r"Norm Squared Error ($e^T e$)", fontsize=20)
     ax.set_xticks(x)
     ax.set_xticklabels(names, fontsize=16, rotation=15, ha="right")
     ax.tick_params(labelsize=16)

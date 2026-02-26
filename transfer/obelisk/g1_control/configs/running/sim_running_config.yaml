@@ -137,6 +137,53 @@ onboard:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
           callback_group: None
+  # # ----- MPC Controller ----- #
+  #   - pkg: mpc
+  #     executable: mpc_node
+  #     params:
+  #       problem_name: straight4
+  #       dt: 0.4
+  #       v_max: [0.8, 0.2, 0.75]
+  #       v_min: [-0.3, -0.2, -0.75]
+  #       N: 25
+  #       Q: [10, 10, 0.1]
+  #       R: [0.1, 0.5, 0.1]
+  #       alpha: 0.7
+  #       delta: 0.2
+  #       v_norm_max: 0.8
+  #       plan_topic: /obelisk/g1/mpc_path
+  #       path_topic: /obelisk/g1/robot_path
+  #       joy_topic: /obelisk/g1/joy_passthrough
+  #       btn_idle: 0     # A
+  #       btn_zeroing: 1  # B
+  #       btn_run: 3      # Y
+  #       obst_topic: /obelisk/g1/mpc_obstacles
+  #       # Zeroing parameters
+  #       imu_topic: /livox/imu
+  #       zeroing_position_threshold: 0.05
+  #       zeroing_stable_duration: 2.0
+  #       zeroing_check_period: 0.1
+  #       zeroing_timeout: 30.0
+  #       odom_frame: odom
+  #       camera_init_frame: camera_init
+  #       logging: False
+  #     # callback_groups:
+  #     publishers:
+  #     # ----- High Level Control ----- #
+  #       - ros_parameter: pub_ctrl_setting
+  #         topic: /obelisk/g1/vel_cmd
+  #         history_depth: 10
+  #         callback_group: None
+  #     subscribers:
+  #     # ----- subscribe to odometry ----- #
+  #       - ros_parameter: sub_est_setting
+  #         topic: /Odometry
+  #       - ros_parameter: sub_imu
+  #         topic: /livox/imu
+  #     timers:
+  #       - ros_parameter: timer_ctrl_setting
+  #         timer_period_sec: 0.4
+  #         callback_group: None
   # ----- High Level/Execution FSM Controller ----- #
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
