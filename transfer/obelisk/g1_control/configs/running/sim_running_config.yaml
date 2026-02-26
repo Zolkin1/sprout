@@ -133,6 +133,11 @@ onboard:
           msg_type: Imu
           history_depth: 10
           callback_group: None
+        # ----- MPC Command Subscriber ----- #
+        - ros_parameter: sub_mpc_setting
+          topic: /mpc_command
+          msg_type: Twist
+          history_depth: 10
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
@@ -461,7 +466,7 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: True
+    on: False #True
     viz_tool: foxglove
     viz_nodes:
       - pkg: robot_viz

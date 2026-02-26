@@ -23,7 +23,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
 import rclpy.duration
 from sensor_msgs.msg import Joy, Imu, JoyFeedback
-from geometry_msgs.msg import TransformStamped, PoseArray, Pose
+from geometry_msgs.msg import TransformStamped, PoseArray, Pose, Twist
 
 @dataclass
 class OdomLog:
@@ -160,6 +160,10 @@ class HighLevelController(ObeliskController, ABC):
             # self.y_vel_window = deque(maxlen=10)
             # self.x_vel_window = deque(maxlen=10)
 
+            # MPC Commands
+            self.mpc_cmd = np.zeros(3)  # x, y, yaw
+            self.mpc_enabled = False
+
             self.lidar_imu_acc_hist = deque(maxlen=15)
             self.rec_lidar_imu = False
 
@@ -262,16 +266,26 @@ class HighLevelController(ObeliskController, ABC):
             msg_type=JoyFeedback,
         )
 
+        # Zeroed odometry
         self.register_obk_publisher(
             "pub_odom_data",
             key="pub_odom_data_key",
             msg_type=Odometry,
         )
 
+        # Trajectory data
         self.register_obk_publisher(
             "pub_traj_data",
             key="pub_traj_data_key",
             msg_type=PoseArray,
+        )
+
+        # Safety velocity command
+        self.register_obk_subscription(
+            "sub_mpc_setting",
+            key="sub_mpc_key",
+            callback=self.mpc_command_callback,
+            msg_type=Twist,
         )
 
         self.cmd_vel = np.zeros((3,))
@@ -289,6 +303,11 @@ class HighLevelController(ObeliskController, ABC):
         self.lidar_imu_acc_hist.append(lin_acc)
 
         self.rec_lidar_imu = True
+
+    def mpc_command_callback(self, msg) -> None:
+        self.mpc_cmd[0] = np.clip(msg.linear.x, self.v_x_min, self.v_x_max)
+        self.mpc_cmd[1] = np.clip(msg.linear.y, -self.v_y_max, self.v_y_max)
+        self.mpc_cmd[2] = np.clip(msg.angular.z, -self.w_z_max, self.w_z_max)  
 
     def pub_odom(self) -> None:
         """
@@ -549,6 +568,11 @@ class HighLevelController(ObeliskController, ABC):
             self.get_logger().info("Integrated joystick control enabled!")
             # TODO: need to think more about how this mode will work
 
+        if msg.axes[DPAD_LEFT_RIGHT] >= 0.9 and now - self.last_DPAD_LEFT_press > 0.5:
+            self.last_DPAD_LEFT_press = now
+            self.mpc_enabled = not self.mpc_enabled
+            self.get_logger().info("MPC status set to " + str(self.mpc_enabled))
+
         if msg.buttons[RIGHT_BUMPER] >= 0.9 and self.control_mode == "integrated_joystick":
             if msg.buttons[Y] >= 0.9 and now - self.last_Y_press > 0.1:
                 self.incremental_vel += self.vel_increment
@@ -587,6 +611,11 @@ class HighLevelController(ObeliskController, ABC):
                 msg.w_z = float(yaw_cmd)
                 msg.v_y = float(y_cmd)
                 msg.v_x = float(self.incremental_vel)
+    
+                if self.mpc_enabled:  # Must be in integrated joystick to use the MPC commands for now
+                    msg.v_x = float(self.mpc_cmd[0])
+                    msg.v_y = float(self.mpc_cmd[1])
+                    msg.w_z = float(self.mpc_cmd[2])
 
             elif self.control_mode != "joystick":
                 raise ValueError("Unsupported control mode!")
