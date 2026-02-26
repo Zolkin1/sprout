@@ -562,13 +562,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Base
         base_pos = RewTerm(
             func=mdp.base_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.4}
         )
         base_ori = RewTerm(
             func=mdp.base_ori_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.5}
         )
@@ -579,13 +579,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
             ##
             base_lin_vel = RewTerm(
                 func=mdp.base_lin_vel_reward,
-                weight=1.0,
+                weight=1.5,
                 params={"command_name": "traj_ref",
                         "sigma": 0.6}
             )
             base_ang_vel = RewTerm(
                 func=mdp.base_ang_vel_reward,
-                weight=1.0,
+                weight=1.5,
                 params={"command_name": "traj_ref",
                         "sigma": 1.5}
             )
@@ -595,13 +595,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
             ##
             base_lin_vel = RewTerm(
                 func=mdp.base_lin_vel_reward,
-                weight=2.0, #1.0,
+                weight=2.5, #1.0,
                 params={"command_name": "traj_ref",
                         "sigma": 0.4} #0.6}
             )
             base_ang_vel = RewTerm(
                 func=mdp.base_ang_vel_reward,
-                weight=2.0, #1.0,
+                weight=2.5, #1.0,
                 params={"command_name": "traj_ref",
                         "sigma": 0.75} #1.5}
             )
@@ -609,13 +609,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Joints
         joint_pos = RewTerm(
             func=mdp.joint_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.3*math.sqrt(21)}
         )
         joint_vel = RewTerm(
             func=mdp.joint_vel_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 6.5*math.sqrt(21)}
         )
@@ -623,25 +623,25 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Bodies
         body_pos = RewTerm(
             func=mdp.body_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.2*math.sqrt(4)}
         )
         body_ori = RewTerm(
             func=mdp.body_ori_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.4 * math.sqrt(4)}
         )
         body_lin_vel = RewTerm(
             func=mdp.body_lin_vel_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 2.0 * math.sqrt(4)}
         )
         body_ang_vel = RewTerm(
             func=mdp.body_ang_vel_reward,
-            weight=1.0, #0.0,
+            weight=1.5, #0.0,
             params={"command_name": "traj_ref",
                     "sigma": 1.0 * math.sqrt(4)}
         )
@@ -808,12 +808,12 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
-        # self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
-        # self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
-        # self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
+        # self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+        # self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        # self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
+        self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.resampling_time_range=(5.0, 5.0) #(4.0, 4.0) #(3.0, 4.0)
         self.commands.base_velocity.debug_vis = False
 
@@ -839,8 +839,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
         self.events.gain_randomization = None
-        # self.events.joint_friction_params = None      # TODO: Why does removing this randomization make the arms seem to go crazy? - No friction is out of distribution
-        # self.events.arm_friction_params = None      # TODO: What is this? Does it exist?
+        # self.events.joint_friction_params = None  # Can't use this - friction goes out of distribution
 
 @configclass
 class G1RunningGaitLibraryEnvCfgExperiment(G1RunningGaitLibraryEnvCfg):

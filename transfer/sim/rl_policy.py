@@ -339,6 +339,16 @@ class RLPolicy:
         """Get the default joint angles from the policy_params file."""
         return np.array(self.policy_params['default_joint_angles'])
 
+    def get_valid_ic_pos(self) -> np.ndarray | None:
+        """Get the valid initial condition positions [base_pos(3), base_quat(4), joint_pos(N)]."""
+        ic = self.policy_params.get('valid_ic_pos')
+        return np.array(ic) if ic is not None else None
+
+    def get_valid_ic_vel(self) -> np.ndarray | None:
+        """Get the valid initial condition velocities [base_lin_vel(3), base_ang_vel(3), joint_vel(N)]."""
+        ic = self.policy_params.get('valid_ic_vel')
+        return np.array(ic) if ic is not None else None
+
     def get_joint_names(self) -> list[str]:
         """Get the joint names from the policy_params file."""
         return self.policy_params['joint_names_isaac']

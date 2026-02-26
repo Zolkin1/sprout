@@ -9,7 +9,7 @@ from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 
 # 1. Create the configuration
 cfg = UrdfConverterCfg(
-    asset_path="/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/robot_assets/g1/g1_21j/g1_21j.urdf",  # Absolute path to your URDF
+    asset_path="/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/robot_assets/g1/g1_21j/g1_21j_merged.urdf",  # Absolute path to your URDF
     usd_dir="/home/zolkin/AmberLab/Project-Isaac-RL/robot-rl/robot_rl/robot_assets/g1/g1_21j",      # Where the USD will be saved
     usd_file_name="g1_21j_default.usd",             # Output file name (optional)
     fix_base=False,                            # Fix the base link in place

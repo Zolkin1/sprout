@@ -68,6 +68,8 @@ def main():
                        help="Scene name for MuJoCo simulation")
     parser.add_argument("--robot_name", type=str, default="g1_21j",
                        help="Robot name")
+    parser.add_argument("--use_ic", action="store_true", default=False,
+                       help="Use the valid initial condition from the policy YAML")
     parser.add_argument("--log", action="store_true", default=False,
                        help="Enable logging")
     parser.add_argument("--log_dir", type=str, default=None,
@@ -136,6 +138,10 @@ def main():
         use_pd=False,
         gains=gains,
     )
+
+    # Set initial condition from YAML if requested
+    if args.use_ic:
+        robot_instance.set_initial_condition(policy)
 
     # Set up log directory
     if args.log_dir is None:
