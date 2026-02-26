@@ -14,7 +14,8 @@ onboard:
           "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
 
           # Walking
-          "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",  # Should be able to do running -> walking
+          "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
+          # "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",  # Should be able to do running -> walking
           # "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [
