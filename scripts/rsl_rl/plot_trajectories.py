@@ -306,6 +306,76 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 plt.savefig(os.path.join(save_dir, f'velocities_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
+        # --- Joint Angle Targets vs Actual ---
+        if 'action_targets' in processed_data and 'joint_pos' in processed_data:
+            n_dims = processed_data['action_targets'].shape[2]
+            title = f'Joint Angle Targets vs Actual (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+
+            # Get joint names for labels
+            joint_names = None
+            if 'joint_names' in processed_data:
+                joint_names = processed_data['joint_names'][0]  # Same for all timesteps
+
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['action_targets'][:, env_id, i], label='Target', linewidth=2)
+                ax.plot(time_steps, processed_data['joint_pos'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
+                if joint_names is not None and i < len(joint_names):
+                    label = format_joint_name(str(joint_names[i]))
+                else:
+                    label = f'Dim {i}'
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel('Angle (rad)')
+                ax.grid(True, alpha=0.3)
+                if i == 0:
+                    ax.legend()
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'joint_targets_vs_actual_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- Joint Torques ---
+        if 'applied_torque' in processed_data:
+            n_dims = processed_data['applied_torque'].shape[2]
+            title = f'Joint Torques (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+
+            joint_names = None
+            if 'joint_names' in processed_data:
+                joint_names = processed_data['joint_names'][0]
+
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['applied_torque'][:, env_id, i], linewidth=2)
+                if joint_names is not None and i < len(joint_names):
+                    label = format_joint_name(str(joint_names[i]))
+                else:
+                    label = f'Dim {i}'
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel('Torque (Nm)')
+                ax.grid(True, alpha=0.3)
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'joint_torques_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
         # --- Base Velocity ---
         if 'base_velocity' in processed_data:
             n_dims = processed_data['base_velocity'].shape[2]
@@ -711,6 +781,18 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
         per_env_mean = v_data.mean(axis=0)  # [envs]
         _log("")
         _log("Lyapunov Function (V):")
+        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
+        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+
+    # --- Norm squared error ---
+    if 'y_des' in processed and 'y_act' in processed and 'dy_des' in processed and 'dy_act' in processed:
+        e_pos = processed['y_des'][si:ei] - processed['y_act'][si:ei]  # [T, envs, pos_dims]
+        e_vel = processed['dy_des'][si:ei] - processed['dy_act'][si:ei]  # [T, envs, vel_dims]
+        e = np.concatenate([e_pos, e_vel], axis=2)  # [T, envs, pos_dims + vel_dims]
+        norm_sq = (e ** 2).sum(axis=2)  # [T, envs]
+        per_env_mean = norm_sq.mean(axis=0)  # [envs]
+        _log("")
+        _log("Norm Squared Error (dot(e,e)):")
         _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
         _log(f"  Std  across envs: {per_env_mean.std():.6f}")
 

@@ -18,10 +18,10 @@ from .g1_trajopt_obs import G1TrajOptObservationsCfg
 from robot_rl.assets.robots.g1_21j import (G1_MINIMAL_CFG, G1_ACTION_SCALE,)  # isort: skip
 from ..terrains.rough import ROUGH_FOR_BASIC_LOCOMOTION_CFG, ROUGH_SLOPED_FOR_BASIC_LOCOMOTION_CFG, ROBUSTNESS_TEST_FOR_BASIC_LOCOMOTION_CFG
 
-REWARD_TYPE = "MIMIC"                 # CLF, MIMIC (TODO: SHOULD I ADJUST THESE TO BE EXACTLY ZEST?)
-TRACKING_REW_TYPE = "ADJ"      # GOAL, ADJ, GOAL_ADJ
+REWARD_TYPE = "CLF"                 # CLF, MIMIC (TODO: SHOULD I ADJUST THESE TO BE EXACTLY ZEST?)
+TRACKING_REW_TYPE = "GOAL_ADJ"      # GOAL, ADJ, GOAL_ADJ
 TRAJECTORY_TYPE = "DYNAMIC_HD"      # DYNAMIC_HD, KINEMATIC_HD, HD, DYNAMIC
-SPEED_RANGE = "SINGLE"              # SINGLE, ALL
+SPEED_RANGE = "ALL"              # SINGLE, ALL
 
 ##
 # Lyapunov Weights
@@ -465,12 +465,15 @@ elif TRAJECTORY_TYPE == "KINEMATIC_HD":
     traj_path = "trajectories/running_tracking_kinematics"
 elif TRAJECTORY_TYPE == "DYNAMIC_HD":
     traj_path = "trajectories/running_tracking"
+elif TRAJECTORY_TYPE == "DYNAMIC":
+    traj_path = "trajectories/running/2026-02-23_12-17-04_running_config"
 else:
     raise NotImplementedError(f"Trajectory type {TRAJECTORY_TYPE} is not supported yet!")
 
 # path = "trajectories/run2_subject1",
 # path = "trajectories/running_tracking_kinematics",
 # path = "trajectories/running_tracking",
+# path = "trajectories/running/2026-02-23_12-17-04_running_config"      # Dynamic, no human data
 # path = "trajectories/running/2026-02-20_12-53-44_running_tracking_kinematics_config",         # Single kinematic, periodic constraint only
 # path = "trajectories/running/2026-02-20_13-05-36_running_tracking_kinematics_config",         # Single kinematic, no periodic, no heuristic constraints
 # path = "trajectories/running/2026-02-20_15-26-16_running_tracking_kinematics_config",         # Single kinematic, heuristic constraints only
@@ -559,13 +562,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Base
         base_pos = RewTerm(
             func=mdp.base_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.4}
         )
         base_ori = RewTerm(
             func=mdp.base_ori_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.5}
         )
@@ -576,13 +579,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
             ##
             base_lin_vel = RewTerm(
                 func=mdp.base_lin_vel_reward,
-                weight=1.0,
+                weight=1.5,
                 params={"command_name": "traj_ref",
                         "sigma": 0.6}
             )
             base_ang_vel = RewTerm(
                 func=mdp.base_ang_vel_reward,
-                weight=1.0,
+                weight=1.5,
                 params={"command_name": "traj_ref",
                         "sigma": 1.5}
             )
@@ -592,13 +595,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
             ##
             base_lin_vel = RewTerm(
                 func=mdp.base_lin_vel_reward,
-                weight=2.0, #1.0,
+                weight=2.5, #1.0,
                 params={"command_name": "traj_ref",
                         "sigma": 0.4} #0.6}
             )
             base_ang_vel = RewTerm(
                 func=mdp.base_ang_vel_reward,
-                weight=2.0, #1.0,
+                weight=2.5, #1.0,
                 params={"command_name": "traj_ref",
                         "sigma": 0.75} #1.5}
             )
@@ -606,13 +609,13 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Joints
         joint_pos = RewTerm(
             func=mdp.joint_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.3*math.sqrt(21)}
         )
         joint_vel = RewTerm(
             func=mdp.joint_vel_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 6.5*math.sqrt(21)}
         )
@@ -620,25 +623,25 @@ class G1RunningRewardCfg(G1TrajOptCLFRewards):
         # Bodies
         body_pos = RewTerm(
             func=mdp.body_pos_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.2*math.sqrt(4)}
         )
         body_ori = RewTerm(
             func=mdp.body_ori_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 0.4 * math.sqrt(4)}
         )
         body_lin_vel = RewTerm(
             func=mdp.body_lin_vel_reward,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "traj_ref",
                     "sigma": 2.0 * math.sqrt(4)}
         )
         body_ang_vel = RewTerm(
             func=mdp.body_ang_vel_reward,
-            weight=1.0, #0.0,
+            weight=1.5, #0.0,
             params={"command_name": "traj_ref",
                     "sigma": 1.0 * math.sqrt(4)}
         )
@@ -805,6 +808,9 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+        # self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        # self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
@@ -833,8 +839,7 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
         self.events.gain_randomization = None
-        self.events.joint_friction_params = None
-        self.events.arm_friction_params = None
+        # self.events.joint_friction_params = None  # Can't use this - friction goes out of distribution
 
 @configclass
 class G1RunningGaitLibraryEnvCfgExperiment(G1RunningGaitLibraryEnvCfg):

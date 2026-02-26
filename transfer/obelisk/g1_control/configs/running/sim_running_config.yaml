@@ -11,10 +11,13 @@ onboard:
           # "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
 
           # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
-          "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+          # "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
 
           # "running_clf_sym/2026-02-15_11-20-21_T2_running_higher_tor_l2_higher_tor_lim_sym",
           # "running_clf_sym/2026-02-15_11-25-13_T1_running_higher_l2_10_lim_sym",
+
+          # "running_clf_sym/2026-02-23_10-41-24_T5_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym",
+          "running_clf_sym/2026-02-25_14-32-28_running_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_NEW_USD_FIXES_sym",
 
           # Walking
           "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
@@ -75,11 +78,11 @@ onboard:
         v_x_min: -1.1
         v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 0.75
+        w_z_max: 0.5
         vel_increment: 0.1
         kp_yaw: 3.5 #3.0
         kd_yaw: 0.0 #0.1
-        kp_y: 2.0 #5.0
+        kp_y: 1.0 #2.0 #5.0
         kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
@@ -140,7 +143,7 @@ onboard:
       params:
         v_x_scale: 3.6
         v_y_scale: 0.5
-        w_z_scale: 0.75
+        w_z_scale: 0.5
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:

@@ -256,6 +256,41 @@ class Robot:
                 joint_names.append(joint_name)
         return joint_names
 
+    def set_initial_condition(self, policy: "RLPolicy") -> None:
+        """Set the robot state from the valid IC in the policy YAML.
+
+        The IC vectors are [base, joints_in_isaac_order]. Joint values are
+        reordered to MuJoCo order before writing to qpos/qvel.
+
+        Args:
+            policy: The RLPolicy object containing the valid IC data.
+        """
+        ic_pos = policy.get_valid_ic_pos()
+        ic_vel = policy.get_valid_ic_vel()
+        if ic_pos is None or ic_vel is None:
+            print("[WARNING] No valid IC found in policy params, using XML default.")
+            return
+
+        isaac_joint_names = policy.get_joint_names()
+
+        # qpos: [base_pos(3), base_quat(4), joint_pos(N)]
+        self.mj_data.qpos[:7] = ic_pos[:7]
+        joint_pos_isaac = ic_pos[7:]
+        self.mj_data.qpos[7:] = policy.convert_joint_order(
+            joint_pos_isaac, isaac_joint_names, self.joint_names
+        )
+
+        # qvel: [base_lin_vel(3), base_ang_vel(3), joint_vel(N)]
+        self.mj_data.qvel[:6] = ic_vel[:6]
+        joint_vel_isaac = ic_vel[6:]
+        self.mj_data.qvel[6:] = policy.convert_joint_order(
+            joint_vel_isaac, isaac_joint_names, self.joint_names
+        )
+
+        # Forward kinematics to update derived quantities
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        print("[INFO] Set initial condition from policy YAML.")
+
     def set_pd_gains_from_policy(self, policy) -> None:
         """Set PD gains on MuJoCo actuators from the RLPolicy gains.
 

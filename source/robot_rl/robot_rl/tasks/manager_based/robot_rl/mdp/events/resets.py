@@ -10,6 +10,8 @@ from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
+# TODO: Break the key parts of this into another function that can be called from the play script easily.
+#   Then I can more easily log initial conditions.
 
 def reset_on_reference(
         env: ManagerBasedEnv,
@@ -48,7 +50,8 @@ def reset_on_reference(
     # Get the robot asset and trajectory command
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
-    env.command_manager.get_term(conditioner_command_name)._resample(env_ids)
+    env.command_manager.get_term(conditioner_command_name)._resample(env_ids)   #     env.command_manager.get_term(conditioner_command_name).reset(env_ids)
+    env.command_manager.get_term(conditioner_command_name)._update_command()
     num_env = len(env_ids)
 
     if num_env == 0:
@@ -63,7 +66,7 @@ def reset_on_reference(
 
     # Temporarily adjust the commands to be in the special range
     r_on_ref = torch.empty(num_ref_envs, device=env.device)
-    special_envs = r_on_ref.uniform_(0.0, 1.0) <= rel_envs_on_special
+    special_envs = r_on_ref.uniform_(0.0, 1.0) < rel_envs_on_special
     command = env.command_manager.get_term(conditioner_command_name).command
     command_clone = command.clone()
     command[ref_ids[special_envs], 0] = special_val * torch.ones(len(ref_ids[special_envs]), device=env.device)
@@ -88,6 +91,7 @@ def reset_on_reference(
             f"Found {len(ori_indices)} orientation outputs."
         )
 
+    # TODO: Can get rid of this to speed things up
     # Validate all robot joints are in trajectory outputs
     traj_joint_names = set()
     for name in cmd.ordered_pos_output_names:
@@ -174,31 +178,34 @@ def reset_on_reference(
     # Restore command
     env.command_manager.get_term(conditioner_command_name).command[:] = command_clone
 
-    # # Compute the measured outputs and print
-    # cmd.get_measured_outputs(random_times, env_ids=ref_ids)
+    # if num_ref_envs > 0:
+    #     # Compute the measured outputs and print
+    #     cmd.get_measured_outputs(random_times, env_ids=ref_ids)
     #
-    # # Get the desired outputs and print
-    # cmd.get_desired_outputs(random_times, env_ids=ref_ids)
+    #     # Get the desired outputs and print
+    #     cmd.get_desired_outputs(random_times, env_ids=ref_ids)
     #
-    # # Compute V
-    # vdot, v = cmd.clf.compute_vdot(cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des, cmd.yaw_output_idxs)
+    #     # Compute V
+    #     vdot, v = cmd.clf.compute_vdot(cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des)
     #
-    # # Pretty print the output names, desired values, and measured values
-    # _pretty_print_reset_state(
-    #     cmd.ordered_pos_output_names,
-    #     cmd.ordered_vel_output_names,
-    #     cmd.y_des,
-    #     cmd.y_act,
-    #     cmd.dy_des,
-    #     cmd.dy_act,
-    #     random_times,
-    #     v,
-    #     vdot,
-    #     cmd.clf.v_subgroups,
-    #     cmd_vel,
-    #     cmd.clf,
-    #     env_idx=0,
-    # )
+    #     cmd_vel = command_clone #command
+    #
+    #     # Pretty print the output names, desired values, and measured values
+    #     _pretty_print_reset_state(
+    #         cmd.ordered_pos_output_names,
+    #         cmd.ordered_vel_output_names,
+    #         cmd.y_des,
+    #         cmd.y_act,
+    #         cmd.dy_des,
+    #         cmd.dy_act,
+    #         random_times,
+    #         v,
+    #         vdot,
+    #         cmd.clf.v_subgroups,
+    #         cmd_vel,
+    #         cmd.clf,
+    #         env_idx=0,
+    #     )
 
 
     if num_nonref_envs != 0:
