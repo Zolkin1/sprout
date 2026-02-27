@@ -280,6 +280,113 @@ def plot_xy_trajectory(data: Dict[str, np.ndarray], save_dir: str) -> None:
     print(f"Saved XY trajectory plot to: {output_path}")
 
 
+def plot_paper_figure(data: Dict[str, np.ndarray], save_dir: str, window_size: int = 20) -> None:
+    """Create a publication-quality figure with LaTeX fonts.
+
+    Generates a 1x3 figure with: X velocity tracking, XY trajectory, and yaw angle tracking.
+    Saves as both PNG and PDF.
+
+    Args:
+        data: Dictionary of odometry data arrays.
+        save_dir: Directory to save the plots.
+        window_size: Window size for moving average smoothing.
+    """
+    # Save original rcParams and set LaTeX configuration
+    original_params = {k: plt.rcParams[k] for k in [
+        "text.usetex", "font.family", "text.latex.preamble",
+        "font.size", "axes.labelsize", "axes.titlesize",
+        "xtick.labelsize", "ytick.labelsize", "legend.fontsize",
+    ]}
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "text.latex.preamble": r"\usepackage{amsmath,amsfonts}",
+        "font.size": 12,
+        "axes.labelsize": 13,
+        "axes.titlesize": 14,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+    })
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 2.5))
+    time = data['time']
+
+    # --- Subplot 1: X Velocity Tracking ---
+    x_vel_smooth, offset = compute_moving_average(data['lin_vel_w_x'], window_size)
+    time_smooth = time[offset:offset + len(x_vel_smooth)]
+
+    axes[0].plot(time, data['lin_vel_w_x'], color='tab:blue', linewidth=0.8, alpha=0.3)
+    axes[0].plot(time_smooth, x_vel_smooth, color='tab:blue', linewidth=2, label=r'Actual')
+    if 'x_vel_cmd' in data:
+        axes[0].plot(time, data['x_vel_cmd'], color='tab:red', linestyle='--', linewidth=2, label=r'Commanded')
+    axes[0].set_xlabel(r'Time (s)')
+    axes[0].set_ylabel(r'Velocity ($\mathrm{m/s}$)')
+    axes[0].set_title(r'Forward Velocity Tracking')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    # --- Subplot 2: Yaw Angle Tracking ---
+    yaw_actual = np.unwrap(data['yaw_w'])
+    yaw_target = np.unwrap(data['yaw_target_w'])
+    yaw_smooth, yaw_offset = compute_moving_average(yaw_actual, window_size)
+    time_yaw_smooth = time[yaw_offset:yaw_offset + len(yaw_smooth)]
+
+    axes[1].plot(time, yaw_actual, color='tab:blue', linewidth=0.8, alpha=0.3)
+    axes[1].plot(time_yaw_smooth, yaw_smooth, color='tab:blue', linewidth=2, label=r'Actual')
+    axes[1].plot(time, yaw_target, color='tab:red', linestyle='--', linewidth=2, label=r'Desired')
+    axes[1].set_xlabel(r'Time (s)')
+    axes[1].set_ylabel(r'Yaw Angle (rad)')
+    axes[1].set_title(r'Yaw Angle Tracking')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    # --- Subplot 3: XY Trajectory ---
+    robot_x = data['pos_w_x']
+    robot_y = data['pos_w_y']
+    has_target = 'target_pos_w_x' in data and 'target_pos_w_y' in data
+
+    axes[2].plot(robot_x, robot_y, color='tab:blue', linewidth=2, label=r'Actual')
+    axes[2].plot(robot_x[0], robot_y[0], 'o', color='tab:green', markersize=8, zorder=5)
+    axes[2].plot(robot_x[-1], robot_y[-1], 'o', color='tab:red', markersize=8, zorder=5)
+    if has_target:
+        target_x = data['target_pos_w_x']
+        target_y = data['target_pos_w_y']
+        axes[2].plot(target_x, target_y, color='tab:red', linestyle='--', linewidth=2, label=r'Desired')
+    axes[2].set_xlabel(r'$x$ Position (m)')
+    axes[2].set_ylabel(r'$y$ Position (m)')
+    axes[2].set_title(r'$(x,y)$ Trajectory')
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(loc='upper left')
+    axes[2].set_aspect('equal')
+
+    # Pad the shorter axis so the plot doesn't get too thin
+    x_range = axes[2].get_xlim()[1] - axes[2].get_xlim()[0]
+    y_range = axes[2].get_ylim()[1] - axes[2].get_ylim()[0]
+    min_aspect_ratio = 0.4  # Shorter axis is at least 40% of longer axis
+    if x_range > 0 and y_range > 0:
+        if y_range / x_range < min_aspect_ratio:
+            y_center = sum(axes[2].get_ylim()) / 2
+            new_half = x_range * min_aspect_ratio / 2
+            axes[2].set_ylim(y_center - new_half, y_center + new_half)
+        elif x_range / y_range < min_aspect_ratio:
+            x_center = sum(axes[2].get_xlim()) / 2
+            new_half = y_range * min_aspect_ratio / 2
+            axes[2].set_xlim(x_center - new_half, x_center + new_half)
+
+    plt.tight_layout()
+
+    # Save as both PNG and SVG
+    for ext in ['png', 'svg']:
+        output_path = os.path.join(save_dir, f'paper_figure.{ext}')
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Saved paper figure to: {output_path}")
+    plt.close()
+
+    # Restore original rcParams
+    plt.rcParams.update(original_params)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Plot odometry data from CSV file')
     parser.add_argument('--data', help='Path to CSV file (if not provided, uses most recent from odom_logs)')
@@ -315,6 +422,7 @@ def main():
     plot_velocity_tracking(data, save_dir)
     plot_yaw_y_tracking(data, save_dir)
     plot_xy_trajectory(data, save_dir)
+    plot_paper_figure(data, save_dir)
 
     print("Plotting complete!")
 

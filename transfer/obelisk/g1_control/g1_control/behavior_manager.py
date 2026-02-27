@@ -89,14 +89,14 @@ class BehaviorManager:
         phi = current_policy.get_phi()
 
         # Check if phi is near 0 (including wrap-around) or 0.5
-        PHI_TOLERANCE = 0.05
+        PHI_TOLERANCE = 0.03
 
         # For now just hard-code the phasing variables for each transition
         current_policy_idx = self.get_active_policy_idx()
         if self.active_behavior == "walking":
             val = 0.164
         elif self.active_behavior == "running":
-            val = 0.5
+            val = 0.03 #0.9 #0.06 #0.5
         else:
             raise ValueError(f"Invalid active behavior: {self.active_behavior}")
 
@@ -107,6 +107,7 @@ class BehaviorManager:
             self.last_behavior_switch = time
             self.pending_behavior = None
             self.policies[self.get_active_policy_idx()].reset_last_action()
+            self.policies[self.get_active_policy_idx()].set_last_zero_time(time)
             return True
 
         return False
