@@ -9,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 import tf2_ros
 from nav_msgs.msg import Path, Odometry
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from rclpy.executors import SingleThreadedExecutor
 from obelisk_py.core.utils.ros import spin_obelisk
 from obelisk_py.core.control import ObeliskController
@@ -42,7 +42,7 @@ class MPCController(ObeliskController, ABC):
 
     def __init__(self, node_name: str = "mpc_controller") -> None:
         """Initialize the example position setpoint controller."""
-        super().__init__(node_name, VelocityCommand, Odometry)
+        super().__init__(node_name, Twist, Odometry)
 
         self.frame_id = ""
         self.z0 = 0
@@ -54,7 +54,7 @@ class MPCController(ObeliskController, ABC):
         self.declare_parameter("z_min", [-1e9, -1e9, -1e9])
         self.declare_parameter("v_max", [0.8, 0.2, 0.8])
         self.declare_parameter("v_min", [-0.3, -0.2, -0.8])
-        self.declare_parameter("body_heading", [0., 0., 1.])  # Vector in the lidar body frame which corrosponds to the heading of the robot.
+        self.declare_parameter("body_heading", [1., 0., 0.])  # Vector in the lidar body frame which corrosponds to the heading of the robot.
         self.declare_parameter("warm_start", "start")
         self.declare_parameter("N", 25)
         self.declare_parameter("Q", [10., 10., 0.1])
@@ -62,6 +62,7 @@ class MPCController(ObeliskController, ABC):
         self.declare_parameter("cbf_alpha", 0.7)
         self.declare_parameter("cbf_delta", 0.2)
         self.declare_parameter("v_norm_max", -1.0)  # negative = disabled
+        self.declare_parameter("dv_max", [-1.0, -1.0, -1.0])  # per-component input rate limits, negative = disabled
         self.declare_parameter("goal_deadzone", 0.1)
         self.declare_parameter("plan_topic", "/mpc_plan")
         self.declare_parameter("path_topic", "/robot_path")
@@ -81,6 +82,8 @@ class MPCController(ObeliskController, ABC):
         cbf_delta = self.get_parameter("cbf_delta").get_parameter_value().double_value
         v_norm_max_val = self.get_parameter("v_norm_max").get_parameter_value().double_value
         self.v_norm_max = v_norm_max_val if v_norm_max_val > 0 else None
+        dv_max_vals = np.array(self.get_parameter("dv_max").get_parameter_value().double_array_value)
+        self.dv_max = dv_max_vals if np.all(dv_max_vals > 0) else None
         self.goal_deadzone = self.get_parameter("goal_deadzone").get_parameter_value().double_value
         debug_file = self.get_parameter("debug_file").get_parameter_value().string_value
         root = os.environ.get("LEGGED_LOCOMOTION_RL_ROOT", "")
@@ -106,6 +109,7 @@ class MPCController(ObeliskController, ABC):
         }
 
         self.planning_model = CasadiUnicycle(dt, z_min, z_max, v_min, v_max)
+        self.v_prev = np.zeros(self.planning_model.m)
         self.sol, self.solver = solve_nominal_cbf(
             self.start,
             self.goal,
@@ -118,7 +122,8 @@ class MPCController(ObeliskController, ABC):
             delta=cbf_delta,
             warm_start=warm_start,
             debug_filename=self.fn,
-            v_norm_max=self.v_norm_max
+            v_norm_max=self.v_norm_max,
+            dv_max=self.dv_max
         )
 
         # MPC solution log file
@@ -188,9 +193,9 @@ class MPCController(ObeliskController, ABC):
         joy_topic = self.get_parameter("joy_topic").get_parameter_value().string_value
         self.create_subscription(Joy, joy_topic, self.on_joy, 10)
 
-        # IMU subscription for gravity alignment
-        imu_topic = self.get_parameter("imu_topic").get_parameter_value().string_value
-        self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
+        # # IMU subscription for gravity alignment
+        # imu_topic = self.get_parameter("imu_topic").get_parameter_value().string_value
+        # self.create_subscription(Imu, imu_topic, self.imu_callback, 10)
 
         # TF broadcaster for odom->camera_init transform
         self.tf_static_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
@@ -368,10 +373,6 @@ class MPCController(ObeliskController, ABC):
 
         return obs_odom, goal_odom
 
-    def imu_callback(self, msg: Imu) -> None:
-        """Store latest IMU message for gravity alignment."""
-        self.imu_msg = msg
-
     def start_zeroing(self) -> None:
         """Begin the non-blocking zeroing process."""
         self.get_logger().info("ZEROING: Starting calibration sequence...")
@@ -547,27 +548,27 @@ class MPCController(ObeliskController, ABC):
 
         return Rotation.from_rotvec(axis * angle)
 
-    def _publish_odom_camera_init_transform(self) -> None:
-        """Publish odom -> camera_init static transform."""
-        if self.tf_static_broadcaster is None:
-            return
+    # def _publish_odom_camera_init_transform(self) -> None:
+    #     """Publish odom -> camera_init static transform."""
+    #     if self.tf_static_broadcaster is None:
+    #         return
 
-        t = TransformStamped()
-        t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = self.get_parameter("odom_frame").get_parameter_value().string_value
-        t.child_frame_id = self.get_parameter("camera_init_frame").get_parameter_value().string_value
+    #     t = TransformStamped()
+    #     t.header.stamp = self.get_clock().now().to_msg()
+    #     t.header.frame_id = self.get_parameter("odom_frame").get_parameter_value().string_value
+    #     t.child_frame_id = self.get_parameter("camera_init_frame").get_parameter_value().string_value
 
-        quat = self.R_odom_camera_init.as_quat()
-        t.transform.translation.x = self.t_odom_camera_init[0]
-        t.transform.translation.y = self.t_odom_camera_init[1]
-        t.transform.translation.z = self.t_odom_camera_init[2]
-        t.transform.rotation.x = quat[0]
-        t.transform.rotation.y = quat[1]
-        t.transform.rotation.z = quat[2]
-        t.transform.rotation.w = quat[3]
+    #     quat = self.R_odom_camera_init.as_quat()
+    #     t.transform.translation.x = self.t_odom_camera_init[0]
+    #     t.transform.translation.y = self.t_odom_camera_init[1]
+    #     t.transform.translation.z = self.t_odom_camera_init[2]
+    #     t.transform.rotation.x = quat[0]
+    #     t.transform.rotation.y = quat[1]
+    #     t.transform.rotation.z = quat[2]
+    #     t.transform.rotation.w = quat[3]
 
-        self.tf_static_broadcaster.sendTransform(t)
-        self.get_logger().info("ZEROING: Published static transform odom -> camera_init")
+    #     self.tf_static_broadcaster.sendTransform(t)
+    #     self.get_logger().info("ZEROING: Published static transform odom -> camera_init")
 
     def finish_zeroing(self, success: bool) -> None:
         """Complete the zeroing process and transition state."""
@@ -603,35 +604,46 @@ class MPCController(ObeliskController, ABC):
         Parameters:
             odom_msg: The nav_msgs/Odometry message containing pose in camera_init frame.
         """
-        # Store message for zeroing state machine
+        # # Store message for zeroing state machine
+        # self.odom_msg = odom_msg
+        # self.received_xhat = True
+
+        # # Extract position and orientation from Odometry
+        # pos = odom_msg.pose.pose.position
+        # ori = odom_msg.pose.pose.orientation
+
+        # position_camera_init = np.array([pos.x, pos.y, pos.z])
+        # quat_camera_init = np.array([ori.x, ori.y, ori.z, ori.w])  # scipy format [x,y,z,w]
+        # R_camera_init = Rotation.from_quat(quat_camera_init)
+
+        # # Apply transform if zeroing has been done
+        # if self.R_odom_camera_init is not None:
+        #     # Transform position: p_odom = R @ p_camera_init + t
+        #     position_odom = self.R_odom_camera_init.apply(position_camera_init) + self.t_odom_camera_init
+
+        #     # Transform orientation: R_odom = R_transform @ R_camera_init
+        #     R_odom = self.R_odom_camera_init * R_camera_init
+
+        #     # Extract yaw from transformed orientation
+        #     heading = R_odom.apply(self.body_heading)
+        #     yaw = np.atan2(heading[1], heading[0])
+
+        #     self.start = np.array([position_odom[0], position_odom[1], yaw])
+        #     self.z0 = position_odom[2]
+        #     self.frame_id = self.get_parameter("odom_frame").get_parameter_value().string_value
+
         self.odom_msg = odom_msg
         self.received_xhat = True
 
-        # Extract position and orientation from Odometry
-        pos = odom_msg.pose.pose.position
         ori = odom_msg.pose.pose.orientation
+        R_body = Rotation.from_quat([ori.x, ori.y, ori.z, ori.w])
+        heading = R_body.apply(self.body_heading)
+        yaw = np.atan2(heading[1], heading[0])
+        self.start = np.array([odom_msg.pose.pose.position.x, odom_msg.pose.pose.position.y, yaw])
+        self.frame_id = odom_msg.header.frame_id
+        self.z0 = odom_msg.pose.pose.position.z
 
-        position_camera_init = np.array([pos.x, pos.y, pos.z])
-        quat_camera_init = np.array([ori.x, ori.y, ori.z, ori.w])  # scipy format [x,y,z,w]
-        R_camera_init = Rotation.from_quat(quat_camera_init)
-
-        # Apply transform if zeroing has been done
-        if self.R_odom_camera_init is not None:
-            # Transform position: p_odom = R @ p_camera_init + t
-            position_odom = self.R_odom_camera_init.apply(position_camera_init) + self.t_odom_camera_init
-
-            # Transform orientation: R_odom = R_transform @ R_camera_init
-            R_odom = self.R_odom_camera_init * R_camera_init
-
-            # Extract yaw from transformed orientation
-            heading = R_odom.apply(self.body_heading)
-            yaw = np.atan2(heading[1], heading[0])
-
-            self.start = np.array([position_odom[0], position_odom[1], yaw])
-            self.z0 = position_odom[2]
-            self.frame_id = self.get_parameter("odom_frame").get_parameter_value().string_value
-
-    def compute_control(self) -> VelocityCommand:
+    def compute_control(self) -> Twist:
         """Compute the control signal for the dummy 2-link robot.
 
         Returns:
@@ -663,7 +675,8 @@ class MPCController(ObeliskController, ABC):
                 return self.publish_zero_vel()
 
             z_sol, v_sol = extract_solution(self.sol, self.N, self.planning_model.n, self.planning_model.m)
-            params = init_params(self.start, goal_odom, obs_odom)
+            v_prev = self.v_prev if self.dv_max is not None else None
+            params = init_params(self.start, goal_odom, obs_odom, v_prev=v_prev)
             x_init = init_decision_var(z_sol, v_sol)
 
             self.sol = self.solver["solver"](
@@ -682,14 +695,17 @@ class MPCController(ObeliskController, ABC):
 
             z_sol, v_sol = extract_solution(self.sol, self.N, self.planning_model.n, self.planning_model.m)
 
+            # Update v_prev for next solve's rate limit
+            self.v_prev = v_sol[0, :]
+
             # self.get_logger().info(f"MPC Solve: \n\tIC: {self.start}\n\tTraj: {z_sol}")
 
             # setting the message
-            vel_cmd = VelocityCommand()
-            vel_cmd.header.stamp = self.get_clock().now().to_msg()
-            vel_cmd.v_x = v_sol[0, 0]
-            vel_cmd.v_y = v_sol[0, 1]
-            vel_cmd.w_z = v_sol[0, 2]
+            vel_cmd = Twist()
+            # vel_cmd.header.stamp = self.get_clock().now().to_msg()
+            vel_cmd.linear.x = v_sol[0, 0]
+            vel_cmd.linear.y = v_sol[0, 1]
+            vel_cmd.angular.z = v_sol[0, 2]
             self.obk_publishers["pub_ctrl"].publish(vel_cmd)
 
             plan_msg = Path()
@@ -761,11 +777,10 @@ class MPCController(ObeliskController, ABC):
         return self.publish_zero_vel()
 
     def publish_zero_vel(self):
-        vel_cmd = VelocityCommand()
-        vel_cmd.header.stamp = self.get_clock().now().to_msg()
-        vel_cmd.v_x = 0.0
-        vel_cmd.v_y = 0.0
-        vel_cmd.w_z = 0.0
+        vel_cmd = Twist()
+        vel_cmd.linear.x = 0.0
+        vel_cmd.linear.y = 0.0
+        vel_cmd.angular.z = 0.0
         self.obk_publishers["pub_ctrl"].publish(vel_cmd)
         return vel_cmd
 
@@ -855,10 +870,10 @@ class MPCController(ObeliskController, ABC):
         if self.requested_mode == self.mode:
             return
 
-        if self.requested_mode == Mode.RUNNING and not self.is_zeroed:
-            self.get_logger().warn("[MPC NODE]: RUN requested but not zeroed -> must ZERO first.")
-            self.requested_mode = self.mode  # Clear invalid request
-            return
+        # if self.requested_mode == Mode.RUNNING and not self.is_zeroed:
+        #     self.get_logger().warn("[MPC NODE]: RUN requested but not zeroed -> must ZERO first.")
+        #     self.requested_mode = self.mode  # Clear invalid request
+        #     return
 
         self.transition_to(self.requested_mode)
 

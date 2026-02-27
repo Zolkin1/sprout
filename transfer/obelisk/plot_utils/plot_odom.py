@@ -139,6 +139,7 @@ def plot_velocity_tracking(data: Dict[str, np.ndarray], save_dir: str, window_si
     axes[0].set_title('X Velocity')
     axes[0].set_xlabel('Time (s)')
     axes[0].set_ylabel('Velocity (m/s)')
+    axes[0].set_ylim([4, -1.5])
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -161,6 +162,7 @@ def plot_velocity_tracking(data: Dict[str, np.ndarray], save_dir: str, window_si
     axes[2].set_title('Yaw Rate')
     axes[2].set_xlabel('Time (s)')
     axes[2].set_ylabel('Angular Velocity (rad/s)')
+    axes[2].set_ylim([2, -2])
     axes[2].grid(True, alpha=0.3)
     axes[2].legend()
 

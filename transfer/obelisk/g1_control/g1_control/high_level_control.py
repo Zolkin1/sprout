@@ -127,6 +127,7 @@ class HighLevelController(ObeliskController, ABC):
             self.yaw_target_w = 0.0
             self.yaw_cur_w = 0.0
             self.quat_w = np.zeros(4)
+            self.quat_w[3] = 1.0
 
             self.yaw_world = 0.0
             self.world_origin = np.zeros(3)

@@ -20,13 +20,18 @@ problem_dict = {
     },
     "right": {
         "start": start,
-        "goal": np.array([2, 0, 0.]),
+        "goal": np.array([30.0, 15.0, 0.0]),
         "obs": {
-            'cx': np.array([1., 0.625]),
-            'cy': np.array([1., -0.625]),
-            'rx': np.array([0.5, 0.5]),
-            'ry': np.array([0.5, 0.5]),
+            'cx': np.array([20., 15.0]),
+            'cy': np.array([10., -4.0]),
+            'rx': np.array([5.0, 5.0]),
+            'ry': np.array([5.0, 5.0]),
             'yaw': np.array([0., 0.])
+            # 'cx': np.zeros((0,)),
+            # 'cy': np.zeros((0,)),
+            # 'rx': np.zeros((0,)),
+            # 'ry': np.zeros((0,)),
+            # 'yaw': np.zeros((0,))
         },
     },
     "right_wide": {

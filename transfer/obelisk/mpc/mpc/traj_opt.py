@@ -231,7 +231,45 @@ def velocity_norm_constraint(v, v_norm_max):
     return ca.horzcat(*g), ca.horzcat(*g_lb), ca.horzcat(*g_ub)
 
 
-def setup_trajopt_solver(pm, N, Nobs):
+def input_rate_constraint(v, v_prev, dv_max):
+    """Constrains the rate of change of inputs between consecutive timesteps.
+
+    Enforces -dv_max[j] <= v[k,j] - v[k-1,j] <= dv_max[j] for each component j.
+    At k=0, the constraint is against v_prev (parameter from previous solve).
+
+    :param v: input variable, N x m
+    :param v_prev: previous solve's first input, 1 x m (CasADi parameter)
+    :param dv_max: per-component rate limits, (m,) numpy array
+    :return: constraints g, g_lb, g_ub
+    """
+    g = []
+    g_lb = []
+    g_ub = []
+    m = v.shape[1]
+    dv_max_dm = ca.DM(dv_max)
+
+    for k in range(v.shape[0]):
+        if k == 0:
+            diff = v[0, :] - v_prev
+        else:
+            diff = v[k, :] - v[k - 1, :]
+        for j in range(m):
+            g.append(diff[j])
+            g_lb.append(ca.DM([-float(dv_max_dm[j])]))
+            g_ub.append(ca.DM([float(dv_max_dm[j])]))
+
+    return ca.horzcat(*g), ca.horzcat(*g_lb), ca.horzcat(*g_ub)
+
+
+def setup_trajopt_solver(pm, N, Nobs, has_rate_limit=False):
+    """Set up decision variables, bounds, and parameters for trajectory optimization.
+
+    :param pm: planning model with dynamics, bounds, etc.
+    :param N: planning horizon
+    :param Nobs: number of obstacles
+    :param has_rate_limit: if True, adds p_v_prev parameter for rate limiting
+    :return: tuple of decision variables, bounds, and parameters
+    """
     # Set up state/input bounds
     z_min = ca.DM(pm.z_min)
     z_max = ca.DM(pm.z_max)
@@ -251,15 +289,18 @@ def setup_trajopt_solver(pm, N, Nobs):
     p_obs_ry = ca.MX.sym("p_obs_ry", Nobs, 1)  # semi-axis in local y
     p_obs_yaw = ca.MX.sym("p_obs_yaw", Nobs, 1)  # rotation angle (radians)
 
+    # Previous solve's first input (for rate limiting)
+    p_v_prev = ca.MX.sym("p_v_prev", 1, pm.m) if has_rate_limit else None
+
     # Make decision variables (2D double integrator)
     z = ca.MX.sym("z", N + 1, pm.n)
     v = ca.MX.sym("v", N, pm.m)
 
-    return z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw
+    return z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw, p_v_prev
 
 
 def trajopt_solver(pm, N, Q, R, Nobs, Qf=None, max_iter=1000, debug_filename=None, v_norm_max=None):
-    z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw = setup_trajopt_solver(pm, N, Nobs)
+    z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw, _ = setup_trajopt_solver(pm, N, Nobs)
 
     if Qf is None:
         Qf = Q
@@ -327,9 +368,8 @@ def trajopt_solver(pm, N, Q, R, Nobs, Qf=None, max_iter=1000, debug_filename=Non
     return solver, nlp_dict, nlp_opts
 
 
-def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, debug_filename=None, v_norm_max=None):
-    """
-    Trajectory optimization solver with CBF obstacle constraints.
+def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, debug_filename=None, v_norm_max=None, dv_max=None):
+    """Trajectory optimization solver with CBF obstacle constraints.
 
     :param pm: planning model with dynamics, bounds, etc.
     :param N: planning horizon
@@ -341,8 +381,11 @@ def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, 
     :param Qf: terminal state cost matrix (defaults to Q)
     :param max_iter: max IPOPT iterations
     :param debug_filename: optional file for debug output
+    :param v_norm_max: if set, constrains velocity 2-norm
+    :param dv_max: per-component input rate limits (m,), None to disable
     """
-    z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw = setup_trajopt_solver(pm, N, Nobs)
+    has_rate = dv_max is not None
+    z, v, z_lb, z_ub, v_lb, v_ub, p_z0, p_zf, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw, p_v_prev = setup_trajopt_solver(pm, N, Nobs, has_rate_limit=has_rate)
 
     if Qf is None:
         Qf = Q
@@ -365,6 +408,12 @@ def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, 
         g_lb = ca.horzcat(g_lb, g_lb_vnorm)
         g_ub = ca.horzcat(g_ub, g_ub_vnorm)
 
+    if has_rate:
+        g_rate, g_lb_rate, g_ub_rate = input_rate_constraint(v, p_v_prev, dv_max)
+        g = ca.horzcat(g, g_rate)
+        g_lb = ca.horzcat(g_lb, g_lb_rate)
+        g_ub = ca.horzcat(g_ub, g_ub_rate)
+
     g = g.T
     g_lb = g_lb.T
     g_ub = g_ub.T
@@ -383,8 +432,10 @@ def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, 
         ca.reshape(v_ub, N * pm.m, 1),
     )
     p_nlp = ca.vertcat(p_z0.T, p_zf.T, p_obs_cx, p_obs_cy, p_obs_rx, p_obs_ry, p_obs_yaw)
+    if has_rate:
+        p_nlp = ca.vertcat(p_nlp, p_v_prev.T)
 
-    x_cols, g_cols, p_cols = generate_cbf_col_names(pm, N, Nobs, x_nlp, g, p_nlp, has_vnorm=v_norm_max is not None)
+    x_cols, g_cols, p_cols = generate_cbf_col_names(pm, N, Nobs, x_nlp, g, p_nlp, has_vnorm=v_norm_max is not None, has_rate_limit=has_rate)
     nlp_dict = {
         "x": x_nlp,
         "f": obj,
@@ -410,7 +461,7 @@ def cbf_trajopt_solver(pm, N, Q, R, Nobs, alpha, delta, Qf=None, max_iter=1000, 
     return solver, nlp_dict, nlp_opts
 
 
-def generate_cbf_col_names(pm, N, Nobs, x, g, p, has_vnorm=False):
+def generate_cbf_col_names(pm, N, Nobs, x, g, p, has_vnorm=False, has_rate_limit=False):
     """Generate column names for CBF solver (N constraints per obstacle, not N+1)."""
     z_str = np.array(["z"] * ((N + 1) * pm.n), dtype='U8').reshape((N + 1, pm.n))
     v_str = np.array(["v"] * (N * pm.m), dtype='U8').reshape((N, pm.m))
@@ -437,6 +488,10 @@ def generate_cbf_col_names(pm, N, Nobs, x, g, p, has_vnorm=False):
     if has_vnorm:
         g_cols += [f"vnorm_{k}" for k in range(N)]
 
+    if has_rate_limit:
+        for k in range(N):
+            g_cols += [f"rate_{k}_{j}" for j in range(pm.m)]
+
     obs_cx_lst = [f'obs_{i}_cx' for i in range(Nobs)]
     obs_cy_lst = [f'obs_{i}_cy' for i in range(Nobs)]
     obs_rx_lst = [f'obs_{i}_rx' for i in range(Nobs)]
@@ -444,6 +499,9 @@ def generate_cbf_col_names(pm, N, Nobs, x, g, p, has_vnorm=False):
     obs_yaw_lst = [f'obs_{i}_yaw' for i in range(Nobs)]
     p_cols = [f'z_ic_{i}' for i in range(pm.n)] + [f'z_g_{i}' for i in range(pm.n)] + \
              obs_cx_lst + obs_cy_lst + obs_rx_lst + obs_ry_lst + obs_yaw_lst
+
+    if has_rate_limit:
+        p_cols += [f'v_prev_{j}' for j in range(pm.m)]
 
     assert len(x_cols) == x.numel() and len(g_cols) == g.numel() and len(p_cols) == p.numel()
     return x_cols, g_cols, p_cols
@@ -497,16 +555,16 @@ def generate_col_names(pm, N, Nobs, x, g, p, H_rev=0, has_vnorm=False):
     return x_cols, g_cols, p_cols
 
 
-def init_params(z0, zf, obs):
-    """
-    Packs initial condition, goal, and ellipse obstacle parameters into a single vector.
+def init_params(z0, zf, obs, v_prev=None):
+    """Packs initial condition, goal, and ellipse obstacle parameters into a single vector.
 
     :param z0: initial state (n,)
     :param zf: goal state (n,)
     :param obs: obstacle dictionary with keys 'cx', 'cy', 'rx', 'ry', 'yaw'
+    :param v_prev: previous solve's first input (m,), None if rate limiting disabled
     :return: parameter vector
     """
-    params = np.vstack([
+    parts = [
         z0[:, None],
         zf[:, None],
         obs['cx'][:, None],
@@ -514,8 +572,10 @@ def init_params(z0, zf, obs):
         obs['rx'][:, None],
         obs['ry'][:, None],
         obs['yaw'][:, None]
-    ])
-    return params
+    ]
+    if v_prev is not None:
+        parts.append(v_prev[:, None])
+    return np.vstack(parts)
 
 
 def init_decision_var(z, v):
@@ -628,9 +688,8 @@ def solve_nominal(start, goal, obs, planning_model, N, Q, R, warm_start='start',
     return sol, solver
 
 
-def solve_nominal_cbf(start, goal, obs, planning_model, N, Q, R, alpha, delta, warm_start='start', debug_filename=None, v_norm_max=None):
-    """
-    Solve trajectory optimization with CBF obstacle constraints.
+def solve_nominal_cbf(start, goal, obs, planning_model, N, Q, R, alpha, delta, warm_start='start', debug_filename=None, v_norm_max=None, dv_max=None):
+    """Solve trajectory optimization with CBF obstacle constraints.
 
     :param start: initial state (n,)
     :param goal: goal state (n,)
@@ -643,15 +702,17 @@ def solve_nominal_cbf(start, goal, obs, planning_model, N, Q, R, alpha, delta, w
     :param delta: safety margin (delta >= 0)
     :param warm_start: initialization method ('start', 'goal', 'interpolate')
     :param debug_filename: optional file for debug output
-    :param v_norm_max: if set, constrains ‖[v_par, v_perp]‖ <= v_norm_max
+    :param v_norm_max: if set, constrains velocity 2-norm
+    :param dv_max: per-component input rate limits (m,), None to disable
     """
     solver, nlp_dict, nlp_opts = cbf_trajopt_solver(
-        planning_model, N, Q, R, len(obs["rx"]), alpha, delta, debug_filename=debug_filename, v_norm_max=v_norm_max
+        planning_model, N, Q, R, len(obs["rx"]), alpha, delta, debug_filename=debug_filename, v_norm_max=v_norm_max, dv_max=dv_max
     )
 
     z_init, v_init = get_warm_start(warm_start, start, goal, N, planning_model)
 
-    params = init_params(start, goal, obs)
+    v_prev = np.zeros(planning_model.m) if dv_max is not None else None
+    params = init_params(start, goal, obs, v_prev=v_prev)
     x_init = init_decision_var(z_init, v_init)
 
     sol = solver["solver"](x0=x_init, p=params, lbg=solver["lbg"], ubg=solver["ubg"], lbx=solver["lbx"],
