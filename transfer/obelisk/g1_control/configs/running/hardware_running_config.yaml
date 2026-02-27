@@ -11,7 +11,12 @@ onboard:
           # Running
           # "running_clf_sym/2026-02-11_19-27-52_T2_running_more_cmd_goal_cond_sym_reward_sym",
           # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
-          "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+          # "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+
+          # New policies
+          # "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- To aggressive on hardware
+          "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Looks good on hardware  
+
 
           # Walking
           "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
@@ -70,11 +75,11 @@ onboard:
         v_x_min: -1.1
         v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 0.75
+        w_z_max: 0.75 #0.4
         vel_increment: 0.1
-        kp_yaw: 2.5 #3.0
+        kp_yaw: 0.75 #2.5 #3.0
         kd_yaw: 0.0 #0.1
-        kp_y: 1.0 #5.0
+        kp_y: 0.5 #1.0 #5.0
         kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
@@ -83,6 +88,8 @@ onboard:
         temp_safety_threshold: 120.0
         temp_lower_start: 105.0
         safe_temp_speed: 1.2
+        traj_dt: 0.3333333
+        traj_nodes: 10
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -91,6 +98,13 @@ onboard:
           callback_group: None
         - ros_parameter: pub_joy_feedback
           topic: /obelisk/g1/joy_feedback
+          history_depth: 10
+        - ros_parameter: pub_odom_data
+          topic: /obelisk/g1/odom
+          history_depth: 10
+        - ros_parameter: pub_traj_data
+          topic: /obelisk/g1/traj_data
+          msg_type: PoseArray
           history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
@@ -183,6 +197,11 @@ onboard:
         - ros_parameter: sub_pelvis_imu
           topic: /obelisk/g1/pelvis_imu
           msg_type: Imu #ObkIMU
+          history_depth: 10
+          callback_group: None
+        - ros_parameter: sub_odom
+          topic: /obelisk/g1/odom
+          msg_type: Odometry
           history_depth: 10
           callback_group: None
       timers:

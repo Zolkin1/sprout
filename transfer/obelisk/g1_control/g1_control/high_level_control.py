@@ -367,7 +367,7 @@ class HighLevelController(ObeliskController, ABC):
             # Transform orientation: R_odom = R_transform @ R_camera_init
             R_odom = self.R_odom_camera_init * R_camera_init
 
-            self.quat_w = R_odom.as_quat(scalar_first=False)
+            self.quat_w = R_odom.as_quat(scalar_first=False)    # TODO: Apply the roll to bring it back to z-up
 
             # Extract yaw from transformed orientation
             heading = R_odom.apply(self.body_heading)
@@ -839,7 +839,7 @@ class HighLevelController(ObeliskController, ABC):
         self.t_odom_camera_init = np.array([
             -op_b[0],
             -op_b[1],
-            0.0  # Keep z offset from gravity-aligned frame
+            0.75 - op_b[2], #0.0  # Keep z offset from gravity-aligned frame
         ])
 
         self.get_logger().info(f"ZEROING: Transform computed. Initial yaw was {np.degrees(initial_yaw):.1f} deg")

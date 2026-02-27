@@ -82,7 +82,7 @@ onboard:
         v_x_min: -1.1
         v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 0.5
+        w_z_max: 0.4
         vel_increment: 0.1
         kp_yaw: 3.5 #3.0
         kd_yaw: 0.0 #0.1
@@ -91,7 +91,7 @@ onboard:
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
-        traj_dt: 0.1
+        traj_dt: 0.3333333
         traj_nodes: 10
       # callback_groups:
       publishers:
@@ -107,7 +107,7 @@ onboard:
           history_depth: 10
         - ros_parameter: pub_traj_data
           topic: /obelisk/g1/traj_data
-          msg_type: Trajectory
+          msg_type: PoseArray
           history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
@@ -199,7 +199,7 @@ onboard:
       params:
         v_x_scale: 3.6
         v_y_scale: 0.5
-        w_z_scale: 0.5
+        w_z_scale: 0.2
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:
