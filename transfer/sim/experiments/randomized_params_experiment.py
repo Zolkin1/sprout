@@ -51,6 +51,8 @@ from plot_randomized_experiment import (
     plot_velocity_comparison,
     plot_torque_comparison,
     plot_force_success_histogram,
+    plot_radar_comparison,
+    print_combined_error_table,
     print_stats_table,
     print_torque_stats_table,
     print_success_table,
@@ -455,12 +457,17 @@ def main():
                 grouped_data,
                 save_path=os.path.join(exp_folder, "comparison_torques"),
             )
+            plot_radar_comparison(
+                grouped_data,
+                save_path=os.path.join(exp_folder, "radar_comparison"),
+            )
 
     # Print stats tables and save to file
     if len(experiment_folders) > 1:
         stats_text = print_stats_table(grouped_data)
         stats_text += print_torque_stats_table(grouped_data)
         stats_text += print_success_table(grouped_data)
+        stats_text += print_combined_error_table(grouped_data)
     else:
         # Single policy — still print stats
         single_grouped = OrderedDict()
@@ -469,6 +476,7 @@ def main():
         stats_text = print_stats_table(single_grouped)
         stats_text += print_torque_stats_table(single_grouped)
         stats_text += print_success_table(single_grouped)
+        stats_text += print_combined_error_table(single_grouped)
 
     for name, exp_folder in experiment_folders.items():
         stats_path = os.path.join(exp_folder, "experiment_stats.txt")

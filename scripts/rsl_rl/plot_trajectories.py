@@ -1,5 +1,6 @@
 import os
 import pickle
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import glob
@@ -741,10 +742,14 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
     ei = end_idx if end_idx is not None else n_timesteps
 
     lines: list[str] = []
+    csv_rows: list[dict[str, str]] = []
 
     def _log(text: str = "") -> None:
         print(text)
         lines.append(text)
+
+    def _csv(metric: str, value: float) -> None:
+        csv_rows.append({"metric": metric, "value": f"{value:.6f}"})
 
     _log("=" * 60)
     _log("  Play Statistics")
@@ -768,10 +773,13 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
         vel_units = ['m/s', 'm/s', 'rad/s']
         _log("")
         _log("Commanded Velocity Ranges:")
+        csv_vel_keys = ['cmd_vel_lin_x', 'cmd_vel_lin_y', 'cmd_vel_ang_z']
         for i in range(min(bv.shape[2], 3)):
             v_min = bv[:, :, i].min()
             v_max = bv[:, :, i].max()
             _log(f"  {vel_labels[i]:>12s}: [{v_min:+.4f}, {v_max:+.4f}] {vel_units[i]}")
+            _csv(f"{csv_vel_keys[i]}_min", float(v_min))
+            _csv(f"{csv_vel_keys[i]}_max", float(v_max))
 
     # --- Mean V (Lyapunov) ---
     if 'v' in processed:
@@ -783,6 +791,8 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
         _log("Lyapunov Function (V):")
         _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
         _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+        _csv("lyapunov_v_mean", float(per_env_mean.mean()))
+        _csv("lyapunov_v_std", float(per_env_mean.std()))
 
     # --- Norm squared error ---
     if 'y_des' in processed and 'y_act' in processed and 'dy_des' in processed and 'dy_act' in processed:
@@ -795,12 +805,14 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
         _log("Norm Squared Error (dot(e,e)):")
         _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
         _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+        _csv("norm_sq_error_mean", float(per_env_mean.mean()))
+        _csv("norm_sq_error_std", float(per_env_mean.std()))
 
     # --- Position errors ---
     if 'y_des' in processed and 'y_act' in processed:
         y_des = processed['y_des'][si:ei]  # [T, envs, dims]
         y_act = processed['y_act'][si:ei]
-        pos_err = np.abs(y_des - y_act)  # [T, envs, dims]
+        pos_err = (y_des - y_act)**2  # [T, envs, dims]
         n_dims = pos_err.shape[2]
 
         # Get labels
@@ -834,12 +846,15 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
                 group_means = mean_over_envs[idxs]
                 group_stds = std_over_envs[idxs]
                 _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+                csv_key = f"pos_error_{group_name.lower()}"
+                _csv(f"{csv_key}_mean", float(group_means.mean()))
+                _csv(f"{csv_key}_std", float(group_stds.mean()))
 
     # --- Velocity errors ---
     if 'dy_des' in processed and 'dy_act' in processed:
         dy_des = processed['dy_des'][si:ei]
         dy_act = processed['dy_act'][si:ei]
-        vel_err = np.abs(dy_des - dy_act)
+        vel_err = (dy_des - dy_act)**2
         n_dims = vel_err.shape[2]
 
         vel_names: list[str] = []
@@ -872,6 +887,9 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
                 group_means = mean_over_envs[idxs]
                 group_stds = std_over_envs[idxs]
                 _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+                csv_key = f"vel_error_{group_name.lower()}"
+                _csv(f"{csv_key}_mean", float(group_means.mean()))
+                _csv(f"{csv_key}_std", float(group_stds.mean()))
 
     _log("")
     _log("=" * 60)
@@ -882,6 +900,15 @@ def compute_and_save_stats(data: dict, save_dir: str | None = None,
         with open(stats_path, "w") as f:
             f.write("\n".join(lines) + "\n")
         print(f"\nStats saved to: {stats_path}")
+
+        # Save CSV
+        if csv_rows:
+            csv_path = os.path.join(save_dir, "tracking_stats.csv")
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["metric", "value"])
+                writer.writeheader()
+                writer.writerows(csv_rows)
+            print(f"Stats saved to: {csv_path}")
 
 
 def main():

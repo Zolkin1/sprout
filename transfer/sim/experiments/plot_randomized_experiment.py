@@ -8,6 +8,7 @@ Can be used as a standalone script or imported for its plotting functions.
 """
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -139,12 +140,23 @@ def load_experiment_data(experiment_dir: str) -> dict:
         except Exception as e:
             print(f"[Warning] Skipping {run_dir}: {e}")
 
+    # Load tracking_stats.csv if present at the experiment directory root
+    tracking_stats: dict[str, float] = {}
+    tracking_csv_path = os.path.join(experiment_dir, "tracking_stats.csv")
+    if os.path.exists(tracking_csv_path):
+        with open(tracking_csv_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tracking_stats[row["metric"]] = float(row["value"])
+        print(f"  Loaded tracking_stats.csv with {len(tracking_stats)} metrics")
+
     return {
         "runs": runs,
         "successes": successes,
         "force_mags": force_mags,
         "joint_names": joint_names or [],
         "torque_limits": torque_limits or [],
+        "tracking_stats": tracking_stats,
     }
 
 
@@ -514,6 +526,103 @@ def plot_force_success_histogram(
     plt.close(fig)
 
 
+def plot_radar_comparison(
+    grouped_data: OrderedDict,
+    save_path: str | None = None,
+    start_idx: int = START_IDX,
+) -> None:
+    """Plot a radar/spider chart of MA velocity tracking errors across policies.
+
+    Metrics plotted: Mean vx err MA, Mean vy err MA, Mean vyaw err MA.
+    Values are normalized so the best (smallest) error per metric equals 1.
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict
+            (as returned by load_experiment_data).
+        save_path: If provided, save the plot to this path (without extension).
+        start_idx: Index to start computing stats from (skip initial transient).
+    """
+    _setup_plot_style()
+
+    actual_vel_dims = [0, 1, 5]
+    cmd_vel_dims = [0, 1, 2]
+    dim_labels = [r"$v_x$ err", r"$v_y$ err", r"$\omega_z$ err"]
+
+    # Compute MA errors per policy
+    policy_errors: OrderedDict[str, list[float]] = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        runs = exp_data["runs"]
+        if not runs:
+            continue
+
+        _, cmd_stack = _interpolate_to_common_grid(runs, "commanded_vel")
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(runs, "actual_vel")
+        if smooth_time is None or smooth_vel is None or cmd_stack is None:
+            continue
+
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :]
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :]
+
+        errors = []
+        for dim in range(3):
+            sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+            sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+            errors.append(float(np.mean(np.abs(sm_actual - sm_commanded))))
+        policy_errors[name] = errors
+
+    if not policy_errors:
+        print("[Warning] No data for radar plot.")
+        return
+
+    # Add norm squared error from tracking_stats.csv if all policies have it
+    all_have_norm_sq = all(
+        "norm_sq_error_mean" in grouped_data[name].get("tracking_stats", {})
+        for name in policy_errors
+    )
+    if all_have_norm_sq:
+        dim_labels.append(r"$\|e\|^2$")
+        for name in policy_errors:
+            policy_errors[name].append(
+                grouped_data[name]["tracking_stats"]["norm_sq_error_mean"]
+            )
+
+    # Normalize: best (min) per metric = 1.0
+    errors_array = np.array(list(policy_errors.values()))  # (num_policies, num_dims)
+    min_per_metric = errors_array.min(axis=0)
+    min_per_metric[min_per_metric == 0] = 1e-9  # avoid division by zero
+    normalized = min_per_metric / errors_array
+
+    # Radar plot setup
+    num_dims = len(dim_labels)
+    angles = np.linspace(0, 2 * np.pi, num_dims, endpoint=False).tolist()
+    angles += angles[:1]  # close the polygon
+
+    colors = plt.cm.tab10.colors
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={"projection": "polar"})
+
+    for i, (name, norm_vals) in enumerate(zip(policy_errors.keys(), normalized)):
+        values = norm_vals.tolist() + [norm_vals[0]]  # close the polygon
+        color = colors[i % len(colors)]
+        ax.plot(angles, values, color=color, linewidth=2.5, label=name)
+        ax.fill(angles, values, color=color, alpha=0.15)
+
+    ax.set_thetagrids(np.degrees(angles[:-1]), dim_labels, fontsize=18)
+    ax.set_rlabel_position(30)
+    ax.tick_params(axis="y", labelsize=12)
+    ax.set_title("Velocity Tracking Error (normalized)", y=1.08, fontsize=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=14, framealpha=0.0)
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
+        print(f"Saved radar plot to {save_path}.png")
+
+    plt.close(fig)
+
+
 def print_stats_table(
     grouped_data: OrderedDict,
     start_idx: int = START_IDX,
@@ -781,6 +890,99 @@ def print_success_table(grouped_data: OrderedDict) -> str:
     return result
 
 
+def print_combined_error_table(
+    grouped_data: OrderedDict,
+    start_idx: int = START_IDX,
+) -> str:
+    """Pretty-print a combined velocity tracking error table.
+
+    Computes the MA-smoothed mean errors for vx, vy, vyaw, then reports
+    each individually plus a total (sum) and combined std dev
+    (sqrt of sum of squared per-dim std devs).
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict.
+        start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
+    """
+    actual_vel_dims = [0, 1, 5]
+    cmd_vel_dims = [0, 1, 2]
+    dim_names = ["vx", "vy", "vyaw"]
+
+    policy_names = list(grouped_data.keys())
+
+    # Compute per-policy errors
+    policy_results: OrderedDict[str, dict] = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        runs = exp_data["runs"]
+        if not runs:
+            continue
+
+        _, cmd_stack = _interpolate_to_common_grid(runs, "commanded_vel")
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(runs, "actual_vel")
+        if smooth_time is None or smooth_vel is None or cmd_stack is None:
+            continue
+
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :]
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :]
+
+        mean_errors = []
+        std_errors = []
+        for dim in range(3):
+            sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+            sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+            err = np.abs(sm_actual - sm_commanded)
+            mean_errors.append(float(np.mean(err)))
+            std_errors.append(float(np.std(err)))
+
+        total_error = sum(mean_errors)
+        combined_std = math.sqrt(sum(s ** 2 for s in std_errors))
+
+        policy_results[name] = {
+            "mean_errors": mean_errors,
+            "total_error": total_error,
+            "combined_std": combined_std,
+        }
+
+    if not policy_results:
+        print("[Warning] No data for combined error table.")
+        return ""
+
+    # Build table
+    name_col_w = max(max(len(n) for n in policy_names), len("Policy")) + 2
+    val_col_w = 14
+
+    col_headers = [f"Mean {d} err MA" for d in dim_names] + ["Total Error", "Combined Std"]
+    header = f"{'Policy':<{name_col_w}}"
+    for h in col_headers:
+        header += f" | {h:^{val_col_w}}"
+    sep = "-" * len(header)
+
+    lines = []
+    lines.append(f"\n{'=' * len(sep)}")
+    lines.append("COMBINED VELOCITY TRACKING ERROR (MA-smoothed)")
+    lines.append(f"{'=' * len(sep)}")
+    lines.append(header)
+    lines.append(sep)
+
+    for name, res in policy_results.items():
+        row = f"{name:<{name_col_w}}"
+        for m in res["mean_errors"]:
+            row += f" | {m:^{val_col_w}.4f}"
+        row += f" | {res['total_error']:^{val_col_w}.4f}"
+        row += f" | {res['combined_std']:^{val_col_w}.4f}"
+        lines.append(row)
+
+    lines.append(f"{'=' * len(sep)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
+
+
 def _resolve_experiment_dirs(
     env_type: str,
     run_dirs: list[str],
@@ -898,11 +1100,16 @@ def main():
         comparison_torque_path = os.path.join(exp_dir, "comparison_torques")
         plot_velocity_comparison(grouped_data, save_path=comparison_vel_path)
         plot_torque_comparison(grouped_data, save_path=comparison_torque_path)
+        plot_radar_comparison(
+            grouped_data,
+            save_path=os.path.join(exp_dir, "radar_comparison"),
+        )
 
     # Print stats tables and save to file
     stats_text = print_stats_table(grouped_data)
     stats_text += print_torque_stats_table(grouped_data)
     stats_text += print_success_table(grouped_data)
+    stats_text += print_combined_error_table(grouped_data)
 
     for name, exp_dir in experiment_dirs.items():
         stats_path = os.path.join(exp_dir, "experiment_stats.txt")

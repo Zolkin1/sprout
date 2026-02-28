@@ -21,7 +21,8 @@ onboard:
 
           # New policies
           # "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- Looks good in sim
-          "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Not quite as clean but works
+          # "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Not quite as clean but works
+          "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
 
           # Walking
           "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
@@ -84,9 +85,9 @@ onboard:
         v_y_max: 0.75
         w_z_max: 0.4
         vel_increment: 0.1
-        kp_yaw: 3.5 #3.0
+        kp_yaw: 0.75 #3.5 #3.0
         kd_yaw: 0.0 #0.1
-        kp_y: 1.0 #2.0 #5.0
+        kp_y: 0.5 #1.0 #2.0 #5.0
         kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
@@ -152,7 +153,7 @@ onboard:
       params:
         problem_name: right
         dt: 0.4
-        v_max: [3.0, 0.5, 0.2]
+        v_max: [2.5, 0.5, 0.2]
         v_min: [-0.5, -0.5, -0.2]
         # dv_max: [0.2, 0.1, 0.1] #[0.1, 0.05, 0.05]
         N: 25
@@ -197,7 +198,7 @@ onboard:
       params:
         v_x_scale: 3.6
         v_y_scale: 0.5
-        w_z_scale: 0.2
+        w_z_scale: 0.4
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:

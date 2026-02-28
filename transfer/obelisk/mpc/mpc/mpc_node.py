@@ -278,7 +278,7 @@ class MPCController(ObeliskController, ABC):
             self.requested_mode = Mode.RUNNING
 
         # Update world->odom transform from joystick axes
-        self.update_world_odom_from_joystick(msg)
+        # self.update_world_odom_from_joystick(msg)
 
         self._prev_buttons = list(msg.buttons)
 

@@ -19,8 +19,8 @@ from robot_rl.assets.robots.g1_21j import (G1_MINIMAL_CFG, G1_ACTION_SCALE,)  # 
 from ..terrains.rough import ROUGH_FOR_BASIC_LOCOMOTION_CFG, ROUGH_SLOPED_FOR_BASIC_LOCOMOTION_CFG, ROBUSTNESS_TEST_FOR_BASIC_LOCOMOTION_CFG
 
 REWARD_TYPE = "CLF"                 # CLF, MIMIC (TODO: SHOULD I ADJUST THESE TO BE EXACTLY ZEST?)
-TRACKING_REW_TYPE = "GOAL_ADJ"      # GOAL, ADJ, GOAL_ADJ
-TRAJECTORY_TYPE = "DYNAMIC_HD"      # DYNAMIC_HD, KINEMATIC_HD, HD, DYNAMIC
+TRACKING_REW_TYPE = "ADJ"      # GOAL, ADJ, GOAL_ADJ
+TRAJECTORY_TYPE = "DYNAMIC"      # DYNAMIC_HD, KINEMATIC_HD, HD, DYNAMIC
 SPEED_RANGE = "ALL"              # SINGLE, ALL
 
 ##
@@ -848,7 +848,7 @@ class G1RunningGaitLibraryEnvCfgExperiment(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6) #(3.0, 3.0) #(3.6, 3.6)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0) #(-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0) #(-0.75, 0.75)
         self.commands.base_velocity.ranges.resampling_time_range=(20.0, 20.0)

@@ -32,6 +32,20 @@ z_x_cols = z_x_cols(~startsWith(z_x_cols, 'z_ic') & ~startsWith(z_x_cols, 'z_g')
 N = numel(z_x_cols) - 1;
 fprintf('Detected horizon N = %d, %d MPC steps\n', N, n_steps);
 
+%% Obstacle definitions (hardcoded from problems.py)
+% Each row: [cx, cy, rx, ry, yaw]
+% "right" problem
+obs = [20.0, 10.0, 5.0, 5.0, 0.0;
+       15.0, -4.0, 5.0, 5.0, 0.0];
+% "gap" problem
+% obs = [4.0, 0.0, 2.0, 3.0, 0.2;
+%        3.0, 6.0, 2.0, 1.0, -0.2];
+% "right_wide" problem
+% obs = [1.0, 1.0, 0.5, 0.5, 0.0;
+%        1.25, -1.25, 0.5, 0.5, 0.0];
+% No obstacles
+% obs = zeros(0, 5);
+
 %% Extract column indices
 time_idx = find(strcmp(headers, 'time'));
 t = data(:, time_idx);
@@ -90,6 +104,17 @@ fail_idx = find(~success_data);
 if ~isempty(fail_idx)
     plot(ic_data(fail_idx, 1), ic_data(fail_idx, 2), 'rx', 'MarkerSize', 8, ...
         'LineWidth', 2, 'DisplayName', 'Failed solve');
+end
+% Plot obstacle ellipses
+for oi = 1:size(obs, 1)
+    [ex, ey] = ellipse_pts(obs(oi,1), obs(oi,2), obs(oi,3), obs(oi,4), obs(oi,5));
+    if oi == 1
+        fill(ex, ey, [1 0.2 0.2], 'FaceAlpha', 0.3, 'EdgeColor', 'r', ...
+            'LineWidth', 1.5, 'DisplayName', 'Obstacle');
+    else
+        fill(ex, ey, [1 0.2 0.2], 'FaceAlpha', 0.3, 'EdgeColor', 'r', ...
+            'LineWidth', 1.5, 'HandleVisibility', 'off');
+    end
 end
 xlabel('x'); ylabel('y');
 title(sprintf('MPC Plans (%d steps)', n_steps));
@@ -234,4 +259,15 @@ function draw_plan(fig)
     ylabel('\omega_z'); xlabel('Horizon step k'); grid on;
 
     drawnow;
+end
+
+function [ex, ey] = ellipse_pts(cx, cy, rx, ry, yaw)
+% Generate points for a rotated ellipse.
+    th = linspace(0, 2*pi, 100);
+    px = rx * cos(th);
+    py = ry * sin(th);
+    R = [cos(yaw), -sin(yaw); sin(yaw), cos(yaw)];
+    pts = R * [px; py];
+    ex = pts(1,:) + cx;
+    ey = pts(2,:) + cy;
 end
