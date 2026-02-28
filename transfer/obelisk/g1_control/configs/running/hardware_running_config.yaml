@@ -14,8 +14,9 @@ onboard:
           # "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
 
           # New policies
-          # "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- To aggressive on hardware
-          "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Looks good on hardware  
+          "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- To aggressive on hardware
+          # "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Looks good on hardware  
+          # "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
 
 
           # Walking
@@ -73,9 +74,9 @@ onboard:
       executable: high_level_control
       params:
         v_x_min: -1.1
-        v_x_max: 3.7
+        v_x_max: 0.75 #3.7
         v_y_max: 0.75
-        w_z_max: 0.75 #0.4
+        w_z_max: 0.3 #0.75 #0.4
         vel_increment: 0.1
         kp_yaw: 0.75 #2.5 #3.0
         kd_yaw: 0.0 #0.1
@@ -142,6 +143,52 @@ onboard:
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
+          callback_group: None
+  # ----- MPC Controller ----- #
+    - pkg: mpc
+      executable: mpc_node
+      params:
+        problem_name: right
+        dt: 0.4
+        v_max: [0.75, 0.3, 0.2] #[2.5, 0.5, 0.2]
+        v_min: [-0.5, -0.3, -0.2] #[-0.5, -0.5, -0.2]
+        # dv_max: [0.2, 0.1, 0.1] #[0.1, 0.05, 0.05]
+        N: 25
+        Q: [10, 1, 0.0]
+        R: [0.4, 0.5, 0.1]
+        alpha: 0.1 #0.7
+        delta: 5 #0.2
+        goal_deadzone: 1.0
+        v_norm_max: 0.75 #3.0 #0.8
+        plan_topic: /obelisk/g1/mpc_path
+        path_topic: /obelisk/g1/robot_path
+        joy_topic: /obelisk/g1/joy_passthrough
+        btn_idle: 0     # A
+        btn_zeroing: 1  # B
+        btn_run: 3      # Y
+        obst_topic: /obelisk/g1/mpc_obstacles
+        # Zeroing parameters
+        zeroing_position_threshold: 0.05
+        zeroing_stable_duration: 2.0
+        zeroing_check_period: 0.1
+        zeroing_timeout: 30.0
+        odom_frame: odom
+        camera_init_frame: camera_init
+        logging: False
+      # callback_groups:
+      publishers:
+      # ----- High Level Control ----- #
+        - ros_parameter: pub_ctrl_setting
+          topic: /mpc_command
+          history_depth: 10
+          callback_group: None
+      subscribers:
+      # ----- subscribe to odometry ----- #
+        - ros_parameter: sub_est_setting
+          topic: /obelisk/g1/odom
+      timers:
+        - ros_parameter: timer_ctrl_setting
+          timer_period_sec: 0.4
           callback_group: None
   # ----- High Level/Execution FSM Controller ----- #
     - pkg: obelisk_unitree_cpp
