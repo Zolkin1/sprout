@@ -20,9 +20,9 @@ onboard:
           # "running_clf_sym/2026-02-25_14-32-28_running_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_NEW_USD_FIXES_sym",
 
           # New policies
-          # "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- Looks good in sim
+          "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- Looks good in sim
           # "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Not quite as clean but works
-          "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
+          # "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
 
           # Walking
           "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
@@ -469,7 +469,7 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: True
+    on: False #True
     viz_tool: foxglove
     viz_nodes:
       - pkg: robot_viz
