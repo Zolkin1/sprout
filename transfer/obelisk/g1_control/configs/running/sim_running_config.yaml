@@ -449,6 +449,12 @@ onboard:
               lidar_imu_acc_sensor: accelerometer
               lidar_imu_gyro_sensor: gyro
               lidar_imu_quat_sensor: framequat
+          - topic: /cloud_registered_body
+            dt: 0.1
+            msg_type: PointCloud2
+            config_path: /home/wcompton/repos/robot_rl/transfer/obelisk/g1_control/configs/lidar/mid360.yaml
+            sensor_names:
+              scan_pos_sensor: framepos
           # viz_geoms:
           #   dt: 1
           #   # ----- Stair scene ----- #
