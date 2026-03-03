@@ -1,0 +1,37 @@
+<mujoco model="g1_basic_scene">
+    <include file="g1_27dof.xml"/>
+
+    <statistic center="1.0 0.7 1.0" extent="0.8"/>
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0.9 0.9 0.9"/>
+        <rgba haze="0.15 0.25 0.35 1"/>
+        <global azimuth="-140" elevation="-20"/>
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="flat" rgb1="0 0 0" rgb2="0 0 0" width="512" height="3072"/>
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+        <material name="wall_material" shininess="0.1" specular="0.5" roughness="0.3"/>
+    </asset>
+
+    <worldbody>
+        <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
+        <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/>
+
+        <body>
+            <geom name="tile1" pos="0.25 0 -0.095" type="box" contype="4" conaffinity="1" size="10 10 0.095" material="wall_material" rgba="0.87 0.72 0.53 0.0" group="2"/>
+        </body>
+
+        <!-- Wall 1: extends from (0, -2.5) to (30, -2.5), 0.25m thick, 2m tall -->
+        <body name="wall1" pos="15 -2.5 1">
+            <geom name="wall1" type="box" size="15 0.125 1" rgba="0.6 0.6 0.7 1" contype="1" conaffinity="1" group="2" material="wall_material"/>
+        </body>
+
+        <!-- Wall 2: extends from (15, -2.5) to (15, 2.5), 0.25m thick, 2m tall -->
+        <body name="wall2" pos="15 0 1">
+            <geom name="wall2" type="box" size="0.125 2.5 1" rgba="0.6 0.6 0.7 1" contype="1" conaffinity="1" group="2" material="wall_material"/>
+        </body>
+    </worldbody>
+</mujoco>
