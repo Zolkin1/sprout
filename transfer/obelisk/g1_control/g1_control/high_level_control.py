@@ -828,7 +828,7 @@ class HighLevelController(ObeliskController, ABC):
         # Compute rotation to zero yaw (in gravity-aligned frame)
         heading = oR_b.apply(self.body_heading)
         initial_yaw = np.atan2(heading[1], heading[0])
-        R_zero_yaw = Rotation.from_euler('z', -initial_yaw)
+        R_zero_yaw = Rotation.from_euler('z', -(initial_yaw - self.waist_joint_angle))
 
         # Combined rotation: first apply gravity alignment, then yaw zeroing
         self.R_odom_camera_init = R_zero_yaw * oR_c
