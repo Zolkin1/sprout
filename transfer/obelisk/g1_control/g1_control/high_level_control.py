@@ -523,13 +523,12 @@ class HighLevelController(ObeliskController, ABC):
 
         return y_vel_local_cmd, yaw_rate_cmd
 
-
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
         self.joy_cmd_vel[0] = min(max(cmd_msg.v_x, self.v_x_min), self.v_x_max)
         self.joy_cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
         self.joy_cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
-            
+
     def update_x_hat(self, msg):
         """Receive the joystick message."""
         self.rec_joystick = True
