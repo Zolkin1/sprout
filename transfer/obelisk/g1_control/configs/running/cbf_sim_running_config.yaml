@@ -239,8 +239,8 @@ onboard:
         - ros_parameter: mujoco_setting
           robot_pkg: g1_model
           # model_xml_path: scene.xml
-          # model_xml_path: walls.xml
-          model_xml_path: single_wall.xml
+          model_xml_path: walls.xml
+          # model_xml_path: single_wall.xml
           sensor_settings:
           # ---------- Joint Encoders ---------- #
           - topic: /obelisk/g1/joint_encoders
