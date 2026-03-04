@@ -153,8 +153,8 @@ onboard:
       params:
         problem_name: right
         dt: 0.4
-        v_max: [2.5, 0.5, 0.2]
-        v_min: [-0.5, -0.5, -0.2]
+        v_max: [2.5, 0.75, 0.4]
+        v_min: [-0.5, -0.75, -0.4]
         # dv_max: [0.2, 0.1, 0.1] #[0.1, 0.05, 0.05]
         N: 25
         Q: [10, 1, 0.0]
@@ -197,7 +197,7 @@ onboard:
       executable: obelisk_unitree_joystick
       params:
         v_x_scale: 3.6
-        v_y_scale: 0.5
+        v_y_scale: 0.75
         w_z_scale: 0.4
 
         vel_cmd_yaw: 13  # RY
@@ -453,7 +453,7 @@ onboard:
           - topic: /cloud_registered_body
             dt: 0.1
             msg_type: PointCloud2
-            config_path: /home/wcompton/repos/robot_rl/transfer/obelisk/g1_control/configs/lidar/mid360.yaml
+            config_path: /home/zolkin/robot_rl/transfer/obelisk/g1_control/configs/lidar/mid360.yaml
             sensor_names:
               scan_pos_sensor: framepos
           # viz_geoms:
@@ -506,4 +506,3 @@ onboard:
     on: True
     pub_topic: /obelisk/g1/joy
     sub_topic: /obelisk/g1/joy_feedback
-    device_id: 1

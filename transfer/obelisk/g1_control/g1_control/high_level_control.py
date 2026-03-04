@@ -318,6 +318,14 @@ class HighLevelController(ObeliskController, ABC):
         """
         # Publish the correct frame odom data
         msg = Odometry()
+
+        # s = 0
+        # N = min(7, len(self.pos_w_window))
+        # for i in range(N):
+        #     s += self.pos_w_window[i][1]
+        # s /= N
+        # msg.pose.pose.position.y = s
+
         msg.pose.pose.position.x = self.pos_w[0]
         msg.pose.pose.position.y = self.pos_w[1]
         msg.pose.pose.position.z = self.pos_w[2]

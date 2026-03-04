@@ -1,11 +1,11 @@
 site_name: "head_lidar_site"
 geom_groups: [2]
-viz_decimation: 10
+viz_decimation: 15
 frame: "body"
 
 pattern:
   type: "lidar_scan"
-  vertical_fov_range: [0.0, 51.0]
+  vertical_fov_range: [-0.0, 51.0]
   horizontal_fov_range: [0., 360.]
   channels: 51
   horizontal_res: 1.0
