@@ -808,12 +808,12 @@ class G1RunningGaitLibraryEnvCfgPlay(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
-        # self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        # self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
+        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        # self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.7)
+        # self.commands.base_velocity.ranges.lin_vel_y = (-0.75, 0.75)
+        # self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)
         self.commands.base_velocity.ranges.resampling_time_range=(5.0, 5.0) #(4.0, 4.0) #(3.0, 4.0)
         self.commands.base_velocity.debug_vis = False
 
@@ -848,7 +848,7 @@ class G1RunningGaitLibraryEnvCfgExperiment(G1RunningGaitLibraryEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.commands.base_velocity.ranges.lin_vel_x = (3.6, 3.6) #(3.0, 3.0) #(3.6, 3.6)
+        self.commands.base_velocity.ranges.lin_vel_x = (3.0, 3.0) #(3.6, 3.6)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0) #(-0.75, 0.75)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0) #(-0.75, 0.75)
         self.commands.base_velocity.ranges.resampling_time_range=(20.0, 20.0)

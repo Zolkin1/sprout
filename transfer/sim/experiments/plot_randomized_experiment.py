@@ -121,12 +121,13 @@ def load_experiment_data(experiment_dir: str) -> dict:
                 joint_names = config.get("joint_names", [])
                 torque_limits = config.get("torque_limits", [])
 
-            runs.append({
+            run_entry = {
                 "time": np.squeeze(data["time"]),
                 "commanded_vel": np.squeeze(data["commanded_vel"]),
                 "actual_vel": np.squeeze(data["qvel"]),
                 "torque": np.squeeze(data["torque"]),
-            })
+                "success": None,
+            }
 
             # Load success and force_mag from robustness_data.yaml if present
             robustness_path = os.path.join(run_dir, "robustness_data.yaml")
@@ -134,9 +135,12 @@ def load_experiment_data(experiment_dir: str) -> dict:
                 with open(robustness_path) as f:
                     robustness_data = yaml.safe_load(f)
                 if robustness_data and "success" in robustness_data:
+                    run_entry["success"] = robustness_data["success"]
                     successes.append(robustness_data["success"])
                 if robustness_data and "force_mag" in robustness_data:
                     force_mags.append(robustness_data["force_mag"])
+
+            runs.append(run_entry)
         except Exception as e:
             print(f"[Warning] Skipping {run_dir}: {e}")
 
@@ -158,6 +162,32 @@ def load_experiment_data(experiment_dir: str) -> dict:
         "torque_limits": torque_limits or [],
         "tracking_stats": tracking_stats,
     }
+
+
+def _filter_successful_runs(grouped_data: OrderedDict) -> OrderedDict:
+    """Return a copy of grouped_data with only successful runs.
+
+    Runs whose ``success`` field is ``False`` are excluded. Runs with
+    ``success`` equal to ``True`` or ``None`` (no robustness data) are kept.
+    The ``successes`` and ``force_mags`` lists are preserved unchanged so
+    that success-rate reporting remains accurate.
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict.
+
+    Returns:
+        New OrderedDict with the same structure but filtered runs.
+    """
+    filtered = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        successful_runs = [
+            r for r in exp_data["runs"] if r.get("success") is not False
+        ]
+        filtered[name] = {
+            **exp_data,
+            "runs": successful_runs,
+        }
+    return filtered
 
 
 def _setup_plot_style():
@@ -1086,10 +1116,17 @@ def main():
         experiment_dirs[name] = exp_dir
         print(f"  Loaded {len(grouped_data[name]['runs'])} runs for '{name}'")
 
-    # Save plots to each experiment directory
+    # Filter to only successful runs for plots and stats
+    filtered_data = _filter_successful_runs(grouped_data)
+    for name in filtered_data:
+        n_total = len(grouped_data[name]["runs"])
+        n_success = len(filtered_data[name]["runs"])
+        print(f"  '{name}': using {n_success}/{n_total} successful runs for plots/stats")
+
+    # Save plots to each experiment directory (using successful runs only)
     for name, exp_dir in experiment_dirs.items():
         # Per-policy plots
-        single_data = OrderedDict({name: grouped_data[name]})
+        single_data = OrderedDict({name: filtered_data[name]})
         vel_path = os.path.join(exp_dir, "velocity_tracking")
         torque_path = os.path.join(exp_dir, "joint_torques")
         plot_velocity_comparison(single_data, save_path=vel_path)
@@ -1098,18 +1135,19 @@ def main():
         # Comparison plots (saved to each experiment dir)
         comparison_vel_path = os.path.join(exp_dir, "comparison_velocity")
         comparison_torque_path = os.path.join(exp_dir, "comparison_torques")
-        plot_velocity_comparison(grouped_data, save_path=comparison_vel_path)
-        plot_torque_comparison(grouped_data, save_path=comparison_torque_path)
+        plot_velocity_comparison(filtered_data, save_path=comparison_vel_path)
+        plot_torque_comparison(filtered_data, save_path=comparison_torque_path)
         plot_radar_comparison(
-            grouped_data,
+            filtered_data,
             save_path=os.path.join(exp_dir, "radar_comparison"),
         )
 
     # Print stats tables and save to file
-    stats_text = print_stats_table(grouped_data)
-    stats_text += print_torque_stats_table(grouped_data)
+    # Use filtered data for velocity/torque stats, unfiltered for success rate
+    stats_text = print_stats_table(filtered_data)
+    stats_text += print_torque_stats_table(filtered_data)
     stats_text += print_success_table(grouped_data)
-    stats_text += print_combined_error_table(grouped_data)
+    stats_text += print_combined_error_table(filtered_data)
 
     for name, exp_dir in experiment_dirs.items():
         stats_path = os.path.join(exp_dir, "experiment_stats.txt")

@@ -56,6 +56,7 @@ from plot_randomized_experiment import (
     print_stats_table,
     print_torque_stats_table,
     print_success_table,
+    _filter_successful_runs,
 )
 
 VELOCITY_COMMANDS = {
@@ -90,7 +91,7 @@ EXPERIMENT_NAMES = {
 TORSO_MASS_SCALE_RANGE = (0.9, 1.1)
 COM_OFFSET_XY_RANGE = 0.05  # meters
 COM_OFFSET_Z_RANGE = 0.01   # meters
-KD_SCALE_RANGE = (0.5, 1.5)
+KD_SCALE_RANGE = (0.95, 1.05)
 
 # --- Force push ranges ---
 FORCE_MAG_MIN = 50.0   # Newtons
@@ -434,11 +435,12 @@ def main():
     for name, exp_folder in experiment_folders.items():
         print(f"\nPlotting for: {name}")
         single_data = OrderedDict({name: load_experiment_data(exp_folder)})
+        filtered_single_data = _filter_successful_runs(single_data)
 
         vel_path = os.path.join(exp_folder, "velocity_tracking")
         torque_path = os.path.join(exp_folder, "joint_torques")
-        plot_velocity_comparison(single_data, save_path=vel_path)
-        plot_torque_comparison(single_data, save_path=torque_path)
+        plot_velocity_comparison(filtered_single_data, save_path=vel_path)
+        plot_torque_comparison(filtered_single_data, save_path=torque_path)
 
     # Generate comparison plots across all policies
     if len(experiment_folders) > 1:
@@ -447,36 +449,48 @@ def main():
         for name, exp_folder in experiment_folders.items():
             grouped_data[name] = load_experiment_data(exp_folder)
 
+        # Filter to only successful runs for plots and stats
+        filtered_data = _filter_successful_runs(grouped_data)
+        for name in filtered_data:
+            n_total = len(grouped_data[name]["runs"])
+            n_success = len(filtered_data[name]["runs"])
+            print(f"  '{name}': using {n_success}/{n_total} successful runs for plots/stats")
+
         # Save comparison plots to each experiment folder
         for name, exp_folder in experiment_folders.items():
             plot_velocity_comparison(
-                grouped_data,
+                filtered_data,
                 save_path=os.path.join(exp_folder, "comparison_velocity"),
             )
             plot_torque_comparison(
-                grouped_data,
+                filtered_data,
                 save_path=os.path.join(exp_folder, "comparison_torques"),
             )
             plot_radar_comparison(
-                grouped_data,
+                filtered_data,
                 save_path=os.path.join(exp_folder, "radar_comparison"),
             )
 
     # Print stats tables and save to file
     if len(experiment_folders) > 1:
-        stats_text = print_stats_table(grouped_data)
-        stats_text += print_torque_stats_table(grouped_data)
-        stats_text += print_success_table(grouped_data)
-        stats_text += print_combined_error_table(grouped_data)
+        stats_text = print_stats_table(filtered_data)
+        stats_text += print_torque_stats_table(filtered_data)
+        stats_text += print_success_table(grouped_data)  # unfiltered for success rate
+        stats_text += print_combined_error_table(filtered_data)
     else:
         # Single policy — still print stats
         single_grouped = OrderedDict()
         for name, exp_folder in experiment_folders.items():
             single_grouped[name] = load_experiment_data(exp_folder)
-        stats_text = print_stats_table(single_grouped)
-        stats_text += print_torque_stats_table(single_grouped)
-        stats_text += print_success_table(single_grouped)
-        stats_text += print_combined_error_table(single_grouped)
+        filtered_single = _filter_successful_runs(single_grouped)
+        for name in filtered_single:
+            n_total = len(single_grouped[name]["runs"])
+            n_success = len(filtered_single[name]["runs"])
+            print(f"  '{name}': using {n_success}/{n_total} successful runs for plots/stats")
+        stats_text = print_stats_table(filtered_single)
+        stats_text += print_torque_stats_table(filtered_single)
+        stats_text += print_success_table(single_grouped)  # unfiltered for success rate
+        stats_text += print_combined_error_table(filtered_single)
 
     for name, exp_folder in experiment_folders.items():
         stats_path = os.path.join(exp_folder, "experiment_stats.txt")

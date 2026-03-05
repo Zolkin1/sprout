@@ -5,9 +5,9 @@ directories, parses the Lyapunov (V) values and group error summaries,
 and produces comparison histograms and LaTeX tables.
 
 Outputs (saved to experiments/{timestamp}_{experiment_name}/ in each run dir):
-- V value histogram with error bars (one bar per policy)
-- Position error subgroup histogram (Positions/Orientations/Joints per policy)
-- Velocity error subgroup histogram (same subgroups)
+- V value bar chart with error bars (one bar per policy)
+- Position error subgroup bar chart (Positions/Orientations/Joints per policy)
+- Velocity error subgroup bar chart (same subgroups)
 - LaTeX table with all V and group error values
 
 Usage:
@@ -22,11 +22,16 @@ import argparse
 import os
 import re
 import sys
+import textwrap
 from collections import OrderedDict
 from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Muted color palette (softer Tableau shades, suitable for publications)
+# Uses the first shade from each of the tab20c color groups
+PLOT_COLORS = [plt.cm.tab20c.colors[i] for i in range(0, 20, 4)]
 
 # Add the project root to the Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -58,6 +63,22 @@ def _setup_plot_style() -> None:
         "text.usetex": True,
         "font.family": "serif",
     })
+
+
+def _wrap_label(name: str, width: int = 15) -> str:
+    """Wrap a label string into a LaTeX shortstack for multi-line x-tick labels.
+
+    Args:
+        name: The label text to wrap.
+        width: Maximum characters per line before wrapping.
+
+    Returns:
+        LaTeX shortstack string with wrapped lines.
+    """
+    lines = textwrap.wrap(name, width=width)
+    if len(lines) <= 1:
+        return name
+    return r"\shortstack{" + r"\\".join(lines) + "}"
 
 
 def parse_play_stats(filepath: str) -> dict:
@@ -125,18 +146,18 @@ def parse_play_stats(filepath: str) -> dict:
     return result
 
 
-def plot_v_histogram(
+def plot_v_bar_chart(
     policy_data: OrderedDict,
     save_path: str | None = None,
 ) -> None:
-    """Plot a histogram of V (Lyapunov) values with error bars across policies.
+    """Plot a bar chart of V (Lyapunov) values with error bars across policies.
 
     Args:
         policy_data: OrderedDict mapping policy name -> parsed play_stats dict.
         save_path: If provided, save plot to this path (without extension).
     """
     _setup_plot_style()
-    colors = plt.cm.tab10.colors
+    colors = PLOT_COLORS
 
     names = list(policy_data.keys())
     means = [policy_data[n]["v_mean"] for n in names]
@@ -157,7 +178,7 @@ def plot_v_histogram(
 
     ax.set_ylabel("Tracking Error ($V = e^TPe)$", fontsize=20)
     ax.set_xticks(x)
-    ax.set_xticklabels(names, fontsize=16, rotation=15, ha="right")
+    ax.set_xticklabels([_wrap_label(n) for n in names], fontsize=16)
     ax.tick_params(labelsize=16)
     ax.grid(True, axis="y", alpha=0.3)
 
@@ -167,23 +188,31 @@ def plot_v_histogram(
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
         fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
         fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
-        print(f"Saved V histogram to {save_path}.png")
+        print(f"Saved V bar chart to {save_path}.png")
 
     plt.close(fig)
 
 
-def plot_norm_sq_error_histogram(
+def plot_norm_sq_error_bar_chart(
     policy_data: OrderedDict,
     save_path: str | None = None,
+    groups: list[str] | None = None,
+    member_names: list[str] | None = None,
 ) -> None:
-    """Plot a histogram of norm squared error (dot(e,e)) with error bars across policies.
+    """Plot a bar chart of norm squared error (dot(e,e)) with error bars across policies.
 
     Args:
         policy_data: OrderedDict mapping policy name -> parsed play_stats dict.
         save_path: If provided, save plot to this path (without extension).
+        groups: Optional list of group labels, one per policy. Policies sharing a
+            group label are clustered together on the x-axis. If None, each policy
+            gets its own bar (original behavior).
+        member_names: Optional list of legend labels, one per position index within
+            each group. The i-th member in every group shares the same color and
+            legend entry. If None, falls back to individual policy names.
     """
     _setup_plot_style()
-    colors = plt.cm.tab10.colors
+    colors = PLOT_COLORS
 
     names = list(policy_data.keys())
     means = [policy_data[n]["norm_sq_mean"] for n in names]
@@ -193,24 +222,76 @@ def plot_norm_sq_error_histogram(
         print("Norm squared error data not available for all policies, skipping plot.")
         return
 
-    x = np.arange(len(names))
-    fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(names)), 6))
+    if groups is not None:
+        # Grouped bar layout: cluster policies by group
+        unique_groups = list(OrderedDict.fromkeys(groups))
+        num_groups = len(unique_groups)
 
-    ax.bar(
-        x, means, yerr=stds,
-        width=0.6,
-        color=[colors[i % len(colors)] for i in range(len(names))],
-        capsize=6,
-        alpha=0.85,
-        edgecolor="black",
-        linewidth=0.5,
-    )
+        # Build mapping: group_label -> list of (policy_name, mean, std) tuples
+        group_members: OrderedDict[str, list[tuple[str, float, float]]] = OrderedDict()
+        for g in unique_groups:
+            group_members[g] = []
+        for name, g, m, s in zip(names, groups, means, stds):
+            group_members[g].append((name, m, s))
 
-    ax.set_ylabel(r"Norm Squared Error ($e^T e$)", fontsize=20)
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, fontsize=16, rotation=15, ha="right")
-    ax.tick_params(labelsize=16)
-    ax.grid(True, axis="y", alpha=0.3)
+        max_members = max(len(v) for v in group_members.values())
+        x = np.arange(num_groups)
+        bar_width = 0.8 / max_members
+
+        fig, ax = plt.subplots(figsize=(max(8, 3 * num_groups), 6))
+
+        # Track which position indices have been added to legend
+        legend_added: set[int] = set()
+
+        for group_idx, group_label in enumerate(unique_groups):
+            members = group_members[group_label]
+            for j, (pname, m, s) in enumerate(members):
+                offset = (j - (len(members) - 1) / 2) * bar_width
+                # Color by position index so the i-th member in every group matches
+                bar_color = colors[j % len(colors)]
+                # Legend label: use member_names if provided, else policy name
+                if j not in legend_added:
+                    label = member_names[j] if member_names is not None else pname
+                else:
+                    label = None
+                ax.bar(
+                    x[group_idx] + offset, m, yerr=s,
+                    width=bar_width * 0.9,
+                    color=bar_color,
+                    capsize=4,
+                    alpha=0.85,
+                    label=label,
+                    edgecolor="black",
+                    linewidth=0.5,
+                )
+                legend_added.add(j)
+
+        ax.set_ylabel(r"Reference Tracking Squared Error ($e^T e$)", fontsize=20)
+        ax.set_xticks(x)
+        ax.set_xticklabels([_wrap_label(g) for g in unique_groups], fontsize=20)
+        ax.tick_params(labelsize=20)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(fontsize=20, framealpha=0.0)
+    else:
+        # Original ungrouped layout: one bar per policy
+        x = np.arange(len(names))
+        fig, ax = plt.subplots(figsize=(max(8, 2.5 * len(names)), 6))
+
+        ax.bar(
+            x, means, yerr=stds,
+            width=0.6,
+            color=[colors[i % len(colors)] for i in range(len(names))],
+            capsize=6,
+            alpha=0.85,
+            edgecolor="black",
+            linewidth=0.5,
+        )
+
+        ax.set_ylabel(r"Reference Tracking Squared Error ($e^T e$)", fontsize=20)
+        ax.set_xticks(x)
+        ax.set_xticklabels([_wrap_label(n) for n in names], fontsize=16)
+        ax.tick_params(labelsize=16)
+        ax.grid(True, axis="y", alpha=0.3)
 
     plt.tight_layout()
 
@@ -218,17 +299,17 @@ def plot_norm_sq_error_histogram(
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
         fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
         fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
-        print(f"Saved norm squared error histogram to {save_path}.png")
+        print(f"Saved norm squared error bar chart to {save_path}.png")
 
     plt.close(fig)
 
 
-def plot_subgroup_error_histogram(
+def plot_subgroup_error_bar_chart(
     policy_data: OrderedDict,
     error_type: str = "pos",
     save_path: str | None = None,
 ) -> None:
-    """Plot a grouped histogram of subgroup errors across policies.
+    """Plot a grouped bar chart of subgroup errors across policies.
 
     Args:
         policy_data: OrderedDict mapping policy name -> parsed play_stats dict.
@@ -236,7 +317,7 @@ def plot_subgroup_error_histogram(
         save_path: If provided, save plot to this path (without extension).
     """
     _setup_plot_style()
-    colors = plt.cm.tab10.colors
+    colors = PLOT_COLORS
 
     key = "pos_error_groups" if error_type == "pos" else "vel_error_groups"
     title_type = "Position" if error_type == "pos" else "Velocity"
@@ -292,7 +373,7 @@ def plot_subgroup_error_histogram(
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
         fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
         fig.savefig(save_path + ".pdf", bbox_inches="tight", transparent=True)
-        print(f"Saved {error_type} error histogram to {save_path}.png")
+        print(f"Saved {error_type} error bar chart to {save_path}.png")
 
     plt.close(fig)
 
@@ -397,10 +478,26 @@ def main() -> None:
         "--experiment_name", type=str, required=True,
         help="Name for the experiment (used in folder naming).",
     )
+    parser.add_argument(
+        "--groups", type=str, nargs="+", default=None,
+        help="Group labels for each policy (same length as --names). "
+             "Policies sharing a group label are clustered together in the "
+             "norm squared error bar chart. If omitted, no grouping is applied.",
+    )
+    parser.add_argument(
+        "--member_names", type=str, nargs="+", default=None,
+        help="Legend labels for each position index within groups. "
+             "Length must equal the number of members per group. "
+             "The i-th member in every group shares the same color and legend entry.",
+    )
     args = parser.parse_args()
 
     if len(args.run_dirs) != len(args.names):
         raise ValueError("Number of --run_dirs must match number of --names.")
+    if args.groups is not None and len(args.groups) != len(args.names):
+        raise ValueError("Number of --groups must match number of --names.")
+    if args.member_names is not None and args.groups is None:
+        raise ValueError("--member_names requires --groups to be specified.")
 
     # Resolve run dirs
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -446,23 +543,25 @@ def main() -> None:
 
     # Generate plots (save to each experiment folder)
     for name, exp_folder in experiment_folders.items():
-        plot_v_histogram(
+        plot_v_bar_chart(
             policy_data,
-            save_path=os.path.join(exp_folder, "v_histogram"),
+            save_path=os.path.join(exp_folder, "v_bar_chart"),
         )
-        plot_subgroup_error_histogram(
+        plot_subgroup_error_bar_chart(
             policy_data,
             error_type="pos",
-            save_path=os.path.join(exp_folder, "position_error_histogram"),
+            save_path=os.path.join(exp_folder, "position_error_bar_chart"),
         )
-        plot_subgroup_error_histogram(
+        plot_subgroup_error_bar_chart(
             policy_data,
             error_type="vel",
-            save_path=os.path.join(exp_folder, "velocity_error_histogram"),
+            save_path=os.path.join(exp_folder, "velocity_error_bar_chart"),
         )
-        plot_norm_sq_error_histogram(
+        plot_norm_sq_error_bar_chart(
             policy_data,
-            save_path=os.path.join(exp_folder, "norm_sq_error_histogram"),
+            save_path=os.path.join(exp_folder, "norm_sq_error_bar_chart"),
+            groups=args.groups,
+            member_names=args.member_names,
         )
 
     # Generate LaTeX table

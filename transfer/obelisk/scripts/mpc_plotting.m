@@ -35,8 +35,7 @@ fprintf('Detected horizon N = %d, %d MPC steps\n', N, n_steps);
 %% Obstacle definitions (hardcoded from problems.py)
 % Each row: [cx, cy, rx, ry, yaw]
 % "right" problem
-obs = [20.0, 10.0, 5.0, 5.0, 0.0;
-       15.0, -4.0, 5.0, 5.0, 0.0];
+obs = [2.0, 0.5, 1.0, 1.0, 0.0];
 % "gap" problem
 % obs = [4.0, 0.0, 2.0, 3.0, 0.2;
 %        3.0, 6.0, 2.0, 1.0, -0.2];
