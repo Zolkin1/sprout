@@ -13,11 +13,21 @@ onboard:
           # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
           # "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
 
-          "running_clf_sym/2026-02-15_11-20-21_T2_running_higher_tor_l2_higher_tor_lim_sym",
+          # "running_clf_sym/2026-02-15_11-20-21_T2_running_higher_tor_l2_higher_tor_lim_sym",
           # "running_clf_sym/2026-02-15_11-25-13_T1_running_higher_l2_10_lim_sym",
 
+          # "running_clf_sym/2026-02-23_10-41-24_T5_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym",
+          # "running_clf_sym/2026-02-25_14-32-28_running_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_NEW_USD_FIXES_sym",
+
+          # New policies
+          "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- Looks good in sim
+          # "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Not quite as clean but works
+          # "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
+
           # Walking
-          "walking_clf_sym/2026-02-15_18-02-52_walking_some_start_run_sym",
+          "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
+          # "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",
+          # "walking_clf_sym/2026-02-15_18-02-52_walking_some_start_run_sym",
           # "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [
@@ -32,6 +42,11 @@ onboard:
           2,                  # x
           1,                  # b
         ]
+        vel_thresholds: [
+          10.0, 1.1,
+          1.1, -1.1
+        ]
+        START_IN_SIM: true
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
         log: true
@@ -65,18 +80,20 @@ onboard:
     - pkg: g1_control
       executable: high_level_control
       params:
-        v_x_min: 0.0
-        v_x_max: 3.6
+        v_x_min: -1.1
+        v_x_max: 3.7
         v_y_max: 0.75
-        w_z_max: 1.0
+        w_z_max: 0.4
         vel_increment: 0.1
-        kp_yaw: 3.5 #3.0
+        kp_yaw: 0.75 #3.5 #3.0
         kd_yaw: 0.0 #0.1
-        kp_y: 2.0 #5.0
+        kp_y: 0.5 #1.0 #2.0 #5.0
         kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
         vel_increment_start: 0.0
+        traj_dt: 0.3333333
+        traj_nodes: 10
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -85,6 +102,13 @@ onboard:
           callback_group: None
         - ros_parameter: pub_joy_feedback
           topic: /obelisk/g1/joy_feedback
+          history_depth: 10
+        - ros_parameter: pub_odom_data
+          topic: /obelisk/g1/odom
+          history_depth: 10
+        - ros_parameter: pub_traj_data
+          topic: /obelisk/g1/traj_data
+          msg_type: PoseArray
           history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
@@ -114,17 +138,67 @@ onboard:
           msg_type: Imu
           history_depth: 10
           callback_group: None
+        # ----- MPC Command Subscriber ----- #
+        - ros_parameter: sub_mpc_setting
+          topic: /mpc_command
+          msg_type: Twist
+          history_depth: 10
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
+          callback_group: None
+  # ----- MPC Controller ----- #
+    - pkg: mpc
+      executable: mpc_node
+      params:
+        problem_name: right
+        dt: 0.4
+        v_max: [2.5, 0.75, 0.4]
+        v_min: [-0.5, -0.75, -0.4]
+        # dv_max: [0.2, 0.1, 0.1] #[0.1, 0.05, 0.05]
+        N: 25
+        Q: [10, 1, 0.0]
+        R: [0.4, 0.5, 0.1]
+        alpha: 0.1 #0.7
+        delta: 5 #0.2
+        v_norm_max: 3.0 #0.8
+        plan_topic: /obelisk/g1/mpc_path
+        path_topic: /obelisk/g1/robot_path
+        joy_topic: /obelisk/g1/joy_passthrough
+        btn_idle: 0     # A
+        btn_zeroing: 1  # B
+        btn_run: 3      # Y
+        obst_topic: /obelisk/g1/mpc_obstacles
+        # Zeroing parameters
+        zeroing_position_threshold: 0.05
+        zeroing_stable_duration: 2.0
+        zeroing_check_period: 0.1
+        zeroing_timeout: 30.0
+        odom_frame: odom
+        camera_init_frame: camera_init
+        logging: False
+      # callback_groups:
+      publishers:
+      # ----- High Level Control ----- #
+        - ros_parameter: pub_ctrl_setting
+          topic: /mpc_command
+          history_depth: 10
+          callback_group: None
+      subscribers:
+      # ----- subscribe to odometry ----- #
+        - ros_parameter: sub_est_setting
+          topic: /obelisk/g1/odom
+      timers:
+        - ros_parameter: timer_ctrl_setting
+          timer_period_sec: 0.4
           callback_group: None
   # ----- High Level/Execution FSM Controller ----- #
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_scale: 3.0
-        v_y_scale: 0.5
-        w_z_scale: 0.2
+        v_x_scale: 3.6
+        v_y_scale: 0.75
+        w_z_scale: 0.4
 
         vel_cmd_yaw: 13  # RY
       # callback_groups:
@@ -174,6 +248,11 @@ onboard:
           msg_type: Imu
           history_depth: 10
           callback_group: None
+        - ros_parameter: sub_odom
+          topic: /obelisk/g1/odom
+          msg_type: Odometry
+          history_depth: 10
+          callback_group: None
       timers:
         - ros_parameter: timer_est_setting
           timer_period_sec: 0.001
@@ -207,7 +286,8 @@ onboard:
       sim:
         - ros_parameter: mujoco_setting
           robot_pkg: g1_model
-          model_xml_path: scene.xml
+          # model_xml_path: scene.xml
+          model_xml_path: cylinder.xml
           sensor_settings:
           # ---------- Joint Encoders ---------- #
           - topic: /obelisk/g1/joint_encoders
@@ -355,7 +435,7 @@ onboard:
           #     torso_camera_gyro: gyro
           # ---------- Head Lidar Odometry ---------- #
           - topic: /obelisk/g1/head_odom
-            dt: 0.1
+            dt: 0.01 #0.1
             msg_type: Odometry
             sensor_names:
               head_lidar_pos_sensor: framepos
@@ -370,6 +450,12 @@ onboard:
               lidar_imu_acc_sensor: accelerometer
               lidar_imu_gyro_sensor: gyro
               lidar_imu_quat_sensor: framequat
+          - topic: /cloud_registered_body
+            dt: 0.1
+            msg_type: PointCloud2
+            config_path: /home/zolkin/robot_rl/transfer/obelisk/g1_control/configs/lidar/mid360.yaml
+            sensor_names:
+              scan_pos_sensor: framepos
           # viz_geoms:
           #   dt: 1
           #   # ----- Stair scene ----- #
@@ -390,11 +476,11 @@ onboard:
   # -------------- Viz -------------- #
   # --------------------------------- #
   viz:
-    on: False
+    on: False #True
     viz_tool: foxglove
     viz_nodes:
-      - pkg: obelisk_viz_cpp
-        executable: default_robot_viz
+      - pkg: robot_viz
+        executable: robot_viz
         robot_pkg: g1_model
         urdf: g1_hand.urdf
         robot_topic: robot_description

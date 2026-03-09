@@ -625,7 +625,8 @@ class G1WalkingEventsCfg(HumanoidEventsCfg):
                 "base_frame_name": "pelvis_link",
                 "conditioner_command_name": "base_velocity",
                 "special_val": 1.2,     # Sometimes start on the running traj
-                "rel_envs_on_ref": 0.5}
+                "rel_envs_on_ref": 0.5,
+                "joint_add_range": [-0.1, 0.1]}
     )
 
     #TODO: Consider moving the common stuff to another cfg
@@ -671,6 +672,17 @@ class G1WalkingEventsCfg(HumanoidEventsCfg):
             "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
             "mass_distribution_params": (0.85, 1.15),  # (-5.0, 5.0),
             "operation": "scale",
+        },
+    )
+
+    # Randomize calibration errors
+    add_joint_default_pos = EventTerm(
+        func=mdp.randomize_joint_default_pos,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "pos_distribution_params": (-0.01, 0.01),
+            "operation": "add",
         },
     )
 
@@ -754,14 +766,14 @@ class G1WalkingRewardCfg(G1TrajOptCLFRewards):
         func=mdp.track_lin_vel_xy_exp,
         weight=1.0,
         params={"command_name": "base_velocity",
-                "std": 0.25, }
+                "std": 0.5, }
     )
 
     yaw_vel = RewTerm(
         func=mdp.track_ang_vel_z_exp,
         weight=1.0,
         params={"command_name": "base_velocity",
-                "std": 0.25, }
+                "std": 0.5, }
     )
 
     clf_reward = None
@@ -837,6 +849,8 @@ class G1WalkingCLFEnvCfg(HumanoidEnvCfg):
         ##
         self.rewards.holonomic_constraint.params["command_name"] = "traj_ref"
         self.rewards.holonomic_constraint_vel.params["command_name"] = "traj_ref"
+
+        self.rewards.dof_torques_l2.weight = -1.0e-5
 
         # self.rewards.clf_reward.params = {
         #     "command_name": "traj_ref",
@@ -924,7 +938,7 @@ class G1WalkingCLFEnvCfg_PLAY(G1WalkingCLFEnvCfg):
         # self.scene.terrain.terrain_type = "plane"
         # self.scene.terrain.terrain_generator = None
 
-        self.episode_length_s = 4.0
+        self.episode_length_s = 8.0
 
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None

@@ -2,3 +2,5 @@ torch==2.5.1
 huggingface_hub
 matplotlib
 scipy
+pandas
+casadi

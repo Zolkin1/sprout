@@ -13,13 +13,18 @@ onboard:
 
           # Works well
           # "running_clf_sym/2026-02-13_17-50-41_running_P_from_QR_init_on_walking_sym",
-          "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
-          
-          # "running_clf_sym/2026-02-15_11-20-21_T2_running_higher_tor_l2_higher_tor_lim_sym",
-          # "running_clf_sym/2026-02-15_11-25-13_T1_running_higher_l2_10_lim_sym",
+          # "running_clf_sym/2026-02-14_09-51-15_T0_running_P_higher_torque_pen_all_on_ref_sym",
+
+          # New policies
+          # "running_clf_sym/2026-02-25_16-21-38_T0_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_sym", #-- To aggressive on hardware
+          "running_clf_sym/2026-02-25_16-24-12_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_sym", # --- Looks good on hardware  
+          # "running_clf_sym/2026-02-27_11-09-13_T1_running_ABL_CLF_GOAL_ADJ_DYNAMIC_HD_ALL_more_torque_pen_more_goal_sym",
+
 
           # Walking
-          "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
+          "walking_clf_sym/2026-02-20_15-18-54_T0_walking_more_robustness_sym",
+          # "walking_clf_sym/2026-02-16_17-51-02_T0_walking_tuning_sym",  # Should be able to do running -> walking
+          # "walking_clf_sym/2026-02-11_13-14-31_walking_new_changes_test_sym",
         ]
         hf_repo_ids: [
           "zolkin/robot_rl",
@@ -32,6 +37,10 @@ onboard:
         behavior_buttons: [
           2,                  # x
           1,                  # b
+        ]
+        vel_thresholds: [
+          10.0, 1.1,
+          1.1, -1.1
         ]
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
@@ -66,14 +75,14 @@ onboard:
     - pkg: g1_control
       executable: high_level_control
       params:
-        v_x_min: 0.0
-        v_x_max: 3.6
-        v_y_max: 0.75
-        w_z_max: 1.0
+        v_x_min: -0.75
+        v_x_max: 2.3 #0.75 #3.7
+        v_y_max: 0.6
+        w_z_max: 0.4 #0.75 #0.4
         vel_increment: 0.1
-        kp_yaw: 2.5 #3.0
+        kp_yaw: 0.75 #2.5 #3.0
         kd_yaw: 0.0 #0.1
-        kp_y: 1.0 #5.0
+        kp_y: 0.5 #1.0 #5.0
         kd_y: 0.0 #0.3
         use_odom: True
         log_odom: True
@@ -82,6 +91,8 @@ onboard:
         temp_safety_threshold: 120.0
         temp_lower_start: 105.0
         safe_temp_speed: 1.2
+        traj_dt: 0.3333333
+        traj_nodes: 10
       # callback_groups:
       publishers:
         - ros_parameter: pub_ctrl_setting
@@ -90,6 +101,13 @@ onboard:
           callback_group: None
         - ros_parameter: pub_joy_feedback
           topic: /obelisk/g1/joy_feedback
+          history_depth: 10
+        - ros_parameter: pub_odom_data
+          topic: /obelisk/g1/odom
+          history_depth: 10
+        - ros_parameter: pub_traj_data
+          topic: /obelisk/g1/traj_data
+          msg_type: PoseArray
           history_depth: 10
       subscribers:
         # ----- Joint Encoder subscriber ----- #
@@ -119,15 +137,66 @@ onboard:
           msg_type: imu #ObkIMU
           history_depth: 10
           callback_group: None
+        # ----- MPC Command Subscriber ----- #
+        - ros_parameter: sub_mpc_setting
+          topic: /mpc_command
+          msg_type: Twist
+          history_depth: 10
       timers:
         - ros_parameter: timer_ctrl_setting
           timer_period_sec: 0.05    # 20 Hz
+          callback_group: None
+  # ----- MPC Controller ----- #
+    - pkg: mpc
+      executable: mpc_node
+      params:
+        problem_name: breezeway_v2 #walk_forward #right
+        dt: 0.3
+        v_max: [2.3, 0.6, 0.4] #[2.5, 0.5, 0.2]
+        v_min: [-0.5, -0.6, -0.4] #[-0.5, -0.5, -0.2]
+        # dv_max: [0.3, 0.4, 0.3] #[0.1, 0.05, 0.05]
+        N: 25
+        Q: [10, 10, 0.0]
+        R: [10.0, 10.0, 5.0] #[0.4, 0.4, 0.1]
+        cbf_alpha: 0.3 #0.7
+        cbf_delta: 0.5 #5 #0.2
+        goal_deadzone: 3.0
+        v_norm_max: 2.3 #0.75 #3.0 #0.8
+        plan_topic: /obelisk/g1/mpc_path
+        path_topic: /obelisk/g1/robot_path
+        joy_topic: /obelisk/g1/joy_passthrough
+        btn_idle: 0     # A
+        btn_zeroing: 1  # B
+        btn_run: 3      # Y
+        obst_topic: /obelisk/g1/mpc_obstacles
+        # Zeroing parameters
+        zeroing_position_threshold: 0.05
+        zeroing_stable_duration: 2.0
+        zeroing_check_period: 0.1
+        zeroing_timeout: 30.0
+        odom_frame: odom
+        camera_init_frame: camera_init
+        logging: False
+      # callback_groups:
+      publishers:
+      # ----- High Level Control ----- #
+        - ros_parameter: pub_ctrl_setting
+          topic: /mpc_command
+          history_depth: 10
+          callback_group: None
+      subscribers:
+      # ----- subscribe to odometry ----- #
+        - ros_parameter: sub_est_setting
+          topic: /obelisk/g1/odom
+      timers:
+        - ros_parameter: timer_ctrl_setting
+          timer_period_sec: 0.4
           callback_group: None
   # ----- High Level/Execution FSM Controller ----- #
     - pkg: obelisk_unitree_cpp
       executable: obelisk_unitree_joystick
       params:
-        v_x_scale: 3.0
+        v_x_scale: 0.8 #3.6
         v_y_scale: 0.5
         w_z_scale: 0.2
 
@@ -177,6 +246,11 @@ onboard:
         - ros_parameter: sub_pelvis_imu
           topic: /obelisk/g1/pelvis_imu
           msg_type: Imu #ObkIMU
+          history_depth: 10
+          callback_group: None
+        - ros_parameter: sub_odom
+          topic: /obelisk/g1/odom
+          msg_type: Odometry
           history_depth: 10
           callback_group: None
       timers:
@@ -243,6 +317,13 @@ onboard:
                   0,
                   0.47, 0.24, 0, 0.8, 0, 0, 0,
                   0.47, -0.24, 0, 0.8, 0, 0, 0,]
+        # Going to a bad set of angles
+        # user_pose: [
+        #   0.5, 0.0, 2.25, 0.175, 0.25, 0.0,
+        #   0.5, -0.2, -2.25, 0.3, -0.35, -0.3,
+        #   -2.5,
+        #   0.0, 0.1, 0.1, 1.4, 0, 0, 0,
+        #   -0.25, -0.1, 2.5, 1.3, 0, 0, 0,]
     # - is_simulated: True
     #   pkg: robot_sim
     #   executable: simulation

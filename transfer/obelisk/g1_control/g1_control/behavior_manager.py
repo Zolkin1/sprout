@@ -14,6 +14,7 @@ class BehaviorManager:
                  behavior_names: list[str],
                  behavior_buttons: list[int],
                  init_behavior: str,
+                 vel_thresholds: list[float],
                  hf_repo_ids: list[str],
                  hf_policy_folders: list[str],):
         """
@@ -25,17 +26,21 @@ class BehaviorManager:
 
         self.behavior_names = behavior_names
         self.behavior_buttons = behavior_buttons
+        self.vel_thresholds = vel_thresholds
 
         self.policies = []
         for repo_id, policy_folder in zip(hf_repo_ids, hf_policy_folders):
             self.policies.append(RLPolicy(repo_id, policy_folder))
+
+        if len(self.vel_thresholds) != 0 and len(self.vel_thresholds) != 2*len(self.policies):
+            raise ValueError(f"Expected no velocity thresholds or length of {2*len(self.policies)}, got: {len(self.vel_thresholds)}")
 
         self.active_behavior = init_behavior
 
         self.last_behavior_switch = 0.0
         self.pending_behavior: str | None = None
 
-    def check_behavior_switch(self, joy_msg: Joy, time: float) -> str:
+    def check_behavior_switch(self, joy_msg: Joy, cmd_vel: np.ndarray, time: float) -> str:
         """Check for behavior switch request and queue if valid.
 
         The actual switch is deferred until phi is near 0 or 0.5.
@@ -48,6 +53,15 @@ class BehaviorManager:
             The currently active behavior name.
         """
         if (time - self.last_behavior_switch) > 0.1:
+            if len(self.vel_thresholds) != 0:
+                for i in range(len(self.behavior_names)):
+                    low = self.vel_thresholds[2 * i + 1]
+                    high = self.vel_thresholds[2 * i]
+                    if low <= cmd_vel[0] < high:
+                        requested_behavior = self.behavior_names[i]
+                        if requested_behavior != self.active_behavior and requested_behavior != self.pending_behavior:
+                            self.pending_behavior = requested_behavior
+
             for i, button in enumerate(self.behavior_buttons):
                 if joy_msg.buttons[button] == 1:
                     requested_behavior = self.behavior_names[i]
@@ -75,11 +89,17 @@ class BehaviorManager:
         phi = current_policy.get_phi()
 
         # Check if phi is near 0 (including wrap-around) or 0.5
-        PHI_TOLERANCE = 0.05
-        # at_zero = phi < PHI_TOLERANCE or phi > (1.0 - PHI_TOLERANCE)
-        # at_half = abs(phi - 0.5) < PHI_TOLERANCE
+        PHI_TOLERANCE = 0.03
 
-        val = 0.164
+        # For now just hard-code the phasing variables for each transition
+        current_policy_idx = self.get_active_policy_idx()
+        if self.active_behavior == "walking":
+            val = 0.164
+        elif self.active_behavior == "running":
+            val = 0.03 #0.9 #0.06 #0.5
+        else:
+            raise ValueError(f"Invalid active behavior: {self.active_behavior}")
+
         at_val = abs(phi - val) < PHI_TOLERANCE
 
         if at_val: #at_zero or at_half:
@@ -87,6 +107,7 @@ class BehaviorManager:
             self.last_behavior_switch = time
             self.pending_behavior = None
             self.policies[self.get_active_policy_idx()].reset_last_action()
+            self.policies[self.get_active_policy_idx()].set_last_zero_time(time)
             return True
 
         return False

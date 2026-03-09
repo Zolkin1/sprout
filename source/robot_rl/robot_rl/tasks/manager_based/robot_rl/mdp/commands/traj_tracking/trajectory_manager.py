@@ -514,6 +514,52 @@ class TrajectoryManager(ManagerBase):
 
         return accelerations
 
+    def _precompute_contact_table(self, contact_frames: list[str]) -> None:
+        """Pre-compute contact state lookup tables for the given contact frames.
+
+        Builds tensors of shape [expanded_num_domains, num_contacts] that can be
+        indexed by domain_indices to avoid per-step loops and string operations.
+
+        For half-periodic trajectories, builds two tables: one for the first half
+        (phi < 0.5) and one for the second half (phi >= 0.5).
+
+        Args:
+            contact_frames: List of contact frame names.
+        """
+        num_contacts = len(contact_frames)
+
+        if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+            # Single lookup table: [expanded_num_domains, num_contacts]
+            table = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            for domain_idx in range(self.expanded_num_domains):
+                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
+                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
+                for i, frame in enumerate(contact_frames):
+                    if frame in domain_contact_frames:
+                        table[domain_idx, i] = 1.0
+            self._contact_table = table
+            self._contact_table_reflected = None
+        else:
+            # Two tables for half-periodic: first-half and second-half
+            table_first = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            table_second = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            for domain_idx in range(self.expanded_num_domains):
+                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
+                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
+                reflect_domain_contact_frames = [
+                    f.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+                    for f in domain_contact_frames
+                ]
+                for i, frame in enumerate(contact_frames):
+                    if frame in domain_contact_frames:
+                        table_first[domain_idx, i] = 1.0
+                    if frame in reflect_domain_contact_frames:
+                        table_second[domain_idx, i] = 1.0
+            self._contact_table = table_first
+            self._contact_table_reflected = table_second
+
+        self._contact_table_frames = tuple(contact_frames)
+
     def get_contact_state(self, t: torch.Tensor,    # [N]
                            contact_frames: list[str],
                            ) -> torch.Tensor:
@@ -528,45 +574,20 @@ class TrajectoryManager(ManagerBase):
             contact_states: shape [N, num_contacts] where num_contacts is the number
              of contact points. A 1 indicates in contact, 0 otherwise.
         """
-        # Determine the domain for each time
-        domain_indicies = self.get_current_domains(t)
+        # Lazily pre-compute lookup table on first call (or if contact_frames changed)
+        if not hasattr(self, '_contact_table_frames') or self._contact_table_frames != tuple(contact_frames):
+            self._precompute_contact_table(contact_frames)
 
-        # Initialize contact states tensor
-        N = t.shape[0]
-        num_contacts = len(contact_frames)
-        contact_states = torch.zeros(N, num_contacts, device=self.device)
-        phi = self.get_phasing_var(t)
+        domain_indices = self.get_current_domains(t)
 
-        # For each contact frame, check if it's in contact across all domains
-        for i, frame in enumerate(contact_frames):
-            # For each domain, check if this frame is in contact
-            for domain_idx in range(self.expanded_num_domains):
-                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
-                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
-
-                if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-                    # Swap left/right in contact frame names for half periodic trajectories
-                    reflect_domain_contact_frames = [
-                        frame_name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
-                        for frame_name in domain_contact_frames
-                    ]
-
-                mask = None
-                if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
-                    if frame in domain_contact_frames:
-                        mask = domain_indicies == domain_idx
-                else:       # Half periodic
-                    if frame in domain_contact_frames:
-                        mask = (domain_indicies == domain_idx) & (phi < 0.5)
-                    elif frame in reflect_domain_contact_frames:
-                        mask = (domain_indicies == domain_idx) & (phi >= 0.5)
-
-                # mask = mask.squeeze()
-                if mask is not None:
-                    contact_states[mask, i] = 1.0
-
-
-        return contact_states
+        if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+            return self._contact_table[domain_indices]
+        else:
+            phi = self.get_phasing_var(t)
+            first_half = (phi < 0.5).unsqueeze(1)  # [N, 1]
+            return torch.where(first_half,
+                               self._contact_table[domain_indices],
+                               self._contact_table_reflected[domain_indices])
 
     def get_current_domains(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -583,6 +604,34 @@ class TrajectoryManager(ManagerBase):
         return domains
 
 
+    def _precompute_ref_frame_mapping(self, ref_frames: list[str]) -> None:
+        """Pre-compute the domain-to-reference-frame mapping.
+
+        Args:
+            ref_frames: List of reference frame names.
+        """
+        domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
+
+        for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+            bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+            if bezier_frame in ref_frames:
+                domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
+            else:
+                raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+                bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+                bezier_frame_reflect = bezier_frame.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+                if bezier_frame_reflect in ref_frames:
+                    domain_to_ref_frame_idx[domain_idx + self.num_domains] = ref_frames.index(bezier_frame_reflect)
+                else:
+                    raise ValueError(
+                        f"Bezier frame '{bezier_frame_reflect}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
+        self._ref_frame_mapping = domain_to_ref_frame_idx
+        self._ref_frame_mapping_key = tuple(ref_frames)
+
     def get_ref_frames_in_use(self, t: torch.Tensor, ref_frames: list[str]) -> torch.Tensor:
         """
         Determine the reference frame in use.
@@ -594,40 +643,12 @@ class TrajectoryManager(ManagerBase):
         Returns:
             frame_tensor: a torch tensor of shape [N] where each scalar is the index into ref_frames for the active frame.
         """
+        # Lazily pre-compute mapping on first call (or if ref_frames changed)
+        if not hasattr(self, '_ref_frame_mapping_key') or self._ref_frame_mapping_key != tuple(ref_frames):
+            self._precompute_ref_frame_mapping(ref_frames)
+
         domain_indices = self.get_current_domains(t)
-
-        # Create a mapping tensor: domain_idx -> ref_frame_idx
-        # This is done once per call, but it's O(num_domains) not O(num_envs)
-        domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
-
-        for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
-            bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
-
-            if bezier_frame in ref_frames:
-                domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
-            else:
-                raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
-
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
-                bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
-                bezier_frame_reflect = bezier_frame.replace("right", "TEMP").replace("left", "right").replace("TEMP",
-                                                                                                              "left")
-                if bezier_frame_reflect in ref_frames:
-                    domain_to_ref_frame_idx[domain_idx + self.num_domains] = ref_frames.index(bezier_frame_reflect)
-                else:
-                    raise ValueError(
-                        f"Bezier frame '{bezier_frame_reflect}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
-
-        # Use advanced indexing to get frame indices for all envs at once
-        # if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
-        frame_indices = domain_to_ref_frame_idx[domain_indices]
-        # else:
-        #     # Mask properly if using a half periodic trajectory
-        #     first_half_mask = phi < 0.5
-        #     frame_indices[first_half_mask] = domain_to_ref_frame_idx[domain_indices][first_half_mask]
-
-        return frame_indices
+        return self._ref_frame_mapping[domain_indices]
 
 
     def remap_trajectory(self) -> tuple[torch.Tensor, torch.Tensor]:

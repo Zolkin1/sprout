@@ -19,6 +19,7 @@ ENVIRONMENTS = {
 
     "running_clf": "G1-running-clf",
     "running_clf_sym": "G1-running-clf-symmetric",
+    "running_clf_sym_exp": "G1-running-clf-symmetric",
 
     "waving_clf": "G1-waving-clf",
 
@@ -42,6 +43,7 @@ EXPERIMENT_NAMES = {
 
     "running_clf": "running_clf",
     "running_clf_sym": "running-clf-symmetric",
+    "running_clf_sym_exp": "running-clf-symmetric",
 
     "waving_clf": "waving_clf",
 

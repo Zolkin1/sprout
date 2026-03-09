@@ -8,6 +8,7 @@ Can be used as a standalone script or imported for its plotting functions.
 """
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -26,6 +27,7 @@ from matplotlib.legend_handler import HandlerBase
 from sim.log_utils import extract_data
 
 START_IDX = 150
+MA_WINDOW = 30
 
 # Environment experiment names mapping (same as in g1_runner.py / train_policy.py)
 EXPERIMENT_NAMES = {
@@ -45,6 +47,20 @@ EXPERIMENT_NAMES = {
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
     "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
+
+
+def moving_average(data: np.ndarray, window_size: int) -> np.ndarray:
+    """Compute moving average of a 1D array.
+
+    Args:
+        data: 1D input array.
+        window_size: Number of samples in the averaging window.
+
+    Returns:
+        Smoothed array of length ``len(data) - window_size + 1``.
+    """
+    kernel = np.ones(window_size) / window_size
+    return np.convolve(data, kernel, mode='valid')
 
 
 class HandlerOverlay(HandlerBase):
@@ -105,12 +121,13 @@ def load_experiment_data(experiment_dir: str) -> dict:
                 joint_names = config.get("joint_names", [])
                 torque_limits = config.get("torque_limits", [])
 
-            runs.append({
+            run_entry = {
                 "time": np.squeeze(data["time"]),
                 "commanded_vel": np.squeeze(data["commanded_vel"]),
                 "actual_vel": np.squeeze(data["qvel"]),
                 "torque": np.squeeze(data["torque"]),
-            })
+                "success": None,
+            }
 
             # Load success and force_mag from robustness_data.yaml if present
             robustness_path = os.path.join(run_dir, "robustness_data.yaml")
@@ -118,11 +135,24 @@ def load_experiment_data(experiment_dir: str) -> dict:
                 with open(robustness_path) as f:
                     robustness_data = yaml.safe_load(f)
                 if robustness_data and "success" in robustness_data:
+                    run_entry["success"] = robustness_data["success"]
                     successes.append(robustness_data["success"])
                 if robustness_data and "force_mag" in robustness_data:
                     force_mags.append(robustness_data["force_mag"])
+
+            runs.append(run_entry)
         except Exception as e:
             print(f"[Warning] Skipping {run_dir}: {e}")
+
+    # Load tracking_stats.csv if present at the experiment directory root
+    tracking_stats: dict[str, float] = {}
+    tracking_csv_path = os.path.join(experiment_dir, "tracking_stats.csv")
+    if os.path.exists(tracking_csv_path):
+        with open(tracking_csv_path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tracking_stats[row["metric"]] = float(row["value"])
+        print(f"  Loaded tracking_stats.csv with {len(tracking_stats)} metrics")
 
     return {
         "runs": runs,
@@ -130,7 +160,34 @@ def load_experiment_data(experiment_dir: str) -> dict:
         "force_mags": force_mags,
         "joint_names": joint_names or [],
         "torque_limits": torque_limits or [],
+        "tracking_stats": tracking_stats,
     }
+
+
+def _filter_successful_runs(grouped_data: OrderedDict) -> OrderedDict:
+    """Return a copy of grouped_data with only successful runs.
+
+    Runs whose ``success`` field is ``False`` are excluded. Runs with
+    ``success`` equal to ``True`` or ``None`` (no robustness data) are kept.
+    The ``successes`` and ``force_mags`` lists are preserved unchanged so
+    that success-rate reporting remains accurate.
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict.
+
+    Returns:
+        New OrderedDict with the same structure but filtered runs.
+    """
+    filtered = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        successful_runs = [
+            r for r in exp_data["runs"] if r.get("success") is not False
+        ]
+        filtered[name] = {
+            **exp_data,
+            "runs": successful_runs,
+        }
+    return filtered
 
 
 def _setup_plot_style():
@@ -178,6 +235,46 @@ def _interpolate_to_common_grid(runs: list, key: str, time_key: str = "time"):
     return common_time, np.stack(interpolated, axis=0)
 
 
+def _interpolate_and_smooth(
+    runs: list,
+    key: str,
+    window_size: int = MA_WINDOW,
+    time_key: str = "time",
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Interpolate runs to a common grid and apply per-run moving average.
+
+    Args:
+        runs: List of run dicts.
+        key: Data key to interpolate and smooth.
+        window_size: Moving average window size.
+        time_key: Key for the time array.
+
+    Returns:
+        Tuple of (smoothed_time, raw_stacked, smoothed_stacked).
+        ``smoothed_time`` is trimmed to match the moving-average output length.
+        ``raw_stacked`` has shape (num_runs, num_timesteps, num_columns).
+        ``smoothed_stacked`` has shape (num_runs, num_timesteps - window + 1, num_columns).
+    """
+    common_time, raw_stack = _interpolate_to_common_grid(runs, key, time_key)
+    if common_time is None or raw_stack is None:
+        return None, None, None
+
+    # Apply moving average per-run, per-column
+    smoothed_runs = []
+    for run_idx in range(raw_stack.shape[0]):
+        run_data = raw_stack[run_idx]
+        if run_data.ndim == 1:
+            smoothed_runs.append(moving_average(run_data, window_size))
+        else:
+            cols = []
+            for col_idx in range(run_data.shape[1]):
+                cols.append(moving_average(run_data[:, col_idx], window_size))
+            smoothed_runs.append(np.stack(cols, axis=1))
+
+    smoothed_time = common_time[window_size - 1:]
+    return smoothed_time, raw_stack, np.stack(smoothed_runs, axis=0)
+
+
 def plot_velocity_comparison(
     grouped_data: OrderedDict,
     save_path: str | None = None,
@@ -212,22 +309,39 @@ def plot_velocity_comparison(
             continue
 
         color = colors[i % len(colors)]
-        common_time, vel_stack = _interpolate_to_common_grid(runs, "actual_vel")
-        if common_time is None:
+        smooth_time, raw_stack, smooth_stack = _interpolate_and_smooth(
+            runs, "actual_vel"
+        )
+        if smooth_time is None:
             continue
+
+        # Also get the raw common_time for the raw overlay
+        common_time, _ = _interpolate_to_common_grid(runs, "actual_vel")
 
         for dim in range(3):
             ax = axes[dim]
-            dim_stack = vel_stack[:, :, actual_vel_dims[dim]]
-            mean_val = np.mean(dim_stack, axis=0)
-            std_val = np.std(dim_stack, axis=0)
+            a_dim = actual_vel_dims[dim]
 
-            ax.plot(common_time[start_idx:], mean_val[start_idx:],
+            # Raw mean (light overlay)
+            raw_dim = raw_stack[:, :, a_dim]
+            raw_mean = np.mean(raw_dim, axis=0)
+            ax.plot(common_time[start_idx:], raw_mean[start_idx:],
+                    color=color, alpha=0.3, linewidth=1.0)
+
+            # Smoothed mean +/- std
+            sm_dim = smooth_stack[:, :, a_dim]
+            sm_mean = np.mean(sm_dim, axis=0)
+            sm_std = np.std(sm_dim, axis=0)
+
+            # Adjust start index for the shorter smoothed array
+            sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+
+            ax.plot(smooth_time[sm_start:], sm_mean[sm_start:],
                     color=color, linewidth=2.5)
             ax.fill_between(
-                common_time[start_idx:],
-                mean_val[start_idx:] - std_val[start_idx:],
-                mean_val[start_idx:] + std_val[start_idx:],
+                smooth_time[sm_start:],
+                sm_mean[sm_start:] - sm_std[sm_start:],
+                sm_mean[sm_start:] + sm_std[sm_start:],
                 color=color, alpha=0.2,
             )
 
@@ -442,15 +556,115 @@ def plot_force_success_histogram(
     plt.close(fig)
 
 
+def plot_radar_comparison(
+    grouped_data: OrderedDict,
+    save_path: str | None = None,
+    start_idx: int = START_IDX,
+) -> None:
+    """Plot a radar/spider chart of MA velocity tracking errors across policies.
+
+    Metrics plotted: Mean vx err MA, Mean vy err MA, Mean vyaw err MA.
+    Values are normalized so the best (smallest) error per metric equals 1.
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict
+            (as returned by load_experiment_data).
+        save_path: If provided, save the plot to this path (without extension).
+        start_idx: Index to start computing stats from (skip initial transient).
+    """
+    _setup_plot_style()
+
+    actual_vel_dims = [0, 1, 5]
+    cmd_vel_dims = [0, 1, 2]
+    dim_labels = [r"$v_x$ err", r"$v_y$ err", r"$\omega_z$ err"]
+
+    # Compute MA errors per policy
+    policy_errors: OrderedDict[str, list[float]] = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        runs = exp_data["runs"]
+        if not runs:
+            continue
+
+        _, cmd_stack = _interpolate_to_common_grid(runs, "commanded_vel")
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(runs, "actual_vel")
+        if smooth_time is None or smooth_vel is None or cmd_stack is None:
+            continue
+
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :]
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :]
+
+        errors = []
+        for dim in range(3):
+            sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+            sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+            errors.append(float(np.mean(np.abs(sm_actual - sm_commanded))))
+        policy_errors[name] = errors
+
+    if not policy_errors:
+        print("[Warning] No data for radar plot.")
+        return
+
+    # Add norm squared error from tracking_stats.csv if all policies have it
+    all_have_norm_sq = all(
+        "norm_sq_error_mean" in grouped_data[name].get("tracking_stats", {})
+        for name in policy_errors
+    )
+    if all_have_norm_sq:
+        dim_labels.append(r"$\|e\|^2$")
+        for name in policy_errors:
+            policy_errors[name].append(
+                grouped_data[name]["tracking_stats"]["norm_sq_error_mean"]
+            )
+
+    # Normalize: best (min) per metric = 1.0
+    errors_array = np.array(list(policy_errors.values()))  # (num_policies, num_dims)
+    min_per_metric = errors_array.min(axis=0)
+    min_per_metric[min_per_metric == 0] = 1e-9  # avoid division by zero
+    normalized = min_per_metric / errors_array
+
+    # Radar plot setup
+    num_dims = len(dim_labels)
+    angles = np.linspace(0, 2 * np.pi, num_dims, endpoint=False).tolist()
+    angles += angles[:1]  # close the polygon
+
+    colors = plt.cm.tab10.colors
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={"projection": "polar"})
+
+    for i, (name, norm_vals) in enumerate(zip(policy_errors.keys(), normalized)):
+        values = norm_vals.tolist() + [norm_vals[0]]  # close the polygon
+        color = colors[i % len(colors)]
+        ax.plot(angles, values, color=color, linewidth=2.5, label=name)
+        ax.fill(angles, values, color=color, alpha=0.15)
+
+    ax.set_thetagrids(np.degrees(angles[:-1]), dim_labels, fontsize=18)
+    ax.set_rlabel_position(30)
+    ax.tick_params(axis="y", labelsize=12)
+    ax.set_title("Velocity Tracking Error (normalized)", y=1.08, fontsize=20)
+    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.1), fontsize=14, framealpha=0.0)
+
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path + ".png", bbox_inches="tight", transparent=False)
+        print(f"Saved radar plot to {save_path}.png")
+
+    plt.close(fig)
+
+
 def print_stats_table(
     grouped_data: OrderedDict,
     start_idx: int = START_IDX,
-) -> None:
+) -> str:
     """Pretty-print a statistics table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict.
         start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
     """
     vel_dim_names = ["vx", "vy", "vyaw"]
     vel_units = ["m/s", "m/s", "rad/s"]
@@ -476,6 +690,14 @@ def print_stats_table(
         cmd = cmd_stack[:, start_idx:, :]
         torque = torque_stack[:, start_idx:, :]
 
+        # Smoothed velocity and commanded stacks
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(
+            runs, "actual_vel"
+        )
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :] if smooth_vel is not None else None
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :] if cmd_stack is not None else None
+
         stats = {}
         for dim, (dim_name, unit) in enumerate(zip(vel_dim_names, vel_units)):
             actual = vel[:, :, actual_vel_dims[dim]]
@@ -486,6 +708,16 @@ def print_stats_table(
             stats[f"Mean {dim_name} err ({unit})"] = np.mean(error)
             stats[f"Std {dim_name} err ({unit})"] = np.std(error)
 
+            # MA-smoothed stats
+            if smooth_vel_trimmed is not None and smooth_cmd_trimmed is not None:
+                sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+                sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+                sm_error = np.abs(sm_actual - sm_commanded)
+
+                stats[f"Mean {dim_name} MA ({unit})"] = np.mean(sm_actual)
+                stats[f"Mean {dim_name} err MA ({unit})"] = np.mean(sm_error)
+                stats[f"Std {dim_name} err MA ({unit})"] = np.std(sm_error)
+
         # Torque stats: mean of absolute values across all joints and runs
         abs_torque = np.abs(torque)
         stats["Mean |torque| (Nm)"] = np.mean(abs_torque)
@@ -495,7 +727,7 @@ def print_stats_table(
 
     if not policy_stats:
         print("[Warning] No data to compute stats.")
-        return
+        return ""
 
     # Build table
     metric_names = list(next(iter(policy_stats.values())).keys())
@@ -513,38 +745,46 @@ def print_stats_table(
     for _ in policy_names:
         sep_line += "-+-" + "-" * val_col_w
 
-    print(f"\n{'=' * len(sep_line)}")
-    print("EXPERIMENT STATISTICS")
-    print(f"{'=' * len(sep_line)}")
-    print(header_line)
-    print(sep_line)
+    lines = []
+    lines.append(f"\n{'=' * len(sep_line)}")
+    lines.append("EXPERIMENT STATISTICS")
+    lines.append(f"{'=' * len(sep_line)}")
+    lines.append(header_line)
+    lines.append(sep_line)
 
     for metric in metric_names:
         row = f"{metric:<{metric_col_w}}"
         for pname in policy_names:
             val = policy_stats[pname][metric]
             row += f" | {val:^{val_col_w}.4f}"
-        print(row)
+        lines.append(row)
 
-    print(f"{'=' * len(sep_line)}\n")
+    lines.append(f"{'=' * len(sep_line)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
 def print_torque_stats_table(
     grouped_data: OrderedDict,
     start_idx: int = START_IDX,
-) -> None:
+) -> str:
     """Pretty-print a per-motor torque statistics table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict.
         start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
     """
     # Get joint names from first policy
     first_data = next(iter(grouped_data.values()))
     joint_names = first_data.get("joint_names", [])
     if not joint_names:
         print("[Warning] No joint names found, skipping per-motor torque stats.")
-        return
+        return ""
 
     policy_names = list(grouped_data.keys())
 
@@ -575,50 +815,65 @@ def print_torque_stats_table(
 
     if not policy_joint_stats:
         print("[Warning] No data to compute per-motor torque stats.")
-        return
+        return ""
 
     # Build table
     joint_col_w = max(len(j) for j in joint_names) + 2
-    # Two columns per policy: mean and std
+    # Two columns per policy: mean and std, width adapts to policy name
     sub_col_w = 10
-    policy_header_w = 2 * sub_col_w + 3  # "mean | std"
+    min_policy_w = 2 * sub_col_w + 1  # "mean" + space + "std"
+    # Per-policy header width must fit both sub-columns and the policy name
+    policy_header_ws = [max(min_policy_w, len(pname) + 2) for pname in policy_names]
 
     # Header
     header_line = f"{'Joint':<{joint_col_w}}"
     sub_header_line = f"{'':<{joint_col_w}}"
-    for pname in policy_names:
-        header_line += f" | {pname:^{policy_header_w}}"
-        sub_header_line += f" | {'mean':^{sub_col_w}} {'std':^{sub_col_w}}"
+    for pname, phw in zip(policy_names, policy_header_ws):
+        header_line += f" | {pname:^{phw}}"
+        # Distribute sub-column widths within the policy header width
+        left_w = phw // 2
+        right_w = phw - left_w
+        sub_header_line += f" | {'mean':^{left_w}}{'std':^{right_w}}"
 
     sep_line = "-" * joint_col_w
-    for _ in policy_names:
-        sep_line += "-+-" + "-" * policy_header_w
+    for phw in policy_header_ws:
+        sep_line += "-+-" + "-" * phw
 
-    print(f"\n{'=' * len(sep_line)}")
-    print("PER-MOTOR TORQUE STATISTICS (|torque| in Nm)")
-    print(f"{'=' * len(sep_line)}")
-    print(header_line)
-    print(sub_header_line)
-    print(sep_line)
+    lines = []
+    lines.append(f"\n{'=' * len(sep_line)}")
+    lines.append("PER-MOTOR TORQUE STATISTICS (|torque| in Nm)")
+    lines.append(f"{'=' * len(sep_line)}")
+    lines.append(header_line)
+    lines.append(sub_header_line)
+    lines.append(sep_line)
 
     for j_idx, j_name in enumerate(joint_names):
         row = f"{j_name:<{joint_col_w}}"
-        for pname in policy_names:
+        for pname, phw in zip(policy_names, policy_header_ws):
             stats = policy_joint_stats[pname]
             m = stats["mean"][j_idx]
             s = stats["std"][j_idx]
-            row += f" | {m:^{sub_col_w}.4f} {s:^{sub_col_w}.4f}"
-        print(row)
+            left_w = phw // 2
+            right_w = phw - left_w
+            row += f" | {m:^{left_w}.4f}{s:^{right_w}.4f}"
+        lines.append(row)
 
-    print(f"{'=' * len(sep_line)}\n")
+    lines.append(f"{'=' * len(sep_line)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
-def print_success_table(grouped_data: OrderedDict) -> None:
+def print_success_table(grouped_data: OrderedDict) -> str:
     """Pretty-print a success rate table comparing all policies.
 
     Args:
         grouped_data: OrderedDict mapping display_name -> experiment data dict
             (as returned by load_experiment_data, must contain "successes" key).
+
+    Returns:
+        The formatted table as a string.
     """
     policy_names = list(grouped_data.keys())
 
@@ -634,11 +889,12 @@ def print_success_table(grouped_data: OrderedDict) -> None:
     )
     sep = "-" * len(header)
 
-    print(f"\n{'=' * len(sep)}")
-    print("SUCCESS STATISTICS")
-    print(f"{'=' * len(sep)}")
-    print(header)
-    print(sep)
+    lines = []
+    lines.append(f"\n{'=' * len(sep)}")
+    lines.append("SUCCESS STATISTICS")
+    lines.append(f"{'=' * len(sep)}")
+    lines.append(header)
+    lines.append(sep)
 
     for name in policy_names:
         successes = grouped_data[name].get("successes", [])
@@ -650,14 +906,111 @@ def print_success_table(grouped_data: OrderedDict) -> None:
             num_success = 0
             rate = 0.0
 
-        print(
+        lines.append(
             f"{name:<{name_col_w}}"
             f" | {total:^{num_col_w}}"
             f" | {num_success:^{num_col_w}}"
             f" | {rate:^{num_col_w}.1f}"
         )
 
-    print(f"{'=' * len(sep)}\n")
+    lines.append(f"{'=' * len(sep)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
+
+
+def print_combined_error_table(
+    grouped_data: OrderedDict,
+    start_idx: int = START_IDX,
+) -> str:
+    """Pretty-print a combined velocity tracking error table.
+
+    Computes the MA-smoothed mean errors for vx, vy, vyaw, then reports
+    each individually plus a total (sum) and combined std dev
+    (sqrt of sum of squared per-dim std devs).
+
+    Args:
+        grouped_data: OrderedDict mapping display_name -> experiment data dict.
+        start_idx: Index to start computing stats from (skip initial transient).
+
+    Returns:
+        The formatted table as a string.
+    """
+    actual_vel_dims = [0, 1, 5]
+    cmd_vel_dims = [0, 1, 2]
+    dim_names = ["vx", "vy", "vyaw"]
+
+    policy_names = list(grouped_data.keys())
+
+    # Compute per-policy errors
+    policy_results: OrderedDict[str, dict] = OrderedDict()
+    for name, exp_data in grouped_data.items():
+        runs = exp_data["runs"]
+        if not runs:
+            continue
+
+        _, cmd_stack = _interpolate_to_common_grid(runs, "commanded_vel")
+        smooth_time, _, smooth_vel = _interpolate_and_smooth(runs, "actual_vel")
+        if smooth_time is None or smooth_vel is None or cmd_stack is None:
+            continue
+
+        sm_start = max(start_idx - (MA_WINDOW - 1), 0)
+        smooth_vel_trimmed = smooth_vel[:, sm_start:, :]
+        smooth_cmd_trimmed = cmd_stack[:, (MA_WINDOW - 1) + sm_start:, :]
+
+        mean_errors = []
+        std_errors = []
+        for dim in range(3):
+            sm_actual = smooth_vel_trimmed[:, :, actual_vel_dims[dim]]
+            sm_commanded = smooth_cmd_trimmed[:, :, cmd_vel_dims[dim]]
+            err = np.abs(sm_actual - sm_commanded)
+            mean_errors.append(float(np.mean(err)))
+            std_errors.append(float(np.std(err)))
+
+        total_error = sum(mean_errors)
+        combined_std = math.sqrt(sum(s ** 2 for s in std_errors))
+
+        policy_results[name] = {
+            "mean_errors": mean_errors,
+            "total_error": total_error,
+            "combined_std": combined_std,
+        }
+
+    if not policy_results:
+        print("[Warning] No data for combined error table.")
+        return ""
+
+    # Build table
+    name_col_w = max(max(len(n) for n in policy_names), len("Policy")) + 2
+    val_col_w = 14
+
+    col_headers = [f"Mean {d} err MA" for d in dim_names] + ["Total Error", "Combined Std"]
+    header = f"{'Policy':<{name_col_w}}"
+    for h in col_headers:
+        header += f" | {h:^{val_col_w}}"
+    sep = "-" * len(header)
+
+    lines = []
+    lines.append(f"\n{'=' * len(sep)}")
+    lines.append("COMBINED VELOCITY TRACKING ERROR (MA-smoothed)")
+    lines.append(f"{'=' * len(sep)}")
+    lines.append(header)
+    lines.append(sep)
+
+    for name, res in policy_results.items():
+        row = f"{name:<{name_col_w}}"
+        for m in res["mean_errors"]:
+            row += f" | {m:^{val_col_w}.4f}"
+        row += f" | {res['total_error']:^{val_col_w}.4f}"
+        row += f" | {res['combined_std']:^{val_col_w}.4f}"
+        lines.append(row)
+
+    lines.append(f"{'=' * len(sep)}\n")
+
+    result = "\n".join(lines)
+    print(result)
+    return result
 
 
 def _resolve_experiment_dirs(
@@ -763,10 +1116,17 @@ def main():
         experiment_dirs[name] = exp_dir
         print(f"  Loaded {len(grouped_data[name]['runs'])} runs for '{name}'")
 
-    # Save plots to each experiment directory
+    # Filter to only successful runs for plots and stats
+    filtered_data = _filter_successful_runs(grouped_data)
+    for name in filtered_data:
+        n_total = len(grouped_data[name]["runs"])
+        n_success = len(filtered_data[name]["runs"])
+        print(f"  '{name}': using {n_success}/{n_total} successful runs for plots/stats")
+
+    # Save plots to each experiment directory (using successful runs only)
     for name, exp_dir in experiment_dirs.items():
         # Per-policy plots
-        single_data = OrderedDict({name: grouped_data[name]})
+        single_data = OrderedDict({name: filtered_data[name]})
         vel_path = os.path.join(exp_dir, "velocity_tracking")
         torque_path = os.path.join(exp_dir, "joint_torques")
         plot_velocity_comparison(single_data, save_path=vel_path)
@@ -775,13 +1135,25 @@ def main():
         # Comparison plots (saved to each experiment dir)
         comparison_vel_path = os.path.join(exp_dir, "comparison_velocity")
         comparison_torque_path = os.path.join(exp_dir, "comparison_torques")
-        plot_velocity_comparison(grouped_data, save_path=comparison_vel_path)
-        plot_torque_comparison(grouped_data, save_path=comparison_torque_path)
+        plot_velocity_comparison(filtered_data, save_path=comparison_vel_path)
+        plot_torque_comparison(filtered_data, save_path=comparison_torque_path)
+        plot_radar_comparison(
+            filtered_data,
+            save_path=os.path.join(exp_dir, "radar_comparison"),
+        )
 
-    # Print stats tables
-    print_stats_table(grouped_data)
-    print_torque_stats_table(grouped_data)
-    print_success_table(grouped_data)
+    # Print stats tables and save to file
+    # Use filtered data for velocity/torque stats, unfiltered for success rate
+    stats_text = print_stats_table(filtered_data)
+    stats_text += print_torque_stats_table(filtered_data)
+    stats_text += print_success_table(grouped_data)
+    stats_text += print_combined_error_table(filtered_data)
+
+    for name, exp_dir in experiment_dirs.items():
+        stats_path = os.path.join(exp_dir, "experiment_stats.txt")
+        with open(stats_path, "w") as f:
+            f.write(stats_text)
+        print(f"Saved stats to {stats_path}")
 
     # Generate force-magnitude success histogram if any policy has force data
     has_force = any(

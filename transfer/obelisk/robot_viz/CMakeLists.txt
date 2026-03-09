@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.8)
+project(robot_viz)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# find dependencies
+find_package(ament_cmake REQUIRED)
+find_package(fastcdr REQUIRED)  # Required for ament transitive dependencies
+
+# Get the Obelisk library
+include(FetchContent)
+FetchContent_Declare(
+  Obelisk
+  SOURCE_DIR $ENV{OBELISK_ROOT}/obelisk/cpp
+)
+
+# Lets us Get Obelisk::Core and Obelisk::Viz  
+FetchContent_MakeAvailable(Obelisk)
+
+# default_robot_viz
+add_executable(robot_viz src/robot_viz.cpp)
+target_link_libraries(robot_viz PUBLIC Obelisk::Core Obelisk::Viz)
+target_include_directories(robot_viz PUBLIC include)
+
+
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  set(ament_cmake_copyright_FOUND TRUE)
+  set(ament_cmake_cpplint_FOUND TRUE)
+  ament_lint_auto_find_test_dependencies()
+endif()
+
+install(TARGETS
+  robot_viz
+  DESTINATION lib/${PROJECT_NAME})
+
+ament_package()

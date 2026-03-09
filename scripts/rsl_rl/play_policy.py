@@ -10,7 +10,7 @@ import cli_args
 import torch
 
 # Import plot_trajectories functions
-from plot_trajectories import plot_trajectories #, plot_hzd_trajectories
+from plot_trajectories import plot_trajectories, compute_and_save_stats
 from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 # Experiment names mapping for different environments
 
@@ -23,6 +23,7 @@ SIM_ENVIRONMENTS = {
 
     "running_clf": "G1-running-clf-play",
     "running_clf_sym": "G1-running-clf-play",
+    "running_clf_sym_exp": "G1-running-clf-experiment",
 
     "waving_clf": "G1-waving-clf-play",
 
@@ -278,7 +279,8 @@ def main():
     # specify directory for logging experiments
    
     base_log_path = os.path.join("logs", "g1_policies", EXPERIMENT_NAMES[args_cli.env_type])
-    log_root_path = os.path.join(base_log_path, args_cli.env_type)
+    env_type_base = args_cli.env_type.split("_exp")[0] if "_exp" in args_cli.env_type else args_cli.env_type
+    log_root_path = os.path.join(base_log_path, env_type_base)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[DEBUG] Log root path: {log_root_path}")
     
@@ -418,8 +420,8 @@ def main():
     else:
         raise ValueError(f"No valid command name for {args_cli.env_type}")
 
-    # Setup logging
-    logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars)
+    # Setup logging (include actions/joint_names separately since they don't come from extract_reference_trajectory)
+    logger = DataLogger(enabled=True, log_dir=play_log_dir, variables=log_vars + ['action_targets', 'joint_pos', 'applied_torque', 'joint_names'])
 
     # reset environment
     obs = env.get_observations()
@@ -446,6 +448,12 @@ def main():
             # Log data
             if args_cli.log_data:
                 data = extract_reference_trajectory(env, log_vars, command_name)
+                action_term = env.unwrapped.action_manager.get_term("joint_pos")
+                robot = env.unwrapped.scene.articulations["robot"]
+                data['action_targets'] = action_term._processed_actions.clone()
+                data['joint_pos'] = robot.data.joint_pos.clone()
+                data['applied_torque'] = robot.data.applied_torque.clone()
+                data['joint_names'] = list(robot.data.joint_names)
                 logger.log_from_dict(data)
 
         timestep += 1
@@ -475,6 +483,7 @@ def main():
         
         # Determine trajectory type based on command type
         plot_trajectories(logger.data, save_dir=plot_dir, trajectory_type="end_effector")
+        compute_and_save_stats(logger.data, save_dir=plot_dir)
 
     # Ensure simulation app is closed
     if simulation_app is not None:

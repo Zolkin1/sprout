@@ -1,5 +1,6 @@
 import os
 import pickle
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import glob
@@ -306,6 +307,76 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
                 plt.savefig(os.path.join(save_dir, f'velocities_env{env_id}.png'), dpi=300, bbox_inches='tight')
             plt.close(fig)
 
+        # --- Joint Angle Targets vs Actual ---
+        if 'action_targets' in processed_data and 'joint_pos' in processed_data:
+            n_dims = processed_data['action_targets'].shape[2]
+            title = f'Joint Angle Targets vs Actual (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+
+            # Get joint names for labels
+            joint_names = None
+            if 'joint_names' in processed_data:
+                joint_names = processed_data['joint_names'][0]  # Same for all timesteps
+
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['action_targets'][:, env_id, i], label='Target', linewidth=2)
+                ax.plot(time_steps, processed_data['joint_pos'][:, env_id, i], label='Actual', linestyle='--', linewidth=2)
+                if joint_names is not None and i < len(joint_names):
+                    label = format_joint_name(str(joint_names[i]))
+                else:
+                    label = f'Dim {i}'
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel('Angle (rad)')
+                ax.grid(True, alpha=0.3)
+                if i == 0:
+                    ax.legend()
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'joint_targets_vs_actual_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
+        # --- Joint Torques ---
+        if 'applied_torque' in processed_data:
+            n_dims = processed_data['applied_torque'].shape[2]
+            title = f'Joint Torques (Env {env_id})'
+            n_cols = 4
+            n_rows = (n_dims + n_cols - 1) // n_cols
+            fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows))
+            fig.suptitle(title, fontsize=16)
+            axs = np.array(axs)
+
+            joint_names = None
+            if 'joint_names' in processed_data:
+                joint_names = processed_data['joint_names'][0]
+
+            for i in range(n_dims):
+                ax = get_ax(axs, i, n_cols)
+                ax.plot(time_steps, processed_data['applied_torque'][:, env_id, i], linewidth=2)
+                if joint_names is not None and i < len(joint_names):
+                    label = format_joint_name(str(joint_names[i]))
+                else:
+                    label = f'Dim {i}'
+                ax.set_title(label, fontsize=10)
+                ax.set_xlabel('Time Steps')
+                ax.set_ylabel('Torque (Nm)')
+                ax.grid(True, alpha=0.3)
+            for i in range(n_dims, n_rows * n_cols):
+                ax = get_ax(axs, i, n_cols)
+                ax.set_visible(False)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            if save_dir:
+                plt.savefig(os.path.join(save_dir, f'joint_torques_env{env_id}.png'), dpi=300, bbox_inches='tight')
+            plt.close(fig)
+
         # --- Base Velocity ---
         if 'base_velocity' in processed_data:
             n_dims = processed_data['base_velocity'].shape[2]
@@ -454,8 +525,8 @@ def plot_trajectories(data, save_dir=None, trajectory_type=None):
             plt.savefig(os.path.join(save_dir, 'clf_ema.png'), dpi=300, bbox_inches='tight')
         plt.close(fig)
 
-    # Generate focused COM and ankle plot
-    plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)
+    # # Generate focused COM and ankle plot
+    # plot_focused_com_ankle(data, save_dir=save_dir, trajectory_type=trajectory_type)
 
 
 def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
@@ -644,16 +715,216 @@ def plot_focused_com_ankle(data, save_dir=None, trajectory_type=None):
         
         plt.close(fig)
 
+def compute_and_save_stats(data: dict, save_dir: str | None = None,
+                           start_idx: int | None = None, end_idx: int | None = None) -> None:
+    """Compute summary statistics (mean V, position/velocity errors) and save to file.
+
+    Computes per-env means first, then reports the mean and std across envs.
+
+    Args:
+        data: Raw data dict from load_data (values may be torch tensors or lists).
+        save_dir: Directory to save play_stats.txt. If None, only prints.
+        start_idx: Start timestep index (inclusive). Defaults to 0.
+        end_idx: End timestep index (exclusive). Defaults to last timestep.
+    """
+    # Convert to numpy
+    processed: dict[str, np.ndarray] = {}
+    for key, values in data.items():
+        if isinstance(values[0], torch.Tensor):
+            processed[key] = np.array([v.cpu().numpy() for v in values])
+        else:
+            processed[key] = np.array(values)
+
+    # Determine timestep range
+    sample_key = next(iter(processed))
+    n_timesteps = processed[sample_key].shape[0]
+    si = start_idx if start_idx is not None else 0
+    ei = end_idx if end_idx is not None else n_timesteps
+
+    lines: list[str] = []
+    csv_rows: list[dict[str, str]] = []
+
+    def _log(text: str = "") -> None:
+        print(text)
+        lines.append(text)
+
+    def _csv(metric: str, value: float) -> None:
+        csv_rows.append({"metric": metric, "value": f"{value:.6f}"})
+
+    _log("=" * 60)
+    _log("  Play Statistics")
+    _log("=" * 60)
+    _log(f"Timestep range: [{si}, {ei}) of {n_timesteps} total")
+
+    # --- Number of envs ---
+    # Infer from a 2D+ array
+    n_envs = None
+    for arr in processed.values():
+        if arr.ndim >= 2:
+            n_envs = arr.shape[1]
+            break
+    if n_envs is not None:
+        _log(f"Number of envs: {n_envs}")
+
+    # --- Commanded velocity ranges ---
+    if 'base_velocity' in processed:
+        bv = processed['base_velocity'][si:ei]  # [T, envs, 3]
+        vel_labels = ['Linear X', 'Linear Y', 'Angular Z']
+        vel_units = ['m/s', 'm/s', 'rad/s']
+        _log("")
+        _log("Commanded Velocity Ranges:")
+        csv_vel_keys = ['cmd_vel_lin_x', 'cmd_vel_lin_y', 'cmd_vel_ang_z']
+        for i in range(min(bv.shape[2], 3)):
+            v_min = bv[:, :, i].min()
+            v_max = bv[:, :, i].max()
+            _log(f"  {vel_labels[i]:>12s}: [{v_min:+.4f}, {v_max:+.4f}] {vel_units[i]}")
+            _csv(f"{csv_vel_keys[i]}_min", float(v_min))
+            _csv(f"{csv_vel_keys[i]}_max", float(v_max))
+
+    # --- Mean V (Lyapunov) ---
+    if 'v' in processed:
+        v_data = processed['v'][si:ei]  # [T, envs] or [T, envs, 1]
+        if v_data.ndim == 3:
+            v_data = v_data.squeeze(-1)
+        per_env_mean = v_data.mean(axis=0)  # [envs]
+        _log("")
+        _log("Lyapunov Function (V):")
+        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
+        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+        _csv("lyapunov_v_mean", float(per_env_mean.mean()))
+        _csv("lyapunov_v_std", float(per_env_mean.std()))
+
+    # --- Norm squared error ---
+    if 'y_des' in processed and 'y_act' in processed and 'dy_des' in processed and 'dy_act' in processed:
+        e_pos = processed['y_des'][si:ei] - processed['y_act'][si:ei]  # [T, envs, pos_dims]
+        e_vel = processed['dy_des'][si:ei] - processed['dy_act'][si:ei]  # [T, envs, vel_dims]
+        e = np.concatenate([e_pos, e_vel], axis=2)  # [T, envs, pos_dims + vel_dims]
+        norm_sq = (e ** 2).sum(axis=2)  # [T, envs]
+        per_env_mean = norm_sq.mean(axis=0)  # [envs]
+        _log("")
+        _log("Norm Squared Error (dot(e,e)):")
+        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
+        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
+        _csv("norm_sq_error_mean", float(per_env_mean.mean()))
+        _csv("norm_sq_error_std", float(per_env_mean.std()))
+
+    # --- Position errors ---
+    if 'y_des' in processed and 'y_act' in processed:
+        y_des = processed['y_des'][si:ei]  # [T, envs, dims]
+        y_act = processed['y_act'][si:ei]
+        pos_err = (y_des - y_act)**2  # [T, envs, dims]
+        n_dims = pos_err.shape[2]
+
+        # Get labels
+        pos_names: list[str] = []
+        if 'ordered_pos_output_names' in processed:
+            for i in range(n_dims):
+                pos_names.append(str(processed['ordered_pos_output_names'][0, i]))
+        else:
+            pos_names = [f"Dim {i}" for i in range(n_dims)]
+
+        per_env_mean_err = pos_err.mean(axis=0)  # [envs, dims]
+        mean_over_envs = per_env_mean_err.mean(axis=0)  # [dims]
+        std_over_envs = per_env_mean_err.std(axis=0)    # [dims]
+
+        _log("")
+        _log("Position Errors (|y_des - y_act|):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            _log(f"  {pos_names[i]:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        # Group summaries for position errors
+        groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
+        _log("")
+        _log("  Position Error Group Summaries:")
+        _log(f"  {'Group':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for group_name, pattern in groups.items():
+            idxs = [i for i, name in enumerate(pos_names) if pattern in name]
+            if idxs:
+                group_means = mean_over_envs[idxs]
+                group_stds = std_over_envs[idxs]
+                _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+                csv_key = f"pos_error_{group_name.lower()}"
+                _csv(f"{csv_key}_mean", float(group_means.mean()))
+                _csv(f"{csv_key}_std", float(group_stds.mean()))
+
+    # --- Velocity errors ---
+    if 'dy_des' in processed and 'dy_act' in processed:
+        dy_des = processed['dy_des'][si:ei]
+        dy_act = processed['dy_act'][si:ei]
+        vel_err = (dy_des - dy_act)**2
+        n_dims = vel_err.shape[2]
+
+        vel_names: list[str] = []
+        if 'ordered_vel_output_names' in processed:
+            for i in range(n_dims):
+                vel_names.append(str(processed['ordered_vel_output_names'][0, i]))
+        else:
+            vel_names = [f"Dim {i}" for i in range(n_dims)]
+
+        per_env_mean_err = vel_err.mean(axis=0)
+        mean_over_envs = per_env_mean_err.mean(axis=0)
+        std_over_envs = per_env_mean_err.std(axis=0)
+
+        _log("")
+        _log("Velocity Errors (|dy_des - dy_act|):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            _log(f"  {vel_names[i]:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        # Group summaries for velocity errors
+        groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
+        _log("")
+        _log("  Velocity Error Group Summaries:")
+        _log(f"  {'Group':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for group_name, pattern in groups.items():
+            idxs = [i for i, name in enumerate(vel_names) if pattern in name]
+            if idxs:
+                group_means = mean_over_envs[idxs]
+                group_stds = std_over_envs[idxs]
+                _log(f"  {group_name:<40s} {group_means.mean():12.6f} {group_stds.mean():12.6f}")
+                csv_key = f"vel_error_{group_name.lower()}"
+                _csv(f"{csv_key}_mean", float(group_means.mean()))
+                _csv(f"{csv_key}_std", float(group_stds.mean()))
+
+    _log("")
+    _log("=" * 60)
+
+    # Save to file
+    if save_dir:
+        stats_path = os.path.join(save_dir, "play_stats.txt")
+        with open(stats_path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"\nStats saved to: {stats_path}")
+
+        # Save CSV
+        if csv_rows:
+            csv_path = os.path.join(save_dir, "tracking_stats.csv")
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["metric", "value"])
+                writer.writeheader()
+                writer.writerows(csv_rows)
+            print(f"Stats saved to: {csv_path}")
+
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Plot trajectory data from log files')
     parser.add_argument('--log_dir', type=str, help='Specific log directory to plot (optional)')
-    parser.add_argument('--trajectory_type', type=str, 
-                       choices=['joint', 'end_effector', 'auto'], 
+    parser.add_argument('--trajectory_type', type=str,
+                       choices=['joint', 'end_effector', 'auto'],
                        default='auto', help='Type of trajectory to plot (default: auto-detect)')
-    parser.add_argument('--base_path', type=str, default='logs/play', 
+    parser.add_argument('--base_path', type=str, default='logs/play',
                        help='Base path to search for log directories (default: logs/play)')
-    
+    parser.add_argument('--start_idx', type=int, default=None,
+                       help='Start timestep index for stats computation (default: 0)')
+    parser.add_argument('--end_idx', type=int, default=None,
+                       help='End timestep index for stats computation (default: last)')
+
     args = parser.parse_args()
     
     # Find the log directory
@@ -679,6 +950,10 @@ def main():
     
     # Plot the data with specified or auto-detected trajectory type
     plot_trajectories(data, save_dir=plot_dir, trajectory_type=trajectory_type)
+
+    # Compute and save stats
+    compute_and_save_stats(data, save_dir=plot_dir,
+                           start_idx=args.start_idx, end_idx=args.end_idx)
 
 
 if __name__ == "__main__":

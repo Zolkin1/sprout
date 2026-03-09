@@ -82,10 +82,10 @@ class TrajectoryCommand(CommandTerm):
 
         # For now assuming that all bodies have a yaw tracking
         # Use velocity output names since CLF uses velocity dimensions
-        self.yaw_output_idxs = []
-        for i, name in enumerate(self.ordered_vel_output_names):
-            if "ori_z" in name:
-                self.yaw_output_idxs.append(i)
+        # self.yaw_output_idxs = []
+        # for i, name in enumerate(self.ordered_vel_output_names):
+        #     if "ori_z" in name:
+        #         self.yaw_output_idxs.append(i)
 
         # Create a mapping from vel output indices to pos output indices
         # This is needed to extract position values that match velocity dimensions
@@ -358,12 +358,15 @@ class TrajectoryCommand(CommandTerm):
 
         # Get the poses of all the possible contact bodies
         poses[:, :, :3] = self.robot.data.body_pos_w[:, self.contact_frame_indices, :]
-        for i in range(len(self.contact_bodies)):
-            poses[:, i, 3:] = get_euler_from_quat(self.robot.data.body_quat_w[:, self.contact_frame_indices[i], :])
+
+        # Batch euler conversion for all contact bodies at once
+        N = self.num_envs
+        C = len(self.contact_bodies)
+        all_quats = self.robot.data.body_quat_w[:, self.contact_frame_indices, :]  # [N, C, 4]
+        poses[:, :, 3:] = get_euler_from_quat(all_quats.reshape(N * C, 4)).reshape(N, C, 3)
 
         # Now mask
         poses[not_in_contact, :] *= 0
-
 
         return poses
 
@@ -536,71 +539,34 @@ class TrajectoryCommand(CommandTerm):
             """
             Compute the position, orientation, and velocity relative to the reference frame.
 
-            # TODO: Think about benefits of just yaw aligning and roll-pitch algining
-            #   If I roll-pitch align it should work better on slopes, but then maybe we are more
-            #   sensitive to the orientation of the reference frame, especially if the reference isn't perfect,
-            #       then we just generate more error
-
-            # TODO: For now just going with yaw aligned
-            # NOTE: All positions should be in the yaw-aligned frame centered at the reference frame.
-            #   All orientation should be in the yaw-aligned frame.
-            #   All velocities should be in the yaw-aligned frame.
-            #   All angular velocities should be in the yaw-aligned frame.
+            All positions are in the yaw-aligned frame centered at the reference frame.
+            All orientations are in the yaw-aligned frame.
+            All velocities are in the yaw-aligned frame.
 
             Args:
-                idx: tensor of shape [num_bodies]
-                frame_pos_w: tensor of shape [3]
-                ref_frame_quat_w: tensor of shape [4]
+                ref_frame_pos_w: tensor of shape [N, 3]
+                ref_frame_quat_w: tensor of shape [N, 4]
+                frame_pos_w: tensor of shape [N, num_bodies, 3]
+                frame_quat_w: tensor of shape [N, num_bodies, 4]
+                frame_lin_vel_w: tensor of shape [N, num_bodies, 3]
+                frame_ang_vel_w: tensor of shape [N, num_bodies, 3]
 
             Returns:
                 frame_pos_rel_yaw_aligned: tensor of shape [N, num_bodies, 3]
-                frame_ori_yaw_aligned: tensor of shape [N, num_bodies, 3]
-                frame_vel_local: tensor of shape [N, num_bodies, 3]
+                frame_ori_yaw_aligned: tensor of shape [N, num_bodies, 4]
+                frame_vel_yaw_aligned: tensor of shape [N, num_bodies, 3]
                 frame_ang_vel_local: tensor of shape [N, num_bodies, 3]
             """
-            # Compute reference orientation as euler
-            # base_frame_ori_w = get_euler_from_quat(ref_frame_quat_w)
+            # Positions: translate then yaw-align (all bodies at once)
+            frame_pos_rel_world_aligned = frame_pos_w - ref_frame_pos_w.unsqueeze(1)
+            frame_pos_rel_yaw_aligned = _align_yaw_batched(frame_pos_rel_world_aligned, ref_frame_quat_w)
 
-            num_idx = len(self.body_idx)
+            # Orientations: yaw-align quaternions (all bodies at once)
+            frame_ori_yaw_aligned = _align_quat_to_yaw_batched(frame_quat_w, ref_frame_quat_w)
 
-            ##
-            # Positions
-            ##
-            # Make buffers
-            frame_ori_euler = torch.zeros(ref_frame_pos_w.shape[0], num_idx, 3, device=ref_frame_pos_w.device)
-            frame_pos_rel_world_aligned = torch.zeros(frame_pos_w.shape, device=frame_pos_w.device)
-            frame_pos_rel_yaw_aligned = torch.zeros(frame_pos_w.shape, device=frame_pos_w.device)
-            frame_ori_yaw_aligned = torch.zeros(ref_frame_pos_w.shape[0], num_idx, 4, device=ref_frame_pos_w.device)
-
-            for i in range(num_idx):
-                # Get the frame orientation as euler from the quat
-                frame_ori_euler[:, i, :] = get_euler_from_quat(frame_quat[:, i, :])
-
-                # Translate the frame to be relative to reference in world-aligned coords
-                frame_pos_rel_world_aligned[:, i, :] = frame_pos_w[:, i, :] - ref_frame_pos_w
-
-                # Align the position in the yaw frame
-                frame_pos_rel_yaw_aligned[:, i, :] = _align_yaw(frame_pos_rel_world_aligned[:, i, :],
-                                                                ref_frame_quat_w)
-
-                # # Align yaw and wrap to pi
-                # frame_ori_yaw_aligned[:, i, 2] = wrap_to_pi(frame_ori_euler[:, i, 2] - base_frame_ori_w[:, 2])
-                #
-                # # Use global roll and pitch
-                # frame_ori_yaw_aligned[:, i, :2] = frame_ori_euler[:, i, :2]
-
-                frame_ori_yaw_aligned[:, i, :] = _align_quat_to_yaw(frame_quat_w[:, i, :], ref_frame_quat_w)
-
-            ##
-            # Velocities
-            ##
-            # Make buffers
-            frame_vel_yaw_aligned = torch.zeros(frame_lin_vel_w.shape, device=frame_lin_vel_w.device)
-            frame_ang_vel_local = torch.zeros(frame_ang_vel_w.shape, device=frame_ang_vel_w.device)
-
-            for i in range(num_idx):
-                frame_vel_yaw_aligned[:, i, :] = _align_yaw(frame_lin_vel_w[:, i, :], ref_frame_quat)
-                frame_ang_vel_local[:, i, :] = _align_yaw(frame_ang_vel_w[:, i, :], ref_frame_quat)
+            # Velocities: yaw-align (all bodies at once)
+            frame_vel_yaw_aligned = _align_yaw_batched(frame_lin_vel_w, ref_frame_quat)
+            frame_ang_vel_local = _align_yaw_batched(frame_ang_vel_w, ref_frame_quat)
 
             return frame_pos_rel_yaw_aligned, frame_ori_yaw_aligned, frame_vel_yaw_aligned, frame_ang_vel_local
 
@@ -655,7 +621,7 @@ class TrajectoryCommand(CommandTerm):
             vel_output_idx += joint_vel.shape[1]
 
     def compute_measured_acceleration(
-        self, ref_frame_pos_w: torch.Tensor, ref_frame_quat: torch.Tensor
+        self, ref_frame_quat: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute measured accelerations from the robot in the same order as outputs.
@@ -665,7 +631,6 @@ class TrajectoryCommand(CommandTerm):
         reference frame.
 
         Args:
-            ref_frame_pos_w: [N, 3] reference frame positions in world frame.
             ref_frame_quat: [N, 4] reference frame quaternions.
 
         Returns:
@@ -692,18 +657,9 @@ class TrajectoryCommand(CommandTerm):
             body_lin_acc_w = self.robot.data.body_acc_w[:, self.body_idx, :3]
             body_ang_acc_w = self.robot.data.body_acc_w[:, self.body_idx, 3:]
 
-            num_idx = len(self.body_idx)
-
-            # Transform to local frame (same pattern as velocities)
-            body_lin_acc_local = torch.zeros(body_lin_acc_w.shape, device=self.device)
-            body_ang_acc_local = torch.zeros(body_ang_acc_w.shape, device=self.device)
-            for i in range(num_idx):
-                body_lin_acc_local[:, i, :] = _align_yaw(
-                    body_lin_acc_w[:, i, :], ref_frame_quat
-                )
-                body_ang_acc_local[:, i, :] = _align_yaw(
-                    body_ang_acc_w[:, i, :], ref_frame_quat
-                )
+            # Transform to local frame (batched over all bodies)
+            body_lin_acc_local = _align_yaw_batched(body_lin_acc_w, ref_frame_quat)
+            body_ang_acc_local = _align_yaw_batched(body_ang_acc_w, ref_frame_quat)
 
             pos_bodies = (self.body_type == 1) | (self.body_type == 2)
             num_pos_bodies = pos_bodies.sum()
@@ -844,6 +800,10 @@ class TrajectoryCommand(CommandTerm):
 
     def _update_command(self):
         """Update the command values."""
+        # Invalidate per-step cache so it refreshes once this step
+        if self.manager_type == "library":
+            self.manager.invalidate_cache()
+
         # Time in each env
         t = self.env.episode_length_buf * self.env.step_dt
 
@@ -878,7 +838,12 @@ class TrajectoryCommand(CommandTerm):
         self.get_desired_output_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
         start = time.perf_counter()
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des, self.yaw_output_idxs)
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
+
+        # # TODO: Test
+        # ddy_act = self.compute_measured_acceleration(self.ref_poses[:, :-4])
+        # ddy_nom = self.manager.get_acceleration(t)
+        # vdot, vcur = self.clf.compute_vdot_analytic(self.y_act, self.y_des, self.dy_act, self.dy_des, ddy_act, ddy_nom)
         end = time.perf_counter()
         self.vdot_time = (end - start) * torch.ones(self.num_envs, device=self.device)
 
@@ -1097,8 +1062,42 @@ class TrajectoryCommand(CommandTerm):
 def _align_yaw(vec, root_quat):
     return quat_apply(yaw_quat(quat_inv(root_quat)), vec)
 
+def _align_yaw_batched(vecs: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:
+    """Align multiple vectors to yaw frame.
+
+    Args:
+        vecs: Shape [N, B, 3] vectors to align.
+        root_quat: Shape [N, 4] reference quaternions.
+
+    Returns:
+        Aligned vectors of shape [N, B, 3].
+    """
+    N, B, _ = vecs.shape
+    yaw_inv = yaw_quat(quat_inv(root_quat))  # [N, 4]
+    yaw_inv_expanded = yaw_inv.unsqueeze(1).expand(N, B, 4).reshape(N * B, 4)
+    vecs_flat = vecs.reshape(N * B, 3)
+    result = quat_apply(yaw_inv_expanded, vecs_flat)
+    return result.reshape(N, B, 3)
+
 def _align_quat_to_yaw(quat, root_quat):
     return quat_mul(yaw_quat(quat_inv(root_quat)), quat)
+
+def _align_quat_to_yaw_batched(quats: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:
+    """Align multiple quaternions to yaw frame.
+
+    Args:
+        quats: Shape [N, B, 4] quaternions to align.
+        root_quat: Shape [N, 4] reference quaternions.
+
+    Returns:
+        Aligned quaternions of shape [N, B, 4].
+    """
+    N, B, _ = quats.shape
+    yaw_inv = yaw_quat(quat_inv(root_quat))  # [N, 4]
+    yaw_inv_expanded = yaw_inv.unsqueeze(1).expand(N, B, 4).reshape(N * B, 4)
+    quats_flat = quats.reshape(N * B, 4)
+    result = quat_mul(yaw_inv_expanded, quats_flat)
+    return result.reshape(N, B, 4)
 
 def get_euler_from_quat(quat):
     """

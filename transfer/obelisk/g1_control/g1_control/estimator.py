@@ -4,6 +4,7 @@ import numpy as np
 
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
 
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.estimation import ObeliskEstimator
@@ -43,10 +44,22 @@ class G1Estimator(ObeliskEstimator):
                 key="sub_opti_track_pose",  # key can be specified here or in the config file
             )
 
-        self.base_pos = np.ones(3)  # np.zeros(3)
+        self.register_obk_subscription(
+            "sub_odom",
+            self.odom_callback,  # type: ignore
+            Odometry,
+            key="sub_odom_key",  # key can be specified here or in the config file
+        )
+
+
+
+        self.base_pos_odom = np.ones(3)  # np.zeros(3)
+        self.base_quat_odom = np.zeros(4)
+
         self.base_quat = np.zeros(4)
 
-        self.base_vel = np.zeros(3)
+        self.base_vel_odom = np.zeros(3)
+        self.base_ang_vel_odom = np.zeros(3)
         self.base_ang_vel = np.zeros(3)
 
         self.received_joint_encoders = False
@@ -75,9 +88,10 @@ class G1Estimator(ObeliskEstimator):
             estimated_state.q_joints = self.joint_angles
             estimated_state.v_joints = self.joint_vels
             estimated_state.joint_names = self.joint_names
+            estimated_state.base_link_name = "pelvis"
 
-            estimated_state.q_base = np.concatenate([self.base_pos, self.base_quat]).tolist()
-            estimated_state.v_base = np.concatenate([self.base_vel, self.base_ang_vel]).tolist()
+            estimated_state.q_base = np.concatenate([self.base_pos_odom, self.base_quat]).tolist()
+            estimated_state.v_base = np.concatenate([self.base_vel_odom, self.base_ang_vel]).tolist()
 
             estimated_state.header.stamp = self.get_clock().now().to_msg()
 
@@ -89,6 +103,12 @@ class G1Estimator(ObeliskEstimator):
         """Callback for the optitrack pose."""
         self.base_pos = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
     
+    def odom_callback(self, msg: Odometry) -> None:
+        """Callback for the odometry."""
+        self.base_pos_odom = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+        self.base_quat_odom = np.array([msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w])
+        self.base_vel_odom = np.array([msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z])
+        self.base_ang_vel_odom = np.array([msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z])
 
 def main(args: list | None = None) -> None:
     """Main entrypoint."""

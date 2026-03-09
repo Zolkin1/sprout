@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from pyglet.media.drivers.pulse.lib_pulseaudio import pa_context_get_client_info
 from torch import Tensor
 
 from .manager_base import ManagerBase
@@ -24,8 +23,58 @@ class LibraryManager(ManagerBase):
         self.num_pos_outputs = None
         self.num_vel_outputs = None
 
+        # Per-step cache to avoid redundant conditioner/index/unique computation
+        self._cache_valid = False
+        self._cache_env_ids = None  # None means full batch
+        self._cached_indices: torch.Tensor | None = None
+        self._cached_unique_cpu: list[int] | None = None
+        self._cached_env_indices: dict[int, torch.Tensor] | None = None
+
+        # Pre-computed contiguous conditioning var for searchsorted
+        self._conditioning_vars_sorted: torch.Tensor | None = None
+
         self.load_library(hf_repo)
 
+        # Store contiguous version for searchsorted
+        self._conditioning_vars_sorted = self.conditioning_vars[:, 0].contiguous()
+
+    def invalidate_cache(self):
+        """Invalidate the per-step cache. Call once at the start of each step."""
+        self._cache_valid = False
+
+    def _ensure_cache(self, env_ids: torch.Tensor | None = None):
+        """Ensure the per-step cache is populated for the given env_ids.
+
+        Computes conditioner, trajectory indices, unique indices, and per-trajectory
+        env_indices once. Subsequent calls with the same env_ids are no-ops.
+
+        Args:
+            env_ids: Optional environment indices. None means full batch.
+        """
+        # Check if cache is valid for this env_ids configuration
+        if self._cache_valid and self._cache_env_ids is env_ids:
+            return
+
+        conditioner = self.get_conditioner_var()
+        if env_ids is not None:
+            conditioner = conditioner[env_ids]
+
+        indices = self.get_traj_indices(conditioner)
+
+        # Single CPU-GPU sync: convert unique indices to CPU list
+        unique_gpu = torch.unique(indices)
+        unique_cpu = unique_gpu.tolist()
+
+        # Pre-compute env_indices for each unique trajectory
+        env_indices_map = {}
+        for idx in unique_cpu:
+            env_indices_map[idx] = torch.where(indices == idx)[0]
+
+        self._cached_indices = indices
+        self._cached_unique_cpu = unique_cpu
+        self._cached_env_indices = env_indices_map
+        self._cache_env_ids = env_ids
+        self._cache_valid = True
 
     def load_library(self, hf_repo: str):
         """Load all trajectory files from the library folder into a list."""
@@ -200,20 +249,15 @@ class LibraryManager(ManagerBase):
         return self.num_vel_outputs
 
     def get_num_domains(self):
-        conditioner = self.get_conditioner_var()
-        indices = self.get_traj_indices(conditioner)
+        """Get the number of domains for each environment."""
+        self._ensure_cache()
 
-        unique_indicies = torch.unique(indices)
+        N = self._cached_indices.shape[0]
+        domains = torch.zeros(N, device=self.device)
 
-        domains = torch.zeros(conditioner.shape[0], device=self.device)
-
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = indices == idx
-            env_indices = torch.where(mask)[0]
-
-            manager_domains = self.trajectory_managers[idx.item()].get_num_domains()
-
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
+            manager_domains = self.trajectory_managers[idx].get_num_domains()
             domains[env_indices] = manager_domains
 
         return domains
@@ -232,29 +276,14 @@ class LibraryManager(ManagerBase):
         Returns:
             Phasing variable tensor of shape [N].
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        indices = self.get_traj_indices(conditioner)
+        self._ensure_cache(env_ids)
 
         phasing_var = torch.zeros(t.shape[0], device=self.device)
 
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(indices)
-
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = indices == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_output for this manager
-            manager_phasing_var = self.trajectory_managers[idx.item()].get_phasing_var(t_for_manager)
-
-            # Place outputs in the correct positions
+            manager_phasing_var = self.trajectory_managers[idx].get_phasing_var(t_for_manager)
             phasing_var[env_indices] = manager_phasing_var
 
         return phasing_var
@@ -271,36 +300,44 @@ class LibraryManager(ManagerBase):
             pos_outputs: shape [N, num_pos_outputs] position outputs
             vel_outputs: shape [N, num_vel_outputs] velocity outputs
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        indices = self.get_traj_indices(conditioner)
+        self._ensure_cache(env_ids)
 
-        # Initialize output tensors (separate for pos and vel)
         N = t.shape[0]
         pos_outputs = torch.zeros(N, self.num_pos_outputs, device=self.device)
         vel_outputs = torch.zeros(N, self.num_vel_outputs, device=self.device)
 
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(indices)
-
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = indices == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_output for this manager - returns (pos, vel) tuple
-            manager_pos_outputs, manager_vel_outputs = self.trajectory_managers[idx.item()].get_output(t_for_manager)
-
-            # Place outputs in the correct positions
+            manager_pos_outputs, manager_vel_outputs = self.trajectory_managers[idx].get_output(t_for_manager)
             pos_outputs[env_indices] = manager_pos_outputs
             vel_outputs[env_indices] = manager_vel_outputs
 
         return pos_outputs, vel_outputs
+
+    def get_acceleration(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Compute the acceleration outputs for each environment.
+
+        Args:
+            t: Time in each env, shape [N].
+            env_ids: Optional environment indices of shape [N]. If provided, only compute
+                for those environments (conditioner is sliced to match t.shape[0]).
+
+        Returns:
+            Acceleration outputs, shape [N, num_vel_outputs].
+        """
+        self._ensure_cache(env_ids)
+
+        N = t.shape[0]
+        accelerations = torch.zeros(N, self.num_vel_outputs, device=self.device)
+
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
+            t_for_manager = t[env_indices]
+            manager_accelerations = self.trajectory_managers[idx].get_acceleration(t_for_manager)
+            accelerations[env_indices] = manager_accelerations
+
+        return accelerations
 
     def get_ref_frames_in_use(self, t: torch.Tensor,
                               ref_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
@@ -315,31 +352,15 @@ class LibraryManager(ManagerBase):
         Returns:
             Frame indices into ref_frames for the active frame in each env, shape [N].
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        indices = self.get_traj_indices(conditioner)
+        self._ensure_cache(env_ids)
 
-        # Initialize output tensor
         N = t.shape[0]
         frame_indices = torch.zeros(N, dtype=torch.long, device=self.device)
 
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(indices)
-
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = indices == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_ref_frames_in_use for this manager
-            manager_frame_indices = self.trajectory_managers[idx.item()].get_ref_frames_in_use(t_for_manager, ref_frames)
-
-            # Place outputs in the correct positions
+            manager_frame_indices = self.trajectory_managers[idx].get_ref_frames_in_use(t_for_manager, ref_frames)
             frame_indices[env_indices] = manager_frame_indices
 
         return frame_indices
@@ -357,31 +378,15 @@ class LibraryManager(ManagerBase):
         Returns:
             Contact states for each frame from the trajectory, shape [N, num_contacts].
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        indices = self.get_traj_indices(conditioner)
+        self._ensure_cache(env_ids)
 
-        # Initialize output tensor
         N = t.shape[0]
         contact_states = torch.zeros(N, len(contact_frames), device=self.device)
 
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(indices)
-
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = indices == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_output for this manager
-            manager_states = self.trajectory_managers[idx.item()].get_contact_state(t_for_manager, contact_frames)
-
-            # Place outputs in the correct positions
+            manager_states = self.trajectory_managers[idx].get_contact_state(t_for_manager, contact_frames)
             contact_states[env_indices] = manager_states
 
         return contact_states
@@ -397,29 +402,14 @@ class LibraryManager(ManagerBase):
         Returns:
             Domain indices, shape [N].
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        traj_idx = self.get_traj_indices(conditioner)
-
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(traj_idx)
+        self._ensure_cache(env_ids)
 
         domain_idx = torch.zeros(t.shape[0], dtype=torch.long, device=self.device)
 
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = traj_idx == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_output for this manager
-            manager_states = self.trajectory_managers[idx.item()].get_current_domains(t_for_manager)
-
-            # Place outputs in the correct positions
+            manager_states = self.trajectory_managers[idx].get_current_domains(t_for_manager)
             domain_idx[env_indices] = manager_states
 
         return domain_idx
@@ -427,10 +417,8 @@ class LibraryManager(ManagerBase):
 
     def get_traj_indices(self, conditioner: torch.Tensor) -> torch.Tensor:
         """Determine which trajectories are in use for each env."""
-        # Determine which trajectory is in use. Use searchsorted
-        # Ensure tensors are contiguous to avoid performance warnings
         indicies = torch.searchsorted(
-            self.conditioning_vars[:, 0].contiguous(),
+            self._conditioning_vars_sorted,
             conditioner.contiguous(),
             right=False
         ) - 1
@@ -448,29 +436,14 @@ class LibraryManager(ManagerBase):
         Returns:
             Domain durations, shape [N].
         """
-        conditioner = self.get_conditioner_var()
-        if env_ids is not None:
-            conditioner = conditioner[env_ids]
-        traj_idx = self.get_traj_indices(conditioner)
-
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(traj_idx)
+        self._ensure_cache(env_ids)
 
         domain_times = torch.zeros(t.shape[0], dtype=torch.float, device=self.device)
 
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = traj_idx == idx
-            env_indices = torch.where(mask)[0]
-
-            # Get times for these environments
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
             t_for_manager = t[env_indices]
-
-            # Call get_output for this manager
-            domain_time = self.trajectory_managers[idx.item()].get_domain_times(t_for_manager)
-
-            # Place outputs in the correct positions
+            domain_time = self.trajectory_managers[idx].get_domain_times(t_for_manager)
             domain_times[env_indices] = domain_time
 
         return domain_times
@@ -499,43 +472,24 @@ class LibraryManager(ManagerBase):
         self.num_vel_outputs = len(vel_output_names)
 
     def log_v_on_phasing_var(self, phi, v):
-        """
-        Log the value of the CLF at its value in the phasing variable.
-        """
-        conditioner = self.get_conditioner_var()
-        traj_idx = self.get_traj_indices(conditioner)
+        """Log the value of the CLF at its value in the phasing variable."""
+        self._ensure_cache()
 
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(traj_idx)
-
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = traj_idx == idx
-            env_indices = torch.where(mask)[0]
-
-            # Call get_output for this manager
-            self.trajectory_managers[idx.item()].log_v_on_phasing_var(phi[env_indices], v[env_indices])
-
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
+            self.trajectory_managers[idx].log_v_on_phasing_var(phi[env_indices], v[env_indices])
 
     def get_v_log(self) -> tuple[Tensor, Any]:
-        conditioner = self.get_conditioner_var()
-        traj_idx = self.get_traj_indices(conditioner)
-
-        # Get the unique managers (avoid repeats)
-        unique_indicies = torch.unique(traj_idx)
+        """Get the V log for all environments."""
+        self._ensure_cache()
 
         phi_keys = self.trajectory_managers[0].phi_keys
-        v_log = torch.zeros(conditioner.shape[0], len(phi_keys), dtype=torch.float, device=self.device)
+        N = self._cached_indices.shape[0]
+        v_log = torch.zeros(N, len(phi_keys), dtype=torch.float, device=self.device)
 
-        # Bin each conditioner by manager
-        for idx in unique_indicies:
-            # Find which environments use this trajectory
-            mask = traj_idx == idx
-            env_indices = torch.where(mask)[0]
-
-            # Call get_output for this manager
-            v_log[env_indices, :] = self.trajectory_managers[idx.item()].v_log
+        for idx in self._cached_unique_cpu:
+            env_indices = self._cached_env_indices[idx]
+            v_log[env_indices, :] = self.trajectory_managers[idx].v_log
 
         return v_log, phi_keys
 
