@@ -86,7 +86,7 @@ class MPCController(ObeliskController, ABC):
         self.dv_max = dv_max_vals if np.all(dv_max_vals > 0) else None
         self.goal_deadzone = self.get_parameter("goal_deadzone").get_parameter_value().double_value
         debug_file = self.get_parameter("debug_file").get_parameter_value().string_value
-        root = os.environ.get("LEGGED_LOCOMOTION_RL_ROOT", "")
+        root = os.environ.get("ROBOT_RL_ROOT", "")
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.log_dir = os.path.join(root, "ctrl_logs", "mpc", timestamp)
         os.makedirs(self.log_dir, exist_ok=True)

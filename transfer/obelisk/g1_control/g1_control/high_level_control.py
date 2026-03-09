@@ -85,6 +85,12 @@ class HighLevelController(ObeliskController, ABC):
         self.declare_parameter("temp_safety_threshold", 110.0)
         self.declare_parameter("temp_lower_start", 80.0)
         self.declare_parameter("safe_temp_speed", 1.1)
+        self.declare_parameter("y_filt_len", 7)
+        self.y_filt_len = self.get_parameter("y_filt_len").get_parameter_value().integer_value
+        self.declare_parameter("yaw_filt_len", 7)
+        self.yaw_filt_len = self.get_parameter("yaw_filt_len").get_parameter_value().integer_value
+        self.declare_parameter("x_filt_len", 3)
+        self.x_filt_len = self.get_parameter("x_filt_len").get_parameter_value().integer_value
         self.temp_safety_threshold = self.get_parameter("temp_safety_threshold").get_parameter_value().double_value
         self.temp_lower_start = self.get_parameter("temp_lower_start").get_parameter_value().double_value
         self.safe_temp_speed = self.get_parameter("safe_temp_speed").get_parameter_value().double_value
@@ -318,9 +324,37 @@ class HighLevelController(ObeliskController, ABC):
         """
         # Publish the correct frame odom data
         msg = Odometry()
-        msg.pose.pose.position.x = self.pos_w[0]
-        msg.pose.pose.position.y = self.pos_w[1]
-        msg.pose.pose.position.z = self.pos_w[2]
+
+        # Moving average filter for x
+        x = 0
+        N = min(self.x_filt_len, len(self.pos_w_window))
+        for i in range(N):
+            x += self.pos_w_window[i][0]
+        x /= N
+
+        # Moving average filter for y
+        y = 0
+        N = min(self.y_filt_len, len(self.pos_w_window))
+        for i in range(N):
+            y += self.pos_w_window[i][1]
+        y /= N
+
+        # Moving average filter for yaw
+        N = min(self.yaw_filt_len, len(self.pos_w_window))
+        yaw = np.zeros((N,))
+        for i in range(N):
+            yaw[i] = self.pos_w_window[i][2]
+        min_yaw = np.min(yaw)
+        adjust = np.pi - min_yaw
+        yaw = np.mean((yaw + adjust) % (2 * np.pi) - adjust)
+
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.position.z = yaw
+
+        # msg.pose.pose.position.x = self.pos_w[0]
+        # msg.pose.pose.position.y = self.pos_w[1]
+        # msg.pose.pose.position.z = self.pos_w[2]
 
         msg.pose.pose.orientation.w = self.quat_w[3]
         msg.pose.pose.orientation.x = self.quat_w[0]
@@ -523,13 +557,12 @@ class HighLevelController(ObeliskController, ABC):
 
         return y_vel_local_cmd, yaw_rate_cmd
 
-
     def vel_cmd_callback(self, cmd_msg: VelocityCommand):
         """Callback for velocity command messages from the unitree joystick node."""
         self.joy_cmd_vel[0] = min(max(cmd_msg.v_x, self.v_x_min), self.v_x_max)
         self.joy_cmd_vel[1] = min(max(cmd_msg.v_y, -self.v_y_max), self.v_y_max)
         self.joy_cmd_vel[2] = min(max(cmd_msg.w_z, -self.w_z_max), self.w_z_max)
-            
+
     def update_x_hat(self, msg):
         """Receive the joystick message."""
         self.rec_joystick = True
@@ -828,7 +861,7 @@ class HighLevelController(ObeliskController, ABC):
         # Compute rotation to zero yaw (in gravity-aligned frame)
         heading = oR_b.apply(self.body_heading)
         initial_yaw = np.atan2(heading[1], heading[0])
-        R_zero_yaw = Rotation.from_euler('z', -initial_yaw)
+        R_zero_yaw = Rotation.from_euler('z', -(initial_yaw - self.waist_joint_angle))
 
         # Combined rotation: first apply gravity alignment, then yaw zeroing
         self.R_odom_camera_init = R_zero_yaw * oR_c
