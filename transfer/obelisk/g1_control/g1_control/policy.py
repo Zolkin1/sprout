@@ -37,6 +37,10 @@ class RLPolicy:
         self.boundaries_crossed = 0
         self.hold_phi_value = -1.0  # -1 means not locked
 
+    def get_phi(self) -> float:
+        """Get the current phase variable value."""
+        return self.phi
+
     def _load_policy_from_hf(self, pkg_path: str, hf_repo_id: str, hf_policy_folder: str) -> tuple[str, str]:
         """Load policy from Hugging Face with local caching.
 
@@ -309,7 +313,11 @@ class RLPolicy:
     def create_cos_phase_obs(self, time: float, freq: float) -> np.ndarray:
         """Create the cosine phase observation."""
         return np.cos(2 * np.pi * time * freq)
-    
+
+    def set_last_zero_time(self, time: float) -> None:
+        """Set the last zero time of the observation."""
+        self.last_zero_time = time
+
     ##
     # Joint Conversions
     ##

@@ -103,20 +103,52 @@ class Robot:
 
         self.mj_model.body_ipos[body_id] += self.torso_ipos
 
-    def get_joystick_command(self):
+    def scale_torso_mass(self, scale: float) -> None:
+        """Scale the torso mass by the given factor.
+
+        Args:
+            scale: Multiplicative factor for the torso mass.
+        """
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        self.mj_model.body_mass[body_id] *= scale
+        print(f"Scaling torso mass by {scale}. New mass: {self.mj_model.body_mass[body_id]}")
+
+    def set_torso_mass_pos_offset(self, offset: np.ndarray) -> None:
+        """Set the torso COM position offset to an exact value.
+
+        Args:
+            offset: 3D offset vector [x, y, z] in meters.
+        """
+        body_name = "torso_link"
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        self.mj_model.body_ipos[body_id] = self.torso_ipos + offset
+        print(f"Setting torso COM offset to: {offset}")
+
+    def scale_kd_gains(self, scale: float) -> None:
+        """Scale all actuator kd gains by the given factor.
+
+        Args:
+            scale: Multiplicative factor for kd gains.
+        """
+        for i in range(self.mj_model.nu):
+            self.mj_model.actuator_biasprm[i, 2] *= scale
+        print(f"Scaling all kd gains by {scale}")
+
+    def get_joystick_command(self, policy):
         """Get velocity commands from joystick."""
         des_vel = np.zeros(3)
         if self.joystick is not None:
             for event in pygame.event.get():
                 pass
             # Left stick: control vx, vy (2D plane), right stick X-axis: vyaw
-            vy = -(self.joystick_scaling[0]*self.joystick.get_axis(0))
-            vx = -(self.joystick_scaling[0]*self.joystick.get_axis(1))
-            vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3))
+            vy = -(self.joystick_scaling[0]*self.joystick.get_axis(0)) * policy.get_max_vy()
+            vx = -(self.joystick_scaling[0]*self.joystick.get_axis(1)) * policy.get_max_vx()
+            vyaw = -(self.joystick_scaling[0]*self.joystick.get_axis(3)) * policy.get_max_vyaw()
 
             des_vel[0] = vx
-            des_vel[1] = min(max(vy, -0.3), 0.3)
-            des_vel[2] = min(max(vyaw, -1.0), 1.0)
+            des_vel[1] = vy
+            des_vel[2] = vyaw
         else:
             des_vel = np.array([0.5, 0.0, 0.0])
         self.commanded_vel = des_vel  # Store the commanded velocity
@@ -130,7 +162,7 @@ class Robot:
         sim_time = self.mj_data.time
         # pg = self.get_projected_gravity(qpos[3:7])
         if self.input_function is None:
-            self.commanded_vel = self.get_joystick_command()
+            self.commanded_vel = self.get_joystick_command(policy)
         else:
             self.commanded_vel = self.input_function(sim_time)
 
@@ -198,7 +230,7 @@ class Robot:
         angular_vel = np.sign(self.commanded_vel[0]) * np.clip(-kp_yaw * yaw + -kd_yaw * qvel[5], -0.5, 0.5)
         self.commanded_vel[2] = angular_vel
 
-        print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
+        # print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
 
     def apply_action(self, action):
         """Apply control action to the robot."""
@@ -223,6 +255,41 @@ class Robot:
             if joint_name:
                 joint_names.append(joint_name)
         return joint_names
+
+    def set_initial_condition(self, policy: "RLPolicy") -> None:
+        """Set the robot state from the valid IC in the policy YAML.
+
+        The IC vectors are [base, joints_in_isaac_order]. Joint values are
+        reordered to MuJoCo order before writing to qpos/qvel.
+
+        Args:
+            policy: The RLPolicy object containing the valid IC data.
+        """
+        ic_pos = policy.get_valid_ic_pos()
+        ic_vel = policy.get_valid_ic_vel()
+        if ic_pos is None or ic_vel is None:
+            print("[WARNING] No valid IC found in policy params, using XML default.")
+            return
+
+        isaac_joint_names = policy.get_joint_names()
+
+        # qpos: [base_pos(3), base_quat(4), joint_pos(N)]
+        self.mj_data.qpos[:7] = ic_pos[:7]
+        joint_pos_isaac = ic_pos[7:]
+        self.mj_data.qpos[7:] = policy.convert_joint_order(
+            joint_pos_isaac, isaac_joint_names, self.joint_names
+        )
+
+        # qvel: [base_lin_vel(3), base_ang_vel(3), joint_vel(N)]
+        self.mj_data.qvel[:6] = ic_vel[:6]
+        joint_vel_isaac = ic_vel[6:]
+        self.mj_data.qvel[6:] = policy.convert_joint_order(
+            joint_vel_isaac, isaac_joint_names, self.joint_names
+        )
+
+        # Forward kinematics to update derived quantities
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        print("[INFO] Set initial condition from policy YAML.")
 
     def set_pd_gains_from_policy(self, policy) -> None:
         """Set PD gains on MuJoCo actuators from the RLPolicy gains.

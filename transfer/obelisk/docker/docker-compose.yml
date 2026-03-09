@@ -1,49 +1,119 @@
+x-common: &common
+  shm_size: '12gb'
+  network_mode: host
+  ipc: host
+  environment:
+    NVIDIA_DRIVER_CAPABILITIES: all
+    DISPLAY: $DISPLAY
+    USER: $USER
+    UID: $UID
+    GID: $GID
+    QT_X11_NO_MITSHM: 1
+    ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+  security_opt:
+    - seccomp=unconfined
+  cap_add:
+    - NET_ADMIN
+  volumes:
+    - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
+    - /tmp/.X11-unix:/tmp/.X11-unix
+    - $HOME/.Xauthority:$HOME/.Xauthority:rw
+    - $HOME/.bashrc:$HOME/.bashrc
+    - $HOME/.gitconfig:$HOME/.gitconfig
+    - $HOME/.ssh:$HOME/.ssh
+    - /dev/input:/dev/input
+  ports:
+    - 7007:7007
+    - 10000:10000
+  runtime: nvidia
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: 1
+            capabilities: [gpu]
+  working_dir: $ROBOT_RL_ROOT
+  stdin_open: true
+  tty: true
+  command: /bin/bash
+
 services:
-  robot_rl_obk:
-    # image: ghcr.io/zolkin1/robot-rl-obk:gpu-latest - does not work due to user mismatch right now
-    shm_size: '12gb'
+  sim:
+    <<: *common
+    privileged: true
     build:
       context: .
+      dockerfile: Dockerfile
+      target: sim
       args:
         USER: $USER
         UID: $UID
         GID: $GID
         ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-      dockerfile: Dockerfile
-    network_mode: host
-    ipc: host
-    environment:
-      NVIDIA_DRIVER_CAPABILITIES: all
-      DISPLAY: $DISPLAY
-      USER: $USER
-      UID: $UID
-      GID: $GID
-      QT_X11_NO_MITSHM: 1
-      ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-    security_opt:
-      - seccomp=unconfined
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - $HOME/.Xauthority:$HOME/.Xauthority:rw
-      - $HOME/.bashrc:$HOME/.bashrc
-      - $HOME/.gitconfig:$HOME/.gitconfig
-      - $HOME/.ssh:$HOME/.ssh
-    ports:
-      - 7007:7007
-      - 10000:10000
+
+  hardware:
+    <<: *common
     privileged: true
-    runtime: nvidia
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [ gpu ]
-    working_dir: $ROBOT_RL_ROOT
-    stdin_open: true
-    tty: true
-    command: /bin/bash
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: hardware
+      args:
+        USER: $USER
+        UID: $UID
+        GID: $GID
+        ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+    # Add device access for the lidar if needed:
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+
+#services:
+#  robot_rl_obk:
+#    # image: ghcr.io/zolkin1/robot-rl-obk:gpu-latest - does not work due to user mismatch right now
+#    shm_size: '12gb'
+#    build:
+#      context: .
+#      args:
+#        USER: $USER
+#        UID: $UID
+#        GID: $GID
+#        ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+#      dockerfile: Dockerfile
+#    network_mode: host
+#    ipc: host
+#    environment:
+#      NVIDIA_DRIVER_CAPABILITIES: all
+#      DISPLAY: $DISPLAY
+#      USER: $USER
+#      UID: $UID
+#      GID: $GID
+#      QT_X11_NO_MITSHM: 1
+#      ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+#    security_opt:
+#      - seccomp=unconfined
+#    cap_add:
+#      - NET_ADMIN
+#    volumes:
+#      - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
+#      - /tmp/.X11-unix:/tmp/.X11-unix
+#      - $HOME/.Xauthority:$HOME/.Xauthority:rw
+#      - $HOME/.bashrc:$HOME/.bashrc
+#      - $HOME/.gitconfig:$HOME/.gitconfig
+#      - $HOME/.ssh:$HOME/.ssh
+#    ports:
+#      - 7007:7007
+#      - 10000:10000
+#    privileged: true
+#    runtime: nvidia
+#    deploy:
+#      resources:
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: 1
+#              capabilities: [ gpu ]
+#    working_dir: $ROBOT_RL_ROOT
+#    stdin_open: true
+#    tty: true
+#    command: /bin/bash

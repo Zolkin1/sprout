@@ -139,6 +139,16 @@ if not _registered:
         }
     )
 
+    gym.register(
+        id="G1-running-clf-symmetric",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        }
+    )
+
     # Play
     gym.register(
         id="G1-running-clf-play",
@@ -148,6 +158,17 @@ if not _registered:
             "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
             "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        }
+    )
+
+    # Play
+    gym.register(
+        id="G1-running-clf-experiment",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfgExperiment",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         }
     )
 

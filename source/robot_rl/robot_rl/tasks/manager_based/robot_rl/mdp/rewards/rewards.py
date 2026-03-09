@@ -17,6 +17,8 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
+KAPPA = 0.5
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -42,10 +44,70 @@ def clf_reward(env: ManagerBasedRLEnv, command_name: str, max_eta_err: float = 0
     v = ref_term.v  # [B] scalar CLF value per env
     max_clf = ref_term.clf.lambda_max * max_eta_err ** 2 + eps # principled normalization; lambda_max(P) * eta**2
 
-    reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
+    reward = torch.exp(-v / max_clf)
+    # reward = torch.exp(-torch.clamp(v, max=5.0 * max_clf) / max_clf)
     # reward = torch.exp(-torch.clamp(v, max=200 * max_clf) / (10*max_clf))    # 200, 100   # NOTE: Used for bend over (10*max_clf is normal)
     return reward
 
+def base_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_pos = cmd_term.clf.v_subgroups["pelvis_pos"]
+
+    return torch.exp(-KAPPA * v_base_pos / sigma)
+
+def base_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_lin_vel = cmd_term.clf.v_subgroups["pelvis_lin_vel"]
+
+    return torch.exp(-KAPPA * v_base_lin_vel / sigma)
+
+def base_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_ori = cmd_term.clf.v_subgroups["pelvis_ori"]
+
+    return torch.exp(-KAPPA * v_base_ori / sigma)
+
+def base_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_base_ang_vel = cmd_term.clf.v_subgroups["pelvis_ang_vel"]
+
+    return torch.exp(-KAPPA * v_base_ang_vel / sigma)
+
+def joint_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_joint_pos = cmd_term.clf.v_subgroups["joint_pos"]
+
+    return torch.exp(-KAPPA * v_joint_pos / sigma)
+
+def joint_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_joint_vel = cmd_term.clf.v_subgroups["joint_vel"]
+
+    return torch.exp(-KAPPA * v_joint_vel / sigma)
+
+def body_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_pos = cmd_term.clf.v_subgroups["other_body_pos"]
+
+    return torch.exp(-KAPPA * v_body_pos / sigma)
+
+def body_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_lin_vel = cmd_term.clf.v_subgroups["other_body_lin_vel"]
+
+    return torch.exp(-KAPPA * v_body_lin_vel / sigma)
+
+def body_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_ori = cmd_term.clf.v_subgroups["other_body_ori"]
+
+    return torch.exp(-KAPPA * v_body_ori / sigma)
+
+def body_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
+    cmd_term = env.command_manager.get_term(command_name)
+    v_body_ang_vel = cmd_term.clf.v_subgroups["other_body_ang_vel"]
+
+    return torch.exp(-KAPPA * v_body_ang_vel / sigma)
 
 def clf_decreasing_condition(
     env: ManagerBasedRLEnv,
@@ -312,12 +374,14 @@ def contact_schedule_penalty(env: ManagerBasedRLEnv, command_name: str,
 
     # Get bodies not in contact for each env
     contact_states = cmd.get_contact_state(t)
-    contact_bodies = cmd.contact_frame_indices
+    contact_body_names = cmd.contact_bodies
 
     contact_forces = torch.zeros(t.shape[0], dtype=torch.float, device=env.device)
-    for i, body_idx in enumerate(contact_bodies):
-        if contact_states[i]:
-            contact_forces += contact_sensor.data.net_forces_w[:, body_idx, :].norm(dim=-1)  # Gets the most recent force only
+    for i, body_name in enumerate(contact_body_names):
+        contact_mask = contact_states[:, i] == 1
+        indices = torch.tensor([i for i, v in enumerate(sensor_cfg.body_names) if v == body_name])
+        body_id = sensor_cfg.body_ids[indices]
+        contact_forces[contact_mask] += contact_sensor.data.net_forces_w[contact_mask, body_id, :].norm(dim=-1)  # Gets the most recent force only
 
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)  # TODO: Think about if this is what I want
     return penalty

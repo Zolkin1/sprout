@@ -1,5 +1,6 @@
 from enum import Enum
 from pathlib import Path
+from typing import Tuple
 
 import torch
 import yaml
@@ -21,7 +22,8 @@ class TrajectoryType(Enum):
 class DomainData:
     domain_name: str
     bezier_coeffs: dict
-    bezier_tensor: torch.Tensor
+    bezier_tensor_pos: torch.Tensor
+    bezier_tensor_vel: torch.Tensor
     contact_bodies: list[str]
     time: float
     bezier_frame: str           # Frame of reference used for the splines
@@ -32,8 +34,10 @@ class TrajectoryData:
     name: str
     domain_order: list[str]
     domain_data: dict[str, DomainData]
-    num_outputs: int
-    output_names: list[str]
+    num_pos_outputs: int            # Count including ori_w
+    num_vel_outputs: int            # Count excluding ori_w
+    pos_output_names: list[str]     # Includes ori_w
+    vel_output_names: list[str]     # Excludes ori_w
     spline_order: int
     trajectory_type: TrajectoryType
     total_time: float
@@ -64,23 +68,69 @@ class TrajectoryManager(ManagerBase):
 
 
         self.T = torch.zeros(self.num_domains, device=self.device)
-        self.bezier_coeffs = torch.zeros(self.num_domains, self.traj_data.num_outputs, 2, self.traj_data.spline_order + 1, device=self.device)
+        # Separate bezier coefficient tensors for position and velocity outputs
+        self.bezier_coeffs_pos = torch.zeros(self.num_domains, self.traj_data.num_pos_outputs, self.traj_data.spline_order + 1, device=self.device)
+        self.bezier_coeffs_vel = torch.zeros(self.num_domains, self.traj_data.num_vel_outputs, self.traj_data.spline_order + 1, device=self.device)
         for i, domain in enumerate(self.traj_data.domain_order):
             self.T[i] = self.traj_data.domain_data[domain].time
-            self.bezier_coeffs[i, :, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+            self.bezier_coeffs_pos[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor_pos
+            self.bezier_coeffs_vel[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor_vel
 
         if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
             self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T]), dim=0)
         else:
             self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T, self.T]), dim=0)
 
-        # Pre-compute relabeling matrix as a tensor
-        R_numpy = self.relable_ee_stance_coeffs()
-        self.R_relabel = torch.from_numpy(R_numpy).to(device=self.device, dtype=self.bezier_coeffs.dtype)
+        # Pre-compute relabeling matrices as tensors (separate for pos and vel)
+        R_pos_numpy = self.relable_ee_stance_coeffs(self.traj_data.pos_output_names)
+        R_vel_numpy = self.relable_ee_stance_coeffs(self.traj_data.vel_output_names)
+        self.R_relabel_pos = torch.from_numpy(R_pos_numpy).to(device=self.device, dtype=self.bezier_coeffs_pos.dtype)
+        self.R_relabel_vel = torch.from_numpy(R_vel_numpy).to(device=self.device, dtype=self.bezier_coeffs_vel.dtype)
 
         # TODO: Fix the trajectory manager so that the bezier coefficient use the same order as the measured states
         # TODO: Make the R to remap programatic instead of hard-coded
         # TODO: Why are the z height values never at zero when the foot is in stance?
+
+        # Pre-compute binomial coefficients for batched bezier interpolation
+        # (doesn't depend on bezier_coeffs order, so computed once here)
+        max_degree = self.traj_data.spline_order
+        self._binomial_coeffs = {}
+        for d in range(max_degree + 1):
+            self._binomial_coeffs[d] = torch.tensor(
+                [math.comb(d, i) for i in range(d + 1)],
+                dtype=torch.float32, device=self.device
+            )
+
+        # Initialize precomputed coefficients (will be updated by order_outputs if called)
+        self._update_precomputed_coefficients()
+
+        # Logging tracking
+        phi_keys = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+        self.phi_keys = torch.tensor(phi_keys, device=self.device)
+        self.v_log = torch.zeros_like(self.phi_keys)
+        self.num_v_log = torch.zeros_like(self.phi_keys)
+
+    def _update_precomputed_coefficients(self):
+        """Recompute cached values after bezier_coeffs change.
+
+        This must be called whenever bezier_coeffs are modified (e.g., by order_outputs).
+        """
+        # Pre-stack coefficients for efficient batched lookup (separate for pos and vel)
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            reflected_pos, reflected_vel = self.remap_trajectory()
+            self._all_coeffs_pos = torch.cat([self.bezier_coeffs_pos, reflected_pos], dim=0)
+            self._all_coeffs_vel = torch.cat([self.bezier_coeffs_vel, reflected_vel], dim=0)
+            self._T_all = torch.cat([self.T, self.T])
+        else:
+            self._all_coeffs_pos = self.bezier_coeffs_pos
+            self._all_coeffs_vel = self.bezier_coeffs_vel
+            self._T_all = self.T
+
+        # Pre-compute cumulative domain times for tau normalization
+        self._cumsum_T = torch.cumsum(
+            torch.cat([torch.zeros(1, device=self.device), self.T[:-1]]), dim=0
+        )
+        self._total_T = self.T.sum()
 
     def _get_from_hugging_face(self, hf_repo: str, hf_path: str) -> str:
         """
@@ -194,7 +244,7 @@ class TrajectoryManager(ManagerBase):
         # Verify that each domain has the same bezier outputs (frames and joints) and spline order
         # Also get the output information (count and names)
         # Do this first so we know the order for creating tensors
-        num_outputs, output_names, spline_order = self._verify_consistent_outputs_and_get_info(
+        num_pos_outputs, num_vel_outputs, pos_output_names, vel_output_names, spline_order = self._verify_consistent_outputs_and_get_info(
             {domain: (data[domain]['bezier_coeffs'], data[domain]['spline_order'])
              for domain in data['domain_sequence']},
             data['domain_sequence']
@@ -207,18 +257,20 @@ class TrajectoryManager(ManagerBase):
         for domain in data['domain_sequence']:
             domain_yaml = data[domain]
 
-            # Create the bezier coefficient tensor in the same order as output_names
-            bezier_tensor = self._create_bezier_tensor(
+            # Create the bezier coefficient tensor in the same order as pos_output_names
+            # _create_bezier_tensor handles pos vs vel internally (skips ori_w for vel)
+            bezier_tensor_pos, bezier_tensor_vel = self._create_bezier_tensor(
                 domain_yaml['bezier_coeffs'],
-                output_names
+                pos_output_names
             )
 
             domain_data = DomainData(
                 domain_name=domain,
                 bezier_coeffs=domain_yaml['bezier_coeffs'],
-                bezier_tensor=bezier_tensor,
+                bezier_tensor_pos=bezier_tensor_pos,
+                bezier_tensor_vel=bezier_tensor_vel,
                 time=domain_yaml['T'][0],
-                contact_bodies=domain_yaml['contact_bodies'],
+                contact_bodies=domain_yaml.get('contact_bodies', []),
                 bezier_frame=domain_yaml['ref_frame'],
                 bezier_frame_domain=domain_yaml['ref_frame_domain']
             )
@@ -234,9 +286,11 @@ class TrajectoryManager(ManagerBase):
             domain_order=data['domain_sequence'],
             # Domain data
             domain_data=domain_data_dict,
-            # Output information
-            num_outputs=num_outputs,
-            output_names=output_names,
+            # Output information (separate pos and vel)
+            num_pos_outputs=num_pos_outputs,
+            num_vel_outputs=num_vel_outputs,
+            pos_output_names=pos_output_names,
+            vel_output_names=vel_output_names,
             # Spline order (same for all domains)
             spline_order=spline_order,
             # Type
@@ -283,77 +337,228 @@ class TrajectoryManager(ManagerBase):
 
     @property
     def get_output_names(self):
-        return self.traj_data.output_names
+        """Get position output names (for backwards compatibility)."""
+        return self.traj_data.pos_output_names
+
+    @property
+    def get_pos_output_names(self):
+        """Get position output names (includes ori_w)."""
+        return self.traj_data.pos_output_names
+
+    @property
+    def get_vel_output_names(self):
+        """Get velocity output names (excludes ori_w)."""
+        return self.traj_data.vel_output_names
 
     def get_num_outputs(self) -> int:
-        """Get the total number of outputs in the trajectory.
+        """Get the total number of position outputs in the trajectory.
 
         Returns:
-            The number of outputs.
+            The number of position outputs (includes ori_w).
         """
-        return self.traj_data.num_outputs
+        return self.traj_data.num_pos_outputs
+
+    def get_num_pos_outputs(self) -> int:
+        """Get the total number of position outputs in the trajectory.
+
+        Returns:
+            The number of position outputs (includes ori_w).
+        """
+        return self.traj_data.num_pos_outputs
+
+    def get_num_vel_outputs(self) -> int:
+        """Get the total number of velocity outputs in the trajectory.
+
+        Returns:
+            The number of velocity outputs (excludes ori_w).
+        """
+        return self.traj_data.num_vel_outputs
 
     def get_num_domains(self):
         return self.expanded_num_domains
 
-    def get_output(self, t: torch.Tensor     # [N]
-                          ) -> torch.Tensor:
+    def _compute_normalized_tau(self, t: torch.Tensor, domain_indices: torch.Tensor) -> torch.Tensor:
+        """Compute tau normalized to [0,1] within each domain.
+
+        Args:
+            t: shape [N] times
+            domain_indices: shape [N] domain index for each time
+
+        Returns:
+            tau_normalized: shape [N] normalized time in [0,1] within domain
         """
-        Compute the bezier values at a given time.
+        tau = self.get_phasing_var(t)
+
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            tau = tau.clone()
+            tau[tau >= 0.5] -= 0.5
+            tau /= 0.5
+
+        # Get domain index within original (non-reflected) domains
+        dom_in_half = domain_indices % self.num_domains
+
+        # Compute relative start of each domain using pre-computed values
+        rel_prev_domains = self._cumsum_T[dom_in_half] / self._total_T
+
+        # Get the domain duration for each environment
+        T_dom = self._T_all[domain_indices]
+
+        # Normalize tau to [0,1] within the domain
+        tau_normalized = (tau - rel_prev_domains) * self._total_T / T_dom
+        return torch.clamp(tau_normalized, 0.0, 1.0)
+
+    def _compute_bezier_batched(self, tau: torch.Tensor, ctrl_pts: torch.Tensor,
+                                T: torch.Tensor, derivative: bool) -> torch.Tensor:
+        """Batched bezier interpolation for all environments at once.
+
+        Args:
+            tau: [N] normalized time in [0,1]
+            ctrl_pts: [N, num_outputs, degree+1] control points for each env
+            T: [N] domain durations for each env
+            derivative: True for velocity, False for position
+
+        Returns:
+            [N, num_outputs] interpolated values
+        """
+        degree = ctrl_pts.shape[-1] - 1
+
+        if not derivative:
+            # Position: Bernstein polynomial B(tau) = sum_i C(n,i) * tau^i * (1-tau)^(n-i) * P_i
+            coefs = self._binomial_coeffs[degree]  # [degree+1]
+            i_vec = torch.arange(degree + 1, device=ctrl_pts.device)
+
+            tau_pow = tau.unsqueeze(1) ** i_vec  # [N, degree+1]
+            one_minus_pow = (1 - tau).unsqueeze(1) ** (degree - i_vec)  # [N, degree+1]
+            weights = coefs * tau_pow * one_minus_pow  # [N, degree+1]
+
+            # Batched weighted sum: [N, degree+1] @ [N, num_outputs, degree+1] -> [N, num_outputs]
+            return torch.einsum('nd,nod->no', weights, ctrl_pts)
+        else:
+            # Velocity: derivative of Bernstein polynomial
+            coefs = self._binomial_coeffs[degree - 1]  # [degree]
+            i_vec = torch.arange(degree, device=ctrl_pts.device)
+
+            tau_pow = tau.unsqueeze(1) ** i_vec  # [N, degree]
+            one_minus_pow = (1 - tau).unsqueeze(1) ** (degree - 1 - i_vec)
+            weights = degree * coefs * tau_pow * one_minus_pow  # [N, degree]
+
+            # Control point differences: [N, num_outputs, degree]
+            cp_diff = ctrl_pts[:, :, 1:] - ctrl_pts[:, :, :-1]
+            result = torch.einsum('nd,nod->no', weights, cp_diff)
+            return result / T.unsqueeze(1)
+
+    def get_output(self, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the bezier values at a given time using batched operations.
 
         Args:
             t: shape [N] where N is the number of times that need to be queried.
 
         Returns:
-            outputs: shape [N, 2, num_outputs] where num_outputs is the number of outputs of the trajectory,
-                and we have one for the position and one for the velocity.
+            pos_outputs: shape [N, num_pos_outputs] position outputs
+            vel_outputs: shape [N, num_vel_outputs] velocity outputs
 
-        To compute this value, we first determine which domain the times are in then we compute the values in a batched manner.
+        This implementation uses fully vectorized operations to avoid per-domain loops.
         """
-        bezier_coeffs = self.bezier_coeffs
+        N = t.shape[0]
 
-        # Map time based on trajectory time
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            bezier_coeffs_reflect = self.remap_trajectory() # TODO: Fix remap to be flexible in the ordering
+        # Get domain indices for all environments
+        domain_indices = self.get_current_domains(t)  # [N]
 
-        # Determine the domain for each time
+        # Compute normalized tau for each environment
+        tau = self._compute_normalized_tau(t, domain_indices)  # [N]
 
-        domain_indices = self.get_current_domains(t)
+        # Gather coefficients for each env using advanced indexing
+        env_coeffs_pos = self._all_coeffs_pos[domain_indices]  # [N, num_pos_outputs, degree+1]
+        env_coeffs_vel = self._all_coeffs_vel[domain_indices]  # [N, num_vel_outputs, degree+1]
 
-        # Normalize the time relative to the domain
-        domain_start_times = self.domain_boundaries[domain_indices]
-        tau = self.get_phasing_var(t)
-        T = self.T
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            # Normalize
-            tau[tau >= 0.5] -= 0.5
-            tau /= 0.5
-            T = torch.cat((self.T, self.T))
+        # Get domain durations for each environment
+        env_T = self._T_all[domain_indices]
 
-        # Compute outputs
-        outputs = torch.zeros(t.shape[0], 2, self.traj_data.num_outputs, device=self.device)
-        # outputs[:, 0, :] = self._compute_bezier_interp(0, tau, bezier_coeffs[0, :, :].squeeze(), T[domain_indices])
+        # Compute position and velocity outputs in batched calls
+        pos_outputs = self._compute_bezier_batched(tau, env_coeffs_pos, env_T, derivative=False)
+        vel_outputs = self._compute_bezier_batched(tau, env_coeffs_vel, env_T, derivative=False)
 
-        # Get the unique domains
-        unique_domains = torch.unique(domain_indices)
+        return pos_outputs, vel_outputs
 
-        # TODO: Speed up. This seems to be taking about 0.2-0.3 s per iteration
-        for dom in unique_domains:
-            current_domains = domain_indices == dom
-            tau_dom = tau[current_domains]
-            T_dom = T[dom].expand(tau_dom.shape[0])
-            if dom >= self.num_domains:
-                if bezier_coeffs_reflect is None:
-                    raise ValueError(f"Issue indexing into the bezier coefficients due to the half period!")
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 0, :].squeeze(),
-                                                                             T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs_reflect[dom - self.num_domains, :, 1, :].squeeze(),
-                                                                             T_dom)
-            else:
-                outputs[current_domains, 0, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 0, :].squeeze(), T_dom)
-                outputs[current_domains, 1, :] = self._compute_bezier_interp(0, tau_dom, bezier_coeffs[dom, :, 1, :].squeeze(), T_dom)
+    def get_acceleration(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the trajectory acceleration reference at the given time.
 
-        return outputs
+        Acceleration is computed by taking the derivative of the velocity Bezier
+        coefficients (which gives the second derivative of position).
+
+        Args:
+            t: shape [N] where N is the number of times that need to be queried.
+
+        Returns:
+            accelerations: shape [N, num_vel_outputs] acceleration reference values.
+        """
+        N = t.shape[0]
+
+        # Get domain indices for all environments
+        domain_indices = self.get_current_domains(t)  # [N]
+
+        # Compute normalized tau for each environment
+        tau = self._compute_normalized_tau(t, domain_indices)  # [N]
+
+        # Gather velocity coefficients for each env using advanced indexing
+        env_coeffs_vel = self._all_coeffs_vel[domain_indices]  # [N, num_vel_outputs, degree+1]
+
+        # Get domain durations for each environment
+        env_T = self._T_all[domain_indices]
+
+        # Compute acceleration by taking derivative of velocity coefficients
+        accelerations = self._compute_bezier_batched(
+            tau, env_coeffs_vel, env_T, derivative=True
+        )
+
+        return accelerations
+
+    def _precompute_contact_table(self, contact_frames: list[str]) -> None:
+        """Pre-compute contact state lookup tables for the given contact frames.
+
+        Builds tensors of shape [expanded_num_domains, num_contacts] that can be
+        indexed by domain_indices to avoid per-step loops and string operations.
+
+        For half-periodic trajectories, builds two tables: one for the first half
+        (phi < 0.5) and one for the second half (phi >= 0.5).
+
+        Args:
+            contact_frames: List of contact frame names.
+        """
+        num_contacts = len(contact_frames)
+
+        if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+            # Single lookup table: [expanded_num_domains, num_contacts]
+            table = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            for domain_idx in range(self.expanded_num_domains):
+                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
+                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
+                for i, frame in enumerate(contact_frames):
+                    if frame in domain_contact_frames:
+                        table[domain_idx, i] = 1.0
+            self._contact_table = table
+            self._contact_table_reflected = None
+        else:
+            # Two tables for half-periodic: first-half and second-half
+            table_first = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            table_second = torch.zeros(self.expanded_num_domains, num_contacts, device=self.device)
+            for domain_idx in range(self.expanded_num_domains):
+                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
+                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
+                reflect_domain_contact_frames = [
+                    f.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+                    for f in domain_contact_frames
+                ]
+                for i, frame in enumerate(contact_frames):
+                    if frame in domain_contact_frames:
+                        table_first[domain_idx, i] = 1.0
+                    if frame in reflect_domain_contact_frames:
+                        table_second[domain_idx, i] = 1.0
+            self._contact_table = table_first
+            self._contact_table_reflected = table_second
+
+        self._contact_table_frames = tuple(contact_frames)
 
     def get_contact_state(self, t: torch.Tensor,    # [N]
                            contact_frames: list[str],
@@ -369,45 +574,20 @@ class TrajectoryManager(ManagerBase):
             contact_states: shape [N, num_contacts] where num_contacts is the number
              of contact points. A 1 indicates in contact, 0 otherwise.
         """
-        # Determine the domain for each time
-        domain_indicies = self.get_current_domains(t)
+        # Lazily pre-compute lookup table on first call (or if contact_frames changed)
+        if not hasattr(self, '_contact_table_frames') or self._contact_table_frames != tuple(contact_frames):
+            self._precompute_contact_table(contact_frames)
 
-        # Initialize contact states tensor
-        N = t.shape[0]
-        num_contacts = len(contact_frames)
-        contact_states = torch.zeros(N, num_contacts, device=self.device)
-        phi = self.get_phasing_var(t)
+        domain_indices = self.get_current_domains(t)
 
-        # For each contact frame, check if it's in contact across all domains
-        for i, frame in enumerate(contact_frames):
-            # For each domain, check if this frame is in contact
-            for domain_idx in range(self.expanded_num_domains):
-                domain_name = self.traj_data.domain_order[domain_idx % self.num_domains]
-                domain_contact_frames = self.traj_data.domain_data[domain_name].contact_bodies
-
-                if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-                    # Swap left/right in contact frame names for half periodic trajectories
-                    reflect_domain_contact_frames = [
-                        frame_name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
-                        for frame_name in domain_contact_frames
-                    ]
-
-                mask = None
-                if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
-                    if frame in domain_contact_frames:
-                        mask = domain_indicies == domain_idx
-                else:       # Half periodic
-                    if frame in domain_contact_frames:
-                        mask = (domain_indicies == domain_idx) & (phi < 0.5)
-                    elif frame in reflect_domain_contact_frames:
-                        mask = (domain_indicies == domain_idx) & (phi >= 0.5)
-
-                # mask = mask.squeeze()
-                if mask is not None:
-                    contact_states[mask, i] = 1.0
-
-
-        return contact_states
+        if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
+            return self._contact_table[domain_indices]
+        else:
+            phi = self.get_phasing_var(t)
+            first_half = (phi < 0.5).unsqueeze(1)  # [N, 1]
+            return torch.where(first_half,
+                               self._contact_table[domain_indices],
+                               self._contact_table_reflected[domain_indices])
 
     def get_current_domains(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -424,6 +604,34 @@ class TrajectoryManager(ManagerBase):
         return domains
 
 
+    def _precompute_ref_frame_mapping(self, ref_frames: list[str]) -> None:
+        """Pre-compute the domain-to-reference-frame mapping.
+
+        Args:
+            ref_frames: List of reference frame names.
+        """
+        domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
+
+        for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+            bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+            if bezier_frame in ref_frames:
+                domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
+            else:
+                raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
+        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
+                bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
+                bezier_frame_reflect = bezier_frame.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
+                if bezier_frame_reflect in ref_frames:
+                    domain_to_ref_frame_idx[domain_idx + self.num_domains] = ref_frames.index(bezier_frame_reflect)
+                else:
+                    raise ValueError(
+                        f"Bezier frame '{bezier_frame_reflect}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
+
+        self._ref_frame_mapping = domain_to_ref_frame_idx
+        self._ref_frame_mapping_key = tuple(ref_frames)
+
     def get_ref_frames_in_use(self, t: torch.Tensor, ref_frames: list[str]) -> torch.Tensor:
         """
         Determine the reference frame in use.
@@ -435,77 +643,73 @@ class TrajectoryManager(ManagerBase):
         Returns:
             frame_tensor: a torch tensor of shape [N] where each scalar is the index into ref_frames for the active frame.
         """
+        # Lazily pre-compute mapping on first call (or if ref_frames changed)
+        if not hasattr(self, '_ref_frame_mapping_key') or self._ref_frame_mapping_key != tuple(ref_frames):
+            self._precompute_ref_frame_mapping(ref_frames)
+
         domain_indices = self.get_current_domains(t)
-
-        # Create a mapping tensor: domain_idx -> ref_frame_idx
-        # This is done once per call, but it's O(num_domains) not O(num_envs)
-        domain_to_ref_frame_idx = torch.zeros(self.expanded_num_domains, dtype=torch.long, device=self.device)
-
-        for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
-            bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
-
-            if bezier_frame in ref_frames:
-                domain_to_ref_frame_idx[domain_idx] = ref_frames.index(bezier_frame)
-            else:
-                raise ValueError(f"Bezier frame '{bezier_frame}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
-
-        if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
-            for domain_idx, domain_name in enumerate(self.traj_data.domain_order):
-                bezier_frame = self.traj_data.domain_data[domain_name].bezier_frame
-                bezier_frame_reflect = bezier_frame.replace("right", "TEMP").replace("left", "right").replace("TEMP",
-                                                                                                              "left")
-                if bezier_frame_reflect in ref_frames:
-                    domain_to_ref_frame_idx[domain_idx + self.num_domains] = ref_frames.index(bezier_frame_reflect)
-                else:
-                    raise ValueError(
-                        f"Bezier frame '{bezier_frame_reflect}' from domain '{domain_name}' not found in ref_frames list: {ref_frames}")
-
-        # Use advanced indexing to get frame indices for all envs at once
-        # if self.traj_data.trajectory_type != TrajectoryType.HALF_PERIODIC:
-        frame_indices = domain_to_ref_frame_idx[domain_indices]
-        # else:
-        #     # Mask properly if using a half periodic trajectory
-        #     first_half_mask = phi < 0.5
-        #     frame_indices[first_half_mask] = domain_to_ref_frame_idx[domain_indices][first_half_mask]
-
-        return frame_indices
+        return self._ref_frame_mapping[domain_indices]
 
 
-    def remap_trajectory(self) -> torch.Tensor:
+    def remap_trajectory(self) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Remap the trajectory by applying the relabeling matrix.
+        Remap the trajectory by applying the relabeling matrices.
 
         Returns:
-            remap_coeffs: Shape [num_domains, num_outputs, 2, degree+1] with relabeled coefficients.
+            remap_coeffs_pos: Shape [num_domains, num_pos_outputs, degree+1] with relabeled position coefficients.
+            remap_coeffs_vel: Shape [num_domains, num_vel_outputs, degree+1] with relabeled velocity coefficients.
         """
-        # self.bezier_coeffs shape: [num_domains, num_outputs, 2, degree+1]
-        # R_relabel shape: [num_outputs, num_outputs]
-        # Apply relabeling to both position and velocity coefficients
-        remap_coeffs = torch.einsum('ij,djkl->dikl', self.R_relabel, self.bezier_coeffs)
+        # bezier_coeffs_pos shape: [num_domains, num_pos_outputs, degree+1]
+        # bezier_coeffs_vel shape: [num_domains, num_vel_outputs, degree+1]
+        # R_relabel_pos shape: [num_pos_outputs, num_pos_outputs]
+        # R_relabel_vel shape: [num_vel_outputs, num_vel_outputs]
+        remap_coeffs_pos = torch.einsum('ij,djk->dik', self.R_relabel_pos, self.bezier_coeffs_pos)
+        remap_coeffs_vel = torch.einsum('ij,djk->dik', self.R_relabel_vel, self.bezier_coeffs_vel)
 
-        return remap_coeffs
+        return remap_coeffs_pos, remap_coeffs_vel
 
-    def order_outputs(self, ordered_output_names: list[str]):
+    def order_outputs(self, ordered_pos_output_names: list[str], ordered_vel_output_names: list[str]):
         """
         Order the outputs in this class to match the given order.
-        This will update the output_names list and the bezier tensor to match the new order.
+        This will update the output_names lists and the bezier tensors to match the new order.
 
         Args:
-            ordered_output_names: a ordered list of output names.
+            ordered_pos_output_names: ordered list of position output names (includes ori_w).
+            ordered_vel_output_names: ordered list of velocity output names (excludes ori_w).
 
         Returns:
             Nothing.
         """
-        self.traj_data.output_names = ordered_output_names
+        self.traj_data.pos_output_names = ordered_pos_output_names
+        self.traj_data.vel_output_names = ordered_vel_output_names
+        self.traj_data.num_pos_outputs = len(ordered_pos_output_names)
+        self.traj_data.num_vel_outputs = len(ordered_vel_output_names)
 
         for dom in self.traj_data.domain_data.values():
-            dom.bezier_tensor = self._create_bezier_tensor(dom.bezier_coeffs, self.traj_data.output_names)
+            dom.bezier_tensor_pos, dom.bezier_tensor_vel = self._create_bezier_tensor(
+                dom.bezier_coeffs, ordered_pos_output_names
+            )
+
+        # Resize the bezier coefficient tensors to match the new output counts
+        self.bezier_coeffs_pos = torch.zeros(
+            self.num_domains, self.traj_data.num_pos_outputs, self.traj_data.spline_order + 1, device=self.device
+        )
+        self.bezier_coeffs_vel = torch.zeros(
+            self.num_domains, self.traj_data.num_vel_outputs, self.traj_data.spline_order + 1, device=self.device
+        )
 
         for i, domain in enumerate(self.traj_data.domain_order):
-            self.bezier_coeffs[i, :, :, :] = self.traj_data.domain_data[domain].bezier_tensor
+            self.bezier_coeffs_pos[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor_pos
+            self.bezier_coeffs_vel[i, :, :] = self.traj_data.domain_data[domain].bezier_tensor_vel
 
-        # Regenerate the relabeling matrix
-        self.R_relabel = torch.from_numpy(self.relable_ee_stance_coeffs()).to(device=self.device, dtype=self.bezier_coeffs.dtype)
+        # Regenerate the relabeling matrices for pos and vel
+        R_pos_numpy = self.relable_ee_stance_coeffs(ordered_pos_output_names)
+        R_vel_numpy = self.relable_ee_stance_coeffs(ordered_vel_output_names)
+        self.R_relabel_pos = torch.from_numpy(R_pos_numpy).to(device=self.device, dtype=self.bezier_coeffs_pos.dtype)
+        self.R_relabel_vel = torch.from_numpy(R_vel_numpy).to(device=self.device, dtype=self.bezier_coeffs_vel.dtype)
+
+        # Regenerate precomputed coefficients for batched operations
+        self._update_precomputed_coefficients()
 
     @staticmethod
     def _compute_bezier_interp(derivative: int,         # 0 -> position, 1 -> velocity
@@ -610,7 +814,7 @@ class TrajectoryManager(ManagerBase):
 
             return B
 
-    def _create_bezier_tensor(self, bezier_coeffs: dict, output_names: list[str]) -> torch.Tensor:
+    def _create_bezier_tensor(self, bezier_coeffs: dict, output_names: list[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Create a tensor of bezier coefficients in the order specified by output_names.
 
@@ -648,19 +852,18 @@ class TrajectoryManager(ManagerBase):
                     raise ValueError(f"Frame '{frame_name}' missing from velocity coefficients!")
 
                 pos_coefficient_lists.append(bezier_coeffs['frames'][frame_name][axis])
-                vel_coefficient_lists.append(bezier_coeffs['frame_vels'][frame_name][axis])
+                if  'ori_w' not in axis:
+                    # No quats in the vel
+                    vel_coefficient_lists.append(bezier_coeffs['frame_vels'][frame_name][axis])
 
         # Stack into tensors: [num_outputs, degree+1]
         pos_tensor = torch.tensor(pos_coefficient_lists, dtype=torch.float32, device=self.device)
         vel_tensor = torch.tensor(vel_coefficient_lists, dtype=torch.float32, device=self.device)
 
-        # Stack along new dimension: [num_outputs, 2, degree+1]
-        bezier_tensor = torch.stack([pos_tensor, vel_tensor], dim=1)
-
-        return bezier_tensor
+        return pos_tensor, vel_tensor
 
     @staticmethod
-    def _verify_consistent_outputs_and_get_info(domain_data: dict, domain_sequence: list) -> tuple[int, list[str], int]:
+    def _verify_consistent_outputs_and_get_info(domain_data: dict, domain_sequence: list) -> tuple[int, int, list[str], list[str], int]:
         """
         Verify that all domains have the same frames, joints, and spline order in their bezier coefficients.
         The numerical values can differ, but the structure must be identical.
@@ -670,15 +873,17 @@ class TrajectoryManager(ManagerBase):
             domain_sequence: Ordered list of domain names
 
         Returns:
-            num_outputs: Total number of outputs (sum of all frame axes + joints)
-            output_names: List of output names in the format "frame:axis" or "joint:name"
+            num_pos_outputs: Total number of position outputs (including ori_w)
+            num_vel_outputs: Total number of velocity outputs (excluding ori_w)
+            pos_output_names: List of position output names in the format "frame:axis" or "joint:name"
+            vel_output_names: List of velocity output names (excludes ori_w entries)
             spline_order: The spline order (verified to be consistent across all domains)
 
         Raises:
             ValueError: If frames, joints, or spline order are inconsistent across domains
         """
         if len(domain_sequence) == 0:
-            return 0, [], 0
+            return 0, 0, [], [], 0
 
         # Get the reference domain (first one)
         reference_domain = domain_sequence[0]
@@ -759,21 +964,29 @@ class TrajectoryManager(ManagerBase):
                 f"  Got joint_vels: {sorted(ref_joint_vels)}"
             )
 
-        # Build output names list and count outputs (preserving YAML order)
-        output_names = []
+        # Build output names lists and count outputs (preserving YAML order)
+        # pos_output_names includes all outputs (including ori_w for quaternions)
+        # vel_output_names excludes ori_w since angular velocity has only 3 components
+        pos_output_names = []
+        vel_output_names = []
 
         # Add frame outputs (in YAML order)
         for frame in ref_bezier['frames'].keys():
             for axis in ref_bezier['frames'][frame].keys():
-                output_names.append(f"{frame}:{axis}")
+                pos_output_names.append(f"{frame}:{axis}")
+                # Velocity excludes ori_w (quaternion w component)
+                if 'ori_w' not in axis:
+                    vel_output_names.append(f"{frame}:{axis}")
 
         # Add joint outputs (in YAML order)
         for joint in ref_bezier['joints'].keys():
-            output_names.append(f"joint:{joint}")
+            pos_output_names.append(f"joint:{joint}")
+            vel_output_names.append(f"joint:{joint}")
 
-        num_outputs = len(output_names)
+        num_pos_outputs = len(pos_output_names)
+        num_vel_outputs = len(vel_output_names)
 
-        return num_outputs, output_names, ref_spline_order
+        return num_pos_outputs, num_vel_outputs, pos_output_names, vel_output_names, ref_spline_order
 
     def get_domain_times(self, t: torch.Tensor) -> torch.Tensor:
         domain_idx = self.get_current_domains(t)
@@ -787,8 +1000,18 @@ class TrajectoryManager(ManagerBase):
             return torch.sum(self.T)
 
     # TODO: Clean
-    def relable_ee_stance_coeffs(self):
-        """Build a relabelling matrix for end effector coefficients including the stance foot."""
+    def relable_ee_stance_coeffs(self, output_names: list[str] = None):
+        """Build a relabelling matrix for end effector coefficients including the stance foot.
+
+        Args:
+            output_names: List of output names to build the relabeling matrix for.
+                         If None, uses pos_output_names for backwards compatibility.
+
+        Returns:
+            R: Relabeling matrix of shape [num_outputs, num_outputs].
+        """
+        if output_names is None:
+            output_names = self.get_pos_output_names
         R_dict = {}
         ##
         # COM
@@ -804,9 +1027,10 @@ class TrajectoryManager(ManagerBase):
         R_dict["left_ankle_roll_link:pos_y"] = -1
         R_dict["left_ankle_roll_link:pos_z"] = 1
 
-        R_dict["left_ankle_roll_link:ori_x"] = 1 #-1
+        R_dict["left_ankle_roll_link:ori_x"] = -1
         R_dict["left_ankle_roll_link:ori_y"] = 1
-        R_dict["left_ankle_roll_link:ori_z"] = 1 #-1
+        R_dict["left_ankle_roll_link:ori_z"] = -1
+        R_dict["left_ankle_roll_link:ori_w"] = 1
 
         ##
         # Right Foot
@@ -815,9 +1039,10 @@ class TrajectoryManager(ManagerBase):
         R_dict["right_ankle_roll_link:pos_y"] = -1
         R_dict["right_ankle_roll_link:pos_z"] = 1
 
-        R_dict["right_ankle_roll_link:ori_x"] = 1 #-1
+        R_dict["right_ankle_roll_link:ori_x"] = -1
         R_dict["right_ankle_roll_link:ori_y"] = 1
-        R_dict["right_ankle_roll_link:ori_z"] = 1 #-1
+        R_dict["right_ankle_roll_link:ori_z"] = -1
+        R_dict["right_ankle_roll_link:ori_w"] = 1
 
         ##
         # Leg Joints
@@ -846,6 +1071,7 @@ class TrajectoryManager(ManagerBase):
         R_dict["pelvis_link:ori_x"] = -1
         R_dict["pelvis_link:ori_y"] = 1
         R_dict["pelvis_link:ori_z"] = -1
+        R_dict["pelvis_link:ori_w"] = 1
 
         ##
         # Arm Bodies
@@ -854,19 +1080,19 @@ class TrajectoryManager(ManagerBase):
         R_dict["right_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
         R_dict["right_wrist_yaw_link:pos_z"] = 1
 
-        # TODO: I think this is wrong?
-        R_dict["right_wrist_yaw_link:ori_x"] = 1
+        R_dict["right_wrist_yaw_link:ori_x"] = -1
         R_dict["right_wrist_yaw_link:ori_y"] = 1
-        R_dict["right_wrist_yaw_link:ori_z"] = 1
+        R_dict["right_wrist_yaw_link:ori_z"] = -1
+        R_dict["right_wrist_yaw_link:ori_w"] = 1
 
         R_dict["left_wrist_yaw_link:pos_x"] = 1
         R_dict["left_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
         R_dict["left_wrist_yaw_link:pos_z"] = 1
 
-        # TODO: I think this is wrong?
-        R_dict["left_wrist_yaw_link:ori_x"] = 1
+        R_dict["left_wrist_yaw_link:ori_x"] = -1
         R_dict["left_wrist_yaw_link:ori_y"] = 1
-        R_dict["left_wrist_yaw_link:ori_z"] = 1
+        R_dict["left_wrist_yaw_link:ori_z"] = -1
+        R_dict["left_wrist_yaw_link:ori_w"] = 1
 
         ##
         # Arm Joints
@@ -888,8 +1114,8 @@ class TrajectoryManager(ManagerBase):
         R_dict["joint:waist_yaw_joint"] = -1
 
 
-        R = np.zeros((len(self.get_output_names), len(self.get_output_names)))
-        for i, name in enumerate(self.get_output_names):
+        R = np.zeros((len(output_names), len(output_names)))
+        for i, name in enumerate(output_names):
             if name not in R_dict:
                 raise ValueError("No corresponding entry for an output name in relabeling matrix!"
                                  f"Name: {name}.")
@@ -898,9 +1124,9 @@ class TrajectoryManager(ManagerBase):
             # Determine the index of the mirror
             mirror_name = name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
 
-            if mirror_name in self.get_output_names:
+            if mirror_name in output_names:
                 # Find the index of the mirrored output
-                j = self.get_output_names.index(mirror_name)
+                j = output_names.index(mirror_name)
                 # Set the relabeling: output[i] = R_dict[name] * input[j]
                 R[i, j] = R_dict[name]
             else:
@@ -967,6 +1193,35 @@ class TrajectoryManager(ManagerBase):
                     })
 
                 current_idx += len(axes)
+
+    def log_v_on_phasing_var(self, phi: torch.Tensor, v: torch.Tensor):
+        """
+        Log the value of the CLF at its value in the phasing variable.
+
+        Args:
+            phi: [N] phasing variable values.
+            v: [N] CLF values to log.
+        """
+        # Get the bin that the phasing variable fits in
+        bin_indices = torch.searchsorted(self.phi_keys, phi, right=False)
+        bin_indices = torch.clamp(bin_indices, 0, len(self.phi_keys) - 1)
+
+        # Count how many values fall into each bin and sum the v values per bin
+        batch_counts = torch.zeros_like(self.num_v_log)
+        batch_sums = torch.zeros_like(self.v_log)
+        batch_counts.scatter_add_(0, bin_indices, torch.ones_like(v))
+        batch_sums.scatter_add_(0, bin_indices, v)
+
+        alpha = 0.005
+
+        # Exponential moving average: update only bins that received new data
+        mask = batch_counts > 0
+        batch_means = batch_sums[mask] / batch_counts[mask]
+        self.v_log[mask] = (1 - alpha) * self.v_log[mask] + alpha * batch_means
+        self.num_v_log += batch_counts
+
+    def get_v_log(self):
+        return self.v_log, self.phi_keys
 
 def _ncr(n, r):
     return math.comb(n, r)

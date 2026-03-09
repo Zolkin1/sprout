@@ -7,6 +7,8 @@ import numpy as np
 
 import yaml
 
+from plot_from_sim import create_plots
+
 # Add the project root to the Python path
 # sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -25,13 +27,19 @@ EXPERIMENT_NAMES = {
     "lip_clf": "lip",
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
+
     "walking_clf": "walking_clf",
     "walking_clf_sym": "walking-clf-symmetric",
     "walking_clf_ec": "walking_clf",
+
     "running_clf": "running_clf",
+    "running_clf_sym": "running-clf-symmetric",
+
     "waving_clf": "waving_clf",
+
     "bow_forward_clf": "bow_forward_clf",
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+
     "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
 
@@ -60,6 +68,8 @@ def main():
                        help="Scene name for MuJoCo simulation")
     parser.add_argument("--robot_name", type=str, default="g1_21j",
                        help="Robot name")
+    parser.add_argument("--use_ic", action="store_true", default=False,
+                       help="Use the valid initial condition from the policy YAML")
     parser.add_argument("--log", action="store_true", default=False,
                        help="Enable logging")
     parser.add_argument("--log_dir", type=str, default=None,
@@ -129,6 +139,10 @@ def main():
         gains=gains,
     )
 
+    # Set initial condition from YAML if requested
+    if args.use_ic:
+        robot_instance.set_initial_condition(policy)
+
     # Set up log directory
     if args.log_dir is None:
         log_dir = os.path.join(run_dir, "mujoco_logs")
@@ -145,6 +159,11 @@ def main():
         tracking_body_name="torso_link",
     )
     sim.run(-1)  # Run forever
+
+    # Generate plots after simulation if logging was enabled
+    if args.log and sim.new_log_folder:
+        print(f"[INFO] Generating plots from: {sim.new_log_folder}")
+        create_plots(sim.new_log_folder)
 
 
 if __name__ == "__main__":

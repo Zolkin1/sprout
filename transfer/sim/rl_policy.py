@@ -110,7 +110,9 @@ class RLPolicy:
         else:
             self.phi = raw_phi
 
-        print(f"phi: {self.phi}")
+        # self.phi = raw_phi
+
+        # print(f"phi: {self.phi}")
 
         # Create the observation
         obs_idx = 0
@@ -157,9 +159,9 @@ class RLPolicy:
                 elif self.get_skill_type() == "episodic":
                     phi = (min(self.get_total_time() - 1e-8, time) % self.get_total_time())/self.get_total_time()
                     # phi = 0
-                    print(f"phi: {phi}, time: {time}")
+                    # print(f"phi: {phi}, time: {time}")
                     obs_np[obs_idx:obs_idx + shape] = self.create_cos_phase_obs(phi, 1.0) * scale
-                    print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
+                    # print(f"cos phase: {self.create_cos_phase_obs(phi, 1.0)}")
                 else:
                     raise NotImplementedError(f"Skill type {self.get_skill_type()} is not implemented yet!")
                 obs_idx += shape
@@ -206,7 +208,7 @@ class RLPolicy:
         clipped_cmd[1] = np.clip(cmd_vel[1], vel_ranges['v_y_min'], vel_ranges['v_y_max'])
         clipped_cmd[2] = np.clip(cmd_vel[2], vel_ranges['w_z_min'], vel_ranges['w_z_max'])
 
-        print(f"clipped_cmd: {clipped_cmd}")
+        # print(f"clipped_cmd: {clipped_cmd}")
 
         return clipped_cmd
 
@@ -337,6 +339,16 @@ class RLPolicy:
         """Get the default joint angles from the policy_params file."""
         return np.array(self.policy_params['default_joint_angles'])
 
+    def get_valid_ic_pos(self) -> np.ndarray | None:
+        """Get the valid initial condition positions [base_pos(3), base_quat(4), joint_pos(N)]."""
+        ic = self.policy_params.get('valid_ic_pos')
+        return np.array(ic) if ic is not None else None
+
+    def get_valid_ic_vel(self) -> np.ndarray | None:
+        """Get the valid initial condition velocities [base_lin_vel(3), base_ang_vel(3), joint_vel(N)]."""
+        ic = self.policy_params.get('valid_ic_vel')
+        return np.array(ic) if ic is not None else None
+
     def get_joint_names(self) -> list[str]:
         """Get the joint names from the policy_params file."""
         return self.policy_params['joint_names_isaac']
@@ -351,13 +363,6 @@ class RLPolicy:
             'w_z_max': self.policy_params.get('w_z_max'),
             'w_z_min': self.policy_params.get('w_z_min'),
         }
-
-    def get_gait_period_range(self) -> tuple[float, float]:
-        """Get the gait period range from the policy_params file."""
-        period_range = self.policy_params.get('gait_period_range')
-        if period_range:
-            return tuple(period_range)
-        return None
 
     def get_obs_scale(self, term_name: str):
         """Get the observation scale for a specific term."""
@@ -383,3 +388,15 @@ class RLPolicy:
             return total_time
         else:
             return None
+
+    def get_max_vx(self) -> float:
+        """Get the max vx from the policy_params file."""
+        return self.policy_params.get('v_x_max')
+
+    def get_max_vy(self) -> float:
+        """Get the max vx from the policy_params file."""
+        return self.policy_params.get('v_y_max')
+
+    def get_max_vyaw(self) -> float:
+        """Get the max vx from the policy_params file."""
+        return self.policy_params.get('w_z_max')

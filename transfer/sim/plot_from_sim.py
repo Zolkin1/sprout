@@ -16,13 +16,19 @@ EXPERIMENT_NAMES = {
     "lip_clf": "lip",
     "lip_clf_ec": "lip",
     "lip_ref_play": "lip",
+
     "walking_clf": "walking_clf",
     "walking_clf_sym": "walking-clf-symmetric",
     "walking_clf_ec": "walking_clf",
+
     "running_clf": "running_clf",
+    "running_clf_sym": "running-clf-symmetric",
+
     "waving_clf": "waving_clf",
+
     "bow_forward_clf": "bow_forward_clf",
     "bow_forward_clf_sym": "bow_forward-clf-symmetric",
+
     "bend_up_clf_sym": "bend_up-clf-symmetric",
 }
 
@@ -156,6 +162,12 @@ def plot_ankles(data):
     axes[1, 2].set_ylabel("right_ankle_pos z (m)")
 
 
+def moving_average(data, window_size):
+    """Compute moving average of 1D array."""
+    kernel = np.ones(window_size) / window_size
+    return np.convolve(data, kernel, mode='valid')
+
+
 def plot_velocity_comparison(data, save_dir):
     """Plot comparison between commanded and actual velocities."""
     time = data["time"]
@@ -165,27 +177,36 @@ def plot_velocity_comparison(data, save_dir):
     # Extract base velocities (first 3 elements of qvel)
     base_vel = qvel[:, :3]
 
+    # Moving average parameters
+    window_size = 30
+    # Adjusted time array for moving average (shorter due to 'valid' mode convolution)
+    time_ma = time[window_size - 1:]
+
     # Create figure with 3 subplots for x, y, and angular velocities
     fig, axes = plt.subplots(3, 1, figsize=(10, 12))
     fig.suptitle("Commanded vs Actual Velocities")
 
-    # Plot x velocity
-    axes[0].plot(time, commanded_vel[:, 0], "r--", label="Commanded")
-    axes[0].plot(time, base_vel[:, 0], "b-", label="Actual")
+    # Plot x velocity (round commanded to nearest 0.2)
+    commanded_x_vel_rounded = np.round(commanded_vel[:, 0] / 0.2) * 0.2
+    axes[0].plot(time, commanded_x_vel_rounded, "r--", label="Commanded")
+    axes[0].plot(time, base_vel[:, 0], "b-", alpha=0.3, label="Actual")
+    axes[0].plot(time_ma, moving_average(base_vel[:, 0], window_size), "b-", label="Actual (avg)")
     axes[0].set_ylabel("X Velocity (m/s)")
     axes[0].legend()
     axes[0].grid(True)
 
     # Plot y velocity
     axes[1].plot(time, commanded_vel[:, 1], "r--", label="Commanded")
-    axes[1].plot(time, base_vel[:, 1], "b-", label="Actual")
+    axes[1].plot(time, base_vel[:, 1], "b-", alpha=0.3, label="Actual")
+    axes[1].plot(time_ma, moving_average(base_vel[:, 1], window_size), "b-", label="Actual (avg)")
     axes[1].set_ylabel("Y Velocity (m/s)")
     axes[1].legend()
     axes[1].grid(True)
 
     # Plot angular velocity
     axes[2].plot(time, commanded_vel[:, 2], "r--", label="Commanded")
-    axes[2].plot(time, qvel[:, 5], "b-", label="Actual")
+    axes[2].plot(time, qvel[:, 5], "b-", alpha=0.3, label="Actual")
+    axes[2].plot(time_ma, moving_average(qvel[:, 5], window_size), "b-", label="Actual (avg)")
     axes[2].set_xlabel("Time (s)")
     axes[2].set_ylabel("Angular Velocity (rad/s)")
     axes[2].legend()

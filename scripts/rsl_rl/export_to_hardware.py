@@ -1,39 +1,9 @@
 import sys
 import os
 import argparse
+from train_policy import ENVIRONMENTS, EXPERIMENT_NAMES
 
 # Define locally to avoid importing train_policy.py which loads AppLauncher
-ENVIRONMENTS = {
-    "vanilla": "G1-vanilla-walking",
-    "vanilla_ec": "G1-vanilla-walking-ec",
-    "lip_clf": "G1-lip-clf",
-    "lip_clf_ec": "G1-lip-clf-ec",
-    "walking_clf": "G1-walking-clf",
-    "walking_clf_sym": "G1-walking-clf-symmetric",
-    "walking_clf_ec": "G1-walking-clf-ec",
-    "running_clf": "G1-running-clf",
-    "waving_clf": "G1-waving-clf",
-    "bow_forward_clf": "G1-bow_forward-clf",
-    "bow_forward_clf_sym": "G1-bow_forward-clf-symmetric",
-    "bend_up_clf_sym": "G1-bend_up_clf-symmetric",
-}
-
-EXPERIMENT_NAMES = {
-    "vanilla": "vanilla",
-    "vanilla_ec": "vanilla",
-    "basic": "baseline",
-    "lip_clf": "lip",
-    "lip_clf_ec": "lip",
-    "lip_ref_play": "lip",
-    "walking_clf": "walking_clf",
-    "walking_clf_sym": "walking-clf-symmetric",
-    "walking_clf_ec": "walking_clf",
-    "running_clf": "running_clf",
-    "waving_clf": "waving_clf",
-    "bow_forward_clf": "bow_forward_clf",
-    "bow_forward_clf_sym": "bow_forward-clf-symmetric",
-    "bend_up_clf_sym": "bend_up-clf-symmetric",
-}
 
 def main():
     parser = argparse.ArgumentParser(description="Export the policy to be used on hardware using hugging face.")

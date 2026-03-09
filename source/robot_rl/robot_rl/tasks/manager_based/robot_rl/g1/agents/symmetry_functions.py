@@ -62,15 +62,20 @@ def symmetric_data_augmentation_episodic(env, obs: tensordict.TensorDict, action
                 elif name == "sin_phase" or name == "cos_phase":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = obs[group][:, obs_idx:obs_idx + obs_size]
-                elif name == "ref_traj" or name == "act_traj" or name == "ref_traj_vel" or name == "act_traj_vel":
+                elif name == "ref_traj" or name == "act_traj":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size])
+                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size], "pos")
+                    )
+                elif name == "ref_traj_vel" or name == "act_traj_vel":
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size], "vel")
                     )
                 elif name == "root_quat":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, 1, -1, -1], device=device)
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1, -1], device=device)
                     )
                 elif name == "contact_state":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
@@ -158,15 +163,20 @@ def symmetric_data_augmentation_half_periodic(env, obs: tensordict.TensorDict, a
                 elif name == "sin_phase" or name == "cos_phase":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = -1*obs[group][:, obs_idx:obs_idx + obs_size]
-                elif name == "ref_traj" or name == "act_traj" or name == "ref_traj_vel" or name == "act_traj_vel":
+                elif name == "ref_traj" or name == "act_traj":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size])
+                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size], "pos")
+                    )
+                elif name == "ref_traj_vel" or name == "act_traj_vel":
+                    obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size], "vel")
                     )
                 elif name == "root_quat":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
                     obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, 1, -1, -1], device=device)
+                        obs[group][:, obs_idx:obs_idx + obs_size] * torch.tensor([1, -1, 1, -1], device=device)
                     )
                 elif name == "contact_state":
                     obs_size = env.unwrapped.observation_manager.group_obs_term_dim[group][i][0]
@@ -193,8 +203,6 @@ def symmetric_data_augmentation_half_periodic(env, obs: tensordict.TensorDict, a
         actions_aug = None
 
     return (obs_aug, actions_aug)
-
-# TODO: Make one for the walking that also flips the phasing variable
 
 def _switch_g1_joints(joints: torch.Tensor) -> torch.Tensor:
     """

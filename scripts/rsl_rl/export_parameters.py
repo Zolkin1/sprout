@@ -92,6 +92,17 @@ def export_policy_parameters(env, obs, actions, save_dir):
     params["default_joint_angles"] = robot.data.default_joint_pos[0].detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
+    # Build valid initial condition vectors (base first, then joints in joint_names order)
+    root_pos = robot.data.root_pos_w[0]        # (3,)
+    root_quat = robot.data.root_quat_w[0]      # (4,) w,x,y,z
+    root_lin_vel = robot.data.root_lin_vel_w[0] # (3,)
+    root_ang_vel = robot.data.root_ang_vel_w[0] # (3,)
+    joint_pos = robot.data.joint_pos[0]         # (num_joints,)
+    joint_vel = robot.data.joint_vel[0]         # (num_joints,)
+
+    params["valid_ic_pos"] = torch.cat([root_pos, root_quat, joint_pos]).detach().cpu().numpy()
+    params["valid_ic_vel"] = torch.cat([root_lin_vel, root_ang_vel, joint_vel]).detach().cpu().numpy()
+
     # Get base kp/kd from config if available, otherwise use current values
     # Note: robot.data values may be randomized during training
     if hasattr(robot, 'cfg') and hasattr(robot.cfg, 'actuators'):
@@ -225,6 +236,10 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params['joint_names_isaac'] = FlowStyleList(params['joint_names_isaac'])
     if 'gait_period_range' in params:
         params['gait_period_range'] = FlowStyleList(params['gait_period_range'])
+    if 'valid_ic_pos' in params:
+        params['valid_ic_pos'] = FlowStyleList(params['valid_ic_pos'])
+    if 'valid_ic_vel' in params:
+        params['valid_ic_vel'] = FlowStyleList(params['valid_ic_vel'])
 
     # Convert all scale lists in observation_terms to flow style
     if 'observation_terms' in params:

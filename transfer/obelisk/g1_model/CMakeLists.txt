@@ -11,6 +11,13 @@ find_package(ament_cmake REQUIRED)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
+# Get the Obelisk library
+include(FetchContent)
+FetchContent_Declare(
+  Obelisk
+  SOURCE_DIR $ENV{OBELISK_ROOT}/obelisk/cpp
+)
+
 # install all the mesh files
 install(
   DIRECTORY meshes/
