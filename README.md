@@ -1,6 +1,5 @@
 # Robot RL
-:construction: This repo is under active development with potentially major/breaking changes coming in. 
-We do not guarantee any kind of API/environment stability right now, although this could come in the future. :construction:
+## :construction: This repo is under active development with potentially major/breaking changes coming in. We do not guarantee any kind of API/environment stability right now, although this could come in the future. :construction:
 
 ## Overview
 
