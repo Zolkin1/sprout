@@ -40,6 +40,7 @@ onboard:
           10.0, 0.9,
           0.9, -1.1
         ]
+        START_IN_SIM: true
         init_behavior: "walking"
         hf_repo_id: "zolkin/robot_rl"
         log: true
@@ -74,7 +75,7 @@ onboard:
       executable: high_level_control
       params:
         v_x_min: -0.25
-        v_x_max: 2.5 #0.75 #3.7
+        v_x_max: 3.7 #2.5 #0.75 #3.7
         v_y_max: 0.75
         w_z_max: 0.4 #0.75 #0.4
         vel_increment: 0.1
@@ -239,8 +240,8 @@ onboard:
         - ros_parameter: mujoco_setting
           robot_pkg: g1_model
           # model_xml_path: scene.xml
-          model_xml_path: walls.xml
-          # model_xml_path: single_wall.xml
+          # model_xml_path: walls.xml
+          model_xml_path: single_wall.xml
           sensor_settings:
           # ---------- Joint Encoders ---------- #
           - topic: /obelisk/g1/joint_encoders
