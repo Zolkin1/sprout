@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional, Dict
 
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 import numpy as np
 
 
@@ -139,7 +140,7 @@ def plot_velocity_tracking(data: Dict[str, np.ndarray], save_dir: str, window_si
     axes[0].set_title('X Velocity')
     axes[0].set_xlabel('Time (s)')
     axes[0].set_ylabel('Velocity (m/s)')
-    axes[0].set_ylim([4, -1.5])
+    axes[0].set_ylim([-1.5, 4])
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
 
@@ -285,8 +286,8 @@ def plot_xy_trajectory(data: Dict[str, np.ndarray], save_dir: str) -> None:
 def plot_paper_figure(data: Dict[str, np.ndarray], save_dir: str, window_size: int = 20) -> None:
     """Create a publication-quality figure with LaTeX fonts.
 
-    Generates a 1x3 figure with: X velocity tracking, XY trajectory, and yaw angle tracking.
-    Saves as both PNG and PDF.
+    Generates a 1x2 figure with: forward velocity tracking and yaw angle tracking.
+    Saves as both PNG and SVG.
 
     Args:
         data: Dictionary of odometry data arrays.
@@ -311,7 +312,8 @@ def plot_paper_figure(data: Dict[str, np.ndarray], save_dir: str, window_size: i
         "legend.fontsize": 11,
     })
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 2.5))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 2.0))
+    fig.subplots_adjust(left=0.07, right=0.98, bottom=0.22, top=0.88, wspace=0.25)
     time = data['time']
 
     # --- Subplot 1: X Velocity Tracking ---
@@ -327,6 +329,7 @@ def plot_paper_figure(data: Dict[str, np.ndarray], save_dir: str, window_size: i
     axes[0].set_title(r'Forward Velocity Tracking')
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
+    axes[0].set_ylim([0, 4.0])
 
     # --- Subplot 2: Yaw Angle Tracking ---
     yaw_actual = np.unwrap(data['yaw_w'])
@@ -343,46 +346,180 @@ def plot_paper_figure(data: Dict[str, np.ndarray], save_dir: str, window_size: i
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    # --- Subplot 3: XY Trajectory ---
+    # Save as both PNG and SVG
+    for ext in ['png', 'svg']:
+        output_path = os.path.join(save_dir, f'paper_figure.{ext}')
+        plt.savefig(output_path, dpi=300)
+        print(f"Saved paper figure to: {output_path}")
+    plt.close()
+
+    # Restore original rcParams
+    plt.rcParams.update(original_params)
+
+
+def plot_paper_xy_trajectory(data: Dict[str, np.ndarray], save_dir: str) -> None:
+    """Create a publication-quality standalone XY trajectory plot with LaTeX fonts.
+
+    Saves as both PNG and SVG.
+
+    Args:
+        data: Dictionary of odometry data arrays.
+        save_dir: Directory to save the plots.
+    """
+    # Save original rcParams and set LaTeX configuration
+    original_params = {k: plt.rcParams[k] for k in [
+        "text.usetex", "font.family", "text.latex.preamble",
+        "font.size", "axes.labelsize", "axes.titlesize",
+        "xtick.labelsize", "ytick.labelsize", "legend.fontsize",
+    ]}
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "text.latex.preamble": r"\usepackage{amsmath,amsfonts}",
+        "font.size": 12,
+        "axes.labelsize": 13,
+        "axes.titlesize": 14,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+    })
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fig.subplots_adjust(left=0.12, right=0.95, bottom=0.13, top=0.92)
+
     robot_x = data['pos_w_x']
     robot_y = data['pos_w_y']
     has_target = 'target_pos_w_x' in data and 'target_pos_w_y' in data
 
-    axes[2].plot(robot_x, robot_y, color='tab:blue', linewidth=2, label=r'Actual')
-    axes[2].plot(robot_x[0], robot_y[0], 'o', color='tab:green', markersize=8, zorder=5)
-    axes[2].plot(robot_x[-1], robot_y[-1], 'o', color='tab:red', markersize=8, zorder=5)
+    ax.plot(robot_x, robot_y, color='tab:blue', linewidth=2, label=r'Actual')
+    ax.plot(robot_x[0], robot_y[0], 'o', color='tab:green', markersize=8, zorder=5)
+    ax.plot(robot_x[-1], robot_y[-1], 'o', color='tab:red', markersize=8, zorder=5)
     if has_target:
         target_x = data['target_pos_w_x']
         target_y = data['target_pos_w_y']
-        axes[2].plot(target_x, target_y, color='tab:red', linestyle='--', linewidth=2, label=r'Desired')
-    axes[2].set_xlabel(r'$x$ Position (m)')
-    axes[2].set_ylabel(r'$y$ Position (m)')
-    axes[2].set_title(r'$(x,y)$ Trajectory')
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend(loc='upper left')
-    axes[2].set_aspect('equal')
+        ax.plot(target_x, target_y, color='tab:red', linestyle='--', linewidth=2, label=r'Desired')
+    ax.set_xlabel(r'$x$ Position (m)')
+    ax.set_ylabel(r'$y$ Position (m)')
+    ax.set_title(r'$(x,y)$ Trajectory')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left')
+    ax.set_aspect('equal')
 
     # Pad the shorter axis so the plot doesn't get too thin
-    x_range = axes[2].get_xlim()[1] - axes[2].get_xlim()[0]
-    y_range = axes[2].get_ylim()[1] - axes[2].get_ylim()[0]
-    min_aspect_ratio = 0.4  # Shorter axis is at least 40% of longer axis
+    x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
+    y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+    min_aspect_ratio = 0.4
     if x_range > 0 and y_range > 0:
         if y_range / x_range < min_aspect_ratio:
-            y_center = sum(axes[2].get_ylim()) / 2
+            y_center = sum(ax.get_ylim()) / 2
             new_half = x_range * min_aspect_ratio / 2
-            axes[2].set_ylim(y_center - new_half, y_center + new_half)
+            ax.set_ylim(y_center - new_half, y_center + new_half)
         elif x_range / y_range < min_aspect_ratio:
-            x_center = sum(axes[2].get_xlim()) / 2
+            x_center = sum(ax.get_xlim()) / 2
             new_half = y_range * min_aspect_ratio / 2
-            axes[2].set_xlim(x_center - new_half, x_center + new_half)
-
-    plt.tight_layout()
+            ax.set_xlim(x_center - new_half, x_center + new_half)
 
     # Save as both PNG and SVG
     for ext in ['png', 'svg']:
-        output_path = os.path.join(save_dir, f'paper_figure.{ext}')
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"Saved paper figure to: {output_path}")
+        output_path = os.path.join(save_dir, f'paper_xy_trajectory.{ext}')
+        plt.savefig(output_path, dpi=300)
+        print(f"Saved paper XY trajectory to: {output_path}")
+    plt.close()
+
+    # Restore original rcParams
+    plt.rcParams.update(original_params)
+
+
+def plot_paper_trajectory_speed(data: Dict[str, np.ndarray], save_dir: str, window_size: int = 20) -> None:
+    """Create a publication-quality XY trajectory plot colored by filtered forward speed.
+
+    The trajectory line is shaded using a coolwarm colormap where blue indicates
+    slower speeds and red indicates faster speeds. The speed values come from the
+    same moving-average filter used in the velocity tracking plots.
+
+    Args:
+        data: Dictionary of odometry data arrays.
+        save_dir: Directory to save the plots.
+        window_size: Window size for moving average smoothing.
+    """
+    # Save original rcParams and set LaTeX configuration
+    original_params = {k: plt.rcParams[k] for k in [
+        "text.usetex", "font.family", "text.latex.preamble",
+        "font.size", "axes.labelsize", "axes.titlesize",
+        "xtick.labelsize", "ytick.labelsize", "legend.fontsize",
+    ]}
+    plt.rcParams.update({
+        "text.usetex": True,
+        "font.family": "serif",
+        "text.latex.preamble": r"\usepackage{amsmath,amsfonts}",
+        "font.size": 12,
+        "axes.labelsize": 13,
+        "axes.titlesize": 14,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+    })
+
+    # Compute filtered velocity and slice positions to match
+    vel_smooth, offset = compute_moving_average(data['lin_vel_w_x'], window_size)
+    n = len(vel_smooth)
+    x = data['pos_w_x'][offset:offset + n]
+    y = data['pos_w_y'][offset:offset + n]
+
+    # Build line segments for LineCollection: each segment connects consecutive points
+    points = np.column_stack([x, y]).reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+    # Color each segment by the average velocity of its two endpoints
+    seg_vel = (vel_smooth[:-1] + vel_smooth[1:]) / 2.0
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    fig.subplots_adjust(left=0.12, right=0.88, bottom=0.13, top=0.92)
+
+    lc = LineCollection(segments, cmap='coolwarm', linewidth=2.5)
+    lc.set_array(seg_vel)
+    ax.add_collection(lc)
+
+    # Start and end markers
+    ax.plot(x[0], y[0], 'o', color='tab:green', markersize=8, zorder=5, label=r'Start')
+    ax.plot(x[-1], y[-1], 'o', color='tab:red', markersize=8, zorder=5, label=r'End')
+
+    # Desired trajectory if available
+    if 'target_pos_w_x' in data and 'target_pos_w_y' in data:
+        ax.plot(data['target_pos_w_x'], data['target_pos_w_y'],
+                color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label=r'Desired')
+
+    ax.set_xlabel(r'$x$ Position (m)')
+    ax.set_ylabel(r'$y$ Position (m)')
+    ax.set_title(r'Trajectory Colored by Forward Speed')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper left')
+    ax.set_aspect('equal')
+    ax.autoscale_view()
+
+    # Colorbar
+    cbar = fig.colorbar(lc, ax=ax)
+    cbar.set_label(r'Forward Speed ($\mathrm{m/s}$)')
+
+    # Pad the shorter axis so the plot doesn't get too thin
+    x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
+    y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
+    min_aspect_ratio = 0.4
+    if x_range > 0 and y_range > 0:
+        if y_range / x_range < min_aspect_ratio:
+            y_center = sum(ax.get_ylim()) / 2
+            new_half = x_range * min_aspect_ratio / 2
+            ax.set_ylim(y_center - new_half, y_center + new_half)
+        elif x_range / y_range < min_aspect_ratio:
+            x_center = sum(ax.get_xlim()) / 2
+            new_half = y_range * min_aspect_ratio / 2
+            ax.set_xlim(x_center - new_half, x_center + new_half)
+
+    # Save as both PNG and SVG
+    for ext in ['png', 'svg']:
+        output_path = os.path.join(save_dir, f'paper_trajectory_speed.{ext}')
+        plt.savefig(output_path, dpi=300)
+        print(f"Saved trajectory speed plot to: {output_path}")
     plt.close()
 
     # Restore original rcParams
@@ -394,6 +531,7 @@ def main():
     parser.add_argument('--data', help='Path to CSV file (if not provided, uses most recent from odom_logs)')
     parser.add_argument('--start-time', type=float, default=0.0, help='Start time for plotting (seconds)')
     parser.add_argument('--end-time', type=float, default=None, help='End time for plotting (seconds)')
+    parser.add_argument('--paper', action='store_true', help='Generate publication-quality figure with LaTeX fonts')
     args = parser.parse_args()
 
     # Determine CSV file to use
@@ -424,7 +562,10 @@ def main():
     plot_velocity_tracking(data, save_dir)
     plot_yaw_y_tracking(data, save_dir)
     plot_xy_trajectory(data, save_dir)
-    plot_paper_figure(data, save_dir)
+    if args.paper:
+        plot_paper_figure(data, save_dir)
+        plot_paper_xy_trajectory(data, save_dir)
+        plot_paper_trajectory_speed(data, save_dir)
 
     print("Plotting complete!")
 
