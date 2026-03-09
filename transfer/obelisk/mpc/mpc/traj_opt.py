@@ -68,7 +68,7 @@ def ellipse_barrier_value(z, obs_cx, obs_cy, obs_rx, obs_ry, obs_yaw):
 
     # Barrier function: (x_local/rx)^2 + (y_local/ry)^2 - 1
     h = (x_local / obs_rx)**2 + (y_local / obs_ry)**2 - 1
-    return h
+    return h * ((obs_rx + obs_ry)/2.0)**2
 
 
 def single_obstacle_constraint_k(z, obs_cx, obs_cy, obs_rx, obs_ry, obs_yaw):

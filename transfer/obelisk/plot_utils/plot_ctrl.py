@@ -386,6 +386,43 @@ def plot_orientation(data: Dict[str, np.ndarray], save_dir: str) -> None:
     plt.close()
     print(f"Saved: {output_path}")
 
+def plot_orientation_quat(data: Dict[str, np.ndarray], save_dir: str) -> None:
+    """Plot orientation as roll-pitch-yaw converted from quaternion."""
+    time = data["time"]
+
+    fig, axes = plt.subplots(1, 4, figsize=(15, 4))
+    fig.suptitle('Orientation (Quaternion)', fontsize=16)
+
+    axes[0].plot(time, data["quat_x"], 'b-', linewidth=1)
+    axes[0].set_xlabel('Time (s)')
+    axes[0].set_ylabel('quat')
+    axes[0].set_title('x')
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(time, data["quat_y"], 'g-', linewidth=1)
+    axes[1].set_xlabel('Time (s)')
+    axes[1].set_ylabel('quat')
+    axes[1].set_title('y')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(time, data["quat_z"], 'r-', linewidth=1)
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_ylabel('quat')
+    axes[2].set_title('z')
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].plot(time, data["quat_w"], 'r-', linewidth=1)
+    axes[3].set_xlabel('Time (s)')
+    axes[3].set_ylabel('quat')
+    axes[3].set_title('w')
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    output_path = os.path.join(save_dir, 'orientation_quat.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_path}")
+
 
 def print_actions_at_time(data: Dict[str, np.ndarray], target_time: float) -> None:
     """Print all control action values at the given time."""
@@ -459,6 +496,7 @@ def main():
     plot_commanded_velocity(data, folder_path)
     plot_angular_velocity(data, folder_path)
     plot_orientation(data, folder_path)
+    plot_orientation_quat(data, folder_path)
 
     print(f"\nAll plots saved to: {folder_path}")
 
