@@ -1,4 +1,6 @@
 # Robot RL
+:construction: This repo is under active development with potentially major/breaking changes coming in. 
+We do not guarantee any kind of API/environment stability right now, although this could come in the future. :construction:
 
 ## Overview
 
@@ -86,7 +88,7 @@ RL Task list:
 | `lip_clf`             |     G1     |     :white_check_mark:     | Basic, LIP CLF RL walking on the G1 humanoid on flat ground.                         |
 | `walking_clf`         |     G1     |             No             | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground.                |
 | `walking_clf_sym`     |     G1     |     :white_check_mark:     | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground, uses symmetry. |
-| `running_clf`         | G1 |     :white_check_mark:     | Running controller using a gait library.                                             |
+| `running_clf_sym`     | G1 |     :white_check_mark:     | Running controller using a gait library.                                             |
 | `waving_clf`          | G1 |             No             | Robot stands still and waves. Uses trajectories and CLFs.                            |
 | `bow_forward_clf_sym` | G1 |     :white_check_mark:     | Robot bows forward then holds its position. Uses symmetry.                           |
 | `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
