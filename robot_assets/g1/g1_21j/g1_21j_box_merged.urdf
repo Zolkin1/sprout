@@ -272,7 +272,7 @@
       </material>
     </visual>
     <collision>
-      <origin xyz="0 0 -0.15" rpy="0 0 0"/>
+      <origin xyz="0 0 -0.1" rpy="0 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.3"/>
       </geometry>
