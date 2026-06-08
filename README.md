@@ -4,21 +4,6 @@ Since we actively develop on this repo we may push major/breaking changes.
 We do not guarantee any kind of API/environment stability right now, although this could come in the future.
 That being said, we attempt to keep the repo as usable and documented as possible given its developmental status.
 
-## TODO Items for the port
-- Double check/fix everything with the USD. It looks pretty good right now, but still there are some warning.
-- Open IsaacSim and use the tool to visualize the collision geoms and make sure they exist
-- Clean up the paths with the USDs and delete old ones that are no longer in use.
-- Fix the number of self collisions in the USD
-- Consider deleting the old envs that won't be in use anymore (vanilla RL, LIP stuff, the base humanoid env class)
-- Test walking and running
-- Then start the update to new networks w/ RSL-RL 5.0.1
-- Clean up the play script and delete the old train script.
-- Fix self collisions so the reward is active again.
-- Try making the feet collisions square, not circles
-- Check the reset on ref as a good way to verify all the quats and reading in - looks pretty good to me
-- Delete all the unused rewards
-- Update all the transfer stuff to use the new folder structure
-
 ## Overview
 
 This project is a set of tools for end-to-end development of RL for robots. Specifically, we support:
