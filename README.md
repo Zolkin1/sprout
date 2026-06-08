@@ -1,4 +1,4 @@
-# Robot RL
+# Sprout
 ## :construction: This repo is under active development :construction:
 Since we actively develop on this repo we may push major/breaking changes.
 We do not guarantee any kind of API/environment stability right now, although this could come in the future.
