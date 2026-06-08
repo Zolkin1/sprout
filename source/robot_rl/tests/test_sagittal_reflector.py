@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for the sagittal reflector utility."""
 
 import numpy as np

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Terrain importer that exposes a vectorized stair projection in world coords.
 
 Stair sub-terrains generated via :mod:`robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair`

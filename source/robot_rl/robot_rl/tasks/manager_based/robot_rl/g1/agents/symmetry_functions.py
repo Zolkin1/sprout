@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Sagittal-plane data augmentation for RL training.
 
 Provides two entry points consumed by ``RslRlSymmetryCfg``:

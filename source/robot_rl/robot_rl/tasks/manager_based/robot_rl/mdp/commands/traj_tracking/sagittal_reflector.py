@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Sagittal-plane reflection utility for bilateral robot symmetry.
 
 Provides a robot-agnostic, precomputed reflector that swaps left/right

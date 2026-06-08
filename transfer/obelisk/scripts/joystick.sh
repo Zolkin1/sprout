@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 
 # Joystick Setup Script for Obelisk
 # This script detects joystick devices and sets up proper permissions

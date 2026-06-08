@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for MultiSkillManager.
 
 Cross-validates batched results against individual TrajectoryManager outputs

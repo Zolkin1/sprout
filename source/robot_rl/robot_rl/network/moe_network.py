@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 ##
 ## A Mixture of Experts (MoE) network architecture
 ##

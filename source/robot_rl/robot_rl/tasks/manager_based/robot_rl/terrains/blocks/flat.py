@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Flat terrain block."""
 
 from __future__ import annotations

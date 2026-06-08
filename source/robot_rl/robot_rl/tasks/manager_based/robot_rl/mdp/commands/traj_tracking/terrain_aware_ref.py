@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Terrain-aware override for trajectory reference-frame snaps.
 
 The base trajectory command keeps a per-env reference-frame pose

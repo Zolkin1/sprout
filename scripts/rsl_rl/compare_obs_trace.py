@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Standalone observation/state trace + diff tool for cross-commit comparison.
 
 Usage::

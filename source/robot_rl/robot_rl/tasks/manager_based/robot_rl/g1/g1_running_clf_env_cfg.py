@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 from isaaclab.utils import configclass
 
 from .g1_clf_tracking_base import G1ClfTrackingEnvCfg

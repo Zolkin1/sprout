@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Pure-function helpers for the velocity-bucket → skill-id state machine.
 
 The trajectory cmd's "active skill" is derived per-step from where the

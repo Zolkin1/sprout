@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 from .hybrid_distillation import HybridDistillation
 from .moe_network import MoEModel
 from .moe_ppo import MoEPPO

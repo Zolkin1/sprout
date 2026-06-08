@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Depth observation wrappers around ``MultiMeshRayCasterCamera``.
 
 These functions consume the camera's native ``distance_to_image_plane`` data

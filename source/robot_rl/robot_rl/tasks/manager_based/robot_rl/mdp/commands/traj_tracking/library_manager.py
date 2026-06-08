@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """TODO: Delete this file. :class:`MultiSkillManager` subsumes
 ``LibraryManager`` (loops-per-trajectory replaced with batched tensor
 ops). Only :class:`TrajectoryCommand` (slated for deletion) imports it.

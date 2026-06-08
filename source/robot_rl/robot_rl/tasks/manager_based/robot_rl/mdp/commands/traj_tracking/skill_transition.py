@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Helpers for cross-fading trajectory outputs across a skill change.
 
 When the multi-skill command commits a new skill at a contact-gate fire it

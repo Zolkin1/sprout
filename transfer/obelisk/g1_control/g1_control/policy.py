@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 # Policy class for RL controllers
 import os
 import numpy as np

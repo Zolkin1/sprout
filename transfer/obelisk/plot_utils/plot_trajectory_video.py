@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """
 Generate a real-time video of the robot's XY trajectory being drawn.
 

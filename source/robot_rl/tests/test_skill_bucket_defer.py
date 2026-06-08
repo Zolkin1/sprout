@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for the velocity-bucket → skill-id state machine.
 
 Pure tensor-level tests on the helpers in

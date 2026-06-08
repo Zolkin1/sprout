@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 # TODO: Need to test and verify this file. Also verify all the other touched files are ok
 """Hybrid DAgger + PPO distillation algorithm.
 

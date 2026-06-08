@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Recursive contact sensor implementation.
 
 This module requires ``SimulationApp`` to be running (imports ``pxr`` and ``isaaclab_physx``).

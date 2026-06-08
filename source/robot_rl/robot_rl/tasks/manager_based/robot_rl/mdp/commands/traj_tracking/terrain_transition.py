@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Terrain-entry "approach" planners for the multi-skill command.
 
 When a contact gate is about to commit a terrain-aware skill (e.g.

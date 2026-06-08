@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Recursive contact sensor: lightweight config module.
 
 This module is safe to import before ``SimulationApp`` is created. It only contains

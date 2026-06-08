@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for TrajectoryManager.
 
 TODO: Trim this file to parser-level tests (YAML loading, expanded vs

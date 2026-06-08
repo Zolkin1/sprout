@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 from isaaclab.utils import configclass
 
 from .velocity_commands_cfg import VelocityTrackingCommandCfg

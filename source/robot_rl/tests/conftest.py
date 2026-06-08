@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Shared fixtures for trajectory tracking tests."""
 
 from pathlib import Path

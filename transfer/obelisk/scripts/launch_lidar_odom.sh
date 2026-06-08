@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 export ROS_DOMAIN_ID=2
 
 export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH

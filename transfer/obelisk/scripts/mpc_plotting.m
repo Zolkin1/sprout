@@ -1,3 +1,5 @@
+% Copyright 2026 Zachary Olkin. All rights reserved.
+
 %% plot_mpc_debug.m - Plot MPC solution log over time
 % Set csv_path below, then run the script.
 clear; clc; close all;

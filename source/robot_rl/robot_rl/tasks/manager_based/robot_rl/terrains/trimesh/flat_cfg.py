@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 from __future__ import annotations
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg

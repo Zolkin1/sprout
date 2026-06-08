@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Data logger for play-time trajectory recording.
 
 Collects per-timestep data from the Isaac Lab environment during policy playback.

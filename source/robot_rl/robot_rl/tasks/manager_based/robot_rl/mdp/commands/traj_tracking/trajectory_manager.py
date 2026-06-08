@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Per-trajectory loader / runtime evaluator.
 
 TODO: KEEP this file but strip the runtime-eval API. The parser

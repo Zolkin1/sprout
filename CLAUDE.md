@@ -21,7 +21,10 @@ transfer holds code to transfer the RL code to mujoco (in transfer/sim) and to t
 
 # General Guidelines
 - Don't care for backwards compatibility.
-- Use uv virtual environment env_isaaaclab for running all related python code.
+- Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`.
 - When writing a function, always provide a doc string.
 - In general, we should always use type hints where it is idiomatic.
 - In python variable names should be snake_case and function should be snake_case and classes should be UpperCamelCase.
+- When creating a new file, add a comment on the very first line (after a shebang, if present): `Copyright <current year> Zachary Olkin. All rights reserved.` Use the file's comment syntax (`#` for Python/shell/YAML, `//` for C/C++, `%` for MATLAB).
+- Many files under `source/robot_rl/.../tasks/` and `scripts/rsl_rl/` are derived from IsaacLab and carry a BSD-3-Clause header (Isaac Lab Project Developers). Retain those headers when editing; do not replace or remove them, and do not add the personal copyright line to them.
+- Training and playing are run via `scripts/rsl_rl/train.py` and `scripts/rsl_rl/play.py` (with `env_isaaclab` active, or via IsaacLab's `./isaaclab.sh -p`). See `README.md` for task names and examples.

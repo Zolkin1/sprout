@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 import os
 from abc import ABC
 from typing import Tuple

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Configuration for the batched multi-skill trajectory command."""
 
 from dataclasses import field

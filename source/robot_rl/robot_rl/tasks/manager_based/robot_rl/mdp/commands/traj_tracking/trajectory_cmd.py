@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Single-skill trajectory command backed by a single trajectory or library.
 
 TODO: Delete this file. Single-skill commands have been superseded by

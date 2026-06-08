@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 obk-build
 
 colcon build --symlink-install --parallel-workers $(nproc)

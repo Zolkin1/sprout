@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 import os
 
 from ament_index_python.packages import get_package_share_directory
