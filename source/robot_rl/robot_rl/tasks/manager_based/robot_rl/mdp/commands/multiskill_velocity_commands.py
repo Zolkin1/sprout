@@ -303,7 +303,12 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
         # end-of-last-episode position at reset-event time, so we pass
         # ``env_origins`` through the ``xy_w`` override.
         xy_spawn = self._env.scene.env_origins[env_ids_t, :2]
-        new_skill = self._sample_skill(env_ids_t, xy_w=xy_spawn)
+        # A fresh episode always draws its skill independently from the spawn
+        # cell's distribution — the previous episode's skill is meaningless
+        # across a reset discontinuity (the env may even have respawned on a
+        # different cell). ``skill_transition_prob`` governs only the
+        # mid-episode resample persistence, not the reset draw.
+        new_skill = self._sample_skill(env_ids_t, xy_w=xy_spawn, force_independent=True)
         new_vx, new_vy, new_wz, new_heading = self._sample_velocity_for_skill(new_skill)
 
         # Immediate live commit.
@@ -327,17 +332,22 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
 
     def _sample_skill(
         self, env_ids: Sequence[int], xy_w: torch.Tensor | None = None,
+        force_independent: bool = False,
     ) -> torch.Tensor:
         """Sample one skill index per env from the terrain's per-cell distribution.
 
-        Without ``skill_transition_prob``: each env's skill is drawn
-        independently from its cell's ``skill_probs`` row each resample.
+        Without ``skill_transition_prob`` (or with ``force_independent=True``):
+        each env's skill is drawn independently from its cell's ``skill_probs``
+        row.
 
         With ``skill_transition_prob = p``: each env independently either keeps
         its previous skill (prob ``1 − p``) or samples a new one from its cell's
         ``skill_probs`` renormalised to exclude the current skill (prob ``p``).
         Cells whose distribution puts all mass on the previous skill leave the
-        env on its current skill (warning logged once).
+        env on its current skill (warning logged once).  Setting ``p = 0.0``
+        therefore locks each env's skill to whatever it was sampled at reset for
+        the whole episode (mid-episode resamples only re-draw the velocity
+        within that skill's bucket).
 
         Args:
             env_ids: Env indices to sample for.
@@ -347,6 +357,10 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
                 ``env.scene.env_origins[..., :2]``) on the reset path —
                 otherwise ``root_pos_w`` is stale and resolves to the
                 end-of-last-episode cell.
+            force_independent: If True, ignore ``skill_transition_prob`` and
+                draw each skill independently from the cell distribution. Used
+                by the reset path so a fresh episode always samples from its
+                spawn cell rather than persisting the previous episode's skill.
         """
         # Per-env world XY → per-env skill probability vector. The importer
         # encapsulates the cell (and per-block, for composite importers)
@@ -355,7 +369,7 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
             xy_w = wp.to_torch(self.robot.data.root_pos_w)[env_ids, :2]
         per_env_probs = self._terrain.skill_probs_at(xy_w)  # (n, num_skills)
 
-        if self.cfg.skill_transition_prob is None:
+        if self.cfg.skill_transition_prob is None or force_independent:
             return torch.multinomial(per_env_probs, num_samples=1).squeeze(-1)
 
         n = len(env_ids)

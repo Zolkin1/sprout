@@ -116,6 +116,16 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         self.commands.base_velocity.max_acc_frac = 1.0
         self.commands.base_velocity.max_acc = 1.0
 
+        # No mid-episode skill transitions: each env draws one skill from its
+        # spawn cell at reset and keeps it for the whole episode (velocity still
+        # resamples within that skill's bucket).  With the FLAT_STAIR_MULTISKILL
+        # terrain split into pure-flat and pure-stair cells, this means a flat
+        # env stays walk/run/stand for the episode and a stair env stays
+        # stair_up — no flat<->skill churn mid-episode.  ``0.0`` only suppresses
+        # transitions because the reset path samples the skill independently
+        # (see MultiskillVelocityTrackingCommand.reset_for_episode).
+        self.commands.base_velocity.skill_transition_prob = 0.0
+
         # Per-skill velocity ranges.  Keys MUST equal the terrain importer's
         # ``skill_list`` exactly (validated at construction).  The
         # trajectory cmd owns this dict; the velocity cmd reads it via
@@ -228,7 +238,10 @@ class G1TerrainMultiskillCLFDistillationEnvCfg(G1TerrainMultiskillCLFEnvCfg):
         self.commands.base_velocity.max_acc = 1.0
         self.commands.base_velocity.max_acc_frac = 1.0
 
-        self.commands.base_velocity.skill_transition_prob = 0.6
+        # Inherit no-transition behavior from the parent (skill locked per
+        # episode).  Bump back toward 0.6 here if distillation should see
+        # mid-episode skill churn.
+        self.commands.base_velocity.skill_transition_prob = 0.0
 
         self.commands.traj_ref.contact_gate_window_frac = 0.1
 

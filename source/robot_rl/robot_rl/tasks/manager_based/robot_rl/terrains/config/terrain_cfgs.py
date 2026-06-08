@@ -328,9 +328,9 @@ FLAT_STAIR_MULTISKILL_CFG = MetaTerrainGeneratorCfg(
     use_cache=False,
     inter_column_borders=[],
     sub_terrains={
-        "pure_flat": MeshFlatTerrainCfg(proportion=0.2),
+        "pure_flat": MeshFlatTerrainCfg(proportion=0.5),
         "pure_stair_up": MeshXStairsUpTerrainCfg(
-            proportion=0.2,
+            proportion=0.5, #0.2,
             step_dim_options=[(_LONG_STAIRS_STEP_HEIGHT, _LONG_STAIRS_STEP_DEPTH)],
             # Lowest stair top sits at z=0 (default ``start_z_zero=True``);
             # spawn the env on stair 0 so the robot starts at ground level.
@@ -340,35 +340,35 @@ FLAT_STAIR_MULTISKILL_CFG = MetaTerrainGeneratorCfg(
             wall_prob=0.0,
             pole_prob=0.0,
         ),
-        "flat_stair_up": RandomizedCompositeSubTerrainCfg(
-            proportion=0.6,
-            size=(_RANDOM_SIZE_X, _RANDOM_SIZE_Y),
-            origin_block_index=0,
-            force_flat_origin=True,
-            length_range=(1.0, 2.0),
-            trailing_flat_length_range=(1.5, 3.0),
-            choices=[
-                BlockChoice(
-                    cfg=FlatBlockCfg(
-                        skill_probs={"walk_forward": 0.98, "running": 0.0, "standing": 0.02},
-                        flat_width_range=(1.5, _RANDOM_SIZE_Y),
-                    ),
-                    weight=1.0,
-                ),
-                BlockChoice(
-                    cfg=StairBlockCfg(
-                        direction="up",
-                        skill_probs={"stair_up": 1.0},
-                        step_dim_options=[(_LONG_STAIRS_STEP_HEIGHT, _LONG_STAIRS_STEP_DEPTH)],
-                        stair_width_range=(1.5, _RANDOM_SIZE_Y),
-                        float_prob=0.5,
-                        wall_prob=0.0,
-                        pole_prob=0.0,
-                    ),
-                    weight=1.0,
-                    length_range=(0.5, 2.0),
-                ),
-            ],
-        ),
+        # "flat_stair_up": RandomizedCompositeSubTerrainCfg(
+        #     proportion=0.6,
+        #     size=(_RANDOM_SIZE_X, _RANDOM_SIZE_Y),
+        #     origin_block_index=0,
+        #     force_flat_origin=True,
+        #     length_range=(1.0, 2.0),
+        #     trailing_flat_length_range=(1.5, 3.0),
+        #     choices=[
+        #         BlockChoice(
+        #             cfg=FlatBlockCfg(
+        #                 skill_probs={"walk_forward": 0.98, "running": 0.0, "standing": 0.02},
+        #                 flat_width_range=(1.5, _RANDOM_SIZE_Y),
+        #             ),
+        #             weight=1.0,
+        #         ),
+        #         BlockChoice(
+        #             cfg=StairBlockCfg(
+        #                 direction="up",
+        #                 skill_probs={"stair_up": 1.0},
+        #                 step_dim_options=[(_LONG_STAIRS_STEP_HEIGHT, _LONG_STAIRS_STEP_DEPTH)],
+        #                 stair_width_range=(1.5, _RANDOM_SIZE_Y),
+        #                 float_prob=0.5,
+        #                 wall_prob=0.0,
+        #                 pole_prob=0.0,
+        #             ),
+        #             weight=1.0,
+        #             length_range=(0.5, 2.0),
+        #         ),
+        #     ],
+        # ),
     },
 )
