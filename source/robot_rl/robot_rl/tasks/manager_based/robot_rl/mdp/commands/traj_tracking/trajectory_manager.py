@@ -1,3 +1,19 @@
+"""Per-trajectory loader / runtime evaluator.
+
+TODO: KEEP this file but strip the runtime-eval API. The parser
+(``__init__``, ``traj_data``, ``_all_coeffs_pos/vel``, ``_T_all``,
+``T``, ``domain_boundaries``, ``expanded_num_domains``,
+``num_domains``, ``TrajectoryType``) is load-bearing — :class:`MultiSkillManager`
+imports ``TrajectoryManager`` to load each YAML and pulls the parsed
+fields into batched tensors. The runtime-eval methods (``get_output``,
+``get_phasing_var``, ``get_current_domains``, ``get_acceleration``,
+``get_domain_times``, ``get_ref_frames_in_use``, ``get_contact_state``,
+``log_v_on_phasing_var`` and their phasing helpers) are unused at
+runtime — only single-skill commands and their tests call them. Remove
+them when ``trajectory_cmd.py`` and ``test_trajectory_manager.py`` are
+deleted/trimmed.
+"""
+
 from enum import Enum
 from pathlib import Path
 from typing import Tuple
@@ -7,9 +23,11 @@ import yaml
 from dataclasses import dataclass
 import math
 import numpy as np
-from hid import device
-
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.manager_base import ManagerBase
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.sagittal_reflector import (
+    NamedReflector,
+    SagittalReflectionConfig,
+)
 
 
 class TrajectoryType(Enum):
@@ -28,6 +46,7 @@ class DomainData:
     time: float
     bezier_frame: str           # Frame of reference used for the splines
     bezier_frame_domain: str    # Domain in which the frame was measured
+    ref_frame_offset: torch.Tensor  # [3] world-frame offset added to env_origin at spawn
 
 @dataclass
 class TrajectoryData:
@@ -43,6 +62,7 @@ class TrajectoryData:
     total_time: float
     conditioner: list[float]
     reference_frames: list[str]     # List of the bezier frames
+    origin_relative_to_stair_center: torch.Tensor  # [3] world offset to stair origin
 
 
 class TrajectoryManager(ManagerBase):
@@ -81,6 +101,23 @@ class TrajectoryManager(ManagerBase):
         else:
             self.domain_boundaries = torch.cumsum(torch.cat([torch.tensor([0.0], device=self.device), self.T, self.T]), dim=0)
 
+        # Per-trajectory stair-origin offset (top-level YAML field). Shape [3].
+        self.origin_relative_to_stair_center = self.traj_data.origin_relative_to_stair_center
+
+        # Per-(expanded-)domain reference-frame offset, [expanded_num_domains, 3].
+        # Half-periodic trajectories reuse the same offset for the reflected half;
+        # if a future trajectory ever needs a sagittal-mirrored offset, flip the y
+        # component for indices >= num_domains.
+        self.ref_frame_offset_per_domain = torch.zeros(
+            self.expanded_num_domains, 3, device=self.device
+        )
+        for i, domain in enumerate(self.traj_data.domain_order):
+            self.ref_frame_offset_per_domain[i] = self.traj_data.domain_data[domain].ref_frame_offset
+            if self.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+                self.ref_frame_offset_per_domain[i + self.num_domains] = (
+                    self.traj_data.domain_data[domain].ref_frame_offset
+                )
+
         # Pre-compute relabeling matrices as tensors (separate for pos and vel)
         R_pos_numpy = self.relable_ee_stance_coeffs(self.traj_data.pos_output_names)
         R_vel_numpy = self.relable_ee_stance_coeffs(self.traj_data.vel_output_names)
@@ -88,7 +125,6 @@ class TrajectoryManager(ManagerBase):
         self.R_relabel_vel = torch.from_numpy(R_vel_numpy).to(device=self.device, dtype=self.bezier_coeffs_vel.dtype)
 
         # TODO: Fix the trajectory manager so that the bezier coefficient use the same order as the measured states
-        # TODO: Make the R to remap programatic instead of hard-coded
         # TODO: Why are the z height values never at zero when the foot is in stance?
 
         # Pre-compute binomial coefficients for batched bezier interpolation
@@ -272,7 +308,12 @@ class TrajectoryManager(ManagerBase):
                 time=domain_yaml['T'][0],
                 contact_bodies=domain_yaml.get('contact_bodies', []),
                 bezier_frame=domain_yaml['ref_frame'],
-                bezier_frame_domain=domain_yaml['ref_frame_domain']
+                bezier_frame_domain=domain_yaml['ref_frame_domain'],
+                ref_frame_offset=torch.tensor(
+                    domain_yaml.get('ref_frame_offset', [0.0, 0.0, 0.0]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
             )
 
             domain_data_dict[domain] = domain_data
@@ -301,6 +342,12 @@ class TrajectoryManager(ManagerBase):
             conditioner=data['conditioner'],
             # Reference frames
             reference_frames=ref_frames,
+            # Stair origin offset (top-level YAML field; defaults to zero for non-stair trajectories).
+            origin_relative_to_stair_center=torch.tensor(
+                data.get('origin_relative_to_stair_center', [0.0, 0.0, 0.0]),
+                dtype=torch.float32,
+                device=self.device,
+            ),
         )
 
     def get_reference_frames(self) -> list[str]:
@@ -331,7 +378,7 @@ class TrajectoryManager(ManagerBase):
             return torch.clamp(t / self.traj_data.total_time, 0, 1)
         elif self.traj_data.trajectory_type == TrajectoryType.PERPETUAL:
             # For now all perpetual motions are assumed to have no phasing associated with them
-            return torch.clamp(torch.zeros(t.shape[0], self.device), 0, 1)
+            return torch.zeros(t.shape[0], device=self.device)
         else:
             raise NotImplementedError(f"Trajectory type {self.traj_data.trajectory_type} is not implemented.")
 
@@ -999,9 +1046,11 @@ class TrajectoryManager(ManagerBase):
         else:
             return torch.sum(self.T)
 
-    # TODO: Clean
     def relable_ee_stance_coeffs(self, output_names: list[str] = None):
         """Build a relabelling matrix for end effector coefficients including the stance foot.
+
+        Uses :class:`NamedReflector` to derive the signed permutation
+        matrix from name-based rules rather than a hand-coded dictionary.
 
         Args:
             output_names: List of output names to build the relabeling matrix for.
@@ -1012,128 +1061,9 @@ class TrajectoryManager(ManagerBase):
         """
         if output_names is None:
             output_names = self.get_pos_output_names
-        R_dict = {}
-        ##
-        # COM
-        ##
-        R_dict["com:pos_x"] = 1
-        R_dict["com:pos_y"] = -1
-        R_dict["com:pos_z"] = 1
-
-        ##
-        # Left Foot
-        ##
-        R_dict["left_ankle_roll_link:pos_x"] = 1
-        R_dict["left_ankle_roll_link:pos_y"] = -1
-        R_dict["left_ankle_roll_link:pos_z"] = 1
-
-        R_dict["left_ankle_roll_link:ori_x"] = -1
-        R_dict["left_ankle_roll_link:ori_y"] = 1
-        R_dict["left_ankle_roll_link:ori_z"] = -1
-        R_dict["left_ankle_roll_link:ori_w"] = 1
-
-        ##
-        # Right Foot
-        ##
-        R_dict["right_ankle_roll_link:pos_x"] = 1
-        R_dict["right_ankle_roll_link:pos_y"] = -1
-        R_dict["right_ankle_roll_link:pos_z"] = 1
-
-        R_dict["right_ankle_roll_link:ori_x"] = -1
-        R_dict["right_ankle_roll_link:ori_y"] = 1
-        R_dict["right_ankle_roll_link:ori_z"] = -1
-        R_dict["right_ankle_roll_link:ori_w"] = 1
-
-        ##
-        # Leg Joints
-        ##
-        R_dict["joint:left_hip_roll_joint"] = -1
-        R_dict["joint:left_hip_pitch_joint"] = 1
-        R_dict["joint:left_hip_yaw_joint"] = -1
-        R_dict["joint:left_knee_joint"] = 1
-        R_dict["joint:left_ankle_roll_joint"] = -1
-        R_dict["joint:left_ankle_pitch_joint"] = 1
-
-        R_dict["joint:right_hip_roll_joint"] = -1
-        R_dict["joint:right_hip_pitch_joint"] = 1
-        R_dict["joint:right_hip_yaw_joint"] = -1
-        R_dict["joint:right_knee_joint"] = 1
-        R_dict["joint:right_ankle_roll_joint"] = -1
-        R_dict["joint:right_ankle_pitch_joint"] = 1
-
-        ##
-        # Pelvis
-        ##
-        R_dict["pelvis_link:pos_x"] = 1
-        R_dict["pelvis_link:pos_y"] = -1
-        R_dict["pelvis_link:pos_z"] = 1
-
-        R_dict["pelvis_link:ori_x"] = -1
-        R_dict["pelvis_link:ori_y"] = 1
-        R_dict["pelvis_link:ori_z"] = -1
-        R_dict["pelvis_link:ori_w"] = 1
-
-        ##
-        # Arm Bodies
-        ##
-        R_dict["right_wrist_yaw_link:pos_x"] = 1
-        R_dict["right_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
-        R_dict["right_wrist_yaw_link:pos_z"] = 1
-
-        R_dict["right_wrist_yaw_link:ori_x"] = -1
-        R_dict["right_wrist_yaw_link:ori_y"] = 1
-        R_dict["right_wrist_yaw_link:ori_z"] = -1
-        R_dict["right_wrist_yaw_link:ori_w"] = 1
-
-        R_dict["left_wrist_yaw_link:pos_x"] = 1
-        R_dict["left_wrist_yaw_link:pos_y"] = -1   # TODO: Is this correct?
-        R_dict["left_wrist_yaw_link:pos_z"] = 1
-
-        R_dict["left_wrist_yaw_link:ori_x"] = -1
-        R_dict["left_wrist_yaw_link:ori_y"] = 1
-        R_dict["left_wrist_yaw_link:ori_z"] = -1
-        R_dict["left_wrist_yaw_link:ori_w"] = 1
-
-        ##
-        # Arm Joints
-        ##
-
-        # Left
-        R_dict["joint:left_elbow_joint"] = 1
-        R_dict["joint:left_shoulder_pitch_joint"] = 1
-        R_dict["joint:left_shoulder_roll_joint"] = -1
-        R_dict["joint:left_shoulder_yaw_joint"] = -1
-
-        # Right
-        R_dict["joint:right_elbow_joint"] = 1
-        R_dict["joint:right_shoulder_pitch_joint"] = 1
-        R_dict["joint:right_shoulder_roll_joint"] = -1
-        R_dict["joint:right_shoulder_yaw_joint"] = -1
-
-        # Waist
-        R_dict["joint:waist_yaw_joint"] = -1
-
-
-        R = np.zeros((len(output_names), len(output_names)))
-        for i, name in enumerate(output_names):
-            if name not in R_dict:
-                raise ValueError("No corresponding entry for an output name in relabeling matrix!"
-                                 f"Name: {name}.")
-
-            # Check if there is an associated right/left mirror in the output_names
-            # Determine the index of the mirror
-            mirror_name = name.replace("right", "TEMP").replace("left", "right").replace("TEMP", "left")
-
-            if mirror_name in output_names:
-                # Find the index of the mirrored output
-                j = output_names.index(mirror_name)
-                # Set the relabeling: output[i] = R_dict[name] * input[j]
-                R[i, j] = R_dict[name]
-            else:
-                # No mirror exists, just apply sign flip to same index
-                R[i, i] = R_dict[name]
-
-        return R
+        cfg = SagittalReflectionConfig()
+        reflector = NamedReflector(cfg, output_names, device=self.device)
+        return reflector.build_relabel_matrix_numpy()
 
     # TODO: Clean
     def generate_axis_names(self, domain_name):

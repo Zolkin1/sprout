@@ -5,10 +5,5 @@
 
 """Command configurations for the environment."""
 
-from .gaitPeriodCfg import GaitPeriodCfg
-
 from .velocity_commands_cfg import VelocityTrackingCommandCfg
-
-from .velocity_commands import VelocityTrackingCommand
-
-# __all__ = ["GaitPeriodCfg"]
+from .multiskill_velocity_commands_cfg import MultiskillVelocityTrackingCommandCfg, VelocityBucketCfg

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import torch
+import warp as wp
 from typing import TYPE_CHECKING
 
-from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
 if TYPE_CHECKING:
+    from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedEnv
 
 # TODO: Break the key parts of this into another function that can be called from the play script easily.
@@ -19,7 +20,7 @@ def reset_on_reference(
         command_name: str,
         conditioner_command_name: str,
         base_frame_name: str,
-        base_z_offset: float = 0.03,
+        base_z_offset: float = 0.03,    # TODO: Need to handle this better, I think the blow up issue is related to this not being correct
         joint_add_range: tuple[float, float] = (0.0, 0.0),
         rel_envs_on_ref: float = 0.5,
         special_val: float = 1.0,
@@ -50,8 +51,19 @@ def reset_on_reference(
     # Get the robot asset and trajectory command
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
-    env.command_manager.get_term(conditioner_command_name)._resample(env_ids)   #     env.command_manager.get_term(conditioner_command_name).reset(env_ids)
-    env.command_manager.get_term(conditioner_command_name)._update_command()
+    cond_term = env.command_manager.get_term(conditioner_command_name)
+    # Reset the velocity command for the new episode: samples a bucket
+    # from the spawn cell (not the stale ``root_pos_w``), commits live
+    # immediately, snaps ``vel_target_b`` past the max-acc ramp, and
+    # refreshes ``time_left``.
+    cond_term.reset_for_episode(env_ids)
+    cond_term._update_command()
+    # Snap the trajectory cmd's active ``skill_id`` to whichever bucket
+    # the freshly-set ``vel_target_b`` lands in for these envs, and
+    # clear any stale pending / cross-fade state.  Must run AFTER the
+    # velocity cmd's reset so ``vel_target_b`` is current.
+    if hasattr(cmd, "reset_for_episode"):
+        cmd.reset_for_episode(env_ids)
     num_env = len(env_ids)
 
     if num_env == 0:
@@ -108,26 +120,41 @@ def reset_on_reference(
             f"The following robot joints are missing from the trajectory outputs: {missing_joints}"
         )
 
-    # Sample random times for each environment
-    total_time = cmd.manager.get_total_time()
-    random_times = torch.rand(num_ref_envs, device=env.device) * total_time
+    # Sample a phase per ref env.  The manager caches its trajectory
+    # assignments across steps and only invalidates inside
+    # ``BatchedMultiSkillCommand._pre_update_phase``.  Reset events fire
+    # between steps, so by default the cache here holds the *previous*
+    # step's traj_idx — built from the pre-resample conditioner.
+    # Invalidate so the read below picks the trajectory matching the
+    # freshly-resampled conditioner (incl. any ``special_envs`` override
+    # above).
+    cmd.manager.invalidate_cache()
+    ref_traj_idx = cmd.manager.get_current_trajectory_indices()[ref_ids]
+    random_phase_ref = torch.rand(num_ref_envs, device=env.device)
 
-    # Get trajectory outputs at sampled times
-    cmd.get_desired_outputs(random_times, env_ids=ref_ids)
+    # Get trajectory outputs at sampled phase
+    cmd.get_desired_outputs(random_phase_ref, env_ids=ref_ids)
     des_outputs = cmd.y_des
     y_sampled = des_outputs[ref_ids]  # Position outputs
 
     # Extract base frame position and orientation from outputs
     base_pos_rel = y_sampled[:, pos_indices]  # Shape: [num_env, 3]
-    base_ori_quat_w = y_sampled[:, ori_indices]  # Shape: [num_env, 3] - roll, pitch, yaw
+    base_ori_quat_w = y_sampled[:, ori_indices]  # Shape: [num_env, 4] - quaternion (x, y, z, w)
 
-    # Add the ground->ankle_roll_link offset
-    base_pos_rel[:, 2] += base_z_offset
+    # Per-env spawn offset = stair-origin offset (per-trajectory, top-level YAML)
+    # + ref-frame offset (per-domain). Spline outputs are ref-frame-relative, so
+    # both the spawn pose and the stored ref pose must shift by the same amount —
+    # keeps ``robot_body - ref_frame == trajectory_value`` after the reset.
+    # Assumes the stair origin lives at the env origin (= 0 in stair-local coords).
+    domain_idx = cmd.manager.get_current_domains(random_phase_ref, env_ids=ref_ids)
+    ref_offset = cmd.manager.data["ref_frame_offset"][ref_traj_idx, domain_idx]
+    stair_offset = cmd.manager.data["origin_relative_to_stair_center"][ref_traj_idx]
+    spawn_offset = ref_offset + stair_offset
 
     # Compute world-frame base pose
-    base_pos_w = base_pos_rel + env.scene.env_origins[ref_ids]
+    base_pos_w = base_pos_rel + env.scene.env_origins[ref_ids] + spawn_offset
 
-    # Build pose tensor: [x, y, z, qw, qx, qy, qz]
+    # Build pose tensor: [x, y, z, qx, qy, qz, qw]
     base_pose = torch.cat([base_pos_w, base_ori_quat_w], dim=-1)
 
     # Extract Base Vel
@@ -142,9 +169,10 @@ def reset_on_reference(
     base_vel = torch.cat([dy_sampled[:, lin_vel_indices], dy_sampled[:, ang_vel_indices]], dim=-1) #torch.zeros(num_env, 6, device=env.device)
 
 
-    # Set the reference frame position
-    cmd.ref_poses[ref_ids, :3] = env.scene.env_origins[ref_ids]
-    cmd.ref_poses[ref_ids, 3:] *= 0
+    # Set the reference frame at env_origin + spawn_offset (identity quaternion).
+    cmd.ref_poses[ref_ids, :3] = env.scene.env_origins[ref_ids] + spawn_offset
+    cmd.ref_poses[ref_ids, 3:6] = 0.0
+    cmd.ref_poses[ref_ids, 6] = 1.0
 
     # Extract joint positions from trajectory output
     # Build a mapping from robot joint indices to trajectory output indices
@@ -167,70 +195,48 @@ def reset_on_reference(
     #     joint_pos = joint_pos * scale_factors
     #     joint_vel = joint_vel * scale_factors
 
-    # Store time offset in command so it knows the current phase
-    cmd.init_time_offset[ref_ids] = random_times
+    # Anchor the trajectory clock so the next step evaluates from the
+    # sampled state.
+    cmd.manager.set_phase(random_phase_ref, ref_ids)
 
     # Write states to simulation
-    asset.write_root_pose_to_sim(base_pose, env_ids=ref_ids)
-    asset.write_root_link_velocity_to_sim(base_vel, env_ids=ref_ids)
-    asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=ref_ids)
+    asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=ref_ids)
+    # NOTE: known discrepancy — the x component of the reset base velocity
+    # has been observed in play to not match the trajectory reference (y
+    # and z line up).  Root cause unknown; left as-is until investigated.
+    asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=ref_ids)
+    asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=ref_ids)
+    asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=ref_ids)
 
     # Restore command
     env.command_manager.get_term(conditioner_command_name).command[:] = command_clone
 
-    # if num_ref_envs > 0:
-    #     # Compute the measured outputs and print
-    #     cmd.get_measured_outputs(random_times, env_ids=ref_ids)
-    #
-    #     # Get the desired outputs and print
-    #     cmd.get_desired_outputs(random_times, env_ids=ref_ids)
-    #
-    #     # Compute V
-    #     vdot, v = cmd.clf.compute_vdot(cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des)
-    #
-    #     cmd_vel = command_clone #command
-    #
-    #     # Pretty print the output names, desired values, and measured values
-    #     _pretty_print_reset_state(
-    #         cmd.ordered_pos_output_names,
-    #         cmd.ordered_vel_output_names,
-    #         cmd.y_des,
-    #         cmd.y_act,
-    #         cmd.dy_des,
-    #         cmd.dy_act,
-    #         random_times,
-    #         v,
-    #         vdot,
-    #         cmd.clf.v_subgroups,
-    #         cmd_vel,
-    #         cmd.clf,
-    #         env_idx=0,
-    #     )
-
-
     if num_nonref_envs != 0:
         # Non reference resets
-        root_states = asset.data.default_root_state[nonref_ids].clone()
+        root_states = wp.to_torch(asset.data.default_root_state)[nonref_ids].clone()
 
         base_pose = root_states[:, 0:7]
         base_pose[:, :3] += env.scene.env_origins[nonref_ids]
         base_vel = root_states[:, 7:]
 
         # get default joint state
-        joint_pos = asset.data.default_joint_pos[nonref_ids, asset_cfg.joint_ids].clone()
-        joint_vel = asset.data.default_joint_vel[nonref_ids, asset_cfg.joint_ids].clone()
+        joint_pos = wp.to_torch(asset.data.default_joint_pos)[nonref_ids, asset_cfg.joint_ids].clone()
+        joint_vel = wp.to_torch(asset.data.default_joint_vel)[nonref_ids, asset_cfg.joint_ids].clone()
 
         # Add noise
         r = torch.empty(num_nonref_envs, len(asset.joint_names), device=env.device)
         r.uniform_(joint_add_range[0], joint_add_range[1])
         joint_pos += r
 
-        asset.write_root_pose_to_sim(base_pose, env_ids=nonref_ids)
-        asset.write_root_velocity_to_sim(base_vel, env_ids=nonref_ids)
-        asset.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=nonref_ids)
+        asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=nonref_ids)
+        asset.write_root_velocity_to_sim_index(root_velocity=base_vel, env_ids=nonref_ids)
+        asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=nonref_ids)
+        asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=nonref_ids)
 
-        # Reset the time offset
-        cmd.init_time_offset[nonref_ids] = 0.0
+        # Anchor the non-ref envs' clock at phase 0 (start of cycle) so the
+        # trajectory eval roughly matches the default-pose spawn.
+        nonref_phase = torch.zeros(num_nonref_envs, device=env.device)
+        cmd.manager.set_phase(nonref_phase, nonref_ids)
 
 
 
@@ -266,6 +272,11 @@ def _pretty_print_reset_state(
     v_subgroups: dict[str, torch.Tensor],
     cmd_vel: torch.Tensor,
     clf,
+    phase: torch.Tensor,
+    current_domain: torch.Tensor,
+    cur_ref_frame_idx: torch.Tensor,
+    ref_frame_names: list[str],
+    ref_pose: torch.Tensor,
     env_idx: int = 0,
 ):
     """
@@ -282,12 +293,24 @@ def _pretty_print_reset_state(
         vdot: Lyapunov derivative, shape [num_envs].
         v_subgroups: Dict mapping subgroup names to their V contributions, each shape [num_envs].
         cmd_vel: Commanded velocity, shape [num_envs, vel_dim].
+        phase: Per-env trajectory phase, shape [num_envs].
+        current_domain: Per-env domain index after reset, shape [num_envs].
+        cur_ref_frame_idx: Per-env index into ``ref_frame_names``, shape [num_envs].
+        ref_frame_names: Ordered reference-frame names (matches ``cur_ref_frame_idx``).
+        ref_pose: Per-env reference-frame pose ``[x, y, z, qx, qy, qz, qw]``, shape [num_envs, 7].
         env_idx: Index of the environment to print (default 0).
     """
     # Header
     print(f"\n{'='*94}")
     print(f"Reset State for Environment {env_idx}")
-    print(f"Time: {times[env_idx].item():.4f} s")
+    print(f"Time: {times[0].item():.4f} s    Phase: {phase[env_idx].item():.4f}")
+    print(f"Domain Index: {current_domain[env_idx].item()}")
+    ref_idx = cur_ref_frame_idx[env_idx].item()
+    ref_name = ref_frame_names[ref_idx] if 0 <= ref_idx < len(ref_frame_names) else "<oob>"
+    ref_xyz = ref_pose[env_idx, :3].tolist()
+    print(f"Reference Frame: {ref_name} (idx {ref_idx})")
+    print(f"Reference Frame Pos (x,y,z): "
+          f"({ref_xyz[0]:.4f}, {ref_xyz[1]:.4f}, {ref_xyz[2]:.4f})")
     print(f"Commanded Velocity: {cmd_vel[env_idx].tolist()} m/s")
     print(f"{'='*94}")
 

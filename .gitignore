@@ -9,7 +9,7 @@
 **/.thumbs
 
 # No USD files allowed in the repo
-**/*.usda
+#**/*.usda
 **/*.usdc
 **/*.usdz
 
@@ -31,7 +31,7 @@ docker/.container.cfg
 **/.vscode/
 # Don't ignore the top-level .vscode directory as it is
 # used to configure VS Code settings
-!.vscode
+# !.vscode
 
 # Outputs
 **/output/*
@@ -88,7 +88,7 @@ transfer/sim/MUJOCO_LOG.TXT
 transfer/sim/experiments/mass_randomization_*/
 remote_mount/
 vulcan_mount/
-vulcan_remote_mount/
+*_remote_mount/
 g1_mount/
 
 transfer/sim/MUJOCO_LOG.TXT
@@ -100,3 +100,9 @@ transfer/sim/experiments/comparison_logs
 talos_remote_mount/
 transfer/sim/experiments/temp_holder/
 hf/
+/uv.lock
+
+todo-report-*
+
+claude_plans/
+.claude/

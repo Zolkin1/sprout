@@ -11,73 +11,6 @@ _registered = False
 
 if not _registered:
     ## =========================================
-    # Vanilla, heuristic RL
-    ## =========================================
-    gym.register(
-        id="G1-vanilla-walking",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_vanilla_walking_env_cfg:G1VanillaWalkingEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    # Extra compute (EC)
-    gym.register(
-        id="G1-vanilla-walking-ec",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_vanilla_walking_env_cfg:G1VanillaWalkingECEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    # TODO: Add a play
-
-
-    ## =========================================
-    # LIP-CLF RL
-    ## =========================================
-    gym.register(
-        id="G1-lip-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_lip_clf_env_cfg:G1LipCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    # Extra compute (EC)
-    gym.register(
-        id="G1-lip-clf-ec",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_lip_clf_env_cfg:G1LipCLFECEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    # Play
-    gym.register(
-        id="G1-lip-ref-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_flat_env_lip_cfg:G1FlatLipEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
-        },
-    )
-
-    ## =========================================
     # Walking Trajectory Optimization
     ## =========================================
     gym.register(
@@ -87,7 +20,6 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
@@ -101,6 +33,28 @@ if not _registered:
         }
     )
 
+    # Custom network architecture
+    gym.register(
+        id="G1-walking-clf-custom-arch",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
+        }
+    )
+
+    # Transformer Architecture
+    gym.register(
+        id="G1-walking-clf-transformer",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFTransformerEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:CausalTransformerPPORunnerCfg",
+        }
+    )
+
     # Extra compute (EC)
     gym.register(
         id="G1-walking-clf-ec",
@@ -109,7 +63,6 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         },
     )
 
@@ -121,7 +74,49 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg_PLAY",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+        },
+    )
+
+    ## =========================================
+    # Walking + Depth Camera (flat scan / image)
+    ## =========================================
+    gym.register(
+        id="G1-walking-clf-depth-scan",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-walking-clf-depth-image",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-walking-clf-depth-scan-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-walking-clf-depth-image-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
 
@@ -133,9 +128,8 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
@@ -144,7 +138,7 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
         }
     )
@@ -155,9 +149,8 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfgPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
@@ -167,34 +160,180 @@ if not _registered:
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningGaitLibraryEnvCfgExperiment",
+            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfgExperiment",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         }
     )
 
     ## =========================================
-    # Waving Trajectory Optimization
+    # Walk + Run Trajectory Optimization
     ## =========================================
+    #########
+    ## MLP ##
+    #########
     gym.register(
-        id="G1-waving-clf",
+        id="G1-walk-run-clf-symmetric",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_waving_clf_env_cfg:G1WavingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:MultiSkillSymmetricHalfPeriodicPPORunnerCfg",
         }
     )
 
     # Play
     gym.register(
-        id="G1-waving-clf-play",
+        id="G1-walk-run-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_waving_clf_env_cfg:G1WavingCLFEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:MultiSkillSymmetricHalfPeriodicPPORunnerCfg",
+        }
+    )
+
+    #########
+    ## MoE ##
+    #########
+    gym.register(
+        id="G1-walk-run-clf-sym-moe",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMoE2MLPDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    ##################
+    ## Distillation ##
+    ##################
+    # MLP -> MLP distillation
+    gym.register(
+        id="G1-walk-run-clf-distill-mlp2mlp",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MulitskillMLP2MLPDistillationRunner"
+            ),
+        }
+    )
+
+    # MLP teacher -> LSTM student
+    gym.register(
+        id="G1-walk-run-clf-distill-mlp2lstm",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2LSTMDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # MLP teacher -> Transformer student
+    gym.register(
+        id="G1-walk-run-clf-distill-mlp2transformer",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2TransformerDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # MLP teacher -> Transformer student with sagittal symmetry augmentation
+    gym.register(
+        id="G1-walk-run-clf-sym-distill-mlp2transformer",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2TransformerSymmetricDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # MLP teacher -> Transformer student with mixed on/off-policy rollout
+    gym.register(
+        id="G1-walk-run-clf-distill-mixed-mlp2transformer",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMixedPolicyMLP2TransformerDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # MoE teacher -> MoE student
+    gym.register(
+        id="G1-walk-run-clf-sym-distill-moe2moe",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMoE2MoEDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # MLP teacher -> MoE student
+    gym.register(
+        id="G1-walk-run-clf-sym-distill-mlp2moe",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2MoEDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    # TODO: Test
+    # Hybrid DAgger + PPO distillation, MLP -> Transformer
+    gym.register(
+        id="G1-walk-run-clf-distill-hybrid",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+            "rsl_rl_distillation_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_distillation_cfg:G1HybridDistillationRunnerCfg"
+            ),
+        }
+    )
+
+    ########
+    # Play #
+    ########
+    gym.register(
+        id="G1-walk-run-clf-custom-arch-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
         }
     )
 
@@ -208,7 +347,6 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
@@ -233,7 +371,6 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg_PLAY",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
@@ -247,7 +384,6 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bend_up_clf_env_cfg:G1BendUpCLFEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
@@ -272,10 +408,52 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_bend_up_clf_env_cfg:G1BendUpCLFEnvCfg_PLAY",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-            "skrl_cfg_entry_point": f"{agents.__name__}:skrl_rough_ppo_cfg.yaml",
         }
     )
 
+    ## =========================================
+    # Stairs Terrain
+    ## =========================================
+    gym.register(
+        id="G1-stairs-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stairs_clf_env_cfg:G1StairsCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-stairs-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_stairs_clf_env_cfg:G1StairsCLFEnvCfg_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        },
+    )
+
+    # Multiskill terrain
+    gym.register(
+        id="G1-multiskill-terrain-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_terrain_multiskill_env_cfg:G1TerrainMultiskillCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-multiskill-terrain-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_terrain_multiskill_env_cfg:G1TerrainMultiskillCLFEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        },
+    )
     _registered = True
 
 

@@ -4,6 +4,7 @@ Export policy parameters and environment configuration to YAML files.
 import os
 import yaml
 import torch
+import warp as wp
 import numpy as np
 
 
@@ -40,8 +41,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
     unwrapped_env = env.unwrapped
     robot = unwrapped_env.scene.articulations["robot"]
 
+    # Prefer student observations (distillation) over policy observations
+    obs_key = "student" if "student" in obs else "policy"
+
     params = {
-        "num_obs": obs["policy"].shape[1],
+        "num_obs": obs[obs_key].shape[1],
         "num_actions": actions.shape[1],
         "dt": unwrapped_env.step_dt,
     }
@@ -85,20 +89,22 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params["v_y_min"] = base_vel_cfg.ranges.lin_vel_y[0]
         params["w_z_max"] = base_vel_cfg.ranges.ang_vel_z[1]
         params["w_z_min"] = base_vel_cfg.ranges.ang_vel_z[0]
+        if hasattr(base_vel_cfg, "max_acc"):
+            params["max_acc"] = base_vel_cfg.max_acc
     except KeyError:
         pass
 
     # Add robot joint information
-    params["default_joint_angles"] = robot.data.default_joint_pos[0].detach().cpu().numpy()
+    params["default_joint_angles"] = wp.to_torch(robot.data.default_joint_pos)[0].detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
     # Build valid initial condition vectors (base first, then joints in joint_names order)
-    root_pos = robot.data.root_pos_w[0]        # (3,)
-    root_quat = robot.data.root_quat_w[0]      # (4,) w,x,y,z
-    root_lin_vel = robot.data.root_lin_vel_w[0] # (3,)
-    root_ang_vel = robot.data.root_ang_vel_w[0] # (3,)
-    joint_pos = robot.data.joint_pos[0]         # (num_joints,)
-    joint_vel = robot.data.joint_vel[0]         # (num_joints,)
+    root_pos = wp.to_torch(robot.data.root_pos_w)[0]        # (3,)
+    root_quat = wp.to_torch(robot.data.root_quat_w)[0]      # (4,) x,y,z,w
+    root_lin_vel = wp.to_torch(robot.data.root_lin_vel_w)[0] # (3,)
+    root_ang_vel = wp.to_torch(robot.data.root_ang_vel_w)[0] # (3,)
+    joint_pos = wp.to_torch(robot.data.joint_pos)[0]         # (num_joints,)
+    joint_vel = wp.to_torch(robot.data.joint_vel)[0]         # (num_joints,)
 
     params["valid_ic_pos"] = torch.cat([root_pos, root_quat, joint_pos]).detach().cpu().numpy()
     params["valid_ic_vel"] = torch.cat([root_lin_vel, root_ang_vel, joint_vel]).detach().cpu().numpy()
@@ -162,11 +168,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
         except (AttributeError, KeyError, ValueError) as e:
             print(f"[WARNING] Could not extract base gains from config: {e}")
             # Fall back to current values if config extraction fails
-            params["kp"] = robot.data.joint_stiffness[0].detach().cpu().numpy()
-            params["kd"] = robot.data.joint_damping[0].detach().cpu().numpy()
+            params["kp"] = wp.to_torch(robot.data.joint_stiffness)[0].detach().cpu().numpy()
+            params["kd"] = wp.to_torch(robot.data.joint_damping)[0].detach().cpu().numpy()
     else:
-        params["kp"] = robot.data.joint_stiffness[0].detach().cpu().numpy()
-        params["kd"] = robot.data.joint_damping[0].detach().cpu().numpy()
+        params["kp"] = wp.to_torch(robot.data.joint_stiffness)[0].detach().cpu().numpy()
+        params["kd"] = wp.to_torch(robot.data.joint_damping)[0].detach().cpu().numpy()
 
     # Custom YAML representer for lists to use flow style for numerical lists
     class FlowStyleList(list):
@@ -177,16 +183,17 @@ def export_policy_parameters(env, obs, actions, save_dir):
 
     yaml.add_representer(FlowStyleList, represent_flow_list)
 
-    # Add observation information (only policy group, skip critic)
+    # Add observation information (prefer student group for distillation, else policy)
     obs_manager = unwrapped_env.observation_manager
     obs_info = {}
+    obs_group_name = "student" if "student" in obs_manager.active_terms else "policy"
 
     for group_name, group_terms in obs_manager.active_terms.items():
-        # Only include policy observations
-        if group_name != "policy":
+        # Only include the target observation group
+        if group_name != obs_group_name:
             continue
 
-        obs_info[group_name] = {}
+        obs_info["policy"] = {}
         # Get the dimensions and configs for this group
         group_dims = obs_manager._group_obs_term_dim[group_name]
         group_cfgs = obs_manager._group_obs_term_cfgs[group_name]
@@ -208,7 +215,17 @@ def export_policy_parameters(env, obs, actions, save_dir):
             else:
                 term_info["scale"] = 1.0
 
-            obs_info[group_name][term_name] = term_info
+            # Export history_length if present (defaults to 0 = no history)
+            history_len = getattr(term_cfg, 'history_length', 0)
+            if history_len > 0:
+                term_info["history_length"] = history_len
+
+            # Export frequency_list for multiskill_phase terms
+            term_params = getattr(term_cfg, 'params', None)
+            if term_params and 'frequency_list' in term_params:
+                term_info["frequency_list"] = term_params['frequency_list']
+
+            obs_info["policy"][term_name] = term_info
 
     params["observation_terms"] = obs_info
 
@@ -241,12 +258,14 @@ def export_policy_parameters(env, obs, actions, save_dir):
     if 'valid_ic_vel' in params:
         params['valid_ic_vel'] = FlowStyleList(params['valid_ic_vel'])
 
-    # Convert all scale lists in observation_terms to flow style
+    # Convert all scale and frequency_list lists in observation_terms to flow style
     if 'observation_terms' in params:
         for group_name, group_terms in params['observation_terms'].items():
             for term_name, term_info in group_terms.items():
                 if 'scale' in term_info and isinstance(term_info['scale'], list):
                     term_info['scale'] = FlowStyleList(term_info['scale'])
+                if 'frequency_list' in term_info and isinstance(term_info['frequency_list'], list):
+                    term_info['frequency_list'] = FlowStyleList(term_info['frequency_list'])
 
     # Save to YAML file
     yaml_path = os.path.join(export_dir, "policy_parameters.yaml")

@@ -4,6 +4,21 @@ Since we actively develop on this repo we may push major/breaking changes.
 We do not guarantee any kind of API/environment stability right now, although this could come in the future.
 That being said, we attempt to keep the repo as usable and documented as possible given its developmental status.
 
+## TODO Items for the port
+- Double check/fix everything with the USD. It looks pretty good right now, but still there are some warning.
+- Open IsaacSim and use the tool to visualize the collision geoms and make sure they exist
+- Clean up the paths with the USDs and delete old ones that are no longer in use.
+- Fix the number of self collisions in the USD
+- Consider deleting the old envs that won't be in use anymore (vanilla RL, LIP stuff, the base humanoid env class)
+- Test walking and running
+- Then start the update to new networks w/ RSL-RL 5.0.1
+- Clean up the play script and delete the old train script.
+- Fix self collisions so the reward is active again.
+- Try making the feet collisions square, not circles
+- Check the reset on ref as a good way to verify all the quats and reading in - looks pretty good to me
+- Delete all the unused rewards
+- Update all the transfer stuff to use the new folder structure
+
 ## Overview
 
 This project is a set of tools for end-to-end development of RL for robots. Specifically, we support:
@@ -35,22 +50,17 @@ When you clone this repo, please use **Git Large File System (lfs)**.
         # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
         python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
         ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
+      
 ## Running Tasks
+Get a list of available tasks:
+```
+python scripts/list_envs.py --keyword clf
+```
+or you could use `G1` as the keyword.
+
 To train a policy run:
 ```bash
-python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --headless
+python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --viz none
 ```
 
 To add a run name add `--run_name=my_run_name`. This will add the name after the date on the folder with the run name.
@@ -59,7 +69,7 @@ Note that right now the only RL library that is tested in `RSL_RL`.
 
 To play the most recently trained policy for a given task run:
 ```bash
-python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --headless
+python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --viz none
 ```
 
 for a specific run you can pass in additional config such as `--load_run=<run_dir>`
@@ -96,6 +106,13 @@ RL Task list:
 | `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
+
+## Generating the USD
+Now we use the default IsaacLab built in urdf to usd converter:
+```
+./isaaclab.sh -p scripts/tools/convert_urdf.py robot_rl/robot_assets/g1/g1_21j/g1_21j_merged.urdf robot_rl/robot_assets/g1/g1_21j/isaac_converter
+```
+TODO: Update this to not have different paths
 
 ## Copying checkpoints from remote server 
 First mount the server to your local desktop
@@ -182,32 +199,69 @@ Sometimes you will want to updated the version of IsaacLab you are using. To do 
 (where you cloned it). Then pull the version you want from git.
 Then in that folder run `./isaaclab.sh --install`.
 
-## Troubleshooting
 
-### Pylance Missing Indexing of Extensions
+## Citing
+If you use this repo in any publications, please consider citing the relevant paper (see below).
 
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
-
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/robot_rl"
-    ]
+### Walking
+For the original CLF-RL idea and basic walking:
+```
+@article{li_clf-rl_2026,
+  author={Li, Kejun and Olkin, Zachary and Yue, Yisong and Ames, Aaron D.},
+  journal={IEEE Robotics and Automation Letters}, 
+  title={CLF-RL: Control Lyapunov Function Guided Reinforcement Learning}, 
+  year={2026},
+  volume={11},
+  number={3},
+  pages={3230-3237},
+  doi={10.1109/LRA.2026.3653329}}
+```
+### Running
+```
+@misc{olkin2026chasingautonomydynamicretargeting,
+      title={Chasing Autonomy: Dynamic Retargeting and Control Guided RL for Performant and Controllable Humanoid Running}, 
+      author={Zachary Olkin and William D. Compton and Ryan M. Bena and Aaron D. Ames},
+      year={2026},
+      eprint={2603.25902},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2603.25902}, 
+}
+```
+and
+```
+@misc{olkin_chasing_2025,
+      title={Chasing Stability: Humanoid Running via Control Lyapunov Function Guided Reinforcement Learning}, 
+      author={Zachary Olkin and Kejun Li and William D. Compton and Aaron D. Ames},
+      year={2025},
+      eprint={2509.19573},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2509.19573}, 
+}
+```
+### Stepping stones
+```
+@misc{dai_walk_2026,
+      title={Walk the PLANC: Physics-Guided RL for Agile Humanoid Locomotion on Constrained Footholds}, 
+      author={Min Dai and William D. Compton and Junheng Li and Lizhi Yang and Aaron D. Ames},
+      year={2026},
+      eprint={2601.06286},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2601.06286}, 
 }
 ```
 
-### Pylance Crash
-
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
-
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
+### Theoretical Results
+```
+@misc{olkin2026stabilitycontrollyapunovfunction,
+      title={Stability of Control Lyapunov Function Guided Reinforcement Learning}, 
+      author={Zachary Olkin and William D. Compton and Aaron D. Ames},
+      year={2026},
+      eprint={2605.01978},
+      archivePrefix={arXiv},
+      primaryClass={eess.SY},
+      url={https://arxiv.org/abs/2605.01978}, 
+}
 ```

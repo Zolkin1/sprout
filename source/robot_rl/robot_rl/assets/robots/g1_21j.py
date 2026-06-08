@@ -21,11 +21,26 @@ DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ
 DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ
 
-ROBOT_ASSETS = "robot_assets/g1"
+import pathlib
+
+
+def _find_project_root() -> pathlib.Path:
+    """Walk up from this file until we find a directory containing 'robot_assets'."""
+    path = pathlib.Path(__file__).resolve().parent
+    while path != path.parent:
+        if (path / "robot_assets").is_dir():
+            return path
+        path = path.parent
+    raise FileNotFoundError("Could not find project root containing 'robot_assets'")
+
+
+ROBOT_ASSETS = str(_find_project_root() / "robot_assets" / "g1")
 # TODO: Fix warnings about waist_roll_link and yaw_link inertia and mass
 G1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_default.usd",
+        # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged/g1_21j_box_merged.usda",
+        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_v2/g1_21j_box_merged_v2.usda",
+        # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_merged/g1_21j_merged.usda",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
@@ -38,36 +53,15 @@ G1_CFG = ArticulationCfg(
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=True,
-            # enabled_self_collisions=False,
             solver_position_iteration_count=8, solver_velocity_iteration_count=4
         ),
         collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.01, rest_offset=0.0),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        # Bend up
-        # pos=(0.0, 0.0, 0.62), #0.63),
-        # rot=(0.73, 0.0, 0.67, 0.0),
-
         # Standing
         pos=(0.0, 0.0, 0.785),
 
         joint_pos={
-            # Bend up
-            # ".*_hip_pitch_joint": -2.0,
-            # ".*_hip_roll_joint": 0.0,
-            # ".*_hip_yaw_joint": 0.0,
-            # ".*_knee_joint": 1.0,
-            # ".*_ankle_pitch_joint": -0.48,
-            # ".*_ankle_roll_joint": 0.0,
-            # "waist_yaw_joint": 0.0,
-            # "left_shoulder_yaw_joint": 0.0,
-            # "left_shoulder_pitch_joint": 0.1,
-            # "left_shoulder_roll_joint": 0.5,
-            # "right_shoulder_yaw_joint": 0.0,
-            # "right_shoulder_pitch_joint": 0.1,
-            # "right_shoulder_roll_joint": -0.5,
-            # ".*_elbow_joint": 0.7,  # 1.39,
-
             # Standing
             ".*_hip_pitch_joint": -0.25,
             ".*_hip_roll_joint": 0.0,
@@ -82,15 +76,7 @@ G1_CFG = ArticulationCfg(
             "right_shoulder_yaw_joint": 0.0,
             "right_shoulder_pitch_joint": 0.31,
             "right_shoulder_roll_joint": -0.24,
-            ".*_elbow_joint": 0.8, #1.39,
-
-            # ".*_wrist_roll_joint": 0.,
-            # ".*_wrist_pitch_joint": 0.,
-            # ".*_wrist_yaw_joint": 0.,
-            # "left_one_joint": 1.0,
-            # "right_one_joint": -1.0,
-            # "left_two_joint": 0.52,
-            # "right_two_joint": -0.52,
+            ".*_elbow_joint": 0.8,
         },
         joint_vel={".*": 0.0},
     ),
@@ -116,24 +102,22 @@ G1_CFG = ArticulationCfg(
                 ".*_knee_joint": 20.0,
             },
             stiffness={
-                ".*_hip_yaw_joint": STIFFNESS_7520_14, #100.0,
-                ".*_hip_roll_joint": STIFFNESS_7520_22, #100.0,
-                ".*_hip_pitch_joint": STIFFNESS_7520_14, #100.0,
-                ".*_knee_joint": STIFFNESS_7520_22, #150.0,
+                ".*_hip_yaw_joint": STIFFNESS_7520_14,
+                ".*_hip_roll_joint": STIFFNESS_7520_22,
+                ".*_hip_pitch_joint": STIFFNESS_7520_14,
+                ".*_knee_joint": STIFFNESS_7520_22,
             },
             damping={
-                ".*_hip_yaw_joint": DAMPING_7520_14, #2.0,
-                ".*_hip_roll_joint": DAMPING_7520_22, #2.0,
-                ".*_hip_pitch_joint":DAMPING_7520_14, # 2.0,
-                ".*_knee_joint": DAMPING_7520_22, #4.0,
+                ".*_hip_yaw_joint": DAMPING_7520_14,
+                ".*_hip_roll_joint": DAMPING_7520_22,
+                ".*_hip_pitch_joint":DAMPING_7520_14,
+                ".*_knee_joint": DAMPING_7520_22,
             },
             armature={
                 ".*_hip_pitch_joint": ARMATURE_7520_14,
                 ".*_hip_roll_joint": ARMATURE_7520_22,
                 ".*_hip_yaw_joint": ARMATURE_7520_14,
                 ".*_knee_joint": ARMATURE_7520_22,
-                # ".*_hip_.*": 0.01,
-                # ".*_knee_joint": 0.01,
             },
         ),
         "feet": ImplicitActuatorCfg(
@@ -143,9 +127,6 @@ G1_CFG = ArticulationCfg(
             stiffness=2.0 * STIFFNESS_5020,
             damping=2.0 * DAMPING_5020,
             armature=2.0 * ARMATURE_5020,
-            # stiffness=40.0,
-            # damping=2.0,
-            # armature=0.01,
         ),
         "waist": ImplicitActuatorCfg(
             effort_limit_sim=88,
@@ -154,9 +135,6 @@ G1_CFG = ArticulationCfg(
             stiffness=STIFFNESS_7520_14,
             damping=DAMPING_7520_14,
             armature=ARMATURE_7520_14,
-            # stiffness=100.0,
-            # damping=2.0,
-            # armature=0.01,
         ),
         "arms": ImplicitActuatorCfg(
             joint_names_expr=[
@@ -182,28 +160,18 @@ G1_CFG = ArticulationCfg(
                 ".*_shoulder_roll_joint": STIFFNESS_5020,
                 ".*_shoulder_yaw_joint": STIFFNESS_5020,
                 ".*_elbow_joint": STIFFNESS_5020,
-                # ".*_shoulder_pitch_joint": 100.0,
-                # ".*_shoulder_roll_joint": 100.0,
-                # ".*_shoulder_yaw_joint": 50.0,
-                # ".*_elbow_joint": 50.0,
             },
             damping={
                 ".*_shoulder_pitch_joint": DAMPING_5020,
                 ".*_shoulder_roll_joint": DAMPING_5020,
                 ".*_shoulder_yaw_joint": DAMPING_5020,
                 ".*_elbow_joint": DAMPING_5020,
-                # ".*_shoulder_pitch_joint": 2.0,
-                # ".*_shoulder_roll_joint": 2.0,
-                # ".*_shoulder_yaw_joint": 2.0,
-                # ".*_elbow_joint": 2.0,
             },
             armature={
                 ".*_shoulder_pitch_joint": ARMATURE_5020,
                 ".*_shoulder_roll_joint": ARMATURE_5020,
                 ".*_shoulder_yaw_joint": ARMATURE_5020,
                 ".*_elbow_joint": ARMATURE_5020,
-                # ".*_shoulder_.*": 0.01,
-                # ".*_elbow_.*": 0.01,
             },
         ),
     },

@@ -7,7 +7,7 @@ from typing import Literal
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
-    RslRlPpoActorCriticCfg,
+    RslRlMLPModelCfg,
     RslRlPpoAlgorithmCfg,
     RslRlSymmetryCfg,
 )
@@ -16,32 +16,12 @@ from .symmetry_functions import (
     symmetric_data_augmentation_half_periodic
 )
 
-@configclass
-class CustomPPOActorCriticCfg:
-    """Configuration for the PPO actor-critic networks."""
-
-    class_name: str = "ActorCriticCNN"
-    """The policy class name. Default is ActorCritic."""
-
-    init_noise_std: float = MISSING
-    """The initial noise standard deviation for the policy."""
-
-    noise_std_type: Literal["scalar", "log"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
-
-    actor_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the actor network."""
-
-    critic_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the critic network."""
-
-    activation: str = MISSING
-    """The activation function for the actor and critic networks."""
-
-    height_map_shape: tuple[int, int, int] = (1, 16,16)
-    """The shape of the height map (C, H, W)."""
-
-
+###################################################
+# MLP
+###################################################
+##
+# Default MLP Runner
+##
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
@@ -49,11 +29,18 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 200
     experiment_name = "g1"
     empirical_normalization = False
-    policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
-        actor_hidden_dims=[512, 256, 128],
-        critic_hidden_dims=[512, 256, 128],
+    logger="wandb"
+    wandb_project = "robot_rl"
+    actor = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
         activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        obs_normalization=False,
+    )
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
@@ -72,10 +59,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     resume = False
     resume_path = None
     obs_groups = {
-        "policy": ["policy"],
+        "actor": ["policy"],
         "critic": ["critic"],
     }
 
+##
+# Symmetric MLP Runner
+##
 @configclass
 class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
     algorithm = RslRlPpoAlgorithmCfg(
@@ -96,6 +86,9 @@ class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
         )
     )
 
+##
+# Symmetric MLP Runner for Half Periodic
+##
 @configclass
 class SymmetricHalfPeriodicPPORunnerCfg(PPORunnerCfg):
     algorithm = RslRlPpoAlgorithmCfg(
@@ -116,3 +109,140 @@ class SymmetricHalfPeriodicPPORunnerCfg(PPORunnerCfg):
         )
     )
 
+# Multiskill
+@configclass
+class MultiSkillSymmetricHalfPeriodicPPORunnerCfg(PPORunnerCfg):
+    actor = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        obs_normalization=False,
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.008,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_half_periodic
+        )
+    )
+
+###################################################
+# MoE
+###################################################
+##
+# Symmetric MoE Runner
+##
+@configclass
+class SymmetricMoEPPORunnerCfg(PPORunnerCfg):
+    """PPO runner config using the custom MLP model (placeholder for future MoE)."""
+    experiment_name = "g1_multiskill_arch"
+    actor = RslRlMLPModelCfg(
+        class_name="robot_rl.network.moe_network:MoEModel",
+        hidden_dims=[256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        obs_normalization=False,
+    )
+    # TODO: Try just making the critic an MLP only
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
+    )
+    # critic = RslRlMLPModelCfg(
+    #     class_name="robot_rl.network.moe_network:MoEModel",
+    #     hidden_dims=[256, 128],
+    #     activation="elu",
+    #     obs_normalization=False,
+    # )
+
+    algorithm = RslRlPpoAlgorithmCfg(
+        class_name="robot_rl.network.moe_ppo.MoEPPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.008,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
+        )
+    )
+
+###################################################
+# Transformer
+###################################################
+##
+# Symmetric Causal Transformer Model
+##
+@configclass
+class RslRlCausalTransformerModelCfg(RslRlMLPModelCfg):
+    """Configuration for the Causal Transformer model."""
+    class_name: str = "robot_rl.network.transformer_network:CausalTransformerModel"
+    single_obs_dim: int = 72
+    history_length: int = 50
+    d_model: int = 128
+    nhead: int = 4
+    num_layers: int = 4
+    dim_feedforward: int = 256
+    dropout: float = 0.0
+    # Indices below are tied to PolicyCfg declaration order in g1_clf_tracking_base.py
+    use_velocity_embedding: bool = False
+    velocity_command_start: int = 6
+    velocity_command_dim: int = 3
+
+##
+# Symmetric Causal Transformer Runner
+##
+@configclass
+class CausalTransformerPPORunnerCfg(PPORunnerCfg):
+    """PPO runner config using a causal transformer actor."""
+    experiment_name = "g1_causal_transformer"
+    obs_groups = {
+        "actor": ["unpriv_policy"],
+        "critic": ["critic"],
+    }
+    actor = RslRlCausalTransformerModelCfg(
+        hidden_dims=[256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        obs_normalization=False,
+    )
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.008,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
+        )
+    )

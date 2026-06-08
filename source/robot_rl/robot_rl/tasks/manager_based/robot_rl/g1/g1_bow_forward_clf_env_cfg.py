@@ -10,7 +10,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import TerminationTermCfg as TerminationTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import RewardTermCfg as RewTerm
-from robot_rl.tasks.manager_based.robot_rl.terrains.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
+from source.robot_rl.robot_rl.tasks.manager_based.robot_rl.terrains.config.rough import ROUGH_SLOPED_FOR_FLAT_HZD_CFG
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -158,6 +158,8 @@ BOWING_R_weights["left_wrist_yaw_link:ori_z"] = [0.005]
 @configclass
 class G1BowingCommandsCfg(HumanoidCommandsCfg):
     """Configuration for gait library commands."""
+    # TODO: Migrate to BatchedMultiSkillCommandCfg.  TrajectoryCommandCfg
+    # is slated for deletion (single-skill path superseded by multi-skill).
     traj_ref = TrajectoryCommandCfg(
         contact_bodies = [".*_ankle_roll_link"],
 
@@ -166,10 +168,8 @@ class G1BowingCommandsCfg(HumanoidCommandsCfg):
         path = "trajectories/bowing/bow_forward_config_solution.yaml",
 
         conditioner_generator_name = "base_velocity",
-        num_outputs = 45, #25, #31, #27,
         Q_weights = BOWING_Q_weights,
         R_weights = BOWING_R_weights,
-        random_start_time_max = -1.0, #1.0,
         percent_hold_phi = 0.0, #0.05,
     )
 

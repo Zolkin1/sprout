@@ -169,7 +169,7 @@ class Robot:
         if self.use_pd:
             self.pd_control(qpos, qvel)
 
-        return policy.create_obs(
+        obs = policy.create_obs(
             qpos[:7],
             qvel[3:6],
             qpos[7:],
@@ -178,6 +178,11 @@ class Robot:
             self.commanded_vel,
             self.joint_names
         )
+
+        # Log what the policy actually saw (clipped, ramped if max_acc is set).
+        self.commanded_vel = policy.vel_target_b.copy()
+
+        return obs
 
     def get_log_data(self, policy, obs, action):
         """Get data to be logged."""
@@ -274,7 +279,10 @@ class Robot:
         isaac_joint_names = policy.get_joint_names()
 
         # qpos: [base_pos(3), base_quat(4), joint_pos(N)]
-        self.mj_data.qpos[:7] = ic_pos[:7]
+        # Isaac stores quat as (x, y, z, w); MuJoCo expects (w, x, y, z).
+        self.mj_data.qpos[:3] = ic_pos[:3]
+        self.mj_data.qpos[3] = ic_pos[6]
+        self.mj_data.qpos[4:7] = ic_pos[3:6]
         joint_pos_isaac = ic_pos[7:]
         self.mj_data.qpos[7:] = policy.convert_joint_order(
             joint_pos_isaac, isaac_joint_names, self.joint_names
