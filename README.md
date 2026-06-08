@@ -265,3 +265,34 @@ and
       url={https://arxiv.org/abs/2605.01978}, 
 }
 ```
+
+## Branch Overview
+
+Snapshot as of 2026-06-08, after merging `multiskill-stair-slowdown` into `main` (PR #1).
+`ahead`/`behind` are relative to `main`.
+
+| Branch | ahead / behind | Description | Recommendation |
+|---|---|---|---|
+| `multiskill-stair-slowdown` | 0 / 1 | Active multiskill work; superset of the whole multiskill chain. Merged into `main`. | Prune (merged) |
+| `multiskill-terrain-blocks` | 0 / 4 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `multiskill-terrain` | 0 / 8 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `multiskill` | 0 / 33 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `clf-running-opt-sim` | 0 / 153 | Fully merged into `main`. | Prune (merged) |
+| `clf-running` | 1 / 125 | Single unique commit (obelisk readme note) already contained in `demo`. | Prune (redundant) |
+| `dual-cmd` | 3 / 54 | "Dual command" feature v1 + the idempotent-guard bug fix. **Not** in the multiskill line. | Decide — unique work |
+| `clf-analytic` | 4 / 124 | Analytic Vdot, double-integrator, paper plots ("initial submission"). | Keep? (paper-relevant) |
+| `demo` | 7 / 125 | Hardware demo configs (bow / bend-over, state machine). | Keep? (HW demos) |
+| `mlip` | 64 / 441 | Older HW transfer + data-processing code (incl. Talos), 2025-12. | Prune? (old experiment) |
+| `revision` | 7 / 449 | Paper rebuttal/revision code, mechanical cost-of-transport (2025-10/11). | Prune (stale) |
+| `clf-rl` | 3 / 449 | Old CLF-RL work, cleanup/formatting commits (2025-08). | Prune (stale) |
+
+> Already deleted: `spc-rl`, `longtest_real`, `amber5`, `distillation`.
+
+### TODO: prune remaining branches
+
+Not dealing with this right now — revisit and delete the branches that are no longer needed.
+Delete a remote branch with `git push origin --delete <branch>` (then `git fetch --prune`).
+
+- [ ] Prune merged/redundant (zero unique work lost): `multiskill-stair-slowdown`, `multiskill-terrain-blocks`, `multiskill-terrain`, `multiskill`, `clf-running-opt-sim`, `clf-running`
+- [ ] Prune stale: `revision`, `clf-rl`, `mlip`
+- [ ] Review before pruning (have unique commits): `dual-cmd`, `clf-analytic`, `demo`

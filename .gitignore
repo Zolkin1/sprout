@@ -46,6 +46,10 @@ docker/artifacts/
 **/docs/_build/*
 **/generated/*
 
+# Python virtual environments (e.g. the uv-managed IsaacLab venv)
+env_isaaclab/
+*.venv/
+
 # Isaac-Sim packman
 _isaac_sim*
 _repo
