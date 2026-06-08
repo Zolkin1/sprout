@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Distillation analysis: study how teacher and student behave during distillation.
 
 Two stages:

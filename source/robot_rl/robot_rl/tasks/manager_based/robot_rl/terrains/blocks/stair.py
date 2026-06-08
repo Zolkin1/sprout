@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Stair terrain block (ascending or descending in +x)."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Unit tests for the composable terrain-blocks system.
 
 These tests exercise the block geometry, the composite assembler, and the

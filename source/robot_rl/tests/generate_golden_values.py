@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """One-time script to generate golden values for regression tests.
 
 Run: env_isaaclab/bin/python source/robot_rl/tests/generate_golden_values.py

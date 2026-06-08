@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for LibraryManager.
 
 TODO: Delete this file when :mod:`library_manager` is removed.

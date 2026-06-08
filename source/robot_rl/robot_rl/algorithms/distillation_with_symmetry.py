@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Distillation algorithm with sagittal-plane symmetry data augmentation.
 
 Upstream rsl-rl rejects ``symmetry_cfg`` in ``Distillation`` because the frozen

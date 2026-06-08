@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """G1 walking-CLF env variants with a forward-facing depth camera.
 
 Two flavours:

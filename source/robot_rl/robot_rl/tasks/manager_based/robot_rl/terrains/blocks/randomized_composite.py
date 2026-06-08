@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Randomized composite sub-terrain: sample block types and lengths at build."""
 
 from __future__ import annotations

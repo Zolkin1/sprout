@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Slope terrain block (continuous +x ramp)."""
 
 from __future__ import annotations

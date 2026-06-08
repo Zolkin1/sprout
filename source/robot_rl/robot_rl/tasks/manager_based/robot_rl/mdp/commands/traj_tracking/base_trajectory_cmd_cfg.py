@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Shared configuration for trajectory command terms."""
 
 from isaaclab.managers import CommandTermCfg

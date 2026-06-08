@@ -1,3 +1,5 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+
 #include "obelisk_ros_utils.h"
 #include "robot_viz/robot_viz.h"
 

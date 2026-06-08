@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Configuration for :class:`TrajectoryCommand`.
 
 TODO: Delete with :mod:`trajectory_cmd`. Replaced by

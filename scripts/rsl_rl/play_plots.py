@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Modular plot functions for play.py trajectory visualization.
 
 Each plot function has the signature::

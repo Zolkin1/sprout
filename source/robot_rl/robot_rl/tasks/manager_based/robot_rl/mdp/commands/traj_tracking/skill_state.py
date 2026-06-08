@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Per-env state-object containers for the multi-skill command stack.
 
 These tiny dataclass-like helpers consolidate the per-env tensors that

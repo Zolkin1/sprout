@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Abstract base classes for composable terrain blocks."""
 
 from __future__ import annotations

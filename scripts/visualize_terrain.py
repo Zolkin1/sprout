@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Visualize an arbitrary IsaacLab terrain config in Isaac Sim.
 
 Pass any ``TerrainGeneratorCfg`` (or a single ``SubTerrainBaseCfg``) as a

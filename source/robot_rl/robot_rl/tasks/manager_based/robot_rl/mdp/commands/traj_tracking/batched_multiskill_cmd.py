@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Batched multi-skill trajectory command using :class:`MultiSkillManager`."""
 
 from __future__ import annotations

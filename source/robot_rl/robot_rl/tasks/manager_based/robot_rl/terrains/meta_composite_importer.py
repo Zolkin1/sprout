@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Terrain importer for composite sub-terrains.
 
 A composite sub-terrain (see :mod:`...terrains.blocks`) is assembled from an

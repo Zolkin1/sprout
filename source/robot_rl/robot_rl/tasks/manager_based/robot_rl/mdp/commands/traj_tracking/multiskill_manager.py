@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """MultiSkillManager: batched trajectory management across multiple skills.
 
 Replaces the loop-per-trajectory pattern in LibraryManager with fully batched

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Trajectory command that exposes a phasing variable and hold-phi logic.
 
 TODO: Delete this file. Single-skill phase-as-observation path was

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Configuration for :class:`PhasedTrajectoryCommand`.
 
 TODO: Delete with :mod:`phased_trajectory_cmd`. Replaced by

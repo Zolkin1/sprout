@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Composite sub-terrain assembled from an ordered list of terrain blocks."""
 
 from __future__ import annotations

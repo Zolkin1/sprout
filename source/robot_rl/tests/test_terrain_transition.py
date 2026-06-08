@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Tests for the terrain-approach slow-down decision core.
 
 Pure tensor-level tests on :func:`plan_slowdown_step` in

@@ -1,3 +1,5 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+
 #include "rclcpp/rclcpp.hpp"
 
 #include "obelisk_mujoco_sim_robot.h"

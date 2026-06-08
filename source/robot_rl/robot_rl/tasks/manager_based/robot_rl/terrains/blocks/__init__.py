@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Composable terrain blocks for assembling heterogeneous sub-terrains.
 
 A :class:`CompositeSubTerrainCfg` stacks an ordered list of

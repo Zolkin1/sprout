@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Depth-camera noise model: plane tilt + per-pixel noise + Gaussian blur + dropout.
 
 Ported from legged_locomotion_rl. Plugs into IsaacLab's :class:`NoiseModel`

@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Depth-camera randomization events.
 
 Ported from legged_locomotion_rl, adapted to IsaacLab v3.0.0-beta's

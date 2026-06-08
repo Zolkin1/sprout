@@ -1,23 +1,8 @@
-# Robot RL
+# Sprout
 ## :construction: This repo is under active development :construction:
 Since we actively develop on this repo we may push major/breaking changes.
 We do not guarantee any kind of API/environment stability right now, although this could come in the future.
 That being said, we attempt to keep the repo as usable and documented as possible given its developmental status.
-
-## TODO Items for the port
-- Double check/fix everything with the USD. It looks pretty good right now, but still there are some warning.
-- Open IsaacSim and use the tool to visualize the collision geoms and make sure they exist
-- Clean up the paths with the USDs and delete old ones that are no longer in use.
-- Fix the number of self collisions in the USD
-- Consider deleting the old envs that won't be in use anymore (vanilla RL, LIP stuff, the base humanoid env class)
-- Test walking and running
-- Then start the update to new networks w/ RSL-RL 5.0.1
-- Clean up the play script and delete the old train script.
-- Fix self collisions so the reward is active again.
-- Try making the feet collisions square, not circles
-- Check the reset on ref as a good way to verify all the quats and reading in - looks pretty good to me
-- Delete all the unused rewards
-- Update all the transfer stuff to use the new folder structure
 
 ## Overview
 
@@ -265,3 +250,34 @@ and
       url={https://arxiv.org/abs/2605.01978}, 
 }
 ```
+
+## Branch Overview
+
+Snapshot as of 2026-06-08, after merging `multiskill-stair-slowdown` into `main` (PR #1).
+`ahead`/`behind` are relative to `main`.
+
+| Branch | ahead / behind | Description | Recommendation |
+|---|---|---|---|
+| `multiskill-stair-slowdown` | 0 / 1 | Active multiskill work; superset of the whole multiskill chain. Merged into `main`. | Prune (merged) |
+| `multiskill-terrain-blocks` | 0 / 4 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `multiskill-terrain` | 0 / 8 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `multiskill` | 0 / 33 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
+| `clf-running-opt-sim` | 0 / 153 | Fully merged into `main`. | Prune (merged) |
+| `clf-running` | 1 / 125 | Single unique commit (obelisk readme note) already contained in `demo`. | Prune (redundant) |
+| `dual-cmd` | 3 / 54 | "Dual command" feature v1 + the idempotent-guard bug fix. **Not** in the multiskill line. | Decide — unique work |
+| `clf-analytic` | 4 / 124 | Analytic Vdot, double-integrator, paper plots ("initial submission"). | Keep? (paper-relevant) |
+| `demo` | 7 / 125 | Hardware demo configs (bow / bend-over, state machine). | Keep? (HW demos) |
+| `mlip` | 64 / 441 | Older HW transfer + data-processing code (incl. Talos), 2025-12. | Prune? (old experiment) |
+| `revision` | 7 / 449 | Paper rebuttal/revision code, mechanical cost-of-transport (2025-10/11). | Prune (stale) |
+| `clf-rl` | 3 / 449 | Old CLF-RL work, cleanup/formatting commits (2025-08). | Prune (stale) |
+
+> Already deleted: `spc-rl`, `longtest_real`, `amber5`, `distillation`.
+
+### TODO: prune remaining branches
+
+Not dealing with this right now — revisit and delete the branches that are no longer needed.
+Delete a remote branch with `git push origin --delete <branch>` (then `git fetch --prune`).
+
+- [ ] Prune merged/redundant (zero unique work lost): `multiskill-stair-slowdown`, `multiskill-terrain-blocks`, `multiskill-terrain`, `multiskill`, `clf-running-opt-sim`, `clf-running`
+- [ ] Prune stale: `revision`, `clf-rl`, `mlip`
+- [ ] Review before pruning (have unique commits): `dual-cmd`, `clf-analytic`, `demo`

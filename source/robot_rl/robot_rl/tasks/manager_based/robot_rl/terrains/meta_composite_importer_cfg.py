@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Pure-cfg companion to ``meta_composite_importer.py``.
 
 Kept separate so importing this cfg does NOT pull in the runtime importer (and

@@ -1,3 +1,5 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+
 #pragma once
 
 #include "obelisk_viz_robot.h"

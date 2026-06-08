@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 import numpy as np
 
 start = np.array([0., 0., 0.])

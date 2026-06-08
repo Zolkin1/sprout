@@ -1,3 +1,5 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
 """Abstract base class for trajectory command terms.
 
 Holds the manager-agnostic, phase-free shared logic.  Concrete commands
