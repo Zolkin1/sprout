@@ -1,0 +1,308 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""Simulator-free unit tests for the flow-matching subpackage.
+
+Run with: ``pytest source/robot_rl/robot_rl/flow_matching/tests`` inside the
+``env_isaaclab`` venv. All tests use synthetic tensors; no Isaac Sim app needed.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+from isaaclab.utils.math import matrix_from_quat
+
+from robot_rl.flow_matching import (
+    FlowMatchingConfig,
+    FlowMatchingTransformer,
+    Normalizer,
+    build_train_val,
+    episode_windows,
+    flow_matching_loss,
+    matrix_to_rot6d,
+    orientation_slice,
+    quat_to_rot6d,
+    relative_state_from_window,
+    rot6d_to_matrix,
+    rot6d_to_quat,
+    sample_flow_batch,
+    sample_trajectory,
+    state_to_absolute,
+    target_state_dim,
+)
+
+
+def _rand_unit_quat(n: int) -> torch.Tensor:
+    """Random unit quaternions (xyzw), shape (n, 4)."""
+    q = torch.randn(n, 4, dtype=torch.float64)
+    return q / q.norm(dim=-1, keepdim=True)
+
+
+# ---------------------------------------------------------------------------
+# 1. 6D rotation round-trip + Gram-Schmidt orthonormality
+# ---------------------------------------------------------------------------
+def test_rot6d_roundtrip_matrices():
+    torch.manual_seed(0)
+    q = _rand_unit_quat(64)
+    r = matrix_from_quat(q)
+    r2 = rot6d_to_matrix(matrix_to_rot6d(r))
+    assert torch.allclose(r, r2, atol=1e-6)
+    # full quat->6d->quat round trip compared as matrices (avoids double-cover)
+    r3 = matrix_from_quat(rot6d_to_quat(quat_to_rot6d(q)))
+    assert torch.allclose(r, r3, atol=1e-5)
+
+
+def test_rot6d_orthonormal_from_garbage():
+    torch.manual_seed(1)
+    d6 = torch.randn(100, 6, dtype=torch.float64)  # not a valid rotation
+    r = rot6d_to_matrix(d6)
+    eye = torch.eye(3, dtype=torch.float64).expand_as(r)
+    assert torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-6)
+    det = torch.linalg.det(r)
+    assert torch.allclose(det, torch.ones_like(det), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 2. Relative-transform invertibility
+# ---------------------------------------------------------------------------
+def test_relative_state_invertible():
+    torch.manual_seed(2)
+    nj, w = 21, 50
+    p = torch.randn(w, 3, dtype=torch.float64)
+    q = _rand_unit_quat(w)
+    v = torch.randn(w, 3, dtype=torch.float64)
+    om = torch.randn(w, 3, dtype=torch.float64)
+    jp = torch.randn(w, nj, dtype=torch.float64)
+    jv = torch.randn(w, nj, dtype=torch.float64)
+    ref = w // 2
+
+    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
+    assert rel.shape == (w, target_state_dim(nj))
+
+    p_ref = p[ref : ref + 1].expand(w, -1)
+    q_ref = q[ref : ref + 1].expand(w, -1)
+    rec = state_to_absolute(rel, p_ref, q_ref, nj)
+
+    assert torch.allclose(rec["joint_pos"], jp, atol=1e-6)
+    assert torch.allclose(rec["joint_vel"], jv, atol=1e-6)
+    assert torch.allclose(rec["root_pos_w"], p, atol=1e-5)
+    assert torch.allclose(rec["root_lin_vel_w"], v, atol=1e-5)
+    assert torch.allclose(rec["root_ang_vel_w"], om, atol=1e-5)
+    # quaternions compared as matrices (double cover)
+    assert torch.allclose(matrix_from_quat(rec["root_quat_w"]), matrix_from_quat(q), atol=1e-5)
+
+
+def test_relative_state_reference_is_identity():
+    torch.manual_seed(3)
+    nj, w = 21, 10
+    p = torch.randn(w, 3, dtype=torch.float64)
+    q = _rand_unit_quat(w)
+    v = torch.randn(w, 3, dtype=torch.float64)
+    om = torch.randn(w, 3, dtype=torch.float64)
+    jp = torch.randn(w, nj, dtype=torch.float64)
+    jv = torch.randn(w, nj, dtype=torch.float64)
+    ref = 7
+    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
+    o0, o1 = orientation_slice(nj)
+    p_rel = rel[ref, 2 * nj : 2 * nj + 3]
+    ori6d = rel[ref, o0:o1]
+    assert torch.allclose(p_rel, torch.zeros(3, dtype=torch.float64), atol=1e-6)
+    expected_ori = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float64)
+    assert torch.allclose(ori6d, expected_ori, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 3. Velocity reference transform is a pure rotation R_ref^T v_w
+# ---------------------------------------------------------------------------
+def test_velocity_frame_pure_rotation():
+    torch.manual_seed(4)
+    nj, w = 5, 4
+    p = torch.zeros(w, 3, dtype=torch.float64)
+    q = _rand_unit_quat(w)
+    v = torch.randn(w, 3, dtype=torch.float64)
+    om = torch.zeros(w, 3, dtype=torch.float64)
+    jp = torch.zeros(w, nj, dtype=torch.float64)
+    jv = torch.zeros(w, nj, dtype=torch.float64)
+    ref = 0
+    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
+    v_rel = rel[:, 2 * nj + 3 : 2 * nj + 6]
+    r_ref = matrix_from_quat(q[ref : ref + 1].expand(w, -1))  # (w,3,3)
+    expected = (r_ref.transpose(-1, -2) @ v.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(v_rel, expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 4. Normalizer
+# ---------------------------------------------------------------------------
+def test_normalizer_mask_and_inverse():
+    torch.manual_seed(5)
+    d = 10
+    x = torch.randn(2000, d) * 5.0 + 3.0
+    x[:, 4] = 2.0  # constant column -> std clamp, no NaN
+    mask = torch.ones(d, dtype=torch.bool)
+    mask[7:9] = False  # identity dims (pretend orientation block)
+    norm = Normalizer.fit(x, mask)
+    z = norm.normalize(x)
+    # standardized dims ~ mean 0 std 1 (skip the constant col 4)
+    std_dims = [i for i in range(d) if mask[i] and i != 4]
+    assert torch.allclose(z[:, std_dims].mean(0), torch.zeros(len(std_dims)), atol=1e-5)
+    assert torch.allclose(z[:, std_dims].std(0), torch.ones(len(std_dims)), atol=1e-2)
+    # identity dims unchanged
+    assert torch.allclose(z[:, 7:9], x[:, 7:9], atol=1e-6)
+    # invertible, finite
+    assert torch.allclose(norm.denormalize(z), x, atol=1e-4)
+    assert torch.isfinite(z).all()
+
+
+# ---------------------------------------------------------------------------
+# 5. Flow batch math
+# ---------------------------------------------------------------------------
+def test_flow_batch_math():
+    torch.manual_seed(6)
+    x1 = torch.randn(8, 25, 57)
+    x_tau, tau, target_v = sample_flow_batch(x1)
+    assert x_tau.shape == x1.shape and target_v.shape == x1.shape and tau.shape == (8,)
+    # recover x0 and verify the interpolation identity
+    x0 = x1 - target_v
+    t = tau.view(-1, 1, 1)
+    assert torch.allclose(x_tau, (1 - t) * x0 + t * x1, atol=1e-6)
+    assert torch.allclose(target_v, x1 - x0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# 6. Model shapes + full (non-causal) decoder self-attention
+# ---------------------------------------------------------------------------
+def test_model_shapes_and_noncausal():
+    torch.manual_seed(7)
+    b, h, f, din, d = 3, 25, 25, 60, 57
+    model = FlowMatchingTransformer(din, d, h, f, d_model=32, nhead=4,
+                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=64)
+    model.eval()
+    history = torch.randn(b, h, din)
+    memory = model.encode(history)
+    assert memory.shape == (b, h, 32)
+    x_tau = torch.randn(b, f, d)
+    tau = torch.rand(b)
+    with torch.no_grad():
+        v0 = model(x_tau, tau, memory)
+        assert v0.shape == (b, f, d)
+        # perturb future token 0 -> output at token 1 must change (full self-attn)
+        x_pert = x_tau.clone()
+        x_pert[:, 0, :] += 5.0
+        v1 = model(x_pert, tau, memory)
+    assert not torch.allclose(v0[:, 1, :], v1[:, 1, :], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 7. Tiny synthetic training drives the loss down
+# ---------------------------------------------------------------------------
+def test_tiny_training_reduces_loss():
+    torch.manual_seed(8)
+    n, h, f, din, d = 256, 6, 6, 12, 8
+    history = torch.randn(n, h, din)
+    # future is a deterministic linear function of the flattened history
+    w_map = torch.randn(h * din, f * d) * 0.1
+    future = (history.reshape(n, -1) @ w_map).reshape(n, f, d)
+    # standardize future so the N(0,I) prior is well scaled
+    future = (future - future.mean(0)) / future.std(0).clamp_min(1e-6)
+
+    model = FlowMatchingTransformer(din, d, h, f, d_model=64, nhead=4,
+                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    torch.manual_seed(8)
+    init_loss = flow_matching_loss(model, history, future)["loss"].item()
+    for _ in range(300):
+        opt.zero_grad()
+        loss = flow_matching_loss(model, history, future)["loss"]
+        loss.backward()
+        opt.step()
+    final_loss = flow_matching_loss(model, history, future)["loss"].item()
+    assert final_loss < 0.5 * init_loss, f"init={init_loss:.3f} final={final_loss:.3f}"
+
+
+# ---------------------------------------------------------------------------
+# 8. Sampling shape + SO(3) validity
+# ---------------------------------------------------------------------------
+def test_sampling_shape_and_so3():
+    torch.manual_seed(9)
+    b, h, f, din, nj = 4, 25, 25, 60, 21
+    d = target_state_dim(nj)
+    model = FlowMatchingTransformer(din, d, h, f, d_model=32, nhead=4,
+                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=64)
+    model.eval()
+    history = torch.randn(b, h, din)
+    traj = sample_trajectory(model, history, f, d, num_steps=8)
+    assert traj.shape == (b, f, d)
+    o0, o1 = orientation_slice(nj)
+    r = rot6d_to_matrix(traj[..., o0:o1])
+    eye = torch.eye(3).expand_as(r)
+    assert torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 9. Windowing logic
+# ---------------------------------------------------------------------------
+def test_episode_windows_respect_boundaries():
+    # episode 0: steps 0..4 (done on last). episode 1: steps 0..2 (done on last).
+    episode_id = np.array([0, 0, 0, 0, 0, 1, 1, 1], dtype=np.int64)
+    step = np.array([0, 1, 2, 3, 4, 0, 1, 2], dtype=np.int64)
+    done = np.array([0, 0, 0, 0, 1, 0, 0, 1], dtype=np.int64)
+    wins = episode_windows(episode_id, step, done, window_len=3, stride=1)
+    for w in wins:
+        assert len(w) == 3
+        assert len(set(episode_id[w])) == 1            # one episode
+        assert np.all(np.diff(step[w]) == 1)           # consecutive
+        assert np.all(done[w][:-1] == 0)               # no internal done
+    # episode 0 -> 3 windows (starts 0,1,2), episode 1 -> 1 window. Total 4.
+    assert len(wins) == 4
+
+
+# ---------------------------------------------------------------------------
+# Dataset end-to-end build with synthetic recorded-style data
+# ---------------------------------------------------------------------------
+def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150):
+    """Build a synthetic (data, meta) pair shaped like a recorded .npz."""
+    rng = np.random.default_rng(0)
+    n = num_envs * steps
+    # obs layout: velocity_commands(3), height_scan(scan_dim), joint_pos(nj)
+    obs_term_names = ["velocity_commands", "height_scan", "joint_pos"]
+    obs_term_dims = [3, scan_dim, nj]
+    obs = rng.standard_normal((n, sum(obs_term_dims))).astype(np.float32)
+    # state layout matches the recorder
+    state_term_names = ["root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel"]
+    state_term_dims = [3, 4, 3, 3, nj, nj]
+    state = rng.standard_normal((n, sum(state_term_dims))).astype(np.float32)
+    # normalize the quaternion block to unit length
+    q = state[:, 3:7]
+    state[:, 3:7] = q / np.linalg.norm(q, axis=1, keepdims=True)
+    # episode_id / step_in_episode: one episode per env, steps 0..steps-1
+    episode_id = np.repeat(np.arange(num_envs), steps).astype(np.int64)
+    step_in_episode = np.tile(np.arange(steps), num_envs).astype(np.int64)
+    done = (step_in_episode == steps - 1).astype(np.uint8)
+    data = {
+        "obs": obs, "state": state, "episode_id": episode_id,
+        "step_in_episode": step_in_episode, "done": done,
+    }
+    meta = SimpleNamespace(
+        obs_term_names=obs_term_names, obs_term_dims=obs_term_dims,
+        state_term_names=state_term_names, state_term_dims=state_term_dims,
+    )
+    return data, meta
+
+
+def test_dataset_build_shapes():
+    # episodes must be at least history_len + future_len (= 50) long to yield windows
+    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=150)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0)
+    train_ds, val_ds = build_train_val(data, meta, cfg)
+    assert cfg.state_dim == target_state_dim(21)         # 57
+    assert cfg.history_in_dim == 57 + 3 + 150            # state + vel_cmd + height_scan
+    sample = train_ds[0]
+    assert sample["history"].shape == (25, cfg.history_in_dim)
+    assert sample["future"].shape == (25, 57)
+    assert sample["p_ref"].shape == (3,) and sample["q_ref"].shape == (4,)
+    assert val_ds is not None and len(val_ds) > 0
+    # episode-disjoint split
+    # (rebuild windows to map back is overkill; rely on build_train_val's split-by-episode)
