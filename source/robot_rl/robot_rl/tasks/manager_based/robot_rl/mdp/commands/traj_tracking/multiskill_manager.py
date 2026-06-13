@@ -74,6 +74,15 @@ _FULL_PERIODIC_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.FULL_PERIODIC]
 _EPISODIC_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.EPISODIC]
 _PERPETUAL_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.PERPETUAL]
 
+# Terrain-dim matching tolerances (width, height, length — same ordering as
+# the trajectory conditioner's terrain columns) for the per-env trajectory
+# filter (see :meth:`MultiSkillManager._terrain_dim_allowed`).  Heights are
+# exact in both the library and the terrain; lengths absorb the legacy stair
+# generator's tile-to-cell depth rescale while staying far below the
+# library's grid spacing.  Width is currently always unconstrained (NaN from
+# the terrain query) so its tolerance is a placeholder.
+_TERRAIN_DIM_TOLS = (0.010, 0.005, 0.010)
+
 
 # ---------------------------------------------------------------------------
 # MultiSkillManager
@@ -235,6 +244,16 @@ class MultiSkillManager(ManagerBase):
         # owning command via :meth:`set_forced_traj_latch`; ``None`` means no
         # override is ever applied.
         self._forced_traj_latch: Any = None
+        # Optional terrain lookup ``fn(xy_w) -> (dims[N, 3], valid[N])``
+        # returning the (width, height, length) of the terrain feature at
+        # each world xy (NaN = dimension unconstrained).  Registered via
+        # :meth:`set_terrain_dim_lookup`; ``None`` (default) disables the
+        # terrain-dim selection filter (offline / flat-only / test usage).
+        self._terrain_dims_at: Any = None
+        self._terrain_dim_tols = torch.tensor(
+            _TERRAIN_DIM_TOLS, dtype=torch.float32, device=self.device,
+        )
+        self._warned_dim_fallback: bool = False
 
         # --- Pre-compute binomial coefficients for Bezier evaluation -------
         self._binomial_coeffs: dict[int, Tensor] = {}
@@ -472,6 +491,13 @@ class MultiSkillManager(ManagerBase):
         # Flat trajectories use -1 as a sentinel for terrain dimensions.
         terrain_dims = self._global_conditioning[:, 3:]  # [T, 3]
         self._terrain_mask = (terrain_dims > 0).any(dim=1)  # [T]
+
+        # Per-skill terrain flag, indexed by the manager's (traj) skill idx.
+        # Used to decide which envs need the terrain-dim filter in
+        # ``_terrain_dim_allowed``.
+        self._skill_has_terrain = torch.tensor(
+            [s.has_terrain for s in self.skills], dtype=torch.bool, device=self.device,
+        )  # [num_skills]
 
     # ------------------------------------------------------------------
     # Output ordering (called by TrajectoryCommand after construction)
@@ -739,6 +765,115 @@ class MultiSkillManager(ManagerBase):
         """
         self._forced_traj_latch = latch
 
+    def set_terrain_dim_lookup(self, fn: Any) -> None:
+        """Register the terrain's per-point terrain-dimension query.
+
+        ``fn(xy_w) -> (dims, valid)`` where ``dims`` is ``[N, 3]`` holding
+        the terrain feature's ``(width, height, length)`` at each world xy —
+        same ordering as the trajectory conditioner's terrain columns — and
+        ``valid`` is ``[N]`` bool (False where the cell has no terrain
+        feature).  A NaN entry in ``dims`` marks that dimension as
+        unconstrained (it never participates in matching).  Typically
+        ``MetaCompositeTerrainImporter.terrain_dims_at``.  ``None`` (the
+        default) disables the terrain-dim selection filter.
+        """
+        self._terrain_dims_at = fn
+
+    def _terrain_dim_allowed(
+        self, anchor_xy: Tensor, env_traj_skill_ids: Tensor
+    ) -> Tensor | None:
+        """Per-env trajectory mask from the terrain dimensions under the anchor.
+
+        For envs whose skill has terrain trajectories AND whose anchor cell
+        has a terrain feature, only trajectories whose conditioner
+        ``(terrain_width, terrain_height, terrain_length)`` matches the
+        feature's dims pass — per dimension, within ``_TERRAIN_DIM_TOLS``,
+        with NaN terrain dims unconstrained.  All other envs pass every
+        trajectory (the skill mask alone applies).
+
+        The length tolerance absorbs the legacy stair generator's depth
+        rescale (``step_depth = size_x / round(size_x / nominal)``, ≤ ~2 mm
+        off nominal) while staying far below the library's 0.04 m grid step.
+
+        Args:
+            anchor_xy: ``[N, 2]`` world xy used to resolve each env's
+                terrain feature.
+            env_traj_skill_ids: ``[N]`` skill indices in the manager's
+                (trajectory) skill index space.
+
+        Returns:
+            ``[N, T]`` bool mask, or ``None`` when no lookup is registered.
+        """
+        if self._terrain_dims_at is None:
+            return None
+        dims, valid = self._terrain_dims_at(anchor_xy)           # [N, 3], [N]
+        needs_dims = self._skill_has_terrain[env_traj_skill_ids] & valid  # [N]
+        # Conditioning columns (see ConditionerData.to_continuous_tensor):
+        # [vx, vy, vyaw, terrain_width, terrain_height, terrain_length].
+        traj_dims = self._global_conditioning[:, 3:6].unsqueeze(0)   # [1, T, 3]
+        tols = self._terrain_dim_tols                                # [3]
+        # NaN terrain dims compare False against any tolerance, so the
+        # explicit isnan() OR is what marks them unconstrained.
+        per_dim_ok = (
+            ((traj_dims - dims.unsqueeze(1)).abs() <= tols)
+            | dims.isnan().unsqueeze(1)
+        )                                                            # [N, T, 3]
+        dim_ok = per_dim_ok.all(dim=-1)                              # [N, T]
+        return torch.where(needs_dims.unsqueeze(1), dim_ok, torch.ones_like(dim_ok))
+
+    def _apply_terrain_dim_filter(
+        self, allowed: Tensor, anchor_xy: Tensor, env_traj_skill_ids: Tensor
+    ) -> Tensor:
+        """Intersect the skill mask with the terrain-dim mask, with fallback.
+
+        Rows where the intersection is empty (the feature's dimensions
+        aren't represented in the library) fall back to the skill-only mask
+        — an all-masked row would otherwise make ``argmin`` silently return
+        trajectory 0 of the wrong skill.  Warns once when that happens.
+
+        Args:
+            allowed: ``[N, T]`` skill-eligibility mask.
+            anchor_xy: ``[N, 2]`` world xy terrain anchor per env.
+            env_traj_skill_ids: ``[N]`` manager-space skill indices.
+
+        Returns:
+            ``[N, T]`` refined mask.
+        """
+        dim_mask = self._terrain_dim_allowed(anchor_xy, env_traj_skill_ids)
+        if dim_mask is None:
+            return allowed
+        refined = allowed & dim_mask
+        has_candidate = refined.any(dim=1)
+        if not bool(has_candidate.all()) and not self._warned_dim_fallback:
+            print(
+                "[WARN] MultiSkillManager: some envs sit on a terrain feature "
+                "whose (width, height, length) has no matching trajectory in "
+                "the library — falling back to skill-only selection for those "
+                "envs. Check that the terrain's feature dimensions (e.g. stair "
+                "step_dim_options) were derived from this trajectory library."
+            )
+            self._warned_dim_fallback = True
+        return torch.where(has_candidate.unsqueeze(1), refined, allowed)
+
+    def _selection_anchor_xy(self, env_ids: Tensor | None) -> Tensor:
+        """World xy used to resolve each env's terrain feature during selection.
+
+        Uses the owner's ``ref_poses`` (latest in-contact stance reference,
+        snapped to the stair tread for terrain-aware skills) — stable across
+        per-step pelvis jitter and the same anchor the velocity command uses
+        for its cell lookups.
+
+        Args:
+            env_ids: Optional env subset.
+
+        Returns:
+            ``[N, 2]`` world xy.
+        """
+        anchor_xy = self._skill_owner.ref_poses[:, :2]
+        if env_ids is not None:
+            anchor_xy = anchor_xy[env_ids]
+        return anchor_xy
+
     def _select_trajectories(
         self,
         conditioner: Tensor,
@@ -754,8 +889,10 @@ class MultiSkillManager(ManagerBase):
 
         Args:
             conditioner: ``(N, C)`` conditioning vectors. Only the first three
-                dims (vel_x, vel_y, vel_yaw) participate in matching now —
-                skill replaces the legacy terrain-dim filter.
+                dims (vel_x, vel_y, vel_yaw) participate in the distance;
+                the skill mask plus the terrain-dim filter (when a terrain
+                lookup is registered — see :meth:`set_terrain_dim_lookup`)
+                replace the legacy terrain-dim distance.
             env_ids: Optional env subset matching ``conditioner``'s rows. When
                 provided, the owner's ``skill_id`` is sliced the same way so
                 row counts stay aligned (callers like ``reset_on_reference``
@@ -785,6 +922,13 @@ class MultiSkillManager(ManagerBase):
         vel_dists = torch.cdist(vel_cmd, vel_global)           # (N, T)
 
         allowed = self._traj_skill_idx.unsqueeze(0) == env_traj_skill_ids.unsqueeze(1)
+        # Terrain-aware skills additionally match the terrain dimensions of
+        # the feature under the stance reference (no-op when no lookup is
+        # registered).
+        if self._terrain_dims_at is not None:
+            allowed = self._apply_terrain_dim_filter(
+                allowed, self._selection_anchor_xy(env_ids), env_traj_skill_ids,
+            )
         vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
 
         selected = vel_dists.argmin(dim=1)
@@ -810,6 +954,7 @@ class MultiSkillManager(ManagerBase):
 
     def nearest_traj_in_skill(
         self, owner_skill_ids: Tensor, env_ids: Tensor,
+        anchor_xy: Tensor | None = None,
     ) -> Tensor:
         """Nearest trajectory (by velocity) within an *arbitrary* skill.
 
@@ -825,6 +970,11 @@ class MultiSkillManager(ManagerBase):
                 (terrain ``skill_list``) index space.
             env_ids: ``[K]`` env indices, aligned to ``owner_skill_ids``,
                 used to read each env's velocity conditioner.
+            anchor_xy: Optional ``[K, 2]`` world xy used to resolve the
+                terrain feature for the terrain-dim filter.  Defaults to the
+                owner's stance reference; the approach planner passes the
+                just-landed stance foot instead (``ref_poses`` is stale at
+                gate-fire time).
 
         Returns:
             ``[K]`` global trajectory indices.
@@ -836,6 +986,10 @@ class MultiSkillManager(ManagerBase):
         vel_dists = torch.cdist(vel_cmd, vel_global)                # (K, T)
         traj_skill_ids = self._vel_skill_to_traj_skill[owner_skill_ids]  # (K,)
         allowed = self._traj_skill_idx.unsqueeze(0) == traj_skill_ids.unsqueeze(1)
+        if self._terrain_dims_at is not None:
+            if anchor_xy is None:
+                anchor_xy = self._selection_anchor_xy(env_ids)
+            allowed = self._apply_terrain_dim_filter(allowed, anchor_xy, traj_skill_ids)
         vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
         return vel_dists.argmin(dim=1)
 

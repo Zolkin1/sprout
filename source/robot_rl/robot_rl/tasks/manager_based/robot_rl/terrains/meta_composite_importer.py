@@ -25,7 +25,7 @@ generator can mix legacy and composite sub-terrains in the same
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
@@ -35,11 +35,58 @@ import isaaclab.sim as sim_utils
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 from .meta_terrain_importer import MetaTerrainImporter
+from .velocity_guidance_cfg import GUIDANCE_MODE_END_OF_BLOCK, KNOWN_GUIDANCE_MODES
 
 if TYPE_CHECKING:
     from .meta_composite_importer_cfg import MetaCompositeTerrainImporterCfg
 
 _SKILL_PROBS_TOL = 1e-5
+
+
+class VelocityGuidanceQuery(NamedTuple):
+    """Per-point velocity guidance returned by ``velocity_guidance_at``.
+
+    All tensors share the query's leading shape ``[N]``.  Where ``active``
+    is False the remaining fields are meaningless (the block declares no
+    guidance) and the velocity command keeps its sampled behavior.
+    """
+
+    active: torch.Tensor
+    """[N] bool — block declares velocity guidance."""
+    target_w: torch.Tensor
+    """[N, 2] world-frame guidance target (block exit-edge midpoint)."""
+    yaw: torch.Tensor
+    """[N] world-frame heading target (the block's travel direction)."""
+    lin_vel_y: torch.Tensor
+    """[N, 2] (min, max) clamp on the lateral PD output."""
+    ang_vel_z: torch.Tensor
+    """[N, 2] (min, max) clamp on the yaw PD output."""
+    gains: torch.Tensor
+    """[N, 3] PD gains (y_kp, y_kd, heading_kp)."""
+
+
+def _guidance_target_end_of_block(b: dict) -> tuple[float, float, float]:
+    """``end_of_block`` target: midpoint of the block's exit edge.
+
+    Args:
+        b: Normalised per-block metadata dict.
+
+    Returns:
+        ``(target_x, target_y, yaw)`` in sub-terrain-local coordinates —
+        the walkable-plate y center at ``aabb_xmax``, facing the block's
+        travel direction (+x).
+    """
+    aabb = b["aabb"]
+    walkable = b.get("walkable_aabb", aabb)
+    return float(aabb[1]), 0.5 * (float(walkable[2]) + float(walkable[3])), 0.0
+
+
+# Guidance-mode registry: mode key -> target builder.  Future terrain types
+# register their own target construction here without touching the velocity
+# command's consumption path.
+_GUIDANCE_TARGET_BUILDERS = {
+    GUIDANCE_MODE_END_OF_BLOCK: _guidance_target_end_of_block,
+}
 
 _FLAT_OUTLINE_COLOR: tuple[float, float, float] = (0.20, 0.80, 0.30)
 _STAIR_OUTLINE_COLOR: tuple[float, float, float] = (0.95, 0.55, 0.15)
@@ -156,6 +203,28 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
         self._block_exit_z = torch.zeros(
             (nrows, ncols, max_blocks), dtype=torch.float, device=self.device
         )
+        # Per-block velocity guidance (see ``velocity_guidance_cfg``): target
+        # point + heading in sub-terrain-local coords, PD output clamps, and
+        # PD gains.  ``active`` False (the default) keeps the velocity
+        # command's sampled behavior for envs on that block.
+        self._block_guidance_active = torch.zeros(
+            (nrows, ncols, max_blocks), dtype=torch.bool, device=self.device
+        )
+        self._block_guidance_target = torch.zeros(
+            (nrows, ncols, max_blocks, 2), dtype=torch.float, device=self.device
+        )
+        self._block_guidance_yaw = torch.zeros(
+            (nrows, ncols, max_blocks), dtype=torch.float, device=self.device
+        )
+        self._block_guidance_vy_range = torch.zeros(
+            (nrows, ncols, max_blocks, 2), dtype=torch.float, device=self.device
+        )
+        self._block_guidance_wz_range = torch.zeros(
+            (nrows, ncols, max_blocks, 2), dtype=torch.float, device=self.device
+        )
+        self._block_guidance_gains = torch.zeros(
+            (nrows, ncols, max_blocks, 3), dtype=torch.float, device=self.device
+        )
 
         self._stair_span_xrange = torch.empty(
             (nrows, ncols, max_spans, 2), dtype=torch.float, device=self.device
@@ -175,6 +244,11 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
         )
         self._stair_span_end_plat_xmin[...] = float("inf")
         self._stair_span_step_depth = torch.ones(
+            (nrows, ncols, max_spans), dtype=torch.float, device=self.device
+        )
+        # Step rise per span — paired with ``_stair_span_step_depth`` for the
+        # terrain-aware trajectory filter (``terrain_dims_at``).
+        self._stair_span_step_height = torch.zeros(
             (nrows, ncols, max_spans), dtype=torch.float, device=self.device
         )
         self._stair_span_num_steps = torch.ones(
@@ -240,6 +314,7 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
             "is_stair": is_stair_cell,
             "stair_top_centers": self._stair_span_centers,
             "stair_step_depths": self._stair_span_step_depth,
+            "stair_step_heights": self._stair_span_step_height,
             "stair_num_steps": self._stair_span_num_steps,
             "stair_span_valid": self._stair_span_valid,
         }
@@ -265,6 +340,7 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
             "exit_z": 0.0,
             "extras": extras,
             "block_type": "LegacyStair" if is_stair else "LegacyFlat",
+            "velocity_guidance": md.get("velocity_guidance"),
         }
 
     def _fill_block(self, r: int, c: int, b_idx: int, b: dict) -> None:
@@ -288,6 +364,28 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
         self._block_needs_dir_cmd[r, c, b_idx] = bool(b["needs_directional_cmd"])
         self._block_entry_z[r, c, b_idx] = float(b.get("entry_z", 0.0))
         self._block_exit_z[r, c, b_idx] = float(b.get("exit_z", 0.0))
+
+        guidance = b.get("velocity_guidance")
+        if guidance is not None:
+            builder = _GUIDANCE_TARGET_BUILDERS.get(guidance.mode)
+            if builder is None:
+                raise ValueError(
+                    f"Block ({r}, {c})[{b_idx}] declares unknown velocity-"
+                    f"guidance mode '{guidance.mode}'. "
+                    f"Known modes: {list(KNOWN_GUIDANCE_MODES)}."
+                )
+            target_x, target_y, yaw = builder(b)
+            self._block_guidance_active[r, c, b_idx] = True
+            self._block_guidance_target[r, c, b_idx, 0] = target_x
+            self._block_guidance_target[r, c, b_idx, 1] = target_y
+            self._block_guidance_yaw[r, c, b_idx] = yaw
+            self._block_guidance_vy_range[r, c, b_idx, 0] = float(guidance.lin_vel_y[0])
+            self._block_guidance_vy_range[r, c, b_idx, 1] = float(guidance.lin_vel_y[1])
+            self._block_guidance_wz_range[r, c, b_idx, 0] = float(guidance.ang_vel_z[0])
+            self._block_guidance_wz_range[r, c, b_idx, 1] = float(guidance.ang_vel_z[1])
+            self._block_guidance_gains[r, c, b_idx, 0] = float(guidance.y_kp)
+            self._block_guidance_gains[r, c, b_idx, 1] = float(guidance.y_kd)
+            self._block_guidance_gains[r, c, b_idx, 2] = float(guidance.heading_kp)
 
         sp = b["skill_probs"]
         if not sp:
@@ -331,6 +429,9 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
             extras.get("end_platform_xmin", block_xmax)
         )
         self._stair_span_step_depth[r, c, span_idx] = step_depth
+        self._stair_span_step_height[r, c, span_idx] = float(
+            extras["stair_dimension"][0]
+        )
         self._stair_span_num_steps[r, c, span_idx] = ns
         self._stair_span_centers[r, c, span_idx, :ns] = centers
         # Connecting-ground z (composer-threaded). Falls back to the first
@@ -360,6 +461,30 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
             the cell) the result is the zero vector.
         """
         rows, cols, local_x, local_y = self._cell_and_local(xy_w)
+        block_idx = self._block_index_at(rows, cols, local_x, local_y)
+        return self._block_skill_probs[rows, cols, block_idx]
+
+    def _block_index_at(
+        self,
+        rows: torch.Tensor,
+        cols: torch.Tensor,
+        local_x: torch.Tensor,
+        local_y: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve the block index containing each sub-terrain-local point.
+
+        Points outside every block AABB (impossible in v1 — the linear
+        layout fills the cell) resolve to index 0.
+
+        Args:
+            rows: Cell row index per point.
+            cols: Cell column index per point.
+            local_x: Sub-terrain-local x per point.
+            local_y: Sub-terrain-local y per point.
+
+        Returns:
+            Block indices with the input's leading shape.
+        """
         aabbs = self._block_aabbs[rows, cols]  # (..., max_blocks, 4)
         hit = (
             (local_x.unsqueeze(-1) >= aabbs[..., 0])
@@ -367,12 +492,135 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
             & (local_y.unsqueeze(-1) >= aabbs[..., 2])
             & (local_y.unsqueeze(-1) < aabbs[..., 3])
         )
-        block_idx = hit.float().argmax(dim=-1)
-        return self._block_skill_probs[rows, cols, block_idx]
+        return hit.float().argmax(dim=-1)
+
+    def velocity_guidance_at(self, xy_w: torch.Tensor) -> VelocityGuidanceQuery:
+        """Per-point velocity guidance of the containing block.
+
+        Blocks that declare ``velocity_guidance`` steer envs toward a
+        block-derived target (e.g. the exit-edge midpoint) instead of
+        receiving randomly-sampled lateral / yaw commands.  The multiskill
+        velocity command calls this every step at the robots' positions, so
+        the target hops automatically as an env crosses block boundaries.
+
+        Args:
+            xy_w: World ``(x, y)`` positions with last dimension 2 and
+                arbitrary leading shape.
+
+        Returns:
+            A :class:`VelocityGuidanceQuery`; entries where ``active`` is
+            False carry meaningless values and must be ignored.
+        """
+        rows, cols, local_x, local_y = self._cell_and_local(xy_w)
+        block_idx = self._block_index_at(rows, cols, local_x, local_y)
+
+        target_local = self._block_guidance_target[rows, cols, block_idx]  # (..., 2)
+        size_x = float(self.cfg.terrain_generator.size[0])
+        size_y = float(self.cfg.terrain_generator.size[1])
+        nrows, ncols = self.terrain_origins.shape[:2]
+        offset_x = rows.to(target_local.dtype) * size_x - nrows * size_x / 2.0
+        offset_y = cols.to(target_local.dtype) * size_y - ncols * size_y / 2.0
+        target_w = torch.stack(
+            [target_local[..., 0] + offset_x, target_local[..., 1] + offset_y],
+            dim=-1,
+        )
+
+        return VelocityGuidanceQuery(
+            active=self._block_guidance_active[rows, cols, block_idx],
+            target_w=target_w,
+            yaw=self._block_guidance_yaw[rows, cols, block_idx],
+            lin_vel_y=self._block_guidance_vy_range[rows, cols, block_idx],
+            ang_vel_z=self._block_guidance_wz_range[rows, cols, block_idx],
+            gains=self._block_guidance_gains[rows, cols, block_idx],
+        )
 
     def eligible_skills_at(self, xy_w: torch.Tensor) -> torch.Tensor:
         """Return a bool mask of skills with non-zero probability at each point."""
         return self.skill_probs_at(xy_w) > 0.0
+
+    def terrain_dims_at(self, xy_w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-point terrain dimensions of the containing/nearest feature.
+
+        Used by the trajectory manager to restrict terrain-aware trajectory
+        selection to trajectories optimized for the terrain geometry the env
+        is on (or approaching).  The returned dims mirror the trajectory
+        conditioner's terrain columns ``[terrain_width, terrain_height,
+        terrain_length]``; a NaN entry means that dimension is unconstrained
+        by the terrain and must not participate in matching.
+
+        Currently the only terrain feature is the stair span: ``height`` is
+        the step rise, ``length`` the step depth, and ``width`` is NaN (the
+        terrain randomizes stair width independently of the library).
+        Points outside any span resolve to the nearest span in their cell.
+        Future terrain-aware features (gaps, platforms, …) extend this query
+        with their own dims.
+
+        Args:
+            xy_w: World ``(x, y)`` positions with last dimension 2 and
+                arbitrary leading shape.
+
+        Returns:
+            Tuple ``(dims, valid)`` where ``dims`` has shape
+            ``xy_w.shape[:-1] + (3,)`` holding ``[width, height, length]``
+            and ``valid`` has shape ``xy_w.shape[:-1]`` — False where the
+            cell has no terrain feature (``dims`` is meaningless there).
+        """
+        rows, cols, local_x, _ = self._cell_and_local(xy_w)
+        span_idx, _, cell_has_stair = self._resolve_span(rows, cols, local_x)
+        height = self._stair_span_step_height[rows, cols, span_idx]
+        dims = torch.stack(
+            [
+                torch.full_like(height, float("nan")),  # width: unconstrained
+                height,
+                self._stair_span_step_depth[rows, cols, span_idx],
+            ],
+            dim=-1,
+        )
+        return dims, cell_has_stair
+
+    def _resolve_span(
+        self, rows: torch.Tensor, cols: torch.Tensor, local_x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Resolve the stair span for sub-terrain-local x positions.
+
+        In-span points use their containing span; outside points use the
+        nearest valid span by ``|local_x − span_center|``.  Invalid spans get
+        +inf distance so they're never chosen.  For cells with no valid span
+        at all the index is arbitrary (all +inf) — callers must gate on the
+        returned ``cell_has_stair``.
+
+        Args:
+            rows: Cell row index per point.
+            cols: Cell column index per point.
+            local_x: Sub-terrain-local x per point.
+
+        Returns:
+            Tuple ``(span_idx, in_span, cell_has_stair)`` aligned to the
+            input shape — the chosen span index, whether the point lies
+            inside that span's xrange, and whether the cell has any span.
+        """
+        spans = self._stair_span_xrange[rows, cols]      # (N, max_spans, 2)
+        valid = self._stair_span_valid[rows, cols]        # (N, max_spans)
+        in_span = (
+            (local_x.unsqueeze(-1) >= spans[..., 0])
+            & (local_x.unsqueeze(-1) < spans[..., 1])
+            & valid
+        )
+        has_hit = in_span.any(dim=-1)
+        cell_has_stair = valid.any(dim=-1)
+        in_span_idx = in_span.float().argmax(dim=-1)
+
+        span_centers = 0.5 * (spans[..., 0] + spans[..., 1])
+        span_dist = (local_x.unsqueeze(-1) - span_centers).abs()
+        span_dist = torch.where(
+            valid, span_dist, torch.full_like(span_dist, float("inf"))
+        )
+        nearest_span_idx = span_dist.argmin(dim=-1)
+
+        # Unified span_idx: in-span points use the span they're inside;
+        # outside-span points use the nearest span.
+        span_idx = torch.where(has_hit, in_span_idx, nearest_span_idx)
+        return span_idx, has_hit, cell_has_stair
 
     def _project_world(self, points: torch.Tensor) -> torch.Tensor:
         """Project a batch of world foot poses ``(x, y, z)`` to stair ``(x, y, z)``.
@@ -418,32 +666,7 @@ class MetaCompositeTerrainImporter(MetaTerrainImporter):
         size_y = float(self.cfg.terrain_generator.size[1])
         nrows, ncols = self.terrain_origins.shape[:2]
 
-        spans = self._stair_span_xrange[rows, cols]      # (N, max_spans, 2)
-        valid = self._stair_span_valid[rows, cols]        # (N, max_spans)
-        in_span = (
-            (local_x.unsqueeze(-1) >= spans[..., 0])
-            & (local_x.unsqueeze(-1) < spans[..., 1])
-            & valid
-        )
-        has_hit = in_span.any(dim=-1)
-        cell_has_stair = valid.any(dim=-1)
-        in_span_idx = in_span.float().argmax(dim=-1)
-
-        # For points outside any span, pick the nearest valid span by
-        # ``|local_x − span_center|``.  Invalid spans get +inf distance so
-        # they're never chosen.  For cells with no valid span at all the
-        # argmin is arbitrary (all +inf), but those points are routed
-        # through the passthrough branch below regardless.
-        span_centers = 0.5 * (spans[..., 0] + spans[..., 1])
-        span_dist = (local_x.unsqueeze(-1) - span_centers).abs()
-        span_dist = torch.where(
-            valid, span_dist, torch.full_like(span_dist, float("inf"))
-        )
-        nearest_span_idx = span_dist.argmin(dim=-1)
-
-        # Unified span_idx: in-span points use the span they're inside;
-        # outside-span points use the nearest span.
-        span_idx = torch.where(has_hit, in_span_idx, nearest_span_idx)
+        span_idx, has_hit, cell_has_stair = self._resolve_span(rows, cols, local_x)
 
         step_depth = self._stair_span_step_depth[rows, cols, span_idx].clamp_min(1e-6)
         num_steps = self._stair_span_num_steps[rows, cols, span_idx]

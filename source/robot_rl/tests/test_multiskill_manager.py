@@ -31,22 +31,34 @@ class _StubSkillOwner:
     """Minimal owner exposing ``skill_id`` and ``_skill_list`` for the
     manager's owner-based skill filter.  Tests that build a manager
     directly (without a trajectory cmd) attach one of these so
-    ``_select_trajectories`` can run.
+    ``_select_trajectories`` can run.  ``ref_poses`` is only needed when a
+    stair-dim lookup is registered (it anchors the span query).
     """
 
-    def __init__(self, skill_id: torch.Tensor, skill_list: list[str]):
+    def __init__(
+        self,
+        skill_id: torch.Tensor,
+        skill_list: list[str],
+        ref_poses: torch.Tensor | None = None,
+    ):
         self.skill_id = skill_id
         self._skill_list = skill_list
+        if ref_poses is not None:
+            self.ref_poses = ref_poses
 
 
-def _attach_stub_owner(msm: MultiSkillManager, skill_id_per_env: torch.Tensor) -> None:
+def _attach_stub_owner(
+    msm: MultiSkillManager,
+    skill_id_per_env: torch.Tensor,
+    ref_poses: torch.Tensor | None = None,
+) -> None:
     """Register a stub skill owner whose ``_skill_list`` matches the
     manager's loaded skills in declaration order."""
     skill_list = sorted(
         msm.skill_name_to_idx.keys(),
         key=lambda n: msm.skill_name_to_idx[n],
     )
-    msm.set_skill_owner(_StubSkillOwner(skill_id_per_env, skill_list))
+    msm.set_skill_owner(_StubSkillOwner(skill_id_per_env, skill_list, ref_poses))
 
 
 # ---------------------------------------------------------------------------
@@ -1020,3 +1032,245 @@ class TestGateState:
             f"snap_phase_to_end_of_previous_domain landed in domain "
             f"{post.item()}; expected {old_domain.item()}."
         )
+
+
+
+# ---------------------------------------------------------------------------
+# Terrain-dim filter
+# ---------------------------------------------------------------------------
+
+# Stair geometry grid baked into the synthetic stair skill below, as
+# (terrain_height, terrain_length) = (step rise, step depth).
+_DIMS_A = (0.10, 0.20)
+_DIMS_B = (0.14, 0.24)
+# terrain_width written into every synthetic stair conditioner.
+_TRAJ_WIDTH = 0.8
+
+_NAN = float("nan")
+
+
+def _dims3(hl: tuple[float, float], width: float = _NAN) -> list[float]:
+    """Terrain-dim row ``[width, height, length]`` for a (height, length)
+    pair — conditioner column ordering, width unconstrained by default."""
+    return [width, hl[0], hl[1]]
+
+
+@pytest.fixture(scope="module")
+def multiskill_with_stairs(tmp_path_factory) -> MultiSkillManager:
+    """Two-skill manager: flat 'walk' + 'stairs' with two stair geometries.
+
+    Built from the walking test YAML with the conditioner rewritten to the
+    new dict format.  The stairs skill covers two velocities per geometry so
+    the tests can check velocity-nearest within a dim-matched subset.
+    """
+    import yaml
+
+    root = tmp_path_factory.mktemp("terrain_dim_library")
+    with open(WALKING_YAML, "r") as f:
+        base = yaml.safe_load(f)
+
+    walk_dir = root / "walk"
+    stairs_dir = root / "stairs"
+    walk_dir.mkdir()
+    stairs_dir.mkdir()
+
+    def _write(folder, name, conditioner):
+        data = dict(base)
+        data["conditioner"] = conditioner
+        with open(folder / name, "w") as f:
+            yaml.safe_dump(data, f)
+
+    _write(walk_dir, "walk_50.yaml", {"terrain": "flat", "vel_x": 0.5, "vel_y": 0.0, "vel_yaw": 0.0})
+    _write(walk_dir, "walk_100.yaml", {"terrain": "flat", "vel_x": 1.0, "vel_y": 0.0, "vel_yaw": 0.0})
+    for (h, l) in (_DIMS_A, _DIMS_B):
+        for vx in (0.4, 0.8):
+            _write(
+                stairs_dir,
+                f"stairs_h{h}_l{l}_v{vx}.yaml",
+                {
+                    "terrain": "stairs",
+                    "terrain_height": h,
+                    "terrain_length": l,
+                    "terrain_width": _TRAJ_WIDTH,
+                    "vel_x": vx,
+                    "vel_y": 0.0,
+                    "vel_yaw": 0.0,
+                },
+            )
+
+    return MultiSkillManager(path=str(root), device=DEVICE)
+
+
+def _make_dim_lookup(dims_per_env: torch.Tensor, valid_per_env: torch.Tensor):
+    """Fake ``terrain.terrain_dims_at`` returning fixed per-env values."""
+
+    def lookup(xy_w: torch.Tensor):
+        assert xy_w.shape[-1] == 2
+        return dims_per_env, valid_per_env
+
+    return lookup
+
+
+class TestTerrainDimFilter:
+    def _skill_indices(self, msm: MultiSkillManager) -> tuple[int, int]:
+        return msm.skill_name_to_idx["stairs"], msm.skill_name_to_idx["walk"]
+
+    def _traj_hl(self, msm: MultiSkillManager) -> torch.Tensor:
+        """Per-trajectory (terrain_height, terrain_length) columns."""
+        return msm._global_conditioning[:, 4:6]
+
+    def test_skill_has_terrain(self, multiskill_with_stairs):
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._skill_indices(msm)
+        assert msm._skill_has_terrain[stairs_idx].item() is True
+        assert msm._skill_has_terrain[walk_idx].item() is False
+
+    def test_dim_mask_filters_terrain_trajectories(self, multiskill_with_stairs):
+        """Terrain-skill envs only pass trajectories matching their feature
+        dims; flat envs and invalid (feature-less) envs pass everything."""
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._skill_indices(msm)
+
+        # env 0: stairs on geometry A; env 1: walk; env 2: stairs, no feature.
+        skill_ids = torch.tensor([stairs_idx, walk_idx, stairs_idx], dtype=torch.long)
+        dims = torch.tensor([_dims3(_DIMS_A)] * 3, dtype=torch.float)
+        valid = torch.tensor([True, True, False])
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, valid))
+        try:
+            anchor = torch.zeros(3, 2)
+            mask = msm._terrain_dim_allowed(anchor, skill_ids)
+            traj_hl = self._traj_hl(msm)
+            expected_env0 = (
+                (traj_hl[:, 0] - _DIMS_A[0]).abs().le(0.005)
+                & (traj_hl[:, 1] - _DIMS_A[1]).abs().le(0.010)
+            )
+            assert torch.equal(mask[0], expected_env0)
+            assert mask[1].all(), "flat-skill env must pass every trajectory"
+            assert mask[2].all(), "feature-less env must pass every trajectory"
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_nan_dims_are_unconstrained_but_real_dims_match(self, multiskill_with_stairs):
+        """A NaN width never excludes; a non-NaN width participates in the
+        match like any other dimension."""
+        msm = multiskill_with_stairs
+        stairs_idx, _ = self._skill_indices(msm)
+        skill_ids = torch.full((3,), stairs_idx, dtype=torch.long)
+        dims = torch.tensor(
+            [
+                _dims3(_DIMS_A),                    # NaN width: unconstrained
+                _dims3(_DIMS_A, width=_TRAJ_WIDTH),  # matching width
+                _dims3(_DIMS_A, width=0.5),          # mismatched width
+            ],
+            dtype=torch.float,
+        )
+        valid = torch.tensor([True, True, True])
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, valid))
+        try:
+            mask = msm._terrain_dim_allowed(torch.zeros(3, 2), skill_ids)
+            assert torch.equal(mask[0], mask[1]), (
+                "NaN width and exactly-matching width must pass the same set"
+            )
+            assert mask[0].any()
+            assert not mask[2].any(), "mismatched width must exclude all"
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_selection_respects_feature_dims(self, multiskill_with_stairs):
+        """Two stair envs with the same velocity but different feature dims
+        must select trajectories of their own geometry."""
+        msm = multiskill_with_stairs
+        stairs_idx, _ = self._skill_indices(msm)
+        N = 2
+        skill_ids = torch.full((N,), stairs_idx, dtype=torch.long)
+        ref_poses = torch.zeros(N, 7)
+        _attach_stub_owner(msm, skill_ids, ref_poses=ref_poses)
+
+        dims = torch.tensor([_dims3(_DIMS_A), _dims3(_DIMS_B)], dtype=torch.float)
+        valid = torch.tensor([True, True])
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, valid))
+        try:
+            cond = torch.zeros(N, 6)
+            cond[:, 0] = 0.8  # both envs command the same vel_x
+            selected = msm._select_trajectories(cond)
+            sel_hl = self._traj_hl(msm)[selected]
+            assert torch.allclose(sel_hl[0], torch.tensor(_DIMS_A), atol=1e-4)
+            assert torch.allclose(sel_hl[1], torch.tensor(_DIMS_B), atol=1e-4)
+            # And velocity-nearest within the matched geometry.
+            sel_vels = msm._global_conditioning[selected, 0]
+            assert torch.allclose(sel_vels, torch.full((N,), 0.8), atol=1e-4)
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_unmatched_dims_fall_back_to_skill_only(self, multiskill_with_stairs):
+        """A feature geometry missing from the library must not produce a
+        wrong-skill pick — selection falls back to the skill mask."""
+        msm = multiskill_with_stairs
+        stairs_idx, _ = self._skill_indices(msm)
+        skill_ids = torch.tensor([stairs_idx], dtype=torch.long)
+        _attach_stub_owner(msm, skill_ids, ref_poses=torch.zeros(1, 7))
+
+        dims = torch.tensor([_dims3((0.99, 0.99))], dtype=torch.float)  # not in library
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, torch.tensor([True])))
+        try:
+            cond = torch.zeros(1, 6)
+            cond[0, 0] = 0.4
+            selected = msm._select_trajectories(cond)
+            assert msm._traj_skill_idx[selected].item() == stairs_idx
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_no_lookup_means_no_dim_filter(self, multiskill_with_stairs):
+        """Without a registered lookup the dim path must not run (and must
+        not touch ``ref_poses``, which offline owners may not define)."""
+        msm = multiskill_with_stairs
+        stairs_idx, _ = self._skill_indices(msm)
+        skill_ids = torch.tensor([stairs_idx], dtype=torch.long)
+        _attach_stub_owner(msm, skill_ids)  # no ref_poses on purpose
+
+        assert msm._terrain_dims_at is None
+        cond = torch.zeros(1, 6)
+        cond[0, 0] = 0.8
+        selected = msm._select_trajectories(cond)
+        # Velocity-nearest within the skill, regardless of geometry.
+        assert msm._traj_skill_idx[selected].item() == stairs_idx
+        assert torch.allclose(
+            msm._global_conditioning[selected, 0], torch.tensor([0.8]), atol=1e-4
+        )
+
+    def test_nearest_traj_in_skill_uses_anchor(self, multiskill_with_stairs):
+        """``nearest_traj_in_skill`` applies the dim filter with an explicit
+        anchor (the approach-planner path)."""
+        msm = multiskill_with_stairs
+        stairs_idx, _ = self._skill_indices(msm)
+        N = 1
+        _attach_stub_owner(
+            msm, torch.full((N,), stairs_idx, dtype=torch.long),
+            ref_poses=torch.zeros(N, 7),
+        )
+
+        class _FakeCondTerm:
+            command = torch.tensor([[0.4, 0.0, 0.0]])
+
+        class _FakeCmdMgr:
+            def get_term(self, name):
+                return _FakeCondTerm()
+
+        class _FakeEnv:
+            command_manager = _FakeCmdMgr()
+
+        msm.env = _FakeEnv()
+        dims = torch.tensor([_dims3(_DIMS_B)], dtype=torch.float)
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, torch.tensor([True])))
+        try:
+            owner_ids = torch.tensor([stairs_idx], dtype=torch.long)
+            env_ids = torch.tensor([0], dtype=torch.long)
+            sel = msm.nearest_traj_in_skill(owner_ids, env_ids, anchor_xy=torch.zeros(1, 2))
+            sel_hl = self._traj_hl(msm)[sel]
+            assert torch.allclose(sel_hl[0], torch.tensor(_DIMS_B), atol=1e-4)
+            assert torch.allclose(
+                msm._global_conditioning[sel, 0], torch.tensor([0.4]), atol=1e-4
+            )
+        finally:
+            msm.set_terrain_dim_lookup(None)
+            msm.env = None

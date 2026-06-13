@@ -162,7 +162,11 @@ class StairUpApproachPlanner:
         # ``apply_terrain_aware_ref`` would at commit.
         stair_owner_idx = cmd._skill_list.index(self.target_skill)
         stair_skill_ids = torch.full((K,), stair_owner_idx, dtype=torch.long, device=device)
-        stair_traj = mgr.nearest_traj_in_skill(stair_skill_ids, env_ids)   # [K]
+        # Anchor the terrain-dim filter on the just-landed stance foot —
+        # ``ref_poses`` (the default anchor) is stale at gate-fire time.
+        stair_traj = mgr.nearest_traj_in_skill(
+            stair_skill_ids, env_ids, anchor_xy=ctx.stance_pos[:, :2],
+        )                                                                  # [K]
         phase = mgr.phase[env_ids]
         domain = mgr._get_domain_indices(phase, stair_traj)
         project = cmd._terrain.terrain_meta_data["project"]

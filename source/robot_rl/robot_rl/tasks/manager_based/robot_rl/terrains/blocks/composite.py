@@ -102,6 +102,7 @@ def composite_terrain(
             "exit_z": float(out.exit_z),
             "extras": dict(out.extras),
             "block_type": type(block).__name__,
+            "velocity_guidance": block_cfg.velocity_guidance,
         })
 
         if i == cfg.origin_block_index:

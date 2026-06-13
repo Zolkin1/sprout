@@ -96,10 +96,11 @@ _DEBUG_VIZ_REF_POSE_COLOR: tuple[float, float, float] = (1.0, 1.0, 1.0)
 # ``meta_composite_importer._DEFAULT_BLOCK_OUTLINE_COLORS`` so the floating
 # sphere over the robot matches the colored block outline it's standing on.
 _SKILL_MARKER_COLORS: dict[str, tuple[float, float, float]] = {
-    "walk_forward": (0.20, 0.80, 0.30),  # green   (matches FlatBlock outline)
-    "running":      (0.95, 0.55, 0.15),  # orange
-    "standing":     (0.85, 0.85, 0.20),  # yellow
-    "stair_up":     (0.30, 0.60, 0.90),  # blue
+    "walk_forward":   (0.20, 0.80, 0.30),  # green   (matches FlatBlock outline)
+    "walk_backwards": (0.60, 0.30, 0.85),  # purple
+    "running":        (0.95, 0.55, 0.15),  # orange
+    "standing":       (0.85, 0.85, 0.20),  # yellow
+    "stair_up":       (0.30, 0.60, 0.90),  # blue
 }
 _SKILL_MARKER_FALLBACK_COLOR: tuple[float, float, float] = (0.55, 0.55, 0.55)
 _SKILL_MARKER_PRIM_PATH: str = "/Visuals/traj_ref_skill_markers"
@@ -303,6 +304,12 @@ class BatchedMultiSkillCommand(BaseTrajectoryCommand):
         self._vel_cmd = None
         # Register us as the manager's source-of-truth for skill_id.
         self.manager.set_skill_owner(self)
+        # Terrain-dimension-aware selection: terrain-aware skills only match
+        # trajectories optimized for the terrain feature (e.g. stair span)
+        # under the stance reference.  Only composite importers expose the
+        # lookup; plain meta importers skip the filter.
+        if hasattr(self._terrain, "terrain_dims_at"):
+            self.manager.set_terrain_dim_lookup(self._terrain.terrain_dims_at)
 
         # --- Precomputed orientation-quat index groups for SLERP ---------
         # For each body frame in the position outputs that has a complete

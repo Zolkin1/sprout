@@ -77,3 +77,8 @@ class MultiskillVelocityTrackingCommandCfg(VelocityTrackingCommandCfg):
     rel_standing_envs: float = 0.0
     """Not used — standing is achieved via a zero-velocity bucket whose skill
     is selected by the terrain. Kept for parent compatibility."""
+
+    guidance_exempt_skills: tuple[str, ...] = ("standing",)
+    """Skills whose envs never receive terrain velocity guidance.  A
+    standing-skill env on a guided block (e.g. a composite flat block)
+    must not be PD-steered laterally against a stationary reference."""

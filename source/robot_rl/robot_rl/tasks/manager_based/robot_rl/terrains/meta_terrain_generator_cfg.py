@@ -44,3 +44,13 @@ class MetaTerrainGeneratorCfg(TerrainGeneratorCfg):
 
     Example: [("wave", 20.0)] inserts a 20m flat border after the "wave" terrain columns.
     """
+
+    border_skill_probs: dict[str, float] = field(
+        default_factory=lambda: {"walk_forward": 0.5, "standing": 0.5}
+    )
+    """Skill distribution advertised by ``inter_column_borders`` cells.
+
+    Border cells are unspawnable but walkable, so they still carry skill
+    metadata for robots that wander onto them. Must sum to 1.0 and every key
+    must be in the importer's ``skill_list``.
+    """

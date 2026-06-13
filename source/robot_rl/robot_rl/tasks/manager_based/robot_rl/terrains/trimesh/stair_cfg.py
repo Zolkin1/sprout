@@ -11,6 +11,9 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair import (
     x_stairs_down_terrain,
     x_stairs_up_terrain,
 )
+from robot_rl.tasks.manager_based.robot_rl.terrains.velocity_guidance_cfg import (
+    BlockVelocityGuidanceCfg,
+)
 
 
 @configclass
@@ -67,6 +70,11 @@ class MeshXStairsUpTerrainCfg(SubTerrainBaseCfg):
     """If True (default), anchor the lowest stair's top surface at z=0 so the
     whole staircase rises above z=0.  Set to False to recover the legacy
     behavior where the staircase is vertically centred around z=0."""
+
+    velocity_guidance: BlockVelocityGuidanceCfg | None = None
+    """Optional terrain-specific velocity guidance for envs on this cell
+    (the legacy full-cell block).  See
+    :mod:`robot_rl.tasks.manager_based.robot_rl.terrains.velocity_guidance_cfg`."""
 
 
 @configclass
