@@ -41,9 +41,16 @@ except AttributeError:  # PyYAML built without libyaml
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
-    FULL_PERIODIC = "periodic"
+    FULL_PERIODIC = "full_periodic"
     EPISODIC = "episodic"
     PERPETUAL = "perpetual"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Accept the legacy ``"periodic"`` spelling for full-periodic trajs."""
+        if value == "periodic":
+            return cls.FULL_PERIODIC
+        return None
 
 @dataclass
 class DomainData:

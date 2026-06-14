@@ -1463,7 +1463,10 @@ class MultiSkillManager(ManagerBase):
 
         - Half-periodic: 2 gates (phi=0.5 entering reflected second half;
           phi=1.0 wrapping back to first half).
-        - Full-periodic: 1 gate at phi=1.0 (cycle wrap).
+        - Full-periodic: 1 gate at phi=1.0 (cycle wrap).  TODO(zolkin): a
+          two-stride full-periodic gait has two contacts per cycle but only
+          gets one gate here — see the big TODO at the full-periodic branch
+          below; revisit before trusting long full-periodic runs.
         - Episodic: 1 gate at phi=1.0 (end of trajectory).
         - Perpetual: 0 gates.
 
@@ -1504,6 +1507,30 @@ class MultiSkillManager(ManagerBase):
                 gate_pre_size[ti, 1] = 0.5
                 num_gates[ti] = 2
             elif tt == _FULL_PERIODIC_INT or tt == _EPISODIC_INT:
+                # =============================================================
+                # TODO(zolkin): REVISIT FULL-PERIODIC CONTACT GATING.
+                # -------------------------------------------------------------
+                # A full-periodic gait is TWO strides, so it has TWO foot-strike
+                # contacts per cycle (one per stride).  But this branch arms only
+                # ONE gate, at phi=1.0 (the cycle wrap).  The mid-cycle foot
+                # strike (start of the second stride) is NEVER gated, so contact-
+                # based phase resync happens once per FULL cycle (every two
+                # strides) instead of once per stride like half-periodic does.
+                #
+                # The entire new gait library (2026-06-13_..._merged:
+                # running / walk_forward / walk_backwards) is full_periodic, so
+                # EVERY locomotion env now resyncs at half the rate it used to.
+                # Worried this lets phase drift too far between corrections and
+                # hurts tracking / contact timing.  THINK ABOUT THIS before
+                # trusting a long full-periodic run.
+                #
+                # Fix sketch: add a second gate at the mid-cycle contact domain
+                # (the domain where the second stride's stance begins) with its
+                # own gate_body_names + gate_pre_size, and bump MAX_GATES if
+                # needed.  The mid-cycle phi is NOT necessarily 0.5 — derive it
+                # from the per-domain contact structure, don't hardcode it.  Keep
+                # episodic (which shares this branch) at a single end gate.
+                # =============================================================
                 gate_phi[ti, 0] = 1.0
                 gate_active[ti, 0] = True
                 gate_body_names[ti][0] = list(first_domain_bodies)
