@@ -1274,3 +1274,267 @@ class TestTerrainDimFilter:
         finally:
             msm.set_terrain_dim_lookup(None)
             msm.env = None
+
+
+# ---------------------------------------------------------------------------
+# Per-skill segmented selection equivalence
+# ---------------------------------------------------------------------------
+
+def _make_indexed_dim_lookup(dims_table: torch.Tensor, valid_table: torch.Tensor):
+    """Position-keyed fake ``terrain.terrain_dims_at``.
+
+    Encodes each env's id in its anchor x coordinate (set ``ref_poses[i, 0]
+    == i``) so the lookup returns the correct per-env dims whether it's called
+    with the full batch (legacy path) or a per-skill row subset (the segmented
+    path).  A plain fixed-size lookup can't serve both, since the segmented
+    path queries only the rows of one skill at a time.
+    """
+
+    def lookup(xy_w: torch.Tensor):
+        idx = xy_w[:, 0].round().long()
+        return dims_table[idx], valid_table[idx]
+
+    return lookup
+
+
+class TestSelectionEquivalence:
+    """``_select_within_skills`` must match the legacy full-library path.
+
+    The per-skill segmented selection (used by ``_select_trajectories`` and
+    ``nearest_traj_in_skill``) must return byte-identical global indices to
+    ``_select_trajectories_reference``.  Identical indices are what keep the
+    manager's ``_traj_changed`` signal — and therefore the contact-gate
+    re-arm / grace-timer logic in the command term — behaving exactly as
+    before the optimization.
+    """
+
+    def _idx(self, msm: MultiSkillManager) -> tuple[int, int]:
+        return msm.skill_name_to_idx["stairs"], msm.skill_name_to_idx["walk"]
+
+    def _assert_equiv(self, msm, cond, env_ids=None):
+        new = msm._select_trajectories(cond, env_ids)
+        ref = msm._select_trajectories_reference(cond, env_ids)
+        assert torch.equal(new, ref), (
+            f"selection mismatch:\n new={new.tolist()}\n ref={ref.tolist()}"
+        )
+
+    def test_equiv_flat_no_lookup(self, multiskill_with_stairs):
+        """No terrain lookup: pure velocity-nearest within each env's skill."""
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._idx(msm)
+        msm.set_terrain_dim_lookup(None)
+        torch.manual_seed(0)
+        N = 50
+        pick = torch.randint(0, 2, (N,))
+        skill_ids = torch.where(
+            pick.bool(),
+            torch.full((N,), walk_idx),
+            torch.full((N,), stairs_idx),
+        ).long()
+        _attach_stub_owner(msm, skill_ids, ref_poses=torch.zeros(N, 7))
+        cond = torch.randn(N, 6)
+        self._assert_equiv(msm, cond)
+
+    def test_equiv_terrain_mixed_valid(self, multiskill_with_stairs):
+        """Terrain lookup with stairs-on-feature, walk, and feature-less envs."""
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._idx(msm)
+        skill_ids = torch.tensor(
+            [stairs_idx, walk_idx, stairs_idx, stairs_idx]
+        ).long()
+        N = skill_ids.numel()
+        ref_poses = torch.zeros(N, 7)
+        ref_poses[:, 0] = torch.arange(N, dtype=torch.float)
+        _attach_stub_owner(msm, skill_ids, ref_poses=ref_poses)
+
+        dims = torch.tensor(
+            [_dims3(_DIMS_A), _dims3(_DIMS_A), _dims3(_DIMS_A), _dims3(_DIMS_B)],
+            dtype=torch.float,
+        )
+        valid = torch.tensor([True, True, False, True])  # env 2 = no feature
+        msm.set_terrain_dim_lookup(_make_indexed_dim_lookup(dims, valid))
+        try:
+            cond = torch.zeros(N, 6)
+            cond[:, 0] = torch.tensor([0.8, 0.7, 0.4, 0.5])
+            self._assert_equiv(msm, cond)
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_equiv_empty_match_fallback(self, multiskill_with_stairs):
+        """A commanded geometry absent from the library must fall back to
+        skill-only in both paths (identically)."""
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._idx(msm)
+        skill_ids = torch.tensor([stairs_idx, stairs_idx, walk_idx]).long()
+        N = skill_ids.numel()
+        ref_poses = torch.zeros(N, 7)
+        ref_poses[:, 0] = torch.arange(N, dtype=torch.float)
+        _attach_stub_owner(msm, skill_ids, ref_poses=ref_poses)
+
+        dims = torch.tensor(
+            [_dims3((0.99, 0.99)), _dims3(_DIMS_B), _dims3(_DIMS_A)],
+            dtype=torch.float,
+        )  # env 0 geometry not in library
+        valid = torch.tensor([True, True, True])
+        msm.set_terrain_dim_lookup(_make_indexed_dim_lookup(dims, valid))
+        try:
+            cond = torch.zeros(N, 6)
+            cond[:, 0] = torch.tensor([0.4, 0.8, 0.6])
+            self._assert_equiv(msm, cond)
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+    def test_equiv_with_forced_latch(self, multiskill_with_stairs):
+        """The forced-traj latch overlay is applied identically by both paths."""
+        from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.skill_state import (
+            ForcedTrajLatch,
+        )
+
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._idx(msm)
+        msm.set_terrain_dim_lookup(None)
+        N = 6
+        skill_ids = torch.tensor(
+            [stairs_idx, walk_idx, stairs_idx, walk_idx, stairs_idx, walk_idx]
+        ).long()
+        _attach_stub_owner(msm, skill_ids, ref_poses=torch.zeros(N, 7))
+
+        latch = ForcedTrajLatch(N, device=DEVICE)
+        latch.set(
+            torch.tensor([0, 3], device=DEVICE),
+            torch.tensor([2, 1], device=DEVICE),
+        )
+        msm.set_forced_traj_latch(latch)
+        try:
+            torch.manual_seed(2)
+            cond = torch.randn(N, 6)
+            self._assert_equiv(msm, cond)
+        finally:
+            msm.set_forced_traj_latch(None)
+
+    def test_equiv_env_ids_subset(self, multiskill_with_stairs):
+        """The env-subset selection path (e.g. reset_on_reference) matches too."""
+        msm = multiskill_with_stairs
+        stairs_idx, walk_idx = self._idx(msm)
+        N = 8
+        torch.manual_seed(1)
+        pick = torch.randint(0, 2, (N,))
+        skill_ids = torch.where(
+            pick.bool(),
+            torch.full((N,), walk_idx),
+            torch.full((N,), stairs_idx),
+        ).long()
+        ref_poses = torch.zeros(N, 7)
+        ref_poses[:, 0] = torch.arange(N, dtype=torch.float)
+        _attach_stub_owner(msm, skill_ids, ref_poses=ref_poses)
+
+        dims = torch.stack(
+            [torch.tensor(_dims3(_DIMS_A), dtype=torch.float) for _ in range(N)]
+        )
+        valid = torch.ones(N, dtype=torch.bool)
+        msm.set_terrain_dim_lookup(_make_indexed_dim_lookup(dims, valid))
+        try:
+            cond_full = torch.randn(N, 6)
+            env_ids = torch.tensor([1, 3, 5, 7])
+            self._assert_equiv(msm, cond_full[env_ids], env_ids)
+        finally:
+            msm.set_terrain_dim_lookup(None)
+
+
+# ---------------------------------------------------------------------------
+# Merged-tensor startup cache
+# ---------------------------------------------------------------------------
+
+class TestTensorCache:
+    """The startup cache must round-trip to byte-identical state and rebuild
+    whenever the library's YAMLs change."""
+
+    def _build_small_library(self, root) -> "Path":
+        """Copy the merged test library into a single 'walk' skill folder."""
+        import shutil
+        from pathlib import Path
+
+        root.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(MERGED_LIBRARY_DIR, str(root / "walk"))
+        return Path(root)
+
+    def test_cache_roundtrip_matches_fresh(self, tmp_path, monkeypatch):
+        """A cache-loaded manager equals a freshly-built one, tensor for tensor."""
+        monkeypatch.setenv("ROBOT_RL_TRAJ_CACHE_DIR", str(tmp_path / "cache"))
+        lib = self._build_small_library(tmp_path / "lib")
+
+        fresh = MultiSkillManager(path=str(lib), device=DEVICE)   # miss -> builds + writes
+        cached = MultiSkillManager(path=str(lib), device=DEVICE)  # hit  -> restores
+
+        assert set(fresh.data.keys()) == set(cached.data.keys())
+        for k in fresh.data.keys():
+            assert torch.equal(fresh.data[k], cached.data[k]), f"data[{k}] mismatch"
+
+        assert fresh.num_trajectories == cached.num_trajectories
+        assert fresh.max_expanded_domains == cached.max_expanded_domains
+        assert fresh.trajectory_names == cached.trajectory_names
+        assert fresh.skill_labels == cached.skill_labels
+        assert fresh.pos_output_names == cached.pos_output_names
+        assert fresh.vel_output_names == cached.vel_output_names
+        assert fresh.spline_order == cached.spline_order
+        assert fresh.ref_frames == cached.ref_frames
+
+        # Derived state rebuilt from the restored tensors must also match.
+        assert torch.equal(fresh._global_conditioning, cached._global_conditioning)
+        assert torch.equal(fresh._cumsum_T, cached._cumsum_T)
+        assert torch.equal(fresh._total_original_T, cached._total_original_T)
+        assert [s.name for s in fresh.skills] == [s.name for s in cached.skills]
+        assert fresh._skill_traj_offset == cached._skill_traj_offset
+        assert fresh._skill_traj_count == cached._skill_traj_count
+        assert fresh._contact_bodies_per_domain == cached._contact_bodies_per_domain
+        assert torch.equal(fresh._gate_phi_table, cached._gate_phi_table)
+        assert torch.equal(fresh._num_gates_per_traj, cached._num_gates_per_traj)
+
+    def test_second_build_uses_cache_not_yaml(self, tmp_path, monkeypatch):
+        """On a cache hit the YAML build path must not run at all."""
+        monkeypatch.setenv("ROBOT_RL_TRAJ_CACHE_DIR", str(tmp_path / "cache"))
+        lib = self._build_small_library(tmp_path / "lib")
+        first = MultiSkillManager(path=str(lib), device=DEVICE)
+
+        def _boom(self, *args, **kwargs):
+            raise AssertionError("_build_from_yaml ran on a cache hit")
+
+        monkeypatch.setattr(MultiSkillManager, "_build_from_yaml", _boom)
+        cached = MultiSkillManager(path=str(lib), device=DEVICE)
+        assert cached.num_trajectories == first.num_trajectories
+
+    def test_cache_invalidated_on_yaml_change(self, tmp_path, monkeypatch):
+        """Editing a YAML must invalidate the cache (no stale data served)."""
+        import yaml
+
+        monkeypatch.setenv("ROBOT_RL_TRAJ_CACHE_DIR", str(tmp_path / "cache"))
+        walk = tmp_path / "lib" / "walk"
+        walk.mkdir(parents=True)
+        with open(WALKING_YAML, "r") as f:
+            base = yaml.safe_load(f)
+
+        base["conditioner"] = {"terrain": "flat", "vel_x": 0.5, "vel_y": 0.0, "vel_yaw": 0.0}
+        with open(walk / "w.yaml", "w") as f:
+            yaml.safe_dump(base, f)
+        first = MultiSkillManager(path=str(tmp_path / "lib"), device=DEVICE)
+        assert torch.allclose(
+            first._global_conditioning[0, 0], torch.tensor(0.5), atol=1e-6
+        )
+
+        # Different value AND different serialized length -> new size/mtime ->
+        # new key, robust even on coarse-mtime filesystems.
+        base["conditioner"]["vel_x"] = 1.25
+        with open(walk / "w.yaml", "w") as f:
+            yaml.safe_dump(base, f)
+        second = MultiSkillManager(path=str(tmp_path / "lib"), device=DEVICE)
+        assert torch.allclose(
+            second._global_conditioning[0, 0], torch.tensor(1.25), atol=1e-6
+        )
+
+    def test_use_cache_false_writes_nothing(self, tmp_path, monkeypatch):
+        """``use_cache=False`` neither reads nor writes the cache."""
+        cache = tmp_path / "cache"
+        monkeypatch.setenv("ROBOT_RL_TRAJ_CACHE_DIR", str(cache))
+        lib = self._build_small_library(tmp_path / "lib")
+        MultiSkillManager(path=str(lib), device=DEVICE, use_cache=False)
+        assert not cache.exists() or not list(cache.glob("*.pt"))

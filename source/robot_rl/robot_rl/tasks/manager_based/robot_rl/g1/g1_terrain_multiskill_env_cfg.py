@@ -156,6 +156,16 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         self.commands.base_velocity.max_acc_frac = 1.0
         self.commands.base_velocity.max_acc = 1.0
 
+        # Force every env fully open-loop for now: no y-position / heading PD
+        # overrides on the sampled velocity. The base multiskill cfg uses
+        # rel_closed_loop=0.55 / rel_closed_loop_yaw=0.25 / rel_open_loop=0.2;
+        # restore those four rel_* values to re-enable the PD. (The four must
+        # still sum to 1.0 — validated in VelocityTrackingCommand.__init__.)
+        self.commands.base_velocity.rel_open_loop = 1.0
+        self.commands.base_velocity.rel_closed_loop = 0.0
+        self.commands.base_velocity.rel_closed_loop_yaw = 0.0
+        self.commands.base_velocity.rel_standing_envs = 0.0
+
         # No mid-episode skill transitions: each env draws one skill from its
         # spawn cell at reset and keeps it for the whole episode (velocity still
         # resamples within that skill's bucket).  With the FLAT_STAIR_MULTISKILL
