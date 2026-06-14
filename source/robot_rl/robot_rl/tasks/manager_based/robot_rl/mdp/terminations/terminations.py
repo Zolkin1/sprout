@@ -135,9 +135,11 @@ def frame_deviation_from_reference(
         min_dist: Absolute minimum threshold in metres.  Default ``0.0``
             disables the floor — set this above the noise floor / typical
             stance-foot drift to avoid spurious termination.
-        grace_period_s: Seconds after a trajectory swap (within-skill bucket
-            swap or full skill change) and after a fresh episode reset
-            during which this termination is suppressed.  Reads
+        grace_period_s: Seconds after an in-episode trajectory swap
+            (within-skill bucket swap or full skill change) during which this
+            termination is suppressed.  Fresh episode resets are NOT granted
+            grace — the reset spawns the robot on the reference, so there is no
+            transition transient and the termination arms immediately.  Reads
             ``cmd.time_since_traj_change_s`` (populated by
             ``BatchedMultiSkillCommand._pre_update_phase``).  Default 0
             disables the grace.  Silently no-ops if the command term does
