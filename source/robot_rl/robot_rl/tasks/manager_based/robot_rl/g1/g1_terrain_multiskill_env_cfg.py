@@ -188,12 +188,9 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
             "walk_forward":   VelocityBucketCfg(
                 lin_vel_x=(0.1, 1.5), lin_vel_y=(-0.6, 0.6), ang_vel_z=(-0.8, 0.8),
             ),
-            # TEMP: backwards walking disabled for now. Re-enable together with
-            # the skill_list entry below and remove the skill_probs strip in the
-            # terrain block.
-            # "walk_backwards": VelocityBucketCfg(
-            #     lin_vel_x=(-0.9, -0.1), lin_vel_y=(-0.6, 0.6), ang_vel_z=(-0.8, 0.8),
-            # ),
+            "walk_backwards": VelocityBucketCfg(
+                lin_vel_x=(-0.9, -0.1), lin_vel_y=(-0.6, 0.6), ang_vel_z=(-0.8, 0.8),
+            ),
             "running":        VelocityBucketCfg(
                 lin_vel_x=(1.7, 3.6), lin_vel_y=(-0.8, 0.8), ang_vel_z=(-0.8, 0.8),
             ),
@@ -229,27 +226,6 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # terrain_generator = copy.deepcopy(FLAT_STAIR_MULTISKILL_CFG)
         terrain_generator = copy.deepcopy(FLAT_MULTISKILL_CFG)
 
-        # TEMP: backwards walking disabled for now (walk_backwards commented out
-        # of skill_list / velocity_buckets above). The shared _FLAT_SKILL_PROBS
-        # (terrains/config/terrain_cfgs.py) still lists walk_backwards, and the
-        # meta importer raises KeyError on any skill_probs entry not in
-        # skill_list, so strip it from this deepcopy's flat cells + border and
-        # renormalize to 1.0. To restore: delete this block.
-        def _drop_skill_renorm(probs: dict, skill: str) -> dict:
-            """Remove ``skill`` from a skill_probs dict and renormalize to 1.0."""
-            kept = {k: v for k, v in probs.items() if k != skill}
-            total = sum(kept.values())
-            return {k: v / total for k, v in kept.items()}
-
-        if terrain_generator.border_skill_probs:
-            terrain_generator.border_skill_probs = _drop_skill_renorm(
-                terrain_generator.border_skill_probs, "walk_backwards"
-            )
-        for _sub in terrain_generator.sub_terrains.values():
-            sub_probs = getattr(_sub, "skill_probs", None)
-            if sub_probs and "walk_backwards" in sub_probs:
-                _sub.skill_probs = _drop_skill_renorm(sub_probs, "walk_backwards")
-
         # Stair sizes come from the gait library so every stair span has a
         # matching stair_up trajectory (see the per-env terrain-dim filter in
         # ``MultiSkillManager``).  Skip for flat-only terrains: the scan needs a
@@ -282,11 +258,7 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
             visual_material=base_terrain.visual_material,
             debug_vis=base_terrain.debug_vis,
             # skill_list=["stair_up", "walk_forward", "walk_backwards", "running", "standing"],
-            # TEMP: backwards walking disabled for now — add "walk_backwards"
-            # back here (and re-enable its velocity bucket above + drop the
-            # skill_probs strip in the terrain block) to restore it.
-            # skill_list=["walk_forward", "walk_backwards", "running", "standing"],
-            skill_list=["walk_forward", "running", "standing"],
+            skill_list=["walk_forward", "walk_backwards", "running", "standing"],
         )
 
         self.commands.base_velocity.debug_vis = False
@@ -403,6 +375,15 @@ class G1TerrainMultiskillCLFEnvCfgPlay(G1TerrainMultiskillCLFEnvCfg):
         # self.scene.terrain.terrain_generator.sub_terrains["pure_flat"].proportion = 0.0
         # self.scene.terrain.terrain_generator.sub_terrains["pure_stair_up"].proportion = 0.0
         # self.scene.terrain.terrain_generator.sub_terrains["flat_stair_up"].proportion = 1.0
+
+        # DEBUG: force every play env onto backwards walking. pure_flat is the
+        # only sub-terrain in FLAT_MULTISKILL_CFG, so overriding its skill_probs
+        # makes all cells 100% walk_backwards (skill is locked per episode via
+        # skill_transition_prob=0.0). Restore the natural skill mix by deleting
+        # this override.
+        self.scene.terrain.terrain_generator.sub_terrains["pure_flat"].skill_probs = {
+            "walk_backwards": 1.0,
+        }
 
 
         self.events.randomize_ground_contact_friction = None

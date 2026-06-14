@@ -14,28 +14,75 @@ This project is a set of tools for end-to-end development of RL for robots. Spec
 interface can be run through a docker/dev-container provided in this repo. See below for more information.
 
 ## Installation
-When you clone this repo, please use **Git Large File System (lfs)**.
+We use a [`uv`](https://docs.astral.sh/uv/) virtual environment named `env_isaaclab` (at the repo root) with a
+**pip-installed Isaac Sim** and an **editable Isaac Lab** checked out as a sibling directory. This repo currently tracks
+Isaac Lab **`v3.0.0-beta`**. For the exact Isaac Sim pip command for your version/CUDA, see the Isaac Lab pip-install
+guide — both the
+[`v3.0.0-beta` page](https://isaac-sim.github.io/IsaacLab/v3.0.0-beta/source/setup/installation/pip_installation.html)
+(the version we track) and the
+[latest page](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/pip_installation.html) are useful
+references. The steps below reflect the setup this repo is currently developed against.
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
+Prerequisites: a recent NVIDIA driver (the pinned `torch` wheels target CUDA 12.8), [`uv`](https://docs.astral.sh/uv/),
+and [`git-lfs`](https://git-lfs.com/) (run `git lfs install` once). Asset files (`*.usd`, `*.pt`, `*.jit`, ...) are
+stored with **Git LFS**, so clone with LFS enabled.
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
+1. Mirror the directory layout — Isaac Lab lives next to (not inside) this repo:
 
     ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/robot_rl
+    mkdir -p Project-Isaac-RL && cd Project-Isaac-RL
+    ```
 
-- Verify that the extension is correctly by attempting to train:
+2. Clone this repo (with LFS) and Isaac Lab, then check out the pinned Isaac Lab tag:
 
-    - Running a task (see below for a full list of tasks):
+    ```bash
+    git clone git@github.com:Zolkin1/sprout.git
+    git -C sprout lfs pull
+    git clone https://github.com/isaac-sim/IsaacLab.git
+    git -C IsaacLab fetch --tags
+    git -C IsaacLab checkout v3.0.0-beta
+    ```
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-      
+3. Create and activate the `uv` venv (Python 3.12) at the sprout root:
+
+    ```bash
+    cd sprout
+    uv venv env_isaaclab --python 3.12
+    source env_isaaclab/bin/activate
+    ```
+
+4. Install Isaac Sim (pinned to match this repo) from NVIDIA's pip index. The two extra `uv` flags are required:
+   `--index-strategy unsafe-best-match` lets `uv` pull dependencies such as `mujoco-usd-converter` from PyPI while taking
+   the Isaac Sim wheels from NVIDIA's index, and `--prerelease=allow` permits pinned pre-release deps like
+   `tinyobjloader==2.0.0rc13`. (Plain `pip` does both implicitly, which is why the online guide doesn't mention them.)
+
+    ```bash
+    uv pip install --upgrade pip
+    uv pip install 'isaacsim[all,extscache]==6.0.0' \
+      --extra-index-url https://pypi.nvidia.com \
+      --index-strategy unsafe-best-match \
+      --prerelease=allow
+    ```
+
+5. Let Isaac Lab install all its extensions and RL libraries (e.g. `rsl-rl-lib`) in editable mode:
+
+    ```bash
+    (cd ../IsaacLab && ./isaaclab.sh -i)
+    ```
+
+6. Install this project in editable mode:
+
+    ```bash
+    uv pip install -e source/robot_rl
+    ```
+
+7. Verify the install by listing tasks and running a short headless training:
+
+    ```bash
+    python scripts/list_envs.py --keyword G1
+    python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=64
+    ```
+
 ## Running Tasks
 Get a list of available tasks:
 ```
