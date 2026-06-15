@@ -137,6 +137,13 @@ parser.add_argument(
     help="Frames per rolling profiling report window (with --profile).",
 )
 parser.add_argument(
+    "--profile_sync", action="store_true", default=False,
+    help="Profile in synchronous mode: drain the whole device at each phase "
+         "boundary for true, correctly-nested per-phase costs (incl. Warp "
+         "physics/render on its own stream). Slower; use to resolve "
+         "cross-stream mis-attribution.",
+)
+parser.add_argument(
     "--no-debug-vis", dest="no_debug_vis", action="store_true", default=False,
     help="Force the trajectory command's debug visualization off "
          "(env_cfg.commands.traj_ref.debug_vis = False) to A/B test its cost.",
@@ -389,13 +396,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             from profiling import PhaseTimer, instrument_env_managers
 
             profile_report_path = os.path.join(log_dir, "profile_report.txt")
-            phase_timer = PhaseTimer(env.unwrapped.device)
+            phase_timer = PhaseTimer(env.unwrapped.device, sync=args_cli.profile_sync)
             # debug-vis + managers run inside env.step → recorded as nested detail.
             instrument_env_managers(env, phase_timer, include_debug_vis=True)
             print(
-                f"[profiling] enabled; rolling report every {args_cli.profile_steps} frames. "
-                f"num_envs={env_cfg.scene.num_envs}, debug_vis="
-                f"{getattr(getattr(env_cfg, 'commands', None), 'traj_ref', None) and env_cfg.commands.traj_ref.debug_vis}, "
+                f"[profiling] enabled  |  sync mode: "
+                f"{'ON (slower, exact nesting)' if phase_timer.sync else 'OFF (async CUDA-event timers)'}"
+                f"  |  requested --profile_sync={args_cli.profile_sync}; "
+                f"rolling report every {args_cli.profile_steps} frames. "
+                f"num_envs={env_cfg.scene.num_envs}, "
                 f"logging={logging_enabled}.",
                 flush=True,
             )

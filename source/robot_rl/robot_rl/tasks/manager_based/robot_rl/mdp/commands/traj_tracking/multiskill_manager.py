@@ -1646,7 +1646,15 @@ class MultiSkillManager(ManagerBase):
         Returns:
             ``[N, num_contacts]`` binary contact states.
         """
-        if not hasattr(self, "_contact_table") or self._contact_table_key != tuple(contact_frames):
+        # Build the lookup once (and rebuild only if the contact-frame list
+        # changes).  The table is derived purely from the static trajectory
+        # contact layout + ``contact_frames``, so it never changes within a
+        # run.  NOTE: the guard keys off ``_contact_table_key`` (set by
+        # ``_precompute_contact_table``); a prior version checked
+        # ``hasattr(self, "_contact_table")`` — an attribute that is never
+        # assigned — so the O(num_trajectories) Python rebuild ran on *every*
+        # call (twice per step), dominating per-step time as the library grew.
+        if getattr(self, "_contact_table_key", None) != tuple(contact_frames):
             self._precompute_contact_table(contact_frames)
 
         traj_idx = self._get_global_indices(env_ids)

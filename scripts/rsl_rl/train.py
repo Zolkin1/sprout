@@ -82,6 +82,13 @@ parser.add_argument(
          "steps during the run (also written to logs so it survives a hard "
          "kill). 0 disables periodic snapshots (report only at the end).",
 )
+parser.add_argument(
+    "--profile_sync", action="store_true", default=False,
+    help="Profile in synchronous mode: drain the whole device at each phase "
+         "boundary for true, correctly-nested per-phase costs (incl. Warp "
+         "physics on its own stream). Slower than the default async timers; "
+         "use it to resolve cross-stream mis-attribution.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -260,7 +267,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "title": "TRAIN per-step breakdown",
                 "out_path": profile_report_path,
             }
-            phase_timer = PhaseTimer(agent_cfg.device)
+            phase_timer = PhaseTimer(agent_cfg.device, sync=args_cli.profile_sync)
             instrument_env_managers(env, phase_timer)
             # Periodic cumulative snapshots during the run (live + kill-safe);
             # the same snapshot is appended to ``profile_report.txt``.
@@ -270,7 +277,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 report_kwargs=profile_report_kwargs,
             )
             print(
-                f"[profiling] enabled. Periodic snapshots every "
+                f"[profiling] enabled  |  sync mode: "
+                f"{'ON (drains device at each phase; slower but exact nesting)' if phase_timer.sync else 'OFF (async CUDA-event timers)'}"
+                f"  |  requested --profile_sync={args_cli.profile_sync}, device={agent_cfg.device}",
+                flush=True,
+            )
+            print(
+                f"[profiling] periodic snapshots every "
                 f"{args_cli.profile_report_every} steps -> console + "
                 f"{profile_report_path}. Also read rsl_rl's per-iteration "
                 "Perf/collection_time, Perf/learning_time, Perf/total_fps for "
