@@ -126,6 +126,26 @@ parser.add_argument(
          "mode (dropout/batchnorm active) AND stochastic action sampling enabled. "
          "Default play is .eval() mode with deterministic actions.",
 )
+parser.add_argument(
+    "--profile", action="store_true", default=False,
+    help="Enable the per-frame profiling harness (phase timers for policy / "
+         "env.step / logging + a manager and debug-vis breakdown). Prints a "
+         "rolling report every --profile_steps frames. Zero cost when off.",
+)
+parser.add_argument(
+    "--profile_steps", type=int, default=100,
+    help="Frames per rolling profiling report window (with --profile).",
+)
+parser.add_argument(
+    "--no-debug-vis", dest="no_debug_vis", action="store_true", default=False,
+    help="Force the trajectory command's debug visualization off "
+         "(env_cfg.commands.traj_ref.debug_vis = False) to A/B test its cost.",
+)
+parser.add_argument(
+    "--no-logging", dest="no_logging", action="store_true", default=False,
+    help="Disable per-step DataLogger collection (overrides --plots) to A/B "
+         "test logging cost.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -187,6 +207,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
+
+        # profiling A/B: optionally force the trajectory debug visualization off
+        if args_cli.no_debug_vis and hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
+            env_cfg.commands.traj_ref.debug_vis = False
+            print("[profiling] traj_ref.debug_vis forced OFF for this run.")
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the
@@ -352,10 +377,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Set up data logging
         plot_names = [s.strip() for s in args_cli.plots.split(",")]
-        logging_enabled = plot_names != ["none"]
+        logging_enabled = plot_names != ["none"] and not args_cli.no_logging
         if logging_enabled:
             logger = DataLogger(env)
         env_ids = list(range(min(args_cli.plot_envs, env_cfg.scene.num_envs)))
+
+        # optional per-frame profiling harness (see scripts/rsl_rl/profiling.py)
+        phase_timer = None
+        profile_report_path = None
+        if args_cli.profile:
+            from profiling import PhaseTimer, instrument_env_managers
+
+            profile_report_path = os.path.join(log_dir, "profile_report.txt")
+            phase_timer = PhaseTimer(env.unwrapped.device)
+            # debug-vis + managers run inside env.step → recorded as nested detail.
+            instrument_env_managers(env, phase_timer, include_debug_vis=True)
+            print(
+                f"[profiling] enabled; rolling report every {args_cli.profile_steps} frames. "
+                f"num_envs={env_cfg.scene.num_envs}, debug_vis="
+                f"{getattr(getattr(env_cfg, 'commands', None), 'traj_ref', None) and env_cfg.commands.traj_ref.debug_vis}, "
+                f"logging={logging_enabled}.",
+                flush=True,
+            )
 
         # reset environment
         obs = env.get_observations()
@@ -365,66 +408,90 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
         export_policy_parameters(env, obs, actions, log_dir)
 
+        def _ph(name):
+            """Phase context (no-op when profiling is off)."""
+            return phase_timer.phase(name) if phase_timer is not None else contextlib.nullcontext()
+
         timestep = 0
+        prof_window = 0  # frames since the last rolling profile report
         # simulate environment
         try:
             while True:
                 start_time = time.time()
-                # Drive the dedicated recording camera before the step so
-                # the next render (triggered inside env.step via
-                # RecordVideo) reads a fresh transform.  Writes directly to
-                # the USD prim via Isaac Sim's viewport util — render
-                # products read the prim transform, no viewport_api needed.
-                if record_cam_state is not None and record_cam_state["follow_robot"]:
-                    robot = env.unwrapped.scene.articulations["robot"]
-                    import warp as wp
-                    env_idx = record_cam_state["env_index"]
-                    root_pos_w = wp.to_torch(robot.data.root_pos_w)[
-                        env_idx, :3
-                    ].detach().cpu().numpy()
-                    eye_off = record_cam_state["eye_offset"]
-                    lookat_off = record_cam_state["lookat_offset"]
-                    if record_cam_state["track_yaw"]:
-                        # Rotate the offsets by the robot's yaw so e.g. a
-                        # side-view (+y) stays on the robot's left even as
-                        # the robot turns.
-                        yaw = float(wp.to_torch(robot.data.heading_w)[env_idx].item())
-                        c, s = np.cos(yaw), np.sin(yaw)
-                        rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-                        eye_off = rot @ eye_off
-                        lookat_off = rot @ lookat_off
-                    eye_w = (root_pos_w + eye_off).tolist()
-                    target_w = (root_pos_w + lookat_off).tolist()
-                    import isaacsim.core.utils.viewports as _isaacsim_viewports
-                    _isaacsim_viewports.set_camera_view(
-                        eye=eye_w, target=target_w,
-                        camera_prim_path=record_cam_state["prim_path"],
-                    )
+                with _ph("frame_total"):
+                    # Drive the dedicated recording camera before the step so
+                    # the next render (triggered inside env.step via
+                    # RecordVideo) reads a fresh transform.  Writes directly to
+                    # the USD prim via Isaac Sim's viewport util — render
+                    # products read the prim transform, no viewport_api needed.
+                    if record_cam_state is not None and record_cam_state["follow_robot"]:
+                        with _ph("camera"):
+                            robot = env.unwrapped.scene.articulations["robot"]
+                            import warp as wp
+                            env_idx = record_cam_state["env_index"]
+                            root_pos_w = wp.to_torch(robot.data.root_pos_w)[
+                                env_idx, :3
+                            ].detach().cpu().numpy()
+                            eye_off = record_cam_state["eye_offset"]
+                            lookat_off = record_cam_state["lookat_offset"]
+                            if record_cam_state["track_yaw"]:
+                                # Rotate the offsets by the robot's yaw so e.g. a
+                                # side-view (+y) stays on the robot's left even as
+                                # the robot turns.
+                                yaw = float(wp.to_torch(robot.data.heading_w)[env_idx].item())
+                                c, s = np.cos(yaw), np.sin(yaw)
+                                rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                                eye_off = rot @ eye_off
+                                lookat_off = rot @ lookat_off
+                            eye_w = (root_pos_w + eye_off).tolist()
+                            target_w = (root_pos_w + lookat_off).tolist()
+                            import isaacsim.core.utils.viewports as _isaacsim_viewports
+                            _isaacsim_viewports.set_camera_view(
+                                eye=eye_w, target=target_w,
+                                camera_prim_path=record_cam_state["prim_path"],
+                            )
 
-                # run everything in inference mode
-                with torch.inference_mode():
-                    # agent stepping
-                    actions = policy(obs, stochastic_output=args_cli.train_mode)
-                    teacher_actions = (
-                        teacher_model(obs, stochastic_output=args_cli.train_mode)
-                        if teacher_model is not None else None
-                    )
-                    # env stepping
-                    obs, _, dones, _ = env.step(actions)
-                    # reset recurrent states for episodes that have terminated
-                    if version.parse(installed_version) >= version.parse("4.0.0"):
-                        policy.reset(dones)
-                    else:
-                        policy_nn.reset(dones)
+                    # run everything in inference mode
+                    with torch.inference_mode():
+                        # agent stepping
+                        with _ph("policy"):
+                            actions = policy(obs, stochastic_output=args_cli.train_mode)
+                            teacher_actions = (
+                                teacher_model(obs, stochastic_output=args_cli.train_mode)
+                                if teacher_model is not None else None
+                            )
+                        # env stepping (physics + GUI render + managers)
+                        with _ph("env_step"):
+                            obs, _, dones, _ = env.step(actions)
+                        # reset recurrent states for episodes that have terminated
+                        if version.parse(installed_version) >= version.parse("4.0.0"):
+                            policy.reset(dones)
+                        else:
+                            policy_nn.reset(dones)
 
-                if logging_enabled:
-                    logger.collect_step(env)
-                    if teacher_model is not None:
-                        logger.collect_distillation_actions(
-                            student_actions=actions, teacher_actions=teacher_actions
+                    if logging_enabled:
+                        with _ph("logger"):
+                            logger.collect_step(env)
+                            if teacher_model is not None:
+                                logger.collect_distillation_actions(
+                                    student_actions=actions, teacher_actions=teacher_actions
+                                )
+                    if is_moe and "val" in _last_gate_w:
+                        gate_weights_log.append(_last_gate_w["val"])
+
+                # rolling profiling report
+                if phase_timer is not None:
+                    phase_timer.tick()
+                    prof_window += 1
+                    if prof_window >= args_cli.profile_steps:
+                        phase_timer.report(
+                            total_key="frame_total",
+                            top_level=["camera", "policy", "env_step", "logger"],
+                            reset=True,
+                            title="PLAY per-frame breakdown",
+                            out_path=profile_report_path,
                         )
-                if is_moe and "val" in _last_gate_w:
-                    gate_weights_log.append(_last_gate_w["val"])
+                        prof_window = 0
 
                 timestep += 1
                 if args_cli.video and timestep >= args_cli.video_length:
@@ -438,6 +505,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except KeyboardInterrupt:
             pass
         finally:
+            # Flush any partial profiling window (e.g. on Ctrl-C).
+            if phase_timer is not None:
+                phase_timer.report(
+                    total_key="frame_total",
+                    top_level=["camera", "policy", "env_step", "logger"],
+                    title="PLAY per-frame breakdown (final)",
+                    out_path=profile_report_path,
+                )
             # Generate plots from collected data
             if logging_enabled and logger.num_steps > 0:
                 data, metadata = logger.finalize()
