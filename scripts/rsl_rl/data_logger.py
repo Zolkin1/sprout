@@ -314,72 +314,13 @@ class DataLogger:
             stacked = torch.stack(tensors, dim=0)
             data[key] = stacked.cpu().numpy()
 
-        # Per-trajectory V summary (multiskill only).
-        if "traj_idx" in self._data and "v" in self._data:
-            self._compute_per_traj_summary(data)
+        # Note: per-trajectory CLF/tracking + termination summaries now live in
+        # the dedicated headless eval (scripts/rsl_rl/eval_per_trajectory.py /
+        # per_traj_stats.py), which has far better trajectory coverage than an
+        # interactive play rollout. This logger only collects the per-step
+        # ``traj_idx``/``v`` series used by the play plots.
 
         return data, self.metadata
-
-    def _compute_per_traj_summary(self, data: dict[str, np.ndarray]) -> None:
-        """Aggregate per-trajectory mean V across the rollout.
-
-        Replays collected ``(traj_idx, v)`` through a fresh
-        :class:`TrajectoryCLFStats` in ``mean`` mode and writes
-        ``per_traj_v_mean``, ``per_traj_v_count``, ``per_traj_names`` into
-        ``data``. Uses the same gating as the live training tracker:
-        skip a few frames after env reset (detected via ``v == 0`` on the
-        first reset frame, or ``dones`` if available later) and after
-        skill transitions.
-        """
-        try:
-            from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.traj_clf_stats import (
-                TrajectoryCLFStats,
-            )
-        except Exception as exc:
-            self._warn("per_traj_summary", f"Could not import TrajectoryCLFStats: {exc}")
-            return
-
-        traj_idx_np = data["traj_idx"]  # [T, N]
-        v_np = data["v"]                # [T, N]
-        if traj_idx_np.size == 0:
-            return
-
-        T = self._num_trajectories
-        if T is None:
-            T = int(traj_idx_np.max()) + 1
-
-        traj_idx_t = torch.from_numpy(traj_idx_np).long()
-        v_t = torch.from_numpy(v_np).float()
-
-        # Active mask: skip the first `warmup` frames of the rollout (CLF
-        # buffer warmup) and any frame where the trajectory changed in the
-        # last `warmup` steps (covers both resets and skill transitions
-        # for one bookkeeping pass).
-        warmup = 3
-        T_steps, N = traj_idx_t.shape
-        traj_changed = torch.zeros((T_steps, N), dtype=torch.bool)
-        traj_changed[1:] = traj_idx_t[1:] != traj_idx_t[:-1]
-
-        active = torch.ones_like(traj_changed)
-        active[:warmup] = False
-        # Roll-and-OR over the last `warmup` frames of traj_changed.
-        recent_change = traj_changed.clone()
-        for offset in range(1, warmup):
-            recent_change[offset:] |= traj_changed[: T_steps - offset]
-        active &= ~recent_change
-
-        stats = TrajectoryCLFStats(
-            num_trajectories=T, device="cpu", mode="mean",
-        )
-        for t in range(T_steps):
-            stats.update(traj_idx_t[t], v_t[t], active[t])
-
-        means = stats.get_means().numpy()
-        counts = stats.get_counts().numpy()
-        data["per_traj_v_mean"] = means
-        data["per_traj_v_count"] = counts
-        if self._traj_names is not None:
-            self.metadata["per_traj_names"] = list(self._traj_names)
 
     # ------------------------------------------------------------------
     # Private helpers
