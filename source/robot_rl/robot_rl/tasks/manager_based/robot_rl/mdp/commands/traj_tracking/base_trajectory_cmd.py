@@ -428,6 +428,111 @@ class BaseTrajectoryCommand(CommandTerm):
                 self.dy_des[env_ids[episodic_mask]] *= 0
 
     # ------------------------------------------------------------------
+    # World-frame reference reconstruction
+    # ------------------------------------------------------------------
+
+    def get_reference_world_state(self, base_frame_name: str) -> torch.Tensor:
+        """Reconstruct the current desired reference as a world-frame state vector.
+
+        The returned layout matches the raw robot ``state`` recorded by
+        ``scripts/rsl_rl/record_data.py``::
+
+            [root_pos_w(3), root_quat_w(4, xyzw), root_lin_vel_w(3),
+             root_ang_vel_w(3), joint_pos(nj), joint_vel(nj)]
+
+        The base pose/velocity stored in ``y_des``/``dy_des`` are expressed
+        yaw-aligned relative to the active contact frame ``self.ref_poses``
+        (see :meth:`compute_measured_output`); this inverts that alignment to
+        lift them back to the world frame.  Joint targets are reordered to
+        ``self.robot.joint_names`` so the joint axis matches the recorded
+        ``state``.  Mirrors the extraction in
+        :func:`mdp.events.resets.reset_on_reference`.
+
+        Args:
+            base_frame_name: Trajectory output frame used as the robot root;
+                must expose ``pos_x/y/z`` and ``ori_x/y/z/w`` outputs (e.g.
+                ``"pelvis_link"``).
+
+        Returns:
+            World-frame reference state, shape ``[num_envs, 3 + 4 + 3 + 3 + 2*nj]``.
+        """
+        idx = self._reference_world_indices(base_frame_name)
+
+        # Base pose/vel in the yaw-aligned contact frame.
+        base_pos_rel = self.y_des[:, idx["pos"]]       # [N, 3]
+        base_quat_rel = self.y_des[:, idx["ori"]]      # [N, 4] xyzw
+        base_lin_rel = self.dy_des[:, idx["lin_vel"]]  # [N, 3]
+        base_ang_rel = self.dy_des[:, idx["ang_vel"]]  # [N, 3]
+
+        # Lift to world: invert the yaw-alignment about the contact frame. The
+        # forward path (compute_measured_output / _align_yaw) rotates by
+        # ``fwd = yaw_quat(quat_inv(ref))``, so the inverse rotation is
+        # ``quat_inv(fwd)`` -- NOT ``yaw_quat(ref)``, which only matches when the
+        # contact frame has zero roll/pitch (it does not on uneven terrain).
+        ref_pos_w = self.ref_poses[:, :3]
+        inv_yaw = quat_inv(yaw_quat(quat_inv(self.ref_poses[:, 3:7])))
+        base_pos_w = ref_pos_w + quat_apply(inv_yaw, base_pos_rel)
+        base_quat_w = quat_mul(inv_yaw, base_quat_rel)
+        base_lin_w = quat_apply(inv_yaw, base_lin_rel)
+        base_ang_w = quat_apply(inv_yaw, base_ang_rel)
+
+        # Joints, reordered to the robot's joint order.
+        joint_pos = self.y_des[:, idx["joint_pos"]]
+        joint_vel = self.dy_des[:, idx["joint_vel"]]
+
+        return torch.cat(
+            [base_pos_w, base_quat_w, base_lin_w, base_ang_w, joint_pos, joint_vel], dim=-1
+        )
+
+    def _reference_world_indices(self, base_frame_name: str) -> dict[str, torch.Tensor]:
+        """Resolve (and cache) the output-vector indices used by :meth:`get_reference_world_state`.
+
+        Args:
+            base_frame_name: Trajectory output frame used as the robot root.
+
+        Returns:
+            Dict of long-tensor index sets keyed by ``pos``, ``ori``, ``lin_vel``,
+            ``ang_vel``, ``joint_pos``, ``joint_vel``.
+        """
+        cache = getattr(self, "_ref_world_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._ref_world_idx_cache = cache
+        if base_frame_name in cache:
+            return cache[base_frame_name]
+
+        pos = _find_output_indices(self.ordered_pos_output_names, base_frame_name, "pos_")
+        ori = _find_output_indices(self.ordered_pos_output_names, base_frame_name, "ori_")
+        if len(pos) != 3 or len(ori) != 4:
+            raise ValueError(
+                f"Base frame '{base_frame_name}' must expose pos_x/y/z and ori_x/y/z/w in the "
+                f"trajectory outputs (found {len(pos)} pos, {len(ori)} ori)."
+            )
+        lin_vel = _find_output_indices(self.ordered_vel_output_names, base_frame_name, "pos_")
+        ang_vel = _find_output_indices(self.ordered_vel_output_names, base_frame_name, "ori_")
+
+        joint_pos_idx: list[int] = []
+        joint_vel_idx: list[int] = []
+        for name in self.robot.joint_names:
+            out = f"joint:{name}"
+            if out not in self.ordered_pos_output_names:
+                raise ValueError(f"Joint output '{out}' missing from trajectory outputs.")
+            joint_pos_idx.append(self.ordered_pos_output_names.index(out))
+            joint_vel_idx.append(self.ordered_vel_output_names.index(out))
+
+        dev = self.device
+        entry = {
+            "pos": torch.as_tensor(pos, dtype=torch.long, device=dev),
+            "ori": torch.as_tensor(ori, dtype=torch.long, device=dev),
+            "lin_vel": torch.as_tensor(lin_vel, dtype=torch.long, device=dev),
+            "ang_vel": torch.as_tensor(ang_vel, dtype=torch.long, device=dev),
+            "joint_pos": torch.as_tensor(joint_pos_idx, dtype=torch.long, device=dev),
+            "joint_vel": torch.as_tensor(joint_vel_idx, dtype=torch.long, device=dev),
+        }
+        cache[base_frame_name] = entry
+        return entry
+
+    # ------------------------------------------------------------------
     # Symmetry helpers
     # ------------------------------------------------------------------
 
@@ -662,6 +767,23 @@ class BaseTrajectoryCommand(CommandTerm):
 # ======================================================================
 # Module-level helpers
 # ======================================================================
+
+def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:
+    """Return indices of outputs named ``"{frame_name}:...{suffix_pattern}..."``.
+
+    Args:
+        ordered_names: Ordered output names (position or velocity list).
+        frame_name: Frame the outputs belong to (e.g. ``"pelvis_link"``).
+        suffix_pattern: Substring identifying the output kind (e.g. ``"pos_"`` or ``"ori_"``).
+
+    Returns:
+        Matching indices in the order they appear in ``ordered_names``.
+    """
+    return [
+        i for i, name in enumerate(ordered_names)
+        if name.startswith(f"{frame_name}:") and suffix_pattern in name
+    ]
+
 
 def _align_yaw(vec: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:
     """Rotate *vec* into the yaw-aligned frame of *root_quat*."""

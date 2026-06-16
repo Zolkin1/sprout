@@ -88,6 +88,16 @@ parser.add_argument(
     help="Sample actions stochastically. Default is deterministic (mean) actions.",
 )
 parser.add_argument(
+    "--ref_command_name", type=str, default=None,
+    help="Name of the trajectory command term to record the reference state from. "
+         "Default: auto-detect the command term exposing get_reference_world_state.",
+)
+parser.add_argument(
+    "--ref_base_frame", type=str, default="pelvis_link",
+    help="Trajectory output frame used as the robot root when reconstructing the "
+         "reference state (must expose pos_x/y/z and ori_x/y/z/w outputs).",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False,
     help="Disable fabric and use USD I/O operations.",
 )
@@ -120,6 +130,37 @@ def _resolve_resume_path(agent_cfg: RslRlBaseRunnerCfg) -> str:
     else:
         play_log_path = log_root_path
     return get_checkpoint_path(play_log_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+
+def _resolve_ref_command(env: RslRlVecEnvWrapper, explicit_name: str | None):
+    """Find the trajectory command term used to reconstruct the reference state.
+
+    Args:
+        env: The wrapped Isaac Lab environment.
+        explicit_name: Command term name from the CLI, or ``None`` to auto-detect
+            the first term exposing ``get_reference_world_state``.
+
+    Returns:
+        ``(name, term)`` for the resolved trajectory command, or ``(None, None)``
+        if the task has no such command (e.g. velocity-only tasks).
+
+    Raises:
+        ValueError: If ``explicit_name`` is given but the term cannot provide a
+            reference state.
+    """
+    cmd_mgr = env.unwrapped.command_manager
+    if explicit_name is not None:
+        term = cmd_mgr.get_term(explicit_name)
+        if not hasattr(term, "get_reference_world_state"):
+            raise ValueError(
+                f"Command term '{explicit_name}' does not expose get_reference_world_state."
+            )
+        return explicit_name, term
+    for name in cmd_mgr.active_terms:
+        term = cmd_mgr.get_term(name)
+        if hasattr(term, "get_reference_world_state"):
+            return name, term
+    return None, None
 
 
 def _build_recording_meta(
@@ -188,6 +229,8 @@ def collect_pairs(
     num_steps: int,
     num_pairs: int,
     stochastic: bool,
+    ref_cmd=None,
+    ref_base_frame: str = "pelvis_link",
 ) -> dict[str, np.ndarray]:
     """Roll out the policy and collect flattened (obs, action) pairs.
 
@@ -206,11 +249,16 @@ def collect_pairs(
         num_steps: Number of rollout steps (``ceil(num_pairs / num_envs)``).
         num_pairs: Total pairs to keep; arrays are trimmed to this length.
         stochastic: Whether to sample actions stochastically.
+        ref_cmd: Trajectory command term exposing ``get_reference_world_state``,
+            or ``None`` to skip recording the reference state.
+        ref_base_frame: Trajectory output frame used as the robot root for the
+            reference reconstruction.
 
     Returns:
         A dict of arrays each with leading dimension ``num_pairs``:
-        ``obs``, ``action``, ``terminated``, ``done``, ``time_out``,
-        ``episode_id``, ``step_in_episode``.
+        ``obs``, ``action``, ``state``, ``terminated``, ``done``, ``time_out``,
+        ``episode_id``, ``step_in_episode`` and, when ``ref_cmd`` is given,
+        ``ref_state`` (the desired reference in the same layout as ``state``).
     """
     n_envs = env.num_envs
     device = env.unwrapped.device
@@ -228,6 +276,8 @@ def collect_pairs(
         "terminated": [], "done": [], "time_out": [],
         "episode_id": [], "step_in_episode": [],
     }
+    if ref_cmd is not None:
+        buf["ref_state"] = []
 
     print(f"[INFO] Collecting {num_steps} steps on {n_envs} envs "
           f"({num_steps * n_envs} pairs, trimming to {num_pairs})...")
@@ -250,6 +300,13 @@ def collect_pairs(
             wp.to_torch(robot.data.joint_vel),       # [N, num_joints] (raw)
         ], dim=-1)
         buf["state"].append(state.detach().cpu().clone())
+        # Desired reference at the same timestep, reconstructed to the world-frame
+        # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
+        # obs (last computed during the previous env.step), so this stays aligned
+        # with the pre-step ``state``/``obs`` snapshot above.
+        if ref_cmd is not None:
+            ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
+            buf["ref_state"].append(ref_state.detach().cpu().clone())
         buf["episode_id"].append(episode_id.detach().cpu().clone())
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
@@ -383,13 +440,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             policy_nn.reset()
 
-        data = collect_pairs(env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic)
+        # Resolve the trajectory command to record the reference state from.
+        ref_name, ref_cmd = _resolve_ref_command(env, args_cli.ref_command_name)
+        if ref_cmd is not None:
+            print(f"[INFO] Recording reference state from command '{ref_name}' "
+                  f"(base frame '{args_cli.ref_base_frame}').")
+        else:
+            print("[WARN] No trajectory command with get_reference_world_state found; "
+                  "skipping ref_state recording.")
+
+        data = collect_pairs(
+            env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic,
+            ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
+        )
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")
         save_recorded_data(out_path, data, meta)
         print(f"[INFO] Saved {meta.num_pairs} (obs, action) pairs to: {out_path}")
+        ref_shape = data["ref_state"].shape if "ref_state" in data else None
         print(f"[INFO]   obs shape={data['obs'].shape}, action shape={data['action'].shape}, "
-              f"state shape={data['state'].shape}, terminations flagged={int(data['terminated'].sum())}")
+              f"state shape={data['state'].shape}, ref_state shape={ref_shape}, "
+              f"terminations flagged={int(data['terminated'].sum())}")
 
         env.close()
 

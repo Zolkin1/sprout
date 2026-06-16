@@ -191,10 +191,21 @@ class FutureStateDataset(Dataset):
         ).reshape(n_win, window_len, self.state_dim)
 
         hist_state = rel[:, :h, :]                                  # (Nw, H, state_dim)
-        future = rel[:, h:, :].contiguous()                         # (Nw, F, state_dim)
         vel_cmd = ow[:, :h, self.vel_slice[0]:self.vel_slice[1]]    # (Nw, H, vel_dim)
         scan = ow[:, :h, self.scan_slice[0]:self.scan_slice[1]]     # (Nw, H, scan_dim)
         history = torch.cat([hist_state, vel_cmd, scan], dim=-1).contiguous()  # (Nw, H, Din)
+
+        # Future target: the actual recorded state, or the tracked reference --
+        # both expressed in the same relative frame (anchored at the actual pose
+        # at step h-1, so history conditioning is identical for either source).
+        if cfg.target_source == "reference":
+            future = self._reference_future(data, s_slc, idx, p, q, h, f, nj)  # (Nw, F, state_dim)
+        elif cfg.target_source == "actual":
+            future = rel[:, h:, :].contiguous()                     # (Nw, F, state_dim)
+        else:
+            raise ValueError(
+                f"Unknown target_source {cfg.target_source!r}; expected 'actual' or 'reference'."
+            )
 
         # Reference pose per window, kept raw for eval/denorm back to world frame.
         self.p_ref = p[:, h - 1, :].contiguous()  # (Nw, 3)
@@ -216,6 +227,71 @@ class FutureStateDataset(Dataset):
         # Pre-normalize once (store normalized tensors; __getitem__ is a pure slice).
         self.history = history_normalizer.normalize(history)
         self.future = target_normalizer.normalize(future)
+
+    def _reference_future(
+        self,
+        data: dict[str, np.ndarray],
+        s_slc: dict[str, tuple[int, int]],
+        idx: np.ndarray,
+        p_actual: torch.Tensor,
+        q_actual: torch.Tensor,
+        h: int,
+        f: int,
+        nj: int,
+    ) -> torch.Tensor:
+        """Build the future target from the recorded reference (``ref_state``).
+
+        The reference future is expressed in the *same* relative frame as the
+        actual-state target: anchored at the actual root pose at the last history
+        step (``p_actual``/``q_actual`` at index ``h-1``), so the history
+        conditioning is identical regardless of target source.
+
+        Args:
+            data: Recorded arrays; must include a non-``None`` ``ref_state``.
+            s_slc: Per-term ``(start, end)`` slices within the state vector.
+            idx: Window row indices, shape ``(Nw, W)``.
+            p_actual: Actual root positions over the window, shape ``(Nw, W, 3)``.
+            q_actual: Actual root quaternions over the window, shape ``(Nw, W, 4)``.
+            h: History length.
+            f: Future length.
+            nj: Number of joints.
+
+        Returns:
+            Reference future in the relative-frame representation, shape ``(Nw, F, state_dim)``.
+
+        Raises:
+            ValueError: If the recording has no ``ref_state`` array.
+        """
+        ref_np = data.get("ref_state")
+        if ref_np is None:
+            raise ValueError(
+                "target_source='reference' requires a 'ref_state' array in the recording; "
+                "re-record with scripts/rsl_rl/record_data.py on a task that has a trajectory command."
+            )
+        ref_t = torch.from_numpy(np.ascontiguousarray(ref_np)).float()
+        rw = ref_t[idx][:, h:, :]  # (Nw, F, state_raw)
+        n_win = rw.shape[0]
+
+        def _split(name: str) -> torch.Tensor:
+            a, b = s_slc[name]
+            return rw[..., a:b]
+
+        pf = _split("root_pos_w")       # (Nw, F, 3)
+        qf = _split("root_quat_w")      # (Nw, F, 4)
+        vf = _split("root_lin_vel_w")   # (Nw, F, 3)
+        wf = _split("root_ang_vel_w")   # (Nw, F, 3)
+        jpf = _split("joint_pos")       # (Nw, F, nj)
+        jvf = _split("joint_vel")       # (Nw, F, nj)
+
+        p_ref = p_actual[:, h - 1 : h, :].expand(n_win, f, 3)
+        q_ref = q_actual[:, h - 1 : h, :].expand(n_win, f, 4)
+
+        m = n_win * f
+        return relative_state(
+            pf.reshape(m, 3), qf.reshape(m, 4), vf.reshape(m, 3), wf.reshape(m, 3),
+            jpf.reshape(m, nj), jvf.reshape(m, nj),
+            p_ref.reshape(m, 3), q_ref.reshape(m, 4),
+        ).reshape(n_win, f, self.state_dim).contiguous()
 
     def __len__(self) -> int:
         return self.history.shape[0]

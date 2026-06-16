@@ -11,12 +11,14 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from isaaclab.utils.math import matrix_from_quat
 
 from robot_rl.flow_matching import (
     FlowMatchingConfig,
     FlowMatchingTransformer,
+    FutureStateDataset,
     Normalizer,
     build_train_val,
     episode_windows,
@@ -24,7 +26,9 @@ from robot_rl.flow_matching import (
     matrix_to_rot6d,
     orientation_slice,
     quat_to_rot6d,
+    relative_state,
     relative_state_from_window,
+    resolve_term_slice,
     rot6d_to_matrix,
     rot6d_to_quat,
     sample_flow_batch,
@@ -262,8 +266,13 @@ def test_episode_windows_respect_boundaries():
 # ---------------------------------------------------------------------------
 # Dataset end-to-end build with synthetic recorded-style data
 # ---------------------------------------------------------------------------
-def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150):
-    """Build a synthetic (data, meta) pair shaped like a recorded .npz."""
+def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False):
+    """Build a synthetic (data, meta) pair shaped like a recorded .npz.
+
+    If ``with_ref`` is set, a distinct ``ref_state`` array (same layout as
+    ``state``, unit quaternions) is added so the reference target source can be
+    exercised.
+    """
     rng = np.random.default_rng(0)
     n = num_envs * steps
     # obs layout: velocity_commands(3), height_scan(scan_dim), joint_pos(nj)
@@ -273,10 +282,14 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150):
     # state layout matches the recorder
     state_term_names = ["root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel"]
     state_term_dims = [3, 4, 3, 3, nj, nj]
-    state = rng.standard_normal((n, sum(state_term_dims))).astype(np.float32)
-    # normalize the quaternion block to unit length
-    q = state[:, 3:7]
-    state[:, 3:7] = q / np.linalg.norm(q, axis=1, keepdims=True)
+
+    def _make_state(seed: int) -> np.ndarray:
+        s = np.random.default_rng(seed).standard_normal((n, sum(state_term_dims))).astype(np.float32)
+        q = s[:, 3:7]
+        s[:, 3:7] = q / np.linalg.norm(q, axis=1, keepdims=True)  # unit quaternion block
+        return s
+
+    state = _make_state(0)
     # episode_id / step_in_episode: one episode per env, steps 0..steps-1
     episode_id = np.repeat(np.arange(num_envs), steps).astype(np.int64)
     step_in_episode = np.tile(np.arange(steps), num_envs).astype(np.int64)
@@ -285,6 +298,8 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150):
         "obs": obs, "state": state, "episode_id": episode_id,
         "step_in_episode": step_in_episode, "done": done,
     }
+    if with_ref:
+        data["ref_state"] = _make_state(1)  # distinct from the actual state
     meta = SimpleNamespace(
         obs_term_names=obs_term_names, obs_term_dims=obs_term_dims,
         state_term_names=state_term_names, state_term_dims=state_term_dims,
@@ -306,3 +321,66 @@ def test_dataset_build_shapes():
     assert val_ds is not None and len(val_ds) > 0
     # episode-disjoint split
     # (rebuild windows to map back is overkill; rely on build_train_val's split-by-episode)
+
+
+def _split_state(rw, s_slc, name):
+    """Slice a named state term out of a windowed state tensor."""
+    a, b = s_slc[name]
+    return rw[..., a:b]
+
+
+def test_target_source_reference_uses_ref_state():
+    """`target_source='reference'` predicts ref_state while keeping the actual
+    history/anchor; `'actual'` predicts state. Both modes share history/p_ref/q_ref."""
+    nj = 21
+    data, meta = _synthetic_dataset(num_envs=4, steps=60, nj=nj, scan_dim=8, with_ref=True)
+    h, f = 25, 25
+    windows = episode_windows(
+        data["episode_id"], data["step_in_episode"], data["done"], h + f, stride=1
+    )
+    assert len(windows) > 0
+
+    cfg_a = FlowMatchingConfig(history_len=h, future_len=f, target_source="actual", seed=0)
+    cfg_r = FlowMatchingConfig(history_len=h, future_len=f, target_source="reference", seed=0)
+    ds_a = FutureStateDataset(data, meta, cfg_a, windows)
+    ds_r = FutureStateDataset(data, meta, cfg_r, windows)
+
+    # History conditioning and the relative-frame anchor are identical across modes.
+    torch.testing.assert_close(ds_a.history, ds_r.history)
+    torch.testing.assert_close(ds_a.p_ref, ds_r.p_ref)
+    torch.testing.assert_close(ds_a.q_ref, ds_r.q_ref)
+
+    # Targets differ because ref_state != state.
+    fut_a = ds_a.target_normalizer.denormalize(ds_a.future)
+    fut_r = ds_r.target_normalizer.denormalize(ds_r.future)
+    assert not torch.allclose(fut_a, fut_r)
+
+    # The reference future is relative_state(ref_state future rows) anchored at the
+    # *actual* pose at step h-1. Verify directly on window 0.
+    s_names = list(meta.state_term_names)
+    s_dims = list(meta.state_term_dims)
+    s_slc = {name: resolve_term_slice(s_names, s_dims, name) for name in s_names}
+    w0 = windows[0]
+    ref_w = torch.from_numpy(data["ref_state"][w0]).float()       # (W, raw)
+    state_w = torch.from_numpy(data["state"][w0]).float()
+    p_ref = state_w[h - 1 : h, s_slc["root_pos_w"][0]:s_slc["root_pos_w"][1]].expand(f, 3)
+    q_ref = state_w[h - 1 : h, s_slc["root_quat_w"][0]:s_slc["root_quat_w"][1]].expand(f, 4)
+    fut = ref_w[h:]
+    expected = relative_state(
+        _split_state(fut, s_slc, "root_pos_w"), _split_state(fut, s_slc, "root_quat_w"),
+        _split_state(fut, s_slc, "root_lin_vel_w"), _split_state(fut, s_slc, "root_ang_vel_w"),
+        _split_state(fut, s_slc, "joint_pos"), _split_state(fut, s_slc, "joint_vel"),
+        p_ref, q_ref,
+    )
+    torch.testing.assert_close(fut_r[0], expected, rtol=1e-4, atol=1e-4)
+
+
+def test_target_source_reference_requires_ref_state():
+    """Selecting the reference target without a recorded ref_state raises."""
+    data, meta = _synthetic_dataset(num_envs=4, steps=60, nj=21, scan_dim=8, with_ref=False)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, target_source="reference", seed=0)
+    windows = episode_windows(
+        data["episode_id"], data["step_in_episode"], data["done"], 50, stride=1
+    )
+    with pytest.raises(ValueError, match="ref_state"):
+        FutureStateDataset(data, meta, cfg, windows)

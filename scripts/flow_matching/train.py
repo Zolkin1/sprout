@@ -62,6 +62,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--future_len", type=int, default=25)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--target_source", type=str, default="actual", choices=["actual", "reference"],
+        help="Future target: 'actual' recorded state, or the tracked 'reference' "
+             "(requires ref_state in the dataset). History is always the actual state.",
+    )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_encoder_layers", type=int, default=4)
@@ -80,7 +85,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         history_len=args.history_len, future_len=args.future_len, stride=args.stride,
-        val_fraction=args.val_fraction, d_model=args.d_model, nhead=args.nhead,
+        val_fraction=args.val_fraction, target_source=args.target_source,
+        d_model=args.d_model, nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
         num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
@@ -159,8 +165,9 @@ def main() -> None:
     data, meta = load_recorded_data(args.data)
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
-    print(f"[INFO] state_dim={cfg.state_dim}, history_in_dim={cfg.history_in_dim}, "
-          f"train_windows={len(train_ds)}, val_windows={0 if val_ds is None else len(val_ds)}")
+    print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
+          f"history_in_dim={cfg.history_in_dim}, train_windows={len(train_ds)}, "
+          f"val_windows={0 if val_ds is None else len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,

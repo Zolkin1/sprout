@@ -121,15 +121,23 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
     Args:
         path: Destination ``.npz`` path.
         data: Per-pair arrays (``obs``, ``action``, ``state``, ``terminated``,
-            ``done``, ``time_out``, ``episode_id``, ``step_in_episode``).
+            ``done``, ``time_out``, ``episode_id``, ``step_in_episode``). May also
+            include ``ref_state`` (desired reference in the ``state`` layout); it
+            is written only when present.
         meta: Provenance/layout metadata to embed alongside the arrays.
     """
+    # ``ref_state`` shares the ``state`` layout (meta.state_term_*); written only
+    # when the recording task exposed a trajectory reference.
+    optional_arrays = {}
+    if data.get("ref_state") is not None:
+        optional_arrays["ref_state"] = data["ref_state"].astype(np.float32)
     np.savez_compressed(
         path,
         # per-pair arrays
         obs=data["obs"].astype(np.float32),
         action=data["action"].astype(np.float32),
         state=data["state"].astype(np.float32),
+        **optional_arrays,
         terminated=data["terminated"].astype(np.uint8),
         done=data["done"].astype(np.uint8),
         time_out=data["time_out"].astype(np.uint8),
@@ -176,6 +184,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         "obs": z["obs"],
         "action": z["action"],
         "state": z["state"],
+        # Present only for datasets recorded with a trajectory reference; older
+        # files lack it, so default to None.
+        "ref_state": z["ref_state"] if "ref_state" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],

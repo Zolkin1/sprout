@@ -24,6 +24,11 @@ class FlowMatchingConfig:
     val_fraction: float = 0.1
     precompute: bool = True
 
+    # Future-target source: "actual" predicts the recorded robot state; "reference"
+    # predicts the tracked reference (requires ``ref_state`` in the recording).
+    # History/conditioning is always the actual recorded state.
+    target_source: str = "actual"
+
     # -- dimensions (resolved from the dataset at build time) --
     state_dim: int = 57
     history_in_dim: int | None = None
