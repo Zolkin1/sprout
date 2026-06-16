@@ -4,6 +4,7 @@ import copy
 
 from isaaclab.utils import configclass
 from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -122,11 +123,32 @@ class G1TerrainMultiskillObservationCfg(G1MultiSkillObservationCfg):
     student: StudentCfg = StudentCfg()
 
 @configclass
+class G1TerrainMultiskillCurriculumCfg:
+    """Curriculum terms for the terrain multiskill MDP."""
+
+    # Anneal the frame-drift termination's post-transition grace window upward so
+    # that post-skill-transition transients are penalized progressively less and
+    # eventually (once grace covers a full episode) frame drift never fires after a
+    # transition. Steady-state / fresh-episode frame drift stays active.
+    frame_drift_grace = CurrTerm(
+        func=mdp.grace_period_curriculum,
+        params={
+            "term_name": "frame_drift",
+            "increment_s": 2.0,
+            "interval_iters": 3000,
+            "num_steps_per_env": 24,  # keep in sync with agents/rsl_rl_ppo_cfg.py
+            # max_grace_period_s=None -> caps at the episode length (20 s)
+        },
+    )
+
+
+@configclass
 class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
     """Config for the G1 for multiple skills with terrain."""
 
     scene: G1TerrainMultiskillSceneCfg = G1TerrainMultiskillSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: G1TerrainMultiskillObservationCfg = G1TerrainMultiskillObservationCfg()
+    curriculum: G1TerrainMultiskillCurriculumCfg = G1TerrainMultiskillCurriculumCfg()
 
     def __post_init__(self):
         # Post init of parent
@@ -302,7 +324,7 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
               "frame_names": ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link"],
               "max_frac": 0.3,
               "min_dist": 0.1,
-              "grace_period_s": 1.0,
+              "grace_period_s": 100.0,
           },
         )
 
@@ -327,6 +349,35 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
                 DoneTerm(
                     func=mdp.frame_drift_in_skill,
                     params={"cmd_name": "traj_ref", "skill_name": skill},
+                ),
+            )
+
+        # Frame-drift terminations that land within ``window_s`` after the grace
+        # period ends — a proxy for "the transition itself failed (just late)".
+        # Logging only: an exact subset of frame_drift, so training is unchanged.
+        # wandb: Episode_Termination/frame_drift_post_grace. ``grace_period_s`` is
+        # read from frame_drift's params automatically. Registered after
+        # frame_drift so it computes first and can read its done.
+        self.terminations.frame_drift_post_grace = DoneTerm(
+            func=mdp.frame_drift_post_grace,
+            params={"cmd_name": "traj_ref", "window_s": 0.25},
+        )
+
+        # Per-skill breakdown of the post-grace metric
+        # (wandb: Episode_Termination/frame_drift_post_grace_<skill>). Reuses the
+        # generic frame_drift_in_skill masker by pointing base_term at the
+        # post-grace term. Registered after it so it computes first.
+        for skill in self.scene.terrain.skill_list:
+            setattr(
+                self.terminations,
+                f"frame_drift_post_grace_{skill}",
+                DoneTerm(
+                    func=mdp.frame_drift_in_skill,
+                    params={
+                        "cmd_name": "traj_ref",
+                        "skill_name": skill,
+                        "base_term": "frame_drift_post_grace",
+                    },
                 ),
             )
 

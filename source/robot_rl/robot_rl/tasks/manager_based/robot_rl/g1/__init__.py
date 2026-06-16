@@ -437,6 +437,15 @@ if not _registered:
     )
 
     # Multiskill terrain
+    # TODO(zolkin): rename the runner these two point at. "HalfPeriodic" only
+    # describes phase-clock handling (negate sin/cos_phase under reflection),
+    # but this env disables the phase clock (sin_phase/cos_phase = None) and
+    # feeds explicit trajectory-reference obs, so the half-periodic-vs-episodic
+    # distinction is inert here and the label is misleading. Add a phase-
+    # agnostic SagittalSymmetricPPORunnerCfg (same as SymmetricEpisodic, using
+    # symmetric_data_augmentation_episodic) and point both registrations at it.
+    # Don't rename SymmetricHalfPeriodicPPORunnerCfg itself — it's accurate for
+    # the phase-obs envs (running / stairs / walk_run) that still use it.
     gym.register(
         id="G1-multiskill-terrain-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",

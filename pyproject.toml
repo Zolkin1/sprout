@@ -1,6 +1,9 @@
 # pyproject.toml
 [tool.setuptools.packages.find]
-where = ["."]
+# The package lives under source/robot_rl/ (Isaac Lab extension layout), NOT the
+# repo root.  With where=["."] setuptools found zero packages, producing a broken
+# editable install (empty finder MAPPING) on `pip install -e .` / `uv sync`.
+where = ["source/robot_rl"]
 include = ["robot_rl*"]
 
 [build-system]

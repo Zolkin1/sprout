@@ -275,6 +275,69 @@ def frame_drift_in_skill(
     return drift & (cmd.skill_id == skill_idx)
 
 
+def frame_drift_post_grace(
+    env,
+    cmd_name: str = "traj_ref",
+    window_s: float = 0.25,
+    base_term: str = "frame_drift",
+    grace_period_s: float | None = None,
+) -> torch.Tensor:
+    """Subset of ``base_term``'s frame-drift done, masked to envs that
+    terminated within ``window_s`` seconds *after* the grace period ended.
+
+    A frame-drift termination this soon after a trajectory swap's grace window
+    expires is strong evidence the transition itself failed (it just took
+    slightly longer than the grace period to blow up), rather than steady-state
+    tracking drift. Logged by the ``TerminationManager`` as
+    ``Episode_Termination/frame_drift_post_grace``; compare against
+    ``Episode_Termination/frame_drift`` for the suspected-transition-failure
+    fraction.
+
+    Like :func:`frame_drift_in_skill` this is an exact subset of ``base_term``
+    (an already-active term) read via ``get_term``, so the union of all done
+    signals — and therefore training dynamics — is unchanged, and the grace
+    logic is not recomputed. This requires ``base_term`` to be computed earlier
+    in the step than this term, which holds as long as it is registered before
+    it in the terminations cfg.
+
+    The window is ``[grace_period_s, grace_period_s + window_s)`` in seconds,
+    measured by ``cmd.time_since_traj_change_s`` (reset to 0 on an in-episode
+    trajectory swap, 1e6 on a fresh reset — so envs that never transitioned are
+    naturally excluded). The lower bound is redundant while ``frame_drift`` can
+    only fire after grace, but is kept explicit so the metric stays correct if
+    the parent gate ever changes.
+
+    Args:
+        env: The IsaacLab environment.
+        cmd_name: Trajectory command term exposing ``time_since_traj_change_s``
+            (the multiskill command).
+        window_s: Width (seconds) of the post-grace window to flag.
+        base_term: Name of the parent frame-drift termination term.
+        grace_period_s: Grace window (seconds). Defaults to ``None``, in which
+            case it is read from ``base_term``'s own ``grace_period_s`` param via
+            ``get_term_cfg`` so it tracks the parent automatically.
+
+    Returns:
+        Boolean tensor of shape ``[num_envs]`` — ``True`` for envs that
+        terminated via ``base_term`` this step within the post-grace window.
+    """
+    # Safe no-op if the parent term is not active (e.g. disabled in a subclass).
+    if base_term not in env.termination_manager.active_terms:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    drift = env.termination_manager.get_term(base_term)                       # (N,) bool
+    cmd = env.command_manager.get_term(cmd_name)
+    # Silent no-op for command terms without a transition clock (single-skill).
+    time_since = getattr(cmd, "time_since_traj_change_s", None)
+    if time_since is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if grace_period_s is None:
+        grace_period_s = env.termination_manager.get_term_cfg(base_term).params.get(
+            "grace_period_s", 0.0
+        )
+    in_window = (time_since >= grace_period_s) & (time_since < grace_period_s + window_s)
+    return drift & in_window
+
+
 def illegal_terrain_contact(
     env, threshold: float, sensor_cfg: SceneEntityCfg
 ) -> torch.Tensor:

@@ -39,6 +39,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # local imports
 import cli_args  # isort: skip
 from data_logger import DataLogger  # isort: skip
+from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 from robot_rl.network.moe_network import MixtureOfExperts  # isort: skip
@@ -152,6 +153,15 @@ parser.add_argument(
     "--no-logging", dest="no_logging", action="store_true", default=False,
     help="Disable per-step DataLogger collection (overrides --plots) to A/B "
          "test logging cost.",
+)
+parser.add_argument(
+    "--episode_stats", action="store_true", default=False,
+    help="Accumulate the env's extras['log'] (Episode_Termination/*, "
+         "Episode_Reward/*, Metrics/*, Curriculum/*) over the run and write a "
+         "training-comparable summary to <log_dir>/episode_stats.txt. These are "
+         "the same step-mean aggregates the training logger reports, so e.g. "
+         "frame_drift_post_grace can be compared against the wandb curve. "
+         "Independent of --plots / DataLogger.",
 )
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
@@ -389,6 +399,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             logger = DataLogger(env)
         env_ids = list(range(min(args_cli.plot_envs, env_cfg.scene.num_envs)))
 
+        # Optional training-comparable episode-metric accumulator. Folds the
+        # env's extras["log"] (which play normally discards) into running
+        # step-means; written to <log_dir>/episode_stats.txt at the end.
+        ep_stats = EpisodeStatsAccumulator() if args_cli.episode_stats else None
+
         # optional per-frame profiling harness (see scripts/rsl_rl/profiling.py)
         phase_timer = None
         profile_report_path = None
@@ -471,7 +486,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                             )
                         # env stepping (physics + GUI render + managers)
                         with _ph("env_step"):
-                            obs, _, dones, _ = env.step(actions)
+                            obs, _, dones, infos = env.step(actions)
                         # reset recurrent states for episodes that have terminated
                         if version.parse(installed_version) >= version.parse("4.0.0"):
                             policy.reset(dones)
@@ -487,6 +502,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                 )
                     if is_moe and "val" in _last_gate_w:
                         gate_weights_log.append(_last_gate_w["val"])
+                    if ep_stats is not None:
+                        tm = env.unwrapped.termination_manager
+                        term_fired = {n: tm.get_term(n) for n in tm.active_terms}
+                        ep_stats.collect_step(infos, dones, term_fired=term_fired)
 
                 # rolling profiling report
                 if phase_timer is not None:
@@ -522,6 +541,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     title="PLAY per-frame breakdown (final)",
                     out_path=profile_report_path,
                 )
+            # Write/print the training-comparable episode-metric summary.
+            if ep_stats is not None and ep_stats.num_steps > 0:
+                num_envs = env.unwrapped.num_envs
+                print("\n" + ep_stats.format_report(num_envs=num_envs))
+                ep_stats_path = os.path.join(log_dir, "episode_stats.txt")
+                ep_stats.write_report(ep_stats_path, num_envs=num_envs)
+                print(f"[INFO] Episode stats written to: {ep_stats_path}")
             # Generate plots from collected data
             if logging_enabled and logger.num_steps > 0:
                 data, metadata = logger.finalize()
