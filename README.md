@@ -122,6 +122,107 @@ NOTE: The policy must already be exported (see `play_policy` above).
 For now we are uploading the policies to the hugging face repo [here](https://huggingface.co/zolkin/robot_rl/tree/main).
 
 These policies are automatically downloaded in the `transfer/obelisk` controller.
+
+## Profiling
+
+`scripts/rsl_rl/train.py` and `scripts/rsl_rl/play.py` ship with an opt-in profiling harness
+(`scripts/rsl_rl/profiling.py`) that breaks the per-step time down by phase — physics vs. the
+MDP managers (observations / rewards / terminations / commands / events) vs. the
+trajectory-command internals. It is zero-cost when off. Use it to find where time is going
+*before* optimizing.
+
+### Quick start
+
+Training — run a short, bounded profile (use a small `--max_iterations`):
+```bash
+python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=4096 \
+    --max_iterations=5 --profile
+```
+
+Play — matches your normal play setup; reports on a rolling window:
+```bash
+python scripts/rsl_rl/play.py --task=<TASK_NAME>-play --num_envs=8 --profile
+```
+
+Each prints a per-phase table to the console and appends it to `profile_report.txt` in the
+run's log directory.
+
+### Reading the output
+
+The table is split into two parts:
+
+- **top-level** — phases that *partition* the step: `obs`, `reward`, `termination`,
+  `command`, `events`, plus an `unaccounted` row that is everything else inside `env.step`
+  (physics + render + scene update). On a headless training run, `unaccounted ≈ physics`.
+- **detail** — phases *nested* inside the top-level ones, shown as % of the frame but **not**
+  subtracted (so they may overlap). This is where the trajectory command is split into
+  selection (`traj.pre_update`), Bezier eval (`traj.get_output`), the CLF (`traj.clf`),
+  measured outputs (`traj.measured`), and the per-event-term breakdown (`evt.reset.*`,
+  `evt.interval.*`).
+
+```
+==================== TRAIN per-step breakdown ====================
+recorded frames: 118   device: cuda
+frame mean: 84.304 ms/frame  (~11.9 FPS)
+-- top-level (partition of frame) --
+  events                         16.331 ms/frame   19.4%
+  command                         4.147 ms/frame    4.9%
+  ...
+  unaccounted (physics/render)   57.841 ms/frame   68.6%
+-- detail (nested; % of frame) --
+  evt.reset.reset_on_reference    9.870 ms/frame   11.7%
+  traj.measured                   7.283 ms/frame    8.6%
+  ...
+==================================================================
+```
+
+rsl_rl already logs `Perf/collection_time`, `Perf/learning_time`, and `Perf/total_fps` every
+iteration — read those alongside the table for the rollout-vs-PPO-update split.
+
+### Flags
+
+`train.py`:
+- `--profile` — enable the harness.
+- `--profile_report_every N` — print a cumulative snapshot every `N` steps (default `50`; also
+  appended to `profile_report.txt`, so a snapshot survives a hard kill). `0` = report only at
+  the end.
+- `--profile_sync` — synchronous mode (see below).
+- `--profile_trace` — also run `torch.profiler` over the (bounded) run, dumping a Chrome trace
+  (`profile_trace.json`) and a top-op table. Use with a small `--max_iterations`.
+
+`play.py`:
+- `--profile` — enable; rolling report every `--profile_steps` frames (default `100`).
+- `--profile_sync` — synchronous mode.
+- `--no-debug-vis` — force the trajectory debug markers off, to A/B their cost.
+- `--no-logging` — disable per-step data logging, to A/B its cost.
+
+### How it works
+
+The harness times named spans with CUDA events (falling back to the wall clock on CPU) and
+also emits NVTX ranges, so the same phase names line up on an
+[Nsight Systems](https://developer.nvidia.com/nsight-systems) timeline if you run the script
+under `nsys`. It wraps the manager `compute` methods (and the trajectory-command / event-term
+functions) at runtime — no Isaac Lab edits. Phase times are read after a single
+`torch.cuda.synchronize()`.
+
+To **stop early, use Ctrl-C** (not `kill`) so the final report prints. The periodic snapshots
+are written to `profile_report.txt` during the run, so even a hard kill leaves the latest
+snapshot on disk.
+
+### Sync mode and a timing caveat
+
+Isaac Lab runs physics/sensors through Warp (a separate CUDA stream) while the timers use
+Torch's stream. With the default **async** timers, a phase that is the first to read physics
+results can absorb the physics wait across the stream boundary — so a *detail* row can read
+larger than its parent. That is an attribution artifact, not real nested cost. When you see
+it, re-run with **`--profile_sync`**: it drains the whole device at each phase boundary and
+times with the wall clock, so phases nest correctly. Sync mode is slower (it serializes the
+pipeline), so read the *proportions*, not the absolute FPS. The script prints
+`sync mode: ON/OFF` at startup so you can confirm it engaged.
+
+For **throughput decisions** (e.g. comparing `decimation` or `num_envs`), prefer the
+artifact-free `Perf/total_fps` that rsl_rl logs every iteration, and change one knob at a time.
+
 ## RL Tasks
 
 RL Task list:

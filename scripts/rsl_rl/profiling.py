@@ -26,6 +26,7 @@ stash ``(start, end)`` event pairs.
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import time
 from contextlib import contextmanager
@@ -301,11 +302,60 @@ def wrap_method(obj: Any, attr: str, timer: PhaseTimer, label: str) -> Callable[
     return undo
 
 
+def instrument_event_terms(
+    env: Any,
+    timer: PhaseTimer,
+    modes: Iterable[str] = ("interval", "reset"),
+) -> list[Callable[[], None]]:
+    """Wrap each per-step event term's ``func`` so it shows up as a phase.
+
+    Splits the ``events`` manager cost into individual terms (e.g.
+    ``evt.reset.reset_on_reference``, ``evt.interval.push_robot``).  Only the
+    requested ``modes`` are wrapped (``interval`` + ``reset`` run per step;
+    ``startup`` runs once).
+
+    Only *function*-based terms are wrapped; **class-based** terms
+    (``ManagerTermBase`` instances, tracked in ``_mode_class_term_cfgs``) are
+    skipped because ``EventManager.reset()`` calls ``term_cfg.func.reset(...)``
+    on them — a plain wrapper would shadow that ``.reset`` and crash. The
+    heavy per-step terms here (``reset_on_reference`` etc.) are functions, so
+    they wrap cleanly.
+
+    Returns a list of undo callables.
+    """
+    base = getattr(env, "unwrapped", env)
+    em = getattr(base, "event_manager", None)
+    mode_cfgs = getattr(em, "_mode_term_cfgs", None)
+    mode_names = getattr(em, "_mode_term_names", None)
+    undos: list[Callable[[], None]] = []
+    if em is None or not isinstance(mode_cfgs, dict) or not isinstance(mode_names, dict):
+        return undos
+    # Authoritative set of class-based term cfgs (the ones reset() calls
+    # ``.reset()`` on); never wrap these.
+    class_ids: set[int] = set()
+    for mode_list in getattr(em, "_mode_class_term_cfgs", {}).values():
+        for tc in mode_list:
+            class_ids.add(id(tc))
+    for mode in modes:
+        cfgs = mode_cfgs.get(mode, [])
+        names = mode_names.get(mode, [])
+        for i, term_cfg in enumerate(cfgs):
+            fn = getattr(term_cfg, "func", None)
+            if fn is None or inspect.isclass(fn) or id(term_cfg) in class_ids:
+                continue  # class-based term (or unresolved class) — leave intact
+            name = names[i] if i < len(names) else f"term{i}"
+            undo = wrap_method(term_cfg, "func", timer, f"evt.{mode}.{name}")
+            if undo is not None:
+                undos.append(undo)
+    return undos
+
+
 def instrument_env_managers(
     env: Any,
     timer: PhaseTimer,
     include_debug_vis: bool = False,
     include_command_detail: bool = True,
+    include_event_detail: bool = True,
 ) -> list[Callable[[], None]]:
     """Wrap the manager ``compute`` methods so each shows up as a phase.
 
@@ -326,6 +376,9 @@ def instrument_env_managers(
             inside ``command``), shown as % of frame but not subtracted. Some
             (e.g. ``traj.desired``) also fire on the reset path, so their
             per-frame mean folds in occasional reset-time calls.
+        include_event_detail: Split the ``events`` cost into individual
+            per-step event terms (``evt.reset.*`` / ``evt.interval.*``) — see
+            :func:`instrument_event_terms`.
 
     Returns:
         A list of undo callables (call each to restore the originals).
@@ -376,6 +429,9 @@ def instrument_env_managers(
         vel_term = _get_term("base_velocity")
         if vel_term is not None:
             _w(vel_term, "_update_command", "vel_cmd")
+
+    if include_event_detail:
+        undos.extend(instrument_event_terms(env, timer))
 
     return undos
 
