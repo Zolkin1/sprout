@@ -225,6 +225,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
 
+        # Trajectory-library version check: the saved env.yaml records the
+        # portable content fingerprint of the library this policy trained
+        # against.  The cfg built from the gym registry has it unset, so inject
+        # the trained-against value here (before env construction); the
+        # trajectory command then warns loudly if the locally loaded library
+        # has since diverged.  Best-effort — never blocks play.
+        if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
+            trained_env_yaml = os.path.join(log_dir, "params", "env.yaml")
+            if os.path.isfile(trained_env_yaml):
+                try:
+                    from isaaclab.utils.io import load_yaml
+
+                    saved_traj = (load_yaml(trained_env_yaml).get("commands") or {}).get("traj_ref") or {}
+                    trained_fp = saved_traj.get("library_fingerprint")
+                    if trained_fp is not None:
+                        env_cfg.commands.traj_ref.library_fingerprint = trained_fp
+                        env_cfg.commands.traj_ref.library_manifest = saved_traj.get("library_manifest")
+                        print(f"[INFO] Trained-against trajectory library fingerprint: {trained_fp}")
+                    else:
+                        print(
+                            "[INFO] Saved env.yaml has no trajectory library fingerprint "
+                            "(run predates fingerprinting); skipping library-version check."
+                        )
+                except Exception as exc:  # noqa: BLE001 - never block play
+                    print(f"[WARN] Could not read trained trajectory library fingerprint: {exc}")
+
         # profiling A/B: optionally force the trajectory debug visualization off
         if args_cli.no_debug_vis and hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
             env_cfg.commands.traj_ref.debug_vis = False

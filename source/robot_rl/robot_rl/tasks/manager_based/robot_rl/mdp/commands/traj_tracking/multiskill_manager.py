@@ -19,6 +19,7 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
+from .library_fingerprint import fingerprint_skill_folders
 from .manager_base import ManagerBase
 from .sagittal_reflector import swap_left_right
 from .trajectory_manager import TrajectoryManager, TrajectoryType
@@ -161,6 +162,20 @@ class MultiSkillManager(ManagerBase):
 
         # --- Discover skill folders from subdirectories --------------------
         skill_folders = self._discover_skill_folders(path, hf_repo)
+
+        # --- Portable content fingerprint of the loaded library ------------
+        # Machine-independent (relative layout + file contents only), unlike
+        # the local tensor-cache key.  The owning command writes this back onto
+        # its cfg so it is serialised into ``params/env.yaml``; at play / resume
+        # it is compared against the trained-against value to catch a library
+        # that has silently diverged from the one the policy trained on.
+        self.library_fingerprint: dict = fingerprint_skill_folders(skill_folders)
+        print(
+            f"[MultiSkillManager] trajectory library '{path}' fingerprint "
+            f"{self.library_fingerprint['short']} "
+            f"({self.library_fingerprint['num_trajectories']} trajectories: "
+            f"{self.library_fingerprint['skill_counts']})"
+        )
 
         # --- Load cached merged tensors, or build them from the YAMLs ------
         # Parsing ~1.5k trajectory YAMLs into the merged global tensors costs

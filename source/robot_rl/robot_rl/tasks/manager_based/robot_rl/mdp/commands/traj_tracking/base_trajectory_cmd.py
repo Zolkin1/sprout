@@ -72,6 +72,54 @@ class BaseTrajectoryCommand(CommandTerm):
         initialisation is complete (e.g. building reference-frame maps).
         """
 
+    def _record_library_fingerprint(self, cfg) -> None:
+        """Persist (and verify) the loaded trajectory library's content hash.
+
+        The manager exposes a portable content fingerprint of the library it
+        actually loaded.  This method:
+
+          * warns loudly when ``cfg.library_fingerprint`` was *already* set to a
+            different hash — i.e. this policy is being replayed (play / resume)
+            against a library that differs from the one recorded in the saved
+            ``env.yaml`` it trained on (see ``play.py``, which injects the
+            trained-against value before env construction); and
+          * writes the freshly computed fingerprint + per-skill manifest back
+            onto ``cfg`` so a fresh training run serialises them into
+            ``params/env.yaml`` (``train.py`` dumps the cfg after env construction).
+
+        No-op for managers that do not expose ``library_fingerprint`` (e.g. the
+        single-file :class:`~.trajectory_manager.TrajectoryManager`).
+
+        Args:
+            cfg: This command term's configuration (the same instance the env
+                cfg holds, so mutations are reflected in the dumped yaml).
+        """
+        fingerprint = getattr(self.manager, "library_fingerprint", None)
+        if fingerprint is None:
+            return
+
+        local_hash = fingerprint["hash"]
+        trained_hash = getattr(cfg, "library_fingerprint", None)
+        if trained_hash is not None and trained_hash != local_hash:
+            trained_manifest = getattr(cfg, "library_manifest", None)
+            bar = "=" * 78
+            print(
+                f"\n{bar}\n"
+                "[WARN] TRAJECTORY LIBRARY MISMATCH\n"
+                f"  cfg.path                 : {cfg.path}\n"
+                f"  trained-against hash     : {trained_hash}\n"
+                f"  locally-loaded hash      : {local_hash}\n"
+                f"  trained-against manifest : {trained_manifest}\n"
+                f"  locally-loaded manifest  : {fingerprint['skill_counts']} "
+                f"({fingerprint['num_trajectories']} trajectories)\n"
+                "  This policy is being run against a DIFFERENT trajectory library\n"
+                "  than the one it trained on -- the references may be wrong.\n"
+                f"{bar}\n"
+            )
+
+        cfg.library_fingerprint = local_hash
+        cfg.library_manifest = fingerprint["skill_counts"]
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
@@ -88,6 +136,12 @@ class BaseTrajectoryCommand(CommandTerm):
         # --- Manager (subclass-specific) ----------------------------------
         self.manager: ManagerBase = self._create_manager(cfg, env)
         self.trajectory_type = self.manager.get_trajectory_type()
+
+        # --- Trajectory-library provenance --------------------------------
+        # Records the loaded library's portable fingerprint onto ``cfg`` (so it
+        # lands in ``params/env.yaml``) and warns if it differs from a
+        # trained-against value already present on ``cfg`` (play / resume).
+        self._record_library_fingerprint(cfg)
 
         self._verify_contact_frames()
 
