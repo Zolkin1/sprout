@@ -324,7 +324,7 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
               "frame_names": ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link"],
               "max_frac": 0.3,
               "min_dist": 0.1,
-              "grace_period_s": 100.0,
+              "grace_period_s": 1.0,
           },
         )
 
