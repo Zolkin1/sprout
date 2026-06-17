@@ -159,7 +159,7 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         ##
         # to HuggingFace is done (walk_forward / walk_backwards / running /
         # stair_up / standing subfolders).
-        self.commands.traj_ref.path = "trajectories/retargeted/2026-06-13_15-10-58_merged" #"trajectories/retargeted/2026-06-12_merged"
+        self.commands.traj_ref.path = "trajectories/retargeted/2026-06-16_16-30-26_merged" #"trajectories/retargeted/2026-06-13_15-10-58_merged" #"trajectories/retargeted/2026-06-12_merged"
         # Cross-fade window after a skill commit — half a cycle of the new
         # trajectory's phase.  Default is 1.0 (a full cycle).
         self.commands.traj_ref.transition_blend_end_phi = 0.3 #0.5
