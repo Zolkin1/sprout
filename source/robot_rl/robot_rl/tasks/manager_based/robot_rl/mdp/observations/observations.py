@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs.mdp.observations import generated_commands
+from isaaclab.utils.math import quat_apply, quat_box_minus, quat_inv
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.phased_trajectory_cmd import (
     PhasedTrajectoryCommand,
@@ -138,6 +139,86 @@ def skill_one_hot(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
         cmd.skill_id[in_bucket], num_classes=num_buckets
     ).float()
     return one_hot
+
+
+# ----------------------------------------------------------------------
+# Motion-sequence (open-loop clip tracking) observations.
+#
+# All base-relative: the policy never sees a world position.  Pair these
+# with a :class:`MotionSequenceCommand` term.
+# ----------------------------------------------------------------------
+
+def _joint_output_indices(ordered_names: list[str]) -> list[int]:
+    """Indices of the ``joint:*`` outputs within an ordered name list."""
+    return [i for i, n in enumerate(ordered_names) if n.startswith("joint:")]
+
+
+def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference-vs-actual base pose error, expressed in the actual base frame.
+
+    Returns ``[N, 6]`` = position error (3, rotated into the robot base frame)
+    + orientation error (3, ``quat_box_minus(actual, reference)`` tangent).
+    This is the same base tracking error the CLF penalises, surfaced as a
+    base-relative observation (no world coordinates).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    state = cmd.reference_world_state()                 # [N, 3+4+3+3+2nj]
+    ref_pos_w = state[:, 0:3]
+    ref_quat_w = state[:, 3:7]                          # wxyz
+    root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
+    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # wxyz
+
+    pos_err_b = quat_apply(quat_inv(root_quat_w), ref_pos_w - root_pos_w)
+    ori_err = quat_box_minus(root_quat_w, ref_quat_w)   # actual ⊟ reference
+    return torch.cat([pos_err_b, ori_err], dim=-1)
+
+
+def joint_pos_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference joint positions (the ``joint:*`` channels of ``y_des``)."""
+    cmd = env.command_manager.get_term(command_name)
+    idx = _joint_output_indices(cmd.ordered_pos_output_names)
+    return cmd.y_des[:, idx].clone()
+
+
+def joint_vel_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference joint velocities (the ``joint:*`` channels of ``dy_des``)."""
+    cmd = env.command_manager.get_term(command_name)
+    idx = _joint_output_indices(cmd.ordered_vel_output_names)
+    return cmd.dy_des[:, idx].clone()
+
+
+def ee_ref_relative_to_base(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", frame_names: list[str] | None = None,
+) -> torch.Tensor:
+    """Reference end-effector positions relative to the reference base.
+
+    The clip stores frame outputs relative to the stance anchor; this
+    re-expresses each named end-effector position in the *reference base*
+    frame (target posture), so no world coordinates appear.  Returns
+    ``[N, 3 * len(frame_names)]``.
+
+    Args:
+        frame_names: End-effector frame names (e.g. the ankle/wrist links).
+            Defaults to all reference output frames except the base frame.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    pos_names = cmd.ordered_pos_output_names
+    base = cmd.cfg.base_frame_name
+
+    if frame_names is None:
+        frames = sorted({n.split(":", 1)[0] for n in pos_names if ":pos_" in n} - {base})
+    else:
+        frames = list(frame_names)
+
+    base_pos = cmd.y_des[:, [pos_names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]]
+    base_quat = cmd.y_des[:, [pos_names.index(f"{base}:ori_{a}") for a in ("w", "x", "y", "z")]]
+    inv_base_quat = quat_inv(base_quat)
+
+    out = []
+    for f in frames:
+        ee_pos = cmd.y_des[:, [pos_names.index(f"{f}:pos_{a}") for a in ("x", "y", "z")]]
+        out.append(quat_apply(inv_base_quat, ee_pos - base_pos))
+    return torch.cat(out, dim=-1)
 
 
 def multiskill_phase(env: ManagerBasedRLEnv, frequency_list: list[float], command_name: str) -> torch.Tensor:

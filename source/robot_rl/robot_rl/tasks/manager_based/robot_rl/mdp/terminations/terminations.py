@@ -7,10 +7,78 @@ import warp as wp
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import euler_xyz_from_quat, quat_conjugate, quat_mul, wrap_to_pi
+from isaaclab.utils.math import (
+    euler_xyz_from_quat,
+    quat_box_minus,
+    quat_conjugate,
+    quat_mul,
+    wrap_to_pi,
+)
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
+
+
+def base_pose_error_termination(
+    env,
+    command_name: str = "traj_ref",
+    max_pos_dist: float = 0.25,
+    max_ori_rad: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base pose drifts too far from the clip reference.
+
+    The single failure termination for open-loop motion-sequence tracking
+    (replaces the pelvis-upright / base-height / frame-drift terminations).
+    Compares the robot's world base pose against the clip's reference base
+    pose (from :meth:`MotionSequenceCommand.reference_world_state`):
+
+      * position: terminate if ``||ref_pos - root_pos|| > max_pos_dist`` (m).
+      * orientation: terminate if the geodesic angle between the reference
+        and actual base quaternions exceeds ``max_ori_rad`` (rad).
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+        max_pos_dist: Max base position error before terminating (m).
+        max_ori_rad: Max base orientation error before terminating (rad).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(command_name)
+    state = cmd.reference_world_state()
+    ref_pos_w = state[:, 0:3]
+    ref_quat_w = state[:, 3:7]                      # wxyz
+    root_pos_w = wp.to_torch(asset.data.root_pos_w)
+    root_quat_w = wp.to_torch(asset.data.root_quat_w)  # wxyz
+
+    pos_err = torch.norm(ref_pos_w - root_pos_w, dim=-1)
+    # ||quat_box_minus|| is the geodesic rotation angle (rad).
+    ori_err = torch.norm(quat_box_minus(root_quat_w, ref_quat_w), dim=-1)
+    return (pos_err > max_pos_dist) | (ori_err > max_ori_rad)
+
+
+def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
+    """Truncate (good termination) when the clip's last step is reached.
+
+    Wire this as ``DoneTerm(..., time_out=True)`` so RSL-RL bootstraps the
+    value from the final state rather than treating clip-end as a failure.
+    Keyed on the clip step counter so it is correct even when episodes start
+    mid-clip (``random_start_phase``).
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs at/after the clip's last step.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    last_step = cmd.manager.num_steps - 1
+    return (cmd.start_step + env.episode_length_buf) >= last_step
 
 def no_progress(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """

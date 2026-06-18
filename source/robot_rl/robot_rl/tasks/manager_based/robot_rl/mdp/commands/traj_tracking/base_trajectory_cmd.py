@@ -30,6 +30,7 @@ from .manager_base import ManagerBase
 from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .terrain_aware_ref import apply_terrain_aware_ref
 from .trajectory_manager import TrajectoryType
+from .world_lift import lift_base_world_state
 
 
 class BaseTrajectoryCommand(CommandTerm):
@@ -512,31 +513,12 @@ class BaseTrajectoryCommand(CommandTerm):
         """
         idx = self._reference_world_indices(base_frame_name)
 
-        # Base pose/vel in the yaw-aligned contact frame.
-        base_pos_rel = self.y_des[:, idx["pos"]]       # [N, 3]
-        base_quat_rel = self.y_des[:, idx["ori"]]      # [N, 4] xyzw
-        base_lin_rel = self.dy_des[:, idx["lin_vel"]]  # [N, 3]
-        base_ang_rel = self.dy_des[:, idx["ang_vel"]]  # [N, 3]
-
-        # Lift to world: invert the yaw-alignment about the contact frame. The
-        # forward path (compute_measured_output / _align_yaw) rotates by
-        # ``fwd = yaw_quat(quat_inv(ref))``, so the inverse rotation is
-        # ``quat_inv(fwd)`` -- NOT ``yaw_quat(ref)``, which only matches when the
-        # contact frame has zero roll/pitch (it does not on uneven terrain).
-        ref_pos_w = self.ref_poses[:, :3]
-        inv_yaw = quat_inv(yaw_quat(quat_inv(self.ref_poses[:, 3:7])))
-        base_pos_w = ref_pos_w + quat_apply(inv_yaw, base_pos_rel)
-        base_quat_w = quat_mul(inv_yaw, base_quat_rel)
-        base_lin_w = quat_apply(inv_yaw, base_lin_rel)
-        base_ang_w = quat_apply(inv_yaw, base_ang_rel)
-
-        # Joints, reordered to the robot's joint order.
-        joint_pos = self.y_des[:, idx["joint_pos"]]
-        joint_vel = self.dy_des[:, idx["joint_vel"]]
-
-        return torch.cat(
-            [base_pos_w, base_quat_w, base_lin_w, base_ang_w, joint_pos, joint_vel], dim=-1
-        )
+        # The base pose/vel in ``y_des``/``dy_des`` are yaw-aligned relative to
+        # the active contact frame ``self.ref_poses``; ``lift_base_world_state``
+        # inverts that alignment to lift them (and pass joints through) into the
+        # world frame.  The lift is shared with the offline clip generator so
+        # generation and runtime use an identical transform.
+        return lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, idx)
 
     def _reference_world_indices(self, base_frame_name: str) -> dict[str, torch.Tensor]:
         """Resolve (and cache) the output-vector indices used by :meth:`get_reference_world_state`.

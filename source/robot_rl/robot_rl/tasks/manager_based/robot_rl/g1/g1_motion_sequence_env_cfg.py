@@ -1,0 +1,188 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""G1 open-loop motion-sequence tracking environment (flat ground, v1).
+
+Tracks pre-generated fixed motion clips (see
+``scripts/rsl_rl/generate_clips.py`` and the ``clips/`` package) instead of
+the online re-anchored multi-skill command.  No velocity conditioner, no
+contact gates, no skill cross-fades; observations are fully base-relative
+and a single base-pose-error termination replaces the upright / height /
+frame-drift terminations.
+"""
+
+from __future__ import annotations
+
+from isaaclab.utils import configclass
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+
+from robot_rl.tasks.manager_based.robot_rl import mdp
+
+from .clf_weights import WALKING_Q_weights, WALKING_R_weights
+from .g1_clf_tracking_base import (
+    G1ClfTrackingEnvCfg,
+    G1ClfTrackingEventsCfg,
+    G1ClfTrackingRewardCfg,
+)
+from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
+
+# Default clip library (generate with scripts/rsl_rl/generate_clips.py at the
+# env control dt, e.g. --dt 0.02).  Override per-run via the cfg.
+DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
+
+
+##
+# Commands
+##
+@configclass
+class G1MotionSeqCommandsCfg:
+    """Single open-loop clip-tracking command; no velocity conditioner."""
+
+    traj_ref = MotionSequenceCommandCfg(
+        contact_bodies=[".*_ankle_roll_link"],
+        path=DEFAULT_CLIP_PATH,
+        base_frame_name="pelvis_link",
+        random_start_phase=False,
+        randomize_heading=False,
+        Q_weights=WALKING_Q_weights,
+        R_weights=WALKING_R_weights,
+    )
+
+
+##
+# Observations
+##
+@configclass
+class G1MotionSeqObservationsCfg:
+    """Fully base-relative observations (no world coordinates)."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        """Policy observations: proprioception + base-relative reference."""
+
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05)
+        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
+
+        # Reference (current step only), base-relative.
+        base_pose_error = ObsTerm(func=mdp.base_pose_error, params={"command_name": "traj_ref"})
+        joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
+        joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Privileged critic observations."""
+
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
+        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
+        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
+
+        base_pose_error = ObsTerm(func=mdp.base_pose_error, params={"command_name": "traj_ref"})
+        joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
+        joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+
+        # Full stance-anchored tracking vector (privileged).
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
+
+
+##
+# Events
+##
+@configclass
+class G1MotionSeqEventsCfg(G1ClfTrackingEventsCfg):
+    """Reuse dynamics randomization; swap the reset onto a clip."""
+
+    reset_on_ref = None  # remove the velocity-conditioned reference reset
+    reset_on_clip = EventTerm(
+        func=mdp.reset_on_motion_sequence,
+        mode="reset",
+        params={"command_name": "traj_ref", "base_frame_name": "pelvis_link"},
+    )
+
+
+##
+# Rewards
+##
+@configclass
+class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
+    """CLF tracking + penalties; drop the velocity-command rewards."""
+
+    xy_vel = None
+    yaw_vel = None
+
+
+##
+# Terminations
+##
+@configclass
+class G1MotionSeqTerminationCfg:
+    """One failure termination (base drift) + clip-end / time-out truncations."""
+
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    clip_end = DoneTerm(
+        func=mdp.clip_end_reached, params={"command_name": "traj_ref"}, time_out=True
+    )
+    base_pose_error = DoneTerm(
+        func=mdp.base_pose_error_termination,
+        params={"command_name": "traj_ref", "max_pos_dist": 0.25, "max_ori_rad": 0.8},
+    )
+
+
+##
+# Environment
+##
+@configclass
+class G1MotionSequenceEnvCfg(G1ClfTrackingEnvCfg):
+    """Flat-ground open-loop motion-sequence tracking env."""
+
+    observations: G1MotionSeqObservationsCfg = G1MotionSeqObservationsCfg()
+    commands: G1MotionSeqCommandsCfg = G1MotionSeqCommandsCfg()
+    rewards: G1MotionSeqRewardCfg = G1MotionSeqRewardCfg()
+    events: G1MotionSeqEventsCfg = G1MotionSeqEventsCfg()
+    terminations: G1MotionSeqTerminationCfg = G1MotionSeqTerminationCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Flat ground for v1 (override the rough-terrain generator).
+        self.scene.terrain.terrain_type = "plane"
+        self.scene.terrain.terrain_generator = None
+        # Episode length matches a 20 s clip at the 0.02 s control dt
+        # (decimation 4 * sim.dt 0.005); regenerate clips at this dt.
+        self.episode_length_s = 20.0
+
+
+@configclass
+class G1MotionSequenceEnvCfgPlay(G1MotionSequenceEnvCfg):
+    """Smaller, noise-free variant for play / debugging."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 16
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None

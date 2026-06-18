@@ -465,6 +465,29 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
         },
     )
+
+    ## =========================================
+    # Open-loop motion-sequence tracking (pre-generated clips, flat ground)
+    ## =========================================
+    gym.register(
+        id="G1-motion-sequence-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-motion-sequence-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 
