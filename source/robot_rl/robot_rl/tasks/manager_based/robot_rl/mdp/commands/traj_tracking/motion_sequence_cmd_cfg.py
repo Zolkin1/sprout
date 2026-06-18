@@ -28,6 +28,13 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     random_start_phase: bool = False
     """If True, episodes start at a random step within the clip (else step 0)."""
 
+    random_start_min_remaining_s: float = 2.0
+    """When ``random_start_phase`` is True, the random start is drawn uniformly
+    from ``[0, clip_length - this]`` seconds, so at least this many seconds of
+    clip remain after the start (avoids near-zero-length episodes that would
+    immediately hit ``clip_end_reached``). Ignored when ``random_start_phase``
+    is False."""
+
     randomize_heading: bool = False
     """If True, each clip is placed at a random world yaw at reset."""
 

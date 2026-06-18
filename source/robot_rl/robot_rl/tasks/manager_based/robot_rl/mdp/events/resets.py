@@ -284,7 +284,10 @@ def reset_on_motion_sequence(
     # 1. Sample a clip and a start step per env.
     clip_id = torch.randint(0, num_clips, (k,), device=device)
     if cmd.cfg.random_start_phase:
-        start_step = torch.randint(0, num_steps, (k,), device=device)
+        # Leave at least random_start_min_remaining_s of clip after the start.
+        margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
+        hi = max(1, num_steps - margin)
+        start_step = torch.randint(0, hi, (k,), device=device)
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
