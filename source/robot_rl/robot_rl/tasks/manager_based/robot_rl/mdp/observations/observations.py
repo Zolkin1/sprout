@@ -211,7 +211,8 @@ def ee_ref_relative_to_base(
         frames = list(frame_names)
 
     base_pos = cmd.y_des[:, [pos_names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]]
-    base_quat = cmd.y_des[:, [pos_names.index(f"{base}:ori_{a}") for a in ("w", "x", "y", "z")]]
+    # xyzw (scalar last) to match Isaac Lab's quat math; outputs store ori_w too.
+    base_quat = cmd.y_des[:, [pos_names.index(f"{base}:ori_{a}") for a in ("x", "y", "z", "w")]]
     inv_base_quat = quat_inv(base_quat)
 
     out = []
