@@ -130,16 +130,17 @@ class G1TerrainMultiskillCurriculumCfg:
     # that post-skill-transition transients are penalized progressively less and
     # eventually (once grace covers a full episode) frame drift never fires after a
     # transition. Steady-state / fresh-episode frame drift stays active.
-    frame_drift_grace = CurrTerm(
-        func=mdp.grace_period_curriculum,
-        params={
-            "term_name": "frame_drift",
-            "increment_s": 2.0,
-            "interval_iters": 3000,
-            "num_steps_per_env": 24,  # keep in sync with agents/rsl_rl_ppo_cfg.py
-            # max_grace_period_s=None -> caps at the episode length (20 s)
-        },
-    )
+    pass
+    # frame_drift_grace = CurrTerm(
+    #     func=mdp.grace_period_curriculum,
+    #     params={
+    #         "term_name": "frame_drift",
+    #         "increment_s": 2.0,
+    #         "interval_iters": 3000,
+    #         "num_steps_per_env": 24,  # keep in sync with agents/rsl_rl_ppo_cfg.py
+    #         # max_grace_period_s=None -> caps at the episode length (20 s)
+    #     },
+    # )
 
 
 @configclass
@@ -159,7 +160,9 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         ##
         # to HuggingFace is done (walk_forward / walk_backwards / running /
         # stair_up / standing subfolders).
-        self.commands.traj_ref.path = "trajectories/retargeted/2026-06-16_16-30-26_merged" #"trajectories/retargeted/2026-06-13_15-10-58_merged" #"trajectories/retargeted/2026-06-12_merged"
+        # self.commands.traj_ref.path = "trajectories/retargeted/2026-05-11_12-34-50_merged" #"trajectories/retargeted/2026-06-16_16-30-26_merged" #"trajectories/retargeted/2026-06-13_15-10-58_merged"
+        self.commands.traj_ref.path = "trajectories/retargeted/2026-06-16_16-30-26_merged" #"trajectories/retargeted/2026-06-13_15-10-58_merged"
+
         # Cross-fade window after a skill commit — half a cycle of the new
         # trajectory's phase.  Default is 1.0 (a full cycle).
         self.commands.traj_ref.transition_blend_end_phi = 0.3 #0.5
@@ -316,25 +319,25 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # Terminations
         ##
 
-        self.terminations.frame_drift = DoneTerm(
-          func=mdp.frame_deviation_from_reference,
-          params={
-              "debug": False,
-              "cmd_name": "traj_ref",
-              "frame_names": ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link"],
-              "max_frac": 0.3,
-              "min_dist": 0.1,
-              "grace_period_s": 1.0,
-          },
-        )
+        # self.terminations.frame_drift = DoneTerm(
+        #   func=mdp.frame_deviation_from_reference,
+        #   params={
+        #       "debug": False,
+        #       "cmd_name": "traj_ref",
+        #       "frame_names": ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link"],
+        #       "max_frac": 0.3,
+        #       "min_dist": 0.1,
+        #       "grace_period_s": 8.0, #1.0,
+        #   },
+        # )
 
         # Face-plant / fallen-robot detector.  Not gated by the trajectory
         # grace window — catches falls even while ``frame_drift`` is being
         # suppressed by a post-skill-transition grace period.
-        self.terminations.pelvis_upright = DoneTerm(
-            func=mdp.base_orientation_from_upright,
-            params={"roll_limit_deg": 50.0, "pitch_limit_deg": 50.0},
-        )
+        # self.terminations.pelvis_upright = DoneTerm(
+        #     func=mdp.base_orientation_from_upright,
+        #     params={"roll_limit_deg": 50.0, "pitch_limit_deg": 50.0},
+        # )
 
         # Per-skill breakdown of frame_drift for logging
         # (wandb: Episode_Termination/frame_drift_<skill>). Generated from the
@@ -342,15 +345,15 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # term is an exact subset of frame_drift, so training dynamics are
         # unchanged. Registered after frame_drift so it computes first and the
         # subset terms can read its done via the termination manager.
-        for skill in self.scene.terrain.skill_list:
-            setattr(
-                self.terminations,
-                f"frame_drift_{skill}",
-                DoneTerm(
-                    func=mdp.frame_drift_in_skill,
-                    params={"cmd_name": "traj_ref", "skill_name": skill},
-                ),
-            )
+        # for skill in self.scene.terrain.skill_list:
+        #     setattr(
+        #         self.terminations,
+        #         f"frame_drift_{skill}",
+        #         DoneTerm(
+        #             func=mdp.frame_drift_in_skill,
+        #             params={"cmd_name": "traj_ref", "skill_name": skill},
+        #         ),
+        #     )
 
         # Frame-drift terminations that land within ``window_s`` after the grace
         # period ends — a proxy for "the transition itself failed (just late)".
@@ -358,28 +361,28 @@ class G1TerrainMultiskillCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # wandb: Episode_Termination/frame_drift_post_grace. ``grace_period_s`` is
         # read from frame_drift's params automatically. Registered after
         # frame_drift so it computes first and can read its done.
-        self.terminations.frame_drift_post_grace = DoneTerm(
-            func=mdp.frame_drift_post_grace,
-            params={"cmd_name": "traj_ref", "window_s": 0.25},
-        )
+        # self.terminations.frame_drift_post_grace = DoneTerm(
+        #     func=mdp.frame_drift_post_grace,
+        #     params={"cmd_name": "traj_ref", "window_s": 0.25},
+        # )
 
         # Per-skill breakdown of the post-grace metric
         # (wandb: Episode_Termination/frame_drift_post_grace_<skill>). Reuses the
         # generic frame_drift_in_skill masker by pointing base_term at the
         # post-grace term. Registered after it so it computes first.
-        for skill in self.scene.terrain.skill_list:
-            setattr(
-                self.terminations,
-                f"frame_drift_post_grace_{skill}",
-                DoneTerm(
-                    func=mdp.frame_drift_in_skill,
-                    params={
-                        "cmd_name": "traj_ref",
-                        "skill_name": skill,
-                        "base_term": "frame_drift_post_grace",
-                    },
-                ),
-            )
+        # for skill in self.scene.terrain.skill_list:
+        #     setattr(
+        #         self.terminations,
+        #         f"frame_drift_post_grace_{skill}",
+        #         DoneTerm(
+        #             func=mdp.frame_drift_in_skill,
+        #             params={
+        #                 "cmd_name": "traj_ref",
+        #                 "skill_name": skill,
+        #                 "base_term": "frame_drift_post_grace",
+        #             },
+        #         ),
+        #     )
 
 @configclass
 class G1TerrainMultiskillCLFDistillationEnvCfg(G1TerrainMultiskillCLFEnvCfg):

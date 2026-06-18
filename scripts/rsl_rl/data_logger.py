@@ -54,6 +54,11 @@ class DataLogger:
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
         self.metadata: dict[str, Any] = {}
+        # Per-step termination signals, stacked in finalize() into a
+        # "successful tracking" mask (steps in episodes that ended via
+        # time_out vs early termination).
+        self._dones: list[torch.Tensor] = []
+        self._time_outs: list[torch.Tensor] = []
 
         self._collect_metadata(env)
 
@@ -88,6 +93,17 @@ class DataLogger:
         """
         unwrapped = env.unwrapped
         step: dict[str, torch.Tensor] = {}
+
+        # 0. Termination signals for this step. Read post-step (before the next
+        # env.step overwrites them) and stored aligned with the per-step data so
+        # finalize() can mask stats down to episodes that ended via time_out
+        # (successful tracking) vs early termination (e.g. a fall).
+        try:
+            tm = unwrapped.termination_manager
+            self._dones.append(tm.dones.clone())
+            self._time_outs.append(tm.time_outs.clone())
+        except Exception as exc:
+            self._warn("term_signals", f"Could not read termination signals: {exc}")
 
         # 1. Trajectory command term attributes
         if self._traj_term_name is not None:
@@ -314,6 +330,17 @@ class DataLogger:
             stacked = torch.stack(tensors, dim=0)
             data[key] = stacked.cpu().numpy()
 
+        # Build the "successful tracking" mask: True for logged steps that
+        # belong to an episode that ended via time_out (truncation), False for
+        # steps in early-terminated (fallen) episodes and the trailing
+        # still-running episode. Lets stats.txt report tracking quality
+        # conditioned on not having failed. Only built when per-step
+        # termination signals were captured for every step.
+        if self._dones and len(self._dones) == self._step_count:
+            dones = torch.stack(self._dones, dim=0).cpu().numpy().astype(bool)
+            time_outs = torch.stack(self._time_outs, dim=0).cpu().numpy().astype(bool)
+            data["_timeout_mask"] = _build_timeout_mask(dones, time_outs)
+
         # Note: per-trajectory CLF/tracking + termination summaries now live in
         # the dedicated headless eval (scripts/rsl_rl/eval_per_trajectory.py /
         # per_traj_stats.py), which has far better trajectory coverage than an
@@ -467,3 +494,34 @@ def _to_torch(data: Any) -> torch.Tensor:
         return wp.to_torch(data)
     except (ImportError, TypeError):
         return torch.as_tensor(data)
+
+
+def _build_timeout_mask(dones: np.ndarray, time_outs: np.ndarray) -> np.ndarray:
+    """Mark each logged step as belonging to a time_out (successful) episode.
+
+    A ``done`` at step ``t`` means the env reset *during* step ``t``; Isaac Lab
+    recomputes the command (and hence ``v``, ``y_act``, ...) after the in-step
+    reset, so the data logged at step ``t`` for that env already belongs to the
+    *next* episode. A logged step ``s`` therefore belongs to the episode that
+    ends at the first ``done`` strictly after ``s``, and is "successful" iff
+    that terminating ``done`` was a ``time_out``. Steps with no later ``done``
+    (the trailing in-progress episode) are marked False. This boundary
+    convention never leaks a fallen episode's divergence into the success set.
+
+    Args:
+        dones: ``[T, N]`` bool array, True where env ``n`` reset at step ``t``.
+        time_outs: ``[T, N]`` bool array, True where that reset was a time_out.
+
+    Returns:
+        ``[T, N]`` bool mask, True for steps in successful (time_out) episodes.
+    """
+    num_steps, num_envs = dones.shape
+    mask = np.zeros((num_steps, num_envs), dtype=bool)
+    pending = np.zeros(num_envs, dtype=bool)      # time_out-ness of nearest done at idx > s
+    has_pending = np.zeros(num_envs, dtype=bool)  # whether any done exists at idx > s
+    for s in range(num_steps - 1, -1, -1):
+        mask[s] = has_pending & pending
+        d = dones[s]
+        pending = np.where(d, time_outs[s], pending)
+        has_pending = has_pending | d
+    return mask

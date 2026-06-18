@@ -10,7 +10,9 @@ module captures, per trajectory:
   and the frame tracking error ``||y_act - y_des||`` over "warm" (non-transient,
   non-terminal) steps.
 * **Terminations** — per-termination-term fire counts and episode-end counts,
-  giving the fraction of episode-ends via each cause for that trajectory.
+  giving both the per-trajectory fraction of episode-ends via each cause and
+  each trajectory's share of *all* terminations of that cause (to spot a single
+  trajectory driving a disproportionate amount of a given failure mode).
 
 Capture is an online, device-tensor accumulator keyed by the global trajectory
 index (memory O(num_trajectories x num_terms), independent of rollout length).
@@ -52,11 +54,14 @@ def _cond_label(row) -> str:
     parts = [f"vx={float(row[0]):.2f}", f"vy={float(row[1]):.2f}", f"vyaw={float(row[2]):.2f}"]
     if len(row) >= 6:
         tw, th, tl = float(row[3]), float(row[4]), float(row[5])
-        if tw:
+        # Terrain dims are physical sizes, so only positive values are real
+        # terrain. ``0.0`` (flat skills) and the ``-1.0`` "no terrain" sentinel
+        # (e.g. standing) are skipped so non-terrain names stay short.
+        if tw > 0:
             parts.append(f"tw={tw:.2f}")
-        if th:
+        if th > 0:
             parts.append(f"th={th:.2f}")
-        if tl:
+        if tl > 0:
             parts.append(f"tl={tl:.2f}")
     return ",".join(parts)
 
@@ -306,6 +311,7 @@ class PerTrajectoryStats:
             w = csv.writer(fh)
             header = ["traj_idx", "name", "skill", *_COND_NAMES,
                       "samples", "episode_ends", "mean_v", "mean_track_err"]
+            header += [f"{n}_count" for n in self.term_names]
             header += [f"{n}_frac" for n in self.term_names]
             w.writerow(header)
             for i in range(self.T):
@@ -314,6 +320,7 @@ class PerTrajectoryStats:
                        int(r["samples"][i]), int(r["episode_ends"][i]),
                        _fmt(mean_v[i] if mean_v is not None else np.nan),
                        _fmt(mean_te[i] if mean_te is not None else np.nan)]
+                row += [int(r["term_count"][i, k]) for k in range(self.K)]
                 row += [_fmt(r["term_frac"][i, k]) for k in range(self.K)]
                 w.writerow(row)
 
@@ -357,7 +364,7 @@ class PerTrajectoryStats:
         L.append("")
         L.append("-- Per-skill aggregate --")
         cols = ["skill", "trajs", "visited", "samples", "ends", "mean_v", "track_err", *headline]
-        L.append(_row(cols, [16, 6, 7, 9, 7, 9, 10] + [11] * len(headline)))
+        L.append(_row(cols, [16, 6, 7, 9, 7, 9, 10] + [15] * len(headline)))
         for sk in _unique_preserve(skills):
             m = skills == sk
             s_samp = int(samples[m].sum())
@@ -368,8 +375,44 @@ class PerTrajectoryStats:
             fr = [(_safe_div(term_count[m, k].sum(), s_ends)) for k in hl_idx]
             L.append(_row(
                 [sk, int(m.sum()), s_vis, s_samp, s_ends, _fmt(mv), _fmt(mt), *[_fmt(x) for x in fr]],
-                [16, 6, 7, 9, 7, 9, 10] + [11] * len(headline),
+                [16, 6, 7, 9, 7, 9, 10] + [15] * len(headline),
             ))
+
+        # -- Termination breakdown: global rate + most disproportionate traj --
+        # Raw-count shares are dominated by heavily-sampled trajectories (a
+        # single standing trajectory can draw ~10% of all episodes), so rather
+        # than "who fired this most" we report each cause's per-episode rate and
+        # the trajectory most disproportionately responsible for it, ranked by
+        # lift (the trajectory's rate over the global rate) among trajectories
+        # with at least ``min_eps`` episode-ends. lift is sampling-normalized:
+        # 1.0 = on par with the average trajectory regardless of how often it is
+        # sampled, so a heavily-sampled trajectory near 1.0 is not an offender.
+        total_ends = int(ends.sum())
+        eligible = ends >= max(min_eps, 1)
+        L.append("")
+        L.append(f"-- Termination breakdown (rate + most disproportionate traj, ends >= {min_eps}) --")
+        bw = [16, 9, 9, 46, 9, 9]
+        L.append(_row(["cause", "total", "%_ends", "worst_traj (by lift)", "frac", "lift"], bw))
+        for k in range(self.K):
+            counts = term_count[:, k]
+            total_t = int(counts.sum())
+            rate = _safe_div(total_t, total_ends)
+            if total_t == 0:
+                L.append(_row([self.term_names[k], 0, _fmt(0.0), "-",
+                               _fmt(np.nan), _fmt(np.nan)], bw))
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                lift_k = np.where(
+                    eligible & np.isfinite(term_frac[:, k]) & (rate > 0),
+                    term_frac[:, k] / max(rate, 1e-12), -np.inf,
+                )
+            wi = int(np.argmax(lift_k))
+            if not np.isfinite(lift_k[wi]):
+                worst, frac_s, lift_s = f"(none, ends >= {min_eps})", np.nan, np.nan
+            else:
+                worst, frac_s, lift_s = f"#{wi}:{names[wi]}", term_frac[wi, k], float(lift_k[wi])
+            L.append(_row([self.term_names[k], total_t, _fmt(rate),
+                           worst, _fmt(frac_s), _fmt(lift_s)], bw))
 
         # -- Top-K worst by mean_v --
         if mean_v is not None:
@@ -378,15 +421,27 @@ class PerTrajectoryStats:
             L += self._top_k_block(mean_v, samples >= min_samples, names, skills,
                                     samples, ends, mean_v, mean_te, term_frac, hl_idx, headline, top_k)
 
-        # -- Top-K worst by frame_drift (or first non-timeout term) --
-        rank_term = "frame_drift" if "frame_drift" in self.term_names else self._first_non_timeout()
-        if rank_term is not None:
-            ti = self.term_names.index(rank_term)
+        # -- Per-cause worst trajectories, ranked by raw termination count --
+        # Defaults to base_height + pelvis_upright (+ frame_drift when active),
+        # so the two failure modes are always reported side by side. Falls back
+        # to the first non-timeout term if none of those are present.
+        rank_terms = [t for t in _HEADLINE_TERMS
+                      if t != "time_out" and t in self.term_names]
+        if not rank_terms:
+            first = self._first_non_timeout()
+            rank_terms = [first] if first is not None else []
+        for term in rank_terms:
+            ti = self.term_names.index(term)
+            total_t = int(term_count[:, ti].sum())
             L.append("")
-            L.append(f"-- Top {top_k} worst by {rank_term}_frac (episode-ends >= {min_eps}) --")
-            key = np.where(ends > 0, term_frac[:, ti], -np.inf)
-            L += self._top_k_block(key, ends >= min_eps, names, skills,
-                                    samples, ends, mean_v, mean_te, term_frac, hl_idx, headline, top_k)
+            L.append(
+                f"-- Top {top_k} by {term} terminations "
+                f"(total {term}: {total_t}, {_fmt(_safe_div(total_t, total_ends))} of all ends) --"
+            )
+            L += self._term_contrib_block(
+                ti, total_t, total_ends, names, skills, ends,
+                term_count, term_frac, mean_v, mean_te, top_k,
+            )
 
         # -- Low coverage --
         low = (samples < min_samples)
@@ -402,7 +457,7 @@ class PerTrajectoryStats:
                      mean_v, mean_te, term_frac, hl_idx, headline, top_k) -> list[str]:
         # ``#`` is the global trajectory index — the unique key, since two
         # trajectories can share identical conditioning (and thus a name).
-        widths = [6, 52, 13, 8, 6, 10, 10] + [11] * len(headline)
+        widths = [6, 52, 13, 8, 6, 10, 10] + [15] * len(headline)
         head = _row(["#", "trajectory", "skill", "samples", "ends", "mean_v", "track_err", *headline], widths)
         out = [head]
         order = np.argsort(-np.where(mask, key, -np.inf))
@@ -419,6 +474,62 @@ class PerTrajectoryStats:
                 break
         if shown == 0:
             out.append("  (none meet the coverage threshold)")
+        return out
+
+    def _term_contrib_block(
+        self, ti, total_t, total_ends, names, skills, ends,
+        term_count, term_frac, mean_v, mean_te, top_k,
+    ) -> list[str]:
+        """Worst trajectories for one termination cause, ranked by raw count.
+
+        Surfaces whether a single trajectory drives a disproportionate share of
+        a cause's terminations. Columns:
+
+        * ``n`` — raw number of this-cause terminations for the trajectory.
+        * ``shr_tot`` — ``n`` as a fraction of *all* terminations of this cause
+          (these sum to 1 across trajectories), the headline "disproportionate
+          amount" signal.
+        * ``lift`` — the trajectory's share of this cause over its share of all
+          episode-ends. ``lift > 1`` means the trajectory triggers this cause
+          *more* than its episode count alone would predict (1.0 = on par with
+          the average trajectory), so a heavily-sampled trajectory near 1.0 is
+          not actually a disproportionate offender.
+        * ``frac`` — this cause's fires over this trajectory's own episode-ends.
+
+        Args:
+            ti: Index of the cause in ``term_names``.
+            total_t: Total terminations of this cause across all trajectories.
+            total_ends: Total episode-ends across all trajectories.
+            names/skills/ends: Per-trajectory display name, skill, episode-ends.
+            term_count: ``[T, K]`` raw per-cause counts.
+            term_frac: ``[T, K]`` per-trajectory cause fraction.
+            mean_v/mean_te: Per-trajectory metric arrays (may be ``None``).
+            top_k: Max rows to emit.
+        """
+        widths = [6, 46, 13, 6, 7, 8, 7, 8, 9, 10]
+        head = _row(["#", "trajectory", "skill", "ends", "n", "shr_tot",
+                     "lift", "frac", "mean_v", "track_err"], widths)
+        out = [head]
+        counts = term_count[:, ti]
+        order = np.argsort(-counts)
+        shown = 0
+        for i in order:
+            i = int(i)
+            if counts[i] <= 0:
+                break
+            shr = _safe_div(counts[i], total_t)
+            lift = _safe_div(shr, _safe_div(ends[i], total_ends))
+            frac = term_frac[i, ti] if ends[i] > 0 else np.nan
+            mv = _fmt(mean_v[i]) if mean_v is not None else "-"
+            mt = _fmt(mean_te[i]) if mean_te is not None else "-"
+            out.append(_row(
+                [i, names[i], str(skills[i]), int(ends[i]), int(counts[i]),
+                 _fmt(shr), _fmt(lift), _fmt(frac), mv, mt], widths))
+            shown += 1
+            if shown >= top_k:
+                break
+        if shown == 0:
+            out.append("  (no terminations of this cause)")
         return out
 
     def _first_non_timeout(self) -> str | None:
@@ -606,10 +717,17 @@ def _fmt(x: float) -> str:
 
 
 def _row(vals, widths) -> str:
-    """Left-align ``vals`` into fixed-width columns with two-space gutters."""
+    """Left-align ``vals`` into fixed-width columns with two-space gutters.
+
+    Cells longer than their column are truncated with a trailing ``…`` so an
+    over-long value (e.g. a terrain trajectory's name) can never push later
+    columns out of alignment.
+    """
     cells = []
     for v, w in zip(vals, widths):
         s = str(v)
+        if len(s) > w:
+            s = s[: max(1, w - 1)] + "…"
         cells.append(f"{s:<{w}}")
     return "  " + "  ".join(cells)
 

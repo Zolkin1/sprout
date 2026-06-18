@@ -1084,12 +1084,125 @@ DEFAULT_PLOTS = ["positions", "velocities"]
 # Stats
 # ---------------------------------------------------------------------------
 
+def _time_mean_per_env(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+    """Mean over time for each env, optionally restricted to masked steps.
+
+    Args:
+        arr: ``[T, N]`` or ``[T, N, D]`` array.
+        mask: ``[T, N]`` bool step mask, or ``None`` to use every step.
+
+    Returns:
+        ``[N]`` or ``[N, D]`` per-env time-mean. Envs with no kept steps are
+        NaN so they drop out of a subsequent ``np.nanmean``/``np.nanstd``.
+        ``mask=None`` reproduces the plain ``arr.mean(axis=0)`` exactly.
+    """
+    if mask is None:
+        return arr.mean(axis=0)
+    m = mask.astype(np.float64)
+    if arr.ndim == 3:
+        m = m[:, :, None]
+    cnt = m.sum(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = (arr * m).sum(axis=0) / cnt
+    return np.where(cnt > 0, out, np.nan)
+
+
+def _emit_tracking_stats(
+    _log: Callable,
+    _csv: Callable,
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    mask: np.ndarray | None,
+    csv_prefix: str,
+) -> None:
+    """Emit the V / norm-sq / position / velocity tracking blocks.
+
+    Every quantity is time-meaned per env (over kept steps when ``mask`` is
+    given), then reduced across envs. ``mask=None`` reproduces the original
+    all-steps stats; a step mask restricts to a subset (e.g. successful
+    episodes). ``csv_prefix`` namespaces the CSV keys for the masked block.
+    """
+    # Mean Lyapunov V
+    if "v" in data:
+        v_data = data["v"]
+        if v_data.ndim == 3:
+            v_data = v_data.squeeze(-1)
+        per_env_mean = _time_mean_per_env(v_data, mask)
+        _log("")
+        _log("Lyapunov Function (V):")
+        _log(f"  Mean across envs: {np.nanmean(per_env_mean):.6f}")
+        _log(f"  Std  across envs: {np.nanstd(per_env_mean):.6f}")
+        _csv(f"{csv_prefix}lyapunov_v_mean", float(np.nanmean(per_env_mean)))
+        _csv(f"{csv_prefix}lyapunov_v_std", float(np.nanstd(per_env_mean)))
+
+    # Norm squared error
+    if all(k in data for k in ("y_des", "y_act", "dy_des", "dy_act")):
+        e_pos = data["y_des"] - data["y_act"]
+        e_vel = data["dy_des"] - data["dy_act"]
+        e = np.concatenate([e_pos, e_vel], axis=2)
+        norm_sq = (e ** 2).sum(axis=2)
+        per_env_mean = _time_mean_per_env(norm_sq, mask)
+        _log("")
+        _log("Norm Squared Error (dot(e,e)):")
+        _log(f"  Mean across envs: {np.nanmean(per_env_mean):.6f}")
+        _log(f"  Std  across envs: {np.nanstd(per_env_mean):.6f}")
+        _csv(f"{csv_prefix}norm_sq_error_mean", float(np.nanmean(per_env_mean)))
+        _csv(f"{csv_prefix}norm_sq_error_std", float(np.nanstd(per_env_mean)))
+
+    # Position errors
+    if "y_des" in data and "y_act" in data:
+        pos_err = (data["y_des"] - data["y_act"]) ** 2
+        n_dims = pos_err.shape[2]
+        pos_names = metadata.get("pos_names", [f"Dim {i}" for i in range(n_dims)])
+
+        per_env_mean_err = _time_mean_per_env(pos_err, mask)
+        mean_over_envs = np.nanmean(per_env_mean_err, axis=0)
+        std_over_envs = np.nanstd(per_env_mean_err, axis=0)
+
+        _log("")
+        _log("Position Errors (MSE per dimension):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            name = pos_names[i] if i < len(pos_names) else f"Dim {i}"
+            _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs, f"{csv_prefix}pos_error")
+
+    # Velocity errors
+    if "dy_des" in data and "dy_act" in data:
+        vel_err = (data["dy_des"] - data["dy_act"]) ** 2
+        n_dims = vel_err.shape[2]
+        vel_names = metadata.get("vel_names", [f"Dim {i}" for i in range(n_dims)])
+
+        per_env_mean_err = _time_mean_per_env(vel_err, mask)
+        mean_over_envs = np.nanmean(per_env_mean_err, axis=0)
+        std_over_envs = np.nanstd(per_env_mean_err, axis=0)
+
+        _log("")
+        _log("Velocity Errors (MSE per dimension):")
+        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
+        for i in range(n_dims):
+            name = vel_names[i] if i < len(vel_names) else f"Dim {i}"
+            _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+
+        _print_group_summaries(_log, _csv, vel_names, mean_over_envs, std_over_envs, f"{csv_prefix}vel_error")
+
+
 def compute_and_save_stats(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
     save_dir: str,
 ) -> None:
     """Compute tracking statistics and write stats.txt.
+
+    Emits two blocks: an "All Steps" block over every logged step/env, and —
+    when ``data`` carries the ``_timeout_mask`` from ``DataLogger.finalize()`` —
+    a "Successful Tracking" block over only the steps in episodes that ended
+    via time_out (excluding fallen/early-terminated and trailing in-progress
+    episodes). Pair the second block with ``episode_stats.txt`` termination
+    fractions to read "how good is successful tracking, and how likely is it."
 
     Args:
         data: Stacked numpy data from DataLogger.finalize().
@@ -1110,13 +1223,17 @@ def compute_and_save_stats(
     _log("  Play Statistics")
     _log("=" * 60)
 
-    # Number of envs
+    # Number of envs / timesteps (ignore internal "_"-prefixed arrays such as
+    # the timeout mask, which is not a logged data series).
     n_envs = None
-    for arr in data.values():
-        if arr.ndim >= 2:
+    n_timesteps = None
+    for key, arr in data.items():
+        if key.startswith("_"):
+            continue
+        if n_timesteps is None:
+            n_timesteps = arr.shape[0]
+        if arr.ndim >= 2 and n_envs is None:
             n_envs = arr.shape[1]
-            break
-    n_timesteps = data[next(iter(data))].shape[0]
     _log(f"Timesteps: {n_timesteps}")
     if n_envs is not None:
         _log(f"Number of envs: {n_envs}")
@@ -1135,72 +1252,34 @@ def compute_and_save_stats(
             _csv(f"{csv_vel_keys[i]}_min", float(v_min))
             _csv(f"{csv_vel_keys[i]}_max", float(v_max))
 
-    # Mean Lyapunov V
-    if "v" in data:
-        v_data = data["v"]
-        if v_data.ndim == 3:
-            v_data = v_data.squeeze(-1)
-        per_env_mean = v_data.mean(axis=0)
+    # --- All-steps block (every logged step, all envs) ---
+    _log("")
+    _log("-" * 60)
+    _log("  All Steps  (every logged step, all envs)")
+    _log("-" * 60)
+    _emit_tracking_stats(_log, _csv, data, metadata, mask=None, csv_prefix="")
+
+    # --- Successful-tracking block (steps in time_out episodes only) ---
+    mask = data.get("_timeout_mask")
+    if mask is not None:
+        total = int(mask.size)
+        n_keep = int(mask.sum())
+        n_envs_mask = int(mask.shape[1])
+        envs_with = int(mask.any(axis=0).sum())
+        pct = (100.0 * n_keep / total) if total else 0.0
         _log("")
-        _log("Lyapunov Function (V):")
-        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
-        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
-        _csv("lyapunov_v_mean", float(per_env_mean.mean()))
-        _csv("lyapunov_v_std", float(per_env_mean.std()))
-
-    # Norm squared error
-    if all(k in data for k in ("y_des", "y_act", "dy_des", "dy_act")):
-        e_pos = data["y_des"] - data["y_act"]
-        e_vel = data["dy_des"] - data["dy_act"]
-        e = np.concatenate([e_pos, e_vel], axis=2)
-        norm_sq = (e ** 2).sum(axis=2)
-        per_env_mean = norm_sq.mean(axis=0)
-        _log("")
-        _log("Norm Squared Error (dot(e,e)):")
-        _log(f"  Mean across envs: {per_env_mean.mean():.6f}")
-        _log(f"  Std  across envs: {per_env_mean.std():.6f}")
-        _csv("norm_sq_error_mean", float(per_env_mean.mean()))
-        _csv("norm_sq_error_std", float(per_env_mean.std()))
-
-    # Position errors
-    if "y_des" in data and "y_act" in data:
-        pos_err = (data["y_des"] - data["y_act"]) ** 2
-        n_dims = pos_err.shape[2]
-        pos_names = metadata.get("pos_names", [f"Dim {i}" for i in range(n_dims)])
-
-        per_env_mean_err = pos_err.mean(axis=0)
-        mean_over_envs = per_env_mean_err.mean(axis=0)
-        std_over_envs = per_env_mean_err.std(axis=0)
-
-        _log("")
-        _log("Position Errors (MSE per dimension):")
-        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
-        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
-        for i in range(n_dims):
-            name = pos_names[i] if i < len(pos_names) else f"Dim {i}"
-            _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
-
-        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs, "pos_error")
-
-    # Velocity errors
-    if "dy_des" in data and "dy_act" in data:
-        vel_err = (data["dy_des"] - data["dy_act"]) ** 2
-        n_dims = vel_err.shape[2]
-        vel_names = metadata.get("vel_names", [f"Dim {i}" for i in range(n_dims)])
-
-        per_env_mean_err = vel_err.mean(axis=0)
-        mean_over_envs = per_env_mean_err.mean(axis=0)
-        std_over_envs = per_env_mean_err.std(axis=0)
-
-        _log("")
-        _log("Velocity Errors (MSE per dimension):")
-        _log(f"  {'Name':<40s} {'Mean':>12s} {'Std':>12s}")
-        _log(f"  {'-'*40} {'-'*12} {'-'*12}")
-        for i in range(n_dims):
-            name = vel_names[i] if i < len(vel_names) else f"Dim {i}"
-            _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
-
-        _print_group_summaries(_log, _csv, vel_names, mean_over_envs, std_over_envs, "vel_error")
+        _log("-" * 60)
+        _log("  Successful Tracking  (steps in time_out episodes only)")
+        _log("-" * 60)
+        _log(f"  steps kept: {n_keep}/{total} ({pct:.1f}%)   "
+             f"envs with >=1 kept step: {envs_with}/{n_envs_mask}")
+        _log("  note: keeps only logged steps in episodes that ended via time_out;")
+        _log("        excludes fallen/early-terminated and trailing in-progress episodes.")
+        if n_keep == 0:
+            _log("")
+            _log("  (no time_out episodes captured — nothing to report)")
+        else:
+            _emit_tracking_stats(_log, _csv, data, metadata, mask=mask, csv_prefix="timeout_")
 
     _log("")
     _log("=" * 60)

@@ -180,6 +180,14 @@ class CLF:
 
 
         # 2) Solve CARE: A^T P + P A - P B R^{-1} B^T P + Q = 0
+        # TODO(future): switch to the discrete-time ARE (scipy.solve_discrete_are)
+        # for self-consistency with the discrete finite-difference vdot
+        # (V_k - V_{k-1}) and the per-step CLF decrease condition. Would use the
+        # ZOH-discretized double integrator A_d=[[1,h],[0,1]], B_d=[[h^2/2],[h]]
+        # with h=sim_dt (and cost-equivalent Q*h, R*h to preserve P's scale). The
+        # position/velocity weight ratio p_pos/p_vel = sqrt(q_p/r) is unchanged for
+        # fine h, so Q/R tuning carries over; the discretization only bites at
+        # coarse h or very large q_p/r. See scripts/rsl_rl/clf_weight_check.py.
         P = solve_continuous_are(A_full, B_full, Q_np, R_np)
 
         return P
