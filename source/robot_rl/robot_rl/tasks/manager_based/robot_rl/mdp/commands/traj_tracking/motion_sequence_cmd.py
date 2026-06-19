@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 import warp as wp
+from isaaclab.utils.math import quat_from_angle_axis
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from .clips.clip_io import load_clip_library
@@ -43,7 +44,11 @@ _DEBUG_FRAME_COLOR_MAP: dict[str, tuple[float, float, float]] = {
     "right_wrist_yaw_link": (0.80, 0.30, 0.90),
 }
 _DEBUG_FRAME_FALLBACK_COLOR: tuple[float, float, float] = (0.6, 0.6, 0.6)
+# Frame-name substrings treated as "hand" end-effectors (filtered out of the
+# debug ribbon unless cfg.debug_vis_show_hands is True).
+_DEBUG_HAND_FRAME_KEYS: tuple[str, ...] = ("wrist", "hand")
 _DEBUG_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_ref"
+_DEBUG_VIZ_EPS: float = 1e-6  # guard against zero-length segments / degenerate axes
 
 
 class MotionSequenceCommand(BaseTrajectoryCommand):
@@ -123,6 +128,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._debug_frame_names = [
             n[: -len(":pos_x")] for n in self.ordered_pos_output_names if n.endswith(":pos_x")
         ]
+        # Optionally drop hand/wrist end-effector frames from the ribbon.
+        if not self.cfg.debug_vis_show_hands:
+            self._debug_frame_names = [
+                f for f in self._debug_frame_names
+                if not any(k in f for k in _DEBUG_HAND_FRAME_KEYS)
+            ]
         self._debug_frame_pos_idx = [
             torch.tensor(
                 [self.ordered_pos_output_names.index(f"{f}:pos_{a}") for a in ("x", "y", "z")],
@@ -261,9 +272,9 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """Toggle the reference-trajectory marker visualizer.
 
         Draws, per env, a forward window of each reference frame's world
-        position as colored spheres -- a "ribbon" of where the clip says
-        each body should go.  Per-step update is in
-        :meth:`_debug_vis_callback`.
+        position as colored cylinder segments -- a "ribbon" of where the clip
+        says each body should go (matching the online command's marker style).
+        Per-step update is in :meth:`_debug_vis_callback`.
         """
         if debug_vis:
             if self._debug_markers is None and hasattr(self, "_debug_frame_pos_idx"):
@@ -278,7 +289,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 self._debug_markers.set_visibility(False)
 
     def _create_debug_markers(self):
-        """Build a :class:`VisualizationMarkers` with one sphere per frame."""
+        """Build a :class:`VisualizationMarkers` with one cylinder prototype per frame.
+
+        Mirrors the online command's marker style: the reference ribbon is
+        drawn as thin cylinder *segments* between consecutive sampled points
+        (oriented + z-scaled per segment in :meth:`_debug_vis_callback`),
+        rather than a point cloud of spheres.  The native cylinder height is
+        ``1.0`` so the per-segment z-scale equals the segment length.
+        """
         try:
             import isaaclab.sim as sim_utils
             from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -287,8 +305,9 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             return None
         radius = float(self.cfg.debug_vis_marker_radius)
         prototypes = {
-            name: sim_utils.SphereCfg(
+            name: sim_utils.CylinderCfg(
                 radius=radius,
+                height=1.0,
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
             )
             for name, color in zip(self._debug_frame_names, self._debug_frame_colors)
@@ -301,7 +320,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             return None
 
     def _debug_vis_callback(self, event) -> None:
-        """Draw the upcoming reference-frame positions for every env."""
+        """Draw the upcoming reference ribbon as cylinder segments per env.
+
+        For each reference frame, the forward window's world positions are
+        connected by one thin cylinder per consecutive pair (the online
+        command's marker style): each cylinder is centred on the segment
+        midpoint, oriented so its local +z lies along the segment, and
+        z-scaled to the segment length.  The prototype index selects the
+        frame's colour.
+        """
         if self._debug_markers is None:
             if not self._debug_vis_pending:
                 return
@@ -313,8 +340,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
 
         n = self.num_envs
         T = self.manager.num_steps
+        F = len(self._debug_frame_pos_idx)
         steps = (self._step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)  # [n, Ns]
         ns = steps.shape[1]
+        if F == 0 or n == 0 or ns < 2:
+            return
         cid = self.clip_id[:, None].expand(n, ns)                                       # [n, Ns]
 
         # World anchor schedule for the window: clip placement ∘ clip anchor.
@@ -322,16 +352,44 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         aq = self.manager.lib.anchor_quat[cid, steps]                                    # [n, Ns, 4]
         wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, ap)
         waq = lift_orientation_batched(self.clip_world_quat, aq)
-        wap_f, waq_f = wap.reshape(-1, 3), waq.reshape(-1, 4)
 
-        yd = self.manager.lib.y_des[cid, steps]                                          # [n, Ns, P]
-        translations, indices = [], []
-        for fi, pidx in enumerate(self._debug_frame_pos_idx):
-            rel = yd[:, :, pidx].reshape(-1, 3)
-            translations.append(lift_position(wap_f, waq_f, rel))
-            indices.append(torch.full((rel.shape[0],), fi, dtype=torch.long, device=self.device))
+        # Per-frame world positions over the window: [n, Ns, F, 3].
+        frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
+        rel = self.manager.lib.y_des[cid, steps][:, :, frame_idx]                        # [n, Ns, F, 3]
+        world_pos = lift_position_batched(
+            wap.reshape(n * ns, 3), waq.reshape(n * ns, 4), rel.reshape(n * ns, F, 3),
+        ).reshape(n, ns, F, 3)
+
+        # Per-segment midpoint, direction, length (one cylinder per segment per frame).
+        starts = world_pos[:, :-1]                                                       # [n, Ns-1, F, 3]
+        ends = world_pos[:, 1:]
+        centers = 0.5 * (starts + ends)
+        vecs = ends - starts
+        lens = torch.linalg.norm(vecs, dim=-1).clamp(min=_DEBUG_VIZ_EPS)                  # [n, Ns-1, F]
+        dirs = vecs / lens.unsqueeze(-1)
+
+        # Quaternion rotating each cylinder's local +z onto the segment direction.
+        # axis = +z x dir = (-dir.y, dir.x, 0); degenerate (dir || +/-z) -> +x fallback.
+        angle = torch.acos(dirs[..., 2].clamp(-1.0, 1.0))
+        axis = torch.stack([-dirs[..., 1], dirs[..., 0], torch.zeros_like(dirs[..., 0])], dim=-1)
+        axis_norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
+        fallback = torch.tensor([1.0, 0.0, 0.0], device=self.device).expand_as(axis)
+        axis = torch.where(axis_norm > _DEBUG_VIZ_EPS, axis, fallback)
+        quats = quat_from_angle_axis(angle.reshape(-1), axis.reshape(-1, 3))             # [M, 4] xyzw
+
+        # Native cylinder height is 1.0; z-scale by the segment length.
+        scales = torch.ones_like(dirs)
+        scales[..., 2] = lens
+
+        # Marker prototype index == frame index (insertion order in _create_debug_markers).
+        marker_indices = (
+            torch.arange(F, device=self.device, dtype=torch.long)
+            .view(1, 1, F).expand(n, ns - 1, F).reshape(-1)
+        )
 
         self._debug_markers.visualize(
-            translations=torch.cat(translations, dim=0),
-            marker_indices=torch.cat(indices, dim=0),
+            translations=centers.reshape(-1, 3),
+            orientations=quats,
+            scales=scales.reshape(-1, 3),
+            marker_indices=marker_indices,
         )

@@ -54,5 +54,11 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     debug_vis_stride: int = 5
     """Draw every Nth step within the debug window (sparser = fewer markers)."""
 
-    debug_vis_marker_radius: float = 0.03
-    """Sphere radius (m) for the per-frame reference-trajectory markers."""
+    debug_vis_marker_radius: float = 0.01
+    """Cylinder radius (m) for the per-frame reference-trajectory ribbon
+    segments (thin = line-like, matching the online command's marker style)."""
+
+    debug_vis_show_hands: bool = False
+    """Whether to draw the hand/wrist end-effector frames in the debug ribbon.
+    Off by default (pelvis + feet are usually what matters); set True to also
+    visualize the wrist trajectories."""
