@@ -64,6 +64,36 @@ def clf_decreasing_condition(
     penalty = torch.clamp(penalty, min=0.0, max=1.0)
     return penalty
 
+
+def _base_vel_output_indices(cmd) -> list[int]:
+    """Indices of the base frame's linear (pos_*) + angular (ori_*) velocity
+    channels within a trajectory command's ``ordered_vel_output_names``."""
+    base = cmd.cfg.base_frame_name
+    names = cmd.ordered_vel_output_names
+    return (
+        [names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]
+        + [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
+    )
+
+
+def ref_base_vel_tracking_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float = 0.5,
+) -> torch.Tensor:
+    """Dense exp reward for tracking the clip's reference base velocity.
+
+    Compares the measured vs reference base (pelvis) linear + angular velocity
+    -- the ``dy_act`` / ``dy_des`` channels of the trajectory command, both in
+    the same yaw-aligned anchor frame -- giving a smooth, shaped locomotion
+    signal on top of the (harder) CLF tracking reward.  Analogous to the
+    velocity-command ``track_lin_vel_xy_exp`` / ``track_ang_vel_z_exp`` rewards,
+    but graded against the reference trajectory rather than a commanded velocity.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    idx = _base_vel_output_indices(cmd)
+    err = cmd.dy_act[:, idx] - cmd.dy_des[:, idx]
+    return torch.exp(-torch.sum(err * err, dim=1) / (std ** 2))
+
+
 def multiple_undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfgs: Sequence[SceneEntityCfg]) -> torch.Tensor:
     """Penalize undesired contacts as the number of violations above a threshold, aggregated across multiple sensors."""
     total = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)

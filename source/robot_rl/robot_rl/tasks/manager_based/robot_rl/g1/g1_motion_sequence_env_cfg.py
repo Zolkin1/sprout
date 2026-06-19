@@ -16,6 +16,7 @@ from isaaclab.utils import configclass
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 
@@ -76,6 +77,8 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+        # Reference base velocity target (pairs with ref_base_vel_tracking_exp).
+        ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         # Full stance-anchored tracking vector.
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
@@ -103,6 +106,7 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+        ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         # Full stance-anchored tracking vector (privileged).
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
@@ -138,10 +142,19 @@ class G1MotionSeqEventsCfg(G1ClfTrackingEventsCfg):
 ##
 @configclass
 class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
-    """CLF tracking + penalties; drop the velocity-command rewards."""
+    """CLF tracking + penalties; drop the velocity-command rewards and add a
+    dense reference-base-velocity tracking term for shaping."""
 
     xy_vel = None
     yaw_vel = None
+
+    # Dense shaped signal replacing the dropped xy_vel/yaw_vel: track the clip's
+    # reference base (pelvis) linear+angular velocity.
+    ref_base_vel = RewTerm(
+        func=mdp.ref_base_vel_tracking_exp,
+        weight=1.0,
+        params={"command_name": "traj_ref", "std": 0.5},
+    )
 
 
 ##
@@ -182,6 +195,16 @@ class G1MotionSequenceEnvCfg(G1ClfTrackingEnvCfg):
         # Episode length matches a 20 s clip at the 0.02 s control dt
         # (decimation 4 * sim.dt 0.005); regenerate clips at this dt.
         self.episode_length_s = 20.0
+
+        # --- Parity with the multiskill baseline (g1_terrain_multiskill) ---
+        # (1) No external pushes (the baseline disables them).
+        self.events.push_robot = None
+        # (2) Reward-knob parity: stronger undesired-contact penalty + tighter
+        #     CLF normalization (baseline used these).
+        self.rewards.undesired_contacts.weight = -0.5
+        self.rewards.clf_reward.params["max_eta_err"] = 5.0
+        self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
+        self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
 
 
 @configclass

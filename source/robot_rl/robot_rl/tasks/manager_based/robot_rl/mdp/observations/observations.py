@@ -180,6 +180,24 @@ def joint_pos_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
     return cmd.y_des[:, idx].clone()
 
 
+def ref_base_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference base (pelvis) linear+angular velocity from the clip (``dy_des``).
+
+    The velocity target the ``ref_base_vel_tracking_exp`` reward grades against;
+    exposing it (paired with the actual base velocity in ``act_traj_vel`` /
+    ``base_*_vel``) makes that reward's error observable to the policy.  Returns
+    ``[N, 6]`` (lin xyz + ang xyz, yaw-aligned anchor frame).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    base = cmd.cfg.base_frame_name
+    names = cmd.ordered_vel_output_names
+    idx = (
+        [names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]
+        + [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
+    )
+    return cmd.dy_des[:, idx].clone()
+
+
 def joint_vel_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
     """Reference joint velocities (the ``joint:*`` channels of ``dy_des``)."""
     cmd = env.command_manager.get_term(command_name)
