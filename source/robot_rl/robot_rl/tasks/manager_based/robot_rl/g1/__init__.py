@@ -488,6 +488,29 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+
+    # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips
+    # are full episodic motions with no gait-phase obs, so the Episodic runner
+    # is the correct choice (phase negation is a no-op here).
+    gym.register(
+        id="G1-motion-sequence-clf-sym",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-motion-sequence-clf-sym-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        },
+    )
     _registered = True
 
 

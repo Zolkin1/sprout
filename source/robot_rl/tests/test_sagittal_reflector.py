@@ -359,3 +359,116 @@ class TestRelabelMatrixRegression:
         R_new = reflector.build_relabel_matrix_numpy()
 
         assert np.allclose(R_old, R_new, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# TestMotionSequenceObsReflection
+# ---------------------------------------------------------------------------
+#
+# Reflector behaviour for the motion-sequence env's new obs terms. These build
+# NamedReflectors over the exact name sets the command helpers
+# (``get_symmetric_joint_ref`` / ``get_symmetric_ee``) construct, validating the
+# core reflection without a running sim.
+
+class TestJointRefReflection:
+    """Reflector over the clip's ``joint:*`` output names (joint_pos/vel_ref)."""
+
+    JOINT_REF_NAMES = [
+        "joint:left_hip_roll_joint",
+        "joint:right_hip_roll_joint",
+        "joint:left_hip_pitch_joint",
+        "joint:right_hip_pitch_joint",
+        "joint:waist_yaw_joint",
+        "joint:left_knee_joint",
+        "joint:right_knee_joint",
+    ]
+
+    @pytest.fixture
+    def reflector(self):
+        return NamedReflector(SagittalReflectionConfig(), self.JOINT_REF_NAMES, DEVICE)
+
+    def test_left_right_swap(self, reflector):
+        perm = reflector.perm_indices.tolist()
+        assert perm[0] == 1 and perm[1] == 0  # hip_roll
+        assert perm[2] == 3 and perm[3] == 2  # hip_pitch
+        assert perm[5] == 6 and perm[6] == 5  # knee
+        assert perm[4] == 4                   # waist_yaw self-maps
+
+    def test_signs(self, reflector):
+        sign = reflector.sign_vector.tolist()
+        assert sign[0] == -1.0 and sign[1] == -1.0  # roll_joint negated
+        assert sign[2] == 1.0 and sign[3] == 1.0    # pitch_joint not negated
+        assert sign[4] == -1.0                       # waist yaw_joint negated
+        assert sign[5] == 1.0 and sign[6] == 1.0    # knee not negated
+
+    def test_double_reflect_is_identity(self, reflector):
+        x = torch.randn(5, len(self.JOINT_REF_NAMES))
+        assert torch.allclose(reflector.reflect(reflector.reflect(x)), x, atol=1e-6)
+
+    def test_relabel_matrix_is_signed_permutation(self, reflector):
+        R = reflector.build_relabel_matrix()
+        for i in range(R.shape[0]):
+            nonzero = R[i][R[i] != 0]
+            assert len(nonzero) == 1
+            assert abs(nonzero.item()) == 1.0
+
+
+class TestEeRefReflection:
+    """Reflector over base-relative ee position names (ee_ref obs)."""
+
+    # Default frame order resolved by MotionSequenceCommand.resolve_ee_frames
+    # (sorted, base excluded), each contributing pos_x/y/z.
+    EE_FRAMES = [
+        "left_ankle_roll_link",
+        "left_wrist_yaw_link",
+        "right_ankle_roll_link",
+        "right_wrist_yaw_link",
+    ]
+    EE_NAMES = [f"{f}:pos_{a}" for f in EE_FRAMES for a in ("x", "y", "z")]
+
+    @pytest.fixture
+    def reflector(self):
+        return NamedReflector(SagittalReflectionConfig(), self.EE_NAMES, DEVICE)
+
+    def test_left_right_frame_swap(self, reflector):
+        perm = reflector.perm_indices.tolist()
+        # left_ankle (0,1,2) <-> right_ankle (6,7,8)
+        assert perm[0:3] == [6, 7, 8]
+        assert perm[6:9] == [0, 1, 2]
+        # left_wrist (3,4,5) <-> right_wrist (9,10,11)
+        assert perm[3:6] == [9, 10, 11]
+        assert perm[9:12] == [3, 4, 5]
+
+    def test_only_pos_y_negated(self, reflector):
+        sign = reflector.sign_vector.tolist()
+        # pos_x, pos_z keep sign; pos_y flips, for every frame.
+        for f in range(4):
+            assert sign[3 * f + 0] == 1.0
+            assert sign[3 * f + 1] == -1.0
+            assert sign[3 * f + 2] == 1.0
+
+    def test_roll_link_not_negated(self, reflector):
+        """``roll_link`` in the ankle name must NOT trigger roll_joint negation."""
+        sign = reflector.sign_vector.tolist()
+        assert sign[0] == 1.0  # left_ankle_roll_link:pos_x
+
+    def test_double_reflect_is_identity(self, reflector):
+        x = torch.randn(5, len(self.EE_NAMES))
+        assert torch.allclose(reflector.reflect(reflector.reflect(x)), x, atol=1e-6)
+
+
+class TestObsMultiplierInvolution:
+    """The fixed sign multipliers must be involutions (reflect twice == identity)."""
+
+    def test_new_multipliers_present_and_involutive(self):
+        cfg = SagittalReflectionConfig()
+        for name in ("base_pose_error", "ref_base_vel"):
+            mult = cfg.obs_term_multipliers[name]
+            assert mult == [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+            squared = [m * m for m in mult]
+            assert squared == [1.0] * len(mult)
+
+    def test_all_multipliers_involutive(self):
+        cfg = SagittalReflectionConfig()
+        for mult in cfg.obs_term_multipliers.values():
+            assert all(m * m == 1.0 for m in mult)

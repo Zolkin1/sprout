@@ -223,10 +223,9 @@ def ee_ref_relative_to_base(
     pos_names = cmd.ordered_pos_output_names
     base = cmd.cfg.base_frame_name
 
-    if frame_names is None:
-        frames = sorted({n.split(":", 1)[0] for n in pos_names if ":pos_" in n} - {base})
-    else:
-        frames = list(frame_names)
+    # Resolved by the command so the symmetry reflector (get_symmetric_ee) uses
+    # the identical frame list/order -- single source of truth, no drift.
+    frames = cmd.resolve_ee_frames(frame_names)
 
     base_pos = cmd.y_des[:, [pos_names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]]
     # xyzw (scalar last) to match Isaac Lab's quat math; outputs store ori_w too.

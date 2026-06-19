@@ -589,6 +589,31 @@ class BaseTrajectoryCommand(CommandTerm):
         reflector = self._traj_vel_reflector if traj_type == "vel" else self._traj_pos_reflector
         return reflector.reflect_with_history(traj)
 
+    def get_symmetric_joint_ref(self, joints: torch.Tensor) -> torch.Tensor:
+        """Return the left-right symmetric reflection of reference joint values.
+
+        Mirrors the ``joint:*`` channels of ``y_des`` / ``dy_des`` (the
+        observations :func:`mdp.joint_pos_ref` / :func:`mdp.joint_vel_ref`
+        expose).  Those channels follow the *clip's* joint output order rather
+        than ``robot.joint_names``, so the reflection is built from the
+        command's own joint-output names instead of the robot-joint reflector.
+        Position and velocity share the same joint names, so one reflector
+        serves both.
+
+        Args:
+            joints: ``[N, num_ref_joints]`` or
+                ``[N, history_length * num_ref_joints]`` reference joint tensor.
+
+        Returns:
+            Symmetric reference joints of the same shape.
+        """
+        reflector = getattr(self, "_joint_ref_reflector", None)
+        if reflector is None:
+            joint_names = [n for n in self.ordered_pos_output_names if n.startswith("joint:")]
+            reflector = NamedReflector(SagittalReflectionConfig(), joint_names, self.device)
+            self._joint_ref_reflector = reflector
+        return reflector.reflect_with_history(joints)
+
     # ------------------------------------------------------------------
     # CommandTerm interface
     # ------------------------------------------------------------------

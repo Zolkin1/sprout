@@ -51,16 +51,36 @@ class SagittalReflectionConfig:
     # ---- observation augmentation classification ----
 
     # Per-observation-term sign multipliers (applied via tiling).
+    #
+    # ``base_pose_error`` / ``ref_base_vel`` are 6-vectors laid out as
+    # [linear xyz, angular xyz]: the linear part mirrors like a position/lin-vel
+    # (negate y) and the angular part like an axial vector / ang-vel (negate
+    # roll + yaw).  For ``base_pose_error`` the angular half is the
+    # ``quat_box_minus`` rotation-vector tangent, which is the same axial-vector
+    # kind already handled for ``base_ang_vel`` / ``root_quat``.
     obs_term_multipliers: dict[str, list[float]] = field(default_factory=lambda: {
         "base_ang_vel": [-1.0, 1.0, -1.0],
         "base_lin_vel": [1.0, -1.0, 1.0],
         "projected_gravity": [1.0, -1.0, 1.0],
         "velocity_commands": [1.0, -1.0, -1.0],
         "root_quat": [-1.0, 1.0, -1.0, 1.0],
+        "base_pose_error": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        "ref_base_vel": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
     })
 
     # Observation terms whose reflection is a joint-level swap+sign.
     joint_obs_terms: tuple[str, ...] = ("joint_pos", "joint_vel", "actions")
+
+    # Reference joint observations whose channels follow the *clip's* joint
+    # output order (not ``robot.joint_names``), so they reflect via a reflector
+    # built from the command's own joint-output names (see
+    # ``BaseTrajectoryCommand.get_symmetric_joint_ref``).
+    joint_ref_obs_terms: tuple[str, ...] = ("joint_pos_ref", "joint_vel_ref")
+
+    # Reference end-effector positions expressed relative to the reference base;
+    # reflected via a frame-swap + pos_y negation built from the command's ee
+    # frame list (see ``MotionSequenceCommand.get_symmetric_ee``).
+    ee_pos_obs_terms: tuple[str, ...] = ("ee_ref",)
 
     # Observation terms that are position / velocity trajectories.
     pos_traj_obs_terms: tuple[str, ...] = ("ref_traj", "act_traj")

@@ -23,6 +23,7 @@ import warp as wp
 from isaaclab.utils.math import quat_from_angle_axis
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
+from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .clips.clip_io import load_clip_library
 from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from .clips.clip_manager import MotionClipManager
@@ -263,6 +264,63 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         wquat = lift_orientation(world_quat, caq)
         anchor = torch.cat([wpos, wquat], dim=-1)
         return lift_base_world_state(y, dy, anchor, self._base_idx)
+
+    # ------------------------------------------------------------------
+    # Symmetry helpers (end-effector reference)
+    # ------------------------------------------------------------------
+
+    def resolve_ee_frames(self, frame_names: list[str] | None = None) -> list[str]:
+        """Resolve the end-effector frame list/order for the ``ee_ref`` obs.
+
+        Single source of truth shared by :func:`mdp.ee_ref_relative_to_base`
+        and its symmetry reflector (:meth:`get_symmetric_ee`) so the two can
+        never drift.  When ``frame_names`` is ``None``, returns every reference
+        output frame that exposes a position, except the base frame, sorted
+        alphabetically (matching the obs default).
+
+        Args:
+            frame_names: Explicit frame list, or ``None`` for the default.
+
+        Returns:
+            Ordered end-effector frame names.
+        """
+        if frame_names is not None:
+            return list(frame_names)
+        base = self.cfg.base_frame_name
+        return sorted(
+            {n.split(":", 1)[0] for n in self.ordered_pos_output_names if ":pos_" in n} - {base}
+        )
+
+    def get_symmetric_ee(
+        self, ee: torch.Tensor, frame_names: list[str] | None = None,
+    ) -> torch.Tensor:
+        """Return the left-right symmetric reflection of base-relative ee positions.
+
+        :func:`mdp.ee_ref_relative_to_base` stacks each frame's xyz position
+        (expressed in the reference base frame).  Under sagittal reflection each
+        left/right frame swaps and each frame's y component negates -- a
+        :class:`NamedReflector` over ``{frame}:pos_{x,y,z}`` names does both.
+        Reflectors are cached per resolved frame tuple.
+
+        Args:
+            ee: ``[N, 3*F]`` or ``[N, history_length * 3*F]`` ee-position tensor.
+            frame_names: Same frame list the obs used (``None`` -> default).
+
+        Returns:
+            Symmetric ee positions of the same shape.
+        """
+        frames = self.resolve_ee_frames(frame_names)
+        key = tuple(frames)
+        cache = getattr(self, "_ee_reflector_cache", None)
+        if cache is None:
+            cache = {}
+            self._ee_reflector_cache = cache
+        reflector = cache.get(key)
+        if reflector is None:
+            names = [f"{f}:pos_{a}" for f in frames for a in ("x", "y", "z")]
+            reflector = NamedReflector(SagittalReflectionConfig(), names, self.device)
+            cache[key] = reflector
+        return reflector.reflect_with_history(ee)
 
     # ------------------------------------------------------------------
     # Debug visualization (standard CommandTerm debug_vis hook)
