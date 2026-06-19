@@ -25,14 +25,36 @@ from .base_trajectory_cmd import BaseTrajectoryCommand
 from .clips.clip_io import load_clip_library
 from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from .clips.clip_manager import MotionClipManager
-from .world_lift import lift_base_world_state, lift_orientation, lift_position
+from .world_lift import (
+    lift_base_world_state,
+    lift_orientation,
+    lift_orientation_batched,
+    lift_position,
+    lift_position_batched,
+)
 from .motion_sequence_cmd_cfg import MotionSequenceCommandCfg
+
+# Per-frame debug-marker colors (RGB 0-1); matches the viser/plot tooling.
+_DEBUG_FRAME_COLOR_MAP: dict[str, tuple[float, float, float]] = {
+    "pelvis_link": (0.95, 0.55, 0.10),
+    "left_ankle_roll_link": (0.20, 0.45, 1.00),
+    "right_ankle_roll_link": (0.90, 0.20, 0.25),
+    "left_wrist_yaw_link": (0.20, 0.80, 0.85),
+    "right_wrist_yaw_link": (0.80, 0.30, 0.90),
+}
+_DEBUG_FRAME_FALLBACK_COLOR: tuple[float, float, float] = (0.6, 0.6, 0.6)
+_DEBUG_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_ref"
 
 
 class MotionSequenceCommand(BaseTrajectoryCommand):
     """Track fixed pre-generated motion clips open-loop."""
 
     cfg: MotionSequenceCommandCfg
+
+    # Lazily built once the simulator is up (CommandTerm may call
+    # ``_set_debug_vis_impl`` before ``_post_init``).  See the debug-vis block.
+    _debug_markers: object | None = None
+    _debug_vis_pending: bool = False
 
     # ------------------------------------------------------------------
     # Construction
@@ -96,6 +118,25 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         )
 
         self._record_clip_fingerprint(self.cfg)
+
+        # --- Debug-viz setup (per reference frame: pos indices + color) ---
+        self._debug_frame_names = [
+            n[: -len(":pos_x")] for n in self.ordered_pos_output_names if n.endswith(":pos_x")
+        ]
+        self._debug_frame_pos_idx = [
+            torch.tensor(
+                [self.ordered_pos_output_names.index(f"{f}:pos_{a}") for a in ("x", "y", "z")],
+                dtype=torch.long, device=dev,
+            )
+            for f in self._debug_frame_names
+        ]
+        self._debug_frame_colors = [
+            _DEBUG_FRAME_COLOR_MAP.get(f, _DEBUG_FRAME_FALLBACK_COLOR) for f in self._debug_frame_names
+        ]
+        # Forward-window step offsets (current step .. +horizon), subsampled.
+        horizon_steps = max(1, int(round(self.cfg.debug_vis_horizon_s / self.manager.dt)))
+        stride = max(1, int(self.cfg.debug_vis_stride))
+        self._debug_offsets = torch.arange(0, horizon_steps, stride, dtype=torch.long, device=dev)
 
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
@@ -211,3 +252,86 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         wquat = lift_orientation(world_quat, caq)
         anchor = torch.cat([wpos, wquat], dim=-1)
         return lift_base_world_state(y, dy, anchor, self._base_idx)
+
+    # ------------------------------------------------------------------
+    # Debug visualization (standard CommandTerm debug_vis hook)
+    # ------------------------------------------------------------------
+
+    def _set_debug_vis_impl(self, debug_vis: bool) -> None:
+        """Toggle the reference-trajectory marker visualizer.
+
+        Draws, per env, a forward window of each reference frame's world
+        position as colored spheres -- a "ribbon" of where the clip says
+        each body should go.  Per-step update is in
+        :meth:`_debug_vis_callback`.
+        """
+        if debug_vis:
+            if self._debug_markers is None and hasattr(self, "_debug_frame_pos_idx"):
+                self._debug_markers = self._create_debug_markers()
+            if self._debug_markers is not None:
+                self._debug_markers.set_visibility(True)
+            else:
+                self._debug_vis_pending = True
+        else:
+            self._debug_vis_pending = False
+            if self._debug_markers is not None:
+                self._debug_markers.set_visibility(False)
+
+    def _create_debug_markers(self):
+        """Build a :class:`VisualizationMarkers` with one sphere per frame."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN MotionSequenceCommand] could not import VisualizationMarkers: {exc}")
+            return None
+        radius = float(self.cfg.debug_vis_marker_radius)
+        prototypes = {
+            name: sim_utils.SphereCfg(
+                radius=radius,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+            )
+            for name, color in zip(self._debug_frame_names, self._debug_frame_colors)
+        }
+        cfg = VisualizationMarkersCfg(prim_path=_DEBUG_VIZ_PRIM_PATH, markers=prototypes)
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not create VisualizationMarkers: {exc}")
+            return None
+
+    def _debug_vis_callback(self, event) -> None:
+        """Draw the upcoming reference-frame positions for every env."""
+        if self._debug_markers is None:
+            if not self._debug_vis_pending:
+                return
+            self._debug_markers = self._create_debug_markers()
+            if self._debug_markers is None:
+                return
+            self._debug_markers.set_visibility(True)
+            self._debug_vis_pending = False
+
+        n = self.num_envs
+        T = self.manager.num_steps
+        steps = (self._step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)  # [n, Ns]
+        ns = steps.shape[1]
+        cid = self.clip_id[:, None].expand(n, ns)                                       # [n, Ns]
+
+        # World anchor schedule for the window: clip placement ∘ clip anchor.
+        ap = self.manager.lib.anchor_pos[cid, steps]                                     # [n, Ns, 3]
+        aq = self.manager.lib.anchor_quat[cid, steps]                                    # [n, Ns, 4]
+        wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, ap)
+        waq = lift_orientation_batched(self.clip_world_quat, aq)
+        wap_f, waq_f = wap.reshape(-1, 3), waq.reshape(-1, 4)
+
+        yd = self.manager.lib.y_des[cid, steps]                                          # [n, Ns, P]
+        translations, indices = [], []
+        for fi, pidx in enumerate(self._debug_frame_pos_idx):
+            rel = yd[:, :, pidx].reshape(-1, 3)
+            translations.append(lift_position(wap_f, waq_f, rel))
+            indices.append(torch.full((rel.shape[0],), fi, dtype=torch.long, device=self.device))
+
+        self._debug_markers.visualize(
+            translations=torch.cat(translations, dim=0),
+            marker_indices=torch.cat(indices, dim=0),
+        )

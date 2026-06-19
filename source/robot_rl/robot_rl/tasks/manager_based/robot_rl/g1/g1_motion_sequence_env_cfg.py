@@ -48,6 +48,7 @@ class G1MotionSeqCommandsCfg:
         random_start_phase=True,
         random_start_min_remaining_s=2.0,
         randomize_heading=False,
+        debug_vis=False,  # training: off (enabled in the -play variant)
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
     )
@@ -75,6 +76,12 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+
+        # Full stance-anchored tracking vector.
+        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
+        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
+        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -187,3 +194,5 @@ class G1MotionSequenceEnvCfgPlay(G1MotionSequenceEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
+        # Draw the reference-trajectory markers in the viewer.
+        self.commands.traj_ref.debug_vis = True

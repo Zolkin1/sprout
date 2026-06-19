@@ -75,6 +75,14 @@ class MotionClipManager(ManagerBase):
         by the command, so the type only labels the run)."""
         return TrajectoryType.EPISODIC
 
+    def get_total_time(self) -> torch.Tensor:
+        """Total clip duration in seconds (``num_steps * dt``).
+
+        Mirrors :meth:`MultiSkillManager.get_total_time`; consumed by the
+        parameter-export tooling (``scripts/rsl_rl/export_parameters.py``).
+        """
+        return torch.tensor(self.num_steps * self.dt, device=self.device)
+
     def order_outputs(self, pos_output_names: list[str], vel_output_names: list[str]) -> None:
         """Permute the dense output dimension to the command's output order."""
         pos_perm = torch.tensor(

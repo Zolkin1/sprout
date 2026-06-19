@@ -46,3 +46,13 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     clip_fingerprint: dict | None = None
     """Recorded clip-library fingerprint (set at train, verified at play).
     Populated by the command at construction; serialised into env.yaml."""
+
+    # --- Debug visualization (set ``debug_vis = True`` to enable) ---
+    debug_vis_horizon_s: float = 3.0
+    """Forward window (seconds) of the reference trajectory drawn as markers."""
+
+    debug_vis_stride: int = 5
+    """Draw every Nth step within the debug window (sparser = fewer markers)."""
+
+    debug_vis_marker_radius: float = 0.03
+    """Sphere radius (m) for the per-frame reference-trajectory markers."""
