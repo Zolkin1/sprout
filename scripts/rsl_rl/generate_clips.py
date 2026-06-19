@@ -92,7 +92,12 @@ def main() -> int:
     p.add_argument("--resample-min", type=float, default=2.0, help="Min seconds between velocity resamples.")
     p.add_argument("--resample-max", type=float, default=5.0, help="Max seconds between velocity resamples.")
     p.add_argument("--max-acc", type=float, default=2.0, help="Velocity ramp max acceleration.")
-    p.add_argument("--transition-prob", type=float, default=None, help="Skill-persistence transition prob.")
+    p.add_argument("--transition-prob", type=float, default=None,
+                   help="Per-resample probability of switching to a DIFFERENT skill mid-clip. "
+                        "0.0 = lock each clip to its start skill -- walk/run/stand still vary across "
+                        "the library and velocity still resamples within that one skill, but there are "
+                        "no in-clip skill transitions. None (default) = draw a skill i.i.d. at every "
+                        "velocity resample (frequent transitions).")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--hf-repo", default=None, help="Optional HuggingFace repo id for the source library.")
     p.add_argument("--config", default=None, help="JSON file overriding velocity_buckets / skill_probs.")
