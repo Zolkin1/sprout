@@ -97,6 +97,11 @@ def main() -> int:
     p.add_argument("--hf-repo", default=None, help="Optional HuggingFace repo id for the source library.")
     p.add_argument("--config", default=None, help="JSON file overriding velocity_buckets / skill_probs.")
     p.add_argument("--exclude-skills", default="", help="Comma-separated skills to never generate (e.g. walk_backwards).")
+    p.add_argument("--forward-only", action="store_true",
+                   help="Zero lateral (vy) and yaw (wz) velocity in every bucket so all clips go "
+                        "straight (no strafing / turning). Combine with --exclude-skills to isolate "
+                        "a single gait, e.g. --exclude-skills running,standing,walk_backwards for "
+                        "a trivial forward-walk-only validation library.")
     p.add_argument("--no-ground-projection", action="store_true",
                    help="Disable pinning stance landings to the ground plane (allows z drift).")
     p.add_argument("--ground-height", type=float, default=0.0, help="Ground plane height for projection (m).")
@@ -130,6 +135,16 @@ def main() -> int:
         skill_probs = [0.0 if name in exclude_skills else p for name, p in zip(skill_list, skill_probs)]
         if sum(skill_probs) <= 0:
             raise SystemExit("--exclude-skills removed every skill; nothing left to sample.")
+
+    # Forward-only: clamp lateral (vy) and yaw (wz) to zero in every bucket so the
+    # sampler only ever commands straight-line motion. Captured in gen_config below
+    # (built from `buckets`) so the fingerprint reflects it.
+    if args.forward_only:
+        buckets = {
+            name: _Bucket(lin_vel_x=b.lin_vel_x, lin_vel_y=(0.0, 0.0),
+                          ang_vel_z=(0.0, 0.0), heading=None)
+            for name, b in buckets.items()
+        }
 
     sampler = OfflineVelocitySampler(
         buckets, skill_list, skill_probs,

@@ -66,18 +66,6 @@ WALKING_Q_weights["left_wrist_yaw_link:ori_x"] = [1.0, 1.0]
 WALKING_Q_weights["left_wrist_yaw_link:ori_y"] = [1.0, 1.0]
 WALKING_Q_weights["left_wrist_yaw_link:ori_z"] = [1.0, 1.0]
 
-# UPDATED VALUES - NEED TESTING
-WALKING_Q_weights["pelvis_link:pos_x"] = [64.0, 10.0]
-WALKING_Q_weights["pelvis_link:pos_y"] = [64.0, 10.0]
-WALKING_Q_weights["pelvis_link:pos_z"] = [3.2, 1.0]
-WALKING_Q_weights["left_ankle_roll_link:pos_x"] = [24.2, 1.0]
-WALKING_Q_weights["left_ankle_roll_link:pos_y"] = [24.2, 1.0]
-WALKING_Q_weights["left_ankle_roll_link:pos_z"] = [24.2, 1.0]
-WALKING_Q_weights["right_ankle_roll_link:pos_x"] = [24.2, 1.0]
-WALKING_Q_weights["right_ankle_roll_link:pos_y"] = [24.2, 1.0]
-WALKING_Q_weights["right_ankle_roll_link:pos_z"] = [24.2, 1.0]
-#
-
 WALKING_R_weights = {}
 WALKING_R_weights["com:pos_x"] = [0.05]
 WALKING_R_weights["com:pos_y"] = [0.05]

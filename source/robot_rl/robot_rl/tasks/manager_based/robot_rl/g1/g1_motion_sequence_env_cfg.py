@@ -170,7 +170,7 @@ class G1MotionSeqTerminationCfg:
     )
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.25, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.75, "max_ori_rad": 0.8},
     )
 
 

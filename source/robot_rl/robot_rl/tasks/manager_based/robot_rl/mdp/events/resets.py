@@ -291,8 +291,9 @@ def reset_on_motion_sequence(
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
-    # 2. World placement of the clip frame (optional random yaw), re-zeroed so
-    #    the start-step stance anchor lands exactly at the env origin.
+    # 2. World placement of the clip frame (optional random yaw): re-zero only the
+    #    downrange (x, y) placement so a mid-clip start spawns at the env origin,
+    #    but KEEP the schedule's anchor height (z).
     world_quat = torch.zeros(k, 4, device=device)
     world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
     if getattr(cmd.cfg, "randomize_heading", False):
@@ -301,6 +302,10 @@ def reset_on_motion_sequence(
         world_quat = quat_from_euler_xyz(zeros, zeros, yaw)
     anchor_pos0, _ = cmd.manager.gather_anchor(clip_id, start_step)  # clip-frame anchor at t0
     rotated = lift_position(torch.zeros(k, 3, device=device), world_quat, anchor_pos0)
+    # The clip anchor z is the natural stance-ankle height (foot resting ON the
+    # ground at generation time). Subtracting it here would sink the robot
+    # ~ankle-height into the ground every reset, so only re-zero x/y placement.
+    rotated[:, 2] = 0.0
     world_pos = env.scene.env_origins[env_ids] - rotated
 
     # 3. World reference state at (clip, start_step, placement).
