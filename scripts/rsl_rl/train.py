@@ -89,6 +89,12 @@ parser.add_argument(
          "physics on its own stream). Slower than the default async timers; "
          "use it to resolve cross-stream mis-attribution.",
 )
+parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold a trajectory/clip library on (e.g. 'cpu' to keep a multi-GB "
+         "library off a small GPU). Applied to any command term exposing a clip_device "
+         "field. Set here (not via hydra) because the cfg default is None.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -123,6 +129,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # override configurations with non-hydra CLI arguments
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+        # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
+        # hydra: the cfg field default is None so hydra rejects a str override).
+        if args_cli.clip_device is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )

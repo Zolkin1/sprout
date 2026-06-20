@@ -182,6 +182,20 @@ class DataLogger:
             except Exception as exc:
                 self._warn("traj_term", f"Failed to read trajectory term: {exc}")
 
+        # 1b. Commanded (joystick-level) base velocity for motion-sequence
+        # clips: the upstream (vx, vy, wz) command baked into the clip library
+        # (``target_vel``).  This is the velocity we are *trying* to track -- the
+        # closest analog to the old ``base_velocity`` command term -- and is
+        # paired with the robot's measured body-frame velocity (section 4) for
+        # the velocity-tracking plot.
+        if self._traj_term_name is not None:
+            try:
+                ref = unwrapped.command_manager.get_term(self._traj_term_name)
+                if getattr(ref, "command_velocity_available", False):
+                    step["target_vel"] = ref.get_command_velocity().clone()
+            except Exception as exc:
+                self._warn("target_vel", f"Could not read commanded target velocity: {exc}")
+
         # 2. Base velocity command
         try:
             step["base_velocity"] = unwrapped.command_manager.get_command("base_velocity").clone()
@@ -200,6 +214,12 @@ class DataLogger:
             robot = unwrapped.scene.articulations["robot"]
             step["joint_pos"] = _to_torch(robot.data.joint_pos).clone()
             step["applied_torque"] = _to_torch(robot.data.applied_torque).clone()
+            # Measured body-frame base velocity as (vx forward, vy lateral, wz
+            # yaw rate) to pair 1:1 with the clip's (vx, vy, wz) ``target_vel``
+            # in the velocity-tracking plot.
+            lin_b = _to_torch(robot.data.root_lin_vel_b)
+            ang_b = _to_torch(robot.data.root_ang_vel_b)
+            step["robot_base_vel"] = torch.stack([lin_b[:, 0], lin_b[:, 1], ang_b[:, 2]], dim=-1).clone()
         except Exception as exc:
             self._warn("robot_data", f"Could not read robot articulation data: {exc}")
 

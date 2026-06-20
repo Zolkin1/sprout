@@ -33,6 +33,7 @@ from .world_lift import (
     lift_orientation_batched,
     lift_position,
     lift_position_batched,
+    lift_vector,
 )
 from .motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
@@ -280,6 +281,71 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         world anchor (``ref_poses``).  Used by the reset event and observations.
         """
         return lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, self._base_idx)
+
+    def _frame_output_indices(self, frame_name: str) -> dict[str, torch.Tensor]:
+        """Resolve (and cache) the y_des/dy_des indices for one output frame.
+
+        Returns long-tensor index sets keyed by ``pos`` (3), ``ori`` (4, xyzw),
+        ``lin_vel`` (3), ``ang_vel`` (3) for ``frame_name``.
+        """
+        cache = getattr(self, "_frame_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._frame_idx_cache = cache
+        if frame_name in cache:
+            return cache[frame_name]
+        pos_names = self.ordered_pos_output_names
+        vel_names = self.ordered_vel_output_names
+        dev = self.device
+        entry = {
+            "pos": torch.tensor(
+                [pos_names.index(f"{frame_name}:pos_{a}") for a in ("x", "y", "z")],
+                dtype=torch.long, device=dev,
+            ),
+            "ori": torch.tensor(
+                [pos_names.index(f"{frame_name}:ori_{a}") for a in ("x", "y", "z", "w")],
+                dtype=torch.long, device=dev,
+            ),
+            "lin_vel": torch.tensor(
+                [vel_names.index(f"{frame_name}:pos_{a}") for a in ("x", "y", "z")],
+                dtype=torch.long, device=dev,
+            ),
+            "ang_vel": torch.tensor(
+                [vel_names.index(f"{frame_name}:ori_{a}") for a in ("x", "y", "z")],
+                dtype=torch.long, device=dev,
+            ),
+        }
+        cache[frame_name] = entry
+        return entry
+
+    def reference_world_frames(self, frame_names: list[str]) -> torch.Tensor:
+        """World-frame reference state for extra output frames (e.g. feet/hands).
+
+        Lifts each frame's stance-anchored ``y_des``/``dy_des`` channels through
+        the current world anchor (``ref_poses``), the same lift
+        :meth:`reference_world_state` uses for the base.  Used both by the data
+        recorder (to record ee reference states) and the generator-tracking
+        command (to build the clip's world-frame CLF outputs).
+
+        Args:
+            frame_names: Output frame names (must expose ``pos_{x,y,z}`` and
+                ``ori_{x,y,z,w}`` outputs, e.g. the ankle/wrist links).
+
+        Returns:
+            ``[N, K, 13]`` per frame ``[pos_w(3), quat_w(4, xyzw), lin_vel_w(3),
+            ang_vel_w(3)]`` in the given frame order.
+        """
+        anchor_pos = self.ref_poses[:, :3]
+        anchor_quat = self.ref_poses[:, 3:7]
+        out = []
+        for f in frame_names:
+            idx = self._frame_output_indices(f)
+            pos_w = lift_position(anchor_pos, anchor_quat, self.y_des[:, idx["pos"]])
+            quat_w = lift_orientation(anchor_quat, self.y_des[:, idx["ori"]])
+            lin_w = lift_vector(anchor_quat, self.dy_des[:, idx["lin_vel"]])
+            ang_w = lift_vector(anchor_quat, self.dy_des[:, idx["ang_vel"]])
+            out.append(torch.cat([pos_w, quat_w, lin_w, ang_w], dim=-1))
+        return torch.stack(out, dim=1)
 
     def get_reference_world_state(self, base_frame_name: str) -> torch.Tensor:
         """World-frame reference state, matching the base-class recording API.

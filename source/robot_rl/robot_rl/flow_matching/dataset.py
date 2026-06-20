@@ -23,7 +23,7 @@ from torch.utils.data import Dataset
 
 from .config import FlowMatchingConfig
 from .normalizer import Normalizer
-from .transforms import orientation_slice, relative_state, target_state_dim
+from .transforms import orientation_slices, relative_state, target_state_dim
 
 
 def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str) -> tuple[int, int]:
@@ -43,6 +43,31 @@ def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str)
             return offset, offset + dim
         offset += dim
     raise KeyError(f"term {target!r} not found in {term_names}")
+
+
+def _stack_frame_tensors(
+    split_fn, frame_names: list[str], rows: int
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Gather extra-frame world tensors and flatten to ``(rows, K, ·)`` for relative_state.
+
+    Args:
+        split_fn: ``name -> (..., dim)`` slicer over the windowed state (the local
+            ``_split``), where ``...`` flattens to ``rows``.
+        frame_names: Ordered extra body-frame names; ``[]`` returns all ``None``.
+        rows: Flattened leading dimension (e.g. ``n_win * window_len``).
+
+    Returns:
+        ``(frame_pos_w, frame_quat_w, frame_lin_vel_w, frame_ang_vel_w)`` each
+        ``(rows, K, ·)``, or all ``None`` when ``frame_names`` is empty.
+    """
+    if not frame_names:
+        return None, None, None, None
+    k = len(frame_names)
+    fp = torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
+    fq = torch.stack([split_fn(f"{f}:quat_w") for f in frame_names], dim=-2).reshape(rows, k, 4)
+    fl = torch.stack([split_fn(f"{f}:lin_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
+    fa = torch.stack([split_fn(f"{f}:ang_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
+    return fp, fq, fl, fa
 
 
 # TODO(partial-history): only full H+F windows are trained on, so the first
@@ -149,7 +174,11 @@ class FutureStateDataset(Dataset):
         s_slc = {name: resolve_term_slice(s_names, s_dims, name) for name in s_names}
         nj = s_dims[s_names.index("joint_pos")]
         self.num_joints = nj
-        self.state_dim = target_state_dim(nj)
+        # Extra body frames recorded beyond root + joints (e.g. feet/hands for the
+        # CLF). Each contributes a [pos, lin_vel, ori6d, ang_vel] block to the state.
+        self.state_frame_names = list(getattr(meta, "state_frame_names", []) or [])
+        self.num_extra_frames = len(self.state_frame_names)
+        self.state_dim = target_state_dim(nj, self.num_extra_frames)
 
         # -- resolve the command + perception inputs --
         # Command source: a dedicated recorded array (cfg.cmd_array, e.g. "target_vel")
@@ -225,10 +254,12 @@ class FutureStateDataset(Dataset):
         q_ref = q[:, h - 1 : h, :].expand(n_win, window_len, 4)
 
         m = n_win * window_len
+        fpos, fquat, flin, fang = _stack_frame_tensors(_split, self.state_frame_names, m)
         rel = relative_state(
             p.reshape(m, 3), q.reshape(m, 4), v.reshape(m, 3), wv.reshape(m, 3),
             jp.reshape(m, nj), jv.reshape(m, nj),
             p_ref.reshape(m, 3), q_ref.reshape(m, 4),
+            frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
         ).reshape(n_win, window_len, self.state_dim)
 
         hist_state = rel[:, :h, :]                       # (Nw, H, state_dim)
@@ -253,10 +284,10 @@ class FutureStateDataset(Dataset):
         self.p_ref = p[:, h - 1, :].contiguous()  # (Nw, 3)
         self.q_ref = q[:, h - 1, :].contiguous()  # (Nw, 4)
 
-        # -- normalizers (fit on train; orientation dims left raw) --
-        o0, o1 = orientation_slice(nj)
+        # -- normalizers (fit on train; every frame's ori6d block left raw) --
         target_mask = torch.ones(self.state_dim, dtype=torch.bool)
-        target_mask[o0:o1] = False
+        for o0, o1 in orientation_slices(nj, self.num_extra_frames):
+            target_mask[o0:o1] = False
         # Command + scan columns of the history token are standardized.
         history_mask = torch.cat(
             [target_mask, torch.ones(self.history_in_dim - self.state_dim, dtype=torch.bool)]
@@ -343,10 +374,12 @@ class FutureStateDataset(Dataset):
         q_ref = q_actual[:, h - 1 : h, :].expand(n_win, f, 4)
 
         m = n_win * f
+        fpos, fquat, flin, fang = _stack_frame_tensors(_split, self.state_frame_names, m)
         return relative_state(
             pf.reshape(m, 3), qf.reshape(m, 4), vf.reshape(m, 3), wf.reshape(m, 3),
             jpf.reshape(m, nj), jvf.reshape(m, nj),
             p_ref.reshape(m, 3), q_ref.reshape(m, 4),
+            frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
         ).reshape(n_win, f, self.state_dim).contiguous()
 
     def __len__(self) -> int:

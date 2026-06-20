@@ -6,9 +6,15 @@ This module is the single source of truth for two conventions:
 
 1. The **relative-frame state vector** layout (per timestep), order::
 
-       [joint_pos(nj), joint_vel(nj), p_rel(3), v_rel(3), ori6d(6), w_rel(3)]
+       [joint_pos(nj), joint_vel(nj),
+        p_rel(3), v_rel(3), ori6d(6), w_rel(3),                 # base (root) block
+        <per extra frame: pos_rel(3), linvel_rel(3), ori6d(6), angvel_rel(3)> ...]
 
-   where root quantities are expressed relative to a reference root frame.
+   where root *and* every extra body frame are expressed relative to a single
+   reference root frame. The base block and each extra-frame block share the
+   identical ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` layout, so an extra
+   frame is just "another base". ``num_extra_frames=0`` reproduces the original
+   base-and-joints-only vector (``2*nj + 15``).
 
 2. The **6D continuous rotation** representation (Zhou et al., 2019): the first
    two *columns* of the rotation matrix. The exact column ordering is reused on
@@ -82,15 +88,68 @@ def rot6d_to_quat(d6: torch.Tensor) -> torch.Tensor:
     return quat_from_matrix(rot6d_to_matrix(d6))
 
 
-def target_state_dim(num_joints: int) -> int:
-    """Width of the relative-frame state vector for a robot with ``num_joints``."""
-    return 2 * num_joints + 3 + 3 + 6 + 3
+# Per-frame block width: [pos(3), lin_vel(3), ori6d(6), ang_vel(3)]. The base
+# (root) block and every extra body frame share this layout.
+FRAME_BLOCK_DIM = 3 + 3 + 6 + 3  # = 15
 
 
-def orientation_slice(num_joints: int) -> tuple[int, int]:
-    """Return ``(start, end)`` of the 6D orientation block within the state vector."""
-    start = 2 * num_joints + 3 + 3
+def target_state_dim(num_joints: int, num_extra_frames: int = 0) -> int:
+    """Width of the relative-frame state vector.
+
+    Args:
+        num_joints: Number of joints ``nj``.
+        num_extra_frames: Number of extra body frames beyond the root (each adds
+            a :data:`FRAME_BLOCK_DIM`-wide block).
+
+    Returns:
+        ``2*nj + FRAME_BLOCK_DIM * (1 + num_extra_frames)``.
+    """
+    return 2 * num_joints + FRAME_BLOCK_DIM * (1 + num_extra_frames)
+
+
+def frame_block_start(num_joints: int, frame_index: int) -> int:
+    """Start offset of a frame block within the state vector.
+
+    Args:
+        num_joints: Number of joints ``nj``.
+        frame_index: ``0`` for the root/base block, ``1..K`` for extra frames.
+
+    Returns:
+        The start column of that frame's ``[pos, lin_vel, ori6d, ang_vel]`` block.
+    """
+    return 2 * num_joints + FRAME_BLOCK_DIM * frame_index
+
+
+def orientation_slice(num_joints: int, frame_index: int = 0) -> tuple[int, int]:
+    """Return ``(start, end)`` of a frame's 6D orientation block.
+
+    Args:
+        num_joints: Number of joints ``nj``.
+        frame_index: ``0`` for the root/base block, ``1..K`` for extra frames.
+    """
+    start = frame_block_start(num_joints, frame_index) + 3 + 3
     return start, start + 6
+
+
+def orientation_slices(num_joints: int, num_extra_frames: int = 0) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` 6D-orientation slice of every frame (base first)."""
+    return [orientation_slice(num_joints, i) for i in range(1 + num_extra_frames)]
+
+
+def _frame_relative_block(
+    p_ref: torch.Tensor,
+    q_ref: torch.Tensor,
+    p_w: torch.Tensor,
+    q_w: torch.Tensor,
+    v_w: torch.Tensor,
+    w_w: torch.Tensor,
+) -> torch.Tensor:
+    """Build one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block (any leading dims)."""
+    p_rel, q_rel = subtract_frame_transforms(p_ref, q_ref, p_w, q_w)
+    ori6d = matrix_to_rot6d(matrix_from_quat(q_rel))
+    v_rel = quat_apply_inverse(q_ref, v_w)
+    w_rel = quat_apply_inverse(q_ref, w_w)
+    return torch.cat([p_rel, v_rel, ori6d, w_rel], dim=-1)
 
 
 def relative_state(
@@ -102,14 +161,19 @@ def relative_state(
     joint_vel: torch.Tensor,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
+    frame_pos_w: torch.Tensor | None = None,
+    frame_quat_w: torch.Tensor | None = None,
+    frame_lin_vel_w: torch.Tensor | None = None,
+    frame_ang_vel_w: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the relative-frame state vector for a batch of steps.
 
-    Every input is ``(M, ·)`` where ``M`` is the number of steps. Root pose is
-    expressed relative to the (per-step) reference frame ``(p_ref, q_ref)``;
-    root velocities are rotated into that frame by a **pure rotation** (the
-    reference frame is a stationary world snapshot, not a moving body frame, so
-    no ``w x r`` term is added).
+    Every input is ``(M, ·)`` where ``M`` is the number of steps. The root pose
+    (and each extra frame's pose) is expressed relative to the (per-step)
+    reference frame ``(p_ref, q_ref)``; velocities are rotated into that frame by
+    a **pure rotation** (the reference frame is a stationary world snapshot, not a
+    moving body frame, so no ``w x r`` term is added). Each extra frame appends a
+    block identical in layout to the root block.
 
     Args:
         p_w: Root positions (world), shape ``(M, 3)``.
@@ -120,15 +184,27 @@ def relative_state(
         joint_vel: Raw joint velocities, shape ``(M, nj)``.
         p_ref: Reference position (world), shape ``(M, 3)``.
         q_ref: Reference quaternion (world, xyzw), shape ``(M, 4)``.
+        frame_pos_w: Extra-frame positions (world), shape ``(M, K, 3)`` or ``None``.
+        frame_quat_w: Extra-frame quaternions (world, xyzw), shape ``(M, K, 4)``.
+        frame_lin_vel_w: Extra-frame linear velocities (world), shape ``(M, K, 3)``.
+        frame_ang_vel_w: Extra-frame angular velocities (world), shape ``(M, K, 3)``.
 
     Returns:
-        Relative-state tensor, shape ``(M, 2*nj + 15)``.
+        Relative-state tensor, shape ``(M, 2*nj + 15*(1 + K))``.
     """
-    p_rel, q_rel = subtract_frame_transforms(p_ref, q_ref, p_w, q_w)
-    ori6d = matrix_to_rot6d(matrix_from_quat(q_rel))
-    v_rel = quat_apply_inverse(q_ref, v_w)
-    w_rel = quat_apply_inverse(q_ref, w_w)
-    return torch.cat([joint_pos, joint_vel, p_rel, v_rel, ori6d, w_rel], dim=-1)
+    root_block = _frame_relative_block(p_ref, q_ref, p_w, q_w, v_w, w_w)
+    parts = [joint_pos, joint_vel, root_block]
+    if frame_pos_w is not None:
+        m, k = frame_pos_w.shape[0], frame_pos_w.shape[1]
+        pr = p_ref.unsqueeze(1).expand(m, k, 3).reshape(m * k, 3)
+        qr = q_ref.unsqueeze(1).expand(m, k, 4).reshape(m * k, 4)
+        block = _frame_relative_block(
+            pr, qr,
+            frame_pos_w.reshape(m * k, 3), frame_quat_w.reshape(m * k, 4),
+            frame_lin_vel_w.reshape(m * k, 3), frame_ang_vel_w.reshape(m * k, 3),
+        ).reshape(m, k * FRAME_BLOCK_DIM)
+        parts.append(block)
+    return torch.cat(parts, dim=-1)
 
 
 def relative_state_from_window(
@@ -155,36 +231,51 @@ def relative_state_from_window(
     return relative_state(p_w, q_w, v_w, w_w, joint_pos, joint_vel, p_ref, q_ref)
 
 
+def _block_to_absolute(
+    block: torch.Tensor, p_ref: torch.Tensor, q_ref: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Invert one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block to world."""
+    p_rel = block[..., 0:3]
+    v_rel = block[..., 3:6]
+    ori6d = block[..., 6:12]
+    w_rel = block[..., 12:15]
+    q_rel = rot6d_to_quat(ori6d)
+    p_w, q_w = combine_frame_transforms(p_ref, q_ref, p_rel, q_rel)
+    v_w = quat_apply(q_ref, v_rel)
+    w_w = quat_apply(q_ref, w_rel)
+    return p_w, q_w, v_w, w_w
+
+
 def state_to_absolute(
     rel_state: torch.Tensor,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
     num_joints: int,
+    num_extra_frames: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Invert :func:`relative_state` back to world-frame quantities.
 
     Args:
-        rel_state: Relative-state tensor, shape ``(M, 2*nj + 15)``.
+        rel_state: Relative-state tensor, shape ``(M, 2*nj + 15*(1 + K))``.
         p_ref: Reference position (world), shape ``(M, 3)``.
         q_ref: Reference quaternion (world, xyzw), shape ``(M, 4)``.
         num_joints: Number of joints ``nj``.
+        num_extra_frames: Number of extra body frames ``K`` to decode.
 
     Returns:
         Dict with ``joint_pos``, ``joint_vel``, ``root_pos_w``, ``root_quat_w``,
-        ``root_lin_vel_w``, ``root_ang_vel_w``.
+        ``root_lin_vel_w``, ``root_ang_vel_w``. When ``K > 0`` also includes
+        ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``,
+        each shape ``(..., K, ·)`` in the frame order used by :func:`relative_state`.
     """
     nj = num_joints
     joint_pos = rel_state[..., 0:nj]
     joint_vel = rel_state[..., nj : 2 * nj]
-    p_rel = rel_state[..., 2 * nj : 2 * nj + 3]
-    v_rel = rel_state[..., 2 * nj + 3 : 2 * nj + 6]
-    ori6d = rel_state[..., 2 * nj + 6 : 2 * nj + 12]
-    w_rel = rel_state[..., 2 * nj + 12 : 2 * nj + 15]
-    q_rel = rot6d_to_quat(ori6d)
-    p_w, q_w = combine_frame_transforms(p_ref, q_ref, p_rel, q_rel)
-    v_w = quat_apply(q_ref, v_rel)
-    w_w = quat_apply(q_ref, w_rel)
-    return {
+    base = frame_block_start(nj, 0)
+    p_w, q_w, v_w, w_w = _block_to_absolute(
+        rel_state[..., base : base + FRAME_BLOCK_DIM], p_ref, q_ref
+    )
+    out = {
         "joint_pos": joint_pos,
         "joint_vel": joint_vel,
         "root_pos_w": p_w,
@@ -192,6 +283,19 @@ def state_to_absolute(
         "root_lin_vel_w": v_w,
         "root_ang_vel_w": w_w,
     }
+    if num_extra_frames > 0:
+        fp, fq, fv, fw = [], [], [], []
+        for k in range(num_extra_frames):
+            b = frame_block_start(nj, 1 + k)
+            kp, kq, kv, kw = _block_to_absolute(
+                rel_state[..., b : b + FRAME_BLOCK_DIM], p_ref, q_ref
+            )
+            fp.append(kp); fq.append(kq); fv.append(kv); fw.append(kw)
+        out["frame_pos_w"] = torch.stack(fp, dim=-2)
+        out["frame_quat_w"] = torch.stack(fq, dim=-2)
+        out["frame_lin_vel_w"] = torch.stack(fv, dim=-2)
+        out["frame_ang_vel_w"] = torch.stack(fw, dim=-2)
+    return out
 
 
 def ori6d_orthonormality_penalty(d6: torch.Tensor) -> torch.Tensor:

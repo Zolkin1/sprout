@@ -205,6 +205,27 @@ def joint_vel_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
     return cmd.dy_des[:, idx].clone()
 
 
+def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference base linear+angular velocity rotated into the current base frame.
+
+    Deployable counterpart to :func:`ref_base_velocity` for world-frame trackers
+    (e.g. :class:`GeneratorTrackingCommand`): there ``dy_des`` holds the base
+    velocity in the world frame, which would leak absolute heading if shown to
+    the policy directly. Rotating it by the inverse current base orientation
+    yields a heading-invariant command (available on hardware from the IMU).
+    Returns ``[N, 6]`` (lin xyz + ang xyz, current base frame).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    base = cmd.cfg.base_frame_name
+    names = cmd.ordered_vel_output_names
+    lin_idx = [names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]
+    ang_idx = [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
+    lin_w = cmd.dy_des[:, lin_idx]
+    ang_w = cmd.dy_des[:, ang_idx]
+    inv_root = quat_inv(wp.to_torch(cmd.robot.data.root_quat_w))
+    return torch.cat([quat_apply(inv_root, lin_w), quat_apply(inv_root, ang_w)], dim=-1)
+
+
 def ee_ref_relative_to_base(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", frame_names: list[str] | None = None,
 ) -> torch.Tensor:

@@ -511,6 +511,29 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
         },
     )
+
+    ## =========================================
+    # Flow-matching generator tracking (clip + generator mix, world-frame CLF)
+    ## =========================================
+    gym.register(
+        id="G1-generator-tracking-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_generator_tracking_env_cfg:G1GeneratorTrackingEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-generator-tracking-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_generator_tracking_env_cfg:G1GeneratorTrackingEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 

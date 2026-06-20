@@ -150,6 +150,12 @@ parser.add_argument(
          "(env_cfg.commands.traj_ref.debug_vis = False) to A/B test its cost.",
 )
 parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold a trajectory/clip library on (e.g. 'cpu' to keep a multi-GB "
+         "library off a small GPU). Applied to any command term exposing a clip_device "
+         "field. Set here (not via hydra) because the cfg default is None.",
+)
+parser.add_argument(
     "--no-logging", dest="no_logging", action="store_true", default=False,
     help="Disable per-step DataLogger collection (overrides --plots) to A/B "
          "test logging cost.",
@@ -255,6 +261,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.no_debug_vis and hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
             env_cfg.commands.traj_ref.debug_vis = False
             print("[profiling] traj_ref.debug_vis forced OFF for this run.")
+
+        # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
+        # hydra: the cfg field default is None so hydra rejects a str override).
+        # Needed to play a policy whose multi-GB clip library would otherwise OOM a
+        # small GPU -- mirrors the same flag in train.py / record_data.py.
+        if args_cli.clip_device is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the

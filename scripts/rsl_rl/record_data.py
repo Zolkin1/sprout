@@ -98,6 +98,14 @@ parser.add_argument(
          "reference state (must expose pos_x/y/z and ori_x/y/z/w outputs).",
 )
 parser.add_argument(
+    "--state_frames", type=str, nargs="*", default=None,
+    help="Extra robot body frames whose world pose/velocity are appended to the "
+         "recorded 'state' (and 'ref_state') vectors beyond root+joints -- e.g. the "
+         "feet/hands the flow-matching CLF tracks. Default: auto-detect the trajectory "
+         "command's end-effector output frames (ankles/wrists). Pass nothing to record "
+         "root+joints only.",
+)
+parser.add_argument(
     "--clip_device", type=str, default=None,
     help="Device to hold the motion-clip library on (e.g. 'cpu' to keep the multi-GB "
          "library off a small GPU; gathers copy only the per-env slice). Default: env device.",
@@ -174,6 +182,7 @@ def _build_recording_meta(
     resume_path: str,
     log_dir: str,
     num_pairs: int,
+    state_frames: list[str],
 ) -> RecordingMeta:
     """Capture provenance and obs/action layout metadata once at the start.
 
@@ -183,6 +192,7 @@ def _build_recording_meta(
         resume_path: Absolute path to the loaded checkpoint.
         log_dir: Directory the checkpoint lives in.
         num_pairs: Final number of pairs that will be saved.
+        state_frames: Extra body frames appended to the state vector (in order).
 
     Returns:
         A populated :class:`RecordingMeta`.
@@ -201,6 +211,10 @@ def _build_recording_meta(
         "root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel",
     ]
     state_term_dims = [3, 4, 3, 3, num_joints, num_joints]
+    # Per extra frame: world pose + twist, appended after root + joints.
+    for f in state_frames:
+        state_term_names += [f"{f}:pos_w", f"{f}:quat_w", f"{f}:lin_vel_w", f"{f}:ang_vel_w"]
+        state_term_dims += [3, 4, 3, 3]
 
     return RecordingMeta(
         checkpoint_path=os.path.abspath(resume_path),
@@ -223,6 +237,7 @@ def _build_recording_meta(
         state_quat_format="xyzw",
         state_joint_names=action_joint_names,
         state_vel_frame="com",
+        state_frame_names=list(state_frames),
     )
 
 
@@ -236,6 +251,7 @@ def collect_pairs(
     stochastic: bool,
     ref_cmd=None,
     ref_base_frame: str = "pelvis_link",
+    state_frames: list[str] | None = None,
 ) -> dict[str, np.ndarray]:
     """Roll out the policy and collect flattened (obs, action) pairs.
 
@@ -270,6 +286,14 @@ def collect_pairs(
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
 
+    # Body indices for the extra frames appended to the state vector (in order).
+    state_frames = list(state_frames or [])
+    if state_frames:
+        body_names = list(robot.data.body_names)
+        frame_body_idx = torch.tensor(
+            [body_names.index(f) for f in state_frames], dtype=torch.long, device=device
+        )
+
     obs = initial_obs
     # Distinct ids per env so step-0 pairs from different envs aren't conflated.
     episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
@@ -302,14 +326,25 @@ def collect_pairs(
         buf["action"].append(actions.detach().cpu().clone())
         # Raw robot world-state at the same timestep as obs. Order/dims MUST match
         # state_term_names/state_term_dims in _build_recording_meta.
-        state = torch.cat([
+        state_parts = [
             wp.to_torch(robot.data.root_pos_w),      # [N, 3]
             wp.to_torch(robot.data.root_quat_w),     # [N, 4] (xyzw)
             wp.to_torch(robot.data.root_lin_vel_w),  # [N, 3] (com vel)
             wp.to_torch(robot.data.root_ang_vel_w),  # [N, 3] (com ang vel)
             wp.to_torch(robot.data.joint_pos),       # [N, num_joints] (raw)
             wp.to_torch(robot.data.joint_vel),       # [N, num_joints] (raw)
-        ], dim=-1)
+        ]
+        # Extra body frames: world pose + twist (link frame), appended in order
+        # matching state_term_names: [pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)].
+        if state_frames:
+            fpos = wp.to_torch(robot.data.body_pos_w)[:, frame_body_idx]        # [N, K, 3]
+            fquat = wp.to_torch(robot.data.body_quat_w)[:, frame_body_idx]      # [N, K, 4]
+            flink = wp.to_torch(robot.data.body_link_vel_w)[:, frame_body_idx]  # [N, K, 6]
+            frame_state = torch.cat(
+                [fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1
+            ).reshape(n_envs, -1)  # [N, K*13]
+            state_parts.append(frame_state)
+        state = torch.cat(state_parts, dim=-1)
         buf["state"].append(state.detach().cpu().clone())
         # Desired reference at the same timestep, reconstructed to the world-frame
         # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
@@ -317,6 +352,11 @@ def collect_pairs(
         # with the pre-step ``state``/``obs`` snapshot above.
         if ref_cmd is not None:
             ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
+            # Append the same extra frames (world-lifted clip reference) so ref_state
+            # shares the state layout (state_term_names) when a 'reference' target is used.
+            if state_frames:
+                ref_frames = ref_cmd.reference_world_frames(state_frames)  # [N, K, 13]
+                ref_state = torch.cat([ref_state, ref_frames.reshape(n_envs, -1)], dim=-1)
             buf["ref_state"].append(ref_state.detach().cpu().clone())
         if record_cmd_vel:
             buf["target_vel"].append(ref_cmd.get_command_velocity().detach().cpu().clone())
@@ -431,7 +471,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         num_pairs = args_cli.num_pairs
         num_steps = math.ceil(num_pairs / env.num_envs)
-        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_pairs)
+
+        # Resolve the trajectory command to record the reference from, plus the extra
+        # body frames appended to the recorded state. Default frames = the command's
+        # end-effector outputs (ankles/wrists). Resolved before meta so layout matches.
+        ref_name, ref_cmd = _resolve_ref_command(env, args_cli.ref_command_name)
+        if args_cli.state_frames is not None:
+            state_frames = list(args_cli.state_frames)
+        elif ref_cmd is not None and hasattr(ref_cmd, "resolve_ee_frames"):
+            state_frames = ref_cmd.resolve_ee_frames()
+        else:
+            state_frames = []
+        if ref_cmd is not None:
+            print(f"[INFO] Recording reference state from command '{ref_name}' "
+                  f"(base frame '{args_cli.ref_base_frame}').")
+            if getattr(ref_cmd, "command_velocity_available", False):
+                print(f"[INFO] Recording commanded velocity (target_vel) from command '{ref_name}'.")
+        else:
+            print("[WARN] No trajectory command with get_reference_world_state found; "
+                  "skipping ref_state recording.")
+        if state_frames:
+            print(f"[INFO] Recording {len(state_frames)} extra state frames: {state_frames}")
+
+        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_pairs, state_frames)
 
         # Single observation fetch reused for the memory estimate, the provenance
         # export, and the start of collection. compute() defaults to
@@ -462,20 +524,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             policy_nn.reset()
 
-        # Resolve the trajectory command to record the reference state from.
-        ref_name, ref_cmd = _resolve_ref_command(env, args_cli.ref_command_name)
-        if ref_cmd is not None:
-            print(f"[INFO] Recording reference state from command '{ref_name}' "
-                  f"(base frame '{args_cli.ref_base_frame}').")
-            if getattr(ref_cmd, "command_velocity_available", False):
-                print(f"[INFO] Recording commanded velocity (target_vel) from command '{ref_name}'.")
-        else:
-            print("[WARN] No trajectory command with get_reference_world_state found; "
-                  "skipping ref_state recording.")
-
         data = collect_pairs(
             env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic,
-            ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
+            ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame, state_frames=state_frames,
         )
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")

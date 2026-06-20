@@ -16,7 +16,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -46,6 +46,9 @@ class RecordingMeta:
         state_quat_format: Component order of ``root_quat_w`` in the state (e.g. "xyzw").
         state_joint_names: Ordered joint names for the state's joint_pos/joint_vel terms.
         state_vel_frame: Frame/accessor used for the recorded root velocities (e.g. "com").
+        state_frame_names: Ordered extra body frames appended to the state vector beyond
+            root + joints (each contributes ``pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)``).
+            Empty when only root + joints were recorded.
     """
 
     checkpoint_path: str
@@ -68,6 +71,7 @@ class RecordingMeta:
     state_quat_format: str
     state_joint_names: list[str]
     state_vel_frame: str
+    state_frame_names: list[str] = field(default_factory=list)
 
 
 def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -171,6 +175,7 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         state_quat_format=np.array(meta.state_quat_format),
         state_joint_names=np.array(meta.state_joint_names),
         state_vel_frame=np.array(meta.state_vel_frame),
+        state_frame_names=np.array(meta.state_frame_names),
     )
 
 
@@ -221,5 +226,8 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         state_quat_format=str(z["state_quat_format"]),
         state_joint_names=[str(x) for x in z["state_joint_names"]],
         state_vel_frame=str(z["state_vel_frame"]),
+        state_frame_names=(
+            [str(x) for x in z["state_frame_names"]] if "state_frame_names" in z.files else []
+        ),
     )
     return data, meta

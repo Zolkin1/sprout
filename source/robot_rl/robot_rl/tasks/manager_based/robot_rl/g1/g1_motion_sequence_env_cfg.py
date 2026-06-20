@@ -78,6 +78,7 @@ class G1MotionSeqObservationsCfg:
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
         # Reference base velocity target (pairs with ref_base_vel_tracking_exp).
+        # TODO: Make this observation the target_vel (the joystick level velocity)
         ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         # Full stance-anchored tracking vector.
@@ -106,6 +107,7 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
+        # TODO: Make this observation the target_vel (the joystick level velocity)
         ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         # Full stance-anchored tracking vector (privileged).
@@ -150,6 +152,7 @@ class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
 
     # Dense shaped signal replacing the dropped xy_vel/yaw_vel: track the clip's
     # reference base (pelvis) linear+angular velocity.
+    # TODO: Change/fix this to be a reward on tracking the targeet_vel value which is more like joystick level tracking.
     ref_base_vel = RewTerm(
         func=mdp.ref_base_vel_tracking_exp,
         weight=1.0,

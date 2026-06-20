@@ -38,6 +38,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     FlowMatchingTransformer,
     build_train_val,
     flow_matching_loss,
+    frame_block_start,
     orientation_slice,
     rot6d_to_matrix,
     sample_trajectory,
@@ -108,13 +109,21 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     return cfg, args
 
 
-def channel_metrics(pred: torch.Tensor, tgt: torch.Tensor, num_joints: int) -> dict[str, float]:
+def channel_metrics(
+    pred: torch.Tensor, tgt: torch.Tensor, num_joints: int, num_extra_frames: int = 0
+) -> dict[str, float]:
     """Per-channel physical-units error between predicted and target futures.
+
+    The base (root) + joint channels occupy a fixed prefix unchanged by extra
+    frames, so their offsets are stable. When ``num_extra_frames > 0`` the extra
+    body-frame position RMSE and orientation geodesic are aggregated (mean over
+    frames) into ``rmse_frame_pos`` / ``frame_ori_geodesic_rad``.
 
     Args:
         pred: Predicted future states (denormalized), shape ``(B, F, D)``.
         tgt: Target future states (denormalized), shape ``(B, F, D)``.
         num_joints: Number of joints ``nj``.
+        num_extra_frames: Number of extra body frames ``K`` appended to the state.
 
     Returns:
         Dict of RMSEs per channel plus the orientation geodesic error (radians).
@@ -124,25 +133,35 @@ def channel_metrics(pred: torch.Tensor, tgt: torch.Tensor, num_joints: int) -> d
     def _rmse(a: torch.Tensor, b: torch.Tensor) -> float:
         return torch.sqrt(torch.mean((a - b) ** 2)).item()
 
-    o0, o1 = orientation_slice(nj)
-    r_pred = rot6d_to_matrix(pred[..., o0:o1])
-    r_tgt = rot6d_to_matrix(tgt[..., o0:o1])
-    rel = r_pred.transpose(-1, -2) @ r_tgt
-    cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
-    geodesic = torch.arccos(cos).mean().item()
+    def _geodesic(o0: int, o1: int) -> float:
+        r_pred = rot6d_to_matrix(pred[..., o0:o1])
+        r_tgt = rot6d_to_matrix(tgt[..., o0:o1])
+        rel = r_pred.transpose(-1, -2) @ r_tgt
+        cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
+        return torch.arccos(cos).mean().item()
 
-    return {
+    bo0, bo1 = orientation_slice(nj)
+    out = {
         "rmse_joint_pos": _rmse(pred[..., 0:nj], tgt[..., 0:nj]),
         "rmse_joint_vel": _rmse(pred[..., nj:2 * nj], tgt[..., nj:2 * nj]),
         "rmse_root_pos": _rmse(pred[..., 2 * nj:2 * nj + 3], tgt[..., 2 * nj:2 * nj + 3]),
         "rmse_root_lin_vel": _rmse(pred[..., 2 * nj + 3:2 * nj + 6], tgt[..., 2 * nj + 3:2 * nj + 6]),
         "rmse_root_ang_vel": _rmse(pred[..., 2 * nj + 12:2 * nj + 15], tgt[..., 2 * nj + 12:2 * nj + 15]),
-        "ori_geodesic_rad": geodesic,
+        "ori_geodesic_rad": _geodesic(bo0, bo1),
     }
+    if num_extra_frames > 0:
+        pos_rmse, geo = 0.0, 0.0
+        for k in range(num_extra_frames):
+            b = frame_block_start(nj, 1 + k)
+            pos_rmse += _rmse(pred[..., b:b + 3], tgt[..., b:b + 3])
+            geo += _geodesic(b + 6, b + 12)
+        out["rmse_frame_pos"] = pos_rmse / num_extra_frames
+        out["frame_ori_geodesic_rad"] = geo / num_extra_frames
+    return out
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg, target_normalizer, num_joints, device) -> dict[str, float]:
+def evaluate(model, loader, cfg, target_normalizer, num_joints, device, num_extra_frames=0) -> dict[str, float]:
     """Compute mean flow loss and per-channel sampling metrics over a loader."""
     model.eval()
     flow_sum, n_batches = 0.0, 0
@@ -158,7 +177,7 @@ def evaluate(model, loader, cfg, target_normalizer, num_joints, device) -> dict[
         )
         pred_d = target_normalizer.denormalize(pred)
         tgt_d = target_normalizer.denormalize(future)
-        for k, v in channel_metrics(pred_d, tgt_d, num_joints).items():
+        for k, v in channel_metrics(pred_d, tgt_d, num_joints, num_extra_frames).items():
             metric_sums[k] = metric_sums.get(k, 0.0) + v
     out = {"flow_mse": flow_sum / max(n_batches, 1)}
     for k, v in metric_sums.items():
@@ -250,7 +269,10 @@ def main() -> None:
         log_line = f"[epoch {epoch}] train_loss={train_loss:.4f}  train_time={epoch_time:.1f}s"
 
         if val_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
-            val = evaluate(model, val_loader, cfg, train_ds.target_normalizer, num_joints, device)
+            val = evaluate(
+                model, val_loader, cfg, train_ds.target_normalizer, num_joints, device,
+                num_extra_frames=train_ds.num_extra_frames,
+            )
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             log_line += "  " + "  ".join(f"val_{k}={v:.4f}" for k, v in val.items())

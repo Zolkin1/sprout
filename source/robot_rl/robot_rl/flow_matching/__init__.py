@@ -13,8 +13,11 @@ from .flow import flow_matching_loss, sample_flow_batch, sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import (
+    FRAME_BLOCK_DIM,
+    frame_block_start,
     matrix_to_rot6d,
     orientation_slice,
+    orientation_slices,
     quat_to_rot6d,
     relative_state,
     relative_state_from_window,
@@ -43,5 +46,8 @@ __all__ = [
     "relative_state_from_window",
     "state_to_absolute",
     "orientation_slice",
+    "orientation_slices",
+    "frame_block_start",
+    "FRAME_BLOCK_DIM",
     "target_state_dim",
 ]

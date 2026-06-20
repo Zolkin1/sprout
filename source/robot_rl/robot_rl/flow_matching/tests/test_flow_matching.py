@@ -25,6 +25,7 @@ from robot_rl.flow_matching import (
     flow_matching_loss,
     matrix_to_rot6d,
     orientation_slice,
+    orientation_slices,
     quat_to_rot6d,
     relative_state,
     relative_state_from_window,
@@ -96,6 +97,45 @@ def test_relative_state_invertible():
     assert torch.allclose(rec["root_ang_vel_w"], om, atol=1e-5)
     # quaternions compared as matrices (double cover)
     assert torch.allclose(matrix_from_quat(rec["root_quat_w"]), matrix_from_quat(q), atol=1e-5)
+
+
+def test_relative_state_invertible_with_frames():
+    """Round-trip relative_state <-> state_to_absolute with extra body frames."""
+    torch.manual_seed(12)
+    nj, w, k = 21, 30, 4
+    p = torch.randn(w, 3, dtype=torch.float64)
+    q = _rand_unit_quat(w)
+    v = torch.randn(w, 3, dtype=torch.float64)
+    om = torch.randn(w, 3, dtype=torch.float64)
+    jp = torch.randn(w, nj, dtype=torch.float64)
+    jv = torch.randn(w, nj, dtype=torch.float64)
+    fpos = torch.randn(w, k, 3, dtype=torch.float64)
+    fquat = _rand_unit_quat(w * k).reshape(w, k, 4)
+    flin = torch.randn(w, k, 3, dtype=torch.float64)
+    fang = torch.randn(w, k, 3, dtype=torch.float64)
+    ref = w // 2
+
+    p_ref = p[ref : ref + 1].expand(w, -1)
+    q_ref = q[ref : ref + 1].expand(w, -1)
+    rel = relative_state(
+        p, q, v, om, jp, jv, p_ref, q_ref,
+        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+    )
+    assert rel.shape == (w, target_state_dim(nj, k))
+    # every ori block (base + frames) is left raw (not standardized) -> there are k+1
+    assert len(orientation_slices(nj, k)) == k + 1
+
+    rec = state_to_absolute(rel, p_ref, q_ref, nj, num_extra_frames=k)
+    assert torch.allclose(rec["root_pos_w"], p, atol=1e-5)
+    assert rec["frame_pos_w"].shape == (w, k, 3)
+    assert torch.allclose(rec["frame_pos_w"], fpos, atol=1e-5)
+    assert torch.allclose(rec["frame_lin_vel_w"], flin, atol=1e-5)
+    assert torch.allclose(rec["frame_ang_vel_w"], fang, atol=1e-5)
+    assert torch.allclose(
+        matrix_from_quat(rec["frame_quat_w"].reshape(w * k, 4)),
+        matrix_from_quat(fquat.reshape(w * k, 4)),
+        atol=1e-5,
+    )
 
 
 def test_relative_state_reference_is_identity():
@@ -266,27 +306,41 @@ def test_episode_windows_respect_boundaries():
 # ---------------------------------------------------------------------------
 # Dataset end-to-end build with synthetic recorded-style data
 # ---------------------------------------------------------------------------
-def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False):
+def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False, frame_names=None):
     """Build a synthetic (data, meta) pair shaped like a recorded .npz.
 
     If ``with_ref`` is set, a distinct ``ref_state`` array (same layout as
     ``state``, unit quaternions) is added so the reference target source can be
-    exercised.
+    exercised. ``frame_names`` appends extra body frames (each
+    ``pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)``) to the state layout.
     """
     rng = np.random.default_rng(0)
     n = num_envs * steps
+    frame_names = list(frame_names or [])
     # obs layout: velocity_commands(3), height_scan(scan_dim), joint_pos(nj)
     obs_term_names = ["velocity_commands", "height_scan", "joint_pos"]
     obs_term_dims = [3, scan_dim, nj]
     obs = rng.standard_normal((n, sum(obs_term_dims))).astype(np.float32)
-    # state layout matches the recorder
+    # state layout matches the recorder (root + joints, then any extra frames)
     state_term_names = ["root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel"]
     state_term_dims = [3, 4, 3, 3, nj, nj]
+    for f in frame_names:
+        state_term_names += [f"{f}:pos_w", f"{f}:quat_w", f"{f}:lin_vel_w", f"{f}:ang_vel_w"]
+        state_term_dims += [3, 4, 3, 3]
+
+    # Offsets of every quaternion block (root + per-frame), to unit-normalize them.
+    quat_blocks: list[tuple[int, int]] = []
+    off = 0
+    for name, dim in zip(state_term_names, state_term_dims):
+        if name == "root_quat_w" or name.endswith(":quat_w"):
+            quat_blocks.append((off, off + dim))
+        off += dim
 
     def _make_state(seed: int) -> np.ndarray:
         s = np.random.default_rng(seed).standard_normal((n, sum(state_term_dims))).astype(np.float32)
-        q = s[:, 3:7]
-        s[:, 3:7] = q / np.linalg.norm(q, axis=1, keepdims=True)  # unit quaternion block
+        for a, b in quat_blocks:
+            qb = s[:, a:b]
+            s[:, a:b] = qb / np.linalg.norm(qb, axis=1, keepdims=True)  # unit quaternion block
         return s
 
     state = _make_state(0)
@@ -303,6 +357,7 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
     meta = SimpleNamespace(
         obs_term_names=obs_term_names, obs_term_dims=obs_term_dims,
         state_term_names=state_term_names, state_term_dims=state_term_dims,
+        state_frame_names=frame_names,
     )
     return data, meta
 
@@ -321,6 +376,21 @@ def test_dataset_build_shapes():
     assert val_ds is not None and len(val_ds) > 0
     # episode-disjoint split
     # (rebuild windows to map back is overkill; rely on build_train_val's split-by-episode)
+
+
+def test_dataset_build_with_extra_frames():
+    """Dataset resolves extra-frame state terms and widens state_dim accordingly."""
+    frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+    k = len(frames)
+    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8, frame_names=frames)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0)
+    train_ds, val_ds = build_train_val(data, meta, cfg)
+    assert train_ds.num_extra_frames == k
+    assert cfg.state_dim == target_state_dim(21, k)            # 57 + 4*15 = 117
+    assert cfg.history_in_dim == target_state_dim(21, k) + 3 + 8  # state + vel_cmd + scan
+    sample = train_ds[0]
+    assert sample["history"].shape == (25, cfg.history_in_dim)
+    assert sample["future"].shape == (25, target_state_dim(21, k))
 
 
 def _split_state(rw, s_slc, name):

@@ -42,6 +42,25 @@ def _unit_for_name(name: str) -> str:
     return ""
 
 
+def _trailing_moving_average(x: np.ndarray, window: int) -> np.ndarray:
+    """Causal trailing moving average of a 1-D series.
+
+    ``out[t]`` is the mean of ``x[max(0, t - window + 1) : t + 1]`` -- a
+    backward-looking window that never uses future samples and starts at the
+    first sample (the window expands until ``window`` samples are available).
+    """
+    x = np.asarray(x, dtype=float)
+    if window <= 1 or x.size == 0:
+        return x
+    cs = np.cumsum(x)
+    out = np.empty_like(cs)
+    n = min(window, x.size)
+    out[:n] = cs[:n] / np.arange(1, n + 1)
+    if x.size > window:
+        out[window:] = (cs[window:] - cs[:-window]) / window
+    return out
+
+
 def _slice_to_time_range(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
@@ -292,6 +311,64 @@ def plot_base_velocity(
             axs[i].grid(True, alpha=0.3)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(save_dir, f"base_velocity_env{env_id}.png"),
+                     dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_velocity_tracking(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+) -> None:
+    """Robot base velocity vs the commanded joystick velocity (``target_vel``).
+
+    Three panels -- forward (vx), lateral (vy), and yaw rate (wz) -- each
+    overlaying the clip's commanded ``target_vel`` (the joystick-level velocity
+    the motion was generated to track) against the robot's measured body-frame
+    base velocity.  This is the open-loop motion-sequence analog of the old
+    commanded-velocity tracking plot.
+
+    Skips silently when ``target_vel`` / ``robot_base_vel`` aren't logged (e.g.
+    a clip library generated without a commanded velocity, or a non-clip env).
+    """
+    if "target_vel" not in data or "robot_base_vel" not in data:
+        print("[WARN plot_velocity_tracking] Missing target_vel or robot_base_vel, skipping.")
+        return
+
+    cmd = data["target_vel"]          # [T, N, 3] (vx, vy, wz)
+    act = data["robot_base_vel"]      # [T, N, 3] (vx, vy, wz)
+    dt = metadata.get("dt", 1.0)
+    t_offset = metadata.get("t_offset", 0.0)
+    time_s = np.arange(cmd.shape[0]) * dt + t_offset
+    labels = ["Forward (vx)", "Lateral (vy)", "Yaw rate (wz)"]
+    units = ["m/s", "m/s", "rad/s"]
+    n_dims = min(cmd.shape[2], act.shape[2], 3)
+
+    # Trailing moving-average window for the measured velocity (last 0.3 s).
+    ma_window_s = 0.3
+    ma_window = max(1, int(round(ma_window_s / dt)))
+
+    for env_id in env_ids:
+        fig, axs = plt.subplots(1, n_dims, figsize=(5 * n_dims, 3.2))
+        fig.suptitle(f"Base Velocity Tracking (Env {env_id})", fontsize=16)
+        if n_dims == 1:
+            axs = [axs]
+        for i in range(n_dims):
+            axs[i].plot(time_s, cmd[:, env_id, i], label="Commanded (target_vel)", linewidth=2)
+            # Raw measured (faded) + its trailing moving average (bold, same hue).
+            axs[i].plot(time_s, act[:, env_id, i], label="Robot (measured)",
+                        linestyle="--", linewidth=1.0, color="C1", alpha=0.35)
+            axs[i].plot(time_s, _trailing_moving_average(act[:, env_id, i], ma_window),
+                        label=f"Robot ({ma_window_s:g}s avg)", linewidth=2, color="C1")
+            axs[i].set_title(labels[i])
+            axs[i].set_xlabel("Time (s)")
+            axs[i].set_ylabel(f"Velocity ({units[i]})")
+            axs[i].grid(True, alpha=0.3)
+            if i == 0:
+                axs[i].legend(loc="best", fontsize=8)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(os.path.join(save_dir, f"velocity_tracking_env{env_id}.png"),
                      dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -1067,6 +1144,7 @@ PLOT_REGISTRY: dict[str, Callable] = {
     "teacher_vs_student": plot_teacher_vs_student_actions,
     "torques": plot_torques,
     "base_velocity": plot_base_velocity,
+    "velocity_tracking": plot_velocity_tracking,
     "skill_and_terrain": plot_skill_and_terrain,
     "skill_transition_diag": plot_skill_transition_diag,
     "domain_info": plot_domain_info,
@@ -1077,7 +1155,7 @@ PLOT_REGISTRY: dict[str, Callable] = {
     "moe_tsne": plot_moe_tsne,
 }
 
-DEFAULT_PLOTS = ["positions", "velocities"]
+DEFAULT_PLOTS = ["positions", "velocities", "velocity_tracking"]
 
 
 # ---------------------------------------------------------------------------
@@ -1188,6 +1266,23 @@ def _emit_tracking_stats(
             _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
 
         _print_group_summaries(_log, _csv, vel_names, mean_over_envs, std_over_envs, f"{csv_prefix}vel_error")
+
+    # Base velocity tracking vs the commanded joystick velocity (target_vel):
+    # MSE of the robot's measured (vx, vy, wz) against the commanded (vx, vy, wz).
+    if "target_vel" in data and "robot_base_vel" in data:
+        track_sq = (data["robot_base_vel"] - data["target_vel"]) ** 2
+        per_env_mean = _time_mean_per_env(track_sq, mask)
+        mean_over_envs = np.nanmean(per_env_mean, axis=0)
+        std_over_envs = np.nanstd(per_env_mean, axis=0)
+        chan_names = ["forward_vx", "lateral_vy", "yaw_wz"]
+        _log("")
+        _log("Base Velocity Tracking vs Commanded (MSE per channel):")
+        _log(f"  {'Channel':<14s} {'Mean':>12s} {'Std':>12s}")
+        _log(f"  {'-'*14} {'-'*12} {'-'*12}")
+        for i in range(min(len(chan_names), mean_over_envs.shape[0])):
+            _log(f"  {chan_names[i]:<14s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
+            _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_mean", float(mean_over_envs[i]))
+            _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_std", float(std_over_envs[i]))
 
 
 def compute_and_save_stats(

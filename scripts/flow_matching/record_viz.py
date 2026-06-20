@@ -56,12 +56,16 @@ from robot_rl.flow_matching import (
     FlowMatchingConfig,
     FlowMatchingTransformer,
     Normalizer,
-    relative_state,
-    sample_trajectory,
-    state_to_absolute,
     target_state_dim,
 )
 from robot_rl.flow_matching.dataset import resolve_term_slice
+from robot_rl.flow_matching.online import (
+    BatchedHistory,
+    FmOnlineContext,
+    build_history_token,
+    load_fm_context,
+    sample_world,
+)
 from robot_rl.flow_matching.viz.recording import (
     VIZ_DIR_DEFAULT,
     VizRecordingMeta,
@@ -164,45 +168,10 @@ if args_cli.print_layout and _FM_CKPT is not None:
     raise SystemExit(0)
 
 
-# TODO(partial-history): if the model is ever trained on partial histories
-# (see the TODO above episode_windows in robot_rl/flow_matching/dataset.py),
-# this buffer must mirror the training-side padding rule instead of waiting
-# for a full window.
-class BatchedHistory:
-    """Fixed-length rolling history of raw world-frame state for ALL envs.
-
-    Holds the most recent ``maxlen`` steps as ``(num_envs, dim)`` tensors,
-    storing the same quantities ``record_data.collect_pairs`` recorded, so the
-    reconstructed history token matches the training dataset exactly. Env
-    resets are handled with a per-env validity counter instead of physically
-    clearing slots: a window is only used once an env has ``maxlen``
-    uninterrupted steps since its last reset.
-    """
-
-    def __init__(self, num_envs: int, maxlen: int, device: torch.device):
-        """Create an empty history for ``num_envs`` envs of length ``maxlen``."""
-        self.maxlen = maxlen
-        self._steps: deque[dict[str, torch.Tensor]] = deque(maxlen=maxlen)
-        self._steps_since_reset = torch.zeros(num_envs, dtype=torch.long, device=device)
-
-    def append(self, step: dict[str, torch.Tensor]) -> None:
-        """Append one step. ``step`` maps each tracked key to a ``(N, dim)`` tensor."""
-        self._steps.append(step)
-        self._steps_since_reset += 1
-
-    def invalidate(self, env_mask: torch.Tensor) -> None:
-        """Restart the validity counter for envs that just reset (``(N,)`` bool)."""
-        self._steps_since_reset[env_mask] = 0
-
-    def valid(self) -> torch.Tensor:
-        """Per-env mask of complete, reset-free history windows (``(N,)`` bool)."""
-        if len(self._steps) < self.maxlen:
-            return torch.zeros_like(self._steps_since_reset, dtype=torch.bool)
-        return self._steps_since_reset >= self.maxlen
-
-    def stack(self, key: str) -> torch.Tensor:
-        """Stack a tracked quantity over the window into ``(N, maxlen, dim)``."""
-        return torch.stack([s[key] for s in self._steps], dim=1)
+# NOTE: ``BatchedHistory`` is imported from ``robot_rl.flow_matching.online`` (the
+# single source of truth shared with the online RL tracking command). See the
+# partial-history TODO above ``episode_windows`` in ``flow_matching/dataset.py``:
+# this buffer waits for a full window and must mirror any training-side padding rule.
 
 
 @hydra_task_config(_RESOLVED_TASK, args_cli.agent)
@@ -289,7 +258,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(
             f"[INFO] FM ready: H={ctx['H']} F={ctx['F']} D={ctx['D']} Din={ctx['Din']} "
             f"nj={ctx['nj']} sampling_steps={ctx['num_steps']} "
-            f"(vel_dim={ctx['vel_dim']}, scan_dim={ctx['scan_dim']})"
+            f"(cmd_dim={ctx['vel_dim']}, future_cmd={'on' if ctx['future_cmd_dim'] > 0 else 'off'}, "
+            f"scan_dim={ctx['scan_dim']}, source={'command-term' if ctx['cmd_term'] is not None else 'obs'})"
         )
 
         # The viewer wants world-frame ray hit points, which only the sensor has
@@ -401,105 +371,121 @@ def _terrain_arrays(captured_meshes: dict, env) -> dict[str, np.ndarray | str]:
     return {"vertices": vertices, "faces": faces, "source": "plane_fallback"}
 
 
-def _build_fm_context(env, robot, device) -> dict:
-    """Assemble the flow-matching model, normalizers, and resolved I/O layout.
+def _resolve_command_term(env):
+    """Find the trajectory command term exposing a commanded velocity (``target_vel``).
 
-    Uses the loaded checkpoint when available; otherwise (``--dry_run`` with no
-    checkpoint) synthesizes a randomly-initialized model with identity normalizers
-    sized from the live environment, so the full shape pipeline can be exercised.
+    Future-command (``cmd_array``) checkpoints condition on the upstream command,
+    which at inference is read from the command term rather than the obs vector.
+    """
+    cmd_mgr = env.unwrapped.command_manager
+    for name in cmd_mgr.active_terms:
+        term = cmd_mgr.get_term(name)
+        if getattr(term, "command_velocity_available", False):
+            return term
+    raise RuntimeError(
+        "This is a future-command (cmd_array) checkpoint, but no command term on the task "
+        "exposes a commanded velocity (command_velocity_available / get_command_velocity)."
+    )
+
+
+def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, vel_dim: int, device) -> FmOnlineContext:
+    """Synthesize a random-weights :class:`FmOnlineContext` for structural smoke tests."""
+    nj = len(live_joint_names)
+    cfg = FlowMatchingConfig()
+    d = target_state_dim(nj)
+    din = d + vel_dim + scan_dim
+    model = FlowMatchingTransformer(
+        history_in_dim=din, state_dim=d, history_len=cfg.history_len, future_len=cfg.future_len,
+        d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
+        num_decoder_layers=cfg.num_decoder_layers, dim_feedforward=cfg.dim_feedforward,
+        dropout=cfg.dropout, cmd_dim=0,
+    ).to(device).eval()
+    return FmOnlineContext(
+        model=model, target_norm=_identity_normalizer(d, device),
+        history_norm=_identity_normalizer(din, device), H=cfg.history_len, F=cfg.future_len,
+        D=d, Din=din, nj=nj, num_extra_frames=0,
+        num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps,
+        cmd_dim=vel_dim, future_cmd_dim=0, scan_dim=scan_dim,
+        joint_names=list(live_joint_names), frame_names=[], device=device,
+    )
+
+
+def _build_fm_context(env, robot, device) -> dict:
+    """Assemble the flow-matching inference context (delegates math to ``online.py``).
+
+    The model, normalizers, and layout come from :func:`load_fm_context` (which
+    handles future-command and extra-frame checkpoints). The command stream feeding
+    the history token is read from the trajectory command term (``target_vel``) for
+    future-command checkpoints, or sliced from the live ``vel_cmd_term`` obs term
+    otherwise. ``--dry_run`` synthesizes a random model + identity normalizers.
 
     Returns:
-        A dict with the model, normalizers, dimensions (H, F, D, Din, nj),
-        sampling-step count, joint permutation, joint names, and obs command slices.
+        A dict with the :class:`FmOnlineContext` (``fm``), the live->FM joint
+        permutation, the command source (``cmd_term`` or ``vel_slice``), the
+        optional height-scan slice, and convenience dims used by the recorder.
     """
     live_joint_names = list(robot.data.joint_names)
     obs_mgr = env.unwrapped.observation_manager
     live_obs_names = list(obs_mgr.active_terms["policy"])
     live_obs_dims = [int(td[0]) for td in obs_mgr.group_obs_term_dim["policy"]]
 
-    # Future-command (cmd_array) checkpoints need the history buffer to capture the
-    # command stream and the decoder to be fed the command horizon at inference --
-    # not yet wired here. Fail loudly rather than with a confusing dim mismatch.
-    if _FM_CKPT is not None and _FM_CKPT["config"].get("cmd_array"):
-        raise NotImplementedError(
-            "record_viz does not yet support future-command (cmd_array) checkpoints. "
-            "The history buffer must capture the command (e.g. target_vel) and the "
-            "decoder must be given get_command_velocity_horizon(F). Use TensorBoard / "
-            "training metrics to inspect such models for now."
-        )
-
-    # Command/perception slices come from the LIVE obs layout (the vector we read
-    # at runtime). The velocity-command term name is whatever the checkpoint was
-    # trained with (default "velocity_commands"; "ref_base_vel" for motion-seq);
-    # it is required. height_scan is optional.
-    vel_cmd_term = (
-        _FM_CKPT["config"].get("vel_cmd_term", "velocity_commands")
-        if _FM_CKPT is not None else "velocity_commands"
-    )
-    vel_slice = resolve_term_slice(live_obs_names, live_obs_dims, vel_cmd_term)
+    # Height scan (optional) -- the only perceptive input the history token may carry.
     try:
         scan_slice = resolve_term_slice(live_obs_names, live_obs_dims, "height_scan")
     except KeyError:
         scan_slice = None
-    vel_dim = vel_slice[1] - vel_slice[0]
     scan_dim = (scan_slice[1] - scan_slice[0]) if scan_slice is not None else 0
 
     if _FM_CKPT is not None:
-        cfg = FlowMatchingConfig.from_dict(_FM_CKPT["config"])
-        nj = int(_FM_CKPT["num_joints"])
-        fm_meta = _FM_CKPT["meta"]
-        target_norm = Normalizer.from_state_dict(_FM_CKPT["target_normalizer"]).to(device)
-        history_norm = Normalizer.from_state_dict(_FM_CKPT["history_normalizer"]).to(device)
-        fm_joint_names = list(fm_meta["state_joint_names"])
-        # Validate the history token width matches what the model expects.
-        expected = target_state_dim(nj) + vel_dim + scan_dim
-        if expected != cfg.history_in_dim:
-            raise ValueError(
-                "Live obs layout does not match the flow-matching checkpoint.\n"
-                f"  target_state_dim({nj}) + vel_dim({vel_dim}) + scan_dim({scan_dim}) = {expected}\n"
-                f"  but checkpoint history_in_dim = {cfg.history_in_dim}.\n"
-                f"  checkpoint obs terms: {list(fm_meta['obs_term_names'])}\n"
-                f"  live obs terms      : {live_obs_names}"
-            )
+        fm = load_fm_context(_FM_CKPT, device, args_cli.num_sampling_steps, scan_dim=scan_dim)
     else:
-        # --dry_run, no checkpoint: synthesize from the live env.
-        nj = len(live_joint_names)
-        cfg = FlowMatchingConfig()
-        cfg.state_dim = target_state_dim(nj)
-        cfg.history_in_dim = cfg.state_dim + vel_dim + scan_dim
-        fm_joint_names = live_joint_names
-        target_norm = _identity_normalizer(cfg.state_dim, device)
-        history_norm = _identity_normalizer(cfg.history_in_dim, device)
+        # --dry_run: command comes from the obs vel term; no future-command, no frames.
+        vd = resolve_term_slice(live_obs_names, live_obs_dims, "velocity_commands")
+        fm = _dry_run_fm_context(live_joint_names, scan_dim, vd[1] - vd[0], device)
         print("[INFO] --dry_run: using a randomly-initialized model and identity normalizers.")
 
-    # Joint permutation: reorder live joints into the model's training order.
-    missing = [n for n in fm_joint_names if n not in live_joint_names]
-    if missing or len(fm_joint_names) != nj:
+    # Extra (ee/com) frames need per-step body capture, not wired into record_viz yet.
+    if fm.num_extra_frames > 0:
+        raise NotImplementedError(
+            f"record_viz does not yet capture the {fm.num_extra_frames} extra body frame(s) "
+            f"({fm.frame_names}) this checkpoint predicts. Use the GeneratorTrackingCommand path."
+        )
+
+    # Joint permutation: reorder live joints into the FM training order.
+    missing = [n for n in fm.joint_names if n not in live_joint_names]
+    if missing or len(fm.joint_names) != fm.nj:
         raise ValueError(
             f"Joint-name mismatch between checkpoint and live robot.\n"
             f"  missing in live robot: {missing}\n"
-            f"  |checkpoint joints|={len(fm_joint_names)} vs nj={nj}"
+            f"  |checkpoint joints|={len(fm.joint_names)} vs nj={fm.nj}"
         )
-    joint_perm = torch.tensor([live_joint_names.index(n) for n in fm_joint_names], device=device)
+    joint_perm = torch.tensor([live_joint_names.index(n) for n in fm.joint_names], device=device)
 
-    model = FlowMatchingTransformer(
-        history_in_dim=cfg.history_in_dim, state_dim=cfg.state_dim,
-        history_len=cfg.history_len, future_len=cfg.future_len,
-        d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
-        num_decoder_layers=cfg.num_decoder_layers, dim_feedforward=cfg.dim_feedforward,
-        dropout=cfg.dropout,
-    ).to(device)
-    if _FM_CKPT is not None:
-        model.load_state_dict(_FM_CKPT["model"])
-    model.eval()
-
-    num_steps = args_cli.num_sampling_steps or cfg.num_sampling_steps
+    # Command source. Future-command (target_vel) checkpoints read it from the command
+    # term (past command + the decoder's future horizon); others slice the live obs.
+    cmd_term, vel_slice = None, None
+    if fm.future_cmd_dim > 0:
+        cmd_term = _resolve_command_term(env)
+        got = int(cmd_term.get_command_velocity().shape[-1])
+        if got != fm.cmd_dim:
+            raise ValueError(f"Command-term velocity width {got} != checkpoint cmd_dim {fm.cmd_dim}.")
+    else:
+        vel_cmd_term = (
+            _FM_CKPT["config"].get("vel_cmd_term", "velocity_commands")
+            if _FM_CKPT is not None else "velocity_commands"
+        )
+        vel_slice = resolve_term_slice(live_obs_names, live_obs_dims, vel_cmd_term)
+        if (vel_slice[1] - vel_slice[0]) != fm.cmd_dim:
+            raise ValueError(
+                f"Obs '{vel_cmd_term}' width {vel_slice[1] - vel_slice[0]} != checkpoint cmd_dim {fm.cmd_dim}."
+            )
 
     return {
-        "model": model, "target_norm": target_norm, "history_norm": history_norm,
-        "H": cfg.history_len, "F": cfg.future_len, "D": cfg.state_dim, "Din": cfg.history_in_dim,
-        "nj": nj, "num_steps": num_steps, "joint_perm": joint_perm, "joint_names": fm_joint_names,
-        "vel_slice": vel_slice, "scan_slice": scan_slice, "vel_dim": vel_dim, "scan_dim": scan_dim,
+        "fm": fm, "joint_perm": joint_perm, "scan_slice": scan_slice,
+        "cmd_term": cmd_term, "vel_slice": vel_slice,
+        "H": fm.H, "F": fm.F, "D": fm.D, "Din": fm.Din, "nj": fm.nj,
+        "num_steps": fm.num_steps, "joint_names": fm.joint_names,
+        "vel_dim": fm.cmd_dim, "scan_dim": fm.scan_dim, "future_cmd_dim": fm.future_cmd_dim,
         "device": device,
     }
 
@@ -531,12 +517,18 @@ def _record_step(history: BatchedHistory, robot, obs, ctx: dict, wp) -> dict[str
         "joint_pos": wp.to_torch(robot.data.joint_pos)[:, perm].clone(),
         "joint_vel": wp.to_torch(robot.data.joint_vel)[:, perm].clone(),
     }
-    obs_policy = obs["policy"]
-    vs = ctx["vel_slice"]
-    step["vel_cmd"] = obs_policy[:, vs[0]:vs[1]].clone()
+    # Command feeding the history token. Future-command checkpoints read the
+    # upstream command (target_vel) from the command term and also need the future
+    # horizon -- captured here (pre-step) so it spans s+1..s+F relative to THIS step.
+    if ctx["cmd_term"] is not None:
+        step["vel_cmd"] = ctx["cmd_term"].get_command_velocity().clone()                  # (N, cmd_dim)
+        step["future_cmd"] = ctx["cmd_term"].get_command_velocity_horizon(ctx["F"]).clone()  # (N, F, cmd_dim)
+    else:
+        vs = ctx["vel_slice"]
+        step["vel_cmd"] = obs["policy"][:, vs[0]:vs[1]].clone()
     if ctx["scan_slice"] is not None:
         ss = ctx["scan_slice"]
-        step["scan"] = obs_policy[:, ss[0]:ss[1]].clone()
+        step["scan"] = obs["policy"][:, ss[0]:ss[1]].clone()
     history.append(step)
     return step
 
@@ -556,12 +548,12 @@ def _infer_predictions(
         ``root_pos (V, F, 3)``, ``root_quat (V, F, 4)`` (xyzw), and
         ``joint_pos (V, F, nj)``; or None when no env has a full history.
     """
+    fm = ctx["fm"]
     valid = history.valid()
     if not bool(valid.any()):
         return None
     env_ids = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    H, F, D, nj = ctx["H"], ctx["F"], ctx["D"], ctx["nj"]
-    V = env_ids.shape[0]
+    H = fm.H
 
     p = history.stack("root_pos")[env_ids]        # (V, H, 3)
     q = history.stack("root_quat")[env_ids]       # (V, H, 4) xyzw
@@ -569,32 +561,21 @@ def _infer_predictions(
     w = history.stack("root_ang_vel")[env_ids]    # (V, H, 3)
     jp = history.stack("joint_pos")[env_ids]      # (V, H, nj)
     jv = history.stack("joint_vel")[env_ids]      # (V, H, nj)
-    vel_cmd = history.stack("vel_cmd")[env_ids]   # (V, H, vel_dim)
+    cmd = history.stack("vel_cmd")[env_ids]       # (V, H, cmd_dim)
+    scan = history.stack("scan")[env_ids] if fm.scan_dim > 0 else None
 
-    # Reference frame = the most recent (current) step, broadcast over the window.
-    p_ref = p[:, H - 1:H].expand(V, H, 3).reshape(V * H, 3)
-    q_ref = q[:, H - 1:H].expand(V, H, 4).reshape(V * H, 4)
-    rel = relative_state(
-        p.reshape(V * H, 3), q.reshape(V * H, 4), v.reshape(V * H, 3), w.reshape(V * H, 3),
-        jp.reshape(V * H, nj), jv.reshape(V * H, nj), p_ref, q_ref,
-    ).reshape(V, H, D)
-
-    parts = [rel, vel_cmd]
-    if ctx["scan_slice"] is not None:
-        parts.append(history.stack("scan")[env_ids])
-    hist = torch.cat(parts, dim=-1)                       # (V, H, Din)
-    hist_n = ctx["history_norm"].normalize(hist)          # (V, H, Din)
-
-    pred_std = sample_trajectory(ctx["model"], hist_n, F, D, ctx["num_steps"])  # (V, F, D)
-    pred = ctx["target_norm"].denormalize(pred_std)                             # (V, F, D)
-
-    p_ref_f = p[:, H - 1:H].expand(V, F, 3).reshape(V * F, 3)
-    q_ref_f = q[:, H - 1:H].expand(V, F, 4).reshape(V * F, 4)
-    world = state_to_absolute(pred.reshape(V * F, D), p_ref_f, q_ref_f, nj)
+    # online.build_history_token does the (training-matched) relative transform +
+    # normalization; sample_world samples, denormalizes, and lifts to world frame.
+    token = build_history_token(fm, p, q, v, w, jp, jv, cmd, frames=None, scan=scan)
+    future_cmd = None
+    if fm.future_cmd_dim > 0:
+        # The horizon for the current step is stored at the last history index.
+        future_cmd = history.stack("future_cmd")[env_ids][:, H - 1]   # (V, F, future_cmd_dim)
+    world = sample_world(fm, token, p[:, H - 1], q[:, H - 1], future_cmd=future_cmd)
     return env_ids, {
-        "root_pos": world["root_pos_w"].reshape(V, F, 3),
-        "root_quat": world["root_quat_w"].reshape(V, F, 4),
-        "joint_pos": world["joint_pos"].reshape(V, F, nj),
+        "root_pos": world["root_pos_w"],
+        "root_quat": world["root_quat_w"],
+        "joint_pos": world["joint_pos"],
     }
 
 
