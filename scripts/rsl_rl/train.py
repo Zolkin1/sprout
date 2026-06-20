@@ -95,6 +95,12 @@ parser.add_argument(
          "library off a small GPU). Applied to any command term exposing a clip_device "
          "field. Set here (not via hydra) because the cfg default is None.",
 )
+parser.add_argument(
+    "--fm_checkpoint", type=str, default=None,
+    help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
+         "command term exposing an fm_checkpoint field (the GeneratorTrackingCommand), "
+         "overriding the cfg default.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -137,6 +143,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "clip_device"):
                     term.clip_device = args_cli.clip_device
                     print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+
+        # Optionally override the flow-matching generator checkpoint to track
+        # (mirrors --clip_device; the cfg default is a str so hydra works too,
+        # but the flag is the convenient way to pick a freshly-trained FM).
+        if args_cli.fm_checkpoint is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "fm_checkpoint"):
+                    term.fm_checkpoint = args_cli.fm_checkpoint
+                    print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )

@@ -156,6 +156,12 @@ parser.add_argument(
          "field. Set here (not via hydra) because the cfg default is None.",
 )
 parser.add_argument(
+    "--fm_checkpoint", type=str, default=None,
+    help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
+         "command term exposing an fm_checkpoint field (the GeneratorTrackingCommand), "
+         "overriding the cfg default.",
+)
+parser.add_argument(
     "--no-logging", dest="no_logging", action="store_true", default=False,
     help="Disable per-step DataLogger collection (overrides --plots) to A/B "
          "test logging cost.",
@@ -271,6 +277,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "clip_device"):
                     term.clip_device = args_cli.clip_device
                     print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+
+        # Optionally override the flow-matching generator checkpoint to track
+        # (mirrors --clip_device / the same flag in train.py); convenient for
+        # playing against a freshly-trained FM without editing the cfg default.
+        if args_cli.fm_checkpoint is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "fm_checkpoint"):
+                    term.fm_checkpoint = args_cli.fm_checkpoint
+                    print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the
