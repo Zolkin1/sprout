@@ -105,17 +105,45 @@ class MotionClipManager(ManagerBase):
     # Per-env gather by (clip_id, step)
     # ------------------------------------------------------------------
 
+    def gather(self, tensor: torch.Tensor, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Index a dense lib tensor ``[num_clips, T, ...]`` by ``(clip_id, step)``.
+
+        Returns the result on ``clip_id``'s device, moving the index tensors to
+        the library's device first.  This lets a CPU-held library
+        (``cfg.clip_device='cpu'``, for large libs on small GPUs) work
+        transparently with a CUDA env -- a per-step gather copies only the tiny
+        per-env slice across the bus.  Same-device (GPU-resident lib) is a no-op.
+        Works for ``[N]`` indices (``[N, ...]`` result) and ``[N, K]`` indices
+        (``[N, K, ...]`` result).
+        """
+        out_dev = clip_id.device
+        lib_dev = tensor.device
+        out = tensor[clip_id.to(lib_dev), step.to(lib_dev)]
+        return out.to(out_dev)
+
     def gather_desired(self, clip_id: torch.Tensor, step: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(y_des, dy_des)`` ``[N, P]`` / ``[N, V]`` for each env."""
-        return self.lib.y_des[clip_id, step], self.lib.dy_des[clip_id, step]
+        return self.gather(self.lib.y_des, clip_id, step), self.gather(self.lib.dy_des, clip_id, step)
 
     def gather_anchor(self, clip_id: torch.Tensor, step: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(anchor_pos, anchor_quat)`` ``[N, 3]`` / ``[N, 4]`` (clip frame)."""
-        return self.lib.anchor_pos[clip_id, step], self.lib.anchor_quat[clip_id, step]
+        return self.gather(self.lib.anchor_pos, clip_id, step), self.gather(self.lib.anchor_quat, clip_id, step)
 
     def gather_contact(self, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
         """Return the stored contact schedule ``[N, C]`` (clip ``contact_frames`` order)."""
-        return self.lib.contact[clip_id, step]
+        return self.gather(self.lib.contact, clip_id, step)
+
+    def gather_target_vel(self, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Return the commanded base velocity ``[N, 3]`` (vx, vy, wz) for each env.
+
+        This is the upstream command that generated the clip (not the achieved
+        ``dy_des`` velocity).  Indexing matches :meth:`gather_desired`.
+        """
+        return self.gather(self.lib.target_vel, clip_id, step)
+
+    def has_target_vel(self) -> bool:
+        """Whether the loaded library carries a per-step commanded velocity."""
+        return self.lib.target_vel.numel() > 0
 
     # ------------------------------------------------------------------
     # ManagerBase abstract methods (trivial for fixed clips; the command's

@@ -229,6 +229,46 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         return out
 
     # ------------------------------------------------------------------
+    # Commanded velocity (upstream command that generated the clip)
+    # ------------------------------------------------------------------
+
+    @property
+    def command_velocity_available(self) -> bool:
+        """True if the clip library carries a per-step commanded velocity (``target_vel``)."""
+        return self.manager.has_target_vel()
+
+    def get_command_velocity(self) -> torch.Tensor:
+        """Per-env commanded base velocity ``[N, 3]`` = (vx, vy, wz) at the current step.
+
+        This is the *command* that generated the clip (library ``target_vel``), not
+        the achieved reference velocity (``dy_des``).  It is the signal to condition
+        a future-horizon flow-matching model on -- upstream of the reference and
+        available at deployment.  Recorded by ``scripts/rsl_rl/record_data.py``.
+        """
+        if not self.command_velocity_available:
+            raise RuntimeError(
+                "Clip library has no target_vel; regenerate clips with a generator that writes it."
+            )
+        return self.manager.gather_target_vel(self.clip_id, self._step)
+
+    def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
+        """Commanded velocity over the next ``num_future`` steps, ``[N, num_future, 3]``.
+
+        Covers steps ``s+1 .. s+num_future`` (clamped to the clip end), matching the
+        flow-matching future window whose history ends at the current step ``s``.
+        Used at inference to condition the decoder on the command horizon.
+        """
+        if not self.command_velocity_available:
+            raise RuntimeError(
+                "Clip library has no target_vel; regenerate clips with a generator that writes it."
+            )
+        T = self.manager.num_steps
+        offs = torch.arange(num_future, device=self.device)
+        steps = (self._step[:, None] + 1 + offs[None, :]).clamp(max=T - 1)  # [N, num_future]
+        cid = self.clip_id[:, None].expand_as(steps)
+        return self.manager.gather(self.manager.lib.target_vel, cid, steps)
+
+    # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)
     # ------------------------------------------------------------------
 
@@ -240,6 +280,31 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         world anchor (``ref_poses``).  Used by the reset event and observations.
         """
         return lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, self._base_idx)
+
+    def get_reference_world_state(self, base_frame_name: str) -> torch.Tensor:
+        """World-frame reference state, matching the base-class recording API.
+
+        ``scripts/rsl_rl/record_data.py`` auto-detects the trajectory command via
+        this method name and calls it with ``--ref_base_frame``.  The inherited
+        :meth:`BaseTrajectoryCommand.get_reference_world_state` re-resolves the
+        orientation indices in name-appearance order, which is wrong for the
+        clip library (it stores ``ori`` scalar-first); this override delegates to
+        the xyzw-correct :meth:`reference_world_state` instead.
+
+        Args:
+            base_frame_name: Trajectory output frame used as the robot root; must
+                match ``cfg.base_frame_name`` (the only base frame this clip-based
+                command is wired for).
+
+        Returns:
+            World-frame reference state, shape ``[N, 3 + 4 + 3 + 3 + 2*nj]``.
+        """
+        if base_frame_name != self.cfg.base_frame_name:
+            raise ValueError(
+                f"MotionSequenceCommand is wired for base frame "
+                f"'{self.cfg.base_frame_name}'; got '{base_frame_name}'."
+            )
+        return self.reference_world_state()
 
     def reference_world_state_at(
         self, clip_id: torch.Tensor, step: torch.Tensor, world_pos: torch.Tensor, world_quat: torch.Tensor,
@@ -406,14 +471,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         cid = self.clip_id[:, None].expand(n, ns)                                       # [n, Ns]
 
         # World anchor schedule for the window: clip placement ∘ clip anchor.
-        ap = self.manager.lib.anchor_pos[cid, steps]                                     # [n, Ns, 3]
-        aq = self.manager.lib.anchor_quat[cid, steps]                                    # [n, Ns, 4]
+        ap = self.manager.gather(self.manager.lib.anchor_pos, cid, steps)                 # [n, Ns, 3]
+        aq = self.manager.gather(self.manager.lib.anchor_quat, cid, steps)                # [n, Ns, 4]
         wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, ap)
         waq = lift_orientation_batched(self.clip_world_quat, aq)
 
         # Per-frame world positions over the window: [n, Ns, F, 3].
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
-        rel = self.manager.lib.y_des[cid, steps][:, :, frame_idx]                        # [n, Ns, F, 3]
+        rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3]
         world_pos = lift_position_batched(
             wap.reshape(n * ns, 3), waq.reshape(n * ns, 4), rel.reshape(n * ns, F, 3),
         ).reshape(n, ns, F, 3)

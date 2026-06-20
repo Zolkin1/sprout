@@ -67,6 +67,17 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         help="Future target: 'actual' recorded state, or the tracked 'reference' "
              "(requires ref_state in the dataset). History is always the actual state.",
     )
+    parser.add_argument(
+        "--vel_cmd_term", type=str, default="velocity_commands",
+        help="Obs term carrying the velocity command in the history token. Use "
+             "'ref_base_vel' for the open-loop motion-sequence task (no velocity command).",
+    )
+    parser.add_argument(
+        "--cmd_array", type=str, default=None,
+        help="Dedicated recorded command array (e.g. 'target_vel') to condition on over "
+             "the whole window -- past in the encoder, future in the decoder. Supersedes "
+             "--vel_cmd_term; requires the array in the recording.",
+    )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_encoder_layers", type=int, default=4)
@@ -86,6 +97,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     cfg = FlowMatchingConfig(
         history_len=args.history_len, future_len=args.future_len, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
+        vel_cmd_term=args.vel_cmd_term, cmd_array=args.cmd_array,
         d_model=args.d_model, nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
@@ -138,9 +150,12 @@ def evaluate(model, loader, cfg, target_normalizer, num_joints, device) -> dict[
     for batch in loader:
         history = batch["history"].to(device)
         future = batch["future"].to(device)
-        flow_sum += flow_matching_loss(model, history, future)["flow_mse"].item()
+        future_cmd = batch["future_cmd"].to(device) if "future_cmd" in batch else None
+        flow_sum += flow_matching_loss(model, history, future, future_cmd)["flow_mse"].item()
         n_batches += 1
-        pred = sample_trajectory(model, history, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps)
+        pred = sample_trajectory(
+            model, history, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps, future_cmd=future_cmd
+        )
         pred_d = target_normalizer.denormalize(pred)
         tgt_d = target_normalizer.denormalize(future)
         for k, v in channel_metrics(pred_d, tgt_d, num_joints).items():
@@ -183,9 +198,10 @@ def main() -> None:
         history_len=cfg.history_len, future_len=cfg.future_len,
         d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
         num_decoder_layers=cfg.num_decoder_layers, dim_feedforward=cfg.dim_feedforward,
-        dropout=cfg.dropout,
+        dropout=cfg.dropout, cmd_dim=cfg.cmd_dim,
     ).to(device)
-    print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "
+          f"(future-command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
 
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
@@ -213,8 +229,9 @@ def main() -> None:
         for batch in train_loader:
             history = batch["history"].to(device)
             future = batch["future"].to(device)
+            future_cmd = batch["future_cmd"].to(device) if "future_cmd" in batch else None
             opt.zero_grad()
-            out = flow_matching_loss(model, history, future, ori_slice, cfg.ori6d_aux_weight)
+            out = flow_matching_loss(model, history, future, future_cmd, ori_slice, cfg.ori6d_aux_weight)
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()

@@ -151,22 +151,63 @@ class FutureStateDataset(Dataset):
         self.num_joints = nj
         self.state_dim = target_state_dim(nj)
 
-        # -- resolve obs slices for the perceptive / command inputs --
-        self.vel_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, "velocity_commands")
-        self.scan_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, "height_scan")
-        vel_dim = self.vel_slice[1] - self.vel_slice[0]
+        # -- resolve the command + perception inputs --
+        # Command source: a dedicated recorded array (cfg.cmd_array, e.g. "target_vel")
+        # enables *future-horizon* conditioning -- the command is known over the whole
+        # window, so its future steps condition the decoder. Falls back to a past-only
+        # obs term (cfg.vel_cmd_term) when no array is given (the online task). The
+        # height scan is optional -- flat-ground tasks have no "height_scan" term.
+        try:
+            self.scan_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, "height_scan")
+        except KeyError:
+            self.scan_slice = (0, 0)
         scan_dim = self.scan_slice[1] - self.scan_slice[0]
-        self.history_in_dim = self.state_dim + vel_dim + scan_dim
+
+        self.cmd_array = cfg.cmd_array
+        if self.cmd_array is not None:
+            cmd_np = data.get(self.cmd_array)
+            if cmd_np is None:
+                raise ValueError(
+                    f"cmd_array={self.cmd_array!r} not in the recording; re-record with "
+                    f"scripts/rsl_rl/record_data.py on a clip task that exposes it (e.g. target_vel)."
+                )
+            self.vel_slice = None
+            cmd_dim = int(cmd_np.shape[1])
+        else:
+            self.vel_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, cfg.vel_cmd_term)
+            cmd_dim = self.vel_slice[1] - self.vel_slice[0]
+
+        # Future-command conditioning only when the command comes from a dedicated
+        # array (its future steps are a true command; an obs term's future would be
+        # an output-side / unavailable-at-deploy signal).
+        self.future_cmd_dim = cmd_dim if self.cmd_array is not None else 0
+        self.history_in_dim = self.state_dim + cmd_dim + scan_dim
         cfg.state_dim = self.state_dim
         cfg.history_in_dim = self.history_in_dim
+        cfg.cmd_dim = self.future_cmd_dim
 
         idx = np.stack(windows).astype(np.int64)  # (Nw, W)
         n_win, _ = idx.shape
 
         state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
-        obs_t = torch.from_numpy(np.ascontiguousarray(data["obs"])).float()
         sw = state_t[idx]  # (Nw, W, state_raw)
-        ow = obs_t[idx]    # (Nw, W, obs_dim)
+
+        # Command + scan, sliced *before* windowing (the full obs is ~obs_dim/used_dim
+        # times wider, e.g. 349 vs 6, and OOMs the host on large overlapping windows).
+        # past_cmd conditions the encoder; future_cmd (array source only) the decoder.
+        if self.cmd_array is not None:
+            cmd_full = torch.from_numpy(np.ascontiguousarray(data[self.cmd_array])).float()[idx]  # (Nw,W,cmd)
+            past_cmd = cmd_full[:, :h, :]            # (Nw, H, cmd_dim)
+            future_cmd_raw = cmd_full[:, h:, :]      # (Nw, F, cmd_dim)
+        else:
+            cmd_cols = data["obs"][:, self.vel_slice[0]:self.vel_slice[1]]
+            past_cmd = torch.from_numpy(np.ascontiguousarray(cmd_cols)).float()[idx][:, :h, :]
+            future_cmd_raw = None
+        if scan_dim > 0:
+            scan_cols = data["obs"][:, self.scan_slice[0]:self.scan_slice[1]]
+            scan = torch.from_numpy(np.ascontiguousarray(scan_cols)).float()[idx][:, :h, :]  # (Nw,H,scan)
+        else:
+            scan = None
 
         def _split(name: str) -> torch.Tensor:
             a, b = s_slc[name]
@@ -190,10 +231,11 @@ class FutureStateDataset(Dataset):
             p_ref.reshape(m, 3), q_ref.reshape(m, 4),
         ).reshape(n_win, window_len, self.state_dim)
 
-        hist_state = rel[:, :h, :]                                  # (Nw, H, state_dim)
-        vel_cmd = ow[:, :h, self.vel_slice[0]:self.vel_slice[1]]    # (Nw, H, vel_dim)
-        scan = ow[:, :h, self.scan_slice[0]:self.scan_slice[1]]     # (Nw, H, scan_dim)
-        history = torch.cat([hist_state, vel_cmd, scan], dim=-1).contiguous()  # (Nw, H, Din)
+        hist_state = rel[:, :h, :]                       # (Nw, H, state_dim)
+        parts = [hist_state, past_cmd]                   # state + command (past)
+        if scan is not None:
+            parts.append(scan)
+        history = torch.cat(parts, dim=-1).contiguous()  # (Nw, H, history_in_dim)
 
         # Future target: the actual recorded state, or the tracked reference --
         # both expressed in the same relative frame (anchored at the actual pose
@@ -215,7 +257,10 @@ class FutureStateDataset(Dataset):
         o0, o1 = orientation_slice(nj)
         target_mask = torch.ones(self.state_dim, dtype=torch.bool)
         target_mask[o0:o1] = False
-        history_mask = torch.cat([target_mask, torch.ones(vel_dim + scan_dim, dtype=torch.bool)])
+        # Command + scan columns of the history token are standardized.
+        history_mask = torch.cat(
+            [target_mask, torch.ones(self.history_in_dim - self.state_dim, dtype=torch.bool)]
+        )
 
         if target_normalizer is None:
             target_normalizer = Normalizer.fit(future.reshape(-1, self.state_dim), target_mask)
@@ -227,6 +272,17 @@ class FutureStateDataset(Dataset):
         # Pre-normalize once (store normalized tensors; __getitem__ is a pure slice).
         self.history = history_normalizer.normalize(history)
         self.future = target_normalizer.normalize(future)
+
+        # Future command (decoder conditioning), normalized with the *same* stats as
+        # the past command in the history token (its command columns), so past and
+        # future command live in one normalized space.
+        if future_cmd_raw is not None:
+            c0, c1 = self.state_dim, self.state_dim + self.future_cmd_dim
+            cmd_mean = history_normalizer.mean[c0:c1]
+            cmd_std = history_normalizer.std[c0:c1]
+            self.future_cmd = ((future_cmd_raw - cmd_mean) / cmd_std).contiguous()
+        else:
+            self.future_cmd = None
 
     def _reference_future(
         self,
@@ -297,12 +353,15 @@ class FutureStateDataset(Dataset):
         return self.history.shape[0]
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        return {
+        item = {
             "history": self.history[i],
             "future": self.future[i],
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }
+        if self.future_cmd is not None:
+            item["future_cmd"] = self.future_cmd[i]
+        return item
 
 
 def build_train_val(

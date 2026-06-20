@@ -131,6 +131,11 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
     optional_arrays = {}
     if data.get("ref_state") is not None:
         optional_arrays["ref_state"] = data["ref_state"].astype(np.float32)
+    # Per-step commanded velocity (vx, vy, wz) -- the upstream command that drove the
+    # reference. Written only when the recording task exposed a command velocity;
+    # used by the flow-matching dataset for future-horizon command conditioning.
+    if data.get("target_vel") is not None:
+        optional_arrays["target_vel"] = data["target_vel"].astype(np.float32)
     np.savez_compressed(
         path,
         # per-pair arrays
@@ -187,6 +192,8 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         # Present only for datasets recorded with a trajectory reference; older
         # files lack it, so default to None.
         "ref_state": z["ref_state"] if "ref_state" in z.files else None,
+        # Present only when recorded on a clip task exposing a command velocity.
+        "target_vel": z["target_vel"] if "target_vel" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],

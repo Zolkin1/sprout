@@ -98,6 +98,11 @@ parser.add_argument(
          "reference state (must expose pos_x/y/z and ori_x/y/z/w outputs).",
 )
 parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold the motion-clip library on (e.g. 'cpu' to keep the multi-GB "
+         "library off a small GPU; gathers copy only the per-env slice). Default: env device.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False,
     help="Disable fabric and use USD I/O operations.",
 )
@@ -278,6 +283,12 @@ def collect_pairs(
     }
     if ref_cmd is not None:
         buf["ref_state"] = []
+    # Per-step commanded velocity (the upstream command that drove the reference),
+    # recorded when the clip task exposes it -- enables future-horizon command
+    # conditioning in the flow-matching dataset.
+    record_cmd_vel = ref_cmd is not None and getattr(ref_cmd, "command_velocity_available", False)
+    if record_cmd_vel:
+        buf["target_vel"] = []
 
     print(f"[INFO] Collecting {num_steps} steps on {n_envs} envs "
           f"({num_steps * n_envs} pairs, trimming to {num_pairs})...")
@@ -307,6 +318,8 @@ def collect_pairs(
         if ref_cmd is not None:
             ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
             buf["ref_state"].append(ref_state.detach().cpu().clone())
+        if record_cmd_vel:
+            buf["target_vel"].append(ref_cmd.get_command_velocity().detach().cpu().clone())
         buf["episode_id"].append(episode_id.detach().cpu().clone())
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
@@ -383,6 +396,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
         env_cfg.log_dir = log_dir
 
+        # Optionally hold the clip library off-GPU (e.g. on a 12 GB card the ~4 GB
+        # library + transient reorder copy OOMs at scene init). Set on any command
+        # term exposing a clip_device field (the motion-sequence trajectory command).
+        if args_cli.clip_device is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
@@ -445,6 +467,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if ref_cmd is not None:
             print(f"[INFO] Recording reference state from command '{ref_name}' "
                   f"(base frame '{args_cli.ref_base_frame}').")
+            if getattr(ref_cmd, "command_velocity_available", False):
+                print(f"[INFO] Recording commanded velocity (target_vel) from command '{ref_name}'.")
         else:
             print("[WARN] No trajectory command with get_reference_world_state found; "
                   "skipping ref_state recording.")
@@ -458,8 +482,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         save_recorded_data(out_path, data, meta)
         print(f"[INFO] Saved {meta.num_pairs} (obs, action) pairs to: {out_path}")
         ref_shape = data["ref_state"].shape if "ref_state" in data else None
+        tvel_shape = data["target_vel"].shape if "target_vel" in data else None
         print(f"[INFO]   obs shape={data['obs'].shape}, action shape={data['action'].shape}, "
               f"state shape={data['state'].shape}, ref_state shape={ref_shape}, "
+              f"target_vel shape={tvel_shape}, "
               f"terminations flagged={int(data['terminated'].sum())}")
 
         env.close()

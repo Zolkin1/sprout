@@ -68,6 +68,8 @@ class FlowMatchingTransformer(nn.Module):
         num_decoder_layers: Decoder depth.
         dim_feedforward: Feedforward dimension in each transformer layer.
         dropout: Dropout rate.
+        cmd_dim: Per-step future-command width injected into the decoder (0 disables
+            future-command conditioning).
     """
 
     def __init__(
@@ -82,15 +84,20 @@ class FlowMatchingTransformer(nn.Module):
         num_decoder_layers: int = 4,
         dim_feedforward: int = 512,
         dropout: float = 0.0,
+        cmd_dim: int = 0,
     ):
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
         self.history_len = history_len
         self.future_len = future_len
+        self.cmd_dim = cmd_dim
 
         self.history_proj = nn.Linear(history_in_dim, d_model)
         self.future_proj = nn.Linear(state_dim, d_model)
+        # Per-future-step command embedding, added to the decoder token like the
+        # positional / time embeddings (only when conditioning on a command horizon).
+        self.cmd_proj = nn.Linear(cmd_dim, d_model) if cmd_dim > 0 else None
         self.time_mlp = nn.Sequential(
             nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
@@ -124,18 +131,30 @@ class FlowMatchingTransformer(nn.Module):
         h = self.history_proj(history) + self.enc_pos
         return self.encoder(h)
 
-    def forward(self, x_tau: torch.Tensor, tau: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x_tau: torch.Tensor,
+        tau: torch.Tensor,
+        memory: torch.Tensor,
+        future_cmd: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Predict the flow vector field for the future trajectory.
 
         Args:
             x_tau: Noisy future states at flow-time ``tau``, shape ``(B, F, state_dim)``.
             tau: Flow time in ``[0, 1]``, shape ``(B,)``.
             memory: Encoder memory, shape ``(B, H, d_model)``.
+            future_cmd: Per-future-step command (normalized), shape ``(B, F, cmd_dim)``.
+                Required when the model was built with ``cmd_dim > 0``; ignored otherwise.
 
         Returns:
             Predicted velocity field, shape ``(B, F, state_dim)``.
         """
         h = self.future_proj(x_tau) + self.dec_pos
+        if self.cmd_proj is not None:
+            if future_cmd is None:
+                raise ValueError("Model built with cmd_dim > 0 requires future_cmd.")
+            h = h + self.cmd_proj(future_cmd)
         t_emb = self.time_mlp(_timestep_embedding(tau, self.d_model))  # (B, d_model)
         h = h + t_emb.unsqueeze(1)
         # FULL self-attention over future tokens (no tgt_mask) + cross-attention to memory.

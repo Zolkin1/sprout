@@ -40,6 +40,7 @@ def flow_matching_loss(
     model: torch.nn.Module,
     history: torch.Tensor,
     x1: torch.Tensor,
+    future_cmd: torch.Tensor | None = None,
     ori_slice: tuple[int, int] | None = None,
     aux_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
@@ -49,6 +50,8 @@ def flow_matching_loss(
         model: A :class:`FlowMatchingTransformer`.
         history: History tokens (normalized), shape ``(B, H, history_in_dim)``.
         x1: Target trajectory (standardized), shape ``(B, F, D)``.
+        future_cmd: Per-future-step command (normalized), shape ``(B, F, cmd_dim)``,
+            or ``None`` when the model is not conditioned on a command horizon.
         ori_slice: ``(start, end)`` of the 6D orientation block, for the optional aux loss.
         aux_weight: Weight of the orientation orthonormality penalty (0 disables).
 
@@ -58,7 +61,7 @@ def flow_matching_loss(
     """
     memory = model.encode(history)
     x_tau, tau, target_v = sample_flow_batch(x1)
-    v = model(x_tau, tau, memory)
+    v = model(x_tau, tau, memory, future_cmd)
     flow_mse = F.mse_loss(v, target_v)
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
     if aux_weight > 0.0 and ori_slice is not None:
@@ -78,6 +81,7 @@ def sample_trajectory(
     future_len: int,
     state_dim: int,
     num_steps: int = 8,
+    future_cmd: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Generate a future trajectory by Euler-integrating the learned flow.
@@ -92,6 +96,8 @@ def sample_trajectory(
         future_len: Number of future steps ``F``.
         state_dim: Per-step state width ``D``.
         num_steps: Number of Euler integration steps.
+        future_cmd: Per-future-step command (normalized), shape ``(B, F, cmd_dim)``,
+            held fixed across the integration; ``None`` when not command-conditioned.
         generator: Optional RNG for the initial noise.
 
     Returns:
@@ -104,6 +110,6 @@ def sample_trajectory(
     dt = 1.0 / num_steps
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device)
-        v = model(x, tau, memory)
+        v = model(x, tau, memory, future_cmd)
         x = x + dt * v
     return x

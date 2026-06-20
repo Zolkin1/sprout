@@ -120,6 +120,11 @@ parser.add_argument(
     "--print_layout", action="store_true", default=False,
     help="Print the resolved layout (H, F, dims, slices, joint names) and exit before launching sim.",
 )
+parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold the motion-clip library on (e.g. 'cpu' to keep the multi-GB "
+         "library off a small GPU). Default: env device.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -220,6 +225,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
         env_cfg.seed = agent_cfg.seed
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+        # Optionally hold the clip library off-GPU (keeps the ~4 GB library + sim +
+        # renderer within a small card's VRAM). Set on any command term with the field.
+        if args_cli.clip_device is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
 
         # -- resolve RL policy checkpoint (mirror play.py) --
         resume_path = None
@@ -404,9 +417,26 @@ def _build_fm_context(env, robot, device) -> dict:
     live_obs_names = list(obs_mgr.active_terms["policy"])
     live_obs_dims = [int(td[0]) for td in obs_mgr.group_obs_term_dim["policy"]]
 
+    # Future-command (cmd_array) checkpoints need the history buffer to capture the
+    # command stream and the decoder to be fed the command horizon at inference --
+    # not yet wired here. Fail loudly rather than with a confusing dim mismatch.
+    if _FM_CKPT is not None and _FM_CKPT["config"].get("cmd_array"):
+        raise NotImplementedError(
+            "record_viz does not yet support future-command (cmd_array) checkpoints. "
+            "The history buffer must capture the command (e.g. target_vel) and the "
+            "decoder must be given get_command_velocity_horizon(F). Use TensorBoard / "
+            "training metrics to inspect such models for now."
+        )
+
     # Command/perception slices come from the LIVE obs layout (the vector we read
-    # at runtime). velocity_commands is required; height_scan is optional.
-    vel_slice = resolve_term_slice(live_obs_names, live_obs_dims, "velocity_commands")
+    # at runtime). The velocity-command term name is whatever the checkpoint was
+    # trained with (default "velocity_commands"; "ref_base_vel" for motion-seq);
+    # it is required. height_scan is optional.
+    vel_cmd_term = (
+        _FM_CKPT["config"].get("vel_cmd_term", "velocity_commands")
+        if _FM_CKPT is not None else "velocity_commands"
+    )
+    vel_slice = resolve_term_slice(live_obs_names, live_obs_dims, vel_cmd_term)
     try:
         scan_slice = resolve_term_slice(live_obs_names, live_obs_dims, "height_scan")
     except KeyError:
