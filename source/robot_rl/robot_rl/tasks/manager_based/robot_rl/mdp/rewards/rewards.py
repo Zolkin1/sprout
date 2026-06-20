@@ -94,6 +94,37 @@ def ref_base_vel_tracking_exp(
     return torch.exp(-torch.sum(err * err, dim=1) / (std ** 2))
 
 
+def command_vel_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Dense exp reward for tracking the clip's joystick-level velocity command.
+
+    Grades the measured base velocity against the upstream command that
+    generated the clip (``target_vel`` = ``(vx, vy, wz)`` -- what a velocity
+    "joystick" would supply), rather than the *achieved* reference velocity
+    (``dy_des``, see :func:`ref_base_vel_tracking_exp`).  Mirrors the standard
+    ``track_lin_vel_xy_exp`` / ``track_ang_vel_z_exp`` velocity-command rewards
+    -- planar linear velocity + yaw rate in the base frame -- but sources the
+    command from the trajectory command rather than a separate velocity command
+    term.  Requires a clip library carrying ``target_vel``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    target_vel = cmd.get_command_velocity()  # [N, 3] = (vx, vy, wz)
+    asset: Articulation = env.scene[asset_cfg.name]
+    meas = torch.cat(
+        [
+            wp.to_torch(asset.data.root_lin_vel_b)[:, :2],   # planar linear velocity
+            wp.to_torch(asset.data.root_ang_vel_b)[:, 2:3],  # yaw rate
+        ],
+        dim=-1,
+    )
+    err = target_vel - meas
+    return torch.exp(-torch.sum(err * err, dim=1) / (std ** 2))
+
+
 def multiple_undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfgs: Sequence[SceneEntityCfg]) -> torch.Tensor:
     """Penalize undesired contacts as the number of violations above a threshold, aggregated across multiple sensors."""
     total = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)

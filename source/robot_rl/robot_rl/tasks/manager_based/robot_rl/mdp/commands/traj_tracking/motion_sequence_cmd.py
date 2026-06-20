@@ -270,6 +270,74 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         return self.manager.gather(self.manager.lib.target_vel, cid, steps)
 
     # ------------------------------------------------------------------
+    # Future window (look-ahead into the clip for the teacher policy)
+    # ------------------------------------------------------------------
+
+    def _future_step_indices(self, offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(clip_id, step)`` index grids ``[N, K]`` for the given future ``offsets``.
+
+        Steps are ``self._step + offset`` clamped to the clip end, so the window
+        saturates on the final frame near a clip's end (same convention as
+        :meth:`get_command_velocity_horizon` and the debug-viz ribbon).
+        """
+        T = self.manager.num_steps
+        steps = (self._step[:, None] + offsets[None, :]).clamp(max=T - 1)  # [N, K]
+        cid = self.clip_id[:, None].expand_as(steps)
+        return cid, steps
+
+    def get_future_command_velocity(self, offsets: torch.Tensor) -> torch.Tensor:
+        """Commanded base velocity ``[N, K, 3]`` = (vx, vy, wz) at the future ``offsets``.
+
+        The upstream ``target_vel`` (heading frame, deployable) at steps
+        ``self._step + offsets`` -- the look-ahead counterpart of
+        :meth:`get_command_velocity`.
+        """
+        if not self.command_velocity_available:
+            raise RuntimeError(
+                "Clip library has no target_vel; regenerate clips with a generator that writes it."
+            )
+        cid, steps = self._future_step_indices(offsets)
+        return self.manager.gather(self.manager.lib.target_vel, cid, steps)
+
+    def get_future_world_base(
+        self, offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """World-frame reference base pose+velocity over the future ``offsets``.
+
+        Returns ``(pos_w, quat_w, lin_w, ang_w)`` of shapes ``[N, K, 3]``,
+        ``[N, K, 4]`` (xyzw), ``[N, K, 3]``, ``[N, K, 3]``.  Lifts the stance-
+        anchored clip outputs through each future step's world anchor (clip
+        placement ∘ clip anchor schedule), reusing the exact lift the debug-viz
+        ribbon and :meth:`reference_world_state` use -- so ``quat_w`` matches the
+        convention consumed by the ``base_pose_error`` observation.
+        """
+        cid, steps = self._future_step_indices(offsets)
+        n, k = steps.shape
+        bi = self._base_idx
+
+        # Per-step world anchor: clip placement ∘ clip anchor schedule.
+        cap = self.manager.gather(self.manager.lib.anchor_pos, cid, steps)    # [N, K, 3]
+        caq = self.manager.gather(self.manager.lib.anchor_quat, cid, steps)   # [N, K, 4]
+        wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, cap)   # [N, K, 3]
+        waq = lift_orientation_batched(self.clip_world_quat, caq)                     # [N, K, 4]
+
+        # Base channels (anchor-relative) lifted to world per (env, step).
+        y = self.manager.gather(self.manager.lib.y_des, cid, steps)           # [N, K, P]
+        dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)         # [N, K, V]
+        ap = wap.reshape(n * k, 3)
+        aq = waq.reshape(n * k, 4)
+        pos_rel = y[:, :, bi["pos"]].reshape(n * k, 3)
+        ori_rel = y[:, :, bi["ori"]].reshape(n * k, 4)
+        lin_rel = dy[:, :, bi["lin_vel"]].reshape(n * k, 3)
+        ang_rel = dy[:, :, bi["ang_vel"]].reshape(n * k, 3)
+
+        pos_w = lift_position(ap, aq, pos_rel).reshape(n, k, 3)
+        quat_w = lift_orientation(aq, ori_rel).reshape(n, k, 4)
+        lin_w = lift_vector(aq, lin_rel).reshape(n, k, 3)
+        ang_w = lift_vector(aq, ang_rel).reshape(n, k, 3)
+        return pos_w, quat_w, lin_w, ang_w
+
+    # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)
     # ------------------------------------------------------------------
 

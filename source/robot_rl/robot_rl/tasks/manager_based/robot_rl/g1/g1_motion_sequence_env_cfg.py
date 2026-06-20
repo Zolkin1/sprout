@@ -77,9 +77,26 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
-        # Reference base velocity target (pairs with ref_base_vel_tracking_exp).
-        # TODO: Make this observation the target_vel (the joystick level velocity)
-        ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        # Joystick-level velocity command that generated the clip (target_vel =
+        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
+
+        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps): future
+        # joystick command + future base pose/velocity, so the teacher can
+        # anticipate upcoming slowdowns / turns. Base pose/vel are relative to the
+        # current actual base (a "future base_pose_error").
+        future_command_vel = ObsTerm(
+            func=mdp.future_command_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_pose = ObsTerm(
+            func=mdp.future_base_pose,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_vel = ObsTerm(
+            func=mdp.future_base_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
 
         # Full stance-anchored tracking vector.
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
@@ -107,8 +124,23 @@ class G1MotionSeqObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
-        # TODO: Make this observation the target_vel (the joystick level velocity)
-        ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        # Joystick-level velocity command that generated the clip (target_vel).
+        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
+
+        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps), same as
+        # the policy group (future command + base pose/vel rel. to current base).
+        future_command_vel = ObsTerm(
+            func=mdp.future_command_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_pose = ObsTerm(
+            func=mdp.future_base_pose,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_vel = ObsTerm(
+            func=mdp.future_base_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
 
         # Full stance-anchored tracking vector (privileged).
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
@@ -151,10 +183,11 @@ class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
     yaw_vel = None
 
     # Dense shaped signal replacing the dropped xy_vel/yaw_vel: track the clip's
-    # reference base (pelvis) linear+angular velocity.
-    # TODO: Change/fix this to be a reward on tracking the targeet_vel value which is more like joystick level tracking.
-    ref_base_vel = RewTerm(
-        func=mdp.ref_base_vel_tracking_exp,
+    # joystick-level velocity command (target_vel = (vx, vy, wz)) -- the same
+    # signal a velocity joystick would supply -- rather than the achieved
+    # reference base velocity.
+    command_vel = RewTerm(
+        func=mdp.command_vel_tracking_exp,
         weight=1.0,
         params={"command_name": "traj_ref", "std": 0.5},
     )

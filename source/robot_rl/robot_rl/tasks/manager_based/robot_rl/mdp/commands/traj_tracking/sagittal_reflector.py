@@ -66,6 +66,16 @@ class SagittalReflectionConfig:
         "root_quat": [-1.0, 1.0, -1.0, 1.0],
         "base_pose_error": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
         "ref_base_vel": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        # Joystick-level velocity command (target_vel = (vx, vy, wz)); reflects
+        # like the standard ``velocity_commands`` term: keep vx, negate vy + yaw.
+        "command_vel": [1.0, -1.0, -1.0],
+        # Look-ahead (future-window) terms: per-step blocks flattened as
+        # [step0, step1, ...], so the same per-step multiplier tiles K times.
+        # Each block mirrors its current-step analogue (command_vel /
+        # base_pose_error / ref_base_vel).
+        "future_command_vel": [1.0, -1.0, -1.0],
+        "future_base_pose": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
+        "future_base_vel": [1.0, -1.0, 1.0, -1.0, 1.0, -1.0],
     })
 
     # Observation terms whose reflection is a joint-level swap+sign.

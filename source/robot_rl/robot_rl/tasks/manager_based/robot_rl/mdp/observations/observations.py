@@ -226,6 +226,98 @@ def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_re
     return torch.cat([quat_apply(inv_root, lin_w), quat_apply(inv_root, ang_w)], dim=-1)
 
 
+def command_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Joystick-level base velocity command that generated the clip (``target_vel``).
+
+    The upstream commanded velocity ``(vx, vy, wz)`` -- the signal a velocity
+    "joystick" would supply -- rather than the achieved reference base velocity
+    (:func:`ref_base_velocity`, ``dy_des``).  Heading-invariant (planar linear
+    velocity + yaw rate in the base/heading frame) and available at deployment.
+    Pairs with the ``command_vel_tracking_exp`` reward so the command it grades
+    against is observable to the policy.  Returns ``[N, 3]``.  Requires a clip
+    library carrying ``target_vel``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    return cmd.get_command_velocity().clone()
+
+
+def _lookahead_offsets(cmd, horizon_s: float, stride: int) -> torch.Tensor:
+    """Strided future step offsets covering ``horizon_s`` at the clip control dt.
+
+    e.g. ``horizon_s=0.5, stride=5`` with ``dt=0.02`` -> ``[5, 10, 15, 20, 25]``
+    (0.1 .. 0.5 s).  Always returns at least one offset.
+    """
+    dt = float(cmd.manager.dt)
+    horizon_steps = max(1, int(round(horizon_s / dt)))
+    stride = max(1, int(stride))
+    offs = torch.arange(stride, horizon_steps + 1, stride, device=cmd.device, dtype=torch.long)
+    if offs.numel() == 0:
+        offs = torch.tensor([horizon_steps], device=cmd.device, dtype=torch.long)
+    return offs
+
+
+def future_command_velocity(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", horizon_s: float = 0.5, stride: int = 5,
+) -> torch.Tensor:
+    """Look-ahead commanded velocity over a future window (``[N, K * 3]``).
+
+    The upstream ``target_vel`` ``(vx, vy, wz)`` (heading frame) at strided future
+    steps covering ``horizon_s`` -- lets the privileged teacher anticipate an
+    upcoming slowdown / direction change before the current reference changes.
+    Flattened as ``[step0(3), step1(3), ...]`` (the per-step layout the symmetry
+    tiler expects).  Requires a clip library carrying ``target_vel``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    offs = _lookahead_offsets(cmd, horizon_s, stride)
+    return cmd.get_future_command_velocity(offs).reshape(env.num_envs, -1)
+
+
+def future_base_pose(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", horizon_s: float = 0.5, stride: int = 5,
+) -> torch.Tensor:
+    """Look-ahead reference base pose error over a future window (``[N, K * 6]``).
+
+    For each strided future step covering ``horizon_s``, the reference base pose
+    expressed relative to the robot's *current* base -- a "future
+    :func:`base_pose_error`": position error (3, rotated into the current base
+    frame) + orientation error (3, ``quat_box_minus`` tangent).  Heading-
+    invariant.  Flattened as ``[step0(6), step1(6), ...]``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    offs = _lookahead_offsets(cmd, horizon_s, stride)
+    pos_w, quat_w, _, _ = cmd.get_future_world_base(offs)       # [N, K, 3], [N, K, 4]
+    n, k, _ = pos_w.shape
+    root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)         # [N, 3]
+    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)       # [N, 4]
+    inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
+    root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
+    pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
+    ori_err = quat_box_minus(root_q, quat_w.reshape(n * k, 4))  # actual ⊟ reference
+    out = torch.cat([pos_err_b, ori_err], dim=-1).reshape(n, k, 6)
+    return out.reshape(n, -1)
+
+
+def future_base_velocity(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", horizon_s: float = 0.5, stride: int = 5,
+) -> torch.Tensor:
+    """Look-ahead reference base velocity over a future window (``[N, K * 6]``).
+
+    For each strided future step covering ``horizon_s``, the reference base
+    linear+angular velocity rotated into the robot's *current* base frame
+    (mirrors :func:`ref_base_velocity_local`).  Heading-invariant.  Flattened as
+    ``[step0(6), step1(6), ...]``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    offs = _lookahead_offsets(cmd, horizon_s, stride)
+    _, _, lin_w, ang_w = cmd.get_future_world_base(offs)        # [N, K, 3], [N, K, 3]
+    n, k, _ = lin_w.shape
+    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)       # [N, 4]
+    inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
+    lin_b = quat_apply(inv_root, lin_w.reshape(n * k, 3)).reshape(n, k, 3)
+    ang_b = quat_apply(inv_root, ang_w.reshape(n * k, 3)).reshape(n, k, 3)
+    return torch.cat([lin_b, ang_b], dim=-1).reshape(n, -1)
+
+
 def ee_ref_relative_to_base(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", frame_names: list[str] | None = None,
 ) -> torch.Tensor:
