@@ -444,11 +444,17 @@ def _build_fm_context(env, robot, device) -> dict:
         fm = _dry_run_fm_context(live_joint_names, scan_dim, vd[1] - vd[0], device)
         print("[INFO] --dry_run: using a randomly-initialized model and identity normalizers.")
 
-    # Extra (ee/com) frames need per-step body capture, not wired into record_viz yet.
+    # Extra body frames (ee): resolve their live body indices in FM frame order so the
+    # per-step capture mirrors record_data.py --state_frames (body_pos_w / body_quat_w /
+    # body_link_vel_w), the exact layout online.build_history_token consumes.
+    frame_body_idx = None
     if fm.num_extra_frames > 0:
-        raise NotImplementedError(
-            f"record_viz does not yet capture the {fm.num_extra_frames} extra body frame(s) "
-            f"({fm.frame_names}) this checkpoint predicts. Use the GeneratorTrackingCommand path."
+        body_names = list(robot.data.body_names)
+        missing_f = [f for f in fm.frame_names if f not in body_names]
+        if missing_f:
+            raise ValueError(f"FM extra frames absent from the live robot bodies: {missing_f}")
+        frame_body_idx = torch.tensor(
+            [body_names.index(f) for f in fm.frame_names], dtype=torch.long, device=device
         )
 
     # Joint permutation: reorder live joints into the FM training order.
@@ -482,11 +488,11 @@ def _build_fm_context(env, robot, device) -> dict:
 
     return {
         "fm": fm, "joint_perm": joint_perm, "scan_slice": scan_slice,
-        "cmd_term": cmd_term, "vel_slice": vel_slice,
+        "cmd_term": cmd_term, "vel_slice": vel_slice, "frame_body_idx": frame_body_idx,
         "H": fm.H, "F": fm.F, "D": fm.D, "Din": fm.Din, "nj": fm.nj,
         "num_steps": fm.num_steps, "joint_names": fm.joint_names,
         "vel_dim": fm.cmd_dim, "scan_dim": fm.scan_dim, "future_cmd_dim": fm.future_cmd_dim,
-        "device": device,
+        "num_extra_frames": fm.num_extra_frames, "device": device,
     }
 
 
@@ -517,6 +523,14 @@ def _record_step(history: BatchedHistory, robot, obs, ctx: dict, wp) -> dict[str
         "joint_pos": wp.to_torch(robot.data.joint_pos)[:, perm].clone(),
         "joint_vel": wp.to_torch(robot.data.joint_vel)[:, perm].clone(),
     }
+    # Extra body frames (ee): world pose + twist, mirroring record_data --state_frames
+    # ([pos(3), quat(4 xyzw), body_link_vel(6) = lin+ang] per frame, FM frame order).
+    if ctx["frame_body_idx"] is not None:
+        idx = ctx["frame_body_idx"]
+        fpos = wp.to_torch(robot.data.body_pos_w)[:, idx]        # (N, K, 3)
+        fquat = wp.to_torch(robot.data.body_quat_w)[:, idx]      # (N, K, 4) xyzw
+        flink = wp.to_torch(robot.data.body_link_vel_w)[:, idx]  # (N, K, 6) [lin, ang]
+        step["frames"] = torch.cat([fpos, fquat, flink], dim=-1).clone()  # (N, K, 13)
     # Command feeding the history token. Future-command checkpoints read the
     # upstream command (target_vel) from the command term and also need the future
     # horizon -- captured here (pre-step) so it spans s+1..s+F relative to THIS step.
@@ -563,10 +577,11 @@ def _infer_predictions(
     jv = history.stack("joint_vel")[env_ids]      # (V, H, nj)
     cmd = history.stack("vel_cmd")[env_ids]       # (V, H, cmd_dim)
     scan = history.stack("scan")[env_ids] if fm.scan_dim > 0 else None
+    frames = history.stack("frames")[env_ids] if fm.num_extra_frames > 0 else None  # (V, H, K, 13)
 
     # online.build_history_token does the (training-matched) relative transform +
     # normalization; sample_world samples, denormalizes, and lifts to world frame.
-    token = build_history_token(fm, p, q, v, w, jp, jv, cmd, frames=None, scan=scan)
+    token = build_history_token(fm, p, q, v, w, jp, jv, cmd, frames=frames, scan=scan)
     future_cmd = None
     if fm.future_cmd_dim > 0:
         # The horizon for the current step is stored at the last history index.
