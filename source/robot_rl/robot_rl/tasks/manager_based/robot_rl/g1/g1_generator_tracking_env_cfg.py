@@ -91,7 +91,7 @@ class G1GeneratorTrackingObservationsCfg:
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
         # Joystick-level velocity command that generated the clip (target_vel =
-        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards.
         command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
 
 
@@ -131,7 +131,7 @@ class G1GeneratorTrackingObservationsCfg:
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
         # Joystick-level velocity command that generated the clip (target_vel =
-        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards.
         command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
 
         # Full world-frame stance tracking vector (privileged -- absolute coords).

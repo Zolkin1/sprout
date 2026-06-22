@@ -43,3 +43,26 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
 
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""
+
+    # --- Debug visualization (generator-tracking specific) ---
+    # These augment the inherited clip-ribbon viz (cylinder segments, drawn for
+    # all envs as the clip baseline). Set ``debug_vis = True`` to enable.
+    debug_vis_show_fm_prediction: bool = True
+    """Draw the flow-matching generator's predicted world-frame trajectory as a
+    ribbon of spheres (one color per frame, matching the clip ribbon's colors),
+    for the envs currently tracking the FM (``_fm_mask & _pred_valid``). Lets you
+    compare the FM prediction (spheres) against the clip baseline (cylinders)."""
+
+    debug_vis_show_source: bool = True
+    """Draw a floating marker above each robot indicating which reference it is
+    tracking: green = FM, white = clip, yellow = FM-but-warming-up (history not
+    yet full, so still falling back to the clip)."""
+
+    debug_vis_fm_marker_radius: float = 0.02
+    """Sphere radius (m) for the FM-prediction ribbon points."""
+
+    debug_vis_source_marker_radius: float = 0.05
+    """Sphere radius (m) for the per-env tracking-source indicator."""
+
+    debug_vis_source_marker_height: float = 0.4
+    """Height (m) above the robot root to float the tracking-source indicator."""

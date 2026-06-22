@@ -78,7 +78,7 @@ class G1MotionSeqObservationsCfg:
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
         # Joystick-level velocity command that generated the clip (target_vel =
-        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards.
         command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
 
         # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps): future
@@ -185,9 +185,15 @@ class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
     # Dense shaped signal replacing the dropped xy_vel/yaw_vel: track the clip's
     # joystick-level velocity command (target_vel = (vx, vy, wz)) -- the same
     # signal a velocity joystick would supply -- rather than the achieved
-    # reference base velocity.
-    command_vel = RewTerm(
-        func=mdp.command_vel_tracking_exp,
+    # reference base velocity.  Split into planar (xy) + yaw exactly like the
+    # stock track_lin_vel_xy_exp / track_ang_vel_z_exp, but sourced from traj_ref.
+    xy_vel = RewTerm(
+        func=mdp.command_lin_vel_xy_tracking_exp,
+        weight=1.0,
+        params={"command_name": "traj_ref", "std": 0.5},
+    )
+    yaw_vel = RewTerm(
+        func=mdp.command_ang_vel_z_tracking_exp,
         weight=1.0,
         params={"command_name": "traj_ref", "std": 0.5},
     )

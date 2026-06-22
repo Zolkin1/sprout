@@ -578,6 +578,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             print(f"[WARN MotionSequenceCommand] could not create VisualizationMarkers: {exc}")
             return None
 
+    def _clip_ribbon_env_mask(self) -> torch.Tensor | None:
+        """Per-env bool mask of which envs draw the clip ribbon (``None`` => all).
+
+        Subclasses override this to suppress the clip ribbon for envs tracking a
+        different reference (e.g. the flow-matching generator). Returning
+        ``None`` keeps the default behavior (draw every env).
+        """
+        return None
+
     def _debug_vis_callback(self, event) -> None:
         """Draw the upcoming reference ribbon as cylinder segments per env.
 
@@ -597,20 +606,36 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             self._debug_markers.set_visibility(True)
             self._debug_vis_pending = False
 
-        n = self.num_envs
+        # Optionally restrict the ribbon to a subset of envs (e.g. drop envs that
+        # are tracking a different reference). Subselect every per-env quantity so
+        # the batched lift stays aligned; hide the markers if no env qualifies.
+        mask = self._clip_ribbon_env_mask()
+        if mask is not None:
+            env_ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            if env_ids.numel() == 0:
+                self._debug_markers.set_visibility(False)
+                return
+            self._debug_markers.set_visibility(True)
+            step, clip_id = self._step[env_ids], self.clip_id[env_ids]
+            clip_world_pos, clip_world_quat = self.clip_world_pos[env_ids], self.clip_world_quat[env_ids]
+        else:
+            step, clip_id = self._step, self.clip_id
+            clip_world_pos, clip_world_quat = self.clip_world_pos, self.clip_world_quat
+
+        n = step.shape[0]
         T = self.manager.num_steps
         F = len(self._debug_frame_pos_idx)
-        steps = (self._step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)  # [n, Ns]
+        steps = (step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)          # [n, Ns]
         ns = steps.shape[1]
         if F == 0 or n == 0 or ns < 2:
             return
-        cid = self.clip_id[:, None].expand(n, ns)                                       # [n, Ns]
+        cid = clip_id[:, None].expand(n, ns)                                            # [n, Ns]
 
         # World anchor schedule for the window: clip placement ∘ clip anchor.
         ap = self.manager.gather(self.manager.lib.anchor_pos, cid, steps)                 # [n, Ns, 3]
         aq = self.manager.gather(self.manager.lib.anchor_quat, cid, steps)                # [n, Ns, 4]
-        wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, ap)
-        waq = lift_orientation_batched(self.clip_world_quat, aq)
+        wap = lift_position_batched(clip_world_pos, clip_world_quat, ap)
+        waq = lift_orientation_batched(clip_world_quat, aq)
 
         # Per-frame world positions over the window: [n, Ns, F, 3].
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
