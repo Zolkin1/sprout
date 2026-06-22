@@ -264,7 +264,7 @@ def state_to_absolute(
 
     Returns:
         Dict with ``joint_pos``, ``joint_vel``, ``root_pos_w``, ``root_quat_w``,
-        ``root_lin_vel_w``, ``root_ang_vel_w``. When ``K > 0`` also includes
+        ``root_link_lin_vel_w``, ``root_link_ang_vel_w``. When ``K > 0`` also includes
         ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``,
         each shape ``(..., K, ·)`` in the frame order used by :func:`relative_state`.
     """
@@ -280,8 +280,8 @@ def state_to_absolute(
         "joint_vel": joint_vel,
         "root_pos_w": p_w,
         "root_quat_w": q_w,
-        "root_lin_vel_w": v_w,
-        "root_ang_vel_w": w_w,
+        "root_link_lin_vel_w": v_w,
+        "root_link_ang_vel_w": w_w,
     }
     if num_extra_frames > 0:
         fp, fq, fv, fw = [], [], [], []

@@ -515,8 +515,8 @@ def _record_step(history: BatchedHistory, robot, obs, ctx: dict, wp) -> dict[str
     step = {
         "root_pos": wp.to_torch(robot.data.root_pos_w).clone(),
         "root_quat": wp.to_torch(robot.data.root_quat_w).clone(),       # xyzw
-        "root_lin_vel": wp.to_torch(robot.data.root_lin_vel_w).clone(),  # com frame
-        "root_ang_vel": wp.to_torch(robot.data.root_ang_vel_w).clone(),  # com frame
+        "root_lin_vel": wp.to_torch(robot.data.root_link_lin_vel_w).clone(),  # link frame
+        "root_ang_vel": wp.to_torch(robot.data.root_link_ang_vel_w).clone(),  # link frame
         "joint_pos": wp.to_torch(robot.data.joint_pos)[:, perm].clone(),
         "joint_vel": wp.to_torch(robot.data.joint_vel)[:, perm].clone(),
     }

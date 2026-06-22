@@ -266,7 +266,7 @@ def sample_world(
 
     Returns:
         World-frame prediction dict with ``root_pos_w (V,F,3)``,
-        ``root_quat_w (V,F,4)``, ``root_lin_vel_w (V,F,3)``, ``root_ang_vel_w (V,F,3)``,
+        ``root_quat_w (V,F,4)``, ``root_link_lin_vel_w (V,F,3)``, ``root_link_ang_vel_w (V,F,3)``,
         ``joint_pos (V,F,nj)``, ``joint_vel (V,F,nj)`` and, when the model predicts
         extra frames, ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/
         ``frame_ang_vel_w`` each ``(V,F,K,·)``.
@@ -290,8 +290,8 @@ def sample_world(
     out = {
         "root_pos_w": world["root_pos_w"].reshape(v, f, 3),
         "root_quat_w": world["root_quat_w"].reshape(v, f, 4),
-        "root_lin_vel_w": world["root_lin_vel_w"].reshape(v, f, 3),
-        "root_ang_vel_w": world["root_ang_vel_w"].reshape(v, f, 3),
+        "root_link_lin_vel_w": world["root_link_lin_vel_w"].reshape(v, f, 3),
+        "root_link_ang_vel_w": world["root_link_ang_vel_w"].reshape(v, f, 3),
         "joint_pos": world["joint_pos"].reshape(v, f, nj),
         "joint_vel": world["joint_vel"].reshape(v, f, nj),
     }

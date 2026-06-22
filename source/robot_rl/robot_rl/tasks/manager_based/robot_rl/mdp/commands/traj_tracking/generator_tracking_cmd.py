@@ -20,12 +20,12 @@ observations, and terminations work uniformly for either source.  The world
 frame is a single stationary inertial frame, valid for the CLF's finite-
 difference ``vdot``.
 
-Base-velocity convention note: the FM was trained on ``root_lin_vel_w`` (the
-root *CoM* velocity, as recorded by ``record_data.py``), while the measured
-``y_act`` base velocity comes from ``body_link_vel_w`` (the pelvis *link* frame).
-For the pelvis these differ by ``omega x r_com`` -- a small, second-order
-mismatch on the 6 base-velocity channels only (positions/orientations/joints are
-exact).  Documented here rather than silently reconciled.
+Base-velocity convention: every base/ee velocity is the **link** (actor-frame)
+twist.  The FM is trained and conditioned on ``root_link_{lin,ang}_vel_w`` (see
+``record_data.py``) and the measured ``y_act`` base velocity comes from
+``body_link_vel_w`` -- the same pelvis link frame.  No CoM velocities are used
+anywhere, so the FM reference and the CLF's measured outputs share one frame
+(no ``omega x r_com`` mismatch).
 """
 
 from __future__ import annotations
@@ -215,8 +215,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         snap = {
             "root_pos": wp.to_torch(self.robot.data.root_pos_w).clone(),
             "root_quat": wp.to_torch(self.robot.data.root_quat_w).clone(),     # xyzw
-            "root_lin": wp.to_torch(self.robot.data.root_lin_vel_w).clone(),   # com vel
-            "root_ang": wp.to_torch(self.robot.data.root_ang_vel_w).clone(),   # com ang vel
+            "root_lin": wp.to_torch(self.robot.data.root_link_lin_vel_w).clone(),  # link vel
+            "root_ang": wp.to_torch(self.robot.data.root_link_ang_vel_w).clone(),  # link ang vel
             "jp": wp.to_torch(self.robot.data.joint_pos)[:, perm].clone(),
             "jv": wp.to_torch(self.robot.data.joint_vel)[:, perm].clone(),
             "cmd": self.get_command_velocity().clone(),                        # past target_vel [N,3]
@@ -268,8 +268,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
 
         self._pred_root_pos[ids] = world["root_pos_w"]
         self._pred_root_quat[ids] = world["root_quat_w"]
-        self._pred_root_lin[ids] = world["root_lin_vel_w"]
-        self._pred_root_ang[ids] = world["root_ang_vel_w"]
+        self._pred_root_lin[ids] = world["root_link_lin_vel_w"]
+        self._pred_root_ang[ids] = world["root_link_ang_vel_w"]
         self._pred_jp[ids] = world["joint_pos"]
         self._pred_jv[ids] = world["joint_vel"]
         if self._ee_body_idx is not None:

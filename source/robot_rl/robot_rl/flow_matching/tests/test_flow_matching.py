@@ -93,8 +93,8 @@ def test_relative_state_invertible():
     assert torch.allclose(rec["joint_pos"], jp, atol=1e-6)
     assert torch.allclose(rec["joint_vel"], jv, atol=1e-6)
     assert torch.allclose(rec["root_pos_w"], p, atol=1e-5)
-    assert torch.allclose(rec["root_lin_vel_w"], v, atol=1e-5)
-    assert torch.allclose(rec["root_ang_vel_w"], om, atol=1e-5)
+    assert torch.allclose(rec["root_link_lin_vel_w"], v, atol=1e-5)
+    assert torch.allclose(rec["root_link_ang_vel_w"], om, atol=1e-5)
     # quaternions compared as matrices (double cover)
     assert torch.allclose(matrix_from_quat(rec["root_quat_w"]), matrix_from_quat(q), atol=1e-5)
 
@@ -322,7 +322,7 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
     obs_term_dims = [3, scan_dim, nj]
     obs = rng.standard_normal((n, sum(obs_term_dims))).astype(np.float32)
     # state layout matches the recorder (root + joints, then any extra frames)
-    state_term_names = ["root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel"]
+    state_term_names = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel"]
     state_term_dims = [3, 4, 3, 3, nj, nj]
     for f in frame_names:
         state_term_names += [f"{f}:pos_w", f"{f}:quat_w", f"{f}:lin_vel_w", f"{f}:ang_vel_w"]
@@ -438,7 +438,7 @@ def test_target_source_reference_uses_ref_state():
     fut = ref_w[h:]
     expected = relative_state(
         _split_state(fut, s_slc, "root_pos_w"), _split_state(fut, s_slc, "root_quat_w"),
-        _split_state(fut, s_slc, "root_lin_vel_w"), _split_state(fut, s_slc, "root_ang_vel_w"),
+        _split_state(fut, s_slc, "root_link_lin_vel_w"), _split_state(fut, s_slc, "root_link_ang_vel_w"),
         _split_state(fut, s_slc, "joint_pos"), _split_state(fut, s_slc, "joint_vel"),
         p_ref, q_ref,
     )

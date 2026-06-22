@@ -211,7 +211,7 @@ def _build_recording_meta(
     # Order and dims MUST match the torch.cat in collect_pairs.
     num_joints = len(action_joint_names)
     state_term_names = [
-        "root_pos_w", "root_quat_w", "root_lin_vel_w", "root_ang_vel_w", "joint_pos", "joint_vel",
+        "root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel",
     ]
     state_term_dims = [3, 4, 3, 3, num_joints, num_joints]
     # Per extra frame: world pose + twist, appended after root + joints.
@@ -239,7 +239,7 @@ def _build_recording_meta(
         state_term_dims=state_term_dims,
         state_quat_format="xyzw",
         state_joint_names=action_joint_names,
-        state_vel_frame="com",
+        state_vel_frame="link",
         state_frame_names=list(state_frames),
     )
 
@@ -332,8 +332,8 @@ def collect_pairs(
         state_parts = [
             wp.to_torch(robot.data.root_pos_w),      # [N, 3]
             wp.to_torch(robot.data.root_quat_w),     # [N, 4] (xyzw)
-            wp.to_torch(robot.data.root_lin_vel_w),  # [N, 3] (com vel)
-            wp.to_torch(robot.data.root_ang_vel_w),  # [N, 3] (com ang vel)
+            wp.to_torch(robot.data.root_link_lin_vel_w),  # [N, 3] (link vel)
+            wp.to_torch(robot.data.root_link_ang_vel_w),  # [N, 3] (link ang vel)
             wp.to_torch(robot.data.joint_pos),       # [N, num_joints] (raw)
             wp.to_torch(robot.data.joint_vel),       # [N, num_joints] (raw)
         ]

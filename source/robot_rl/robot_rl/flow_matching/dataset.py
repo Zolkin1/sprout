@@ -240,8 +240,8 @@ class FutureStateDataset(Dataset):
 
         p = _split("root_pos_w")        # (Nw, W, 3)
         q = _split("root_quat_w")       # (Nw, W, 4)
-        v = _split("root_lin_vel_w")    # (Nw, W, 3)
-        wv = _split("root_ang_vel_w")   # (Nw, W, 3)
+        v = _split("root_link_lin_vel_w")    # (Nw, W, 3)
+        wv = _split("root_link_ang_vel_w")   # (Nw, W, 3)
         jp = _split("joint_pos")        # (Nw, W, nj)
         jv = _split("joint_vel")        # (Nw, W, nj)
 
@@ -363,8 +363,8 @@ class FutureStateDataset(Dataset):
 
         pf = _split("root_pos_w")       # (Nw, F, 3)
         qf = _split("root_quat_w")      # (Nw, F, 4)
-        vf = _split("root_lin_vel_w")   # (Nw, F, 3)
-        wf = _split("root_ang_vel_w")   # (Nw, F, 3)
+        vf = _split("root_link_lin_vel_w")   # (Nw, F, 3)
+        wf = _split("root_link_ang_vel_w")   # (Nw, F, 3)
         jpf = _split("joint_pos")       # (Nw, F, nj)
         jvf = _split("joint_vel")       # (Nw, F, nj)
 

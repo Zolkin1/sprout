@@ -35,7 +35,7 @@ from .g1_motion_sequence_env_cfg import (
 from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
 
 # Default flow-matching generator checkpoint (override per-run via the cfg / CLI).
-DEFAULT_FM_CHECKPOINT = "logs/flow_matching/latest/best.pt"
+DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt"
 
 
 ##
@@ -58,7 +58,7 @@ class G1GeneratorTrackingCommandsCfg:
         # --- generator-tracking knobs ---
         fm_checkpoint=DEFAULT_FM_CHECKPOINT,
         clip_fraction=0.35,
-        fm_update_every=1,
+        fm_update_every=2,
     )
 
 
@@ -90,9 +90,24 @@ class G1GeneratorTrackingObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
-        # Reference base velocity rotated into the current base frame (deployable).
-        ref_base_vel = ObsTerm(
-            func=mdp.ref_base_velocity_local, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0)
+        # Joystick-level velocity command that generated the clip (target_vel =
+        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
+
+
+        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps), same as
+        # the policy group (future command + base pose/vel rel. to current base).
+        future_command_vel = ObsTerm(
+            func=mdp.future_command_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_pose = ObsTerm(
+            func=mdp.future_base_pose,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_vel = ObsTerm(
+            func=mdp.future_base_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
         )
 
         def __post_init__(self):
@@ -115,14 +130,30 @@ class G1GeneratorTrackingObservationsCfg:
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
         joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
-        # World-frame reference base velocity (privileged) + the local one (parity with policy).
-        ref_base_vel = ObsTerm(func=mdp.ref_base_velocity, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        # Joystick-level velocity command that generated the clip (target_vel =
+        # (vx, vy, wz)); pairs with command_vel_tracking_exp.
+        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
 
         # Full world-frame stance tracking vector (privileged -- absolute coords).
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+
+        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps), same as
+        # the policy group (future command + base pose/vel rel. to current base).
+        future_command_vel = ObsTerm(
+            func=mdp.future_command_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_pose = ObsTerm(
+            func=mdp.future_base_pose,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
+        future_base_vel = ObsTerm(
+            func=mdp.future_base_velocity,
+            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
+        )
 
         def __post_init__(self):
             self.enable_corruption = False

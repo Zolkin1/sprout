@@ -45,7 +45,7 @@ class RecordingMeta:
         state_term_dims: Per-term dimensions of the state vector; sums to its width.
         state_quat_format: Component order of ``root_quat_w`` in the state (e.g. "xyzw").
         state_joint_names: Ordered joint names for the state's joint_pos/joint_vel terms.
-        state_vel_frame: Frame/accessor used for the recorded root velocities (e.g. "com").
+        state_vel_frame: Frame/accessor used for the recorded root velocities (e.g. "link").
         state_frame_names: Ordered extra body frames appended to the state vector beyond
             root + joints (each contributes ``pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)``).
             Empty when only root + joints were recorded.
