@@ -467,24 +467,24 @@ if not _registered:
     )
 
     ## =========================================
-    # Open-loop motion-sequence tracking (pre-generated clips, flat ground)
+    # Teacher: open-loop motion-clip tracking (pre-generated clips, flat ground)
     ## =========================================
     gym.register(
-        id="G1-motion-sequence-clf",
+        id="G1-teacher-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
 
     gym.register(
-        id="G1-motion-sequence-clf-play",
+        id="G1-teacher-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfgPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
@@ -493,44 +493,44 @@ if not _registered:
     # are full episodic motions with no gait-phase obs, so the Episodic runner
     # is the correct choice (phase negation is a no-op here).
     gym.register(
-        id="G1-motion-sequence-clf-sym",
+        id="G1-teacher-clf-sym",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
         },
     )
 
     gym.register(
-        id="G1-motion-sequence-clf-sym-play",
+        id="G1-teacher-clf-sym-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_motion_sequence_env_cfg:G1MotionSequenceEnvCfgPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
         },
     )
 
     ## =========================================
-    # Flow-matching generator tracking (clip + generator mix, world-frame CLF)
+    # Tracker: clip + flow-matching generator mix (world-frame CLF)
     ## =========================================
     gym.register(
-        id="G1-generator-tracking-clf",
+        id="G1-tracker-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_generator_tracking_env_cfg:G1GeneratorTrackingEnvCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
 
     gym.register(
-        id="G1-generator-tracking-clf-play",
+        id="G1-tracker-clf-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_generator_tracking_env_cfg:G1GeneratorTrackingEnvCfgPlay",
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )

@@ -44,7 +44,7 @@ from fm.online import build_history_token, sample_world  # noqa: E402
 from fm.quat_math import quat_apply, quat_box_minus, quat_inv  # noqa: E402
 
 # Observation clip bounds that are set on the obs terms in the env cfg
-# (G1MotionSeqObservationsCfg) but not carried in policy_parameters.yaml.
+# (G1TeacherObservationsCfg) but not carried in policy_parameters.yaml.
 _TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0}
 
 

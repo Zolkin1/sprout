@@ -1,13 +1,13 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 open-loop motion-sequence tracking environment (flat ground, v1).
+"""G1 teacher policy: open-loop motion-clip tracking environment (flat ground, v1).
 
 Tracks pre-generated fixed motion clips (see
 ``scripts/rsl_rl/generate_clips.py`` and the ``clips/`` package) instead of
 the online re-anchored multi-skill command.  No velocity conditioner, no
 contact gates, no skill cross-fades.  Clips are stored in a single clip-world
 frame and the CLF runs in the absolute world frame (the same frame as the
-generator-tracking task), so the policy's reference observations are
+tracker task), so the policy's reference observations are
 base-relative / heading-invariant while the privileged critic sees the raw
 world-frame tracking vectors.  A single base-pose-error termination replaces
 the upright / height / frame-drift terminations.
@@ -42,7 +42,7 @@ DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
 # Commands
 ##
 @configclass
-class G1MotionSeqCommandsCfg:
+class G1TeacherCommandsCfg:
     """Single open-loop clip-tracking command; no velocity conditioner."""
 
     traj_ref = MotionSequenceCommandCfg(
@@ -62,7 +62,7 @@ class G1MotionSeqCommandsCfg:
 # Observations
 ##
 @configclass
-class G1MotionSeqObservationsCfg:
+class G1TeacherObservationsCfg:
     """World-frame-aware observations: deployable policy, privileged critic.
 
     The CLF tracking vectors are world-frame (absolute position / heading), so
@@ -70,7 +70,7 @@ class G1MotionSeqObservationsCfg:
     critic-only group; the policy's reference terms (base-pose error, joint
     refs, ee refs, future windows) are all relative / heading-invariant, so the
     policy never sees a world coordinate.  Shared with
-    :class:`G1GeneratorTrackingEnvCfg` (one frame across both tasks)."""
+    :class:`G1TrackerEnvCfg` (one frame across both tasks)."""
 
     @configclass
     class PolicyCfg(ObsGroup):
@@ -164,7 +164,7 @@ class G1MotionSeqObservationsCfg:
 # Events
 ##
 @configclass
-class G1MotionSeqEventsCfg(G1ClfTrackingEventsCfg):
+class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
     """Reuse dynamics randomization; swap the reset onto a clip."""
 
     reset_on_ref = None  # remove the velocity-conditioned reference reset
@@ -179,7 +179,7 @@ class G1MotionSeqEventsCfg(G1ClfTrackingEventsCfg):
 # Rewards
 ##
 @configclass
-class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
+class G1TeacherRewardCfg(G1ClfTrackingRewardCfg):
     """CLF tracking + penalties; drop the velocity-command rewards and add a
     dense reference-base-velocity tracking term for shaping."""
 
@@ -207,7 +207,7 @@ class G1MotionSeqRewardCfg(G1ClfTrackingRewardCfg):
 # Terminations
 ##
 @configclass
-class G1MotionSeqTerminationCfg:
+class G1TeacherTerminationCfg:
     """One failure termination (base drift) + clip-end / time-out truncations."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
@@ -224,14 +224,14 @@ class G1MotionSeqTerminationCfg:
 # Environment
 ##
 @configclass
-class G1MotionSequenceEnvCfg(G1ClfTrackingEnvCfg):
+class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
     """Flat-ground open-loop motion-sequence tracking env."""
 
-    observations: G1MotionSeqObservationsCfg = G1MotionSeqObservationsCfg()
-    commands: G1MotionSeqCommandsCfg = G1MotionSeqCommandsCfg()
-    rewards: G1MotionSeqRewardCfg = G1MotionSeqRewardCfg()
-    events: G1MotionSeqEventsCfg = G1MotionSeqEventsCfg()
-    terminations: G1MotionSeqTerminationCfg = G1MotionSeqTerminationCfg()
+    observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
+    commands: G1TeacherCommandsCfg = G1TeacherCommandsCfg()
+    rewards: G1TeacherRewardCfg = G1TeacherRewardCfg()
+    events: G1TeacherEventsCfg = G1TeacherEventsCfg()
+    terminations: G1TeacherTerminationCfg = G1TeacherTerminationCfg()
 
     def __post_init__(self):
         super().__post_init__()
@@ -254,7 +254,7 @@ class G1MotionSequenceEnvCfg(G1ClfTrackingEnvCfg):
 
 
 @configclass
-class G1MotionSequenceEnvCfgPlay(G1MotionSequenceEnvCfg):
+class G1TeacherEnvCfgPlay(G1TeacherEnvCfg):
     """Smaller, noise-free variant for play / debugging."""
 
     def __post_init__(self):

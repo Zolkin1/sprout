@@ -1,6 +1,6 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 flow-matching generator-tracking environment (flat ground).
+"""G1 tracker policy: flow-matching generator-tracking environment (flat ground).
 
 Tracks a learned flow-matching *generator* instead of (only) the pre-made clips:
 a fraction of envs follow the clip reference (the stable teacher signal), the
@@ -8,10 +8,10 @@ rest follow the generator's predicted future state. Both sources drive a single
 **world-frame** CLF reward, so the tracker can ultimately be deployed sim2sim /
 sim2real with the generator + tracker pair (no privileged info in the policy).
 
-Differs from :class:`G1MotionSequenceEnvCfg` only in the command term
+Differs from :class:`G1TeacherEnvCfg` only in the command term
 (:class:`GeneratorTrackingCommand`, the clip + generator mix).  Both tasks now
 run a world-frame CLF, so they share one observation layout
-(:class:`G1MotionSeqObservationsCfg`): the raw ``ref_traj``/``act_traj``/
+(:class:`G1TeacherObservationsCfg`): the raw ``ref_traj``/``act_traj``/
 ``*_vel`` tracking vectors are critic-only (absolute world coords), and the
 policy's reference terms (base-pose error, joint refs, ee refs, future windows)
 are all relative / heading-invariant.
@@ -25,11 +25,11 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
-from .g1_motion_sequence_env_cfg import (
+from .g1_teacher_env_cfg import (
     DEFAULT_CLIP_PATH,
-    G1MotionSeqObservationsCfg,
-    G1MotionSeqTerminationCfg,
-    G1MotionSequenceEnvCfg,
+    G1TeacherObservationsCfg,
+    G1TeacherTerminationCfg,
+    G1TeacherEnvCfg,
 )
 from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
 
@@ -41,7 +41,7 @@ DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt"
 # Commands
 ##
 @configclass
-class G1GeneratorTrackingCommandsCfg:
+class G1TrackerCommandsCfg:
     """Clip + flow-matching-generator tracking command."""
 
     traj_ref = GeneratorTrackingCommandCfg(
@@ -65,7 +65,7 @@ class G1GeneratorTrackingCommandsCfg:
 # Terminations
 ##
 @configclass
-class G1GeneratorTrackingTerminationCfg(G1MotionSeqTerminationCfg):
+class G1TrackerTerminationCfg(G1TeacherTerminationCfg):
     """Inherited base-drift failure + clip-end / time-out truncations, plus a
     reference-independent fall detector.
 
@@ -85,18 +85,18 @@ class G1GeneratorTrackingTerminationCfg(G1MotionSeqTerminationCfg):
 # Environment
 ##
 @configclass
-class G1GeneratorTrackingEnvCfg(G1MotionSequenceEnvCfg):
-    """Flat-ground generator-tracking env (clip + flow-matching mix, world-frame CLF)."""
+class G1TrackerEnvCfg(G1TeacherEnvCfg):
+    """Flat-ground tracker env (clip + flow-matching generator mix, world-frame CLF)."""
 
     # Shared world-frame observation layout (policy base-relative, critic
     # privileged); only the command term differs from the clip-only task.
-    observations: G1MotionSeqObservationsCfg = G1MotionSeqObservationsCfg()
-    commands: G1GeneratorTrackingCommandsCfg = G1GeneratorTrackingCommandsCfg()
-    terminations: G1GeneratorTrackingTerminationCfg = G1GeneratorTrackingTerminationCfg()
+    observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
+    commands: G1TrackerCommandsCfg = G1TrackerCommandsCfg()
+    terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
 
 
 @configclass
-class G1GeneratorTrackingEnvCfgPlay(G1GeneratorTrackingEnvCfg):
+class G1TrackerEnvCfgPlay(G1TrackerEnvCfg):
     """Smaller, noise-free variant for play / debugging."""
 
     def __post_init__(self):

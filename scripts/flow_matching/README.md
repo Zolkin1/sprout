@@ -37,12 +37,12 @@ The sections below document the underlying scripts and their (now mostly optiona
 
 ## 1. Record training data  (needs Isaac Sim)
 
-Rolls out a trained motion-seq tracking policy and records per-step
+Rolls out a trained teacher (clip-tracking) policy and records per-step
 `obs / action / state / ref_state / target_vel / ee-frames` to one `.npz`.
 
 ```bash
 python scripts/rsl_rl/record_data.py \
-    --task G1-motion-sequence-clf \
+    --task G1-teacher-clf \
     --load_run <tracking-policy run> \
     --num_pairs 2000000 --num_envs 256
 ```
