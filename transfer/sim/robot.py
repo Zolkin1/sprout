@@ -222,6 +222,57 @@ class Robot:
 
         return v_local
 
+    def get_base_world_velocity(self, body_name: str = "pelvis_link") -> tuple[np.ndarray, np.ndarray]:
+        """World-frame linear and angular velocity of a base link.
+
+        Returns the link-frame (NOT CoM) spatial velocity of ``body_name`` in the
+        world frame, matching the flow-matching generator's training convention
+        (``root_link_{lin,ang}_vel_w``). Uses ``mj_objectVelocity`` rather than raw
+        ``qvel`` to avoid the free-joint local/global ambiguity.
+
+        Args:
+            body_name: MuJoCo body whose link-frame velocity to read (the FM/CLF base).
+
+        Returns:
+            ``(lin_vel_w, ang_vel_w)`` each a length-3 numpy array in the world frame.
+        """
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id == -1:
+            raise ValueError(f"Body '{body_name}' not found in MuJoCo model.")
+        vel = np.zeros(6)  # mj_objectVelocity fills [angular(3), linear(3)]
+        mujoco.mj_objectVelocity(self.mj_model, self.mj_data, mujoco.mjtObj.mjOBJ_BODY, body_id, vel, 0)
+        ang_vel_w = vel[:3].copy()
+        lin_vel_w = vel[3:].copy()
+        return lin_vel_w, ang_vel_w
+
+    def get_body_world_states(self, body_names: list[str]) -> np.ndarray:
+        """World-frame pose + link twist for a list of bodies (for the FM history).
+
+        Only needed when the loaded generator's history token carries extra frames
+        (legacy symmetric checkpoints). The deployment-design generator consumes no
+        end-effector frames, so this is unused there.
+
+        Args:
+            body_names: MuJoCo body names, in the FM's frame order.
+
+        Returns:
+            Array ``[K, 13]`` per frame ``[pos_w(3), quat_w(4, xyzw), lin_vel_w(3),
+            ang_vel_w(3)]`` (link-frame velocity in the world frame).
+        """
+        out = np.zeros((len(body_names), 13))
+        vel = np.zeros(6)  # [angular(3), linear(3)]
+        for i, name in enumerate(body_names):
+            bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if bid == -1:
+                raise ValueError(f"Body '{name}' not found in MuJoCo model.")
+            out[i, 0:3] = self.mj_data.xpos[bid]
+            wxyz = self.mj_data.xquat[bid]
+            out[i, 3:7] = [wxyz[1], wxyz[2], wxyz[3], wxyz[0]]  # wxyz -> xyzw
+            mujoco.mj_objectVelocity(self.mj_model, self.mj_data, mujoco.mjtObj.mjOBJ_BODY, bid, vel, 0)
+            out[i, 7:10] = vel[3:]   # linear (world)
+            out[i, 10:13] = vel[:3]  # angular (world)
+        return out
+
     def pd_control(self, qpos: np.ndarray, qvel: np.ndarray):
         """Compute the PD control actions to keep the robot moving straight."""
         kp_y = self.gains["kp_y"]

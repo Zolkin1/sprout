@@ -207,6 +207,12 @@ def _build_recording_meta(
     robot = env.unwrapped.scene.articulations["robot"]
     action_joint_names = list(robot.data.joint_names)
 
+    # TODO(asymmetric-frames): record the UNION of history+target frames here, and
+    # persist both meta.history_frame_names (history token; deployment = []) and
+    # meta.target_frame_names (predicted; the ee frames) in addition to / instead of
+    # state_frame_names. The vendored transfer/fm/online.py reads those two keys
+    # (falling back to state_frame_names for both when absent). See config.py +
+    # dataset.py for the matching build-side change.
     # Raw robot-state layout recorded by collect_pairs (world frame, absolute).
     # Order and dims MUST match the torch.cat in collect_pairs.
     num_joints = len(action_joint_names)
