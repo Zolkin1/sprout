@@ -171,6 +171,42 @@ def base_orientation_from_upright(
     return (roll.abs() > roll_limit) | (pitch.abs() > pitch_limit)
 
 
+def base_fallen(
+    env,
+    min_height: float = 0.5,
+    roll_limit_deg: float = 70.0,
+    pitch_limit_deg: float = 70.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base has fallen: too low, or tilted too far from upright.
+
+    A trajectory-independent fall detector: fires when the base world height
+    drops below ``min_height`` (m) **or** the base roll/pitch deviates from
+    world upright (world z) by more than ``roll_limit_deg`` / ``pitch_limit_deg``
+    (yaw ignored).  The orientation half reuses
+    :func:`base_orientation_from_upright`, so the two share one definition.
+
+    Independent of the tracking reference (unlike
+    :func:`base_pose_error_termination`), so it catches a collapsed / face-
+    planted robot regardless of where the reference is.  On flat ground the
+    base world ``z`` is the height above the ground plane.
+
+    Args:
+        env: IsaacLab environment.
+        min_height: Minimum base world height before terminating (m).
+        roll_limit_deg: Maximum allowed |roll| from upright (deg).
+        pitch_limit_deg: Maximum allowed |pitch| from upright (deg).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    too_low = wp.to_torch(asset.data.root_pos_w)[:, 2] < min_height
+    tilted = base_orientation_from_upright(env, roll_limit_deg, pitch_limit_deg, asset_cfg)
+    return too_low | tilted
+
+
 def frame_deviation_from_reference(
     env,
     cmd_name: str,

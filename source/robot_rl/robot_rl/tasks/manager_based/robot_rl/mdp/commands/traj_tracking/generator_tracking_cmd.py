@@ -33,6 +33,8 @@ from __future__ import annotations
 import torch
 import warp as wp
 
+from isaaclab.utils.math import quat_from_euler_xyz
+
 from robot_rl.flow_matching.online import (
     BatchedHistory,
     build_history_token,
@@ -53,6 +55,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     # up, alongside the inherited clip-ribbon ``_debug_markers``).
     _fm_markers: object | None = None
     _source_markers: object | None = None
+    _ref_vel_markers: object | None = None
+    _act_vel_markers: object | None = None
 
     # ------------------------------------------------------------------
     # Construction
@@ -413,7 +417,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         """
         super()._set_debug_vis_impl(debug_vis)
         if not debug_vis:
-            for m in (self._fm_markers, self._source_markers):
+            for m in (self._fm_markers, self._source_markers,
+                      self._ref_vel_markers, self._act_vel_markers):
                 if m is not None:
                     m.set_visibility(False)
 
@@ -430,6 +435,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             self._draw_fm_prediction_ribbon()
         if self.cfg.debug_vis_show_source:
             self._draw_source_markers()
+        if self.cfg.debug_vis_show_base_velocity:
+            self._draw_base_velocity_arrows()
 
     def _clip_ribbon_env_mask(self) -> torch.Tensor:
         """Draw the clip ribbon only where the env is NOT actively tracking the FM.
@@ -551,3 +558,68 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         except Exception as exc:
             print(f"[WARN GeneratorTrackingCommand] could not create source markers: {exc}")
             return None
+
+    def _draw_base_velocity_arrows(self) -> None:
+        """Draw two world-frame base-velocity arrows per env, floated above the base.
+
+        Mirrors the stock velocity-command arrows: a **green** arrow for the
+        reference base velocity (the source-selected clip / FM target the CLF
+        grades against) and a **blue** arrow for the robot's actual base
+        velocity. Both point along the velocity's world heading and grow in
+        length with speed, so the gap between them is the base-velocity tracking
+        error at a glance. Drawn for every env (clip- and FM-tracking alike).
+        """
+        if self._ref_vel_markers is None:
+            self._ref_vel_markers, self._act_vel_markers = self._create_vel_markers()
+            if self._ref_vel_markers is None:
+                return
+
+        # Reference world base linear velocity (source-selected; layout
+        # [pos3, quat4, lin3, ang3, ...] -> lin at 7:10) and the actual one.
+        ref_lin_w = self.reference_world_state()[:, 7:10]
+        act_lin_w = wp.to_torch(self.robot.data.root_lin_vel_w)
+
+        base_pos = wp.to_torch(self.robot.data.root_pos_w).clone()
+        base_pos[:, 2] += float(self.cfg.debug_vis_velocity_height)
+
+        ref_scale, ref_quat = self._resolve_xy_velocity_to_arrow(ref_lin_w[:, :2], self._ref_vel_markers)
+        act_scale, act_quat = self._resolve_xy_velocity_to_arrow(act_lin_w[:, :2], self._act_vel_markers)
+
+        self._ref_vel_markers.set_visibility(True)
+        self._act_vel_markers.set_visibility(True)
+        self._ref_vel_markers.visualize(translations=base_pos, orientations=ref_quat, scales=ref_scale)
+        self._act_vel_markers.visualize(translations=base_pos, orientations=act_quat, scales=act_scale)
+
+    def _resolve_xy_velocity_to_arrow(
+        self, xy_velocity_w: torch.Tensor, markers
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Map a world-frame XY base velocity to an x-arrow's ``(scale, quat)``.
+
+        The arrow's x-scale grows with speed (``debug_vis_velocity_scale`` gain)
+        and it is yawed to the velocity's world heading. The quaternion is wxyz
+        in the world frame -- the convention the marker visualizer consumes --
+        so no robot-orientation compose is needed (the input is already world).
+        """
+        default_scale = markers.cfg.markers["arrow"].scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_velocity_w.shape[0], 1)
+        arrow_scale[:, 0] *= torch.linalg.norm(xy_velocity_w, dim=1) * float(self.cfg.debug_vis_velocity_scale)
+        heading = torch.atan2(xy_velocity_w[:, 1], xy_velocity_w[:, 0])
+        zeros = torch.zeros_like(heading)
+        arrow_quat = quat_from_euler_xyz(zeros, zeros, heading)  # wxyz, world frame
+        return arrow_scale, arrow_quat
+
+    def _create_vel_markers(self):
+        """Build the green (reference) + blue (actual) base-velocity arrow marker sets."""
+        try:
+            from isaaclab.markers import VisualizationMarkers
+            from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG, GREEN_ARROW_X_MARKER_CFG
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN GeneratorTrackingCommand] could not import arrow markers: {exc}")
+            return None, None
+        try:
+            ref = VisualizationMarkers(GREEN_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/gen_ref_vel"))
+            act = VisualizationMarkers(BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/gen_act_vel"))
+            return ref, act
+        except Exception as exc:
+            print(f"[WARN GeneratorTrackingCommand] could not create velocity markers: {exc}")
+            return None, None

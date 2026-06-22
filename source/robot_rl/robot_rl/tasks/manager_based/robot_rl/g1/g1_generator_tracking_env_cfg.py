@@ -20,11 +20,15 @@ are all relative / heading-invariant.
 from __future__ import annotations
 
 from isaaclab.utils import configclass
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+
+from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
 from .g1_motion_sequence_env_cfg import (
     DEFAULT_CLIP_PATH,
     G1MotionSeqObservationsCfg,
+    G1MotionSeqTerminationCfg,
     G1MotionSequenceEnvCfg,
 )
 from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
@@ -58,6 +62,26 @@ class G1GeneratorTrackingCommandsCfg:
 
 
 ##
+# Terminations
+##
+@configclass
+class G1GeneratorTrackingTerminationCfg(G1MotionSeqTerminationCfg):
+    """Inherited base-drift failure + clip-end / time-out truncations, plus a
+    reference-independent fall detector.
+
+    The generator may steer envs into states the clip never visits, so we add a
+    fall termination that does not depend on the reference: terminate when the
+    base drops below ``min_height`` or tilts more than 70 deg from upright (in
+    roll or pitch).
+    """
+
+    base_fallen = DoneTerm(
+        func=mdp.base_fallen,
+        params={"min_height": 0.5, "roll_limit_deg": 70.0, "pitch_limit_deg": 70.0},
+    )
+
+
+##
 # Environment
 ##
 @configclass
@@ -68,6 +92,7 @@ class G1GeneratorTrackingEnvCfg(G1MotionSequenceEnvCfg):
     # privileged); only the command term differs from the clip-only task.
     observations: G1MotionSeqObservationsCfg = G1MotionSeqObservationsCfg()
     commands: G1GeneratorTrackingCommandsCfg = G1GeneratorTrackingCommandsCfg()
+    terminations: G1GeneratorTrackingTerminationCfg = G1GeneratorTrackingTerminationCfg()
 
 
 @configclass

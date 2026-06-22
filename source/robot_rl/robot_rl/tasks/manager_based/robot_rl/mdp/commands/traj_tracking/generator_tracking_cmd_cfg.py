@@ -66,3 +66,16 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
 
     debug_vis_source_marker_height: float = 0.4
     """Height (m) above the robot root to float the tracking-source indicator."""
+
+    debug_vis_show_base_velocity: bool = True
+    """Draw two world-frame base-velocity arrows per env: green = reference base
+    velocity (the source-selected clip / FM target), blue = the robot's actual
+    base velocity. The gap between them visualizes the base-velocity tracking
+    error. Drawn for every env regardless of source."""
+
+    debug_vis_velocity_height: float = 0.6
+    """Height (m) above the robot root to float the base-velocity arrows."""
+
+    debug_vis_velocity_scale: float = 3.0
+    """Arrow-length gain: the x-scale is ``speed (m/s) * this`` (matches the
+    stock velocity-command arrow scaling)."""
