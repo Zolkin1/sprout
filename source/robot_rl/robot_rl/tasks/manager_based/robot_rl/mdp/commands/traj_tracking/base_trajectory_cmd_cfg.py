@@ -37,3 +37,9 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     """Per-skill trajectory counts of the loaded library (``{skill: count}``),
     recorded alongside :attr:`library_fingerprint` for human-readable provenance
     in ``params/env.yaml``."""
+
+    strict_fingerprint: bool = False
+    """If True, a trajectory/clip library fingerprint mismatch at construction *raises*
+    instead of warning -- a guardrail for deploy / cross-machine runs where the loaded
+    library must match the trained-against one. Set via a hydra override, e.g.
+    ``env.commands.traj_ref.strict_fingerprint=true``. Default warns (non-fatal)."""

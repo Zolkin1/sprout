@@ -165,6 +165,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         if trained is not None:
             ok, msg = verify_clip_fingerprint(trained, loaded)
             if not ok:
+                if getattr(cfg, "strict_fingerprint", False):
+                    raise RuntimeError(msg)
                 print("\n" + "=" * 78 + f"\n[WARN] {msg}\n" + "=" * 78 + "\n")
         cfg.clip_fingerprint = loaded
 

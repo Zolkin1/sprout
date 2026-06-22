@@ -104,9 +104,9 @@ class BaseTrajectoryCommand(CommandTerm):
         if trained_hash is not None and trained_hash != local_hash:
             trained_manifest = getattr(cfg, "library_manifest", None)
             bar = "=" * 78
-            print(
+            msg = (
                 f"\n{bar}\n"
-                "[WARN] TRAJECTORY LIBRARY MISMATCH\n"
+                "TRAJECTORY LIBRARY MISMATCH\n"
                 f"  cfg.path                 : {cfg.path}\n"
                 f"  trained-against hash     : {trained_hash}\n"
                 f"  locally-loaded hash      : {local_hash}\n"
@@ -117,6 +117,9 @@ class BaseTrajectoryCommand(CommandTerm):
                 "  than the one it trained on -- the references may be wrong.\n"
                 f"{bar}\n"
             )
+            if getattr(cfg, "strict_fingerprint", False):
+                raise RuntimeError(msg)
+            print(f"[WARN] {msg}")
 
         cfg.library_fingerprint = local_hash
         cfg.library_manifest = fingerprint["skill_counts"]

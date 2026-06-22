@@ -1,0 +1,31 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Data registry: the source of truth for named data artifacts (clip & trajectory
+# libraries) this project trains/evaluates against. Each entry records the artifact's
+# *identity* (content fingerprint) and, where applicable, where it lives.
+#
+# Today this is provenance + a verify helper (scripts/rsl_rl/data_registry.py) that
+# catches silent local/server divergence by checking a local artifact against its
+# recorded fingerprint. A future resolver will pull artifacts by name at the pinned
+# `revision` and verify the fingerprint before use (HF Hub). `hf_repo`/`revision` are
+# placeholders for clip libraries until that lands.
+
+clip_libraries:
+  g1_flat_v1:
+    path: clips/g1_flat_v1.h5
+    hf_repo: null
+    revision: null
+    fingerprint: e299afe62d85f866e8b7e1eec52b0c7ad200ac734e11c048fba39ff324abcdf8
+    source_fingerprint: 0505e1281362bc4ab9c1ed769e31afea011f41105f4d17b604d3a1f35b589e91
+  # Held-out eval library (generate with `just fm-gen-eval-clips`, then fill in the
+  # fingerprint printed by `data_registry.py verify` / the clip-library checker):
+  # g1_flat_v1_eval:
+  #   path: clips/g1_flat_v1_eval.h5
+  #   fingerprint: <full clip_fingerprint hash>
+
+trajectory_libraries:
+  2026-06-16_16-30-26_merged:
+    hf_repo: zolkin/robot_rl
+    hf_path: trajectories/retargeted/2026-06-16_16-30-26_merged
+    revision: null
+    fingerprint: 0505e1281362bc4ab9c1ed769e31afea011f41105f4d17b604d3a1f35b589e91

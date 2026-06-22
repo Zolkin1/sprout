@@ -126,7 +126,14 @@ Where artifacts land and how they're identified:
 | Clip libraries (`.h5`) | `clips/` (gitignored) | `clip_fingerprint` (source+config+seed), verified at load | local |
 | Trajectory libraries | `hf/` cache | `library_fingerprint` (content) | HuggingFace Hub |
 
-Recorded datasets deliberately stay **machine-local** (multi-GB, many); the FM run's `params/data.yaml` records their hashes, so correctness is verifiable across manual copies. *(Planned: versioning clip libraries on HF Hub via a `data/registry.yaml` manifest with revision pinning + fingerprint-verified loading — not yet implemented.)*
+Recorded datasets deliberately stay **machine-local** (multi-GB, many); the FM run's `params/data.yaml` records their hashes, so correctness is verifiable across manual copies.
+
+A git-tracked **`data/registry.yaml`** records the identity (fingerprint) of named clip/trajectory libraries. Check a local artifact against it with:
+```bash
+python scripts/rsl_rl/data_registry.py list
+python scripts/rsl_rl/data_registry.py verify g1_flat_v1   # local .h5 / lib vs the recorded fingerprint
+```
+Set `env.commands.traj_ref.strict_fingerprint=true` to make a library/clip fingerprint mismatch **fatal** at env construction (vs the default loud warning) — a guardrail for deploy / cross-machine runs. *(Planned: pulling registry artifacts from HF Hub at a pinned revision — not yet wired.)*
 
 ## Gotchas
 - **`clip_device`, command, and target-source are auto** — large libs go to CPU, and the command/target are inferred from the recording. Each is overridable, and the resolved choice is printed.
