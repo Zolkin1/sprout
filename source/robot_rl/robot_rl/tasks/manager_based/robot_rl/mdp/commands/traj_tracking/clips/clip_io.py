@@ -4,10 +4,11 @@
 
 A clip library is a single ``.h5`` file holding, for ``N`` equal-length
 clips of ``T`` control steps, the dense per-step arrays produced by
-:class:`OfflineClipGenerator` (anchor-relative reference outputs + the
-world anchor schedule + contact/skill labels).  Layout metadata (dt,
-output names, contact frames, skill list, fingerprints, generator config)
-lives in JSON-encoded root attributes.
+:class:`OfflineClipGenerator` (clip-world reference outputs + contact/skill
+labels).  The per-step stance anchor is baked into the outputs at generation
+time, so a clip is a single clip-world frame -- the runtime only applies a
+per-env placement.  Layout metadata (dt, output names, contact frames, skill
+list, fingerprints, generator config) lives in JSON-encoded root attributes.
 
 The writer is streaming -- datasets are pre-sized to ``N`` clips and each
 generated batch is written into its slice -- so generating a large library
@@ -27,8 +28,6 @@ import torch
 _DENSE_DTYPES: dict[str, str] = {
     "y_des": "float32",
     "dy_des": "float32",
-    "anchor_pos": "float32",
-    "anchor_quat": "float32",
     "contact": "uint8",
     "skill_id": "uint8",
     "stride_idx": "int32",
@@ -60,8 +59,6 @@ class ClipLibraryWriter:
         shapes = {
             "y_des": (num_clips, T, P),
             "dy_des": (num_clips, T, V),
-            "anchor_pos": (num_clips, T, 3),
-            "anchor_quat": (num_clips, T, 4),
             "contact": (num_clips, T, C),
             "skill_id": (num_clips, T),
             "stride_idx": (num_clips, T),
@@ -113,10 +110,8 @@ class ClipLibraryWriter:
 class ClipLibraryData:
     """In-memory dense clip library (tensors on the requested device)."""
 
-    y_des: torch.Tensor          # [N, T, P]
-    dy_des: torch.Tensor         # [N, T, V]
-    anchor_pos: torch.Tensor     # [N, T, 3]
-    anchor_quat: torch.Tensor    # [N, T, 4]
+    y_des: torch.Tensor          # [N, T, P] clip-world position outputs
+    dy_des: torch.Tensor         # [N, T, V] clip-world velocity outputs
     contact: torch.Tensor        # [N, T, C] uint8
     skill_id: torch.Tensor       # [N, T] uint8
     stride_idx: torch.Tensor     # [N, T] int32

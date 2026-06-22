@@ -5,8 +5,8 @@
 Requires the full-periodic stride library on disk (skipped if absent, e.g.
 in CI without the HF cache).  Asserts the two correctness properties that
 the dense rollout must hold: a continuous world stance foot across stride
-seams (the anchor recursion) and an exactly uniform global timeline (the
-dt-remainder carry).
+seams (the anchor recursion, now baked into the stored clip-world outputs)
+and an exactly uniform global timeline (the dt-remainder carry).
 """
 
 from __future__ import annotations
@@ -66,27 +66,26 @@ def test_shapes_and_finite(generated):
     n, T = 16, gen.num_steps
     assert out["y_des"].shape == (n, T, gen.num_pos)
     assert out["dy_des"].shape == (n, T, gen.num_vel)
-    assert out["anchor_pos"].shape == (n, T, 3)
-    assert out["anchor_quat"].shape == (n, T, 4)
-    for k in ("y_des", "dy_des", "anchor_pos", "anchor_quat"):
+    # The per-step anchor schedule is baked into y_des/dy_des, not stored.
+    assert "anchor_pos" not in out and "anchor_quat" not in out
+    for k in ("y_des", "dy_des"):
         assert torch.isfinite(out[k]).all(), k
-    # Anchor quaternions stay unit norm.
-    assert torch.allclose(out["anchor_quat"].norm(dim=-1), torch.ones(n, T), atol=1e-4)
 
 
 def test_world_stance_foot_continuous_across_seams(generated):
-    """Across each stride seam the world right-ankle must not jump (planted)."""
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
-        lift_position,
-    )
+    """Across each stride seam the world right-ankle must not jump (planted).
+
+    The outputs are baked into the clip-world frame, so the right-ankle world
+    track is read straight from ``y_des`` (no runtime lift).
+    """
     m, gen, out = generated
     names = m.pos_output_names
     ra = torch.tensor([names.index(f"{gen.ref_frame}:{a}") for a in ("pos_x", "pos_y", "pos_z")])
-    y, ap, aq, st = out["y_des"], out["anchor_pos"], out["anchor_quat"], out["stride_idx"]
+    y, st = out["y_des"], out["stride_idx"]
     n = y.shape[0]
     max_jump = 0.0
     for ci in range(n):
-        wra = lift_position(ap[ci], aq[ci], y[ci][:, ra])  # [T, 3]
+        wra = y[ci][:, ra]  # [T, 3] clip-world right-ankle position
         bnd = (st[ci, 1:] != st[ci, :-1]).nonzero().flatten()
         for b in bnd.tolist():
             max_jump = max(max_jump, (wra[b + 1] - wra[b]).norm().item())

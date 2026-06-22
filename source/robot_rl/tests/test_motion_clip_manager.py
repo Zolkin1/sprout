@@ -41,8 +41,6 @@ def _synthetic_lib(num_clips=4, T=10) -> ClipLibraryData:
     return ClipLibraryData(
         y_des=base.clone(),
         dy_des=base.clone() + 0.5,
-        anchor_pos=torch.zeros(num_clips, T, 3),
-        anchor_quat=torch.tensor([1.0, 0, 0, 0]).expand(num_clips, T, 4).clone(),
         contact=torch.zeros(num_clips, T, C, dtype=torch.uint8),
         skill_id=torch.zeros(num_clips, T, dtype=torch.uint8),
         stride_idx=torch.zeros(num_clips, T, dtype=torch.int32),
@@ -82,12 +80,3 @@ def test_gather_desired_indexes_per_env():
     assert torch.equal(y[1], torch.tensor([3050.0, 3051, 3052, 3053]))  # c3 t5
     assert torch.equal(y[2], torch.tensor([1090.0, 1091, 1092, 1093]))  # c1 t9
     assert torch.allclose(dy, y + 0.5)
-
-
-def test_gather_anchor_shapes():
-    m = MotionClipManager(_synthetic_lib())
-    clip_id = torch.tensor([0, 1])
-    step = torch.tensor([2, 3])
-    ap, aq = m.gather_anchor(clip_id, step)
-    assert ap.shape == (2, 3) and aq.shape == (2, 4)
-    assert torch.allclose(aq, torch.tensor([1.0, 0, 0, 0]).expand(2, 4))

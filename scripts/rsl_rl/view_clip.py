@@ -20,20 +20,19 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
-import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
     load_clip_library,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
-    lift_position,
-)
 
 
-def _world_track(y_des, anchor_pos, anchor_quat, idx) -> np.ndarray:
-    """World xyz track [T, 3] for the frame whose pos outputs are at ``idx``."""
-    pos_rel = y_des[:, idx]                       # [T, 3]
-    return lift_position(anchor_pos, anchor_quat, pos_rel).cpu().numpy()
+def _world_track(y_des, idx) -> np.ndarray:
+    """Clip-world xyz track [T, 3] for the frame whose pos outputs are at ``idx``.
+
+    Clips are stored in the clip-world frame, so the track is read straight from
+    ``y_des`` -- no lift.
+    """
+    return y_des[:, idx].cpu().numpy()
 
 
 def main() -> int:
@@ -54,9 +53,7 @@ def main() -> int:
     names = lib.meta["pos_output_names"]
     skill_list = lib.meta["skill_list"]
 
-    y = lib.y_des[ci]                 # [T, P]
-    ap = lib.anchor_pos[ci]           # [T, 3]
-    aq = lib.anchor_quat[ci]          # [T, 4]
+    y = lib.y_des[ci]                 # [T, P] clip-world
     skill = lib.skill_id[ci].cpu().numpy()
     contact = lib.contact[ci].cpu().numpy()
     cframes = lib.meta["contact_frames"]
@@ -64,8 +61,8 @@ def main() -> int:
     def idx(frame, axes=("pos_x", "pos_y", "pos_z")):
         return [names.index(f"{frame}:{a}") for a in axes]
 
-    pelvis = _world_track(y, ap, aq, idx("pelvis_link"))
-    feet = {f: _world_track(y, ap, aq, idx(f)) for f in cframes}
+    pelvis = _world_track(y, idx("pelvis_link"))
+    feet = {f: _world_track(y, idx(f)) for f in cframes}
 
     fig = plt.figure(figsize=(11, 8))
     ax = fig.add_subplot(111, projection="3d")

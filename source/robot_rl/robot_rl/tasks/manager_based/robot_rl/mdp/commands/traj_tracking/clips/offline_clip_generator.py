@@ -13,9 +13,11 @@ the live contact re-anchor (anchor to the stance foot once per gait cycle),
 but uses the *reference* foot pose computed offline -- so there is no
 re-anchoring during training and hence no left/right tracking asymmetry.
 
-The stored ``y_des``/``dy_des`` are exactly the source strides' anchor-
-relative outputs (unchanged); stitching only computes the per-step world
-anchor schedule.  See ``world_lift.py`` for the lift shared with runtime.
+Stitching computes a per-step world anchor schedule, and the source strides'
+anchor-relative outputs are then **baked** through that schedule
+(:func:`world_lift.bake_outputs_to_world`) so the stored ``y_des``/``dy_des``
+are in a single clip-world frame.  At runtime the command applies only a
+per-env placement -- there is no stance re-anchoring.
 
 Output of :meth:`generate_batch` is a dict of dense ``[n, T, .]`` tensors;
 HDF5 serialisation lives in the generation CLI.
@@ -31,7 +33,7 @@ from isaaclab.utils.math import yaw_quat
 from ..multiskill_manager import MultiSkillManager
 from ..skill_bucket import bucket_for_velocity
 from ..skill_transition import blend_outputs
-from ..world_lift import lift_orientation, lift_position
+from ..world_lift import bake_outputs_to_world, lift_orientation, lift_position
 from .offline_velocity_sampler import OfflineVelocitySampler
 
 # Phase used to read the "end of stride" stance-foot landing pose.  Just shy
@@ -217,9 +219,7 @@ class OfflineClipGenerator:
         Returns:
             Dict with dense tensors (all on ``self.device``):
               ``y_des`` ``[n, T, P]``, ``dy_des`` ``[n, T, V]`` --
-                  anchor-relative reference outputs (the source strides);
-              ``anchor_pos`` ``[n, T, 3]``, ``anchor_quat`` ``[n, T, 4]`` --
-                  per-step world anchor schedule in the clip frame;
+                  clip-world reference outputs (per-step stance anchor baked in);
               ``contact`` ``[n, T, C]`` uint8 -- expected contact schedule;
               ``skill_id`` ``[n, T]`` uint8, ``stride_idx`` ``[n, T]`` int32 --
                   per-step labels;
@@ -334,6 +334,13 @@ class OfflineClipGenerator:
                 skill_id[ids] = new_skill
                 phase[ids] = (overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
 
+        # Bake the per-step stance anchor into the stored outputs so a clip is a
+        # single clip-world frame (the runtime applies only a per-env placement).
+        bake_outputs_to_world(
+            y_des, dy_des, anchor_pos_buf, anchor_quat_buf,
+            self.pos_output_names, self.vel_output_names,
+        )
+
         meta = {
             "dt": self.dt,
             "clip_length_s": self.clip_length_s,
@@ -347,8 +354,6 @@ class OfflineClipGenerator:
         return {
             "y_des": y_des,
             "dy_des": dy_des,
-            "anchor_pos": anchor_pos_buf,
-            "anchor_quat": anchor_quat_buf,
             "contact": contact_buf,
             "skill_id": skill_buf,
             "stride_idx": stride_buf,

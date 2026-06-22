@@ -84,6 +84,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "a recorded array name (e.g. 'target_vel'). 'auto' -> 'target_vel' if present in the "
              "recording, else no command. 'none' -> no command.",
     )
+    parser.add_argument(
+        "--history_frames", type=str, nargs="*", default=None,
+        help="Extra body frames the history/encoder token consumes (a subset of the "
+             "recorded --state_frames). Omit for symmetric (history uses every recorded "
+             "frame). Pass the flag with no values (or 'none') for an empty set: the "
+             "generator then needs NO measured end-effectors at deployment, while the "
+             "target still predicts every recorded frame for the tracker's ee_ref obs.",
+    )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_encoder_layers", type=int, default=4)
@@ -100,9 +108,17 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    # ``--history_frames`` (bare) -> [] (no history frames); 'none'/'None' -> []; a
+    # list -> that subset; omitted -> None (symmetric, history uses every recorded frame).
+    history_frame_names = args.history_frames
+    if history_frame_names is not None:
+        if len(history_frame_names) == 1 and history_frame_names[0].lower() == "none":
+            history_frame_names = []
+
     cfg = FlowMatchingConfig(
         history_len=args.history_len, future_len=args.future_len, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source, cmd_array=args.cmd_array,
+        history_frame_names=history_frame_names,
         d_model=args.d_model, nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
@@ -420,7 +436,15 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
 
     ``data_path``/``data_sha256`` record exactly which recorded dataset trained this
     checkpoint, so a ``.pt`` is self-describing without the separate params YAML.
+
+    The resolved history/target extra-frame split (which may be asymmetric -- the
+    encoder consuming fewer frames than the target predicts) is injected into the
+    saved ``meta`` so ``online.load_fm_context`` (and the deployment-side
+    ``transfer/fm/online.py``) reconstruct the exact token layout.
     """
+    meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
+    meta_dict["history_frame_names"] = list(train_ds.history_frame_names)
+    meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
     torch.save(
         {
             "model": model.state_dict(),
@@ -429,7 +453,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
             "target_normalizer": train_ds.target_normalizer.state_dict(),
             "history_normalizer": train_ds.history_normalizer.state_dict(),
             "num_joints": train_ds.num_joints,
-            "meta": asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta),
+            "meta": meta_dict,
             "data_path": data_path,
             "data_sha256": data_sha256,
             "epoch": epoch,

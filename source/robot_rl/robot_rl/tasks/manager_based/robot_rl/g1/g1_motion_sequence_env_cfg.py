@@ -5,9 +5,12 @@
 Tracks pre-generated fixed motion clips (see
 ``scripts/rsl_rl/generate_clips.py`` and the ``clips/`` package) instead of
 the online re-anchored multi-skill command.  No velocity conditioner, no
-contact gates, no skill cross-fades; observations are fully base-relative
-and a single base-pose-error termination replaces the upright / height /
-frame-drift terminations.
+contact gates, no skill cross-fades.  Clips are stored in a single clip-world
+frame and the CLF runs in the absolute world frame (the same frame as the
+generator-tracking task), so the policy's reference observations are
+base-relative / heading-invariant while the privileged critic sees the raw
+world-frame tracking vectors.  A single base-pose-error termination replaces
+the upright / height / frame-drift terminations.
 """
 
 from __future__ import annotations
@@ -60,11 +63,18 @@ class G1MotionSeqCommandsCfg:
 ##
 @configclass
 class G1MotionSeqObservationsCfg:
-    """Fully base-relative observations (no world coordinates)."""
+    """World-frame-aware observations: deployable policy, privileged critic.
+
+    The CLF tracking vectors are world-frame (absolute position / heading), so
+    the raw ``ref_traj``/``act_traj``/``*_vel`` observations live in the
+    critic-only group; the policy's reference terms (base-pose error, joint
+    refs, ee refs, future windows) are all relative / heading-invariant, so the
+    policy never sees a world coordinate.  Shared with
+    :class:`G1GeneratorTrackingEnvCfg` (one frame across both tasks)."""
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Policy observations: proprioception + base-relative reference."""
+        """Deployable proprioception + base-relative reference (no world coords)."""
 
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
         projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
@@ -98,19 +108,13 @@ class G1MotionSeqObservationsCfg:
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
         )
 
-        # Full stance-anchored tracking vector.
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
-
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
 
     @configclass
     class CriticCfg(ObsGroup):
-        """Privileged critic observations."""
+        """Privileged critic: clean state + world-frame CLF tracking vectors."""
 
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
@@ -142,7 +146,7 @@ class G1MotionSeqObservationsCfg:
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
         )
 
-        # Full stance-anchored tracking vector (privileged).
+        # Full world-frame tracking vector (privileged -- absolute coords).
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))

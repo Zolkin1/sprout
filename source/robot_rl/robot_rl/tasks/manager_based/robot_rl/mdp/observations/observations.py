@@ -144,8 +144,11 @@ def skill_one_hot(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
 # ----------------------------------------------------------------------
 # Motion-sequence (open-loop clip tracking) observations.
 #
-# All base-relative: the policy never sees a world position.  Pair these
-# with a :class:`MotionSequenceCommand` term.
+# The CLF runs in the world frame, so the raw reference vectors (``ref_traj``
+# etc.) are absolute-world (critic-only).  The helpers here are all relative /
+# heading-invariant (they difference reference-vs-actual or ee-vs-base and
+# rotate into a relative frame), so they are frame-agnostic and safe for the
+# policy.  Pair these with a :class:`MotionSequenceCommand` term.
 # ----------------------------------------------------------------------
 
 def _joint_output_indices(ordered_names: list[str]) -> list[int]:
@@ -156,21 +159,26 @@ def _joint_output_indices(ordered_names: list[str]) -> list[int]:
 def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
     """Reference-vs-actual base pose error, expressed in the actual base frame.
 
-    Returns ``[N, 6]`` = position error (3, rotated into the robot base frame)
-    + orientation error (3, ``quat_box_minus(actual, reference)`` tangent).
-    This is the same base tracking error the CLF penalises, surfaced as a
-    base-relative observation (no world coordinates).
+    Returns ``[N, 6]`` = position error (3) + orientation error (3), *both*
+    rotated into the robot's current base frame, so the observation is fully
+    heading-invariant (no absolute world heading leaks) and deployable sim2real.
+    The orientation half is the world-frame ``quat_box_minus`` rotation vector
+    (a spatial error whose roll/pitch axes would otherwise rotate with heading)
+    re-expressed in the base frame to match the position half.  Same base
+    tracking error the CLF penalises, surfaced as a base-relative observation.
     """
     cmd = env.command_manager.get_term(command_name)
     state = cmd.reference_world_state()                 # [N, 3+4+3+3+2nj]
     ref_pos_w = state[:, 0:3]
-    ref_quat_w = state[:, 3:7]                          # wxyz
+    ref_quat_w = state[:, 3:7]                          # xyzw
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
-    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # wxyz
+    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # xyzw
+    inv_root_quat = quat_inv(root_quat_w)
 
-    pos_err_b = quat_apply(quat_inv(root_quat_w), ref_pos_w - root_pos_w)
-    ori_err = quat_box_minus(root_quat_w, ref_quat_w)   # actual ⊟ reference
-    return torch.cat([pos_err_b, ori_err], dim=-1)
+    pos_err_b = quat_apply(inv_root_quat, ref_pos_w - root_pos_w)
+    ori_err_w = quat_box_minus(root_quat_w, ref_quat_w)  # actual ⊟ reference (world frame)
+    ori_err_b = quat_apply(inv_root_quat, ori_err_w)     # -> current base frame
+    return torch.cat([pos_err_b, ori_err_b], dim=-1)
 
 
 def joint_pos_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
@@ -186,7 +194,8 @@ def ref_base_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") ->
     The velocity target the ``ref_base_vel_tracking_exp`` reward grades against;
     exposing it (paired with the actual base velocity in ``act_traj_vel`` /
     ``base_*_vel``) makes that reward's error observable to the policy.  Returns
-    ``[N, 6]`` (lin xyz + ang xyz, yaw-aligned anchor frame).
+    ``[N, 6]`` (lin xyz + ang xyz) in the world frame (use
+    :func:`ref_base_velocity_local` for a deployable, heading-invariant variant).
     """
     cmd = env.command_manager.get_term(command_name)
     base = cmd.cfg.base_frame_name
@@ -280,9 +289,11 @@ def future_base_pose(
 
     For each strided future step covering ``horizon_s``, the reference base pose
     expressed relative to the robot's *current* base -- a "future
-    :func:`base_pose_error`": position error (3, rotated into the current base
-    frame) + orientation error (3, ``quat_box_minus`` tangent).  Heading-
-    invariant.  Flattened as ``[step0(6), step1(6), ...]``.
+    :func:`base_pose_error`": position error (3) + orientation error (3), both
+    rotated into the current base frame (the orientation half is the world-frame
+    ``quat_box_minus`` rotation vector re-expressed in the base frame, matching
+    :func:`base_pose_error`).  Fully heading-invariant.  Flattened as
+    ``[step0(6), step1(6), ...]``.
     """
     cmd = env.command_manager.get_term(command_name)
     offs = _lookahead_offsets(cmd, horizon_s, stride)
@@ -293,8 +304,9 @@ def future_base_pose(
     inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
     root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
     pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
-    ori_err = quat_box_minus(root_q, quat_w.reshape(n * k, 4))  # actual ⊟ reference
-    out = torch.cat([pos_err_b, ori_err], dim=-1).reshape(n, k, 6)
+    ori_err_w = quat_box_minus(root_q, quat_w.reshape(n * k, 4))  # actual ⊟ reference (world)
+    ori_err_b = quat_apply(inv_root, ori_err_w)                  # -> current base frame
+    out = torch.cat([pos_err_b, ori_err_b], dim=-1).reshape(n, k, 6)
     return out.reshape(n, -1)
 
 
@@ -324,10 +336,11 @@ def ee_ref_relative_to_base(
 ) -> torch.Tensor:
     """Reference end-effector positions relative to the reference base.
 
-    The clip stores frame outputs relative to the stance anchor; this
-    re-expresses each named end-effector position in the *reference base*
-    frame (target posture), so no world coordinates appear.  Returns
-    ``[N, 3 * len(frame_names)]``.
+    Re-expresses each named end-effector position in the *reference base* frame
+    (target posture), so no world coordinates appear.  Frame-agnostic: the ee
+    and base reference positions are differenced and rotated into the reference
+    base orientation, so it is correct whether ``y_des`` is clip-world or world.
+    Returns ``[N, 3 * len(frame_names)]``.
 
     Args:
         frame_names: End-effector frame names (e.g. the ankle/wrist links).

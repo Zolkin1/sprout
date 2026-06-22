@@ -411,10 +411,12 @@ def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, device) -> F
     return FmOnlineContext(
         model=model, target_norm=_identity_normalizer(d, device),
         history_norm=_identity_normalizer(din, device), H=cfg.history_len, F=cfg.future_len,
-        D=d, Din=din, nj=nj, num_extra_frames=0,
+        D=d, history_D=d, Din=din, nj=nj,
+        history_num_extra_frames=0, target_num_extra_frames=0,
         num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps,
         cmd_dim=0, future_cmd_dim=0, scan_dim=scan_dim,
-        joint_names=list(live_joint_names), frame_names=[], device=device,
+        joint_names=list(live_joint_names), history_frame_names=[], target_frame_names=[],
+        device=device,
     )
 
 
@@ -451,17 +453,19 @@ def _build_fm_context(env, robot, device) -> dict:
         fm = _dry_run_fm_context(live_joint_names, scan_dim, device)
         print("[INFO] --dry_run: using a randomly-initialized model and identity normalizers.")
 
-    # Extra body frames (ee): resolve their live body indices in FM frame order so the
-    # per-step capture mirrors record_data.py --state_frames (body_pos_w / body_quat_w /
-    # body_link_vel_w), the exact layout online.build_history_token consumes.
+    # History extra body frames (ee): resolve their live body indices in FM history
+    # frame order so the per-step capture mirrors record_data.py --state_frames
+    # (body_pos_w / body_quat_w / body_link_vel_w), the exact layout
+    # online.build_history_token consumes. Empty for the deployment design
+    # (history_frame_names = []): no measured end-effectors feed the history token.
     frame_body_idx = None
-    if fm.num_extra_frames > 0:
+    if fm.history_num_extra_frames > 0:
         body_names = list(robot.data.body_names)
-        missing_f = [f for f in fm.frame_names if f not in body_names]
+        missing_f = [f for f in fm.history_frame_names if f not in body_names]
         if missing_f:
-            raise ValueError(f"FM extra frames absent from the live robot bodies: {missing_f}")
+            raise ValueError(f"FM history extra frames absent from the live robot bodies: {missing_f}")
         frame_body_idx = torch.tensor(
-            [body_names.index(f) for f in fm.frame_names], dtype=torch.long, device=device
+            [body_names.index(f) for f in fm.history_frame_names], dtype=torch.long, device=device
         )
 
     # Joint permutation: reorder live joints into the FM training order.
@@ -570,7 +574,7 @@ def _infer_predictions(
     jp = history.stack("joint_pos")[env_ids]      # (V, H, nj)
     jv = history.stack("joint_vel")[env_ids]      # (V, H, nj)
     scan = history.stack("scan")[env_ids] if fm.scan_dim > 0 else None
-    frames = history.stack("frames")[env_ids] if fm.num_extra_frames > 0 else None  # (V, H, K, 13)
+    frames = history.stack("frames")[env_ids] if fm.history_num_extra_frames > 0 else None  # (V, H, K_hist, 13)
     # Command (when the checkpoint is command-conditioned): past in the token, future
     # horizon to the decoder. The horizon for the current step is at the last index.
     if fm.cmd_dim > 0:

@@ -25,10 +25,6 @@ from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
     load_clip_library,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
-    lift_orientation,
-    lift_position,
-)
 
 # Default frames to plot (base + feet); pass --wrists to add the hands.
 _DEFAULT_FRAMES = ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link"]
@@ -51,10 +47,9 @@ def _frame_ori_idx(pos_names: list[str], frame: str) -> list[int]:
     return [pos_names.index(f"{frame}:ori_{a}") for a in ("x", "y", "z", "w")]
 
 
-def _rpy_deg(anchor_quat, quat_rel) -> np.ndarray:
-    """World roll/pitch/yaw (degrees) [T, 3] for an anchor-relative quat track."""
-    qw = lift_orientation(anchor_quat, quat_rel)          # [T, 4] wxyz
-    r, p, y = euler_xyz_from_quat(qw)
+def _rpy_deg(quat_track) -> np.ndarray:
+    """World roll/pitch/yaw (degrees) [T, 3] for a clip-world quat track."""
+    r, p, y = euler_xyz_from_quat(quat_track)
     rpy = torch.stack([wrap_to_pi(r), wrap_to_pi(p), wrap_to_pi(y)], dim=-1)
     return torch.rad2deg(rpy).cpu().numpy()
 
@@ -89,17 +84,15 @@ def main() -> int:
     sl = slice(i0, i1)
     t = np.arange(i0, i1) * dt
 
-    y = lib.y_des[ci][sl]
-    ap = lib.anchor_pos[ci][sl]
-    aq = lib.anchor_quat[ci][sl]
+    y = lib.y_des[ci][sl]  # clip-world
 
     frames = list(_DEFAULT_FRAMES) + (_WRIST_FRAMES if args.wrists else [])
     frames = [f for f in frames if f"{f}:pos_x" in pos_names]
-    tracks = {f: lift_position(ap, aq, y[:, _frame_pos_idx(pos_names, f)]).cpu().numpy() for f in frames}
+    tracks = {f: y[:, _frame_pos_idx(pos_names, f)].cpu().numpy() for f in frames}
     # Orientation is shown for the base (pelvis) only -- the feet just wrap
     # through +-180 deg and aren't a useful read.
     base_frame = "pelvis_link" if "pelvis_link" in frames else frames[0]
-    base_rpy = _rpy_deg(aq, y[:, _frame_ori_idx(pos_names, base_frame)])
+    base_rpy = _rpy_deg(y[:, _frame_ori_idx(pos_names, base_frame)])
 
     has_vel = lib.target_vel.numel() > 0
     n_rows = 7 if has_vel else 6

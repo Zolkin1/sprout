@@ -1,19 +1,23 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Open-loop motion-sequence tracking command.
+"""Open-loop motion-sequence tracking command (world-frame CLF).
 
 Tracks a pre-generated fixed motion clip (see ``clips/``) by a pure step
 index -- no contact gates, no online re-anchoring, no skill cross-fades.
-At reset each env is assigned a clip and placed exactly on it; thereafter
-the reference advances by ``step = episode_length_buf`` and the robot's
-measured outputs are computed relative to the clip's *pre-computed* world
-anchor schedule (the reference stance-foot landing poses baked in offline).
+Clips are stored in a single clip-world frame (the per-step stance anchor is
+baked in at generation time), so the only runtime transform is a per-env
+*placement* (the clip's yaw + xy in the sim world, fixed at reset).  At reset
+each env is assigned a clip and placed exactly on it; thereafter the reference
+advances by ``step = episode_length_buf``.
 
-Because the anchor schedule is fixed at generation time, there is no
-re-anchoring to the measured foot during training, so neither foot gets a
-"free zero" -- the left/right tracking asymmetry of the online command is
-gone.  The CLF tracking (``y_des``/``y_act`` in the stance-anchored,
-yaw-aligned frame) and reward are otherwise unchanged.
+The CLF runs in the **absolute world frame**: the desired outputs
+``y_des``/``dy_des`` are the clip's outputs lifted through the placement, and
+the measured outputs ``y_act``/``dy_act`` are read with an identity reference
+(no yaw re-alignment).  This is the same world frame
+:class:`GeneratorTrackingCommand` uses, so the two tasks share one frame.
+Because the placement is fixed per episode, there is no re-anchoring to the
+measured foot during training -- the left/right tracking asymmetry of the
+online command is gone.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from .world_lift import (
     lift_position,
     lift_position_batched,
     lift_vector,
+    lift_vector_batched,
 )
 from .motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
@@ -151,6 +156,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         stride = max(1, int(self.cfg.debug_vis_stride))
         self._debug_offsets = torch.arange(0, horizon_steps, stride, dtype=torch.long, device=dev)
 
+        # --- World-frame assembly (shared with GeneratorTrackingCommand) ---
+        # Output frames whose Cartesian channels are lifted clip-world -> world:
+        # the base plus every end-effector reference frame, in resolved order.
+        # (GeneratorTrackingCommand rebuilds these in its FM frame order.)
+        self._build_world_frame_maps([self.cfg.base_frame_name] + self.resolve_ee_frames())
+
+        # Identity reference for the world-frame measured outputs (no alignment).
+        self._zeros3 = torch.zeros(n, 3, device=dev)
+        self._ident_quat = torch.zeros(n, 4, device=dev)
+        self._ident_quat[:, 3] = 1.0  # xyzw identity
+
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
 
@@ -174,11 +190,36 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     # Lifecycle (overrides the online phase/gate machinery)
     # ------------------------------------------------------------------
 
+    def _build_world_frame_maps(self, frames: list[str]) -> None:
+        """Build the world-frame channel index maps + per-step cache for ``frames``.
+
+        ``frames`` is ``[base] + ee`` (the base frame followed by the ee
+        reference frames whose Cartesian channels get lifted clip-world ->
+        world).  Populates the flat scatter indices into ``y_des``/``dy_des``,
+        a name->row lookup, and the ``[N, nf, 13]`` world-frame cache served by
+        :meth:`reference_world_frames` / :meth:`reference_world_state`.
+        """
+        self._wf_frames = list(frames)
+        self._wf_frame_index = {f: i for i, f in enumerate(self._wf_frames)}
+        pos_list, ori_list, lin_list, ang_list = [], [], [], []
+        for f in self._wf_frames:
+            fidx = self._frame_output_indices(f)
+            pos_list.append(fidx["pos"]); ori_list.append(fidx["ori"])
+            lin_list.append(fidx["lin_vel"]); ang_list.append(fidx["ang_vel"])
+        self._wf_pos_flat = torch.cat(pos_list)   # [nf*3] -> y_des
+        self._wf_ori_flat = torch.cat(ori_list)   # [nf*4] -> y_des
+        self._wf_lin_flat = torch.cat(lin_list)   # [nf*3] -> dy_des
+        self._wf_ang_flat = torch.cat(ang_list)   # [nf*3] -> dy_des
+        self._wf_world_frames = torch.zeros(self.num_envs, len(self._wf_frames), 13, device=self.device)
+
     def _update_command(self) -> None:
-        """Advance the step index, gather reference + measured, update CLF."""
+        """Advance the step, build world-frame desired + measured, update CLF."""
         self._advance_step()
-        self.get_measured_outputs()
-        self.get_desired_outputs()
+        self.get_desired_outputs()                 # clip-world y_des/dy_des
+        frames = self._clip_world_frames()         # lift through the placement
+        self._write_world_des(frames)              # base+ee Cartesian -> world
+        # Measured outputs in the world frame (identity reference -> no alignment).
+        self.compute_measured_output(self._zeros3, self._ident_quat)
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
         self.vdot = vdot
         self.v = vcur
@@ -193,28 +234,67 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._step = torch.clamp(self.start_step + self.env.episode_length_buf, max=T - 1)
         self.manager.phase = self._step.float() / max(T - 1, 1)
 
-    def _world_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-env world anchor pose = clip placement ∘ clip anchor[step]."""
-        cap, caq = self.manager.gather_anchor(self.clip_id, self._step)
-        wpos = lift_position(self.clip_world_pos, self.clip_world_quat, cap)
-        wquat = lift_orientation(self.clip_world_quat, caq)
-        return wpos, wquat
+    def _placement(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-env world placement of the clip (yaw-only ground frame, fixed at reset)."""
+        return self.clip_world_pos, self.clip_world_quat
 
-    def get_measured_outputs(self, phase: torch.Tensor = None, env_ids: torch.Tensor = None) -> None:
-        """Compute measured outputs relative to the clip's world anchor.
+    def _lift_ee_world(
+        self, frame_names: list[str], anchor_pos: torch.Tensor, anchor_quat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Lift the clip-world ``y_des``/``dy_des`` channels of ``frame_names`` through an anchor.
 
-        Bypasses all online re-anchoring: the anchor is read from the clip's
-        pre-computed schedule (lifted into the world by the per-env clip
-        placement), stored in ``ref_poses``, then handed to the inherited
-        :meth:`compute_measured_output`.
+        Reads the (clip-world) stored outputs, so this must run before
+        :meth:`_write_world_des` overwrites them.  Returns ``[N, K, 13]`` per
+        frame ``[pos_w(3), quat_w(4, xyzw), lin_w(3), ang_w(3)]``.
         """
-        wpos, wquat = self._world_anchor()
+        out = []
+        for f in frame_names:
+            idx = self._frame_output_indices(f)
+            pos_w = lift_position(anchor_pos, anchor_quat, self.y_des[:, idx["pos"]])
+            quat_w = lift_orientation(anchor_quat, self.y_des[:, idx["ori"]])
+            lin_w = lift_vector(anchor_quat, self.dy_des[:, idx["lin_vel"]])
+            ang_w = lift_vector(anchor_quat, self.dy_des[:, idx["ang_vel"]])
+            out.append(torch.cat([pos_w, quat_w, lin_w, ang_w], dim=-1))
+        return torch.stack(out, dim=1)
+
+    def _clip_world_frames(self) -> torch.Tensor:
+        """Lift the current clip-world outputs through the per-env placement.
+
+        Sets ``ref_poses`` to the placement, then lifts the base + every ee
+        reference frame from the stored clip-world frame into the absolute world
+        frame.  Must run before :meth:`_write_world_des` (reads clip-world
+        ``y_des``).
+
+        Returns:
+            ``frames [N, nf, 13]`` -- ``[base] + ee`` in ``self._wf_frames``
+            order, each ``[pos_w(3), quat_w(4, xyzw), lin_w(3), ang_w(3)]``.
+        """
+        wpos, wquat = self._placement()
         self.ref_poses[:, :3] = wpos
         self.ref_poses[:, 3:7] = wquat
-        self.compute_measured_output(wpos, wquat)
+        base13 = lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, self._base_idx)[:, :13]
+        if len(self._wf_frames) > 1:
+            ee = self._lift_ee_world(self._wf_frames[1:], wpos, wquat)  # [N, K, 13]
+            return torch.cat([base13[:, None, :], ee], dim=1)          # [N, nf, 13]
+        return base13[:, None, :]
+
+    def _write_world_des(self, frames: torch.Tensor) -> None:
+        """Scatter world-frame ``[N, nf, 13]`` frames into y_des/dy_des, and cache them.
+
+        Caches the (final, source-selected) world frames so the post-step
+        recorder API (:meth:`reference_world_state` /
+        :meth:`reference_world_frames`) reads them back without re-lifting the
+        now-overwritten ``y_des``.
+        """
+        n = self.num_envs
+        self.y_des[:, self._wf_pos_flat] = frames[:, :, 0:3].reshape(n, -1)
+        self.y_des[:, self._wf_ori_flat] = frames[:, :, 3:7].reshape(n, -1)
+        self.dy_des[:, self._wf_lin_flat] = frames[:, :, 7:10].reshape(n, -1)
+        self.dy_des[:, self._wf_ang_flat] = frames[:, :, 10:13].reshape(n, -1)
+        self._wf_world_frames = frames
 
     def get_desired_outputs(self, phase: torch.Tensor = None, env_ids: torch.Tensor = None) -> None:
-        """Gather the (stance-anchored) reference outputs for the current step."""
+        """Gather the (clip-world) reference outputs for the current step."""
         ids = env_ids if env_ids is not None else slice(None)
         y, dy = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
         self.y_des[ids] = y
@@ -307,36 +387,19 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """World-frame reference base pose+velocity over the future ``offsets``.
 
         Returns ``(pos_w, quat_w, lin_w, ang_w)`` of shapes ``[N, K, 3]``,
-        ``[N, K, 4]`` (xyzw), ``[N, K, 3]``, ``[N, K, 3]``.  Lifts the stance-
-        anchored clip outputs through each future step's world anchor (clip
-        placement ∘ clip anchor schedule), reusing the exact lift the debug-viz
-        ribbon and :meth:`reference_world_state` use -- so ``quat_w`` matches the
-        convention consumed by the ``base_pose_error`` observation.
+        ``[N, K, 4]`` (xyzw), ``[N, K, 3]``, ``[N, K, 3]``.  Lifts the clip-world
+        base channels through the per-env placement (a single yaw+xy transform),
+        so ``quat_w`` matches the convention consumed by the ``base_pose_error``
+        observation and the debug-viz ribbon.
         """
         cid, steps = self._future_step_indices(offsets)
-        n, k = steps.shape
         bi = self._base_idx
-
-        # Per-step world anchor: clip placement ∘ clip anchor schedule.
-        cap = self.manager.gather(self.manager.lib.anchor_pos, cid, steps)    # [N, K, 3]
-        caq = self.manager.gather(self.manager.lib.anchor_quat, cid, steps)   # [N, K, 4]
-        wap = lift_position_batched(self.clip_world_pos, self.clip_world_quat, cap)   # [N, K, 3]
-        waq = lift_orientation_batched(self.clip_world_quat, caq)                     # [N, K, 4]
-
-        # Base channels (anchor-relative) lifted to world per (env, step).
-        y = self.manager.gather(self.manager.lib.y_des, cid, steps)           # [N, K, P]
-        dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)         # [N, K, V]
-        ap = wap.reshape(n * k, 3)
-        aq = waq.reshape(n * k, 4)
-        pos_rel = y[:, :, bi["pos"]].reshape(n * k, 3)
-        ori_rel = y[:, :, bi["ori"]].reshape(n * k, 4)
-        lin_rel = dy[:, :, bi["lin_vel"]].reshape(n * k, 3)
-        ang_rel = dy[:, :, bi["ang_vel"]].reshape(n * k, 3)
-
-        pos_w = lift_position(ap, aq, pos_rel).reshape(n, k, 3)
-        quat_w = lift_orientation(aq, ori_rel).reshape(n, k, 4)
-        lin_w = lift_vector(aq, lin_rel).reshape(n, k, 3)
-        ang_w = lift_vector(aq, ang_rel).reshape(n, k, 3)
+        y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P] clip-world
+        dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)  # [N, K, V]
+        pos_w = lift_position_batched(self.clip_world_pos, self.clip_world_quat, y[:, :, bi["pos"]])
+        quat_w = lift_orientation_batched(self.clip_world_quat, y[:, :, bi["ori"]])
+        lin_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["lin_vel"]])
+        ang_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["ang_vel"]])
         return pos_w, quat_w, lin_w, ang_w
 
     # ------------------------------------------------------------------
@@ -347,10 +410,13 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """World-frame reference state ``[N, 3+4+3+3+2*nj]`` at the current step.
 
         ``[base_pos_w, base_quat_w(wxyz), base_lin_w, base_ang_w, joint_pos,
-        joint_vel]`` -- lifts the stance-anchored ``y_des`` through the current
-        world anchor (``ref_poses``).  Used by the reset event and observations.
+        joint_vel]`` -- served from the per-step world cache populated by
+        :meth:`_write_world_des` (base row) plus the frame-invariant joint
+        channels.  Used by the reset event, observations, and terminations.
         """
-        return lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, self._base_idx)
+        joint_pos = self.y_des[:, self._base_idx["joint_pos"]]
+        joint_vel = self.dy_des[:, self._base_idx["joint_vel"]]
+        return torch.cat([self._wf_world_frames[:, 0, :], joint_pos, joint_vel], dim=-1)
 
     def _frame_output_indices(self, frame_name: str) -> dict[str, torch.Tensor]:
         """Resolve (and cache) the y_des/dy_des indices for one output frame.
@@ -391,31 +457,21 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def reference_world_frames(self, frame_names: list[str]) -> torch.Tensor:
         """World-frame reference state for extra output frames (e.g. feet/hands).
 
-        Lifts each frame's stance-anchored ``y_des``/``dy_des`` channels through
-        the current world anchor (``ref_poses``), the same lift
-        :meth:`reference_world_state` uses for the base.  Used both by the data
-        recorder (to record ee reference states) and the generator-tracking
-        command (to build the clip's world-frame CLF outputs).
+        Served from the per-step world cache populated by
+        :meth:`_write_world_des` -- so it reflects the selected source (clip or
+        generator) and never re-lifts the world-overwritten ``y_des``.  Used by
+        the data recorder to record ee reference states.
 
         Args:
-            frame_names: Output frame names (must expose ``pos_{x,y,z}`` and
-                ``ori_{x,y,z,w}`` outputs, e.g. the ankle/wrist links).
+            frame_names: Output frame names; each must be one of the command's
+                world-frame ee frames (``self._wf_frames`` minus the base).
 
         Returns:
             ``[N, K, 13]`` per frame ``[pos_w(3), quat_w(4, xyzw), lin_vel_w(3),
             ang_vel_w(3)]`` in the given frame order.
         """
-        anchor_pos = self.ref_poses[:, :3]
-        anchor_quat = self.ref_poses[:, 3:7]
-        out = []
-        for f in frame_names:
-            idx = self._frame_output_indices(f)
-            pos_w = lift_position(anchor_pos, anchor_quat, self.y_des[:, idx["pos"]])
-            quat_w = lift_orientation(anchor_quat, self.y_des[:, idx["ori"]])
-            lin_w = lift_vector(anchor_quat, self.dy_des[:, idx["lin_vel"]])
-            ang_w = lift_vector(anchor_quat, self.dy_des[:, idx["ang_vel"]])
-            out.append(torch.cat([pos_w, quat_w, lin_w, ang_w], dim=-1))
-        return torch.stack(out, dim=1)
+        idxs = [self._wf_frame_index[f] for f in frame_names]
+        return self._wf_world_frames[:, idxs, :]
 
     def get_reference_world_state(self, base_frame_name: str) -> torch.Tensor:
         """World-frame reference state, matching the base-class recording API.
@@ -460,11 +516,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             ``[K, 3+4+3+3+2*nj]`` world reference state.
         """
         y, dy = self.manager.gather_desired(clip_id, step)
-        cap, caq = self.manager.gather_anchor(clip_id, step)
-        wpos = lift_position(world_pos, world_quat, cap)
-        wquat = lift_orientation(world_quat, caq)
-        anchor = torch.cat([wpos, wquat], dim=-1)
-        return lift_base_world_state(y, dy, anchor, self._base_idx)
+        placement = torch.cat([world_pos, world_quat], dim=-1)
+        return lift_base_world_state(y, dy, placement, self._base_idx)
 
     # ------------------------------------------------------------------
     # Symmetry helpers (end-effector reference)
@@ -631,17 +684,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             return
         cid = clip_id[:, None].expand(n, ns)                                            # [n, Ns]
 
-        # World anchor schedule for the window: clip placement ∘ clip anchor.
-        ap = self.manager.gather(self.manager.lib.anchor_pos, cid, steps)                 # [n, Ns, 3]
-        aq = self.manager.gather(self.manager.lib.anchor_quat, cid, steps)                # [n, Ns, 4]
-        wap = lift_position_batched(clip_world_pos, clip_world_quat, ap)
-        waq = lift_orientation_batched(clip_world_quat, aq)
-
-        # Per-frame world positions over the window: [n, Ns, F, 3].
+        # Per-frame clip-world positions over the window, lifted to sim-world by
+        # the per-env placement (a single yaw+xy transform; no per-step anchor).
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
-        rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3]
+        rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3] clip-world
         world_pos = lift_position_batched(
-            wap.reshape(n * ns, 3), waq.reshape(n * ns, 4), rel.reshape(n * ns, F, 3),
+            clip_world_pos, clip_world_quat, rel.reshape(n, ns * F, 3),
         ).reshape(n, ns, F, 3)
 
         # Per-segment midpoint, direction, length (one cylinder per segment per frame).

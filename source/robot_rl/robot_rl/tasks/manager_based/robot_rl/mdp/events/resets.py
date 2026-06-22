@@ -292,19 +292,21 @@ def reset_on_motion_sequence(
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
     # 2. World placement of the clip frame (optional random yaw): re-zero only the
-    #    downrange (x, y) placement so a mid-clip start spawns at the env origin,
-    #    but KEEP the schedule's anchor height (z).
+    #    downrange (x, y) placement so a mid-clip start spawns the base at the env
+    #    origin, but KEEP the clip's base height (z).
     world_quat = torch.zeros(k, 4, device=device)
     world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
     if getattr(cmd.cfg, "randomize_heading", False):
         yaw = torch.empty(k, device=device).uniform_(-torch.pi, torch.pi)
         zeros = torch.zeros_like(yaw)
         world_quat = quat_from_euler_xyz(zeros, zeros, yaw)
-    anchor_pos0, _ = cmd.manager.gather_anchor(clip_id, start_step)  # clip-frame anchor at t0
-    rotated = lift_position(torch.zeros(k, 3, device=device), world_quat, anchor_pos0)
-    # The clip anchor z is the natural stance-ankle height (foot resting ON the
-    # ground at generation time). Subtracting it here would sink the robot
-    # ~ankle-height into the ground every reset, so only re-zero x/y placement.
+    # Clip-world base position at the start step (clips are stored clip-world, so
+    # there is no per-step anchor schedule). Rotate it by the placement heading;
+    # re-zero only x/y (keep z) so the base spawns at the env origin at its
+    # natural clip height, with the feet resting on the ground.
+    y0, _ = cmd.manager.gather_desired(clip_id, start_step)
+    base_pos_cf = y0[:, cmd._base_idx["pos"]]  # [k, 3]
+    rotated = lift_position(torch.zeros(k, 3, device=device), world_quat, base_pos_cf)
     rotated[:, 2] = 0.0
     world_pos = env.scene.env_origins[env_ids] - rotated
 

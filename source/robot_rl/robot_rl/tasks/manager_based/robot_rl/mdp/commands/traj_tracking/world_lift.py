@@ -1,22 +1,24 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Shared world-frame lift for anchor-relative trajectory outputs.
+"""Shared yaw-only lift between a (yaw-aligned) anchor frame and the world.
 
-Trajectory outputs (positions, orientations, velocities) are stored
-yaw-aligned relative to a stance/contact anchor frame (see
-:meth:`BaseTrajectoryCommand.compute_measured_output`).  This module holds
-the single inverse transform that lifts those anchor-relative quantities
-back into the world frame, given the anchor's world pose.
-
-It is the exact inverse of the forward yaw-alignment ``_align_yaw`` /
+Given an anchor's world pose, these helpers lift quantities expressed
+yaw-aligned-relative to that anchor back into the world frame.  They are
+the exact inverse of the forward yaw-alignment ``_align_yaw`` /
 ``_align_yaw_batched`` in :mod:`base_trajectory_cmd`::
 
     forward:  v_rel = R_yaw(q_a)^{-1} @ v_w     (world  -> anchor-relative)
     inverse:  v_w   = R_yaw(q_a)      @ v_rel   (anchor -> world)
 
-Both the offline clip generator and the runtime command import these
-helpers so trajectory generation and runtime tracking use a provably
-identical lift.  Quaternions are xyzw to match Isaac Lab's math utils.
+Two callers use this lift:
+
+  * the **offline clip generator** bakes its per-step stance anchor into the
+    stored outputs via :func:`bake_outputs_to_world`, so a generated clip is a
+    single clip-world frame (no runtime stance re-anchoring);
+  * the **runtime command** applies a single per-env *placement* (yaw + xy of
+    the clip in the sim world) to those clip-world outputs.
+
+Quaternions are xyzw to match Isaac Lab's math utils.
 """
 
 from __future__ import annotations
@@ -215,3 +217,72 @@ def lift_base_world_state(
     return torch.cat(
         [base_pos_w, base_quat_w, base_lin_w, base_ang_w, joint_pos, joint_vel], dim=-1
     )
+
+
+# ----------------------------------------------------------------------
+# Generation: bake a per-step anchor schedule into the stored outputs.
+# ----------------------------------------------------------------------
+
+def bake_outputs_to_world(
+    y_des: torch.Tensor,
+    dy_des: torch.Tensor,
+    anchor_pos: torch.Tensor,
+    anchor_quat: torch.Tensor,
+    pos_output_names: list[str],
+    vel_output_names: list[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lift dense anchor-relative outputs into the clip-world frame, in place.
+
+    Converts a clip's anchor-relative reference outputs into a single
+    clip-world frame by lifting every output frame through its own per-step
+    anchor.  After baking, the stored clip needs no runtime stance
+    re-anchoring -- only a per-env placement.  Uses the exact same lift the
+    runtime/placement applies (:func:`lift_position` / :func:`lift_orientation`
+    / :func:`lift_vector`).
+
+    Per output frame ``f``: position channels (``{f}:pos_{x,y,z}``) are
+    translated+rotated, orientation channels (``{f}:ori_{x,y,z,w}``, xyzw) are
+    quat-composed, and velocity channels (linear ``{f}:pos_*`` and angular
+    ``{f}:ori_*`` in ``vel_output_names``) are rotated only.  ``joint:*``
+    channels are frame-invariant and pass through untouched.
+
+    Args:
+        y_des: ``[n, T, P]`` anchor-relative position outputs (mutated in place).
+        dy_des: ``[n, T, V]`` anchor-relative velocity outputs (mutated in place).
+        anchor_pos: ``[n, T, 3]`` per-step world anchor positions (clip frame).
+        anchor_quat: ``[n, T, 4]`` per-step world anchor quaternions (xyzw).
+        pos_output_names: Ordered position-output names (includes ``ori_w``).
+        vel_output_names: Ordered velocity-output names.
+
+    Returns:
+        ``(y_des, dy_des)`` lifted into the clip-world frame.
+    """
+    n, t = anchor_pos.shape[0], anchor_pos.shape[1]
+    ap = anchor_pos.reshape(n * t, 3)
+    aq = anchor_quat.reshape(n * t, 4)
+    yf = y_des.reshape(n * t, y_des.shape[-1])
+    dyf = dy_des.reshape(n * t, dy_des.shape[-1])
+    dev = yf.device
+
+    def _idx(names: list[str], frame: str, comps: tuple[str, ...], kind: str) -> torch.Tensor:
+        return torch.tensor(
+            [names.index(f"{frame}:{kind}_{a}") for a in comps], dtype=torch.long, device=dev
+        )
+
+    # Position blocks (translate + rotate), plus orientation where present.
+    for f in sorted({nm.split(":", 1)[0] for nm in pos_output_names if ":pos_" in nm}):
+        pos_i = _idx(pos_output_names, f, ("x", "y", "z"), "pos")
+        yf[:, pos_i] = lift_position(ap, aq, yf[:, pos_i])
+        if f"{f}:ori_w" in pos_output_names:
+            ori_i = _idx(pos_output_names, f, ("x", "y", "z", "w"), "ori")
+            yf[:, ori_i] = lift_orientation(aq, yf[:, ori_i])
+
+    # Velocity blocks (rotate only): linear (pos_*) and angular (ori_*).
+    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":pos_" in nm}):
+        lin_i = _idx(vel_output_names, f, ("x", "y", "z"), "pos")
+        dyf[:, lin_i] = lift_vector(aq, dyf[:, lin_i])
+    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":ori_" in nm}):
+        ang_i = _idx(vel_output_names, f, ("x", "y", "z"), "ori")
+        dyf[:, ang_i] = lift_vector(aq, dyf[:, ang_i])
+
+    return y_des, dy_des

@@ -24,8 +24,12 @@ from __future__ import annotations
 import hashlib
 import json
 
-# Bump if the digest inputs or canonicalisation below change.
-_CLIP_FINGERPRINT_VERSION = 1
+# Bump if the digest inputs or canonicalisation below change, or if the on-disk
+# clip representation for a given config/seed changes (so old and new libraries
+# never collide on the fingerprint).
+# v2: outputs stored in clip-world frame (per-step stance anchor baked in; the
+#     anchor_pos/anchor_quat schedule was dropped).
+_CLIP_FINGERPRINT_VERSION = 2
 
 
 def _canonical(obj) -> str:

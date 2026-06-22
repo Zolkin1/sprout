@@ -4,9 +4,10 @@
 """Generate a dense motion-clip library by stitching per-stride references.
 
 Samples a velocity profile per clip (the same rules the live sim uses) and
-stitches the matching strides into fixed long world-anchored clips, then
-writes them to a single HDF5 file the runtime tracks open-loop.  Flat
-ground only (v1): pure velocity nearest-neighbour selection, no terrain.
+stitches the matching strides into fixed long clips stored in a single
+clip-world frame (the per-step stance anchor is baked into the outputs), then
+writes them to a single HDF5 file the runtime tracks open-loop.  Flat ground
+only (v1): pure velocity nearest-neighbour selection, no terrain.
 
 Example::
 

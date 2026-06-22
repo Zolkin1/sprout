@@ -5,7 +5,7 @@
 Wraps a loaded :class:`ClipLibraryData` and exposes the minimal
 :class:`ManagerBase` surface the trajectory-command base class needs at
 construction (output names, ordering, reference frames, trajectory type),
-plus a per-env ``gather`` of the dense reference + world-anchor schedule by
+plus a per-env ``gather`` of the dense clip-world reference by
 ``(clip_id, step)``.  All the online machinery (Bezier eval, domains,
 contact gates, skill selection) is absent -- a clip is tracked open-loop by
 a pure step index, so the manager is a gather, not an evaluator.
@@ -122,12 +122,8 @@ class MotionClipManager(ManagerBase):
         return out.to(out_dev)
 
     def gather_desired(self, clip_id: torch.Tensor, step: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(y_des, dy_des)`` ``[N, P]`` / ``[N, V]`` for each env."""
+        """Return ``(y_des, dy_des)`` ``[N, P]`` / ``[N, V]`` (clip-world) for each env."""
         return self.gather(self.lib.y_des, clip_id, step), self.gather(self.lib.dy_des, clip_id, step)
-
-    def gather_anchor(self, clip_id: torch.Tensor, step: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return ``(anchor_pos, anchor_quat)`` ``[N, 3]`` / ``[N, 4]`` (clip frame)."""
-        return self.gather(self.lib.anchor_pos, clip_id, step), self.gather(self.lib.anchor_quat, clip_id, step)
 
     def gather_contact(self, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
         """Return the stored contact schedule ``[N, C]`` (clip ``contact_frames`` order)."""

@@ -29,16 +29,11 @@ import argparse
 import time
 
 import numpy as np
-import torch
 import viser
 from viser.extras import ViserUrdf
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
     load_clip_library,
-)
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
-    lift_orientation,
-    lift_position,
 )
 from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
 
@@ -196,23 +191,24 @@ class ClipScene:
 
     # ------------------------------------------------------------------
 
-    def _world_track(self, anchor_pos, anchor_quat, y_des, idx) -> np.ndarray:
-        """World [T,3] track for the frame whose pos outputs are at ``idx``."""
-        return lift_position(anchor_pos, anchor_quat, y_des[:, idx]).cpu().numpy()
+    def _world_track(self, y_des, idx) -> np.ndarray:
+        """Clip-world [T,3] track for the frame whose pos outputs are at ``idx``.
+
+        Clips are stored clip-world, so the track is read straight from ``y_des``.
+        """
+        return y_des[:, idx].cpu().numpy()
 
     def load_clip(self, clip_idx: int) -> None:
         """Reconstruct world tracks + robot poses for ``clip_idx`` and redraw."""
         self.clip_idx = clip_idx
-        y = self.lib.y_des[clip_idx]                 # [T, P]
-        ap = self.lib.anchor_pos[clip_idx]           # [T, 3]
-        aq = self.lib.anchor_quat[clip_idx]          # [T, 4] wxyz
+        y = self.lib.y_des[clip_idx]                 # [T, P] clip-world
         skill = self.lib.skill_id[clip_idx].cpu().numpy()
         contact = self.lib.contact[clip_idx].cpu().numpy()
 
-        # Robot base world pose + joint config for every step.  The lifted
+        # Robot base world pose + joint config for every step.  The stored
         # quaternion is xyzw (Isaac Lab); viser frames want wxyz.
-        self._world_base_pos = lift_position(ap, aq, y[:, self.base_pos_idx]).cpu().numpy()
-        self._world_base_quat = xyzw_to_wxyz(lift_orientation(aq, y[:, self.base_ori_idx]).cpu().numpy())
+        self._world_base_pos = y[:, self.base_pos_idx].cpu().numpy()
+        self._world_base_quat = xyzw_to_wxyz(y[:, self.base_ori_idx].cpu().numpy())
         self._joint_cfg = y[:, self.joint_idx].cpu().numpy()[:, self.joint_perm]
 
         # Sampled (target) velocity per step, if the library stored it.
@@ -231,7 +227,7 @@ class ClipScene:
 
         # Frame trajectory polylines.
         for fi, (frame, idx) in enumerate(self.frame_pos.items()):
-            track = self._world_track(ap, aq, y, idx)               # [T, 3]
+            track = self._world_track(y, idx)                       # [T, 3]
             segs = np.stack([track[:-1], track[1:]], axis=1)        # [T-1, 2, 3]
             color = _FRAME_COLORS[fi % len(_FRAME_COLORS)]
             name = f"/tracks/{frame}"
@@ -251,7 +247,7 @@ class ClipScene:
         for ci, cf in enumerate(self.contact_frames):
             if cf not in self.frame_pos:
                 continue
-            track = self._world_track(ap, aq, y, self.frame_pos[cf])
+            track = self._world_track(y, self.frame_pos[cf])
             c = contact[:, ci].astype(bool)
             td = np.where(c[1:] & ~c[:-1])[0] + 1
             if td.size == 0:

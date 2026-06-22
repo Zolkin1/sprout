@@ -35,6 +35,18 @@ class FlowMatchingConfig:
     # command conditioning. This is the sole command path.
     cmd_array: str | None = None
 
+    # Extra body frames (feet/hands) the *history*/encoder token is built from.
+    # ``None`` -> symmetric: the history uses every recorded extra frame (legacy
+    # behaviour). An explicit list (a subset of the recording's ``state_frame_names``;
+    # ``[]`` for none) lets the encoder consume FEWER frames than the target predicts.
+    # The deployment design uses ``[]`` so the generator needs NO measured
+    # end-effectors from the robot, while the target still PREDICTS them to feed the
+    # tracker's ``ee_ref`` obs. The two resolved lists (history_frame_names /
+    # target_frame_names) are persisted in the checkpoint meta; the target set is
+    # always every recorded extra frame. ``state_dim`` is the target width and
+    # ``history_in_dim`` the (possibly narrower) history-token width.
+    history_frame_names: list[str] | None = None
+
     # -- dimensions (resolved from the dataset at build time) --
     state_dim: int = 57
     history_in_dim: int | None = None

@@ -14,6 +14,11 @@ eval_clip := "clips/g1_flat_v1_eval.h5"
 default:
     @just --list
 
+# generate the training clip library (FM data is recorded against this)
+gen-clips num="10000" seed="0":
+    {{venv}} python scripts/rsl_rl/generate_clips.py --source {{source}} --config clips/skill_mix.json \
+        --exclude-skills walk_backwards --out {{clip_lib}} --num-clips {{num}} --seed {{seed}}
+
 # generate the held-out eval clip library (unseen stitchings: same source, new seed)
 fm-gen-eval-clips num="100" seed="1":
     {{venv}} python scripts/rsl_rl/generate_clips.py --source {{source}} --config clips/skill_mix.json \

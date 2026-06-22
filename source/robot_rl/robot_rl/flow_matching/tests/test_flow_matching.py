@@ -351,6 +351,9 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
     data = {
         "obs": obs, "state": state, "episode_id": episode_id,
         "step_in_episode": step_in_episode, "done": done,
+        # Recorded joystick command array (width 3); only used when a test sets
+        # cfg.cmd_array="target_vel" (otherwise ignored, cmd_dim == 0).
+        "target_vel": rng.standard_normal((n, 3)).astype(np.float32),
     }
     if with_ref:
         data["ref_state"] = _make_state(1)  # distinct from the actual state
@@ -365,7 +368,7 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
 def test_dataset_build_shapes():
     # episodes must be at least history_len + future_len (= 50) long to yield windows
     data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=150)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0, cmd_array="target_vel")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     assert cfg.state_dim == target_state_dim(21)         # 57
     assert cfg.history_in_dim == 57 + 3 + 150            # state + vel_cmd + height_scan
@@ -383,7 +386,7 @@ def test_dataset_build_with_extra_frames():
     frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
     k = len(frames)
     data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8, frame_names=frames)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0, cmd_array="target_vel")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     assert train_ds.num_extra_frames == k
     assert cfg.state_dim == target_state_dim(21, k)            # 57 + 4*15 = 117
@@ -391,6 +394,79 @@ def test_dataset_build_with_extra_frames():
     sample = train_ds[0]
     assert sample["history"].shape == (25, cfg.history_in_dim)
     assert sample["future"].shape == (25, target_state_dim(21, k))
+
+
+def test_dataset_asymmetric_history_frames():
+    """`history_frame_names=[]` builds a history token with NO extra frames while the
+    target still predicts every recorded frame, and the layout round-trips through
+    online.load_fm_context (the deployment design: no measured end-effectors)."""
+    from robot_rl.flow_matching.online import build_history_token, load_fm_context, sample_world
+
+    nj, scan_dim = 21, 8
+    frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+    k = len(frames)
+    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=nj, scan_dim=scan_dim, frame_names=frames)
+    # A real (recorded-array) command so cmd_dim is exercised end-to-end.
+    rng = np.random.default_rng(1)
+    data["target_vel"] = rng.standard_normal((data["state"].shape[0], 3)).astype(np.float32)
+
+    cfg = FlowMatchingConfig(
+        history_len=25, future_len=25, val_fraction=0.34, seed=0,
+        cmd_array="target_vel", history_frame_names=[],  # encoder sees NO extra frames
+    )
+    train_ds, _ = build_train_val(data, meta, cfg)
+
+    # The history is frame-free; the target predicts all recorded frames.
+    assert train_ds.history_num_extra_frames == 0
+    assert train_ds.target_num_extra_frames == k
+    assert train_ds.num_extra_frames == k  # back-compat alias == target count
+    assert cfg.state_dim == target_state_dim(nj, k)
+    assert train_ds.history_state_dim == target_state_dim(nj, 0)
+    assert cfg.history_in_dim == target_state_dim(nj, 0) + 3 + scan_dim  # history-state + cmd + scan
+    sample = train_ds[0]
+    assert sample["history"].shape == (25, cfg.history_in_dim)
+    assert sample["future"].shape == (25, target_state_dim(nj, k))
+    assert sample["future_cmd"].shape == (25, 3)
+
+    # Hand-build a checkpoint and confirm the online context resolves the asymmetry.
+    model = FlowMatchingTransformer(
+        history_in_dim=cfg.history_in_dim, state_dim=cfg.state_dim,
+        history_len=cfg.history_len, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+    )
+    ckpt = {
+        "config": cfg.to_dict(),
+        "meta": {
+            "state_joint_names": [f"j{i}" for i in range(nj)],
+            "history_frame_names": [],
+            "target_frame_names": frames,
+        },
+        "num_joints": nj,
+        "model": model.state_dict(),
+        "target_normalizer": train_ds.target_normalizer.state_dict(),
+        "history_normalizer": train_ds.history_normalizer.state_dict(),
+    }
+    ctx = load_fm_context(ckpt, device="cpu", scan_dim=scan_dim)
+    assert ctx.history_num_extra_frames == 0 and ctx.target_num_extra_frames == k
+    assert ctx.history_D == target_state_dim(nj, 0) and ctx.D == target_state_dim(nj, k)
+    assert ctx.frame_names == frames and ctx.num_extra_frames == k  # properties -> target
+    assert ctx.cmd_dim == 3 and ctx.future_cmd_dim == 3
+
+    # Online inference: a frame-free history token still predicts the target frames.
+    v, h, f = 2, ctx.H, ctx.F
+    token = build_history_token(
+        ctx,
+        root_pos=torch.randn(v, h, 3), root_quat=_rand_unit_quat(v * h).reshape(v, h, 4).float(),
+        root_lin_vel=torch.randn(v, h, 3), root_ang_vel=torch.randn(v, h, 3),
+        joint_pos=torch.randn(v, h, nj), joint_vel=torch.randn(v, h, nj),
+        cmd=torch.randn(v, h, 3), frames=None, scan=torch.randn(v, h, scan_dim),
+    )
+    assert token.shape == (v, h, ctx.Din)
+    world = sample_world(
+        ctx, token, p_ref=torch.randn(v, 3), q_ref=_rand_unit_quat(v).float(),
+        future_cmd=torch.randn(v, f, 3),
+    )
+    assert world["root_pos_w"].shape == (v, f, 3)
+    assert world["frame_pos_w"].shape == (v, f, k, 3)  # target frames are predicted
 
 
 def _split_state(rw, s_slc, name):
