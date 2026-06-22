@@ -181,11 +181,11 @@ class FutureStateDataset(Dataset):
         self.state_dim = target_state_dim(nj, self.num_extra_frames)
 
         # -- resolve the command + perception inputs --
-        # Command source: a dedicated recorded array (cfg.cmd_array, e.g. "target_vel")
-        # enables *future-horizon* conditioning -- the command is known over the whole
-        # window, so its future steps condition the decoder. Falls back to a past-only
-        # obs term (cfg.vel_cmd_term) when no array is given (the online task). The
-        # height scan is optional -- flat-ground tasks have no "height_scan" term.
+        # The command, when present, comes from a dedicated recorded array
+        # (cfg.cmd_array, e.g. "target_vel") and conditions the *whole* window: past
+        # steps in the encoder history token, future steps in the decoder. With no
+        # cmd_array there is no command conditioning (cmd_dim == 0). The height scan is
+        # optional -- flat-ground tasks have no "height_scan" term.
         try:
             self.scan_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, "height_scan")
         except KeyError:
@@ -200,16 +200,13 @@ class FutureStateDataset(Dataset):
                     f"cmd_array={self.cmd_array!r} not in the recording; re-record with "
                     f"scripts/rsl_rl/record_data.py on a clip task that exposes it (e.g. target_vel)."
                 )
-            self.vel_slice = None
             cmd_dim = int(cmd_np.shape[1])
         else:
-            self.vel_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, cfg.vel_cmd_term)
-            cmd_dim = self.vel_slice[1] - self.vel_slice[0]
+            cmd_dim = 0  # no command conditioning
 
-        # Future-command conditioning only when the command comes from a dedicated
-        # array (its future steps are a true command; an obs term's future would be
-        # an output-side / unavailable-at-deploy signal).
-        self.future_cmd_dim = cmd_dim if self.cmd_array is not None else 0
+        # The command spans the whole window, so past (encoder) and future (decoder)
+        # command widths are equal.
+        self.future_cmd_dim = cmd_dim
         self.history_in_dim = self.state_dim + cmd_dim + scan_dim
         cfg.state_dim = self.state_dim
         cfg.history_in_dim = self.history_in_dim
@@ -226,11 +223,10 @@ class FutureStateDataset(Dataset):
         # past_cmd conditions the encoder; future_cmd (array source only) the decoder.
         if self.cmd_array is not None:
             cmd_full = torch.from_numpy(np.ascontiguousarray(data[self.cmd_array])).float()[idx]  # (Nw,W,cmd)
-            past_cmd = cmd_full[:, :h, :]            # (Nw, H, cmd_dim)
-            future_cmd_raw = cmd_full[:, h:, :]      # (Nw, F, cmd_dim)
+            past_cmd = cmd_full[:, :h, :]            # (Nw, H, cmd_dim) -> encoder
+            future_cmd_raw = cmd_full[:, h:, :]      # (Nw, F, cmd_dim) -> decoder
         else:
-            cmd_cols = data["obs"][:, self.vel_slice[0]:self.vel_slice[1]]
-            past_cmd = torch.from_numpy(np.ascontiguousarray(cmd_cols)).float()[idx][:, :h, :]
+            past_cmd = None
             future_cmd_raw = None
         if scan_dim > 0:
             scan_cols = data["obs"][:, self.scan_slice[0]:self.scan_slice[1]]
@@ -263,7 +259,9 @@ class FutureStateDataset(Dataset):
         ).reshape(n_win, window_len, self.state_dim)
 
         hist_state = rel[:, :h, :]                       # (Nw, H, state_dim)
-        parts = [hist_state, past_cmd]                   # state + command (past)
+        parts = [hist_state]
+        if past_cmd is not None:
+            parts.append(past_cmd)                       # command (past) -> encoder
         if scan is not None:
             parts.append(scan)
         history = torch.cat(parts, dim=-1).contiguous()  # (Nw, H, history_in_dim)

@@ -29,16 +29,10 @@ class FlowMatchingConfig:
     # History/conditioning is always the actual recorded state.
     target_source: str = "actual"
 
-    # Obs term carrying the velocity command in the history token. Defaults to the
-    # online task's "velocity_commands"; the open-loop motion-sequence task has no
-    # velocity command, so point this at "ref_base_vel" (the clip's instantaneous
-    # reference base velocity, already recorded in the policy obs). Past-only.
-    vel_cmd_term: str = "velocity_commands"
-
     # Dedicated recorded command array (e.g. "target_vel") to condition on over the
     # *whole* window: past steps in the encoder history token, future steps injected
-    # into the decoder (future-horizon command conditioning). When set it supersedes
-    # ``vel_cmd_term``. ``None`` keeps the past-only obs-term command.
+    # into the decoder (future-horizon command conditioning). ``None`` means no
+    # command conditioning. This is the sole command path.
     cmd_array: str | None = None
 
     # -- dimensions (resolved from the dataset at build time) --

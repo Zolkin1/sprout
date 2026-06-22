@@ -77,6 +77,7 @@ from robot_rl.flow_matching.viz.recording import (
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
 import cli_args  # noqa: E402  isort: skip
+from provenance import auto_clip_device  # noqa: E402  isort: skip
 
 # NOTE: quaternions are (x, y, z, w) throughout this repo fork (robot.data,
 # isaaclab.utils.math, state_to_absolute). This differs from stock IsaacLab
@@ -131,6 +132,9 @@ parser.add_argument(
 )
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
+# Capture whether --load_run was explicit before argv is rewritten, so we can default
+# the driver policy to the one the FM checkpoint recorded (meta.checkpoint_path).
+_EXPLICIT_LOAD_RUN = any(a == "--load_run" or a.startswith("--load_run=") for a in sys.argv)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
 
@@ -197,19 +201,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Optionally hold the clip library off-GPU (keeps the ~4 GB library + sim +
         # renderer within a small card's VRAM). Set on any command term with the field.
-        if args_cli.clip_device is not None:
-            for name, term in vars(env_cfg.commands).items():
-                if hasattr(term, "clip_device"):
-                    term.clip_device = args_cli.clip_device
-                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+        # Hold the clip library off-GPU when large (auto: cpu for >1 GB). Override with --clip_device.
+        auto_clip_device(env_cfg, args_cli.clip_device)
 
-        # -- resolve RL policy checkpoint (mirror play.py) --
+        # -- resolve the RL driver checkpoint --
+        # Default to the driver the FM checkpoint was recorded with (meta.checkpoint_path);
+        # --checkpoint wins, and an explicit --load_run takes the play.py resolution path.
         resume_path = None
         if not args_cli.dry_run:
-            log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
             if args_cli.checkpoint:
                 resume_path = retrieve_file_path(args_cli.checkpoint)
-            else:
+            elif not _EXPLICIT_LOAD_RUN and _FM_CKPT is not None:
+                meta_ckpt = _FM_CKPT["meta"].get("checkpoint_path")
+                if meta_ckpt and os.path.isfile(meta_ckpt):
+                    resume_path = meta_ckpt
+                    print(f"[auto] driver policy from FM checkpoint meta: {meta_ckpt}")
+            if resume_path is None:
+                log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
                 resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
             print(f"[INFO] Loading RL policy checkpoint: {resume_path}")
 
@@ -259,7 +267,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"[INFO] FM ready: H={ctx['H']} F={ctx['F']} D={ctx['D']} Din={ctx['Din']} "
             f"nj={ctx['nj']} sampling_steps={ctx['num_steps']} "
             f"(cmd_dim={ctx['vel_dim']}, future_cmd={'on' if ctx['future_cmd_dim'] > 0 else 'off'}, "
-            f"scan_dim={ctx['scan_dim']}, source={'command-term' if ctx['cmd_term'] is not None else 'obs'})"
+            f"scan_dim={ctx['scan_dim']}, command={'on' if ctx['cmd_term'] is not None else 'none'})"
         )
 
         # The viewer wants world-frame ray hit points, which only the sensor has
@@ -388,12 +396,12 @@ def _resolve_command_term(env):
     )
 
 
-def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, vel_dim: int, device) -> FmOnlineContext:
-    """Synthesize a random-weights :class:`FmOnlineContext` for structural smoke tests."""
+def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, device) -> FmOnlineContext:
+    """Synthesize a random-weights, no-command :class:`FmOnlineContext` for smoke tests."""
     nj = len(live_joint_names)
     cfg = FlowMatchingConfig()
     d = target_state_dim(nj)
-    din = d + vel_dim + scan_dim
+    din = d + scan_dim
     model = FlowMatchingTransformer(
         history_in_dim=din, state_dim=d, history_len=cfg.history_len, future_len=cfg.future_len,
         d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
@@ -405,7 +413,7 @@ def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, vel_dim: int
         history_norm=_identity_normalizer(din, device), H=cfg.history_len, F=cfg.future_len,
         D=d, Din=din, nj=nj, num_extra_frames=0,
         num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps,
-        cmd_dim=vel_dim, future_cmd_dim=0, scan_dim=scan_dim,
+        cmd_dim=0, future_cmd_dim=0, scan_dim=scan_dim,
         joint_names=list(live_joint_names), frame_names=[], device=device,
     )
 
@@ -414,15 +422,15 @@ def _build_fm_context(env, robot, device) -> dict:
     """Assemble the flow-matching inference context (delegates math to ``online.py``).
 
     The model, normalizers, and layout come from :func:`load_fm_context` (which
-    handles future-command and extra-frame checkpoints). The command stream feeding
-    the history token is read from the trajectory command term (``target_vel``) for
-    future-command checkpoints, or sliced from the live ``vel_cmd_term`` obs term
-    otherwise. ``--dry_run`` synthesizes a random model + identity normalizers.
+    handles command-conditioned and extra-frame checkpoints). When the checkpoint is
+    command-conditioned, the command stream (past + future horizon) is read from the
+    trajectory command term; otherwise there is no command. ``--dry_run`` synthesizes
+    a random model + identity normalizers.
 
     Returns:
         A dict with the :class:`FmOnlineContext` (``fm``), the live->FM joint
-        permutation, the command source (``cmd_term`` or ``vel_slice``), the
-        optional height-scan slice, and convenience dims used by the recorder.
+        permutation, the command term (``cmd_term`` or None), the optional
+        height-scan slice, and convenience dims used by the recorder.
     """
     live_joint_names = list(robot.data.joint_names)
     obs_mgr = env.unwrapped.observation_manager
@@ -439,9 +447,8 @@ def _build_fm_context(env, robot, device) -> dict:
     if _FM_CKPT is not None:
         fm = load_fm_context(_FM_CKPT, device, args_cli.num_sampling_steps, scan_dim=scan_dim)
     else:
-        # --dry_run: command comes from the obs vel term; no future-command, no frames.
-        vd = resolve_term_slice(live_obs_names, live_obs_dims, "velocity_commands")
-        fm = _dry_run_fm_context(live_joint_names, scan_dim, vd[1] - vd[0], device)
+        # --dry_run: random model, no command, no extra frames -- exercises shapes only.
+        fm = _dry_run_fm_context(live_joint_names, scan_dim, device)
         print("[INFO] --dry_run: using a randomly-initialized model and identity normalizers.")
 
     # Extra body frames (ee): resolve their live body indices in FM frame order so the
@@ -467,28 +474,18 @@ def _build_fm_context(env, robot, device) -> dict:
         )
     joint_perm = torch.tensor([live_joint_names.index(n) for n in fm.joint_names], device=device)
 
-    # Command source. Future-command (target_vel) checkpoints read it from the command
-    # term (past command + the decoder's future horizon); others slice the live obs.
-    cmd_term, vel_slice = None, None
-    if fm.future_cmd_dim > 0:
+    # Command source: command-conditioned checkpoints read the command (past + the
+    # decoder's future horizon) from the trajectory command term. Otherwise no command.
+    cmd_term = None
+    if fm.cmd_dim > 0:
         cmd_term = _resolve_command_term(env)
         got = int(cmd_term.get_command_velocity().shape[-1])
         if got != fm.cmd_dim:
             raise ValueError(f"Command-term velocity width {got} != checkpoint cmd_dim {fm.cmd_dim}.")
-    else:
-        vel_cmd_term = (
-            _FM_CKPT["config"].get("vel_cmd_term", "velocity_commands")
-            if _FM_CKPT is not None else "velocity_commands"
-        )
-        vel_slice = resolve_term_slice(live_obs_names, live_obs_dims, vel_cmd_term)
-        if (vel_slice[1] - vel_slice[0]) != fm.cmd_dim:
-            raise ValueError(
-                f"Obs '{vel_cmd_term}' width {vel_slice[1] - vel_slice[0]} != checkpoint cmd_dim {fm.cmd_dim}."
-            )
 
     return {
         "fm": fm, "joint_perm": joint_perm, "scan_slice": scan_slice,
-        "cmd_term": cmd_term, "vel_slice": vel_slice, "frame_body_idx": frame_body_idx,
+        "cmd_term": cmd_term, "frame_body_idx": frame_body_idx,
         "H": fm.H, "F": fm.F, "D": fm.D, "Din": fm.Din, "nj": fm.nj,
         "num_steps": fm.num_steps, "joint_names": fm.joint_names,
         "vel_dim": fm.cmd_dim, "scan_dim": fm.scan_dim, "future_cmd_dim": fm.future_cmd_dim,
@@ -537,9 +534,6 @@ def _record_step(history: BatchedHistory, robot, obs, ctx: dict, wp) -> dict[str
     if ctx["cmd_term"] is not None:
         step["vel_cmd"] = ctx["cmd_term"].get_command_velocity().clone()                  # (N, cmd_dim)
         step["future_cmd"] = ctx["cmd_term"].get_command_velocity_horizon(ctx["F"]).clone()  # (N, F, cmd_dim)
-    else:
-        vs = ctx["vel_slice"]
-        step["vel_cmd"] = obs["policy"][:, vs[0]:vs[1]].clone()
     if ctx["scan_slice"] is not None:
         ss = ctx["scan_slice"]
         step["scan"] = obs["policy"][:, ss[0]:ss[1]].clone()
@@ -575,17 +569,20 @@ def _infer_predictions(
     w = history.stack("root_ang_vel")[env_ids]    # (V, H, 3)
     jp = history.stack("joint_pos")[env_ids]      # (V, H, nj)
     jv = history.stack("joint_vel")[env_ids]      # (V, H, nj)
-    cmd = history.stack("vel_cmd")[env_ids]       # (V, H, cmd_dim)
     scan = history.stack("scan")[env_ids] if fm.scan_dim > 0 else None
     frames = history.stack("frames")[env_ids] if fm.num_extra_frames > 0 else None  # (V, H, K, 13)
+    # Command (when the checkpoint is command-conditioned): past in the token, future
+    # horizon to the decoder. The horizon for the current step is at the last index.
+    if fm.cmd_dim > 0:
+        cmd = history.stack("vel_cmd")[env_ids]                       # (V, H, cmd_dim)
+        future_cmd = history.stack("future_cmd")[env_ids][:, H - 1]   # (V, F, cmd_dim)
+    else:
+        cmd = p.new_zeros(p.shape[0], H, 0)
+        future_cmd = None
 
     # online.build_history_token does the (training-matched) relative transform +
     # normalization; sample_world samples, denormalizes, and lifts to world frame.
     token = build_history_token(fm, p, q, v, w, jp, jv, cmd, frames=frames, scan=scan)
-    future_cmd = None
-    if fm.future_cmd_dim > 0:
-        # The horizon for the current step is stored at the last history index.
-        future_cmd = history.stack("future_cmd")[env_ids][:, H - 1]   # (V, F, future_cmd_dim)
     world = sample_world(fm, token, p[:, H - 1], q[:, H - 1], future_cmd=future_cmd)
     return env_ids, {
         "root_pos": world["root_pos_w"],

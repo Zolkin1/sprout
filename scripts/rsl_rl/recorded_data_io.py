@@ -49,6 +49,8 @@ class RecordingMeta:
         state_frame_names: Ordered extra body frames appended to the state vector beyond
             root + joints (each contributes ``pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)``).
             Empty when only root + joints were recorded.
+        content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
+            set after collection. Compression-robust dataset identity; empty for older files.
     """
 
     checkpoint_path: str
@@ -72,6 +74,34 @@ class RecordingMeta:
     state_joint_names: list[str]
     state_vel_frame: str
     state_frame_names: list[str] = field(default_factory=list)
+    content_sha256: str = ""
+
+
+def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
+    """Content hash over the recorded arrays (independent of npz compression).
+
+    Hashes each present array's name + dtype + shape + raw bytes in sorted key
+    order, so identical recorded content yields the same digest regardless of how
+    the ``.npz`` was written. This identifies a dataset by *content* (complementing
+    :func:`sha256_file`, which hashes the exact file). ``None`` entries are skipped.
+
+    Args:
+        data: The per-pair arrays passed to :func:`save_recorded_data`.
+
+    Returns:
+        The hex-encoded SHA-256 content digest.
+    """
+    h = hashlib.sha256()
+    for key in sorted(data):
+        arr = data[key]
+        if arr is None:
+            continue
+        a = np.ascontiguousarray(arr)
+        h.update(key.encode())
+        h.update(str(a.dtype).encode())
+        h.update(str(a.shape).encode())
+        h.update(a.tobytes())
+    return h.hexdigest()
 
 
 def sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
@@ -176,6 +206,7 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         state_joint_names=np.array(meta.state_joint_names),
         state_vel_frame=np.array(meta.state_vel_frame),
         state_frame_names=np.array(meta.state_frame_names),
+        content_sha256=np.array(meta.content_sha256),
     )
 
 
@@ -229,5 +260,6 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         state_frame_names=(
             [str(x) for x in z["state_frame_names"]] if "state_frame_names" in z.files else []
         ),
+        content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
     return data, meta

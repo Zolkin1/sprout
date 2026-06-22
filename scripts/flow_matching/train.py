@@ -32,11 +32,14 @@ from torch.utils.tensorboard import SummaryWriter
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
 from recorded_data_io import load_recorded_data  # noqa: E402  isort: skip
+from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402  isort: skip
 
 from robot_rl.flow_matching import (  # noqa: E402
     FlowMatchingConfig,
     FlowMatchingTransformer,
+    FutureStateDataset,
     build_train_val,
+    episode_windows,
     flow_matching_loss,
     frame_block_start,
     orientation_slice,
@@ -49,6 +52,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     """Parse CLI arguments into a config plus runtime options."""
     parser = argparse.ArgumentParser(description="Train a flow-matching future-state predictor.")
     parser.add_argument("--data", type=str, required=True, help="Path to a recorded .npz dataset.")
+    parser.add_argument(
+        "--eval_data", type=str, default=None,
+        help="Optional separate held-out recording (.npz) for eval metrics (logged under "
+             "eval/*). Never trained on; evaluated with the train normalizers. Must share "
+             "the train dataset's layout (state_dim / history_in_dim / extra frames).",
+    )
     parser.add_argument("--logdir", type=str, default="logs/flow_matching", help="Log/checkpoint root.")
     parser.add_argument("--run_name", type=str, default=None, help="Run name (default: timestamp).")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -64,20 +73,16 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument(
-        "--target_source", type=str, default="actual", choices=["actual", "reference"],
-        help="Future target: 'actual' recorded state, or the tracked 'reference' "
-             "(requires ref_state in the dataset). History is always the actual state.",
+        "--target_source", type=str, default="auto", choices=["auto", "actual", "reference"],
+        help="Future target: 'reference' (tracked clip reference) or 'actual' (recorded robot "
+             "state). Default 'auto' -> 'reference' if the recording has ref_state else 'actual'. "
+             "History conditioning is always the actual state.",
     )
     parser.add_argument(
-        "--vel_cmd_term", type=str, default="velocity_commands",
-        help="Obs term carrying the velocity command in the history token. Use "
-             "'ref_base_vel' for the open-loop motion-sequence task (no velocity command).",
-    )
-    parser.add_argument(
-        "--cmd_array", type=str, default=None,
-        help="Dedicated recorded command array (e.g. 'target_vel') to condition on over "
-             "the whole window -- past in the encoder, future in the decoder. Supersedes "
-             "--vel_cmd_term; requires the array in the recording.",
+        "--cmd_array", type=str, default="auto",
+        help="Command conditioning over the whole window (past in encoder, future in decoder): "
+             "a recorded array name (e.g. 'target_vel'). 'auto' -> 'target_vel' if present in the "
+             "recording, else no command. 'none' -> no command.",
     )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
@@ -97,8 +102,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         history_len=args.history_len, future_len=args.future_len, stride=args.stride,
-        val_fraction=args.val_fraction, target_source=args.target_source,
-        vel_cmd_term=args.vel_cmd_term, cmd_array=args.cmd_array,
+        val_fraction=args.val_fraction, target_source=args.target_source, cmd_array=args.cmd_array,
         d_model=args.d_model, nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
@@ -190,18 +194,50 @@ def main() -> None:
     cfg, args = parse_args()
     torch.manual_seed(cfg.seed)
 
-    run_name = args.run_name or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # Run-dir naming matches RL: <timestamp>[_<run_name>].
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_name = f"{ts}_{args.run_name}" if args.run_name else ts
     out_dir = os.path.join(args.logdir, run_name)
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    print(f"[INFO] Loading dataset: {args.data}")
-    data, meta = load_recorded_data(args.data)
+    data_path = _resolve_data_path(args.data)
+    print(f"[INFO] Loading dataset: {data_path}")
+    data, meta = load_recorded_data(data_path)
+    # Auto-config from the recording's content (only the 'auto' sentinel infers;
+    # an explicit --cmd_array / --target_source always wins).
+    cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
+    cfg.target_source = _resolve_target_source(cfg.target_source, data)
+    print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"history_in_dim={cfg.history_in_dim}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
+
+    # Optional held-out eval recording (separate dataset, never trained on; reuses the
+    # train normalizers so eval/* metrics are leakage-free and comparable to val/*).
+    eval_path = _resolve_data_path(args.eval_data) if args.eval_data else None
+    eval_ds = _build_eval_dataset(eval_path, cfg, train_ds) if eval_path else None
+    eval_sha = sha256_file(eval_path) if eval_path else None
+    if eval_ds is not None:
+        print(f"[INFO] eval_data: {len(eval_ds)} windows from {eval_path} (sha {eval_sha[:12]})")
+
+    # -- run provenance (parity with RL: git snapshot + params yaml + data identity) --
+    # cfg dims (state_dim/history_in_dim/cmd_dim) are resolved by build_train_val above,
+    # so fm_config.yaml captures the *resolved* config.
+    data_path_abs = os.path.abspath(data_path)
+    data_sha256 = sha256_file(data_path)
+    git_snapshot(out_dir)
+    dump_params_yaml(os.path.join(out_dir, "params", "fm_config.yaml"), cfg.to_dict())
+    dump_params_yaml(os.path.join(out_dir, "params", "data.yaml"), {
+        "data": data_path_abs,
+        "data_sha256": data_sha256,
+        "recording_meta": asdict(meta) if hasattr(meta, "__dataclass_fields__") else dict(vars(meta)),
+        "eval_data": os.path.abspath(eval_path) if eval_path else None,
+        "eval_data_sha256": eval_sha,
+    })
+    print(f"[INFO] Provenance -> {out_dir}/params/{{fm_config,data}}.yaml + git/  (data sha {data_sha256[:12]})")
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
@@ -211,6 +247,10 @@ def main() -> None:
     if val_ds is not None:
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                                 num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+    eval_loader = None
+    if eval_ds is not None:
+        eval_loader = DataLoader(eval_ds, batch_size=cfg.batch_size, shuffle=False,
+                                 num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
     model = FlowMatchingTransformer(
         history_in_dim=cfg.history_in_dim, state_dim=cfg.state_dim,
@@ -278,15 +318,28 @@ def main() -> None:
             log_line += "  " + "  ".join(f"val_{k}={v:.4f}" for k, v in val.items())
             if val["flow_mse"] < best_val:
                 best_val = val["flow_mse"]
-                _save_ckpt(os.path.join(out_dir, "best.pt"), model, opt, cfg, train_ds, meta, epoch)
+                _save_ckpt(os.path.join(out_dir, "best.pt"), model, opt, cfg, train_ds, meta, epoch,
+                           data_path=data_path_abs, data_sha256=data_sha256)
             if wandb_run is not None:
                 wandb_run.log({**{f"val/{k}": v for k, v in val.items()}, "epoch": epoch})
+
+        if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
+            ev = evaluate(
+                model, eval_loader, cfg, train_ds.target_normalizer, num_joints, device,
+                num_extra_frames=train_ds.num_extra_frames,
+            )
+            for k, v in ev.items():
+                writer.add_scalar(f"eval/{k}", v, epoch)
+            log_line += "  " + "  ".join(f"eval_{k}={v:.4f}" for k, v in ev.items())
+            if wandb_run is not None:
+                wandb_run.log({**{f"eval/{k}": v for k, v in ev.items()}, "epoch": epoch})
 
         print(log_line)
         if wandb_run is not None:
             wandb_run.log({"train/loss_epoch": train_loss, "train/epoch_time_s": epoch_time, "epoch": epoch})
         if epoch % args.ckpt_every == 0 or epoch == cfg.num_epochs - 1:
-            _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch)
+            _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch,
+                       data_path=data_path_abs, data_sha256=data_sha256)
 
     writer.close()
     if wandb_run is not None:
@@ -294,8 +347,80 @@ def main() -> None:
     print(f"[INFO] Done. Checkpoints in {out_dir}")
 
 
-def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch) -> None:
-    """Save model weights, optimizer, config, normalizers, and dataset metadata."""
+def _resolve_data_path(path: str) -> str:
+    """Accept a recorded ``.npz`` file or a directory.
+
+    For a directory (e.g. a run dir or its ``recorded_data/``), return the newest
+    ``recorded_*.npz`` found under it — so you can pass a run name instead of the
+    full timestamped filename.
+    """
+    if os.path.isfile(path):
+        return path
+    if os.path.isdir(path):
+        import glob  # noqa: PLC0415
+        cands = glob.glob(os.path.join(path, "**", "recorded_*.npz"), recursive=True)
+        if not cands:
+            raise FileNotFoundError(f"No recorded_*.npz found under directory: {path}")
+        return max(cands, key=os.path.getmtime)
+    raise FileNotFoundError(f"--data not found: {path}")
+
+
+def _resolve_cmd_array(value, data) -> str | None:
+    """Resolve the ``--cmd_array`` sentinel against the recording's arrays.
+
+    ``auto`` -> ``target_vel`` if recorded, else no command; ``none`` -> no command;
+    any other value is taken as an explicit array name.
+    """
+    if value in (None, "none", "None"):
+        return None
+    if value == "auto":
+        return "target_vel" if data.get("target_vel") is not None else None
+    return value
+
+
+def _resolve_target_source(value, data) -> str:
+    """Resolve the ``--target_source`` sentinel: ``auto`` -> 'reference' if the
+    recording has ``ref_state`` else 'actual'."""
+    if value == "auto":
+        return "reference" if data.get("ref_state") is not None else "actual"
+    return value
+
+
+def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
+    """Build a held-out eval dataset from a *separate* recording.
+
+    Uses ALL of its valid windows (no train/val split) and reuses the train
+    normalizers, so eval metrics are leakage-free and directly comparable to val.
+    The eval recording must share the train layout (validated below).
+    """
+    data, meta = load_recorded_data(eval_path)
+    window_len = cfg.history_len + cfg.future_len
+    windows = episode_windows(
+        data["episode_id"], data["step_in_episode"], data["done"], window_len, cfg.stride
+    )
+    if not windows:
+        raise ValueError(f"--eval_data produced no valid windows: {eval_path}")
+    ds = FutureStateDataset(
+        data, meta, cfg, windows,
+        target_normalizer=train_ds.target_normalizer,
+        history_normalizer=train_ds.history_normalizer,
+    )
+    got = (ds.state_dim, ds.history_in_dim, ds.num_extra_frames)
+    want = (train_ds.state_dim, train_ds.history_in_dim, train_ds.num_extra_frames)
+    if got != want:
+        raise ValueError(
+            f"--eval_data layout (state_dim, history_in_dim, extra_frames)={got} "
+            f"differs from train={want}; record eval data with the same task/flags."
+        )
+    return ds
+
+
+def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_sha256="") -> None:
+    """Save model weights, optimizer, config, normalizers, and dataset provenance.
+
+    ``data_path``/``data_sha256`` record exactly which recorded dataset trained this
+    checkpoint, so a ``.pt`` is self-describing without the separate params YAML.
+    """
     torch.save(
         {
             "model": model.state_dict(),
@@ -305,6 +430,8 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch) -> None:
             "history_normalizer": train_ds.history_normalizer.state_dict(),
             "num_joints": train_ds.num_joints,
             "meta": asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta),
+            "data_path": data_path,
+            "data_sha256": data_sha256,
             "epoch": epoch,
         },
         path,

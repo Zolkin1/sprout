@@ -53,10 +53,13 @@ import cli_args  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 from recorded_data_io import (  # isort: skip
     RecordingMeta,
+    fingerprint_arrays,
     sha256_file,
     unique_output_path,
     save_recorded_data,
 )
+from provenance import auto_clip_device, git_snapshot  # isort: skip
+from isaaclab.utils.io import dump_yaml  # isort: skip
 
 with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
@@ -436,14 +439,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
         env_cfg.log_dir = log_dir
 
-        # Optionally hold the clip library off-GPU (e.g. on a 12 GB card the ~4 GB
-        # library + transient reorder copy OOMs at scene init). Set on any command
-        # term exposing a clip_device field (the motion-sequence trajectory command).
-        if args_cli.clip_device is not None:
-            for name, term in vars(env_cfg.commands).items():
-                if hasattr(term, "clip_device"):
-                    term.clip_device = args_cli.clip_device
-                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+        # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
+        # OOM a small card at scene init). Explicit --clip_device overrides.
+        auto_clip_device(env_cfg, args_cli.clip_device)
 
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
@@ -530,8 +528,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")
+        # Content hash of the recorded arrays -> the dataset self-identifies.
+        meta.content_sha256 = fingerprint_arrays(data)
         save_recorded_data(out_path, data, meta)
+        # Per-recording provenance sidecar: git snapshot + the env/agent cfg used.
+        prov_dir = os.path.splitext(out_path)[0] + ".provenance"
+        git_snapshot(prov_dir)
+        try:
+            dump_yaml(os.path.join(prov_dir, "params", "env.yaml"), env_cfg)
+            dump_yaml(os.path.join(prov_dir, "params", "agent.yaml"), agent_cfg)
+        except Exception as exc:
+            print(f"[WARN] recording params dump skipped: {exc}")
         print(f"[INFO] Saved {meta.num_pairs} (obs, action) pairs to: {out_path}")
+        print(f"[INFO]   content_sha256={meta.content_sha256[:12]}  provenance={prov_dir}")
         ref_shape = data["ref_state"].shape if "ref_state" in data else None
         tvel_shape = data["target_vel"].shape if "target_vel" in data else None
         print(f"[INFO]   obs shape={data['obs'].shape}, action shape={data['action'].shape}, "
