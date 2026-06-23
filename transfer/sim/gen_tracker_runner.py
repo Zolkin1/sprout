@@ -30,32 +30,22 @@ import sys
 import mujoco
 import mujoco.viewer
 import numpy as np
-import torch
 import yaml
 
-from gen_tracker_policy import GeneratorTrackerPolicy, _wxyz_to_xyzw  # also puts transfer/ on sys.path
-from robot import Robot
-from fm.quat_math import quat_apply, quat_box_minus, quat_inv
-import experiments.velocity_commands as vc
+# Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw  # noqa: E402
+from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
+from deploy.tracker_session import convert_joint_order  # noqa: E402
+
+from robot import Robot  # noqa: E402
+import experiments.velocity_commands as vc  # noqa: E402
 
 
 def find_latest_run(log_root_path: str) -> str | None:
     """Return the most recently modified run directory name under ``log_root_path``."""
     run_dirs = glob.glob(os.path.join(log_root_path, "*"))
     return os.path.basename(max(run_dirs, key=os.path.getmtime)) if run_dirs else None
-
-
-def fm_checkpoint_from_env_yaml(run_dir: str) -> str | None:
-    """Read ``commands.traj_ref.fm_checkpoint`` from a run's ``params/env.yaml``."""
-    env_yaml = os.path.join(run_dir, "params", "env.yaml")
-    if not os.path.exists(env_yaml):
-        return None
-    with open(env_yaml) as f:
-        cfg = yaml.unsafe_load(f)
-    try:
-        return cfg["commands"]["traj_ref"]["fm_checkpoint"]
-    except (KeyError, TypeError):
-        return None
 
 
 class JoystickCommand:
@@ -89,8 +79,8 @@ class JoystickCommand:
         return np.array([vx, vy, wz])
 
 
-def build_state(robot: Robot, policy: GeneratorTrackerPolicy, command: np.ndarray) -> dict:
-    """Assemble the world-state dict ``GeneratorTrackerPolicy.create_obs`` expects.
+def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> dict:
+    """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
 
     Reads only base pose + base world-frame velocity + joints + command (and, when
     the loaded generator's history needs them, the extra-frame world states).
@@ -106,11 +96,11 @@ def build_state(robot: Robot, policy: GeneratorTrackerPolicy, command: np.ndarra
     qpos, qvel = robot.mj_data.qpos, robot.mj_data.qvel
     lin_w, ang_w = robot.get_base_world_velocity(policy.base_frame_name)
     isaac = policy.get_joint_names()
-    jp = policy._rl.convert_joint_order(np.asarray(qpos[7:]), robot.joint_names, isaac)
-    jv = policy._rl.convert_joint_order(np.asarray(qvel[6:]), robot.joint_names, isaac)
+    jp = convert_joint_order(np.asarray(qpos[7:]), robot.joint_names, isaac)
+    jv = convert_joint_order(np.asarray(qvel[6:]), robot.joint_names, isaac)
     state = {
         "root_pos": np.asarray(qpos[:3], dtype=np.float64),
-        "root_quat": _wxyz_to_xyzw(qpos[3:7]),
+        "root_quat": wxyz_to_xyzw(qpos[3:7]),
         "root_lin_vel_w": lin_w,
         "root_ang_vel_w": ang_w,
         "base_ang_vel": np.asarray(qvel[3:6], dtype=np.float64),  # body-local = Isaac base_ang_vel
@@ -176,13 +166,13 @@ def run(policy: GeneratorTrackerPolicy, robot: Robot, command_fn, total_time: fl
         if not writer:
             return
         ref = policy._reference_from_fm()
-        rq = torch.tensor(state["root_quat"])
-        ref_pos = ref["current"]["root_pos"].double()
-        ref_quat = ref["current"]["root_quat"].double()
-        pos_err = float((ref_pos - torch.tensor(state["root_pos"])).norm())
-        ori_err = float(quat_box_minus(rq, ref_quat).norm())
-        jp_err = float((ref["current"]["jp"].double() - torch.tensor(state["joint_pos"])).norm())
-        lin_b = quat_apply(quat_inv(rq), torch.tensor(state["root_lin_vel_w"]))
+        rq = np.asarray(state["root_quat"], dtype=np.float64)
+        ref_pos = np.asarray(ref["current"]["root_pos"], dtype=np.float64)
+        ref_quat = np.asarray(ref["current"]["root_quat"], dtype=np.float64)
+        pos_err = float(np.linalg.norm(ref_pos - np.asarray(state["root_pos"])))
+        ori_err = float(np.linalg.norm(quat_box_minus(rq, ref_quat)))
+        jp_err = float(np.linalg.norm(np.asarray(ref["current"]["jp"], dtype=np.float64) - state["joint_pos"]))
+        lin_b = quat_apply(quat_inv(rq), np.asarray(state["root_lin_vel_w"], dtype=np.float64))
         torques = [float(robot.mj_data.actuator_force[a]) for a in act_ids]
         writer.writerow([robot.mj_data.time, *state["command"].tolist(),
                          float(lin_b[0]), float(lin_b[1]), float(state["base_ang_vel"][2]),
@@ -232,15 +222,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the G1 generator+tracker pair in MuJoCo.")
     parser.add_argument("--experiment", type=str, default="g1")
     parser.add_argument("--load_run", type=str, default=None, help="Tracker run dir (default: latest).")
-    parser.add_argument("--fm_checkpoint", type=str, default=None,
-                        help="Generator checkpoint (default: read from the run's params/env.yaml).")
+    parser.add_argument("--fm_onnx", type=str, default=None,
+                        help="Generator ONNX (default: <run>/exported/fm.onnx).")
     parser.add_argument("--mode", choices=["joystick", "eval"], default="joystick")
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--fm_device", type=str, default=None)
+    parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
     parser.add_argument("--fm_update_every", type=int, default=2)
     parser.add_argument("--total_time", type=float, default=-1.0)
     parser.add_argument("--headless", action="store_true", default=False)
@@ -260,29 +249,22 @@ def main() -> None:
         sys.exit(f"[ERROR] No runs found in {log_root}")
     run_dir = os.path.join(log_root, run_name)
     exported = os.path.join(run_dir, "exported")
-    policy_path = os.path.join(exported, "policy.pt")
-    param_path = os.path.join(exported, "policy_parameters.yaml")
-    for p in (policy_path, param_path):
+    tracker_onnx = os.path.join(exported, "tracker.onnx")
+    fm_onnx = args.fm_onnx or os.path.join(exported, "fm.onnx")
+    for p in (tracker_onnx, fm_onnx):
         if not os.path.exists(p):
-            sys.exit(f"[ERROR] Missing {p}. Run play.py to export the tracker first.")
+            sys.exit(f"[ERROR] Missing {p}. Export with export_tracker_onnx.py / export_fm_onnx.py first.")
+    print(f"[INFO] Tracker run: {run_name}\n[INFO] tracker.onnx: {tracker_onnx}\n[INFO] fm.onnx: {fm_onnx}")
 
-    fm_ckpt = args.fm_checkpoint or fm_checkpoint_from_env_yaml(run_dir)
-    if not fm_ckpt:
-        sys.exit("[ERROR] No FM checkpoint: pass --fm_checkpoint (none found in params/env.yaml).")
-    if not os.path.isabs(fm_ckpt):
-        fm_ckpt = os.path.join(root_dir, fm_ckpt)
-    print(f"[INFO] Tracker run: {run_name}\n[INFO] FM checkpoint: {fm_ckpt}")
-
-    policy = GeneratorTrackerPolicy(
-        param_path, policy_path, fm_ckpt,
-        device=args.device, fm_device=args.fm_device, fm_update_every=args.fm_update_every,
+    policy = GenTrackerPolicy(
+        tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
     )
     policy.load()
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
     if args.use_ic:
-        robot.set_initial_condition(policy._rl)
+        robot.set_initial_condition(policy._trk)
 
     if args.mode == "joystick":
         command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)

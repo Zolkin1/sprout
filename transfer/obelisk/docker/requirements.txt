@@ -1,4 +1,5 @@
-torch==2.5.1
+torch==2.5.1  # legacy velocity-walking path only; the ONNX gen+tracker path is torch-free (drop once retired)
+onnxruntime  # torch-free generator+tracker deploy (transfer/deploy)
 huggingface_hub
 matplotlib
 scipy
