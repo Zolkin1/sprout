@@ -39,9 +39,9 @@ fm-train data name="" target="auto":
     {{venv}} python scripts/flow_matching/train.py --data {{data}} --target_source {{target}} \
         {{ if name != "" { "--run_name " + name } else { "" } }} --wandb
 
-# train with a held-out eval dataset (eval/* metrics alongside val/*)
-fm-train-eval data eval name="":
-    {{venv}} python scripts/flow_matching/train.py --data {{data}} --eval_data {{eval}} \
+# train with a held-out eval dataset (eval/* metrics alongside val/*; target=auto|actual|reference)
+fm-train-eval data eval name="" target="auto":
+    {{venv}} python scripts/flow_matching/train.py --data {{data}} --eval_data {{eval}} --target_source {{target}} \
         {{ if name != "" { "--run_name " + name } else { "" } }} --wandb
 
 # record a viz rollout (driver auto-resolved from the checkpoint) and open the viewer.
