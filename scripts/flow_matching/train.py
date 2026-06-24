@@ -100,6 +100,24 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--num_sampling_steps", type=int, default=8)
     parser.add_argument("--ori6d_aux_weight", type=float, default=0.0)
+    # Observation noise (train-time augmentation on the history/encoder token only;
+    # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
+    # physical uniform half-widths; the command (target_vel) is never noised.
+    _dn = FlowMatchingConfig()
+    parser.add_argument(
+        "--obs_noise", action=argparse.BooleanOptionalAction, default=_dn.obs_noise,
+        help="Add observation noise to the history token during training (default: on; "
+             "disable with --no-obs_noise). Off for val/eval/deployment regardless.",
+    )
+    parser.add_argument("--noise_scale", type=float, default=_dn.noise_scale,
+                        help="Global multiplier on every noise amplitude.")
+    parser.add_argument("--noise_joint_pos", type=float, default=_dn.noise_joint_pos)
+    parser.add_argument("--noise_joint_vel", type=float, default=_dn.noise_joint_vel)
+    parser.add_argument("--noise_pos", type=float, default=_dn.noise_pos)
+    parser.add_argument("--noise_lin_vel", type=float, default=_dn.noise_lin_vel)
+    parser.add_argument("--noise_ori", type=float, default=_dn.noise_ori)
+    parser.add_argument("--noise_ang_vel", type=float, default=_dn.noise_ang_vel)
+    parser.add_argument("--noise_scan", type=float, default=_dn.noise_scan)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -129,6 +147,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
+        obs_noise=args.obs_noise, noise_scale=args.noise_scale,
+        noise_joint_pos=args.noise_joint_pos, noise_joint_vel=args.noise_joint_vel,
+        noise_pos=args.noise_pos, noise_lin_vel=args.noise_lin_vel,
+        noise_ori=args.noise_ori, noise_ang_vel=args.noise_ang_vel,
+        noise_scan=args.noise_scan,
     )
     return cfg, args
 
@@ -234,6 +257,13 @@ def main() -> None:
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"history_in_dim={cfg.history_in_dim}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
+    if cfg.obs_noise:
+        print(f"[INFO] obs_noise=on (history token, train split only), scale={cfg.noise_scale} | "
+              f"joint_pos={cfg.noise_joint_pos} joint_vel={cfg.noise_joint_vel} "
+              f"pos={cfg.noise_pos} lin_vel={cfg.noise_lin_vel} ori={cfg.noise_ori} "
+              f"ang_vel={cfg.noise_ang_vel} scan={cfg.noise_scan}")
+    else:
+        print("[INFO] obs_noise=off (clean history token)")
 
     # Optional held-out eval recording (separate dataset, never trained on; reuses the
     # train normalizers so eval/* metrics are leakage-free and comparable to val/*).

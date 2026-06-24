@@ -62,6 +62,25 @@ class FlowMatchingConfig:
     dim_feedforward: int = 512
     dropout: float = 0.0
 
+    # -- observation noise (train-time augmentation on the history/encoder token) --
+    # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs
+    # the generator sees at deployment come from noisy hardware sensors, so the
+    # encoder history token is perturbed during training. Noise is applied ONLY to
+    # the history token (the conditioning), never to the prediction target, the
+    # decoder command, or the command columns of the history. It is resampled every
+    # epoch and disabled for val/eval/deployment. ``obs_noise`` is the master flag;
+    # ``noise_scale`` scales every amplitude at once (ablation / curriculum).
+    # Amplitudes are physical, uniform half-widths (the sample is U(-amp, amp)).
+    obs_noise: bool = True
+    noise_scale: float = 1.0
+    noise_joint_pos: float = 0.01   # rad        (RL match)
+    noise_joint_vel: float = 0.5    # rad/s      (RL match)
+    noise_pos: float = 0.02         # m          base + extra-frame positions (estimator)
+    noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
+    noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
+    noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
+    noise_scan: float = 0.01        # height-scan term, if present (RL match)
+
     # -- flow --
     num_sampling_steps: int = 8
     ori6d_aux_weight: float = 0.0

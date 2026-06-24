@@ -23,7 +23,13 @@ from torch.utils.data import Dataset
 
 from .config import FlowMatchingConfig
 from .normalizer import Normalizer
-from .transforms import orientation_slices, relative_state, target_state_dim
+from .transforms import (
+    FRAME_BLOCK_DIM,
+    frame_block_start,
+    orientation_slices,
+    relative_state,
+    target_state_dim,
+)
 
 
 def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str) -> tuple[int, int]:
@@ -152,6 +158,7 @@ class FutureStateDataset(Dataset):
         windows: list[np.ndarray],
         target_normalizer: Normalizer | None = None,
         history_normalizer: Normalizer | None = None,
+        add_noise: bool = False,
     ):
         """Build and (optionally) fit normalizers over the provided windows.
 
@@ -162,6 +169,9 @@ class FutureStateDataset(Dataset):
             windows: Valid window index arrays (from :func:`episode_windows`).
             target_normalizer: If given, reused (val split); else fit on these windows.
             history_normalizer: If given, reused (val split); else fit on these windows.
+            add_noise: Add resampled observation noise to the history token in
+                ``__getitem__`` (train split only). Gated by ``cfg.obs_noise``; the
+                future target and command columns are never perturbed.
         """
         self.cfg = cfg
         h, f = cfg.history_len, cfg.future_len
@@ -342,9 +352,19 @@ class FutureStateDataset(Dataset):
         self.target_normalizer = target_normalizer
         self.history_normalizer = history_normalizer
 
-        # Pre-normalize once (store normalized tensors; __getitem__ is a pure slice).
+        # Pre-normalize once (store normalized tensors; __getitem__ is a pure slice
+        # unless observation noise is active, in which case noise is added on top).
         self.history = history_normalizer.normalize(history)
         self.future = target_normalizer.normalize(future)
+
+        # -- observation noise (train-time augmentation; history token only) --
+        # Resampled per access in __getitem__, never applied to the future target,
+        # the decoder command, or the history's command columns. Gated by
+        # cfg.obs_noise so a single config field disables it everywhere.
+        self.add_noise = bool(add_noise and cfg.obs_noise)
+        self.history_noise = (
+            self._history_noise_std(history_normalizer) if self.add_noise else None
+        )
 
         # Future command (decoder conditioning), normalized with the *same* stats as
         # the past command in the history token (its command columns), so past and
@@ -424,12 +444,48 @@ class FutureStateDataset(Dataset):
             frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
         ).reshape(n_win, f, self.state_dim).contiguous()
 
+    def _history_noise_std(self, history_normalizer: Normalizer) -> torch.Tensor:
+        """Per-channel uniform noise half-width (normalized space) for the history token.
+
+        Maps the config's physical per-group amplitudes onto the history-token
+        layout ``[joint_pos | joint_vel | frame blocks x (1+K_hist) | cmd | scan]``
+        (each frame block = ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]``, frame 0
+        the root), scales by ``cfg.noise_scale``, then divides by the normalizer std
+        so the stored amplitude is in the same normalized space as ``self.history``
+        (ori6d channels have ``std == 1``, so their noise stays in raw 6D units).
+        Command columns are zero -- a command is not a measured sensor.
+
+        Args:
+            history_normalizer: The fitted history-token normalizer.
+
+        Returns:
+            Non-negative half-widths, shape ``(history_in_dim,)``.
+        """
+        cfg = self.cfg
+        nj = self.num_joints
+        amp = torch.zeros(self.history_in_dim, dtype=self.history.dtype)
+        amp[0:nj] = cfg.noise_joint_pos
+        amp[nj : 2 * nj] = cfg.noise_joint_vel
+        for fi in range(1 + self.history_num_extra_frames):
+            b = frame_block_start(nj, fi)
+            amp[b : b + 3] = cfg.noise_pos              # pos(3)
+            amp[b + 3 : b + 6] = cfg.noise_lin_vel      # lin_vel(3)
+            amp[b + 6 : b + 12] = cfg.noise_ori         # ori6d(6)
+            amp[b + 12 : b + FRAME_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
+        # Command columns [history_state_dim : +future_cmd_dim] stay zero; the
+        # remaining tail is the (optional) height-scan term.
+        amp[self.history_state_dim + self.future_cmd_dim :] = cfg.noise_scan
+        return (amp * cfg.noise_scale) / history_normalizer.std
+
     def __len__(self) -> int:
         return self.history.shape[0]
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        history = self.history[i]
+        if self.add_noise:
+            history = history + (torch.rand_like(history) * 2.0 - 1.0) * self.history_noise
         item = {
-            "history": self.history[i],
+            "history": history,
             "future": self.future[i],
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
@@ -471,7 +527,9 @@ def build_train_val(
     train_windows = [w for w, e in zip(windows, ep_of_window) if e not in val_eps]
     val_windows = [w for w, e in zip(windows, ep_of_window) if e in val_eps]
 
-    train_ds = FutureStateDataset(data, meta, cfg, train_windows)
+    # Observation noise augments the training split only; val keeps clean inputs
+    # (default add_noise=False) so val metrics measure clean-input prediction error.
+    train_ds = FutureStateDataset(data, meta, cfg, train_windows, add_noise=True)
     val_ds = None
     if len(val_windows) > 0:
         val_ds = FutureStateDataset(

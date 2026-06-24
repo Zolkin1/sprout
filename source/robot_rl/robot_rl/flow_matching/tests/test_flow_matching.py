@@ -527,6 +527,58 @@ def test_target_source_reference_uses_ref_state():
     torch.testing.assert_close(fut_r[0], expected, rtol=1e-4, atol=1e-4)
 
 
+def test_history_observation_noise():
+    """Train-time obs noise perturbs the history token only, resampled per access.
+
+    Verifies: noise lands on the train split (not val), the future target / anchors
+    / command columns stay clean, the amplitude vector maps groups correctly (root
+    ori6d is raw-scaled so it equals the configured amplitude; command columns are
+    zero), and the master flag (cfg.obs_noise=False) disables it entirely.
+    """
+    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8)
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
+                             cmd_array="target_vel")  # obs_noise defaults on
+    train_ds, val_ds = build_train_val(data, meta, cfg)
+    assert train_ds.add_noise is True
+    assert val_ds is not None and val_ds.add_noise is False
+
+    torch.manual_seed(0)
+    s1, s2 = train_ds[0], train_ds[0]
+    # History is resampled each access -> two draws differ.
+    assert not torch.allclose(s1["history"], s2["history"])
+    # Target, anchors, and decoder command are never noised -> identical.
+    torch.testing.assert_close(s1["future"], s2["future"])
+    torch.testing.assert_close(s1["p_ref"], s2["p_ref"])
+    torch.testing.assert_close(s1["q_ref"], s2["q_ref"])
+    torch.testing.assert_close(s1["future_cmd"], s2["future_cmd"])
+
+    # The command columns of the history token are not sensors -> never noised.
+    hsd, cmd_dim = train_ds.history_state_dim, train_ds.future_cmd_dim
+    torch.testing.assert_close(s1["history"][:, hsd:hsd + cmd_dim],
+                               s2["history"][:, hsd:hsd + cmd_dim])
+    torch.testing.assert_close(s1["history"][:, hsd:hsd + cmd_dim],
+                               train_ds.history[0][:, hsd:hsd + cmd_dim])
+
+    # Amplitude-vector mapping: root ori6d block is raw (std==1) so it equals the
+    # configured amplitude exactly; command columns are zero; scan columns noised.
+    o0, o1 = orientation_slice(train_ds.num_joints)
+    torch.testing.assert_close(train_ds.history_noise[o0:o1],
+                               torch.full((6,), cfg.noise_ori, dtype=train_ds.history_noise.dtype))
+    assert torch.all(train_ds.history_noise[hsd:hsd + cmd_dim] == 0)
+    assert torch.all(train_ds.history_noise[hsd + cmd_dim:] > 0)  # height-scan tail
+    assert torch.all(train_ds.history_noise[:train_ds.num_joints] > 0)  # joint_pos
+
+    # The val split (and any add_noise=False dataset) is deterministic.
+    torch.testing.assert_close(val_ds[0]["history"], val_ds[0]["history"])
+
+    # Master flag off -> no noise even though build_train_val requests add_noise.
+    cfg_off = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
+                                 cmd_array="target_vel", obs_noise=False)
+    ds_off, _ = build_train_val(data, meta, cfg_off)
+    assert ds_off.add_noise is False and ds_off.history_noise is None
+    torch.testing.assert_close(ds_off[0]["history"], ds_off[0]["history"])
+
+
 def test_target_source_reference_requires_ref_state():
     """Selecting the reference target without a recorded ref_state raises."""
     data, meta = _synthetic_dataset(num_envs=4, steps=60, nj=21, scan_dim=8, with_ref=False)

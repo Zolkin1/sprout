@@ -36,17 +36,21 @@ fm-record-eval run num="150000" envs="256":
 
 # train the FM model (target=auto|actual|reference; auto infers from the data).
 # frames: history extra-frames; "" (default) = none, "all" = symmetric, or a space-separated subset.
-fm-train data name="" target="auto" frames="":
+# noise: history-token obs noise, "on" (default) or "off" (passes --no-obs_noise).
+fm-train data name="" target="auto" frames="" noise="on":
     {{venv}} python scripts/flow_matching/train.py --data {{data}} --target_source {{target}} \
         {{ if name != "" { "--run_name " + name } else { "" } }} \
-        {{ if frames != "" { "--history_frames " + frames } else { "" } }} --wandb
+        {{ if frames != "" { "--history_frames " + frames } else { "" } }} \
+        {{ if noise == "off" { "--no-obs_noise" } else { "" } }} --wandb
 
 # train with a held-out eval dataset (eval/* metrics alongside val/*; target=auto|actual|reference).
 # frames: history extra-frames; "" (default) = none, "all" = symmetric, or a space-separated subset.
-fm-train-eval data eval name="" target="auto" frames="":
+# noise: history-token obs noise, "on" (default) or "off" (passes --no-obs_noise).
+fm-train-eval data eval name="" target="auto" frames="" noise="on":
     {{venv}} python scripts/flow_matching/train.py --data {{data}} --eval_data {{eval}} --target_source {{target}} \
         {{ if name != "" { "--run_name " + name } else { "" } }} \
-        {{ if frames != "" { "--history_frames " + frames } else { "" } }} --wandb
+        {{ if frames != "" { "--history_frames " + frames } else { "" } }} \
+        {{ if noise == "off" { "--no-obs_noise" } else { "" } }} --wandb
 
 # record a viz rollout (driver auto-resolved from the checkpoint) and open the viewer.
 # Pass `task=...` to override a stale/renamed task baked into an old checkpoint.
