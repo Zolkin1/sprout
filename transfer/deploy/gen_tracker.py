@@ -80,6 +80,7 @@ class GenTrackerPolicy:
         self._pred_idx = 0
         self._pred_valid = False
         self._ctrl_step = -1
+        self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
         self._loaded = True
 
     def _build_orderings(self) -> None:
@@ -134,6 +135,17 @@ class GenTrackerPolicy:
         self._pred_valid = False
         self._pred_idx = 0
 
+    def observe(self, state: dict) -> None:
+        """Append a real snapshot to the history without running the generator.
+
+        Used during the stable-stand warmup: the window fills with measured frames
+        while the FM stays dormant (``_pred_valid`` False), so the first live
+        ``create_obs`` cleanly triggers the first FM sample anchored on a settled
+        stand rather than on a static repeated snapshot.
+        """
+        self._ctrl_step += 1
+        self._history.append(self._make_snapshot(state))
+
     def _update_generator(self, state: dict) -> None:
         """Append the snapshot and (re-)run or advance the generator prediction."""
         self._ctrl_step += 1
@@ -159,7 +171,14 @@ class GenTrackerPolicy:
         frames = self._history.stack("frames") if ctx.history_num_extra_frames > 0 else None
 
         token = build_history_token(ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames)
-        fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
+        if self._future_cmd_override is not None:
+            # Actual future-command horizon (clip→FM handoff) -- matches IsaacLab's
+            # get_command_velocity_horizon. Without it the deploy holds the current
+            # command, which is right for joystick (future unknown) but diverges from
+            # IsaacLab during command ramps.
+            fut_cmd = np.asarray(self._future_cmd_override, dtype=np.float64).reshape(1, ctx.F, ctx.cmd_dim)
+        else:
+            fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
         noise = self._rng.standard_normal((1, ctx.F, ctx.D))
         world = sample_world(ctx, token, rp[:, -1], rq[:, -1], fut_cmd, noise)
 
@@ -233,7 +252,10 @@ class GenTrackerPolicy:
 
         fcmd, fpose, fvel = [], [], []
         for step in ref["future"]:
-            fcmd.append(command)  # held command over the horizon
+            # Held current command (FM: no per-step command) or the clip's actual
+            # future target_vel when the reference source supplies it (parity with
+            # IsaacLab's future_command_velocity, which reads the clip lookahead).
+            fcmd.append(f64(step["command"]) if "command" in step else command)
             fp = f64(step["root_pos"]); fq = f64(step["root_quat"])
             fl = f64(step["root_lin"]); fa = f64(step["root_ang"])
             fpose.append(np.concatenate(
@@ -282,6 +304,14 @@ class GenTrackerPolicy:
         """Run the tracker; return joint position targets in ``joint_names_out`` order."""
         return self._trk.get_action(obs, joint_names_out)
 
+    def set_future_command(self, future_cmd: np.ndarray | None) -> None:
+        """Override the decoder's future-command horizon for subsequent FM samples.
+
+        ``future_cmd`` is ``(F, cmd_dim)`` (the actual upcoming command, e.g. from a
+        clip); ``None`` restores the held-current-command default (joystick deploy).
+        """
+        self._future_cmd_override = None if future_cmd is None else np.asarray(future_cmd, dtype=np.float64)
+
     def reset(self) -> None:
         """Reset the rolling history + prediction state (the tracker is stateless)."""
         if self._loaded:
@@ -289,6 +319,7 @@ class GenTrackerPolicy:
             self._pred_idx = 0
             self._pred_valid = False
             self._ctrl_step = -1
+            self._future_cmd_override = None
 
     def get_dt(self) -> float:
         return self._trk.get_dt()

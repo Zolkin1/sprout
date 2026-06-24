@@ -32,6 +32,15 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     signal); the remaining ``1 - clip_fraction`` track the FM generator.  The
     per-env assignment is re-rolled on every reset."""
 
+    fm_handoff_time_s: float = -1.0
+    """If ``>= 0``, every env tracks the clip for the first ``fm_handoff_time_s`` seconds
+    of the episode, then hands off to the flow-matching generator -- a single time-based
+    clip->FM switch within one episode (overrides the per-env ``clip_fraction`` roll).
+    Mirrors the MuJoCo runner's ``--clip_handoff_time`` so the clip->FM handoff can be
+    compared apples-to-apples across IsaacLab and sim2sim.  ``< 0`` (default) uses the
+    normal random per-env clip/FM split (training).  (Float, not Optional, so a hydra
+    ``env.commands.traj_ref.fm_handoff_time_s=...`` override type-checks.)"""
+
     fm_update_every: int = 1
     """Re-run flow-matching inference every ``K`` control steps for FM-tracking
     envs; the predicted next reference advances through the F-step prediction

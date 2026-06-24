@@ -268,6 +268,16 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             self._pred_valid = self._pred_valid & ~just_reset
             self._pred_idx = torch.where(just_reset, torch.zeros_like(self._pred_idx), self._pred_idx)
 
+        # Time-based clip->FM handoff (mirrors the MuJoCo runner's --clip_handoff_time):
+        # when set, every env tracks the clip until it passes the handoff step, then the
+        # FM -- a single mid-episode switch overriding the random clip_fraction roll, so
+        # the IsaacLab side can reproduce the sim2sim handoff for comparison. The FM
+        # history is filled for all envs every step above, so the prediction is valid
+        # the moment an env crosses the handoff.
+        if self.cfg.fm_handoff_time_s >= 0.0:
+            handoff_step = round(self.cfg.fm_handoff_time_s / self.manager.dt)
+            self._fm_mask = self._step >= handoff_step
+
         # Snapshot the current world state (FM joint/frame order) into the history.
         perm = self._joint_perm
         snap = {

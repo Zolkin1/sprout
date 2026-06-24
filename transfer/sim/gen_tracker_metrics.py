@@ -147,6 +147,66 @@ def _plot_torques(cols, meta, out_dir) -> dict:
             "max_utilization": (max(util.values()) if util else None)}
 
 
+def _plot_joint_tracking(cols, meta, out_dir) -> dict:
+    """Per-joint FM-reference vs actual joint position; returns per-joint RMS."""
+    joints = meta.get("joint_names_isaac")
+    if not joints or f"jpref_{joints[0]}" not in cols:
+        return {}
+    t = cols["time"]
+    n = len(joints)
+    ncol = 3
+    nrow = (n + ncol - 1) // ncol
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.2 * nrow), sharex=True)
+    axes = np.atleast_1d(axes).ravel()
+    rms = {}
+    for i, jn in enumerate(joints):
+        ax = axes[i]
+        r, a = cols.get(f"jpref_{jn}"), cols.get(f"jpact_{jn}")
+        if r is None or a is None:
+            continue
+        ax.plot(t, r, lw=1.3, label="FM ref")
+        ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
+        rms[jn] = float(np.sqrt(np.mean((r - a) ** 2)))
+        ax.set_title(f"{jn}  (rms={rms[jn]:.3f})", fontsize=7)
+        ax.grid(alpha=0.3)
+    axes[0].legend(loc="upper right", fontsize=6)
+    for j in range(n, len(axes)):
+        axes[j].axis("off")
+    fig.suptitle("Per-joint position: FM reference vs actual [rad]")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "joint_tracking.png"), dpi=120)
+    plt.close(fig)
+    return {"rms": rms, "max_rms": (max(rms.values()) if rms else None)}
+
+
+def _plot_ee_tracking(cols, meta, out_dir) -> dict:
+    """Per-EE FM-reference vs actual position (base frame), x/y/z; returns per-EE RMS."""
+    ee = meta.get("ee_frame_names")
+    if not ee or f"eeref_{ee[0]}_x" not in cols:
+        return {}
+    t = cols["time"]
+    fig, axes = plt.subplots(len(ee), 3, figsize=(12, 2.4 * len(ee)), sharex=True, squeeze=False)
+    summary = {}
+    for i, name in enumerate(ee):
+        errs = []
+        for j, ax_name in enumerate(("x", "y", "z")):
+            ax = axes[i][j]
+            r, a = cols.get(f"eeref_{name}_{ax_name}"), cols.get(f"eeact_{name}_{ax_name}")
+            ax.plot(t, r, lw=1.3, label="FM ref")
+            ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
+            errs.append(float(np.sqrt(np.mean((r - a) ** 2))))
+            ax.set_title(f"{name}  {ax_name}", fontsize=7)
+            ax.grid(alpha=0.3)
+        summary[name] = float(np.linalg.norm(errs))
+    axes[0][0].legend(loc="upper right", fontsize=6)
+    axes[-1][0].set_xlabel("time [s]")
+    fig.suptitle("Per-EE position (base frame): FM reference vs actual [m]")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "ee_tracking.png"), dpi=120)
+    plt.close(fig)
+    return {"rms_norm": summary, "max_rms_norm": (max(summary.values()) if summary else None)}
+
+
 def create_metrics(log_dir: str) -> dict:
     """Generate all metric plots + a summary JSON for a finished run.
 
@@ -162,6 +222,8 @@ def create_metrics(log_dir: str) -> dict:
     summary = {
         "command_velocity_rms": _plot_velocity_tracking(cols, out_dir),
         "reference_tracking": _plot_reference_tracking(cols, out_dir),
+        "joint_tracking": _plot_joint_tracking(cols, meta, out_dir),
+        "ee_tracking": _plot_ee_tracking(cols, meta, out_dir),
         "survival": _plot_survival(cols, out_dir),
         "torques": _plot_torques(cols, meta, out_dir),
     }

@@ -36,6 +36,10 @@ from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTra
 # Default flow-matching generator checkpoint (override per-run via the cfg / CLI).
 DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt"
 
+# Single deterministic parity clip (see scripts/rsl_rl/generate_parity_clip.py),
+# played open-loop in the clip-only parity variant for IsaacLab <-> MuJoCo checks.
+DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
+
 
 ##
 # Commands
@@ -107,3 +111,24 @@ class G1TrackerEnvCfgPlay(G1TrackerEnvCfg):
         self.events.randomize_ground_contact_friction = None
         # Draw the (clip) reference-trajectory markers in the viewer.
         self.commands.traj_ref.debug_vis = True
+
+
+@configclass
+class G1TrackerParityPlayEnvCfg(G1TrackerEnvCfgPlay):
+    """Deterministic clip-only playback for IsaacLab <-> MuJoCo parity checks.
+
+    Plays the single hand-authored parity clip (stand -> walk -> run -> stand)
+    open-loop through the *deployed* tracker policy: ``clip_fraction = 1.0`` makes
+    every env track the clip (the FM is loaded but never sampled -- the per-env
+    source roll ``rand() >= 1.0`` is always False), and ``random_start_phase =
+    False`` starts at clip step 0 on the clip's spawn pose, so the run is fully
+    deterministic and matches the MuJoCo ``--clip`` clip-only mode reference.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.commands.traj_ref.path = DEFAULT_PARITY_CLIP_PATH
+        self.commands.traj_ref.clip_fraction = 1.0          # all envs clip, FM idle
+        self.commands.traj_ref.random_start_phase = False   # start at clip step 0
+        self.commands.traj_ref.randomize_heading = False

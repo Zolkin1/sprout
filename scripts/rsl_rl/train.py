@@ -251,6 +251,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+
+        # Don't upload model checkpoints to W&B (they eat a lot of cloud storage and
+        # we keep/use the local copies instead). Checkpoints are still written to
+        # ``log_dir`` by the runner, and code/config state still uploads via save_file.
+        if agent_cfg.logger == "wandb":
+            from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+
+            WandbSummaryWriter.save_model = lambda self, model_path, it: None
+
         # print parameter counts
         if isinstance(runner, DistillationRunner):
             student_params = sum(p.numel() for p in runner.alg.student.parameters())
