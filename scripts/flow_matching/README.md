@@ -65,7 +65,8 @@ python scripts/flow_matching/train.py --data <run-dir-or-.npz> --wandb
   - `--cmd_array` → `target_vel` if that array was recorded, else no command (future-horizon conditioning: past command in the encoder, future in the decoder). Override with an array name or `none`.
 - **`--eval_data <run-or-.npz>`** — a *separate* held-out recording (never trained on); metrics logged under `eval/*`, distinct from the within-recording `val/*`. Must share the train layout. See "Held-out evaluation" below.
 - **`--run_name`** — run dir is `logs/flow_matching/<timestamp>_<run_name>` (defaults to just the timestamp).
-- Other knobs: `--num_epochs` (200), `--stride` (1; raise to cut RAM on huge datasets), `--history_len` / `--future_len` (25), `--lr`, `--cosine`.
+- **`--history_frames`** — extra body frames the history/encoder token consumes. Default (omit / `none` / bare flag) is an **empty set**: the generator needs **no** measured end-effectors at deployment, while the target still predicts every recorded frame for the tracker's `ee_ref`. Pass `all` for symmetric (history uses every recorded frame), or a space-separated subset.
+- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--history_len` / `--future_len` (25), `--lr`, `--cosine`.
 - **Output:** `logs/flow_matching/<ts>_<run_name>/{best.pt, ckpt_<N>.pt}`. wandb logs per epoch (val every `--val_every`=5); per-step loss → TensorBoard.
 - **Provenance (parity with RL):** each run writes `git/sprout.diff` + `params/fm_config.yaml` (the resolved config) + `params/data.yaml` (train/eval `.npz` paths + their `sha256` + the recording's metadata), and every `.pt` records `data_path`/`data_sha256` — so a run is fully self-describing.
 

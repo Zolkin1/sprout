@@ -33,7 +33,7 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-from isaaclab.utils.math import quat_from_euler_xyz
+from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, yaw_quat
 
 from robot_rl.flow_matching.online import (
     BatchedHistory,
@@ -563,20 +563,31 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         """Draw two world-frame base-velocity arrows per env, floated above the base.
 
         Mirrors the stock velocity-command arrows: a **green** arrow for the
-        reference base velocity (the source-selected clip / FM target the CLF
-        grades against) and a **blue** arrow for the robot's actual base
-        velocity. Both point along the velocity's world heading and grow in
-        length with speed, so the gap between them is the base-velocity tracking
-        error at a glance. Drawn for every env (clip- and FM-tracking alike).
+        joystick-level velocity *command* (``target_vel`` = ``(vx, vy, wz)`` -- the
+        signal the velocity-tracking reward grades and the FM is conditioned on,
+        *not* the achieved reference velocity) and a **blue** arrow for the
+        robot's actual base velocity. ``target_vel`` is stored in the robot's
+        heading (base-yaw) frame, so it is rotated into the world frame by the
+        base yaw before drawing; both arrows then point along their world heading
+        and grow in length with speed, so the gap between them is the
+        joystick-level tracking error at a glance. Drawn for every env (clip- and
+        FM-tracking alike).
         """
+        if not self.command_velocity_available:
+            return  # library has no target_vel -> nothing meaningful to draw
         if self._ref_vel_markers is None:
             self._ref_vel_markers, self._act_vel_markers = self._create_vel_markers()
             if self._ref_vel_markers is None:
                 return
 
-        # Reference world base linear velocity (source-selected; layout
-        # [pos3, quat4, lin3, ang3, ...] -> lin at 7:10) and the actual one.
-        ref_lin_w = self.reference_world_state()[:, 7:10]
+        # Green: joystick-level command (target_vel, heading frame) rotated to the
+        # world frame by the base yaw -- the exact signal the reward/FM consume,
+        # not the achieved reference velocity. Blue: actual world-frame base vel.
+        cmd_vel = self.get_command_velocity()                          # [N, 3] = (vx, vy, wz), heading frame
+        cmd_xy = torch.zeros_like(cmd_vel)
+        cmd_xy[:, :2] = cmd_vel[:, :2]
+        base_yaw = yaw_quat(wp.to_torch(self.robot.data.root_quat_w))   # xyzw
+        ref_lin_w = quat_apply(base_yaw, cmd_xy)                        # [N, 3], world frame
         act_lin_w = wp.to_torch(self.robot.data.root_lin_vel_w)
 
         base_pos = wp.to_torch(self.robot.data.root_pos_w).clone()

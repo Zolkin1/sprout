@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
 
@@ -36,16 +36,16 @@ class FlowMatchingConfig:
     cmd_array: str | None = None
 
     # Extra body frames (feet/hands) the *history*/encoder token is built from.
-    # ``None`` -> symmetric: the history uses every recorded extra frame (legacy
-    # behaviour). An explicit list (a subset of the recording's ``state_frame_names``;
-    # ``[]`` for none) lets the encoder consume FEWER frames than the target predicts.
-    # The deployment design uses ``[]`` so the generator needs NO measured
-    # end-effectors from the robot, while the target still PREDICTS them to feed the
-    # tracker's ``ee_ref`` obs. The two resolved lists (history_frame_names /
-    # target_frame_names) are persisted in the checkpoint meta; the target set is
-    # always every recorded extra frame. ``state_dim`` is the target width and
-    # ``history_in_dim`` the (possibly narrower) history-token width.
-    history_frame_names: list[str] | None = None
+    # Default ``[]`` -> the history uses NO extra frames: this is the deployment
+    # design, so the generator needs NO measured end-effectors from the robot while
+    # the target still PREDICTS every recorded frame to feed the tracker's ``ee_ref``
+    # obs. ``None`` -> symmetric: the history uses every recorded extra frame (legacy
+    # behaviour). An explicit list (a subset of the recording's ``state_frame_names``)
+    # lets the encoder consume a chosen subset. The two resolved lists
+    # (history_frame_names / target_frame_names) are persisted in the checkpoint meta;
+    # the target set is always every recorded extra frame. ``state_dim`` is the target
+    # width and ``history_in_dim`` the (possibly narrower) history-token width.
+    history_frame_names: list[str] | None = field(default_factory=list)
 
     # -- dimensions (resolved from the dataset at build time) --
     state_dim: int = 57
@@ -70,7 +70,7 @@ class FlowMatchingConfig:
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-4
-    num_epochs: int = 200
+    num_epochs: int = 100
     grad_clip: float = 1.0
     seed: int = 0
 

@@ -11,7 +11,7 @@ normalizers, config, and dataset metadata.
 Example:
     python scripts/flow_matching/train.py \
         --data logs/rsl_rl/g1/<run>/recorded_data/recorded_<ts>.npz \
-        --logdir logs/flow_matching --num_epochs 200
+        --logdir logs/flow_matching --num_epochs 100
 """
 
 from __future__ import annotations
@@ -87,10 +87,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument(
         "--history_frames", type=str, nargs="*", default=None,
         help="Extra body frames the history/encoder token consumes (a subset of the "
-             "recorded --state_frames). Omit for symmetric (history uses every recorded "
-             "frame). Pass the flag with no values (or 'none') for an empty set: the "
-             "generator then needs NO measured end-effectors at deployment, while the "
-             "target still predicts every recorded frame for the tracker's ee_ref obs.",
+             "recorded --state_frames). Default (omit, 'none', or the bare flag): an "
+             "empty set, so the generator needs NO measured end-effectors at deployment "
+             "while the target still predicts every recorded frame for the tracker's "
+             "ee_ref obs. Pass 'all' for symmetric (history uses every recorded frame).",
     )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
@@ -103,17 +103,21 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_epochs", type=int, default=200)
+    parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    # ``--history_frames`` (bare) -> [] (no history frames); 'none'/'None' -> []; a
-    # list -> that subset; omitted -> None (symmetric, history uses every recorded frame).
+    # ``--history_frames``: omitted / bare / 'none' -> [] (no history frames; the
+    # deployment default so the generator needs no measured end-effectors). 'all' ->
+    # None (symmetric: history uses every recorded frame). A list -> that subset.
     history_frame_names = args.history_frames
-    if history_frame_names is not None:
-        if len(history_frame_names) == 1 and history_frame_names[0].lower() == "none":
-            history_frame_names = []
+    if history_frame_names is None:
+        history_frame_names = []
+    elif len(history_frame_names) == 1 and history_frame_names[0].lower() == "all":
+        history_frame_names = None
+    elif len(history_frame_names) == 1 and history_frame_names[0].lower() == "none":
+        history_frame_names = []
 
     cfg = FlowMatchingConfig(
         history_len=args.history_len, future_len=args.future_len, stride=args.stride,

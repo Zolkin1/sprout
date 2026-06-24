@@ -34,15 +34,19 @@ fm-record-eval run num="150000" envs="256":
     {{venv}} python scripts/rsl_rl/record_data.py --task {{task}} --load_run {{run}} \
         --num_pairs {{num}} --num_envs {{envs}} env.commands.traj_ref.path={{eval_clip}}
 
-# train the FM model (target=auto|actual|reference; auto infers from the data)
-fm-train data name="" target="auto":
+# train the FM model (target=auto|actual|reference; auto infers from the data).
+# frames: history extra-frames; "" (default) = none, "all" = symmetric, or a space-separated subset.
+fm-train data name="" target="auto" frames="":
     {{venv}} python scripts/flow_matching/train.py --data {{data}} --target_source {{target}} \
-        {{ if name != "" { "--run_name " + name } else { "" } }} --wandb
+        {{ if name != "" { "--run_name " + name } else { "" } }} \
+        {{ if frames != "" { "--history_frames " + frames } else { "" } }} --wandb
 
-# train with a held-out eval dataset (eval/* metrics alongside val/*; target=auto|actual|reference)
-fm-train-eval data eval name="" target="auto":
+# train with a held-out eval dataset (eval/* metrics alongside val/*; target=auto|actual|reference).
+# frames: history extra-frames; "" (default) = none, "all" = symmetric, or a space-separated subset.
+fm-train-eval data eval name="" target="auto" frames="":
     {{venv}} python scripts/flow_matching/train.py --data {{data}} --eval_data {{eval}} --target_source {{target}} \
-        {{ if name != "" { "--run_name " + name } else { "" } }} --wandb
+        {{ if name != "" { "--run_name " + name } else { "" } }} \
+        {{ if frames != "" { "--history_frames " + frames } else { "" } }} --wandb
 
 # record a viz rollout (driver auto-resolved from the checkpoint) and open the viewer.
 # Pass `task=...` to override a stale/renamed task baked into an old checkpoint.

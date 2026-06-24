@@ -382,11 +382,17 @@ def test_dataset_build_shapes():
 
 
 def test_dataset_build_with_extra_frames():
-    """Dataset resolves extra-frame state terms and widens state_dim accordingly."""
+    """Dataset resolves extra-frame state terms and widens state_dim accordingly.
+
+    ``history_frame_names=None`` selects the symmetric mode (history uses every
+    recorded frame); the default ``[]`` is exercised by
+    ``test_dataset_asymmetric_history_frames``.
+    """
     frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
     k = len(frames)
     data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8, frame_names=frames)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0, cmd_array="target_vel")
+    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
+                             cmd_array="target_vel", history_frame_names=None)  # symmetric
     train_ds, val_ds = build_train_val(data, meta, cfg)
     assert train_ds.num_extra_frames == k
     assert cfg.state_dim == target_state_dim(21, k)            # 57 + 4*15 = 117
