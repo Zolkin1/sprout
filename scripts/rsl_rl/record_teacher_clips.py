@@ -30,6 +30,21 @@ Example::
         --num_envs 256 --headless --clip_device cpu
 
 Smoke-test a handful of clips first with ``--max-clips 16 --num_envs 16``.
+
+To record the teacher's achieved motion on the deterministic *parity* profile
+(``stand -> walk -> run -> stand``), point ``--source-clip`` at the synthetic
+parity clip; this yields a teacher-recorded parity reference for running the same
+IsaacLab <-> MuJoCo sim2sim check on a tracker trained against teacher clips::
+
+    python scripts/rsl_rl/record_teacher_clips.py \\
+        --task G1-teacher-clf-play \\
+        --load_run 2026-06-22_16-05-10_TM1_teacher_updated_sym \\
+        --source-clip clips/g1_parity_v1.h5 \\
+        --out clips/g1_teacher_parity_v1.h5 \\
+        --num_envs 1 --headless
+
+Play it back with ``--task G1-tracker-clf-teacher-parity-play`` (IsaacLab) /
+``gen_tracker_runner.py --clip clips/g1_teacher_parity_v1.h5`` (MuJoCo).
 """
 
 import argparse

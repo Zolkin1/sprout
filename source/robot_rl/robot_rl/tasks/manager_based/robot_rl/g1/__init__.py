@@ -544,6 +544,18 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+
+    # Same parity check, but against the teacher-recorded parity clip (for a
+    # tracker trained on teacher-recorded references).
+    gym.register(
+        id="G1-tracker-clf-teacher-parity-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerTeacherParityPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 

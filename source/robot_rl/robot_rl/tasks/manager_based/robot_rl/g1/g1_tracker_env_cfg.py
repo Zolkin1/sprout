@@ -40,6 +40,13 @@ DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt"
 # played open-loop in the clip-only parity variant for IsaacLab <-> MuJoCo checks.
 DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
 
+# Teacher-recorded counterpart of the parity clip: the motion the teacher actually
+# achieved while tracking DEFAULT_PARITY_CLIP_PATH, recorded by
+# scripts/rsl_rl/record_teacher_clips.py (--source-clip clips/g1_parity_v1.h5).
+# Use this to run the identical sim2sim parity check on a tracker trained against
+# teacher-recorded clips (an on-distribution, physically realizable reference).
+DEFAULT_TEACHER_PARITY_CLIP_PATH = "clips/g1_teacher_parity_v1.h5"
+
 
 ##
 # Commands
@@ -50,7 +57,7 @@ class G1TrackerCommandsCfg:
 
     traj_ref = GeneratorTrackingCommandCfg(
         contact_bodies=[".*_ankle_roll_link"],
-        path=DEFAULT_CLIP_PATH,
+        path="clips/g1_teacher_v1.h5", #DEFAULT_CLIP_PATH,
         base_frame_name="pelvis_link",
         random_start_phase=True,
         random_start_min_remaining_s=2.0,
@@ -132,3 +139,20 @@ class G1TrackerParityPlayEnvCfg(G1TrackerEnvCfgPlay):
         self.commands.traj_ref.clip_fraction = 1.0          # all envs clip, FM idle
         self.commands.traj_ref.random_start_phase = False   # start at clip step 0
         self.commands.traj_ref.randomize_heading = False
+
+
+@configclass
+class G1TrackerTeacherParityPlayEnvCfg(G1TrackerParityPlayEnvCfg):
+    """Parity playback against the *teacher-recorded* parity clip.
+
+    Identical clip-only, deterministic playback to ``G1TrackerParityPlayEnvCfg``,
+    but tracks the motion the teacher actually achieved on the parity profile
+    (``DEFAULT_TEACHER_PARITY_CLIP_PATH``) instead of the hand-authored kinematic
+    clip.  Use this to run the same IsaacLab <-> MuJoCo parity check on a tracker
+    trained against teacher-recorded clips, whose reference distribution is the
+    teacher's realizable motion rather than the raw stitched strides.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.traj_ref.path = DEFAULT_TEACHER_PARITY_CLIP_PATH
