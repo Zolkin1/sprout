@@ -63,6 +63,14 @@ class GenTrackerPolicy:
     def load(self) -> None:
         """Load the tracker + FM ONNX sessions and build the orderings/buffers."""
         self._trk = TrackerSession(self.tracker_onnx, self.num_threads)
+        # Prefer the cadence baked into the tracker metadata (the value the policy trained
+        # with) over the constructor/CLI default, so sim2sim + hardware can't silently drift
+        # from training. Falls back to the constructor value when the export predates it.
+        meta_every = self._trk.params.get("fm_update_every")
+        if meta_every is not None:
+            self.fm_update_every = max(int(meta_every), 1)
+        print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} "
+              f"({'from tracker metadata' if meta_every is not None else 'from constructor default'})")
         self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
         if self.ctx.future_cmd_dim <= 0:
             raise ValueError("GenTrackerPolicy expects a future-command-conditioned fm.onnx.")

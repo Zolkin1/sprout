@@ -103,6 +103,13 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.clip_id = torch.zeros(n, dtype=torch.long, device=dev)
         self.start_step = torch.zeros(n, dtype=torch.long, device=dev)
         self._step = torch.zeros(n, dtype=torch.long, device=dev)
+        # Optional deterministic-reset overrides (default None => random sampling
+        # in reset_on_motion_sequence is unchanged).  When set to [N] long tensors
+        # they force the per-env clip id / start step at reset -- used by
+        # scripts/rsl_rl/record_teacher_clips.py to roll out every clip exactly
+        # once.  Training never sets these.
+        self.forced_clip_id: torch.Tensor | None = None
+        self.forced_start_step: torch.Tensor | None = None
         # Per-env world placement of the clip frame (yaw-only ground frame).
         self.clip_world_pos = torch.zeros(n, 3, device=dev)
         self.clip_world_quat = torch.zeros(n, 4, device=dev)

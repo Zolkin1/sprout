@@ -406,14 +406,16 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         base_pos = np.asarray(state["root_pos"], dtype=np.float64)
         # FM prediction spheres (only once the generator has a valid prediction).
         if policy._pred_valid:
-            rp = policy._pred["root_pos"][0]  # (F, 3) predicted root path
             n_pts = max(1, min(fm_traj_points, policy.ctx.F))
-            for i in np.unique(np.linspace(0, policy.ctx.F - 1, n_pts).astype(int)):
+            idxs = np.unique(np.linspace(0, policy.ctx.F - 1, n_pts).astype(int))
+            rp = policy._pred["root_pos"][0]  # (F, 3) predicted root path
+            for i in idxs:
                 _add_sphere(scn, rp[int(i)], (1.0, 0.55, 0.0, 0.85), 0.02)
             if foot_idx:
-                fp = policy._pred["frame_pos"][0, policy._pred_idx]  # (k, 3) current feet
-                for fi in foot_idx:
-                    _add_sphere(scn, fp[fi], (0.0, 0.9, 1.0, 0.95), 0.035)
+                fp = policy._pred["frame_pos"][0]  # (F, k, 3) predicted feet paths
+                for i in idxs:
+                    for fi in foot_idx:
+                        _add_sphere(scn, fp[int(i), fi], (0.0, 0.9, 1.0, 0.95), 0.02)
         # Velocity arrows above the pelvis: green = desired (joystick), blue = actual.
         head = base_pos + np.array([0.0, 0.0, vel_arrow_height])
         yaw = _yaw_from_xyzw(np.asarray(state["root_quat"], dtype=np.float64))
@@ -549,7 +551,9 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
-    parser.add_argument("--fm_update_every", type=int, default=2)
+    parser.add_argument("--fm_update_every", type=int, default=2,
+                        help="Generator re-inference cadence (control steps). Fallback only: "
+                             "overridden by 'fm_update_every' in the tracker metadata if present.")
     parser.add_argument("--total_time", type=float, default=-1.0)
     parser.add_argument("--warmup_time", type=float, default=1.0,
                         help="Seconds to PD-hold a stand before live control (0 disables; "

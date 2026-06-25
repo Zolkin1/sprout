@@ -46,7 +46,8 @@ def load_gen_tracker_from_hf(
         hf_repo_id: HuggingFace repo id (``user/repo``).
         hf_policy_folder: Folder within the repo holding the two ONNX files.
         cache_root: Local directory to cache downloads under.
-        fm_update_every: Generator re-inference cadence (control steps).
+        fm_update_every: Generator re-inference cadence (control steps). Fallback only:
+            overridden by 'fm_update_every' in the tracker metadata if present.
         num_threads: onnxruntime intra-op threads (0 = auto).
 
     Returns:

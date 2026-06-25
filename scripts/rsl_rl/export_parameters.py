@@ -112,6 +112,16 @@ def export_policy_parameters(env, obs, actions, save_dir):
     except (KeyError, AttributeError):
         pass
 
+    # FM generator re-inference cadence (control steps). Only the generator-tracking
+    # command carries it; baking it into the metadata lets sim2sim/hardware re-run the
+    # generator at the same cadence the tracker trained with instead of a runner default.
+    try:
+        params["fm_update_every"] = int(
+            unwrapped_env.command_manager.get_term("traj_ref").cfg.fm_update_every
+        )
+    except (KeyError, AttributeError):
+        pass
+
     # Build valid initial condition vectors (base first, then joints in joint_names order)
     root_pos = wp.to_torch(robot.data.root_pos_w)[0]        # (3,)
     root_quat = wp.to_torch(robot.data.root_quat_w)[0]      # (4,) x,y,z,w

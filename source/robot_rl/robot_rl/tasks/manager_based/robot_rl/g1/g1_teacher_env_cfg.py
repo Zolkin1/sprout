@@ -37,6 +37,13 @@ from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceC
 # env control dt, e.g. --dt 0.02).  Override per-run via the cfg.
 DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
 
+# Teacher-recorded clip library: the motion the trained teacher actually
+# achieved while tracking DEFAULT_CLIP_PATH, recorded by
+# scripts/rsl_rl/record_teacher_clips.py.  Identical schema to a generated
+# clip library, so it is selected the same way -- set traj_ref.path to this
+# (e.g. in the tracker, with clip_fraction controlling the clip-vs-FM mix).
+DEFAULT_TEACHER_CLIP_PATH = "clips/g1_teacher_v1.h5"
+
 
 ##
 # Commands
