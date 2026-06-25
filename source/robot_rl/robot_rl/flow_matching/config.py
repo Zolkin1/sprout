@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields
+import math
+from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 
@@ -12,64 +13,66 @@ from typing import Any
 class FlowMatchingConfig:
     """Hyperparameters for the flow-matching model, data pipeline, and training.
 
-    ``state_dim`` and ``history_in_dim`` are resolved from the dataset at build
-    time (they depend on the joint count and the perceptive-input width), so the
-    defaults here are placeholders.
+    ``state_dim`` and ``cmd_dim`` are resolved from the dataset at build time (they
+    depend on the joint/extra-frame count and the command width), so the defaults
+    here are placeholders.
+
+    Architecture (PARC-style single transformer, inpainting): the model denoises a
+    window of ``future_len`` state tokens. The ``num_history_states`` most-recent
+    measured states are dropped in as *clean* conditioning tokens (held fixed at
+    every flow-time and excluded from the loss); the rest of the window is the
+    predicted future. Effective novel horizon is ``future_len - num_history_states``.
+    During training the history is dropped with probability ``history_dropout_prob``
+    (the whole window is denoised unconditionally), which regularizes away history
+    over-reliance and lets the model predict from step 0 after a reset.
     """
 
     # -- data / windowing --
-    history_len: int = 25
+    # Window length F: the full denoised state sequence. The first ``num_history_states``
+    # tokens are the recent past (conditioning), the rest are the predicted future. The
+    # relative-frame anchor is the most recent history step (index num_history_states-1).
     future_len: int = 25
+    num_history_states: int = 2
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
 
     # Future-target source: "actual" predicts the recorded robot state; "reference"
-    # predicts the tracked reference (requires ``ref_state`` in the recording).
-    # History/conditioning is always the actual recorded state.
+    # predicts the tracked reference (requires ``ref_state`` in the recording). The
+    # conditioning (the clean history tokens) is always the actual recorded state.
     target_source: str = "actual"
 
-    # Dedicated recorded command array (e.g. "target_vel") to condition on over the
-    # *whole* window: past steps in the encoder history token, future steps injected
-    # into the decoder (future-horizon command conditioning). ``None`` means no
-    # command conditioning. This is the sole command path.
+    # Dedicated recorded command array (e.g. "target_vel") giving the per-step
+    # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
+    # (indices 0, cmd_stride, ...) and each sample becomes its own conditioning token
+    # (a separate command-embedding MLP). ``None`` means no command conditioning.
     cmd_array: str | None = None
-
-    # Extra body frames (feet/hands) the *history*/encoder token is built from.
-    # Default ``[]`` -> the history uses NO extra frames: this is the deployment
-    # design, so the generator needs NO measured end-effectors from the robot while
-    # the target still PREDICTS every recorded frame to feed the tracker's ``ee_ref``
-    # obs. ``None`` -> symmetric: the history uses every recorded extra frame (legacy
-    # behaviour). An explicit list (a subset of the recording's ``state_frame_names``)
-    # lets the encoder consume a chosen subset. The two resolved lists
-    # (history_frame_names / target_frame_names) are persisted in the checkpoint meta;
-    # the target set is always every recorded extra frame. ``state_dim`` is the target
-    # width and ``history_in_dim`` the (possibly narrower) history-token width.
-    history_frame_names: list[str] | None = field(default_factory=list)
+    cmd_stride: int = 5
 
     # -- dimensions (resolved from the dataset at build time) --
+    # Per-step state width of every token: 2*nj + 15*(1 + num_extra_frames). History
+    # and predicted states share this single representation (no asymmetry).
     state_dim: int = 57
-    history_in_dim: int | None = None
-    # Per-step future-command width fed to the decoder (0 disables future-command
-    # conditioning); resolved from the dataset (= cmd width when ``cmd_array`` is set).
+    # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
-    # -- model --
+    # -- model (single transformer; no separate history encoder) --
     d_model: int = 256
     nhead: int = 8
-    num_encoder_layers: int = 4
-    num_decoder_layers: int = 4
+    num_layers: int = 4
     dim_feedforward: int = 512
     dropout: float = 0.0
+    # Probability that a training sample drops its history (all tokens denoised
+    # unconditionally). Regularizes history over-reliance; enables step-0 prediction.
+    history_dropout_prob: float = 0.8
 
-    # -- observation noise (train-time augmentation on the history/encoder token) --
-    # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs
-    # the generator sees at deployment come from noisy hardware sensors, so the
-    # encoder history token is perturbed during training. Noise is applied ONLY to
-    # the history token (the conditioning), never to the prediction target, the
-    # decoder command, or the command columns of the history. It is resampled every
-    # epoch and disabled for val/eval/deployment. ``obs_noise`` is the master flag;
-    # ``noise_scale`` scales every amplitude at once (ablation / curriculum).
+    # -- observation noise (train-time augmentation on the clean history tokens) --
+    # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
+    # generator conditions on at deployment come from noisy sensors, so the first
+    # ``num_history_states`` (conditioning) state tokens are perturbed during training.
+    # Noise is applied ONLY to those conditioning tokens, never to the prediction
+    # target; it is resampled every access and disabled for val/eval/deployment.
+    # ``obs_noise`` is the master flag; ``noise_scale`` scales every amplitude at once.
     # Amplitudes are physical, uniform half-widths (the sample is U(-amp, amp)).
     obs_noise: bool = True
     noise_scale: float = 1.0
@@ -79,7 +82,6 @@ class FlowMatchingConfig:
     noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
     noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
     noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
-    noise_scan: float = 0.01        # height-scan term, if present (RL match)
 
     # -- flow --
     num_sampling_steps: int = 8
@@ -92,6 +94,13 @@ class FlowMatchingConfig:
     num_epochs: int = 100
     grad_clip: float = 1.0
     seed: int = 0
+
+    @property
+    def num_cmd_tokens(self) -> int:
+        """Number of strided command tokens (0 when not command-conditioned)."""
+        if self.cmd_dim <= 0:
+            return 0
+        return math.ceil(self.future_len / self.cmd_stride)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict copy of the config (for checkpointing)."""

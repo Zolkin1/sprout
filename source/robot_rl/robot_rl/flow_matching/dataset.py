@@ -1,6 +1,6 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Turn recorded rollouts into (history, future) windows for flow matching.
+"""Turn recorded rollouts into fixed-length state windows for flow matching.
 
 The dataset operates on already-loaded numpy arrays plus a ``meta`` object (duck
 -typed; only its layout attributes are read), so it has no dependency on the
@@ -8,9 +8,13 @@ recording scripts and is unit-testable with synthetic data. The training script
 is responsible for loading the ``.npz`` via ``recorded_data_io.load_recorded_data``
 and passing ``(data, meta)`` here.
 
-History token per past step = [relative-state] + [velocity_command] + [height_scan].
-Future target per step = relative-state. Root quantities are expressed relative to
-the reference frame at the last history step.
+Each window is ``future_len`` (F) consecutive recorded steps in one relative-frame
+representation, anchored at the most recent history step (index ``num_history_states
+- 1``). The first ``num_history_states`` (N) steps are the recent past used as clean
+conditioning tokens; the rest are the predicted future. The commanded-velocity
+profile over the window is sampled every ``cmd_stride`` steps into conditioning
+command tokens. There is one state normalizer (history and target share the
+representation) and a separate command normalizer.
 """
 
 from __future__ import annotations
@@ -76,26 +80,6 @@ def _stack_frame_tensors(
     return fp, fq, fl, fa
 
 
-# TODO(partial-history): only full H+F windows are trained on, so the first
-# H-1 steps after every reset produce no training data and no predictions at
-# inference (the viz shows nothing for the first H steps of each episode).
-# Consider training on partial histories so the model can predict from step 0.
-# Candidate approaches (roughly in order of effort):
-#   1. Repeat-first-state ("edge") padding: pad missing history by repeating
-#      the episode's first state (what Diffusion Policy / ACT do). Keeps every
-#      padded step a geometrically valid state (relative frames, ori6d) with no
-#      architecture change. NOTE: naive zero-padding is a trap here — post-
-#      normalization zeros look like the mean state, and all-zeros is not a
-#      valid ori6d rotation.
-#   2. Add a per-step 0/1 validity flag to the history token so the model can
-#      tell padding from "standing still for H steps".
-#   3. Randomize the history truncation length during training (history
-#      dropout) so the model is robust to any context length, not just the
-#      lengths that occur right after resets.
-#   4. The principled version: pad with anything + a key_padding_mask in
-#      FlowMatchingTransformer.encode so attention never reads padded steps.
-# Whatever padding rule is trained with must be mirrored exactly in the
-# inference-side history buffers (scripts/flow_matching/record_viz.py).
 def episode_windows(
     episode_id: np.ndarray,
     step_in_episode: np.ndarray,
@@ -114,7 +98,7 @@ def episode_windows(
         episode_id: Per-pair episode id, shape ``(N,)``.
         step_in_episode: Per-pair step index within its episode, shape ``(N,)``.
         done: Per-pair episode-end flag, shape ``(N,)``.
-        window_len: Window length ``H + F``.
+        window_len: Window length ``F``.
         stride: Sliding stride.
 
     Returns:
@@ -148,7 +132,7 @@ def episode_windows(
 
 
 class FutureStateDataset(Dataset):
-    """Precomputed (history, future) windows in the relative-frame representation."""
+    """Precomputed fixed-length state windows in the relative-frame representation."""
 
     def __init__(
         self,
@@ -156,28 +140,32 @@ class FutureStateDataset(Dataset):
         meta: Any,
         cfg: FlowMatchingConfig,
         windows: list[np.ndarray],
-        target_normalizer: Normalizer | None = None,
-        history_normalizer: Normalizer | None = None,
+        state_normalizer: Normalizer | None = None,
+        cmd_normalizer: Normalizer | None = None,
         add_noise: bool = False,
     ):
         """Build and (optionally) fit normalizers over the provided windows.
 
         Args:
-            data: Recorded arrays (must include ``obs`` and ``state``).
-            meta: Layout metadata (reads ``obs_term_names/dims``, ``state_term_names/dims``).
-            cfg: Config; ``state_dim`` and ``history_in_dim`` are written back here.
+            data: Recorded arrays (must include ``state``; ``ref_state`` for the
+                reference target; the command array when ``cfg.cmd_array`` is set).
+            meta: Layout metadata (reads ``state_term_names/dims``, ``state_frame_names``).
+            cfg: Config; ``state_dim`` and ``cmd_dim`` are written back here.
             windows: Valid window index arrays (from :func:`episode_windows`).
-            target_normalizer: If given, reused (val split); else fit on these windows.
-            history_normalizer: If given, reused (val split); else fit on these windows.
-            add_noise: Add resampled observation noise to the history token in
-                ``__getitem__`` (train split only). Gated by ``cfg.obs_noise``; the
-                future target and command columns are never perturbed.
+            state_normalizer: If given, reused (val split); else fit on these windows.
+            cmd_normalizer: If given, reused (val split); else fit on these windows.
+            add_noise: Add resampled observation noise to the conditioning tokens
+                (first N steps) in ``__getitem__`` (train split only). Gated by
+                ``cfg.obs_noise``; the prediction target is never perturbed.
         """
         self.cfg = cfg
-        h, f = cfg.history_len, cfg.future_len
-        window_len = h + f
+        f = cfg.future_len
+        n = cfg.num_history_states
+        self.N = n
+        if n < 1 or n >= f:
+            raise ValueError(f"num_history_states={n} must satisfy 1 <= N < future_len={f}.")
         if len(windows) == 0:
-            raise ValueError("No valid windows; check episode lengths vs history_len + future_len.")
+            raise ValueError("No valid windows; check episode lengths vs future_len.")
 
         # -- resolve state layout --
         s_names, s_dims = list(meta.state_term_names), list(meta.state_term_dims)
@@ -186,52 +174,14 @@ class FutureStateDataset(Dataset):
         self.num_joints = nj
         # Extra body frames recorded beyond root + joints (e.g. feet/hands for the
         # CLF). Each contributes a [pos, lin_vel, ori6d, ang_vel] block to the state.
-        #
-        # Asymmetric frames: the predicted *target* uses every recorded extra frame
-        # (we can only predict what was recorded), while the *history*/encoder token
-        # uses a configurable subset (``cfg.history_frame_names``). ``None`` ->
-        # symmetric (history uses every recorded frame); an explicit list (``[]`` for
-        # none) lets the encoder consume fewer frames than the target predicts -- the
-        # deployment design uses ``[]`` so the generator needs no measured
-        # end-effectors. The history is built over steps ``[:, :h]`` and the target
-        # over ``[:, h:]``, each with its own frame set (see the two relative_state
-        # builds below).
+        # History and target share this single (full) representation.
         recorded_frames = list(getattr(meta, "state_frame_names", []) or [])
-        self.state_frame_names = recorded_frames  # recorded set (legacy field name)
         self.target_frame_names = list(recorded_frames)
-        if cfg.history_frame_names is None:
-            self.history_frame_names = list(recorded_frames)
-        else:
-            requested = set(cfg.history_frame_names)
-            unknown = requested - set(recorded_frames)
-            if unknown:
-                raise ValueError(
-                    f"cfg.history_frame_names {sorted(unknown)} not in recorded "
-                    f"state_frame_names {recorded_frames}; the history can only use "
-                    f"recorded frames."
-                )
-            # Preserve the recording order for a canonical, reproducible token layout.
-            self.history_frame_names = [f for f in recorded_frames if f in requested]
-        self.target_num_extra_frames = len(self.target_frame_names)
-        self.history_num_extra_frames = len(self.history_frame_names)
-        # Back-compat alias: train.py eval metrics / tests read ``num_extra_frames``
-        # as the predicted (target) frame count.
-        self.num_extra_frames = self.target_num_extra_frames
-        self.state_dim = target_state_dim(nj, self.target_num_extra_frames)
-        self.history_state_dim = target_state_dim(nj, self.history_num_extra_frames)
+        self.num_extra_frames = len(self.target_frame_names)
+        self.state_dim = target_state_dim(nj, self.num_extra_frames)
+        cfg.state_dim = self.state_dim
 
-        # -- resolve the command + perception inputs --
-        # The command, when present, comes from a dedicated recorded array
-        # (cfg.cmd_array, e.g. "target_vel") and conditions the *whole* window: past
-        # steps in the encoder history token, future steps in the decoder. With no
-        # cmd_array there is no command conditioning (cmd_dim == 0). The height scan is
-        # optional -- flat-ground tasks have no "height_scan" term.
-        try:
-            self.scan_slice = resolve_term_slice(meta.obs_term_names, meta.obs_term_dims, "height_scan")
-        except KeyError:
-            self.scan_slice = (0, 0)
-        scan_dim = self.scan_slice[1] - self.scan_slice[0]
-
+        # -- resolve the command input (strided commanded-velocity profile) --
         self.cmd_array = cfg.cmd_array
         if self.cmd_array is not None:
             cmd_np = data.get(self.cmd_array)
@@ -242,140 +192,94 @@ class FutureStateDataset(Dataset):
                 )
             cmd_dim = int(cmd_np.shape[1])
         else:
-            cmd_dim = 0  # no command conditioning
+            cmd_dim = 0
+        self.cmd_dim = cmd_dim
+        cfg.cmd_dim = cmd_dim
+        self.cmd_steps = list(range(0, f, cfg.cmd_stride))
+        self.num_cmd_tokens = len(self.cmd_steps) if cmd_dim > 0 else 0
 
-        # The command spans the whole window, so past (encoder) and future (decoder)
-        # command widths are equal. The history token's state part is the *history*
-        # frame width (which may be narrower than the target ``state_dim``).
-        self.future_cmd_dim = cmd_dim
-        self.history_in_dim = self.history_state_dim + cmd_dim + scan_dim
-        cfg.state_dim = self.state_dim
-        cfg.history_in_dim = self.history_in_dim
-        cfg.cmd_dim = self.future_cmd_dim
-
-        idx = np.stack(windows).astype(np.int64)  # (Nw, W)
-        n_win, _ = idx.shape
+        idx = np.stack(windows).astype(np.int64)  # (Nw, F)
+        n_win = idx.shape[0]
 
         state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
-        sw = state_t[idx]  # (Nw, W, state_raw)
-
-        # Command + scan, sliced *before* windowing (the full obs is ~obs_dim/used_dim
-        # times wider, e.g. 349 vs 6, and OOMs the host on large overlapping windows).
-        # past_cmd conditions the encoder; future_cmd (array source only) the decoder.
-        if self.cmd_array is not None:
-            cmd_full = torch.from_numpy(np.ascontiguousarray(data[self.cmd_array])).float()[idx]  # (Nw,W,cmd)
-            past_cmd = cmd_full[:, :h, :]            # (Nw, H, cmd_dim) -> encoder
-            future_cmd_raw = cmd_full[:, h:, :]      # (Nw, F, cmd_dim) -> decoder
-        else:
-            past_cmd = None
-            future_cmd_raw = None
-        if scan_dim > 0:
-            scan_cols = data["obs"][:, self.scan_slice[0]:self.scan_slice[1]]
-            scan = torch.from_numpy(np.ascontiguousarray(scan_cols)).float()[idx][:, :h, :]  # (Nw,H,scan)
-        else:
-            scan = None
+        sw = state_t[idx]  # (Nw, F, state_raw)
 
         def _split(name: str) -> torch.Tensor:
             a, b = s_slc[name]
             return sw[..., a:b]
 
-        p = _split("root_pos_w")        # (Nw, W, 3)
-        q = _split("root_quat_w")       # (Nw, W, 4)
-        v = _split("root_link_lin_vel_w")    # (Nw, W, 3)
-        wv = _split("root_link_ang_vel_w")   # (Nw, W, 3)
-        jp = _split("joint_pos")        # (Nw, W, nj)
-        jv = _split("joint_vel")        # (Nw, W, nj)
+        p = _split("root_pos_w")              # (Nw, F, 3)
+        q = _split("root_quat_w")             # (Nw, F, 4)
+        v = _split("root_link_lin_vel_w")     # (Nw, F, 3)
+        wv = _split("root_link_ang_vel_w")    # (Nw, F, 3)
+        jp = _split("joint_pos")              # (Nw, F, nj)
+        jv = _split("joint_vel")              # (Nw, F, nj)
 
-        # Reference frame = last history step (index h-1), shared by both the history
-        # and target sub-windows (so history conditioning is identical regardless of
-        # target source / frame set).
-        p_ref0 = p[:, h - 1 : h, :]
-        q_ref0 = q[:, h - 1 : h, :]
+        # Relative-frame anchor = most recent history step (index N-1), shared by the
+        # actual-state conditioning and the prediction target.
+        anchor = n - 1
+        p_ref0 = p[:, anchor : anchor + 1, :]
+        q_ref0 = q[:, anchor : anchor + 1, :]
+        m = n_win * f
+        pr = p_ref0.expand(n_win, f, 3).reshape(m, 3)
+        qr = q_ref0.expand(n_win, f, 4).reshape(m, 4)
 
-        def _rel_block(step_slice: slice, length: int, frame_names: list[str]) -> torch.Tensor:
-            """Relative-state over a sub-window (steps ``step_slice``) with ``frame_names``."""
-            mm = n_win * length
-            pr = p_ref0.expand(n_win, length, 3).reshape(mm, 3)
-            qr = q_ref0.expand(n_win, length, 4).reshape(mm, 4)
-            fp, fq, fl, fa = _stack_frame_tensors(
-                lambda nm: _split(nm)[:, step_slice], frame_names, mm
-            )
-            return relative_state(
-                p[:, step_slice].reshape(mm, 3), q[:, step_slice].reshape(mm, 4),
-                v[:, step_slice].reshape(mm, 3), wv[:, step_slice].reshape(mm, 3),
-                jp[:, step_slice].reshape(mm, nj), jv[:, step_slice].reshape(mm, nj),
-                pr, qr, frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
-            ).reshape(n_win, length, -1)
+        fp, fq, fl, fa = _stack_frame_tensors(_split, self.target_frame_names, m)
+        actual = relative_state(
+            p.reshape(m, 3), q.reshape(m, 4), v.reshape(m, 3), wv.reshape(m, 3),
+            jp.reshape(m, nj), jv.reshape(m, nj), pr, qr,
+            frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
+        ).reshape(n_win, f, self.state_dim).contiguous()  # conditioning source
 
-        # History token state uses the (possibly narrower) history frame set.
-        hist_state = _rel_block(slice(0, h), h, self.history_frame_names)  # (Nw, H, history_state_dim)
-        parts = [hist_state]
-        if past_cmd is not None:
-            parts.append(past_cmd)                       # command (past) -> encoder
-        if scan is not None:
-            parts.append(scan)
-        history = torch.cat(parts, dim=-1).contiguous()  # (Nw, H, history_in_dim)
-
-        # Future target: the actual recorded state, or the tracked reference -- both
-        # use the target frame set (every recorded extra frame) and are expressed in
-        # the same relative frame (anchored at the actual pose at step h-1).
         if cfg.target_source == "reference":
-            future = self._reference_future(data, s_slc, idx, p, q, h, f, nj)  # (Nw, F, state_dim)
+            target = self._reference_future(data, s_slc, idx, p, q, anchor, f, nj).contiguous()
         elif cfg.target_source == "actual":
-            future = _rel_block(slice(h, window_len), f, self.target_frame_names).contiguous()  # (Nw, F, state_dim)
+            target = actual
         else:
             raise ValueError(
                 f"Unknown target_source {cfg.target_source!r}; expected 'actual' or 'reference'."
             )
 
-        # Reference pose per window, kept raw for eval/denorm back to world frame.
-        self.p_ref = p[:, h - 1, :].contiguous()  # (Nw, 3)
-        self.q_ref = q[:, h - 1, :].contiguous()  # (Nw, 4)
+        # Reference pose per window (anchor step), kept raw for eval/denorm to world.
+        self.p_ref = p[:, anchor, :].contiguous()  # (Nw, 3)
+        self.q_ref = q[:, anchor, :].contiguous()  # (Nw, 4)
+
+        # Strided command tokens over the window.
+        if cmd_dim > 0:
+            cmd_full = torch.from_numpy(np.ascontiguousarray(data[self.cmd_array])).float()[idx]  # (Nw,F,cmd)
+            cmd_strided = cmd_full[:, self.cmd_steps, :].contiguous()  # (Nw, num_cmd_tokens, cmd)
+        else:
+            cmd_strided = None
 
         # -- normalizers (fit on train; every frame's ori6d block left raw) --
-        target_mask = torch.ones(self.state_dim, dtype=torch.bool)
-        for o0, o1 in orientation_slices(nj, self.target_num_extra_frames):
-            target_mask[o0:o1] = False
-        # The history token's state part uses the history frame set (its own ori6d
-        # blocks); command + scan columns that follow are standardized.
-        history_state_mask = torch.ones(self.history_state_dim, dtype=torch.bool)
-        for o0, o1 in orientation_slices(nj, self.history_num_extra_frames):
-            history_state_mask[o0:o1] = False
-        history_mask = torch.cat(
-            [history_state_mask, torch.ones(self.history_in_dim - self.history_state_dim, dtype=torch.bool)]
-        )
+        state_mask = torch.ones(self.state_dim, dtype=torch.bool)
+        for o0, o1 in orientation_slices(nj, self.num_extra_frames):
+            state_mask[o0:o1] = False
+        if state_normalizer is None:
+            state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
+        self.state_normalizer = state_normalizer
 
-        if target_normalizer is None:
-            target_normalizer = Normalizer.fit(future.reshape(-1, self.state_dim), target_mask)
-        if history_normalizer is None:
-            history_normalizer = Normalizer.fit(history.reshape(-1, self.history_in_dim), history_mask)
-        self.target_normalizer = target_normalizer
-        self.history_normalizer = history_normalizer
-
-        # Pre-normalize once (store normalized tensors; __getitem__ is a pure slice
-        # unless observation noise is active, in which case noise is added on top).
-        self.history = history_normalizer.normalize(history)
-        self.future = target_normalizer.normalize(future)
-
-        # -- observation noise (train-time augmentation; history token only) --
-        # Resampled per access in __getitem__, never applied to the future target,
-        # the decoder command, or the history's command columns. Gated by
-        # cfg.obs_noise so a single config field disables it everywhere.
-        self.add_noise = bool(add_noise and cfg.obs_noise)
-        self.history_noise = (
-            self._history_noise_std(history_normalizer) if self.add_noise else None
-        )
-
-        # Future command (decoder conditioning), normalized with the *same* stats as
-        # the past command in the history token (its command columns), so past and
-        # future command live in one normalized space.
-        if future_cmd_raw is not None:
-            c0, c1 = self.history_state_dim, self.history_state_dim + self.future_cmd_dim
-            cmd_mean = history_normalizer.mean[c0:c1]
-            cmd_std = history_normalizer.std[c0:c1]
-            self.future_cmd = ((future_cmd_raw - cmd_mean) / cmd_std).contiguous()
+        if cmd_dim > 0:
+            if cmd_normalizer is None:
+                cmd_normalizer = Normalizer.fit(
+                    cmd_strided.reshape(-1, cmd_dim), torch.ones(cmd_dim, dtype=torch.bool)
+                )
+            self.cmd_normalizer = cmd_normalizer
+            self.cmd_tokens = cmd_normalizer.normalize(cmd_strided).contiguous()
         else:
-            self.future_cmd = None
+            self.cmd_normalizer = None
+            self.cmd_tokens = None
+
+        # Pre-normalize once. ``cond`` is the actual-state conditioning; for the
+        # "actual" target it is the same tensor as the (target) ``state``.
+        self.state = state_normalizer.normalize(target)
+        self.cond = self.state if cfg.target_source == "actual" else state_normalizer.normalize(actual)
+
+        # -- observation noise (train-time augmentation; conditioning tokens only) --
+        self.add_noise = bool(add_noise and cfg.obs_noise)
+        self.state_noise = (
+            self._state_noise_std(state_normalizer) if self.add_noise else None
+        )
 
     def _reference_future(
         self,
@@ -384,29 +288,29 @@ class FutureStateDataset(Dataset):
         idx: np.ndarray,
         p_actual: torch.Tensor,
         q_actual: torch.Tensor,
-        h: int,
+        anchor: int,
         f: int,
         nj: int,
     ) -> torch.Tensor:
-        """Build the future target from the recorded reference (``ref_state``).
+        """Build the prediction target from the recorded reference (``ref_state``).
 
-        The reference future is expressed in the *same* relative frame as the
-        actual-state target: anchored at the actual root pose at the last history
-        step (``p_actual``/``q_actual`` at index ``h-1``), so the history
+        The reference window is expressed in the *same* relative frame as the
+        actual-state conditioning: anchored at the actual root pose at the most
+        recent history step (``p_actual``/``q_actual`` at index ``anchor``), so the
         conditioning is identical regardless of target source.
 
         Args:
             data: Recorded arrays; must include a non-``None`` ``ref_state``.
             s_slc: Per-term ``(start, end)`` slices within the state vector.
-            idx: Window row indices, shape ``(Nw, W)``.
-            p_actual: Actual root positions over the window, shape ``(Nw, W, 3)``.
-            q_actual: Actual root quaternions over the window, shape ``(Nw, W, 4)``.
-            h: History length.
-            f: Future length.
+            idx: Window row indices, shape ``(Nw, F)``.
+            p_actual: Actual root positions over the window, shape ``(Nw, F, 3)``.
+            q_actual: Actual root quaternions over the window, shape ``(Nw, F, 4)``.
+            anchor: Index of the anchor (most recent history) step.
+            f: Window length ``F``.
             nj: Number of joints.
 
         Returns:
-            Reference future in the relative-frame representation, shape ``(Nw, F, state_dim)``.
+            Reference window in the relative-frame representation, shape ``(Nw, F, state_dim)``.
 
         Raises:
             ValueError: If the recording has no ``ref_state`` array.
@@ -418,22 +322,22 @@ class FutureStateDataset(Dataset):
                 "re-record with scripts/rsl_rl/record_data.py on a task that has a trajectory command."
             )
         ref_t = torch.from_numpy(np.ascontiguousarray(ref_np)).float()
-        rw = ref_t[idx][:, h:, :]  # (Nw, F, state_raw)
+        rw = ref_t[idx]  # (Nw, F, state_raw)
         n_win = rw.shape[0]
 
         def _split(name: str) -> torch.Tensor:
             a, b = s_slc[name]
             return rw[..., a:b]
 
-        pf = _split("root_pos_w")       # (Nw, F, 3)
-        qf = _split("root_quat_w")      # (Nw, F, 4)
-        vf = _split("root_link_lin_vel_w")   # (Nw, F, 3)
-        wf = _split("root_link_ang_vel_w")   # (Nw, F, 3)
-        jpf = _split("joint_pos")       # (Nw, F, nj)
-        jvf = _split("joint_vel")       # (Nw, F, nj)
+        pf = _split("root_pos_w")
+        qf = _split("root_quat_w")
+        vf = _split("root_link_lin_vel_w")
+        wf = _split("root_link_ang_vel_w")
+        jpf = _split("joint_pos")
+        jvf = _split("joint_vel")
 
-        p_ref = p_actual[:, h - 1 : h, :].expand(n_win, f, 3)
-        q_ref = q_actual[:, h - 1 : h, :].expand(n_win, f, 4)
+        p_ref = p_actual[:, anchor : anchor + 1, :].expand(n_win, f, 3)
+        q_ref = q_actual[:, anchor : anchor + 1, :].expand(n_win, f, 4)
 
         m = n_win * f
         fpos, fquat, flin, fang = _stack_frame_tensors(_split, self.target_frame_names, m)
@@ -442,56 +346,55 @@ class FutureStateDataset(Dataset):
             jpf.reshape(m, nj), jvf.reshape(m, nj),
             p_ref.reshape(m, 3), q_ref.reshape(m, 4),
             frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
-        ).reshape(n_win, f, self.state_dim).contiguous()
+        ).reshape(n_win, f, self.state_dim)
 
-    def _history_noise_std(self, history_normalizer: Normalizer) -> torch.Tensor:
-        """Per-channel uniform noise half-width (normalized space) for the history token.
+    def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
+        """Per-channel uniform noise half-width (normalized space) for a state token.
 
-        Maps the config's physical per-group amplitudes onto the history-token
-        layout ``[joint_pos | joint_vel | frame blocks x (1+K_hist) | cmd | scan]``
-        (each frame block = ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]``, frame 0
-        the root), scales by ``cfg.noise_scale``, then divides by the normalizer std
-        so the stored amplitude is in the same normalized space as ``self.history``
-        (ori6d channels have ``std == 1``, so their noise stays in raw 6D units).
-        Command columns are zero -- a command is not a measured sensor.
+        Maps the config's physical per-group amplitudes onto the state layout
+        ``[joint_pos | joint_vel | frame blocks x (1+K)]`` (each frame block =
+        ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]``, frame 0 the root), scales by
+        ``cfg.noise_scale``, then divides by the normalizer std so the amplitude is in
+        the same normalized space as ``self.state`` (ori6d channels have ``std == 1``,
+        so their noise stays in raw 6D units).
 
         Args:
-            history_normalizer: The fitted history-token normalizer.
+            state_normalizer: The fitted state normalizer.
 
         Returns:
-            Non-negative half-widths, shape ``(history_in_dim,)``.
+            Non-negative half-widths, shape ``(state_dim,)``.
         """
         cfg = self.cfg
         nj = self.num_joints
-        amp = torch.zeros(self.history_in_dim, dtype=self.history.dtype)
+        amp = torch.zeros(self.state_dim, dtype=self.state.dtype)
         amp[0:nj] = cfg.noise_joint_pos
         amp[nj : 2 * nj] = cfg.noise_joint_vel
-        for fi in range(1 + self.history_num_extra_frames):
+        for fi in range(1 + self.num_extra_frames):
             b = frame_block_start(nj, fi)
             amp[b : b + 3] = cfg.noise_pos              # pos(3)
             amp[b + 3 : b + 6] = cfg.noise_lin_vel      # lin_vel(3)
             amp[b + 6 : b + 12] = cfg.noise_ori         # ori6d(6)
             amp[b + 12 : b + FRAME_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
-        # Command columns [history_state_dim : +future_cmd_dim] stay zero; the
-        # remaining tail is the (optional) height-scan term.
-        amp[self.history_state_dim + self.future_cmd_dim :] = cfg.noise_scan
-        return (amp * cfg.noise_scale) / history_normalizer.std
+        return (amp * cfg.noise_scale) / state_normalizer.std
 
     def __len__(self) -> int:
-        return self.history.shape[0]
+        return self.state.shape[0]
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        history = self.history[i]
+        state = self.state[i]
+        cond = self.cond[i]
         if self.add_noise:
-            history = history + (torch.rand_like(history) * 2.0 - 1.0) * self.history_noise
+            noise = (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
+            cond = cond.clone()
+            cond[: self.N] = cond[: self.N] + noise
         item = {
-            "history": history,
-            "future": self.future[i],
+            "state": state,
+            "cond": cond,
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }
-        if self.future_cmd is not None:
-            item["future_cmd"] = self.future_cmd[i]
+        if self.cmd_tokens is not None:
+            item["cmd_tokens"] = self.cmd_tokens[i]
         return item
 
 
@@ -511,7 +414,7 @@ def build_train_val(
     Returns:
         ``(train_ds, val_ds_or_None)``.
     """
-    window_len = cfg.history_len + cfg.future_len
+    window_len = cfg.future_len
     windows = episode_windows(
         data["episode_id"], data["step_in_episode"], data["done"], window_len, cfg.stride
     )
@@ -527,14 +430,13 @@ def build_train_val(
     train_windows = [w for w, e in zip(windows, ep_of_window) if e not in val_eps]
     val_windows = [w for w, e in zip(windows, ep_of_window) if e in val_eps]
 
-    # Observation noise augments the training split only; val keeps clean inputs
-    # (default add_noise=False) so val metrics measure clean-input prediction error.
+    # Observation noise augments the training split only; val keeps clean inputs.
     train_ds = FutureStateDataset(data, meta, cfg, train_windows, add_noise=True)
     val_ds = None
     if len(val_windows) > 0:
         val_ds = FutureStateDataset(
             data, meta, cfg, val_windows,
-            target_normalizer=train_ds.target_normalizer,
-            history_normalizer=train_ds.history_normalizer,
+            state_normalizer=train_ds.state_normalizer,
+            cmd_normalizer=train_ds.cmd_normalizer,
         )
     return train_ds, val_ds

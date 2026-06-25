@@ -201,88 +201,152 @@ def test_normalizer_mask_and_inverse():
 
 
 # ---------------------------------------------------------------------------
-# 5. Flow batch math
+# 5. Masked flow batch math
 # ---------------------------------------------------------------------------
-def test_flow_batch_math():
+def test_flow_batch_masked():
     torch.manual_seed(6)
-    x1 = torch.randn(8, 25, 57)
-    x_tau, tau, target_v = sample_flow_batch(x1)
-    assert x_tau.shape == x1.shape and target_v.shape == x1.shape and tau.shape == (8,)
-    # recover x0 and verify the interpolation identity
+    b, f, d, n = 8, 10, 57, 2
+    x1 = torch.randn(b, f, d)
+    cond = torch.randn(b, f, d)
+    known = torch.zeros(b, f, dtype=torch.bool)
+    known[:, :n] = True
+    x_tau, tau, target_v = sample_flow_batch(x1, cond, known)
+    assert x_tau.shape == x1.shape and target_v.shape == x1.shape and tau.shape == (b,)
+    # Known tokens are held at the observed cond values.
+    assert torch.allclose(x_tau[:, :n], cond[:, :n])
+    # Unknown tokens follow the linear noise->data path.
     x0 = x1 - target_v
     t = tau.view(-1, 1, 1)
-    assert torch.allclose(x_tau, (1 - t) * x0 + t * x1, atol=1e-6)
+    interp = (1 - t) * x0 + t * x1
+    assert torch.allclose(x_tau[:, n:], interp[:, n:], atol=1e-6)
     assert torch.allclose(target_v, x1 - x0, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
-# 6. Model shapes + full (non-causal) decoder self-attention
+# 6. Model shapes + full (non-causal) self-attention over the token sequence
 # ---------------------------------------------------------------------------
-def test_model_shapes_and_noncausal():
+def test_model_shapes_and_full_attention():
     torch.manual_seed(7)
-    b, h, f, din, d = 3, 25, 25, 60, 57
-    model = FlowMatchingTransformer(din, d, h, f, d_model=32, nhead=4,
-                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=64)
+    b, f, d, cmd_dim, stride = 3, 8, 57, 3, 5
+    model = FlowMatchingTransformer(
+        state_dim=d, future_len=f, cmd_dim=cmd_dim, cmd_stride=stride,
+        d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
+    )
     model.eval()
-    history = torch.randn(b, h, din)
-    memory = model.encode(history)
-    assert memory.shape == (b, h, 32)
+    n_cmd = len(range(0, f, stride))  # 2
     x_tau = torch.randn(b, f, d)
     tau = torch.rand(b)
+    cmd_tokens = torch.randn(b, n_cmd, cmd_dim)
     with torch.no_grad():
-        v0 = model(x_tau, tau, memory)
+        v0 = model(x_tau, tau, cmd_tokens)
         assert v0.shape == (b, f, d)
-        # perturb future token 0 -> output at token 1 must change (full self-attn)
+        # perturb state token 0 -> output at token 1 must change (full self-attn)
         x_pert = x_tau.clone()
         x_pert[:, 0, :] += 5.0
-        v1 = model(x_pert, tau, memory)
+        v1 = model(x_pert, tau, cmd_tokens)
     assert not torch.allclose(v0[:, 1, :], v1[:, 1, :], atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
-# 7. Tiny synthetic training drives the loss down
-# ---------------------------------------------------------------------------
-def test_tiny_training_reduces_loss():
-    torch.manual_seed(8)
-    n, h, f, din, d = 256, 6, 6, 12, 8
-    history = torch.randn(n, h, din)
-    # future is a deterministic linear function of the flattened history
-    w_map = torch.randn(h * din, f * d) * 0.1
-    future = (history.reshape(n, -1) @ w_map).reshape(n, f, d)
-    # standardize future so the N(0,I) prior is well scaled
-    future = (future - future.mean(0)) / future.std(0).clamp_min(1e-6)
-
-    model = FlowMatchingTransformer(din, d, h, f, d_model=64, nhead=4,
-                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=128)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    torch.manual_seed(8)
-    init_loss = flow_matching_loss(model, history, future)["loss"].item()
-    for _ in range(300):
-        opt.zero_grad()
-        loss = flow_matching_loss(model, history, future)["loss"]
-        loss.backward()
-        opt.step()
-    final_loss = flow_matching_loss(model, history, future)["loss"].item()
-    assert final_loss < 0.5 * init_loss, f"init={init_loss:.3f} final={final_loss:.3f}"
-
-
-# ---------------------------------------------------------------------------
-# 8. Sampling shape + SO(3) validity
-# ---------------------------------------------------------------------------
-def test_sampling_shape_and_so3():
-    torch.manual_seed(9)
-    b, h, f, din, nj = 4, 25, 25, 60, 21
-    d = target_state_dim(nj)
-    model = FlowMatchingTransformer(din, d, h, f, d_model=32, nhead=4,
-                                    num_encoder_layers=2, num_decoder_layers=2, dim_feedforward=64)
+def test_model_no_command():
+    """A model built with cmd_dim=0 runs with cmd_tokens=None."""
+    torch.manual_seed(7)
+    b, f, d = 2, 6, 8
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32)
     model.eval()
-    history = torch.randn(b, h, din)
-    traj = sample_trajectory(model, history, f, d, num_steps=8)
+    with torch.no_grad():
+        v = model(torch.randn(b, f, d), torch.rand(b), None)
+    assert v.shape == (b, f, d)
+
+
+# ---------------------------------------------------------------------------
+# 7. Masked inpainting: known tokens preserved; loss ignores them
+# ---------------------------------------------------------------------------
+def test_sample_trajectory_preserves_known():
+    torch.manual_seed(9)
+    b, f, n, nj = 4, 10, 2, 21
+    d = target_state_dim(nj)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=3, cmd_stride=5,
+                                    d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
+    model.eval()
+    cond = torch.randn(b, f, d)
+    known = torch.zeros(b, f, dtype=torch.bool)
+    known[:, :n] = True
+    cmd_tokens = torch.randn(b, len(range(0, f, 5)), 3)
+    traj = sample_trajectory(model, cond, known, f, d, num_steps=8, cmd_tokens=cmd_tokens)
     assert traj.shape == (b, f, d)
+    # Known tokens are reproduced bit-exactly (re-clamped every Euler step).
+    assert torch.equal(traj[:, :n], cond[:, :n])
+    # ori6d block is Gram-Schmidt-able into a valid rotation for every token.
     o0, o1 = orientation_slice(nj)
     r = rot6d_to_matrix(traj[..., o0:o1])
     eye = torch.eye(3).expand_as(r)
     assert torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-5)
+
+
+def test_loss_ignores_known_tokens():
+    torch.manual_seed(10)
+    b, f, d, n = 4, 10, 12, 3
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32)
+    model.eval()
+    x1 = torch.randn(b, f, d)
+    cond = torch.randn(b, f, d)
+    known = torch.zeros(b, f, dtype=torch.bool)
+    known[:, :n] = True
+    torch.manual_seed(123)
+    l0 = flow_matching_loss(model, x1, cond, known)["flow_mse"].item()
+    x1b = x1.clone()
+    x1b[:, :n] += 10.0  # perturb the *known* tokens' targets only
+    torch.manual_seed(123)
+    l1 = flow_matching_loss(model, x1b, cond, known)["flow_mse"].item()
+    assert abs(l0 - l1) < 1e-6
+
+
+def test_unconditional_all_false_mask():
+    torch.manual_seed(11)
+    b, f, nj = 2, 8, 21
+    d = target_state_dim(nj)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
+    model.eval()
+    cond = torch.randn(b, f, d)
+    known = torch.zeros(b, f, dtype=torch.bool)  # drop history entirely
+    traj = sample_trajectory(model, cond, known, f, d, num_steps=4)
+    assert traj.shape == (b, f, d)
+    # Nothing is clamped -> cond is ignored.
+    assert not torch.equal(traj[:, 0], cond[:, 0])
+
+
+# ---------------------------------------------------------------------------
+# 8. Tiny synthetic training drives the (masked) loss down
+# ---------------------------------------------------------------------------
+def test_tiny_training_reduces_loss():
+    torch.manual_seed(8)
+    num, f, d, n = 256, 6, 8, 2
+    # Future tokens are a deterministic affine function of the conditioning tokens,
+    # so conditioning carries real signal the model can exploit.
+    cond_part = torch.randn(num, n, d)
+    w_map = torch.randn(n * d, (f - n) * d) * 0.1
+    future_part = (cond_part.reshape(num, -1) @ w_map).reshape(num, f - n, d)
+    state = torch.cat([cond_part, future_part], dim=1)
+    state = (state - state.mean(0)) / state.std(0).clamp_min(1e-6)
+    cond = state.clone()
+    known = torch.zeros(num, f, dtype=torch.bool)
+    known[:, :n] = True
+
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=64, nhead=4, num_layers=2, dim_feedforward=128)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    torch.manual_seed(8)
+    init_loss = flow_matching_loss(model, state, cond, known)["loss"].item()
+    for _ in range(300):
+        opt.zero_grad()
+        loss = flow_matching_loss(model, state, cond, known)["loss"]
+        loss.backward()
+        opt.step()
+    final_loss = flow_matching_loss(model, state, cond, known)["loss"].item()
+    assert final_loss < 0.5 * init_loss, f"init={init_loss:.3f} final={final_loss:.3f}"
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +370,7 @@ def test_episode_windows_respect_boundaries():
 # ---------------------------------------------------------------------------
 # Dataset end-to-end build with synthetic recorded-style data
 # ---------------------------------------------------------------------------
-def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False, frame_names=None):
+def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=8, with_ref=False, frame_names=None):
     """Build a synthetic (data, meta) pair shaped like a recorded .npz.
 
     If ``with_ref`` is set, a distinct ``ref_state`` array (same layout as
@@ -317,7 +381,8 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
     rng = np.random.default_rng(0)
     n = num_envs * steps
     frame_names = list(frame_names or [])
-    # obs layout: velocity_commands(3), height_scan(scan_dim), joint_pos(nj)
+    # obs layout: velocity_commands(3), height_scan(scan_dim), joint_pos(nj). The obs
+    # is unused by the dataset now (perception is not wired into the token layout).
     obs_term_names = ["velocity_commands", "height_scan", "joint_pos"]
     obs_term_dims = [3, scan_dim, nj]
     obs = rng.standard_normal((n, sum(obs_term_dims))).astype(np.float32)
@@ -366,113 +431,99 @@ def _synthetic_dataset(num_envs=4, steps=40, nj=21, scan_dim=150, with_ref=False
 
 
 def test_dataset_build_shapes():
-    # episodes must be at least history_len + future_len (= 50) long to yield windows
-    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=150)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0, cmd_array="target_vel")
+    data, meta = _synthetic_dataset(num_envs=6, steps=30, nj=21)
+    cfg = FlowMatchingConfig(future_len=10, num_history_states=2, cmd_stride=5,
+                             val_fraction=0.34, seed=0, cmd_array="target_vel")
     train_ds, val_ds = build_train_val(data, meta, cfg)
-    assert cfg.state_dim == target_state_dim(21)         # 57
-    assert cfg.history_in_dim == 57 + 3 + 150            # state + vel_cmd + height_scan
-    sample = train_ds[0]
-    assert sample["history"].shape == (25, cfg.history_in_dim)
-    assert sample["future"].shape == (25, 57)
-    assert sample["p_ref"].shape == (3,) and sample["q_ref"].shape == (4,)
+    assert cfg.state_dim == target_state_dim(21)  # 57
+    assert cfg.cmd_dim == 3
+    assert cfg.num_cmd_tokens == 2  # ceil(10/5)
+    s = train_ds[0]
+    assert s["state"].shape == (10, 57)
+    assert s["cond"].shape == (10, 57)
+    assert s["cmd_tokens"].shape == (2, 3)
+    assert s["p_ref"].shape == (3,) and s["q_ref"].shape == (4,)
     assert val_ds is not None and len(val_ds) > 0
-    # episode-disjoint split
-    # (rebuild windows to map back is overkill; rely on build_train_val's split-by-episode)
 
 
 def test_dataset_build_with_extra_frames():
     """Dataset resolves extra-frame state terms and widens state_dim accordingly.
 
-    ``history_frame_names=None`` selects the symmetric mode (history uses every
-    recorded frame); the default ``[]`` is exercised by
-    ``test_dataset_asymmetric_history_frames``.
+    History and target share the single full-state representation (every recorded
+    frame), so both ``state`` and ``cond`` carry the extra frames.
     """
     frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
     k = len(frames)
-    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8, frame_names=frames)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
-                             cmd_array="target_vel", history_frame_names=None)  # symmetric
-    train_ds, val_ds = build_train_val(data, meta, cfg)
+    data, meta = _synthetic_dataset(num_envs=6, steps=30, nj=21, frame_names=frames)
+    cfg = FlowMatchingConfig(future_len=10, num_history_states=2, val_fraction=0.34, seed=0,
+                             cmd_array="target_vel")
+    train_ds, _ = build_train_val(data, meta, cfg)
     assert train_ds.num_extra_frames == k
-    assert cfg.state_dim == target_state_dim(21, k)            # 57 + 4*15 = 117
-    assert cfg.history_in_dim == target_state_dim(21, k) + 3 + 8  # state + vel_cmd + scan
-    sample = train_ds[0]
-    assert sample["history"].shape == (25, cfg.history_in_dim)
-    assert sample["future"].shape == (25, target_state_dim(21, k))
+    assert cfg.state_dim == target_state_dim(21, k)  # 57 + 4*15 = 117
+    s = train_ds[0]
+    assert s["state"].shape == (10, target_state_dim(21, k))
+    assert s["cond"].shape == (10, target_state_dim(21, k))
+    assert s["cmd_tokens"].shape == (2, 3)
 
 
-def test_dataset_asymmetric_history_frames():
-    """`history_frame_names=[]` builds a history token with NO extra frames while the
-    target still predicts every recorded frame, and the layout round-trips through
-    online.load_fm_context (the deployment design: no measured end-effectors)."""
-    from robot_rl.flow_matching.online import build_history_token, load_fm_context, sample_world
+def test_online_roundtrip_with_frames():
+    """Build a checkpoint and confirm the online context round-trips conditioning
+    -> masked sampling -> world-frame prediction (history carries the EE frames the
+    model predicts)."""
+    from robot_rl.flow_matching.online import build_cmd_tokens, build_cond_states, load_fm_context, sample_world
 
-    nj, scan_dim = 21, 8
+    nj = 21
     frames = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
     k = len(frames)
-    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=nj, scan_dim=scan_dim, frame_names=frames)
-    # A real (recorded-array) command so cmd_dim is exercised end-to-end.
-    rng = np.random.default_rng(1)
-    data["target_vel"] = rng.standard_normal((data["state"].shape[0], 3)).astype(np.float32)
-
+    data, meta = _synthetic_dataset(num_envs=6, steps=30, nj=nj, frame_names=frames)
     cfg = FlowMatchingConfig(
-        history_len=25, future_len=25, val_fraction=0.34, seed=0,
-        cmd_array="target_vel", history_frame_names=[],  # encoder sees NO extra frames
+        future_len=10, num_history_states=2, cmd_stride=5, val_fraction=0.34, seed=0,
+        cmd_array="target_vel", d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
     )
     train_ds, _ = build_train_val(data, meta, cfg)
-
-    # The history is frame-free; the target predicts all recorded frames.
-    assert train_ds.history_num_extra_frames == 0
-    assert train_ds.target_num_extra_frames == k
-    assert train_ds.num_extra_frames == k  # back-compat alias == target count
     assert cfg.state_dim == target_state_dim(nj, k)
-    assert train_ds.history_state_dim == target_state_dim(nj, 0)
-    assert cfg.history_in_dim == target_state_dim(nj, 0) + 3 + scan_dim  # history-state + cmd + scan
-    sample = train_ds[0]
-    assert sample["history"].shape == (25, cfg.history_in_dim)
-    assert sample["future"].shape == (25, target_state_dim(nj, k))
-    assert sample["future_cmd"].shape == (25, 3)
 
-    # Hand-build a checkpoint and confirm the online context resolves the asymmetry.
     model = FlowMatchingTransformer(
-        history_in_dim=cfg.history_in_dim, state_dim=cfg.state_dim,
-        history_len=cfg.history_len, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+        state_dim=cfg.state_dim, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
+        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     )
     ckpt = {
         "config": cfg.to_dict(),
-        "meta": {
-            "state_joint_names": [f"j{i}" for i in range(nj)],
-            "history_frame_names": [],
-            "target_frame_names": frames,
-        },
+        "meta": {"state_joint_names": [f"j{i}" for i in range(nj)], "target_frame_names": frames},
         "num_joints": nj,
         "model": model.state_dict(),
-        "target_normalizer": train_ds.target_normalizer.state_dict(),
-        "history_normalizer": train_ds.history_normalizer.state_dict(),
+        "state_normalizer": train_ds.state_normalizer.state_dict(),
+        "cmd_normalizer": train_ds.cmd_normalizer.state_dict(),
     }
-    ctx = load_fm_context(ckpt, device="cpu", scan_dim=scan_dim)
-    assert ctx.history_num_extra_frames == 0 and ctx.target_num_extra_frames == k
-    assert ctx.history_D == target_state_dim(nj, 0) and ctx.D == target_state_dim(nj, k)
-    assert ctx.frame_names == frames and ctx.num_extra_frames == k  # properties -> target
-    assert ctx.cmd_dim == 3 and ctx.future_cmd_dim == 3
+    ctx = load_fm_context(ckpt, device="cpu")
+    assert ctx.N == 2 and ctx.F == 10 and ctx.D == target_state_dim(nj, k)
+    assert ctx.target_num_extra_frames == k and ctx.frame_names == frames
+    assert ctx.cmd_dim == 3 and ctx.num_cmd_tokens == 2
 
-    # Online inference: a frame-free history token still predicts the target frames.
-    v, h, f = 2, ctx.H, ctx.F
-    token = build_history_token(
+    v, nstate = 2, ctx.N
+    fr = torch.randn(v, nstate, k, 13)
+    fr[..., 3:7] = fr[..., 3:7] / fr[..., 3:7].norm(dim=-1, keepdim=True)  # unit quats
+    cond, known = build_cond_states(
         ctx,
-        root_pos=torch.randn(v, h, 3), root_quat=_rand_unit_quat(v * h).reshape(v, h, 4).float(),
-        root_lin_vel=torch.randn(v, h, 3), root_ang_vel=torch.randn(v, h, 3),
-        joint_pos=torch.randn(v, h, nj), joint_vel=torch.randn(v, h, nj),
-        cmd=torch.randn(v, h, 3), frames=None, scan=torch.randn(v, h, scan_dim),
+        root_pos=torch.randn(v, nstate, 3),
+        root_quat=_rand_unit_quat(v * nstate).reshape(v, nstate, 4).float(),
+        root_lin_vel=torch.randn(v, nstate, 3), root_ang_vel=torch.randn(v, nstate, 3),
+        joint_pos=torch.randn(v, nstate, nj), joint_vel=torch.randn(v, nstate, nj),
+        frames=fr,
     )
-    assert token.shape == (v, h, ctx.Din)
+    assert cond.shape == (v, ctx.F, ctx.D) and known.shape == (v, ctx.F)
+    assert known[:, :nstate].all() and not known[:, nstate:].any()
+
+    cmd_tokens = build_cmd_tokens(ctx, torch.randn(v, ctx.F, 3))
+    assert cmd_tokens.shape == (v, ctx.num_cmd_tokens, 3)
+
     world = sample_world(
-        ctx, token, p_ref=torch.randn(v, 3), q_ref=_rand_unit_quat(v).float(),
-        future_cmd=torch.randn(v, f, 3),
+        ctx, cond, known, p_ref=torch.randn(v, 3), q_ref=_rand_unit_quat(v).float(),
+        cmd_tokens=cmd_tokens,
     )
-    assert world["root_pos_w"].shape == (v, f, 3)
-    assert world["frame_pos_w"].shape == (v, f, k, 3)  # target frames are predicted
+    assert world["root_pos_w"].shape == (v, ctx.F, 3)
+    assert world["frame_pos_w"].shape == (v, ctx.F, k, 3)  # target frames are predicted
 
 
 def _split_state(rw, s_slc, name):
@@ -482,61 +533,59 @@ def _split_state(rw, s_slc, name):
 
 
 def test_target_source_reference_uses_ref_state():
-    """`target_source='reference'` predicts ref_state while keeping the actual
-    history/anchor; `'actual'` predicts state. Both modes share history/p_ref/q_ref."""
+    """`target_source='reference'` predicts ref_state while conditioning on the
+    actual state; `'actual'` predicts the actual state. Both share the conditioning."""
     nj = 21
-    data, meta = _synthetic_dataset(num_envs=4, steps=60, nj=nj, scan_dim=8, with_ref=True)
-    h, f = 25, 25
+    data, meta = _synthetic_dataset(num_envs=4, steps=30, nj=nj, with_ref=True)
+    f, n = 10, 2
     windows = episode_windows(
-        data["episode_id"], data["step_in_episode"], data["done"], h + f, stride=1
+        data["episode_id"], data["step_in_episode"], data["done"], f, stride=1
     )
     assert len(windows) > 0
 
-    cfg_a = FlowMatchingConfig(history_len=h, future_len=f, target_source="actual", seed=0)
-    cfg_r = FlowMatchingConfig(history_len=h, future_len=f, target_source="reference", seed=0)
+    cfg_a = FlowMatchingConfig(future_len=f, num_history_states=n, target_source="actual", seed=0)
+    cfg_r = FlowMatchingConfig(future_len=f, num_history_states=n, target_source="reference", seed=0)
     ds_a = FutureStateDataset(data, meta, cfg_a, windows)
     ds_r = FutureStateDataset(data, meta, cfg_r, windows)
 
-    # History conditioning and the relative-frame anchor are identical across modes.
-    torch.testing.assert_close(ds_a.history, ds_r.history)
+    # The actual-state conditioning (raw) and the relative-frame anchor are identical.
+    cond_a_raw = ds_a.state_normalizer.denormalize(ds_a.cond)
+    cond_r_raw = ds_r.state_normalizer.denormalize(ds_r.cond)
+    torch.testing.assert_close(cond_a_raw, cond_r_raw, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(ds_a.p_ref, ds_r.p_ref)
     torch.testing.assert_close(ds_a.q_ref, ds_r.q_ref)
 
     # Targets differ because ref_state != state.
-    fut_a = ds_a.target_normalizer.denormalize(ds_a.future)
-    fut_r = ds_r.target_normalizer.denormalize(ds_r.future)
+    fut_a = ds_a.state_normalizer.denormalize(ds_a.state)
+    fut_r = ds_r.state_normalizer.denormalize(ds_r.state)
     assert not torch.allclose(fut_a, fut_r)
 
-    # The reference future is relative_state(ref_state future rows) anchored at the
-    # *actual* pose at step h-1. Verify directly on window 0.
+    # The reference target is relative_state(ref over all F) anchored at the *actual*
+    # pose at step N-1. Verify directly on window 0.
     s_names = list(meta.state_term_names)
     s_dims = list(meta.state_term_dims)
     s_slc = {name: resolve_term_slice(s_names, s_dims, name) for name in s_names}
     w0 = windows[0]
-    ref_w = torch.from_numpy(data["ref_state"][w0]).float()       # (W, raw)
+    ref_w = torch.from_numpy(data["ref_state"][w0]).float()       # (F, raw)
     state_w = torch.from_numpy(data["state"][w0]).float()
-    p_ref = state_w[h - 1 : h, s_slc["root_pos_w"][0]:s_slc["root_pos_w"][1]].expand(f, 3)
-    q_ref = state_w[h - 1 : h, s_slc["root_quat_w"][0]:s_slc["root_quat_w"][1]].expand(f, 4)
-    fut = ref_w[h:]
+    anchor = n - 1
+    p_ref = state_w[anchor : anchor + 1, s_slc["root_pos_w"][0]:s_slc["root_pos_w"][1]].expand(f, 3)
+    q_ref = state_w[anchor : anchor + 1, s_slc["root_quat_w"][0]:s_slc["root_quat_w"][1]].expand(f, 4)
     expected = relative_state(
-        _split_state(fut, s_slc, "root_pos_w"), _split_state(fut, s_slc, "root_quat_w"),
-        _split_state(fut, s_slc, "root_link_lin_vel_w"), _split_state(fut, s_slc, "root_link_ang_vel_w"),
-        _split_state(fut, s_slc, "joint_pos"), _split_state(fut, s_slc, "joint_vel"),
+        _split_state(ref_w, s_slc, "root_pos_w"), _split_state(ref_w, s_slc, "root_quat_w"),
+        _split_state(ref_w, s_slc, "root_link_lin_vel_w"), _split_state(ref_w, s_slc, "root_link_ang_vel_w"),
+        _split_state(ref_w, s_slc, "joint_pos"), _split_state(ref_w, s_slc, "joint_vel"),
         p_ref, q_ref,
     )
     torch.testing.assert_close(fut_r[0], expected, rtol=1e-4, atol=1e-4)
 
 
-def test_history_observation_noise():
-    """Train-time obs noise perturbs the history token only, resampled per access.
-
-    Verifies: noise lands on the train split (not val), the future target / anchors
-    / command columns stay clean, the amplitude vector maps groups correctly (root
-    ori6d is raw-scaled so it equals the configured amplitude; command columns are
-    zero), and the master flag (cfg.obs_noise=False) disables it entirely.
-    """
-    data, meta = _synthetic_dataset(num_envs=6, steps=60, nj=21, scan_dim=8)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
+def test_conditioning_observation_noise():
+    """Train-time obs noise perturbs the conditioning tokens (first N) only,
+    resampled per access; the target, anchors, command, and later tokens stay clean."""
+    n = 2
+    data, meta = _synthetic_dataset(num_envs=6, steps=30, nj=21)
+    cfg = FlowMatchingConfig(future_len=10, num_history_states=n, val_fraction=0.34, seed=0,
                              cmd_array="target_vel")  # obs_noise defaults on
     train_ds, val_ds = build_train_val(data, meta, cfg)
     assert train_ds.add_noise is True
@@ -544,47 +593,37 @@ def test_history_observation_noise():
 
     torch.manual_seed(0)
     s1, s2 = train_ds[0], train_ds[0]
-    # History is resampled each access -> two draws differ.
-    assert not torch.allclose(s1["history"], s2["history"])
-    # Target, anchors, and decoder command are never noised -> identical.
-    torch.testing.assert_close(s1["future"], s2["future"])
-    torch.testing.assert_close(s1["p_ref"], s2["p_ref"])
-    torch.testing.assert_close(s1["q_ref"], s2["q_ref"])
-    torch.testing.assert_close(s1["future_cmd"], s2["future_cmd"])
-
-    # The command columns of the history token are not sensors -> never noised.
-    hsd, cmd_dim = train_ds.history_state_dim, train_ds.future_cmd_dim
-    torch.testing.assert_close(s1["history"][:, hsd:hsd + cmd_dim],
-                               s2["history"][:, hsd:hsd + cmd_dim])
-    torch.testing.assert_close(s1["history"][:, hsd:hsd + cmd_dim],
-                               train_ds.history[0][:, hsd:hsd + cmd_dim])
+    # cond is resampled each access -> the conditioning tokens differ.
+    assert not torch.allclose(s1["cond"], s2["cond"])
+    # Only the first N tokens are noised; later tokens and the target stay identical.
+    torch.testing.assert_close(s1["cond"][n:], s2["cond"][n:])
+    torch.testing.assert_close(s1["state"], s2["state"])
+    torch.testing.assert_close(s1["cmd_tokens"], s2["cmd_tokens"])
 
     # Amplitude-vector mapping: root ori6d block is raw (std==1) so it equals the
-    # configured amplitude exactly; command columns are zero; scan columns noised.
+    # configured amplitude exactly; joint channels are noised.
     o0, o1 = orientation_slice(train_ds.num_joints)
-    torch.testing.assert_close(train_ds.history_noise[o0:o1],
-                               torch.full((6,), cfg.noise_ori, dtype=train_ds.history_noise.dtype))
-    assert torch.all(train_ds.history_noise[hsd:hsd + cmd_dim] == 0)
-    assert torch.all(train_ds.history_noise[hsd + cmd_dim:] > 0)  # height-scan tail
-    assert torch.all(train_ds.history_noise[:train_ds.num_joints] > 0)  # joint_pos
+    torch.testing.assert_close(train_ds.state_noise[o0:o1],
+                               torch.full((6,), cfg.noise_ori, dtype=train_ds.state_noise.dtype))
+    assert torch.all(train_ds.state_noise[:train_ds.num_joints] > 0)  # joint_pos
 
     # The val split (and any add_noise=False dataset) is deterministic.
-    torch.testing.assert_close(val_ds[0]["history"], val_ds[0]["history"])
+    torch.testing.assert_close(val_ds[0]["cond"], val_ds[0]["cond"])
 
     # Master flag off -> no noise even though build_train_val requests add_noise.
-    cfg_off = FlowMatchingConfig(history_len=25, future_len=25, val_fraction=0.34, seed=0,
+    cfg_off = FlowMatchingConfig(future_len=10, num_history_states=n, val_fraction=0.34, seed=0,
                                  cmd_array="target_vel", obs_noise=False)
     ds_off, _ = build_train_val(data, meta, cfg_off)
-    assert ds_off.add_noise is False and ds_off.history_noise is None
-    torch.testing.assert_close(ds_off[0]["history"], ds_off[0]["history"])
+    assert ds_off.add_noise is False and ds_off.state_noise is None
+    torch.testing.assert_close(ds_off[0]["cond"], ds_off[0]["cond"])
 
 
 def test_target_source_reference_requires_ref_state():
     """Selecting the reference target without a recorded ref_state raises."""
-    data, meta = _synthetic_dataset(num_envs=4, steps=60, nj=21, scan_dim=8, with_ref=False)
-    cfg = FlowMatchingConfig(history_len=25, future_len=25, target_source="reference", seed=0)
+    data, meta = _synthetic_dataset(num_envs=4, steps=30, nj=21, with_ref=False)
+    cfg = FlowMatchingConfig(future_len=10, num_history_states=2, target_source="reference", seed=0)
     windows = episode_windows(
-        data["episode_id"], data["step_in_episode"], data["done"], 50, stride=1
+        data["episode_id"], data["step_in_episode"], data["done"], 10, stride=1
     )
     with pytest.raises(ValueError, match="ref_state"):
         FutureStateDataset(data, meta, cfg, windows)

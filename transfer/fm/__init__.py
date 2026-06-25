@@ -9,8 +9,8 @@ lives in :mod:`quat_math` (parity-tested against ``isaaclab.utils.math`` in
 ``tests/test_quat_math_parity.py``).
 
 Keep these modules in lock-step with ``source/robot_rl/robot_rl/flow_matching``;
-the only edits versus the originals are the math import (isaaclab -> quat_math)
-and ``online.py``'s asymmetric history/target frame support.
+the only edit versus the originals is the math import (isaaclab -> quat_math) in
+``transforms.py``.
 """
 
 from .config import FlowMatchingConfig
@@ -19,9 +19,9 @@ from .normalizer import Normalizer
 from .online import (
     BatchedHistory,
     FmOnlineContext,
-    build_history_token,
+    build_cmd_tokens,
+    build_cond_states,
     load_fm_context,
-    normalize_future_cmd,
     sample_world,
 )
 
@@ -31,8 +31,8 @@ __all__ = [
     "Normalizer",
     "BatchedHistory",
     "FmOnlineContext",
-    "build_history_token",
+    "build_cmd_tokens",
+    "build_cond_states",
     "load_fm_context",
-    "normalize_future_cmd",
     "sample_world",
 ]

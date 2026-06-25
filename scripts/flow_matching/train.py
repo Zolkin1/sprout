@@ -56,7 +56,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         "--eval_data", type=str, default=None,
         help="Optional separate held-out recording (.npz) for eval metrics (logged under "
              "eval/*). Never trained on; evaluated with the train normalizers. Must share "
-             "the train dataset's layout (state_dim / history_in_dim / extra frames).",
+             "the train dataset's layout (state_dim / cmd_dim / extra frames).",
     )
     parser.add_argument("--logdir", type=str, default="logs/flow_matching", help="Log/checkpoint root.")
     parser.add_argument("--run_name", type=str, default=None, help="Run name (default: timestamp).")
@@ -68,8 +68,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--wandb", action="store_true", help="Also log to Weights & Biases.")
     parser.add_argument("--wandb_project", type=str, default="robot_rl_flow_matching")
     # config fields
-    parser.add_argument("--history_len", type=int, default=25)
-    parser.add_argument("--future_len", type=int, default=25)
+    parser.add_argument("--future_len", type=int, default=25,
+                        help="Window length F (state tokens). Effective novel horizon is "
+                             "F - num_history_states.")
+    parser.add_argument("--num_history_states", type=int, default=2,
+                        help="N most-recent measured states used as clean conditioning tokens.")
+    parser.add_argument("--history_dropout_prob", type=float, default=0.8,
+                        help="Probability a training sample drops its history (denoised "
+                             "unconditionally), regularizing history over-reliance.")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument(
@@ -80,33 +86,26 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     )
     parser.add_argument(
         "--cmd_array", type=str, default="auto",
-        help="Command conditioning over the whole window (past in encoder, future in decoder): "
-             "a recorded array name (e.g. 'target_vel'). 'auto' -> 'target_vel' if present in the "
-             "recording, else no command. 'none' -> no command.",
+        help="Commanded-velocity profile over the window, sampled every --cmd_stride steps into "
+             "conditioning command tokens: a recorded array name (e.g. 'target_vel'). 'auto' -> "
+             "'target_vel' if present in the recording, else no command. 'none' -> no command.",
     )
-    parser.add_argument(
-        "--history_frames", type=str, nargs="*", default=None,
-        help="Extra body frames the history/encoder token consumes (a subset of the "
-             "recorded --state_frames). Default (omit, 'none', or the bare flag): an "
-             "empty set, so the generator needs NO measured end-effectors at deployment "
-             "while the target still predicts every recorded frame for the tracker's "
-             "ee_ref obs. Pass 'all' for symmetric (history uses every recorded frame).",
-    )
+    parser.add_argument("--cmd_stride", type=int, default=5,
+                        help="Keep every cmd_stride-th step of the command profile as a token.")
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_encoder_layers", type=int, default=4)
-    parser.add_argument("--num_decoder_layers", type=int, default=4)
+    parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dim_feedforward", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--num_sampling_steps", type=int, default=8)
     parser.add_argument("--ori6d_aux_weight", type=float, default=0.0)
-    # Observation noise (train-time augmentation on the history/encoder token only;
+    # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
     _dn = FlowMatchingConfig()
     parser.add_argument(
         "--obs_noise", action=argparse.BooleanOptionalAction, default=_dn.obs_noise,
-        help="Add observation noise to the history token during training (default: on; "
+        help="Add observation noise to the conditioning tokens during training (default: on; "
              "disable with --no-obs_noise). Off for val/eval/deployment regardless.",
     )
     parser.add_argument("--noise_scale", type=float, default=_dn.noise_scale,
@@ -117,7 +116,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--noise_lin_vel", type=float, default=_dn.noise_lin_vel)
     parser.add_argument("--noise_ori", type=float, default=_dn.noise_ori)
     parser.add_argument("--noise_ang_vel", type=float, default=_dn.noise_ang_vel)
-    parser.add_argument("--noise_scan", type=float, default=_dn.noise_scan)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -126,23 +124,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    # ``--history_frames``: omitted / bare / 'none' -> [] (no history frames; the
-    # deployment default so the generator needs no measured end-effectors). 'all' ->
-    # None (symmetric: history uses every recorded frame). A list -> that subset.
-    history_frame_names = args.history_frames
-    if history_frame_names is None:
-        history_frame_names = []
-    elif len(history_frame_names) == 1 and history_frame_names[0].lower() == "all":
-        history_frame_names = None
-    elif len(history_frame_names) == 1 and history_frame_names[0].lower() == "none":
-        history_frame_names = []
-
     cfg = FlowMatchingConfig(
-        history_len=args.history_len, future_len=args.future_len, stride=args.stride,
-        val_fraction=args.val_fraction, target_source=args.target_source, cmd_array=args.cmd_array,
-        history_frame_names=history_frame_names,
-        d_model=args.d_model, nhead=args.nhead,
-        num_encoder_layers=args.num_encoder_layers, num_decoder_layers=args.num_decoder_layers,
+        future_len=args.future_len, num_history_states=args.num_history_states,
+        history_dropout_prob=args.history_dropout_prob, stride=args.stride,
+        val_fraction=args.val_fraction, target_source=args.target_source,
+        cmd_array=args.cmd_array, cmd_stride=args.cmd_stride,
+        d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
         num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -151,7 +138,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         noise_joint_pos=args.noise_joint_pos, noise_joint_vel=args.noise_joint_vel,
         noise_pos=args.noise_pos, noise_lin_vel=args.noise_lin_vel,
         noise_ori=args.noise_ori, noise_ang_vel=args.noise_ang_vel,
-        noise_scan=args.noise_scan,
     )
     return cfg, args
 
@@ -207,26 +193,58 @@ def channel_metrics(
     return out
 
 
+def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_history) -> torch.Tensor:
+    """Per-token conditioning mask ``(B, F)``: first N tokens known where history is used.
+
+    Args:
+        batch_size: Number of samples ``B``.
+        cfg: Config (reads ``future_len`` and ``num_history_states``).
+        device: Target device.
+        use_history: Per-sample bool ``(B,)`` (history used), or ``True``/``False`` for all.
+
+    Returns:
+        Boolean mask ``(B, F)``.
+    """
+    f, n = cfg.future_len, cfg.num_history_states
+    if isinstance(use_history, bool):
+        use_history = torch.full((batch_size,), use_history, dtype=torch.bool, device=device)
+    is_hist = torch.arange(f, device=device).unsqueeze(0) < n  # (1, F)
+    return use_history.unsqueeze(1) & is_hist
+
+
 @torch.no_grad()
-def evaluate(model, loader, cfg, target_normalizer, num_joints, device, num_extra_frames=0) -> dict[str, float]:
-    """Compute mean flow loss and per-channel sampling metrics over a loader."""
+def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0) -> dict[str, float]:
+    """Compute conditioned/unconditional flow loss and per-channel sampling metrics.
+
+    Metrics are over the novel (predicted) frames ``N..F-1`` only; ``flow_mse`` is the
+    conditioned masked loss and ``flow_mse_uncond`` drops the history.
+    """
     model.eval()
-    flow_sum, n_batches = 0.0, 0
+    n = cfg.num_history_states
+    flow_sum, flow_unc_sum, n_batches = 0.0, 0.0, 0
     metric_sums: dict[str, float] = {}
     for batch in loader:
-        history = batch["history"].to(device)
-        future = batch["future"].to(device)
-        future_cmd = batch["future_cmd"].to(device) if "future_cmd" in batch else None
-        flow_sum += flow_matching_loss(model, history, future, future_cmd)["flow_mse"].item()
+        state = batch["state"].to(device)
+        cond = batch["cond"].to(device)
+        cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
+        b = state.shape[0]
+        known = make_known_mask(b, cfg, device, True)
+        none = make_known_mask(b, cfg, device, False)
+        flow_sum += flow_matching_loss(model, state, cond, known, cmd_tokens)["flow_mse"].item()
+        flow_unc_sum += flow_matching_loss(model, state, cond, none, cmd_tokens)["flow_mse"].item()
         n_batches += 1
         pred = sample_trajectory(
-            model, history, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps, future_cmd=future_cmd
+            model, cond, known, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
+            cmd_tokens=cmd_tokens,
         )
-        pred_d = target_normalizer.denormalize(pred)
-        tgt_d = target_normalizer.denormalize(future)
+        pred_d = state_normalizer.denormalize(pred)[:, n:]
+        tgt_d = state_normalizer.denormalize(state)[:, n:]
         for k, v in channel_metrics(pred_d, tgt_d, num_joints, num_extra_frames).items():
             metric_sums[k] = metric_sums.get(k, 0.0) + v
-    out = {"flow_mse": flow_sum / max(n_batches, 1)}
+    out = {
+        "flow_mse": flow_sum / max(n_batches, 1),
+        "flow_mse_uncond": flow_unc_sum / max(n_batches, 1),
+    }
     for k, v in metric_sums.items():
         out[k] = v / max(n_batches, 1)
     return out
@@ -255,15 +273,17 @@ def main() -> None:
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
-          f"history_in_dim={cfg.history_in_dim}, train_windows={len(train_ds)}, "
+          f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
+          f"F={cfg.future_len}, N={cfg.num_history_states}, "
+          f"history_dropout={cfg.history_dropout_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
     if cfg.obs_noise:
-        print(f"[INFO] obs_noise=on (history token, train split only), scale={cfg.noise_scale} | "
+        print(f"[INFO] obs_noise=on (conditioning tokens, train split only), scale={cfg.noise_scale} | "
               f"joint_pos={cfg.noise_joint_pos} joint_vel={cfg.noise_joint_vel} "
               f"pos={cfg.noise_pos} lin_vel={cfg.noise_lin_vel} ori={cfg.noise_ori} "
-              f"ang_vel={cfg.noise_ang_vel} scan={cfg.noise_scan}")
+              f"ang_vel={cfg.noise_ang_vel}")
     else:
-        print("[INFO] obs_noise=off (clean history token)")
+        print("[INFO] obs_noise=off (clean conditioning tokens)")
 
     # Optional held-out eval recording (separate dataset, never trained on; reuses the
     # train normalizers so eval/* metrics are leakage-free and comparable to val/*).
@@ -274,7 +294,7 @@ def main() -> None:
         print(f"[INFO] eval_data: {len(eval_ds)} windows from {eval_path} (sha {eval_sha[:12]})")
 
     # -- run provenance (parity with RL: git snapshot + params yaml + data identity) --
-    # cfg dims (state_dim/history_in_dim/cmd_dim) are resolved by build_train_val above,
+    # cfg dims (state_dim/cmd_dim) are resolved by build_train_val above,
     # so fm_config.yaml captures the *resolved* config.
     data_path_abs = os.path.abspath(data_path)
     data_sha256 = sha256_file(data_path)
@@ -303,19 +323,18 @@ def main() -> None:
                                  num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
     model = FlowMatchingTransformer(
-        history_in_dim=cfg.history_in_dim, state_dim=cfg.state_dim,
-        history_len=cfg.history_len, future_len=cfg.future_len,
-        d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
-        num_decoder_layers=cfg.num_decoder_layers, dim_feedforward=cfg.dim_feedforward,
-        dropout=cfg.dropout, cmd_dim=cfg.cmd_dim,
+        state_dim=cfg.state_dim, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
+        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(device)
     print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "
-          f"(future-command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
+          f"(command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
 
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
-    train_ds.target_normalizer.to(device)
-    train_ds.history_normalizer.to(device)
+    train_ds.state_normalizer.to(device)
+    if train_ds.cmd_normalizer is not None:
+        train_ds.cmd_normalizer.to(device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = (
@@ -336,11 +355,16 @@ def main() -> None:
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0
         for batch in train_loader:
-            history = batch["history"].to(device)
-            future = batch["future"].to(device)
-            future_cmd = batch["future_cmd"].to(device) if "future_cmd" in batch else None
+            state = batch["state"].to(device)
+            cond = batch["cond"].to(device)
+            cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
+            # Per-sample history dropout: use the conditioning tokens w.p. (1 - dropout).
+            use_hist = torch.rand(state.shape[0], device=device) >= cfg.history_dropout_prob
+            known = make_known_mask(state.shape[0], cfg, device, use_hist)
             opt.zero_grad()
-            out = flow_matching_loss(model, history, future, future_cmd, ori_slice, cfg.ori6d_aux_weight)
+            out = flow_matching_loss(
+                model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight
+            )
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
@@ -360,7 +384,7 @@ def main() -> None:
 
         if val_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             val = evaluate(
-                model, val_loader, cfg, train_ds.target_normalizer, num_joints, device,
+                model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames,
             )
             for k, v in val.items():
@@ -375,7 +399,7 @@ def main() -> None:
 
         if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             ev = evaluate(
-                model, eval_loader, cfg, train_ds.target_normalizer, num_joints, device,
+                model, eval_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames,
             )
             for k, v in ev.items():
@@ -444,22 +468,21 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
     The eval recording must share the train layout (validated below).
     """
     data, meta = load_recorded_data(eval_path)
-    window_len = cfg.history_len + cfg.future_len
     windows = episode_windows(
-        data["episode_id"], data["step_in_episode"], data["done"], window_len, cfg.stride
+        data["episode_id"], data["step_in_episode"], data["done"], cfg.future_len, cfg.stride
     )
     if not windows:
         raise ValueError(f"--eval_data produced no valid windows: {eval_path}")
     ds = FutureStateDataset(
         data, meta, cfg, windows,
-        target_normalizer=train_ds.target_normalizer,
-        history_normalizer=train_ds.history_normalizer,
+        state_normalizer=train_ds.state_normalizer,
+        cmd_normalizer=train_ds.cmd_normalizer,
     )
-    got = (ds.state_dim, ds.history_in_dim, ds.num_extra_frames)
-    want = (train_ds.state_dim, train_ds.history_in_dim, train_ds.num_extra_frames)
+    got = (ds.state_dim, ds.cmd_dim, ds.num_extra_frames)
+    want = (train_ds.state_dim, train_ds.cmd_dim, train_ds.num_extra_frames)
     if got != want:
         raise ValueError(
-            f"--eval_data layout (state_dim, history_in_dim, extra_frames)={got} "
+            f"--eval_data layout (state_dim, cmd_dim, extra_frames)={got} "
             f"differs from train={want}; record eval data with the same task/flags."
         )
     return ds
@@ -471,29 +494,26 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     ``data_path``/``data_sha256`` record exactly which recorded dataset trained this
     checkpoint, so a ``.pt`` is self-describing without the separate params YAML.
 
-    The resolved history/target extra-frame split (which may be asymmetric -- the
-    encoder consuming fewer frames than the target predicts) is injected into the
-    saved ``meta`` so ``online.load_fm_context`` (and the deployment-side
-    ``transfer/fm/online.py``) reconstruct the exact token layout.
+    The predicted extra-frame order is injected into the saved ``meta`` so
+    ``online.load_fm_context`` (and the deployment-side ``transfer/fm/online.py``)
+    reconstruct the exact token layout.
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
-    meta_dict["history_frame_names"] = list(train_ds.history_frame_names)
     meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": opt.state_dict(),
-            "config": cfg.to_dict(),
-            "target_normalizer": train_ds.target_normalizer.state_dict(),
-            "history_normalizer": train_ds.history_normalizer.state_dict(),
-            "num_joints": train_ds.num_joints,
-            "meta": meta_dict,
-            "data_path": data_path,
-            "data_sha256": data_sha256,
-            "epoch": epoch,
-        },
-        path,
-    )
+    ckpt = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "config": cfg.to_dict(),
+        "state_normalizer": train_ds.state_normalizer.state_dict(),
+        "num_joints": train_ds.num_joints,
+        "meta": meta_dict,
+        "data_path": data_path,
+        "data_sha256": data_sha256,
+        "epoch": epoch,
+    }
+    if train_ds.cmd_normalizer is not None:
+        ckpt["cmd_normalizer"] = train_ds.cmd_normalizer.state_dict()
+    torch.save(ckpt, path)
 
 
 if __name__ == "__main__":

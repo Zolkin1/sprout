@@ -2,9 +2,10 @@
 
 """Flow-matching transformer for predicting future robot states.
 
-A conditional flow-matching (rectified-flow) encoder-decoder transformer that,
-given a history window (relative-frame robot state + velocity command + perceptive
-input), generates a future trajectory of robot states in the current root frame.
+A conditional flow-matching (rectified-flow) PARC-style single transformer that
+denoises a window of relative-frame state tokens conditioned on the most-recent
+measured states (dropped in as clean tokens, inpainting) and a strided
+commanded-velocity profile, generating a future trajectory in the current root frame.
 """
 
 from .config import FlowMatchingConfig
