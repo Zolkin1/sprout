@@ -61,7 +61,7 @@ class G1TrackerCommandsCfg:
         # --- generator-tracking knobs ---
         fm_checkpoint=DEFAULT_FM_CHECKPOINT,
         clip_fraction=0.35,
-        fm_update_every=1, #12, #2,
+        fm_update_every=2,
     )
 
 

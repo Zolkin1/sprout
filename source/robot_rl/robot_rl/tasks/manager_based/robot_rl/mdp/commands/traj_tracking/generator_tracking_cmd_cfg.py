@@ -46,6 +46,16 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     envs; the predicted next reference advances through the F-step prediction
     between re-infers (``K = 1`` re-infers every step).  Amortizes FM compute."""
 
+    fm_anchor_on_prev_traj: bool = False
+    """If True, FM-tracking envs plant each newly sampled trajectory on the *previous*
+    generated trajectory (at the step it has advanced to, ``dt = fm_update_every``
+    steps in) instead of on the robot's current pose. Only the ground plane (xy +
+    yaw) is chained from the prior reference; height (z) and tilt (roll/pitch) stay
+    grounded to the robot each inference. This lets the FM reference drift globally
+    away from a poorly-tracking robot, like the pre-made motion clips. The first
+    inference after a reset (no valid prior prediction) still anchors on the robot.
+    ``False`` (default) keeps the original robot-anchored behavior."""
+
     fm_num_sampling_steps: int | None = None
     """Override the checkpoint's Euler sampling-step count at inference (or ``None``
     to use the trained value).  Fewer steps = cheaper, coarser samples."""

@@ -33,7 +33,7 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-from isaaclab.utils.math import quat_apply, quat_from_euler_xyz, yaw_quat
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_from_euler_xyz, quat_mul, yaw_quat
 
 from robot_rl.flow_matching.online import (
     BatchedHistory,
@@ -329,9 +329,27 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         token = build_history_token(self.ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames, scan=None)
         # Future command horizon (steps s+1..s+F) for the decoder, current-step subset.
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
-        # Anchor each prediction at the current base pose (the deployable relative frame).
-        p_ref = rp[:, -1]
-        q_ref = rq[:, -1]
+        # Default: anchor each prediction at the current base pose (the deployable relative frame).
+        p_ref = rp[:, -1].clone()
+        q_ref = rq[:, -1].clone()
+        if self.cfg.fm_anchor_on_prev_traj:
+            # Re-anchor on the *previous* prediction's ground pose so the reference
+            # drifts globally with poor tracking (clip-like). Envs with a stored
+            # prior prediction re-anchor; the rest (first inference after a reset /
+            # window break -- _pred_valid still False here, before the set below)
+            # stay robot-anchored. _pred_root_* / _pred_idx still hold the prior
+            # trajectory and consumed index at this point (overwritten further down).
+            had_prev = self._pred_valid[ids]              # [V] bool
+            off = self._pred_idx[ids]                     # [V] currently-applied ref step
+            prev_p = self._pred_root_pos[ids, off]        # [V, 3] world (prior traj)
+            prev_q = self._pred_root_quat[ids, off]       # [V, 4] xyzw
+            # Ground-corrected anchor: prior reference's xy + yaw, robot's z + tilt.
+            p_ref_prev = p_ref.clone()
+            p_ref_prev[:, :2] = prev_p[:, :2]
+            dz_yaw = quat_mul(yaw_quat(prev_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
+            q_ref_prev = quat_mul(dz_yaw, q_ref)          # robot tilt, re-yawed to prior heading
+            p_ref = torch.where(had_prev[:, None], p_ref_prev, p_ref)
+            q_ref = torch.where(had_prev[:, None], q_ref_prev, q_ref)
         world = sample_world(self.ctx, token, p_ref, q_ref, future_cmd=fut_cmd)
 
         self._pred_root_pos[ids] = world["root_pos_w"]
