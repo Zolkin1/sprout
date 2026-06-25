@@ -42,6 +42,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import zipfile
@@ -73,9 +74,15 @@ import matplotlib.cm  # noqa: E402
 import matplotlib.colors as mcolors  # noqa: E402
 
 
-DEFAULT_CKPT = os.path.join(
+_FALLBACK_CKPT = os.path.join(
     ROOT, "logs", "flow_matching", "2026-06-24_19-00-54_fm-basic-actual-noise", "best.pt"
 )
+
+
+def default_fm_checkpoint() -> str:
+    """Most-recently-modified ``logs/flow_matching/*/best.pt`` (fallback constant)."""
+    cands = glob.glob(os.path.join(ROOT, "logs", "flow_matching", "*", "best.pt"))
+    return max(cands, key=os.path.getmtime) if cands else _FALLBACK_CKPT
 
 # Canonical command targets (vx, vy, wz) used to fish representative history
 # windows out of the recording. "standing" is scarce (recorded mean vx ~1.65),
@@ -1078,7 +1085,8 @@ def choose_backend(save: bool):
 def build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--fm_checkpoint", default=DEFAULT_CKPT, help="Path to the FM .pt checkpoint.")
+    p.add_argument("--fm_checkpoint", default=None,
+                   help="Path to the FM .pt checkpoint (default: latest logs/flow_matching/*/best.pt).")
     p.add_argument("--data", default=None, help="Recording .npz (default: auto-resolve from the run dir).")
     p.add_argument("--mode", choices=["sweep_command", "sweep_history", "sweep_phase", "rollout", "all"],
                    default="all")
@@ -1127,6 +1135,10 @@ def main() -> int:
     plt, interactive = choose_backend(args.save is not None)
 
     device = torch.device(args.device)
+    auto = args.fm_checkpoint is None
+    args.fm_checkpoint = args.fm_checkpoint or default_fm_checkpoint()
+    print(f"[bench] FM checkpoint: {os.path.abspath(args.fm_checkpoint)}"
+          f"{'  (auto: latest run -- pass --fm_checkpoint to pin)' if auto else ''}")
     ctx = load_fm_context(args.fm_checkpoint, device, num_sampling_steps=args.num_sampling_steps)
     # dt is not on the context; the recording carries it -- patched on below.
     print(f"[bench] FM: H={ctx.H} F={ctx.F} nj={ctx.nj} state_dim={ctx.D} "

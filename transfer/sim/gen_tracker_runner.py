@@ -188,6 +188,15 @@ def _yaw_from_xyzw(q: np.ndarray) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def _rpy_from_xyzw(q: np.ndarray) -> tuple[float, float, float]:
+    """Roll, pitch, yaw (rad) of an ``(x, y, z, w)`` quaternion (ZYX convention)."""
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return roll, pitch, yaw
+
+
 def _add_sphere(scn, pos: np.ndarray, rgba: tuple, radius: float) -> None:
     """Append a sphere geom to a viewer ``user_scn`` (no-op if at capacity)."""
     if scn.ngeom >= scn.maxgeom:
@@ -336,18 +345,28 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     ee_cols = [f"ee{kind}_{n}_{ax}" for n in ee_names for kind in ("ref", "act") for ax in ("x", "y", "z")]
 
     log_file = writer = None
+    log_meta = log_meta_path = None
+    # Sim time (s) at which the FM generator takes over the reference (clip->FM handoff,
+    # or the warmup->FM handoff in non-clip runs). Stays None if the FM never drives
+    # (clip-only playback). Captured live below and written to sim_meta.yaml at the end
+    # so the metrics plots can mark the transition.
+    handoff_time = None
     if log_path:
         log_file = open(log_path, "w", newline="")
         writer = csv.writer(log_file)
         writer.writerow(["time", "cmd_vx", "cmd_vy", "cmd_wz", "vx_b", "vy_b", "wz_b",
-                         "pos_err", "ori_err", "joint_pos_err", "base_z", "fell",
+                         "pos_err", "ori_err", "joint_pos_err",
+                         "ref_pos_x", "ref_pos_y", "ref_pos_z", "act_pos_x", "act_pos_y", "act_pos_z",
+                         "ref_roll", "ref_pitch", "ref_yaw", "act_roll", "act_pitch", "act_yaw",
+                         "base_z", "fell",
                          *[f"tau_{n}" for n in isaac], *jp_cols, *ee_cols])
         # Sidecar metadata for the metrics module (joint order + effort limits + EE frames).
-        meta = {"joint_names_isaac": isaac, "effort_limits": effort_limits,
-                "ee_frame_names": ee_names, "dt": policy.get_dt(),
-                "fm_update_every": policy.fm_update_every}
-        with open(os.path.join(os.path.dirname(log_path), "sim_meta.yaml"), "w") as mf:
-            yaml.dump(meta, mf, default_flow_style=False, sort_keys=False)
+        log_meta = {"joint_names_isaac": isaac, "effort_limits": effort_limits,
+                    "ee_frame_names": ee_names, "dt": policy.get_dt(),
+                    "fm_update_every": policy.fm_update_every}
+        log_meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
+        with open(log_meta_path, "w") as mf:
+            yaml.dump(log_meta, mf, default_flow_style=False, sort_keys=False)
 
     vel_cmd = np.zeros(3)  # rate-limited command state (ramps from 0 at handoff)
 
@@ -379,6 +398,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         pos_err = float(np.linalg.norm(ref_pos - root_pos))
         ori_err = float(np.linalg.norm(quat_box_minus(rq, ref_quat)))
         jp_err = float(np.linalg.norm(ref_jp - act_jp))
+        ref_rpy = _rpy_from_xyzw(ref_quat)  # desired base orientation (roll, pitch, yaw)
+        act_rpy = _rpy_from_xyzw(rq)         # achieved base orientation
         inv_root = quat_inv(rq)
         lin_b = quat_apply(inv_root, np.asarray(state["root_lin_vel_w"], dtype=np.float64))
         torques = [float(robot.mj_data.actuator_force[a]) for a in act_ids]
@@ -395,7 +416,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 ee_vals += [rb[0], rb[1], rb[2], ab[0], ab[1], ab[2]]
         writer.writerow([robot.mj_data.time, *state["command"].tolist(),
                          float(lin_b[0]), float(lin_b[1]), float(state["base_ang_vel"][2]),
-                         pos_err, ori_err, jp_err, float(root_pos[2]), int(robot.failed()),
+                         pos_err, ori_err, jp_err,
+                         float(ref_pos[0]), float(ref_pos[1]), float(ref_pos[2]),
+                         float(root_pos[0]), float(root_pos[1]), float(root_pos[2]),
+                         float(ref_rpy[0]), float(ref_rpy[1]), float(ref_rpy[2]),
+                         float(act_rpy[0]), float(act_rpy[1]), float(act_rpy[2]),
+                         float(root_pos[2]), int(robot.failed()),
                          *torques, *jp_vals, *ee_vals])
 
     def draw_viz(viewer, state: dict) -> None:
@@ -439,6 +465,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
 
     def run_loop(viewer) -> bool:
         """Warmup hold then live FM + tracker control; return False if the robot fell."""
+        nonlocal handoff_time
         # Warmup: PD-hold the stand (cmd = 0, XML default gains) while the history fills.
         # When gated, hold until the start button is pressed (after the buffer is full).
         if gate:
@@ -463,7 +490,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 break
         # Switch from the XML default gains to the RL tracker gains for live control.
         robot.set_pd_gains_from_policy(policy)
-        print("[INFO] Handoff: switched to RL PD gains, handing control to the FM + tracker.")
+        handoff_time = robot.mj_data.time
+        print(f"[INFO] Handoff: switched to RL PD gains, handing control to the FM + tracker "
+              f"(t={handoff_time:.2f}s).")
         # Live: hand control to the FM + tracker.
         while True:
             if viewer is not None and not viewer.is_running():
@@ -486,6 +515,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         keeps following the authored clip velocity profile. ``clip_handoff_time < 0``
         never hands off (clip-only). Returns False if the robot fell.
         """
+        nonlocal handoff_time
         clip_only = clip_handoff_time < 0
         handed_off = False
         clip_step = clip.start_step
@@ -498,7 +528,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             state = build_state(robot, policy, clip.command_at(s))
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
-                    print(f"[INFO] Clip->FM handoff at t={robot.mj_data.time:.2f}s "
+                    handoff_time = robot.mj_data.time
+                    print(f"[INFO] Clip->FM handoff at t={handoff_time:.2f}s "
                           f"(clip step {s}/{clip.num_steps - 1}); FM now drives the reference.")
                     handed_off = True
                 # Feed the FM the clip's ACTUAL upcoming command horizon (matches IsaacLab's
@@ -536,6 +567,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     if log_file:
         log_file.close()
         print(f"[INFO] Wrote metrics log to {log_path}")
+    if log_meta is not None:
+        # Re-dump now that the actual FM-handoff time is known (None if the FM never
+        # took over, e.g. clip-only playback) so the metrics plots can mark the transition.
+        log_meta["fm_handoff_time"] = handoff_time
+        with open(log_meta_path, "w") as mf:
+            yaml.dump(log_meta, mf, default_flow_style=False, sort_keys=False)
     return success
 
 

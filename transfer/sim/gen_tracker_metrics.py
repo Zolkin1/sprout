@@ -50,7 +50,19 @@ def _load(log_dir: str) -> tuple[dict[str, np.ndarray], dict]:
     return cols, meta
 
 
-def _plot_velocity_tracking(cols, out_dir) -> dict:
+def _mark_handoff(ax, meta) -> None:
+    """Draw a vertical line where the FM generator took over the reference.
+
+    Reads ``fm_handoff_time`` from the run meta (written by ``gen_tracker_runner``).
+    No-op when absent or ``None`` (e.g. clip-only playback, or an older log).
+    """
+    t_ho = meta.get("fm_handoff_time") if meta else None
+    if t_ho is None:
+        return
+    ax.axvline(float(t_ho), color="#8a2be2", ls="--", lw=1.4, label="FM handoff")
+
+
+def _plot_velocity_tracking(cols, out_dir, meta) -> dict:
     """Commanded vs achieved base velocity (vx, vy, wz); returns RMS errors."""
     t = cols["time"]
     pairs = [("vx", "cmd_vx", "vx_b"), ("vy", "cmd_vy", "vy_b"), ("wz", "cmd_wz", "wz_b")]
@@ -62,6 +74,7 @@ def _plot_velocity_tracking(cols, out_dir) -> dict:
         rms[name] = float(np.sqrt(np.mean((cols[c] - cols[a]) ** 2)))
         ax.set_ylabel(f"{name}  (rms={rms[name]:.3f})")
         ax.grid(alpha=0.3)
+        _mark_handoff(ax, meta)
         ax.legend(loc="upper right")
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Commanded vs achieved base velocity")
@@ -71,8 +84,46 @@ def _plot_velocity_tracking(cols, out_dir) -> dict:
     return rms
 
 
-def _plot_reference_tracking(cols, out_dir) -> dict:
-    """Base pose + joint tracking error vs the FM reference; returns means."""
+def _plot_reference_tracking(cols, out_dir, meta) -> dict:
+    """Base pose tracking: FM reference vs actual, overlaid (not the error norm).
+
+    Left column = base position (x, y, z); right column = base orientation
+    (roll, pitch, yaw). Returns the per-component RMS error. Falls back to the
+    legacy error-norm plot for logs recorded before the per-axis columns existed.
+    """
+    if not all(k in cols for k in ("ref_pos_x", "act_pos_x", "ref_yaw", "act_yaw")):
+        return _plot_reference_tracking_legacy(cols, out_dir, meta)
+    t = cols["time"]
+    # (ylabel, ref col, act col, summary key)
+    pos = [("base x [m]", "ref_pos_x", "act_pos_x", "pos_x"),
+           ("base y [m]", "ref_pos_y", "act_pos_y", "pos_y"),
+           ("base z [m]", "ref_pos_z", "act_pos_z", "pos_z")]
+    ori = [("roll [rad]", "ref_roll", "act_roll", "roll"),
+           ("pitch [rad]", "ref_pitch", "act_pitch", "pitch"),
+           ("yaw [rad]", "ref_yaw", "act_yaw", "yaw")]
+    fig, axes = plt.subplots(3, 2, figsize=(12, 8), sharex=True)
+    summary = {}
+    for r in range(3):
+        for col, (label, rk, ak, key) in ((0, pos[r]), (1, ori[r])):
+            ax = axes[r][col]
+            ax.plot(t, cols[rk], label="FM reference", lw=1.8)
+            ax.plot(t, cols[ak], label="actual", lw=1.3, alpha=0.85)
+            summary[key] = float(np.sqrt(np.mean((cols[rk] - cols[ak]) ** 2)))
+            ax.set_ylabel(f"{label}\n(rms={summary[key]:.3f})")
+            ax.grid(alpha=0.3)
+            _mark_handoff(ax, meta)
+    axes[0][0].legend(loc="upper right", fontsize=8)
+    axes[2][0].set_xlabel("time [s]")
+    axes[2][1].set_xlabel("time [s]")
+    fig.suptitle("Base pose: FM reference vs actual")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=120)
+    plt.close(fig)
+    return summary
+
+
+def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
+    """Error-norm reference plot for logs without the per-axis ref/act columns."""
     t = cols["time"]
     series = [("base pos err [m]", "pos_err"), ("base ori err [rad]", "ori_err"),
               ("joint pos err [rad]", "joint_pos_err")]
@@ -83,6 +134,9 @@ def _plot_reference_tracking(cols, out_dir) -> dict:
         summary[key] = {"mean": float(np.mean(cols[key])), "max": float(np.max(cols[key]))}
         ax.set_ylabel(f"{label}\n(mean={summary[key]['mean']:.3f})")
         ax.grid(alpha=0.3)
+        _mark_handoff(ax, meta)
+    if meta and meta.get("fm_handoff_time") is not None:
+        axes[0].legend(loc="upper right", fontsize=8)
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Tracker-vs-generator reference error")
     fig.tight_layout()
@@ -91,7 +145,7 @@ def _plot_reference_tracking(cols, out_dir) -> dict:
     return summary
 
 
-def _plot_survival(cols, out_dir) -> dict:
+def _plot_survival(cols, out_dir, meta) -> dict:
     """Base height + fall flag over time; returns survival summary."""
     t = cols["time"]
     fell = cols["fell"] > 0.5
@@ -101,6 +155,7 @@ def _plot_survival(cols, out_dir) -> dict:
     ax.plot(t, cols["base_z"], lw=1.5, label="base height")
     if time_to_fall is not None:
         ax.axvline(time_to_fall, color="r", ls="--", label=f"fall @ {time_to_fall:.2f}s")
+    _mark_handoff(ax, meta)
     ax.set_xlabel("time [s]"); ax.set_ylabel("base z [m]"); ax.grid(alpha=0.3); ax.legend()
     fig.suptitle("Survival / base height")
     fig.tight_layout()
@@ -135,6 +190,7 @@ def _plot_torques(cols, meta, out_dir) -> dict:
             ax.axhline(lim, color="r", ls="--", lw=0.8)
             ax.axhline(-lim, color="r", ls="--", lw=0.8)
             util[jn] = float(np.max(np.abs(tau)) / lim) if lim > 0 else None
+        _mark_handoff(ax, meta)
         ax.set_title(jn, fontsize=7)
         ax.grid(alpha=0.3)
     for j in range(n, len(axes)):
@@ -167,6 +223,7 @@ def _plot_joint_tracking(cols, meta, out_dir) -> dict:
         ax.plot(t, r, lw=1.3, label="FM ref")
         ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
         rms[jn] = float(np.sqrt(np.mean((r - a) ** 2)))
+        _mark_handoff(ax, meta)
         ax.set_title(f"{jn}  (rms={rms[jn]:.3f})", fontsize=7)
         ax.grid(alpha=0.3)
     axes[0].legend(loc="upper right", fontsize=6)
@@ -195,6 +252,7 @@ def _plot_ee_tracking(cols, meta, out_dir) -> dict:
             ax.plot(t, r, lw=1.3, label="FM ref")
             ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
             errs.append(float(np.sqrt(np.mean((r - a) ** 2))))
+            _mark_handoff(ax, meta)
             ax.set_title(f"{name}  {ax_name}", fontsize=7)
             ax.grid(alpha=0.3)
         summary[name] = float(np.linalg.norm(errs))
@@ -220,11 +278,11 @@ def create_metrics(log_dir: str) -> dict:
     out_dir = os.path.join(log_dir, "plots")
     os.makedirs(out_dir, exist_ok=True)
     summary = {
-        "command_velocity_rms": _plot_velocity_tracking(cols, out_dir),
-        "reference_tracking": _plot_reference_tracking(cols, out_dir),
+        "command_velocity_rms": _plot_velocity_tracking(cols, out_dir, meta),
+        "reference_tracking": _plot_reference_tracking(cols, out_dir, meta),
         "joint_tracking": _plot_joint_tracking(cols, meta, out_dir),
         "ee_tracking": _plot_ee_tracking(cols, meta, out_dir),
-        "survival": _plot_survival(cols, out_dir),
+        "survival": _plot_survival(cols, out_dir, meta),
         "torques": _plot_torques(cols, meta, out_dir),
     }
     with open(os.path.join(log_dir, "metrics_summary.json"), "w") as f:
