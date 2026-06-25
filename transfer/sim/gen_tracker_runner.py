@@ -277,7 +277,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     # Stable-stand warmup: spawn + PD-hold the solved standing pose (so the generator
     # history fills with in-distribution standing snapshots) for at least the FM window.
     if clip is not None:
-        # Clip mode: spawn directly on the clip's step-0 pose and hand control to the
+        # Clip mode: spawn directly on the clip's start-step pose and hand control to the
         # tracker immediately (no standing warmup), RL gains from the start -- matching
         # the IsaacLab reset_on_motion_sequence spawn. The FM history is filled live by
         # the clip loop's per-step observe() so a later clip->FM handoff is seamless.
@@ -288,7 +288,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         robot.set_base_and_joints(c_pos, c_quat_wxyz, hold_target)
         robot.set_pd_gains_from_policy(policy)
         warmup_steps = 0
-        print(f"[INFO] Clip mode: spawned on clip step-0 pose (z+{spawn_z_offset}); RL gains set.")
+        print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} pose "
+              f"(t={clip.start_step * clip.dt:.2f}s, z+{spawn_z_offset}); RL gains set.")
     elif standing_config and os.path.exists(standing_config):
         jp_isaac, base_pos, base_quat = load_standing_pose(standing_config, isaac)
         base_pos[2] += spawn_z_offset  # lift feet clear of the floor (optimizer frame offset)
@@ -487,7 +488,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         """
         clip_only = clip_handoff_time < 0
         handed_off = False
-        clip_step = 0
+        clip_step = clip.start_step
         while True:
             if viewer is not None and not viewer.is_running():
                 return True
@@ -600,6 +601,11 @@ def main() -> None:
                         help="In --clip mode, sim time (s) to hand the reference off from the clip "
                              "to the FM generator. Omit (default) for clip-only playback; pass a "
                              "value inside the clip (e.g. 8.0) for a clip->FM handoff run.")
+    parser.add_argument("--clip_start_time", type=float, default=0.0,
+                        help="In --clip mode, seconds into the clip to begin playback (default 0). "
+                             "The robot spawns on the clip pose at this time and the reference is "
+                             "served from here -- e.g. to skip a standing prefix. Sim time and the "
+                             "--clip_handoff_time gate are still measured from this start.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -655,15 +661,19 @@ def main() -> None:
     if args.clip:
         clip_path = args.clip if os.path.isabs(args.clip) else os.path.join(root_dir, args.clip)
         clip = ClipReference(clip_path, policy.get_joint_names(),
-                             list(policy.ctx.target_frame_names), policy.base_frame_name)
+                             list(policy.ctx.target_frame_names), policy.base_frame_name,
+                             start_time=args.clip_start_time)
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
         clip_handoff_time = args.clip_handoff_time if args.clip_handoff_time is not None else -1.0
-        if total_time <= 0:  # clip-only -> clip length; clip->FM -> a few extra seconds of FM.
-            total_time = clip.clip_length_s if clip_handoff_time < 0 else clip.clip_length_s + 5.0
+        # Playable duration from the chosen start to the clip end (sim time begins at 0 here).
+        remaining_s = (clip.num_steps - clip.start_step) * clip.dt
+        if total_time <= 0:  # clip-only -> remaining length; clip->FM -> a few extra seconds of FM.
+            total_time = remaining_s if clip_handoff_time < 0 else remaining_s + 5.0
         print(f"[INFO] Clip: {clip_path}\n"
               f"[INFO] {clip.num_steps} steps, {clip.clip_length_s:.2f}s @ dt={clip.dt}; "
+              f"start={clip.start_step * clip.dt:.2f}s (step {clip.start_step}); "
               f"handoff={'clip-only' if clip_handoff_time < 0 else f'{clip_handoff_time:.2f}s'}; "
               f"total_time={total_time:.2f}s")
 

@@ -58,6 +58,9 @@ class ClipReference:
         base_frame_name: Trajectory output frame used as the robot root
             (``policy.base_frame_name``, e.g. ``"pelvis_link"``).
         clip_id: Which clip in the library to play (parity libraries hold one).
+        start_time: Seconds into the clip at which playback begins.  The robot
+            spawns on the clip pose at this time and the reference is served from
+            here (e.g. to skip a standing prefix).  Clamped to ``[0, clip_end)``.
     """
 
     def __init__(
@@ -67,6 +70,7 @@ class ClipReference:
         ee_frame_names: list[str],
         base_frame_name: str = "pelvis_link",
         clip_id: int = 0,
+        start_time: float = 0.0,
     ) -> None:
         with h5py.File(str(path), "r") as f:
             self.y = np.asarray(f["y_des"][clip_id], dtype=np.float64)    # [T, P] clip-world
@@ -80,6 +84,8 @@ class ClipReference:
             self.dt = float(json.loads(f.attrs["dt"]))
         self.num_steps = int(self.y.shape[0])
         self.clip_length_s = self.num_steps * self.dt
+        # Step at which playback begins (spawn pose + first served reference).
+        self.start_step = int(min(max(round(float(start_time) / self.dt), 0), self.num_steps - 1))
 
         def pi(name: str) -> int:
             return pos_names.index(name)
@@ -196,12 +202,12 @@ class ClipReference:
         return {"current": cur, "future": fut}
 
     def spawn_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Step-0 spawn pose: ``(base_pos, base_quat_wxyz, joint_pos_isaac)``.
+        """Spawn pose at ``start_step``: ``(base_pos, base_quat_wxyz, joint_pos_isaac)``.
 
         ``base_quat`` is converted to MuJoCo ``(w, x, y, z)`` order for
         ``Robot.set_base_and_joints``; joints stay in the isaac order.
         """
-        s0 = self._frame_state(0)
+        s0 = self._frame_state(self.start_step)
         q = s0["root_quat"]  # xyzw
         base_quat_wxyz = np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
         return s0["root_pos"].copy(), base_quat_wxyz, s0["jp"].copy()
