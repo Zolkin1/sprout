@@ -338,48 +338,32 @@ class Window:
     mean_cmd: np.ndarray            # achieved mean command over the window
 
 
-def find_window(
+def find_steady_rows(
     data: dict[str, np.ndarray],
-    layout: StateLayout,
     ctx: FmOnlineContext,
     target_cmd: list[float],
-    label: str,
+    length: int,
     n_envs_scan: int,
-    device: torch.device,
     cmd_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
     steady_weight: float = 1.0,
-) -> Window:
-    """Find the recording window that best matches ``target_cmd`` and is steady.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Find the steadiest contiguous ``length``-step stretch matching ``target_cmd``.
 
-    Scans the first ``n_envs_scan`` env streams (the recording is step-major:
-    env ``e`` is ``arr[e::num_envs]``). A window is valid iff its
-    ``step_in_episode`` is strictly consecutive and no row before the last is a
-    ``done`` (mirrors ``dataset.episode_windows``). Validity and scoring are
-    vectorized with prefix sums.
-
-    The score is ``||mean(cmd) - target||`` plus ``steady_weight`` times the
-    combined std of the command over the window, so a constant-velocity segment
-    is preferred over a transient (e.g. decelerating) one with the same mean.
-    Set ``steady_weight=0`` for pure mean-matching.
-
-    Args:
-        data: Recording arrays.
-        layout: State layout for parsing/slicing.
-        ctx: Loaded FM context (for H, F, joint/frame order, device).
-        target_cmd: Desired ``(vx, vy, wz)``.
-        label: Human label for the returned window.
-        n_envs_scan: Number of env streams to scan.
-        device: Device for the returned input tensors.
-        cmd_weights: Per-component weights for the command-match score.
-        steady_weight: Penalty weight on the command's within-window std.
+    Scans the first ``n_envs_scan`` env streams (step-major: env ``e`` is
+    ``arr[e::num_envs]``). A stretch is valid iff ``step_in_episode`` is strictly
+    consecutive and no row before the last is a ``done`` (mirrors
+    ``dataset.episode_windows``). The score is ``||mean(cmd) - target||`` plus
+    ``steady_weight`` times the combined within-stretch command std, so a
+    constant-velocity segment beats a transient with the same mean. Vectorized
+    with prefix sums.
 
     Returns:
-        The best-matching :class:`Window`.
+        ``(rows, mean_cmd, cmd_std, score)`` -- absolute row indices of the best
+        stretch (length ``length``) and its command mean/std/score.
     """
-    H, F = ctx.H, ctx.F
-    W = H + F
+    L = length
     num_envs = layout_num_envs(data)
-    state = data["state"]
+    n_rows = data["target_vel"].shape[0]
     tv = data["target_vel"].astype(np.float64)
     sie = data["step_in_episode"]
     done = data["done"].astype(np.int64)
@@ -388,45 +372,62 @@ def find_window(
 
     best = None  # (score, rows)
     for e in range(min(n_envs_scan, num_envs)):
-        idx = np.arange(e, state.shape[0], num_envs)
+        idx = np.arange(e, n_rows, num_envs)
         n_e = len(idx)
-        if n_e < W:
+        if n_e < L:
             continue
         st_e = sie[idx]
         dn_e = done[idx]
         tv_e = tv[idx]  # (n_e, 3)
 
-        cons = (np.diff(st_e) == 1).astype(np.int64)  # (n_e-1,)
-        cons_cs = np.concatenate([[0], np.cumsum(cons)])         # (n_e,)
-        done_cs = np.concatenate([[0], np.cumsum(dn_e)])         # (n_e+1,)
-        tv_cs = np.concatenate([np.zeros((1, 3)), np.cumsum(tv_e, axis=0)])  # (n_e+1, 3)
+        cons = (np.diff(st_e) == 1).astype(np.int64)
+        cons_cs = np.concatenate([[0], np.cumsum(cons)])
+        done_cs = np.concatenate([[0], np.cumsum(dn_e)])
+        tv_cs = np.concatenate([np.zeros((1, 3)), np.cumsum(tv_e, axis=0)])
         tv_sq_cs = np.concatenate([np.zeros((1, 3)), np.cumsum(tv_e ** 2, axis=0)])
 
-        starts = np.arange(0, n_e - W + 1)
-        cons_ok = (cons_cs[starts + (W - 1)] - cons_cs[starts]) == (W - 1)
-        done_ok = (done_cs[starts + (W - 1)] - done_cs[starts]) == 0  # no done before last
+        starts = np.arange(0, n_e - L + 1)
+        cons_ok = (cons_cs[starts + (L - 1)] - cons_cs[starts]) == (L - 1)
+        done_ok = (done_cs[starts + (L - 1)] - done_cs[starts]) == 0  # no done before last
         valid = cons_ok & done_ok
         if not np.any(valid):
             continue
         vstarts = starts[valid]
-        mean_vel = (tv_cs[vstarts + W] - tv_cs[vstarts]) / W       # (M, 3)
-        mean_sq = (tv_sq_cs[vstarts + W] - tv_sq_cs[vstarts]) / W  # (M, 3)
-        std_tot = np.sqrt(np.maximum(mean_sq - mean_vel ** 2, 0.0).sum(axis=1))  # (M,)
+        mean_vel = (tv_cs[vstarts + L] - tv_cs[vstarts]) / L
+        mean_sq = (tv_sq_cs[vstarts + L] - tv_sq_cs[vstarts]) / L
+        std_tot = np.sqrt(np.maximum(mean_sq - mean_vel ** 2, 0.0).sum(axis=1))
         match = np.sqrt(((mean_vel - tgt) ** 2 * wts).sum(axis=1))
         score = match + steady_weight * std_tot
         j = int(np.argmin(score))
         if best is None or score[j] < best[0]:
-            best = (float(score[j]), idx[vstarts[j] : vstarts[j] + W].copy())
+            best = (float(score[j]), idx[vstarts[j] : vstarts[j] + L].copy())
 
     if best is None:
         raise RuntimeError(
-            f"no valid {W}-step window found for {label!r} in {n_envs_scan} env streams; "
-            f"increase --n-envs-scan"
+            f"no valid {L}-step stretch found near {target_cmd} in {n_envs_scan} env streams; "
+            f"increase --n-envs-scan or lower --gait-max-period"
         )
-
     rows = best[1]
-    ws = state[rows]                # (W, state_dim)
-    cmd_w = data["target_vel"][rows]  # (W, cmd_dim)
+    cmd_w = data["target_vel"][rows]
+    return rows, cmd_w.mean(axis=0), cmd_w.std(axis=0), best[0]
+
+
+def build_window_from_rows(
+    data: dict[str, np.ndarray],
+    layout: StateLayout,
+    ctx: FmOnlineContext,
+    rows: np.ndarray,
+    device: torch.device,
+    label: str,
+) -> Window:
+    """Build a :class:`Window` from ``H+F`` contiguous absolute row indices.
+
+    History inputs come from the first ``H`` rows; the recorded actual future and
+    its command come from the last ``F``.
+    """
+    H, F = ctx.H, ctx.F
+    ws = data["state"][rows]            # (H+F, state_dim)
+    cmd_w = data["target_vel"][rows]    # (H+F, cmd_dim)
     hist_rows, fut_rows = ws[:H], ws[H:]
 
     def t3(term: str, rows_np: np.ndarray) -> torch.Tensor:
@@ -442,15 +443,35 @@ def find_window(
         "joint_vel": t3("joint_vel", hist_rows),
     }
     past_cmd = torch.from_numpy(np.ascontiguousarray(cmd_w[:H])).float().unsqueeze(0).to(device)
-    mean_cmd = cmd_w.mean(axis=0)
-    cmd_std = cmd_w.std(axis=0)
-    print(f"[bench]   window {label!r}: target={target_cmd} achieved_mean={np.round(mean_cmd, 3).tolist()} "
-          f"cmd_std={np.round(cmd_std, 3).tolist()} (score={best[0]:.3f})")
     return Window(
         label=label, inputs=inputs, past_cmd=past_cmd,
         hist_traj=layout.parse(hist_rows), actual_fut_traj=layout.parse(fut_rows),
-        actual_fut_cmd=cmd_w[H:], mean_cmd=mean_cmd,
+        actual_fut_cmd=cmd_w[H:], mean_cmd=cmd_w.mean(axis=0),
     )
+
+
+def find_window(
+    data: dict[str, np.ndarray],
+    layout: StateLayout,
+    ctx: FmOnlineContext,
+    target_cmd: list[float],
+    label: str,
+    n_envs_scan: int,
+    device: torch.device,
+    cmd_weights: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    steady_weight: float = 1.0,
+) -> Window:
+    """Find the steady ``H+F`` window best matching ``target_cmd`` and build it.
+
+    Thin wrapper over :func:`find_steady_rows` + :func:`build_window_from_rows`;
+    ``steady_weight=0`` reverts to pure mean-command matching.
+    """
+    rows, mean_cmd, cmd_std, score = find_steady_rows(
+        data, ctx, target_cmd, ctx.H + ctx.F, n_envs_scan, cmd_weights, steady_weight
+    )
+    print(f"[bench]   window {label!r}: target={target_cmd} achieved_mean={np.round(mean_cmd, 3).tolist()} "
+          f"cmd_std={np.round(cmd_std, 3).tolist()} (score={score:.3f})")
+    return build_window_from_rows(data, layout, ctx, rows, device, label)
 
 
 def layout_num_envs(data: dict[str, np.ndarray]) -> int:
@@ -507,6 +528,7 @@ class Series:
     fut_cmd: np.ndarray
     hist: dict[str, np.ndarray] | None = None
     past_cmd: np.ndarray | None = None
+    actual: dict[str, np.ndarray] | None = None  # per-series recorded future (phase mode)
 
 
 @dataclass
@@ -587,6 +609,87 @@ def run_sweep_history(ctx, windows, args, device) -> Scenario:
     return Scenario(
         name=f"sweep_history future_cmd={cmd_vec}", dt=ctx.dt_attr, H=ctx.H, F=ctx.F,
         series=series, frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
+    )
+
+
+def estimate_gait_period(stretch: dict[str, np.ndarray], dt: float,
+                         min_s: float = 0.3, max_s: float = 1.5) -> int | None:
+    """Estimate the gait period (in steps) by autocorrelating a foot's height.
+
+    Uses the first end-effector's vertical position (falls back to the first
+    joint position) over a steady stretch, picking the first autocorrelation peak
+    in the lag range ``[min_s, max_s]`` seconds. Returns ``None`` if undeterminable.
+    """
+    if "ee_pos" in stretch:
+        sig = stretch["ee_pos"][:, 0, 2]
+    else:
+        sig = stretch["joint_pos"][:, 0]
+    sig = np.asarray(sig, dtype=np.float64)
+    sig = sig - sig.mean()
+    n = len(sig)
+    min_lag = max(2, int(round(min_s / dt)))
+    max_lag = min(n - 1, int(round(max_s / dt)))
+    if max_lag <= min_lag or np.allclose(sig, 0.0):
+        return None
+    ac = np.correlate(sig, sig, mode="full")[n - 1:]  # autocorr at lags 0..n-1
+    return int(min_lag + np.argmax(ac[min_lag : max_lag + 1]))
+
+
+def run_sweep_phase(ctx, data, layout, args, device) -> Scenario:
+    """Fix the command; shift the history across one gait period; overlay futures.
+
+    Pulls one long steady gait stretch, estimates its period, then builds
+    ``--n-phases`` history windows whose start is shifted across that period. Each
+    gets the SAME command (matched past + future), so the only thing that changes
+    is *where in the gait cycle* the history sits. If the model is phase-aware,
+    each predicted future continues its own history's phase (and tracks that
+    window's recorded continuation, drawn dotted); if not, the futures collapse
+    onto one curve regardless of phase.
+    """
+    H, F = ctx.H, ctx.F
+    W = H + F
+    cmd_vec = parse_vec3(args.future_cmd)
+    if args.phase_hist not in CANONICAL_CMDS:
+        raise ValueError(f"unknown --phase-hist {args.phase_hist!r}; choose from {list(CANONICAL_CMDS)}")
+    # A steady stretch long enough to shift the window across one full period.
+    length = W + args.gait_max_period
+    rows, mean_cmd, cmd_std, score = find_steady_rows(
+        data, ctx, CANONICAL_CMDS[args.phase_hist], length, args.n_envs_scan,
+        steady_weight=max(args.steady_weight, 1.0),
+    )
+    stretch = layout.parse(data["state"][rows])  # (length, .)
+
+    period = args.gait_period if args.gait_period > 0 else estimate_gait_period(stretch, ctx.dt_attr)
+    if not period or period <= 0:
+        period = int(round(0.8 / ctx.dt_attr))
+    period = min(period, args.gait_max_period)
+    n = max(2, args.n_phases)
+    offsets = sorted({int(round(k * period / n)) for k in range(n)})
+    print(f"[bench] sweep_phase on {args.phase_hist!r}: cmd={cmd_vec} (matched past+future) "
+          f"period={period} steps ({period * ctx.dt_attr:.2f}s) offsets={offsets} "
+          f"cmd_std={np.round(cmd_std, 3).tolist()}")
+
+    fut_cmd = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3).expand(1, F, 3).contiguous()
+    match = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3)
+    cmap = matplotlib.colormaps["viridis"]
+    fracs = [o / period for o in offsets]
+    norm = mcolors.Normalize(vmin=0.0, vmax=max(fracs) if max(fracs) > 0 else 1.0)
+    vf = args.vel_frame
+    series: list[Series] = []
+    for o, frac in zip(offsets, fracs):
+        win = build_window_from_rows(data, layout, ctx, rows[o : o + W], device, f"phase {o}")
+        tr = predict(ctx, win, fut_cmd, args.seed, match)  # same seed -> identical noise across phases
+        series.append(Series(
+            label=f"phase {o} ({frac * 100:.0f}%)", color=cmap(norm(frac)),
+            fut=disp_traj(tr, vf), fut_cmd=np.tile(cmd_vec, (F, 1)),
+            hist=disp_traj(win.hist_traj, vf), actual=disp_traj(win.actual_fut_traj, vf),
+        ))
+    return Scenario(
+        name=f"sweep_phase [{args.phase_hist}] cmd={cmd_vec} period={period}",
+        dt=ctx.dt_attr, H=H, F=F, series=series,
+        shared_past_cmd=np.tile(cmd_vec, (H, 1)),
+        colorbar=(fracs, "gait phase (frac)"),
+        frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
     )
 
 
@@ -721,6 +824,8 @@ def _overlay(ax, getter, scn: Scenario, t_hist, t_fut) -> None:
         if s.hist is not None:
             ax.plot(t_hist, getter(s.hist), color=s.color, lw=1.4, alpha=0.9)
         ax.plot(t_fut, getter(s.fut), color=s.color, lw=1.6, alpha=0.95, label=s.label)
+        if s.actual is not None:
+            ax.plot(t_fut, getter(s.actual), color=s.color, lw=1.0, ls=":", alpha=0.6)
     ax.axvline(0.0, color="0.3", lw=0.8, ls=":")
     ax.grid(True, alpha=0.3)
 
@@ -975,7 +1080,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--fm_checkpoint", default=DEFAULT_CKPT, help="Path to the FM .pt checkpoint.")
     p.add_argument("--data", default=None, help="Recording .npz (default: auto-resolve from the run dir).")
-    p.add_argument("--mode", choices=["sweep_command", "sweep_history", "rollout", "all"], default="all")
+    p.add_argument("--mode", choices=["sweep_command", "sweep_history", "sweep_phase", "rollout", "all"],
+                   default="all")
     p.add_argument("--device", default="cpu")
     p.add_argument("--num_sampling_steps", type=int, default=None, help="Override Euler step count.")
     p.add_argument("--seed", type=int, default=0)
@@ -992,7 +1098,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sweep-hist", default="walking", help="Canonical history used for sweep_command.")
     # sweep_history
     p.add_argument("--histories", default="standing,walking,running,turning")
-    p.add_argument("--future-cmd", default="1.0,0,0", help="Fixed command for sweep_history.")
+    p.add_argument("--future-cmd", default="1.0,0,0", help="Fixed command for sweep_history and sweep_phase.")
+    # sweep_phase (does the prediction track the history's gait phase?)
+    p.add_argument("--phase-hist", default="walking", help="Canonical gait used for the phase sweep.")
+    p.add_argument("--n-phases", type=int, default=8, help="Number of phase offsets across one gait period.")
+    p.add_argument("--gait-period", type=int, default=0,
+                   help="Gait period in steps (0 = auto-estimate via foot-height autocorrelation).")
+    p.add_argument("--gait-max-period", type=int, default=80,
+                   help="Upper bound (steps) for the period / extra steady stretch length to scan.")
     # rollout
     p.add_argument("--rollout_steps", type=int, default=200)
     p.add_argument("--advance", type=int, default=1, help="Predicted steps consumed per inference (<=F).")
@@ -1050,7 +1163,8 @@ def main() -> int:
                            steady_weight=args.steady_weight)
 
     pages: list[Page] = []
-    modes = ["sweep_command", "sweep_history", "rollout"] if args.mode == "all" else [args.mode]
+    modes = (["sweep_command", "sweep_history", "sweep_phase", "rollout"]
+             if args.mode == "all" else [args.mode])
 
     if "sweep_command" in modes:
         win = get_window(args.sweep_hist)
@@ -1059,6 +1173,8 @@ def main() -> int:
         names = [n.strip() for n in args.histories.split(",") if n.strip()]
         windows = [get_window(n) for n in names]
         pages += scenario_pages(run_sweep_history(ctx, windows, args, device))
+    if "sweep_phase" in modes:
+        pages += scenario_pages(run_sweep_phase(ctx, data, layout, args, device))
     if "rollout" in modes:
         win = get_window(args.rollout_seed_history)
         res = run_rollout(ctx, win, args, device)
