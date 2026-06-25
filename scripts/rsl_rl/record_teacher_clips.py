@@ -194,6 +194,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # fires inside a clip-length window.
         env_cfg.commands.traj_ref.path = args_cli.source_clip
         env_cfg.commands.traj_ref.random_start_phase = False
+        # Never render during recording; the -play configs enable debug markers,
+        # whose set_debug_vis path NameErrors on a headless build with no
+        # visualizer (omni not imported).  Force it off before the env is built.
+        env_cfg.commands.traj_ref.debug_vis = False
         _disable_terminations(env_cfg)
 
         # Hold the source library off-GPU when large; gathers copy only the per-env slice.
