@@ -297,8 +297,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             cmd.forced_clip_id[:n] = ids
             cmd.forced_clip_id[n:] = 0
 
-            obs, _ = env.reset()
-            _reset_policy()
+            # Reset under inference_mode: the command-term metric tensors are
+            # touched inside the step loop's inference_mode below, so zeroing
+            # them in CommandTerm.reset must also run under inference_mode
+            # (inplace update to an inference tensor is illegal outside it).
+            with torch.inference_mode():
+                obs, _ = env.reset()
+                _reset_policy()
 
             y_buf = torch.zeros(n_envs, T, P)
             dy_buf = torch.zeros(n_envs, T, V)
