@@ -8,6 +8,7 @@ Run with: ``pytest source/robot_rl/robot_rl/flow_matching/tests`` inside the
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,15 +17,18 @@ import torch
 from isaaclab.utils.math import matrix_from_quat
 
 from robot_rl.flow_matching import (
+    FKChain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
     FutureStateDataset,
     Normalizer,
     build_train_val,
     episode_windows,
+    fk_consistency_terms,
     flow_matching_loss,
     frame_block_start,
-    frame_consistency_loss,
+    frame_consistency_terms,
+    joint_vel_consistency_term,
     matrix_to_rot6d,
     orientation_slice,
     orientation_slices,
@@ -689,10 +693,12 @@ def test_frame_consistency_zero_for_consistent_traj():
     nf, nj, k, dt = 6, 2, 1, 0.05
     x = _consistent_frame_traj(nf, nj, k, dt, seed=1)
     known = torch.zeros(1, nf, dtype=torch.bool)  # all unknown -> consistency on the prediction itself
-    vel, accel = frame_consistency_loss(x, x, known, dt, nj, k)
+    vel, accel = frame_consistency_terms(x, x, known, dt, nj, k)  # per-sample (B,)
+    jvel = joint_vel_consistency_term(x, x, known, dt, nj)
     # A self-consistent constant-velocity trajectory has ~zero finite-difference residual.
-    assert vel.item() < 1e-10, vel.item()
-    assert accel.item() < 1e-10, accel.item()
+    assert vel.max().item() < 1e-10, vel.max().item()
+    assert accel.max().item() < 1e-10, accel.max().item()
+    assert jvel.max().item() < 1e-10, jvel.max().item()
 
 
 def test_frame_consistency_penalizes_jump():
@@ -701,8 +707,151 @@ def test_frame_consistency_penalizes_jump():
     known = torch.zeros(1, nf, dtype=torch.bool)
     pred = x.clone()
     pred[0, 3, frame_block_start(nj, 0):frame_block_start(nj, 0) + 3] += 1.0  # jump the root position
-    vel, _ = frame_consistency_loss(pred, x, known, dt, nj, k)
-    assert vel.item() > 1e-2, vel.item()  # the position jump breaks pos-FD == velocity
+    vel, _ = frame_consistency_terms(pred, x, known, dt, nj, k)
+    assert vel.max().item() > 1e-2, vel.max().item()  # the position jump breaks pos-FD == velocity
+
+
+def test_joint_vel_consistency_penalizes_jump():
+    nf, nj, k, dt = 6, 2, 1, 0.05
+    x = _consistent_frame_traj(nf, nj, k, dt, seed=3)
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    pred = x.clone()
+    pred[0, 3, 0:nj] += 0.5  # jump the joint positions
+    assert joint_vel_consistency_term(pred, x, known, dt, nj).max().item() > 1e-2
+
+
+# ---------------------------------------------------------------------------
+# Forward kinematics (torch FK) vs MuJoCo, Jacobian vs FD, and the FK loss
+# ---------------------------------------------------------------------------
+_FK_MJCF = os.path.join(
+    os.path.dirname(__file__), "..", "..", "..", "..", "..",
+    "transfer", "sim", "robots", "g1", "g1_21j.xml",
+)
+_FK_JOINTS = (
+    [f"{s}_{j}_joint" for s in ("left", "right")
+     for j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")]
+    + ["waist_yaw_joint"]
+    + [f"{s}_{j}_joint" for s in ("left", "right")
+       for j in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow")]
+)
+_FK_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+
+def _have_fk_model() -> bool:
+    return os.path.isfile(_FK_MJCF)
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_fk_matches_mujoco_and_jacobian_vs_fd():
+    mujoco = pytest.importorskip("mujoco")
+    chain = FKChain(_FK_MJCF, _FK_JOINTS, _FK_FRAMES, base_link="pelvis_link", dtype=torch.float64)
+
+    m = mujoco.MjModel.from_xml_path(_FK_MJCF)
+    d = mujoco.MjData(m)
+    jadr = [int(m.joint(n).qposadr[0]) for n in _FK_JOINTS]
+    bids = [int(m.body(f).id) for f in _FK_FRAMES]
+    rng = np.random.default_rng(0)
+    b, nj = 6, len(_FK_JOINTS)
+    qs = rng.uniform(-0.6, 0.6, size=(b, nj))
+    mj_pos = np.zeros((b, len(_FK_FRAMES), 3))
+    mj_rot = np.zeros((b, len(_FK_FRAMES), 3, 3))
+    for i in range(b):
+        d.qpos[:] = 0.0
+        d.qpos[3:7] = (1, 0, 0, 0)  # pelvis at identity -> xpos/xmat are in the base frame
+        for a, j in zip(jadr, qs[i]):
+            d.qpos[a] = j
+        mujoco.mj_kinematics(m, d)
+        for kf, bid in enumerate(bids):
+            mj_pos[i, kf] = d.xpos[bid]
+            mj_rot[i, kf] = d.xmat[bid].reshape(3, 3)
+
+    q = torch.tensor(qs, dtype=torch.float64)
+    pos, rot, jv, jw = chain.pose_and_jacobian(q)
+    assert np.abs(pos.numpy() - mj_pos).max() < 1e-6
+    assert np.abs(rot.numpy() - mj_rot).max() < 1e-6
+
+    # analytic Jacobian vs central finite difference of the FK pose
+    eps = 1e-6
+    _, rot0, _, _ = chain.pose_and_jacobian(q)
+    jv_fd = torch.zeros_like(jv)
+    jw_fd = torch.zeros_like(jw)
+    for j in range(nj):
+        dq = torch.zeros_like(q)
+        dq[:, j] = eps
+        pp, rp, _, _ = chain.pose_and_jacobian(q + dq)
+        pm, rm, _, _ = chain.pose_and_jacobian(q - dq)
+        jv_fd[:, :, :, j] = (pp - pm) / (2 * eps)
+        dR = (rp @ rot0.transpose(-1, -2) - rm @ rot0.transpose(-1, -2)) / (2 * eps)
+        jw_fd[:, :, :, j] = torch.stack(
+            [dR[..., 2, 1] - dR[..., 1, 2], dR[..., 0, 2] - dR[..., 2, 0], dR[..., 1, 0] - dR[..., 0, 1]], -1
+        ) * 0.5
+    assert (jv - jv_fd).abs().max() < 1e-4
+    assert (jw - jw_fd).abs().max() < 1e-4
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_fk_consistency_zero_for_fk_consistent_state():
+    """A state whose ee blocks equal FK(joints)/J·qdot (root at identity) has ~0 FK loss."""
+    chain = FKChain(_FK_MJCF, _FK_JOINTS, _FK_FRAMES, base_link="pelvis_link", dtype=torch.float64)
+    nj, k = len(_FK_JOINTS), len(_FK_FRAMES)
+    d = target_state_dim(nj, k)
+    nf = 4
+    rng = np.random.default_rng(1)
+    q = torch.tensor(rng.uniform(-0.5, 0.5, size=(1, nf, nj)), dtype=torch.float64)
+    qd = torch.tensor(rng.standard_normal((1, nf, nj)) * 0.3, dtype=torch.float64)
+    fk_pos, fk_rot, jv, jw = chain.pose_and_jacobian(q.reshape(nf, nj))
+    fk_pos = fk_pos.reshape(1, nf, k, 3); fk_rot = fk_rot.reshape(1, nf, k, 3, 3)
+    v_fk = torch.einsum("mkij,mj->mki", jv, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
+    w_fk = torch.einsum("mkij,mj->mki", jw, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
+
+    x = torch.zeros(1, nf, d, dtype=torch.float64)
+    x[..., 0:nj] = q
+    x[..., nj:2 * nj] = qd
+    # root block: identity rotation, zero pose/velocity -> base frame == ref frame.
+    rb = frame_block_start(nj, 0)
+    x[..., rb + 6:rb + 12] = torch.tensor([1.0, 0, 0, 0, 1, 0], dtype=torch.float64)  # ori6d of I
+    for kf in range(k):
+        eb = frame_block_start(nj, 1 + kf)
+        x[..., eb:eb + 3] = fk_pos[:, :, kf]
+        x[..., eb + 3:eb + 6] = v_fk[:, :, kf]
+        x[..., eb + 6:eb + 12] = matrix_to_rot6d(fk_rot[:, :, kf])
+        x[..., eb + 12:eb + 15] = w_fk[:, :, kf]
+
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    pose_ps, vel_ps = fk_consistency_terms(x, x, known, 0.05, nj, k, chain)
+    assert pose_ps.max().item() < 1e-8, pose_ps.max().item()
+    assert vel_ps.max().item() < 1e-8, vel_ps.max().item()
+    # perturb an ee position -> pose loss rises
+    xb = x.clone(); xb[0, 1, frame_block_start(nj, 1):frame_block_start(nj, 1) + 3] += 0.1
+    pose_b, _ = fk_consistency_terms(xb, xb, known, 0.05, nj, k, chain)
+    assert pose_b.max().item() > 1e-4
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_flow_loss_fk_terms_and_tau_gate():
+    """flow_matching_loss reports fk_pose/fk_vel/joint_vel; tau_min>1 gates accel+FK to 0."""
+    torch.manual_seed(30)
+    chain = FKChain(_FK_MJCF, _FK_JOINTS, _FK_FRAMES, base_link="pelvis_link")
+    nj, k = len(_FK_JOINTS), len(_FK_FRAMES)
+    d = target_state_dim(nj, k)
+    f, n = 8, 2
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32).eval()
+    x1 = torch.randn(16, f, d)
+    cond = torch.randn(16, f, d)
+    known = torch.zeros(16, f, dtype=torch.bool); known[:, :n] = True
+    norm = Normalizer.fit(x1.reshape(-1, d), torch.ones(d, dtype=torch.bool))
+    ckw = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k,
+               vel_weight=0.1, accel_weight=0.01, joint_vel_weight=0.1,
+               fk=chain, fk_pose_weight=0.1, fk_vel_weight=0.01)
+    out = flow_matching_loss(model, x1, cond, known, None, tau_min=0.0, **ckw)
+    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel"):
+        assert key in out
+    assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    # tau_min above 1 -> no sample passes the gate -> accel + FK contribute 0.
+    out_g = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, **ckw)
+    assert out_g["accel_consistency"].item() == 0.0
+    assert out_g["fk_pose"].item() == 0.0 and out_g["fk_vel"].item() == 0.0
 
 
 def test_flow_matching_loss_consistency_terms_present():

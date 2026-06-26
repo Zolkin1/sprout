@@ -452,8 +452,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Set up data logging
         plot_names = [s.strip() for s in args_cli.plots.split(",")]
         logging_enabled = plot_names != ["none"] and not args_cli.no_logging
+        # The FM peel-off plot needs the full F-step predicted window logged each
+        # step (heavier: [T, N, F, P]); enable it only when that plot is requested.
+        log_fm_window = any(p in ("fm_predictions", "all") for p in plot_names)
         if logging_enabled:
-            logger = DataLogger(env)
+            logger = DataLogger(env, log_fm_window=log_fm_window)
         env_ids = list(range(min(args_cli.plot_envs, env_cfg.scene.num_envs)))
 
         # Optional training-comparable episode-metric accumulator. Folds the

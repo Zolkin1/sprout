@@ -30,11 +30,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Make the recording I/O module importable (it lives in scripts/rsl_rl).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
 from recorded_data_io import load_recorded_data  # noqa: E402  isort: skip
 from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402  isort: skip
 
 from robot_rl.flow_matching import (  # noqa: E402
+    FKChain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
     FutureStateDataset,
@@ -109,7 +111,21 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "(predicted pose d/dt vs predicted velocity).")
     parser.add_argument("--accel_consistency_weight", type=float, default=0.0,
                         help="Weight on the frame acceleration finite-difference consistency loss "
-                             "(predicted velocity d/dt vs data velocity d/dt).")
+                             "(predicted velocity d/dt vs data velocity d/dt). tau-gated.")
+    parser.add_argument("--joint_vel_consistency_weight", type=float, default=0.0,
+                        help="Weight on the joint-velocity finite-difference consistency "
+                             "(predicted joint_pos d/dt vs predicted joint_vel). Ungated.")
+    parser.add_argument("--fk_pose_weight", type=float, default=0.0,
+                        help="Weight on the FK pose consistency (predicted ee pose vs FK of "
+                             "predicted joints). tau-gated.")
+    parser.add_argument("--fk_vel_weight", type=float, default=0.0,
+                        help="Weight on the FK velocity consistency (predicted ee velocity vs "
+                             "J(q)*qdot of predicted joints/joint-vels). tau-gated.")
+    parser.add_argument("--consistency_tau_min", type=float, default=FlowMatchingConfig().consistency_tau_min,
+                        help="Only score the acceleration + FK terms on samples with flow-time "
+                             "tau >= this (velocity/joint-velocity stay ungated).")
+    parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
+                        help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
     # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
@@ -145,6 +161,9 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
         vel_consistency_weight=args.vel_consistency_weight,
         accel_consistency_weight=args.accel_consistency_weight,
+        joint_vel_consistency_weight=args.joint_vel_consistency_weight,
+        fk_pose_weight=args.fk_pose_weight, fk_vel_weight=args.fk_vel_weight,
+        consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
@@ -225,8 +244,53 @@ def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_histor
     return use_history.unsqueeze(1) & is_hist
 
 
+_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel")
+
+
 @torch.no_grad()
-def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0) -> dict[str, float]:
+def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> None:
+    """Sanity baseline: FK(recorded joints) vs the recorded ee pose (base frame).
+
+    On clean recorded data the FK of the joints should reproduce the recorded
+    end-effector frames (~0), validating the joint/frame name+order mapping and that
+    the MJCF kinematics match the recording. A large value warns of a model mismatch
+    that would floor the FK loss.
+    """
+    nj, k = num_joints, train_ds.num_extra_frames
+    s = train_ds.state[:n_windows].to(device)
+    x = train_ds.state_normalizer.denormalize(s)  # (W, F, D) physical
+    w, f = x.shape[0], x.shape[1]
+    fk_pos, _, _, _ = fk.pose_and_jacobian(x[..., :nj].reshape(w * f, nj))
+    fk_pos = fk_pos.reshape(w, f, k, 3)
+    rb = frame_block_start(nj, 0)
+    p_root = x[..., rb:rb + 3]
+    r_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])
+    errs = []
+    for kf in range(k):
+        eb = frame_block_start(nj, 1 + kf)
+        p_ee_base = torch.einsum("wfji,wfj->wfi", r_root, x[..., eb:eb + 3] - p_root)
+        errs.append(float((p_ee_base - fk_pos[:, :, kf]).norm(dim=-1).mean()))
+    mean_mm = 1000.0 * sum(errs) / max(len(errs), 1)
+    print(f"[INFO] FK sanity (FK(recorded joints) vs recorded ee, base frame): "
+          f"mean {mean_mm:.1f} mm | per-frame mm {[round(1000 * e, 1) for e in errs]}")
+    if mean_mm > 20.0:
+        print("[WARN] FK baseline > 20 mm: the MJCF kinematics may not match the recording "
+              "(joint order/names, base link, or model mismatch); the FK loss will have this floor.")
+
+
+def consistency_kwargs(cfg, num_joints, num_extra_frames, fk) -> dict:
+    """Shared flow_matching_loss kwargs for the consistency + FK regularizers."""
+    return dict(
+        dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
+        vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
+        joint_vel_weight=cfg.joint_vel_consistency_weight,
+        fk=fk, fk_pose_weight=cfg.fk_pose_weight, fk_vel_weight=cfg.fk_vel_weight,
+        tau_min=cfg.consistency_tau_min,
+    )
+
+
+@torch.no_grad()
+def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0, fk=None) -> dict[str, float]:
     """Compute conditioned/unconditional flow loss and per-channel sampling metrics.
 
     Metrics are over the novel (predicted) frames ``N..F-1`` only; ``flow_mse`` is the
@@ -237,6 +301,7 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     flow_sum, flow_unc_sum, n_batches = 0.0, 0.0, 0
     cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
+    ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk)
     for batch in loader:
         state = batch["state"].to(device)
         cond = batch["cond"].to(device)
@@ -244,14 +309,9 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
         b = state.shape[0]
         known = make_known_mask(b, cfg, device, True)
         none = make_known_mask(b, cfg, device, False)
-        cond_out = flow_matching_loss(
-            model, state, cond, known, cmd_tokens,
-            state_norm=state_normalizer, dt=cfg.dt, num_joints=num_joints,
-            num_extra_frames=num_extra_frames,
-            vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
-        )
+        cond_out = flow_matching_loss(model, state, cond, known, cmd_tokens, state_norm=state_normalizer, **ckw)
         flow_sum += cond_out["flow_mse"].item()
-        for k in ("vel_consistency", "accel_consistency"):
+        for k in _CONS_KEYS:
             if k in cond_out:
                 cons_sums[k] = cons_sums.get(k, 0.0) + cond_out[k].item()
         flow_unc_sum += flow_matching_loss(model, state, cond, none, cmd_tokens)["flow_mse"].item()
@@ -363,6 +423,17 @@ def main() -> None:
     if train_ds.cmd_normalizer is not None:
         train_ds.cmd_normalizer.to(device)
 
+    # Forward-kinematics chain for the FK consistency losses (only when weighted).
+    fk = None
+    if cfg.fk_pose_weight > 0.0 or cfg.fk_vel_weight > 0.0:
+        if train_ds.num_extra_frames == 0:
+            print("[WARN] fk_pose_weight/fk_vel_weight set but the dataset has no extra (ee) "
+                  "frames; skipping the FK losses.")
+        else:
+            fk_path = cfg.fk_model_path if os.path.isabs(cfg.fk_model_path) else os.path.join(_REPO_ROOT, cfg.fk_model_path)
+            fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)
+            _fk_sanity_check(fk, train_ds, num_joints, device)
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
@@ -391,9 +462,8 @@ def main() -> None:
             opt.zero_grad()
             out = flow_matching_loss(
                 model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight,
-                state_norm=train_ds.state_normalizer, dt=cfg.dt, num_joints=num_joints,
-                num_extra_frames=train_ds.num_extra_frames,
-                vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
+                state_norm=train_ds.state_normalizer,
+                **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk),
             )
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -402,7 +472,7 @@ def main() -> None:
             n += 1
             global_step += 1
             writer.add_scalar("train/loss_step", out["loss"].item(), global_step)
-            for k in ("flow_mse", "vel_consistency", "accel_consistency"):
+            for k in ("flow_mse", *_CONS_KEYS):
                 if k in out:
                     writer.add_scalar(f"train/{k}_step", out[k].item(), global_step)
         if scheduler is not None:
@@ -418,7 +488,7 @@ def main() -> None:
         if val_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             val = evaluate(
                 model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
-                num_extra_frames=train_ds.num_extra_frames,
+                num_extra_frames=train_ds.num_extra_frames, fk=fk,
             )
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
@@ -433,7 +503,7 @@ def main() -> None:
         if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             ev = evaluate(
                 model, eval_loader, cfg, train_ds.state_normalizer, num_joints, device,
-                num_extra_frames=train_ds.num_extra_frames,
+                num_extra_frames=train_ds.num_extra_frames, fk=fk,
             )
             for k, v in ev.items():
                 writer.add_scalar(f"eval/{k}", v, epoch)

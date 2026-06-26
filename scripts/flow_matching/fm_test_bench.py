@@ -912,6 +912,95 @@ def run_rollout(ctx, win, args, device) -> RolloutResult:
     )
 
 
+class ForwardKinematics:
+    """MuJoCo forward kinematics: generated root pose + joints -> EE world positions.
+
+    Used to check whether the FM's predicted end-effector frames are consistent with
+    the FK of its predicted joints. Lazily imports ``mujoco`` and loads the G1 model;
+    raises if either is unavailable so the caller can degrade gracefully.
+    """
+
+    def __init__(self, model_path: str, joint_names: list[str], frame_names: list[str]):
+        """Load the model and map FM joint names -> qpos addresses, frames -> body ids."""
+        import mujoco  # lazy: keeps the rest of the bench import-light / mujoco-optional
+
+        self._mj = mujoco
+        self.model = mujoco.MjModel.from_xml_path(model_path)
+        self.data = mujoco.MjData(self.model)
+        if int(self.model.jnt_type[0]) != 0:  # 0 == mjJNT_FREE (floating base at qpos[0:7])
+            raise ValueError(f"{model_path}: expected a floating-base (free) joint at index 0.")
+        self.jadr = np.array([int(self.model.joint(n).qposadr[0]) for n in joint_names], dtype=np.int64)
+        self.jdof = np.array([int(self.model.joint(n).dofadr[0]) for n in joint_names], dtype=np.int64)
+        self.bids = [int(self.model.body(f).id) for f in frame_names]
+        self.base_bid = int(self.model.jnt_bodyid[0])      # floating-base child body (its world rotation)
+
+    def positions(self, root_pos: np.ndarray, root_quat_xyzw: np.ndarray, joint_pos: np.ndarray) -> np.ndarray:
+        """FK EE world positions for a ``(T, .)`` batch -> ``(T, K, 3)``."""
+        t_n, k = root_pos.shape[0], len(self.bids)
+        out = np.empty((t_n, k, 3), dtype=np.float32)
+        m, d = self.model, self.data
+        for t in range(t_n):
+            d.qpos[:] = 0.0
+            d.qpos[0:3] = root_pos[t]
+            q = root_quat_xyzw[t]
+            d.qpos[3:7] = (q[3], q[0], q[1], q[2])  # xyzw -> wxyz
+            d.qpos[self.jadr] = joint_pos[t]
+            self._mj.mj_kinematics(m, d)
+            for j, bid in enumerate(self.bids):
+                out[t, j] = d.xpos[bid]
+        return out
+
+    def velocities(
+        self, root_pos: np.ndarray, root_quat_xyzw: np.ndarray,
+        root_lin_vel_w: np.ndarray, root_ang_vel_w: np.ndarray,
+        joint_pos: np.ndarray, joint_vel: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """FK EE world-frame link velocities -> ``(lin (T,K,3), ang (T,K,3))``.
+
+        Maps the recorded world link twist onto MuJoCo's free-joint qvel: linear is
+        the world frame-origin velocity (direct), angular is body-local (``R^T omega``);
+        joint dof velocities map by name. Reads each EE frame-origin velocity via the
+        point Jacobian (``v = Jp @ qvel``, ``w = Jr @ qvel``) -- ``mj_objectVelocity``
+        returns a COM-based velocity, so the Jacobian is used instead. Validated exact
+        against the recording's ``body_link_vel_w``.
+        """
+        mj, m, d = self._mj, self.model, self.data
+        t_n, k, nv = root_pos.shape[0], len(self.bids), self.model.nv
+        lin = np.empty((t_n, k, 3), dtype=np.float32)
+        ang = np.empty((t_n, k, 3), dtype=np.float32)
+        jacp = np.zeros((3, nv))
+        jacr = np.zeros((3, nv))
+        for t in range(t_n):
+            d.qpos[:] = 0.0
+            d.qvel[:] = 0.0
+            d.qpos[0:3] = root_pos[t]
+            q = root_quat_xyzw[t]
+            d.qpos[3:7] = (q[3], q[0], q[1], q[2])
+            d.qpos[self.jadr] = joint_pos[t]
+            mj.mj_kinematics(m, d)
+            mj.mj_comPos(m, d)                                      # required by mj_jac
+            rot = d.xmat[self.base_bid].reshape(3, 3)              # base world rotation
+            d.qvel[0:3] = root_lin_vel_w[t]                        # free-joint linear = world frame-origin vel
+            d.qvel[3:6] = rot.T @ root_ang_vel_w[t]               # angular in body-local
+            d.qvel[self.jdof] = joint_vel[t]
+            for j, bid in enumerate(self.bids):
+                mj.mj_jac(m, d, jacp, jacr, d.xpos[bid], bid)      # Jacobian of the EE frame origin
+                lin[t, j] = jacp @ d.qvel
+                ang[t, j] = jacr @ d.qvel
+        return lin, ang
+
+
+def try_build_fk(args, ctx: FmOnlineContext) -> ForwardKinematics | None:
+    """Build the FK helper, or return None (with a warning) if disabled/unavailable."""
+    if args.no_fk:
+        return None
+    try:
+        return ForwardKinematics(args.fk_model, ctx.joint_names, ctx.target_frame_names)
+    except Exception as ex:  # mujoco missing, model not found, name mismatch, ...
+        print(f"[bench] FK disabled ({type(ex).__name__}: {str(ex)[:90]}); skipping ee-vs-fk page")
+        return None
+
+
 @dataclass
 class ForecastResult:
     """Open-loop forecasts overlaid on a ground-truth recording."""
@@ -947,6 +1036,24 @@ def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
     gt = layout.parse(data["state"][rows])      # (L, .)
     cmd_w = data["target_vel"][rows]            # (L, 3) recorded command (ramps as in training)
     stride = max(1, args.forecast_stride)
+    fk = try_build_fk(args, ctx)                # FK of generated joints (None if mujoco/model missing)
+
+    def attach_fk(tr: dict[str, np.ndarray]) -> None:
+        """Add FK consistency fields to a RAW (world-frame) traj, before disp_traj.
+
+        ``fk_ee_pos`` (world); ``fk_lin_err``/``fk_ang_err`` are the world-frame
+        magnitudes ‖generated EE vel - FK(generated joints) vel‖ (frame-invariant, so
+        unaffected by the later body-frame display rotation).
+        """
+        if fk is None or "ee_pos" not in tr:
+            return
+        tr["fk_ee_pos"] = fk.positions(tr["root_pos"], tr["root_quat"], tr["joint_pos"])
+        lin, ang = fk.velocities(tr["root_pos"], tr["root_quat"], tr["root_lin_vel"],
+                                 tr["root_ang_vel"], tr["joint_pos"], tr["joint_vel"])
+        tr["fk_lin_err"] = np.linalg.norm(tr["ee_lin_vel"] - lin, axis=-1).astype(np.float32)  # (T,K)
+        tr["fk_ang_err"] = np.linalg.norm(tr["ee_ang_vel"] - ang, axis=-1).astype(np.float32)  # (T,K)
+
+    attach_fk(gt)  # baseline ~0 (FK matches the recording exactly)
     preds: list[tuple[int, dict[str, np.ndarray]]] = []
     # Anchor = the most-recent conditioning step (window start s0 = a-(N-1)); need the
     # full F-window of recorded rows and the horizon to land inside the ground truth.
@@ -956,6 +1063,7 @@ def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
         prof = np.ascontiguousarray(cmd_w[s0 : s0 + F])  # recorded command over the window
         fut_cmd = torch.from_numpy(prof).float().unsqueeze(0).to(device)
         tr = predict(ctx, win, fut_cmd, args.seed, include_history=True)  # full window: echo + novel
+        attach_fk(tr)
         preds.append((a, disp_traj(tr, vf)))
     cmd_ctx, left_pad = cmd_context_window(data, rows, args.forecast_pad)
     print(f"[bench] forecast on {args.forecast_hist!r}: L={L} steps ({L * ctx.dt_attr:.1f}s) "
@@ -1278,6 +1386,92 @@ def draw_forecast_cmd(fig, res: ForecastResult) -> None:
     fig.suptitle("forecast vs ground truth  --  recorded commanded velocity (+ context)", fontsize=12)
 
 
+def draw_forecast_fk(fig, res: ForecastResult) -> None:
+    """Consistency: generated EE position vs FK of the generated joints, per EE.
+
+    Per end-effector, the Cartesian error ``||generated EE - FK(generated root+joints)||``
+    over the forecast windows (colored by anchor time), with the ground-truth baseline
+    (black, ~0 since FK matches the recording exactly). Branch values near the baseline
+    mean the FM's predicted joints and EE frames agree; values above it mean the
+    generated joints don't place the EE where the generated EE frame says.
+    """
+    fig.clear()
+    k = len(res.frame_names)
+    ncol = 2
+    nrow = (k + ncol - 1) // ncol
+    axs = np.array(fig.subplots(nrow, ncol)).reshape(nrow, ncol)
+    n = res.N
+    fwin = res.preds[0][1]["root_pos"].shape[0] if res.preds else 0
+    dt = res.dt
+    norm, cmap = _forecast_color(res)
+    L = res.gt["root_pos"].shape[0]
+    t_gt = np.arange(L) * dt
+    gt_err = np.linalg.norm(res.gt["ee_pos"] - res.gt["fk_ee_pos"], axis=-1)  # (L, K)
+    novel_errs: list[np.ndarray] = []
+    for j in range(k):
+        ax = axs.ravel()[j]
+        ax.plot(t_gt, gt_err[:, j], color="k", lw=1.4, zorder=5)
+        for a, pred in res.preds:
+            e = np.linalg.norm(pred["ee_pos"][:, j] - pred["fk_ee_pos"][:, j], axis=-1)  # (F,)
+            ax.plot((np.arange(fwin) + (a - (n - 1))) * dt, e, color=cmap(norm(a * dt)), lw=1.0, alpha=0.85)
+            novel_errs.append(e[n:])
+        ax.set_title(res.frame_names[j], fontsize=9)
+        ax.set_xlabel("time (s)")
+        ax.set_ylabel("|gen EE - FK| (m)", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    for j in range(k, nrow * ncol):
+        axs.ravel()[j].set_visible(False)
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm.set_array([])
+    fig.colorbar(sm, ax=list(axs.ravel()), label="forecast anchor time (s)", fraction=0.02, pad=0.01)
+    mean_nov = float(np.concatenate(novel_errs).mean()) if novel_errs else 0.0
+    fig.suptitle(f"generated EE position vs FK(generated joints)  --  mean novel error {mean_nov * 1000:.1f} mm "
+                 f"(black = GT baseline)", fontsize=12)
+
+
+def draw_forecast_fk_vel(fig, res: ForecastResult) -> None:
+    """Consistency of generated EE *velocities* vs FK of the generated joint velocities.
+
+    Per EE, the world-frame error magnitude ``||generated EE vel - FK vel||`` over the
+    forecasts (colored by anchor), with the GT baseline (black, ~0): left column linear
+    (m/s), right column angular (rad/s). Lines near the baseline mean the generated EE
+    velocities are consistent with the differential FK of the generated joint motion.
+    """
+    fig.clear()
+    k = len(res.frame_names)
+    axs = np.array(fig.subplots(k, 2)).reshape(k, 2)
+    n = res.N
+    fwin = res.preds[0][1]["root_pos"].shape[0] if res.preds else 0
+    dt = res.dt
+    norm, cmap = _forecast_color(res)
+    L = res.gt["root_pos"].shape[0]
+    t_gt = np.arange(L) * dt
+    cols = [("fk_lin_err", "lin vel", "m/s"), ("fk_ang_err", "ang vel", "rad/s")]
+    novel: dict[str, list] = {c[0]: [] for c in cols}
+    for j in range(k):
+        for c, (key, title, unit) in enumerate(cols):
+            ax = axs[j, c]
+            ax.plot(t_gt, res.gt[key][:, j], color="k", lw=1.4, zorder=5)
+            for a, pred in res.preds:
+                ax.plot((np.arange(fwin) + (a - (n - 1))) * dt, pred[key][:, j],
+                        color=cmap(norm(a * dt)), lw=1.0, alpha=0.85)
+                novel[key].append(pred[key][n:, j])
+            ax.set_title(f"{res.frame_names[j]} {title}", fontsize=8)
+            ax.set_ylabel(f"|gen - FK| ({unit})", fontsize=7)
+            ax.grid(True, alpha=0.3)
+            if j == k - 1:
+                ax.set_xlabel("time (s)")
+            else:
+                ax.tick_params(labelbottom=False)  # declutter: ticks only on the bottom row
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm.set_array([])
+    fig.colorbar(sm, ax=list(axs.ravel()), label="forecast anchor time (s)", fraction=0.02, pad=0.01)
+    ml = float(np.concatenate(novel["fk_lin_err"]).mean()) if novel["fk_lin_err"] else 0.0
+    ma = float(np.concatenate(novel["fk_ang_err"]).mean()) if novel["fk_ang_err"] else 0.0
+    fig.suptitle(f"generated EE velocity vs FK(generated joints)  --  mean novel lin {ml * 1000:.1f} mm/s, "
+                 f"ang {ma:.3f} rad/s (black = GT baseline)", fontsize=12)
+
+
 # ======================================================================
 # 7. figure browser + PNG save
 # ======================================================================
@@ -1455,6 +1649,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--forecast-pad", type=int, default=60,
                    help="Steps of recorded command context to show before/after the FM region "
                         "(trimmed at episode resets) so you can see ramps into/out of it.")
+    p.add_argument("--fk-model", default=os.path.join(ROOT, "transfer", "sim", "robots", "g1", "g1_21j.xml"),
+                   help="MuJoCo G1 model for the EE-vs-FK consistency page (FK of generated joints).")
+    p.add_argument("--no-fk", action="store_true",
+                   help="Skip the generated-EE-vs-FK(generated-joints) consistency page.")
     # rollout
     p.add_argument("--rollout_steps", type=int, default=200)
     p.add_argument("--advance", type=int, default=1, help="Predicted steps consumed per inference (<=F).")
@@ -1545,6 +1743,9 @@ def main() -> int:
         pages.append(Page("forecast / root", lambda fig, r=forecast_result: draw_forecast(fig, r)))
         pages.append(Page("forecast / xy path", lambda fig, r=forecast_result: draw_forecast_path(fig, r)))
         pages.append(Page("forecast / command", lambda fig, r=forecast_result: draw_forecast_cmd(fig, r)))
+        if "fk_ee_pos" in forecast_result.gt:
+            pages.append(Page("forecast / ee vs fk (pos)", lambda fig, r=forecast_result: draw_forecast_fk(fig, r)))
+            pages.append(Page("forecast / ee vs fk (vel)", lambda fig, r=forecast_result: draw_forecast_fk_vel(fig, r)))
     if "rollout" in modes:
         win = get_window(args.rollout_seed_history)
         rollout_result = run_rollout(ctx, win, args, device)

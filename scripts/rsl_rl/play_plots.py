@@ -61,6 +61,103 @@ def _trailing_moving_average(x: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Flow-matching (FM) source helpers -- transition lines + active spans
+# ---------------------------------------------------------------------------
+
+def _fm_transitions_and_spans(
+    fm_active_env: np.ndarray, dt: float, t_offset: float,
+) -> tuple[list[float], list[float], list[tuple[float, float]]]:
+    """Decode a per-step FM-active series into transition times + active spans.
+
+    Args:
+        fm_active_env: ``[T]`` bool series, True where the flow-matching generator
+            (not the clip) drives this env's reference.
+        dt: Seconds per step (use ``1.0`` for a step-indexed x-axis).
+        t_offset: Time of the first sample (``0.0`` unless a time window is sliced).
+
+    Returns:
+        ``(on_times, off_times, spans)`` where ``on_times`` are clip->FM switch
+        times, ``off_times`` are FM->clip switch times, and ``spans`` are
+        ``(lo, hi)`` FM-active intervals (the trailing span is extended one ``dt``
+        so a final still-active step is still visible).  A series that *starts*
+        active opens a span without an ``on`` line (the switch happened before the
+        window), so a sliced time range never invents a transition at its edge.
+    """
+    act = np.asarray(fm_active_env, dtype=bool)
+    T = act.shape[0]
+    on: list[float] = []
+    off: list[float] = []
+    spans: list[tuple[float, float]] = []
+    if T == 0:
+        return on, off, spans
+
+    def t_of(i: int) -> float:
+        return i * dt + t_offset
+
+    prev = False
+    span_start: float | None = None
+    for i in range(T):
+        cur = bool(act[i])
+        if cur and not prev:
+            if i > 0:
+                on.append(t_of(i))
+            span_start = t_of(i)
+        elif not cur and prev:
+            if i > 0:
+                off.append(t_of(i))
+            if span_start is not None:
+                spans.append((span_start, t_of(i)))
+            span_start = None
+        prev = cur
+    if prev and span_start is not None:
+        spans.append((span_start, t_of(T - 1) + dt))
+    return on, off, spans
+
+
+def _draw_fm_transitions(
+    ax: "plt.Axes",
+    on_times: list[float],
+    off_times: list[float],
+    spans: list[tuple[float, float]] | None = None,
+    label: bool = False,
+) -> None:
+    """Overlay clip<->FM transition lines (and optional FM-active shading) on ``ax``.
+
+    Args:
+        ax: Target axis.
+        on_times: clip->FM switch times (vertical green dash-dot lines).
+        off_times: FM->clip switch times (vertical grey dash-dot lines).
+        spans: ``(lo, hi)`` FM-active intervals to lightly shade, or ``None``.
+        label: Attach legend labels (set True on a single subplot only, so the
+            shared legend isn't repeated across a grid).
+    """
+    if spans:
+        for k, (lo, hi) in enumerate(spans):
+            ax.axvspan(lo, hi, color="tab:green", alpha=0.07,
+                       label=("FM active" if (label and k == 0) else None))
+    for k, t in enumerate(on_times):
+        ax.axvline(t, color="tab:green", linestyle="-.", linewidth=1.5, alpha=0.9,
+                   label=("clip→FM" if (label and k == 0) else None))
+    for k, t in enumerate(off_times):
+        ax.axvline(t, color="0.4", linestyle="-.", linewidth=1.5, alpha=0.9,
+                   label=("FM→clip" if (label and k == 0) else None))
+
+
+def _fm_for_env(
+    data: dict[str, np.ndarray], env_id: int, dt: float | None, t_offset: float,
+) -> tuple[list[float], list[float], list[tuple[float, float]]] | None:
+    """Per-env FM transitions+spans from ``data['fm_active']``, or ``None`` if absent.
+
+    Falls back to a step-indexed axis (``dt=1``) when ``dt`` is ``None`` so the
+    overlay lines up with whichever x-axis the host plot uses.
+    """
+    fm = data.get("fm_active")
+    if fm is None or env_id >= fm.shape[1]:
+        return None
+    return _fm_transitions_and_spans(fm[:, env_id], dt if dt else 1.0, t_offset if dt else 0.0)
+
+
 def _slice_to_time_range(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
@@ -116,11 +213,15 @@ def _grid_plot(
     dt: float | None = None,
     legend_loc: str = "best",
     t_offset: float = 0.0,
+    fm_active: np.ndarray | None = None,
 ) -> None:
     """Shared helper for grid-of-subplots plots (positions, velocities, joints, torques).
 
     When ``dt`` is provided the x-axis is rendered in seconds; otherwise it
-    falls back to integer time steps.
+    falls back to integer time steps.  When ``fm_active`` (``[T, N]`` bool) is
+    given, every subplot is overlaid with the clip<->FM transition lines and a
+    light shade over the FM-active span -- so it's clear at a glance where the
+    reference (``key_a``) stops being the clip and becomes the FM prediction.
     """
     arr_a = data[key_a]
     n_dims = arr_a.shape[2] if arr_a.ndim >= 3 else arr_a.shape[1]
@@ -137,6 +238,10 @@ def _grid_plot(
         fig.suptitle(title_fmt.format(env_id=env_id), fontsize=16)
         axs_flat = np.array(axs).flatten()
 
+        fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {},
+                         env_id, dt, t_offset)
+        has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
+
         for i in range(n_dims):
             ax = axs_flat[i]
             y_a = arr_a[:, env_id, i] if arr_a.ndim >= 3 else arr_a[:, env_id]
@@ -144,6 +249,8 @@ def _grid_plot(
             if key_b is not None:
                 y_b = data[key_b][:, env_id, i] if data[key_b].ndim >= 3 else data[key_b][:, env_id]
                 ax.plot(x_axis, y_b, label=label_b, linestyle="--", linewidth=2)
+            if has_fm:
+                _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=(i == 0))
 
             name = names[i] if i < len(names) else f"Dim {i}"
             unit = _unit_for_name(name)
@@ -151,7 +258,7 @@ def _grid_plot(
             ax.set_xlabel(x_label)
             ax.set_ylabel(y_label_fmt.format(unit=unit) if unit else y_label_fmt.format(unit=""))
             ax.grid(True, alpha=0.3)
-            if i == 0 and key_b is not None:
+            if i == 0 and (key_b is not None or has_fm):
                 ax.legend(loc=legend_loc)
 
         # Hide unused subplots
@@ -179,15 +286,21 @@ def plot_positions(
         print("[WARN plot_positions] Missing y_des or y_act data, skipping.")
         return
     names = metadata.get("pos_names", [f"Dim {i}" for i in range(data["y_des"].shape[2])])
+    # When the FM source is in play, ``y_des`` is the *tracked* reference (the
+    # clip while clip-tracking, the FM prediction while FM-active) -- not always
+    # the clip -- so name it accordingly.
+    ref_label = "Tracked ref (clip/FM)" if "fm_active" in data else "Reference"
     _grid_plot(
         data, "y_des", "y_act", names,
         title_fmt="Reference vs Actual Positions (Env {env_id})",
         y_label_fmt="Position ({unit})",
         filename_fmt="positions_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
+        label_a=ref_label,
         dt=metadata.get("dt"),
         legend_loc="lower left",
         t_offset=metadata.get("t_offset", 0.0),
+        fm_active=data.get("fm_active"),
     )
 
 
@@ -202,14 +315,17 @@ def plot_velocities(
         print("[WARN plot_velocities] Missing dy_des or dy_act data, skipping.")
         return
     names = metadata.get("vel_names", [f"Dim {i}" for i in range(data["dy_des"].shape[2])])
+    ref_label = "Tracked ref (clip/FM)" if "fm_active" in data else "Reference"
     _grid_plot(
         data, "dy_des", "dy_act", names,
         title_fmt="Reference vs Actual Velocities (Env {env_id})",
         y_label_fmt="Velocity ({unit}/s)",
         filename_fmt="velocities_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
+        label_a=ref_label,
         dt=metadata.get("dt"),
         t_offset=metadata.get("t_offset", 0.0),
+        fm_active=data.get("fm_active"),
     )
 
 
@@ -232,6 +348,7 @@ def plot_joint_targets(
         filename_fmt="joint_targets_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
         label_a="Target", label_b="Actual",
+        fm_active=data.get("fm_active"),
     )
 
 
@@ -276,6 +393,7 @@ def plot_torques(
         filename_fmt="joint_torques_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
         label_a="Torque",
+        fm_active=data.get("fm_active"),
     )
 
 
@@ -303,12 +421,18 @@ def plot_base_velocity(
         fig.suptitle(f"Base Velocity (Env {env_id})", fontsize=16)
         if n_dims == 1:
             axs = [axs]
+        fm = _fm_for_env(data, env_id, dt, t_offset)
+        has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
         for i in range(n_dims):
             axs[i].plot(time_s, bv[:, env_id, i], linewidth=2)
+            if has_fm:
+                _draw_fm_transitions(axs[i], fm[0], fm[1], fm[2], label=(i == 0))
             axs[i].set_title(labels[i])
             axs[i].set_xlabel("Time (s)")
             axs[i].set_ylabel(f"Velocity ({units[i]})")
             axs[i].grid(True, alpha=0.3)
+            if has_fm and i == 0:
+                axs[i].legend(loc="best", fontsize=8)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(save_dir, f"base_velocity_env{env_id}.png"),
                      dpi=300, bbox_inches="tight")
@@ -354,6 +478,8 @@ def plot_velocity_tracking(
         fig.suptitle(f"Base Velocity Tracking (Env {env_id})", fontsize=16)
         if n_dims == 1:
             axs = [axs]
+        fm = _fm_for_env(data, env_id, dt, t_offset)
+        has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
         for i in range(n_dims):
             axs[i].plot(time_s, cmd[:, env_id, i], label="Commanded (target_vel)", linewidth=2)
             # Raw measured (faded) + its trailing moving average (bold, same hue).
@@ -361,6 +487,8 @@ def plot_velocity_tracking(
                         linestyle="--", linewidth=1.0, color="C1", alpha=0.35)
             axs[i].plot(time_s, _trailing_moving_average(act[:, env_id, i], ma_window),
                         label=f"Robot ({ma_window_s:g}s avg)", linewidth=2, color="C1")
+            if has_fm:
+                _draw_fm_transitions(axs[i], fm[0], fm[1], fm[2], label=(i == 0))
             axs[i].set_title(labels[i])
             axs[i].set_xlabel("Time (s)")
             axs[i].set_ylabel(f"Velocity ({units[i]})")
@@ -1134,6 +1262,162 @@ def plot_moe_tsne(
 
 
 # ---------------------------------------------------------------------------
+# Flow-matching prediction fan ("peel-off")
+# ---------------------------------------------------------------------------
+
+def _plot_fm_peeloff(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+    *,
+    act_key: str,
+    des_key: str,
+    pred_key: str,
+    names_key: str,
+    y_label_fmt: str,
+    title: str,
+    file_fmt: str,
+) -> None:
+    """Fan every fresh FM prediction forward off the tracked reference.
+
+    One subplot per output dimension overlays:
+
+      * the robot's **actual** value (``act_key``, solid black);
+      * the **tracked** reference (``des_key`` -- the clip while clip-tracking,
+        the FM prediction while FM-active, dashed red);
+      * one faint curve per **fresh FM inference**, drawn from the moment it was
+        generated through window steps ``pred_idx .. F-1`` (the predicted
+        future), colour-graded by generation time so successive predictions are
+        distinguishable and drift is visible.  A fresh prediction's first point
+        sits exactly on the tracked line, so each curve visibly "peels off" it.
+
+    Plus the clip<->FM transition lines and the shaded FM-active span.  Skips
+    silently unless the FM predicted window was logged (run with
+    ``--plots fm_predictions`` / ``all``, which enables the heavier window
+    logging in ``play.py``).
+    """
+    required = (act_key, des_key, pred_key, "fm_pred_idx", "fm_active")
+    missing = [k for k in required if k not in data]
+    if missing:
+        print(f"[WARN plot_fm_predictions] Missing {missing}; "
+              "run with --plots fm_predictions (or all). Skipping.")
+        return
+
+    import matplotlib.colors as mcolors
+
+    dt = metadata.get("dt", 1.0) or 1.0
+    t_offset = metadata.get("t_offset", 0.0)
+    n_steps = data[des_key].shape[0]
+    time_s = np.arange(n_steps) * dt + t_offset
+    pred = data[pred_key]                 # [T, N, F, P]
+    pidx_all = data["fm_pred_idx"]        # [T, N]
+    F = int(metadata.get("fm_window_len", pred.shape[2]))
+    n_dims = data[des_key].shape[2]
+    names = metadata.get(names_key, [f"Dim {i}" for i in range(n_dims)])
+    n_cols = 4
+    n_rows = max(1, (n_dims + n_cols - 1) // n_cols)
+    cmap = plt.cm.viridis
+
+    for env_id in env_ids:
+        act_series = data["fm_active"][:, env_id].astype(bool)
+        if not act_series.any():
+            print(f"[INFO plot_fm_predictions] Env {env_id} never tracks the FM; skipping.")
+            continue
+
+        p_env = pidx_all[:, env_id].astype(int)            # [T]
+        # Fresh inference == FM active AND the window index did not advance: it
+        # resets to N on a re-infer but strictly increases on a pure advance, so
+        # a non-increase (or the first FM-active step) marks a new prediction.
+        prev_active = np.concatenate([[False], act_series[:-1]])
+        prev_pidx = np.concatenate([[0], p_env[:-1]])
+        fresh = act_series & (~prev_active | (p_env <= prev_pidx))
+        fresh_steps = np.nonzero(fresh)[0]
+
+        vmin = time_s[fresh_steps[0]] if fresh_steps.size else time_s[0]
+        vmax = time_s[fresh_steps[-1]] if fresh_steps.size > 1 else time_s[-1]
+        norm = mcolors.Normalize(vmin=vmin, vmax=max(vmax, vmin + 1e-6))
+
+        fm = _fm_transitions_and_spans(act_series, dt, t_offset)
+
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows),
+                                constrained_layout=True)
+        fig.suptitle(f"{title} (Env {env_id}) — {fresh_steps.size} FM predictions",
+                     fontsize=16)
+        axs_flat = np.array(axs).flatten()
+
+        for i in range(n_dims):
+            ax = axs_flat[i]
+            # Peel-off fan first (under the bold actual/tracked lines).
+            for fs in fresh_steps:
+                j0 = int(p_env[fs])
+                if j0 >= F - 1:
+                    continue
+                js = np.arange(j0, F)
+                ax.plot(time_s[fs] + (js - j0) * dt, pred[fs, env_id, js, i],
+                        color=cmap(norm(time_s[fs])), alpha=0.75, linewidth=1.6, zorder=1)
+            ax.plot(time_s, data[act_key][:, env_id, i], color="black",
+                    linewidth=1.6, label="Actual", zorder=3)
+            ax.plot(time_s, data[des_key][:, env_id, i], color="C3", linestyle="--",
+                    linewidth=1.6, label="Tracked ref", zorder=3)
+            _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=(i == 0))
+
+            name = names[i] if i < len(names) else f"Dim {i}"
+            unit = _unit_for_name(name)
+            ax.set_title(name, fontsize=10)
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel(y_label_fmt.format(unit=unit) if unit else "")
+            ax.grid(True, alpha=0.3)
+            if i == 0:
+                ax.legend(loc="best", fontsize=8)
+
+        for i in range(n_dims, len(axs_flat)):
+            axs_flat[i].set_visible(False)
+
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=axs_flat[:n_dims].tolist(), fraction=0.015, pad=0.01)
+        cbar.set_label("FM prediction generated at (s)")
+
+        plt.savefig(os.path.join(save_dir, file_fmt.format(env_id=env_id)),
+                    dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_fm_predictions(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+) -> None:
+    """Position- and velocity-space FM prediction fans (see :func:`_plot_fm_peeloff`).
+
+    Shows, per output dimension, every flow-matching prediction peeling off the
+    tracked reference together with what the robot actually tracked -- so the
+    full set of predicted futures and the realised trajectory are visible at
+    once.  Needs the predicted window (``--plots fm_predictions`` / ``all``).
+    """
+    if "fm_pred_y" not in data and "fm_pred_dy" not in data:
+        print("[WARN plot_fm_predictions] No FM predicted window logged; "
+              "run with --plots fm_predictions (or all). Skipping.")
+        return
+    if "fm_pred_y" in data:
+        _plot_fm_peeloff(
+            data, metadata, save_dir, env_ids,
+            act_key="y_act", des_key="y_des", pred_key="fm_pred_y",
+            names_key="pos_names", y_label_fmt="Position ({unit})",
+            title="FM Predicted Positions", file_fmt="fm_predictions_pos_env{env_id}.png",
+        )
+    if "fm_pred_dy" in data:
+        _plot_fm_peeloff(
+            data, metadata, save_dir, env_ids,
+            act_key="dy_act", des_key="dy_des", pred_key="fm_pred_dy",
+            names_key="vel_names", y_label_fmt="Velocity ({unit}/s)",
+            title="FM Predicted Velocities", file_fmt="fm_predictions_vel_env{env_id}.png",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -1145,6 +1429,7 @@ PLOT_REGISTRY: dict[str, Callable] = {
     "torques": plot_torques,
     "base_velocity": plot_base_velocity,
     "velocity_tracking": plot_velocity_tracking,
+    "fm_predictions": plot_fm_predictions,
     "skill_and_terrain": plot_skill_and_terrain,
     "skill_transition_diag": plot_skill_transition_diag,
     "domain_info": plot_domain_info,

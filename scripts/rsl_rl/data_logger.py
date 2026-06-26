@@ -44,15 +44,23 @@ class DataLogger:
         data, metadata = logger.finalize()
     """
 
-    def __init__(self, env) -> None:
+    def __init__(self, env, log_fm_window: bool = False) -> None:
         """Initialize the logger and capture one-time metadata from the env.
 
         Args:
             env: The RslRlVecEnvWrapper-wrapped environment.
+            log_fm_window: If True and the trajectory term is a flow-matching
+                generator command, additionally log the full F-step predicted
+                window (``fm_pred_y`` / ``fm_pred_dy`` / ``fm_pred_idx``) each
+                step so ``plot_fm_predictions`` can fan the predictions off the
+                tracked reference.  Heavier (``[T, N, F, P]``), so it's opt-in;
+                ``fm_active`` (the cheap source mask used for the transition
+                line) is always logged when available.
         """
         self._data: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
+        self._log_fm_window = log_fm_window
         self.metadata: dict[str, Any] = {}
         # Per-step termination signals, stacked in finalize() into a
         # "successful tracking" mask (steps in episodes that ended via
@@ -195,6 +203,29 @@ class DataLogger:
                     step["target_vel"] = ref.get_command_velocity().clone()
             except Exception as exc:
                 self._warn("target_vel", f"Could not read commanded target velocity: {exc}")
+
+        # 1c. Flow-matching generator source mask + (optionally) the predicted
+        # window.  ``fm_active`` ([N] bool) marks the envs whose reference is
+        # being driven by the FM (vs the clip) this step -- the play plots use it
+        # to draw the clip->FM transition line and to know that ``y_des`` is the
+        # FM prediction, not the clip, while it's True.  When ``log_fm_window`` is
+        # set we also capture the full F-step prediction in the y_des/dy_des
+        # layout plus the currently-applied window index, so ``plot_fm_predictions``
+        # can fan each fresh prediction forward off the tracked line.  Both are
+        # no-ops for clip-only commands (no ``fm_active`` attribute).
+        if self._traj_term_name is not None:
+            try:
+                ref = unwrapped.command_manager.get_term(self._traj_term_name)
+                fm_active = getattr(ref, "fm_active", None)
+                if isinstance(fm_active, torch.Tensor):
+                    step["fm_active"] = fm_active.clone()
+                    if self._log_fm_window and hasattr(ref, "predicted_outputs_window"):
+                        y_win, dy_win = ref.predicted_outputs_window()
+                        step["fm_pred_y"] = y_win.clone()
+                        step["fm_pred_dy"] = dy_win.clone()
+                        step["fm_pred_idx"] = ref.fm_pred_idx.clone()
+            except Exception as exc:
+                self._warn("fm_source", f"Could not read FM source / predicted window: {exc}")
 
         # 2. Base velocity command
         try:
@@ -399,6 +430,13 @@ class DataLogger:
                     self.metadata["vel_names"] = list(ref.ordered_vel_output_names)
                 if hasattr(ref, "ref_frames"):
                     self.metadata["ref_frames"] = list(ref.ref_frames)
+                # Flow-matching prediction-window geometry (generator command only):
+                # ``fm_window_len`` = F steps stored per inference, ``fm_novel_start``
+                # = window index N where the novel future begins.  Lets the
+                # peel-off plot align each prediction's window steps to sim time.
+                if hasattr(ref, "fm_window_len") and hasattr(ref, "fm_novel_start"):
+                    self.metadata["fm_window_len"] = int(ref.fm_window_len)
+                    self.metadata["fm_novel_start"] = int(ref.fm_novel_start)
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)

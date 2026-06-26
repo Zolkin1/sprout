@@ -10,7 +10,15 @@ commanded-velocity profile, generating a future trajectory in the current root f
 
 from .config import FlowMatchingConfig
 from .dataset import FutureStateDataset, build_train_val, episode_windows, resolve_term_slice
-from .flow import flow_matching_loss, frame_consistency_loss, sample_flow_batch, sample_trajectory
+from .fk import FKChain
+from .flow import (
+    fk_consistency_terms,
+    flow_matching_loss,
+    frame_consistency_terms,
+    joint_vel_consistency_term,
+    sample_flow_batch,
+    sample_trajectory,
+)
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import (
@@ -37,8 +45,11 @@ __all__ = [
     "build_train_val",
     "episode_windows",
     "resolve_term_slice",
+    "FKChain",
     "flow_matching_loss",
-    "frame_consistency_loss",
+    "frame_consistency_terms",
+    "joint_vel_consistency_term",
+    "fk_consistency_terms",
     "sample_flow_batch",
     "sample_trajectory",
     "matrix_to_rot6d",

@@ -385,6 +385,89 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         return base, ee, self._pred_jp[ar, idx], self._pred_jv[ar, idx]
 
     # ------------------------------------------------------------------
+    # Introspection for play-time logging / plots
+    # ------------------------------------------------------------------
+
+    @property
+    def fm_active(self) -> torch.Tensor:
+        """Per-env ``[N]`` bool: True where the FM prediction (not the clip) drives the reference.
+
+        This is the exact authoritative-source mask used in :meth:`_update_command`
+        (``_fm_mask & _pred_valid``): True only for envs assigned to the generator
+        *and* past their history warmup.  Flips False->True at the clip->FM handoff
+        (or end of warmup) and True->False on a window break -- the boundary the
+        play plots mark with a transition line.
+        """
+        return self._fm_mask & self._pred_valid
+
+    @property
+    def fm_pred_idx(self) -> torch.Tensor:
+        """Per-env ``[N]`` long: the currently-applied step within the F-step prediction window.
+
+        Reset to :attr:`fm_novel_start` (``ctx.N``) on each fresh inference and
+        advanced by one per control step in between, so a non-increase between
+        consecutive steps marks a re-inference -- used to pick out distinct
+        predictions for the peel-off plot.
+        """
+        return self._pred_idx
+
+    @property
+    def fm_window_len(self) -> int:
+        """Length ``F`` of the FM prediction window (steps stored per inference)."""
+        return int(self.ctx.F)
+
+    @property
+    def fm_novel_start(self) -> int:
+        """Window index ``N`` where the novel future begins (steps ``0..N-1`` reproduce history)."""
+        return int(self.ctx.N)
+
+    @torch.no_grad()
+    def predicted_outputs_window(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Full F-step FM prediction expressed in the ``y_des`` / ``dy_des`` output layout.
+
+        Mirrors the single-index conversion in :meth:`_update_command` but for
+        every window step at once, so the play-time logger can draw the predicted
+        trajectories peeling off the tracked reference.
+
+        Returns:
+            ``(y_win, dy_win)`` of shapes ``[N, F, P_pos]`` / ``[N, F, P_vel]``,
+            where ``[:, j]`` is the predicted reference at window step ``j`` in the
+            same channel order (``ordered_pos_output_names`` /
+            ``ordered_vel_output_names``) as ``self.y_des`` / ``self.dy_des``.
+            Only meaningful for envs where :attr:`fm_active` is True (the buffers
+            are stale/garbage for clip- and warmup-tracking envs).
+        """
+        n, f = self.num_envs, self.ctx.F
+        y_win = torch.zeros(n, f, self.y_des.shape[1], device=self.device)
+        dy_win = torch.zeros(n, f, self.dy_des.shape[1], device=self.device)
+
+        # Assemble [N, F, nf, 13] world frames ([base] + ee) in self._wf_frames order.
+        base13 = torch.cat(
+            [self._pred_root_pos, self._pred_root_quat, self._pred_root_lin, self._pred_root_ang],
+            dim=-1,
+        )  # [N, F, 13]
+        frames = base13[:, :, None, :]
+        if self.ctx.num_extra_frames > 0:
+            ee13 = torch.cat(
+                [self._pred_frame_pos, self._pred_frame_quat,
+                 self._pred_frame_lin, self._pred_frame_ang],
+                dim=-1,
+            )  # [N, F, K, 13]
+            frames = torch.cat([frames, ee13], dim=2)  # [N, F, nf, 13]
+
+        # Scatter the world-frame Cartesian channels into the output layout (same
+        # flat index maps + reshape order as _write_world_des, with an extra F axis).
+        y_win[:, :, self._wf_pos_flat] = frames[..., 0:3].reshape(n, f, -1)
+        y_win[:, :, self._wf_ori_flat] = frames[..., 3:7].reshape(n, f, -1)
+        dy_win[:, :, self._wf_lin_flat] = frames[..., 7:10].reshape(n, f, -1)
+        dy_win[:, :, self._wf_ang_flat] = frames[..., 10:13].reshape(n, f, -1)
+
+        # Joints: FM order -> clip output slots (same permutation as _update_command).
+        y_win[:, :, self._joint_slots_pos] = self._pred_jp[:, :, self._fm_jperm]
+        dy_win[:, :, self._joint_slots_vel] = self._pred_jv[:, :, self._fm_jperm]
+        return y_win, dy_win
+
+    # ------------------------------------------------------------------
     # Future window (per-env source-selected: FM prediction vs clip)
     # ------------------------------------------------------------------
 

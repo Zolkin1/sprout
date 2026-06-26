@@ -87,15 +87,26 @@ class FlowMatchingConfig:
     num_sampling_steps: int = 8
     ori6d_aux_weight: float = 0.0
 
-    # -- frame consistency regularization (finite-difference, on root + ee frame blocks) --
+    # -- consistency / forward-kinematics regularization (finite-difference + FK) --
     # ``dt`` is the control step period (seconds), resolved from the recording meta at
     # train time. ``vel_consistency_weight`` ties each frame's predicted velocity to the
-    # finite difference of its predicted pose (penalizes the prediction jumping off the
-    # last history pose); ``accel_consistency_weight`` matches the finite difference of
-    # the predicted velocity to that of the data velocity. Both default off.
+    # finite difference of its predicted pose; ``joint_vel_consistency_weight`` does the
+    # same for joints; ``accel_consistency_weight`` matches the finite difference of the
+    # predicted velocity to that of the data velocity. The FK terms tie the predicted
+    # end-effector pose/velocity to the forward kinematics (``fk_pose_weight``) and
+    # Jacobian (``fk_vel_weight``) of the predicted joints, using ``fk_model_path``
+    # (a MuJoCo MJCF). ``consistency_tau_min`` gates the acceleration + FK terms to
+    # samples with flow-time ``tau >= consistency_tau_min`` (where the predicted
+    # endpoint is a faithful estimate of the clean target); velocity/joint-velocity
+    # stay ungated. All weights default off.
     dt: float = 0.02
-    vel_consistency_weight: float = 0.0
+    vel_consistency_weight: float = 0.01 #0.0
     accel_consistency_weight: float = 0.0
+    joint_vel_consistency_weight: float = 0.01 #0.0
+    fk_pose_weight: float = 0.01 #0.0
+    fk_vel_weight: float = 0.001 #0.0
+    consistency_tau_min: float = 0.75
+    fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
 
     # -- training --
     batch_size: int = 256
