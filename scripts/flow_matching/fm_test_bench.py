@@ -8,25 +8,29 @@ commands, then plots the predicted future trajectories. Runs WITHOUT IsaacSim
 (imports only the vendored, isaaclab-free ``transfer.fm`` inference stack), so it
 is fast and usable locally.
 
-Three experiments:
+The model is the PARC-style single transformer with masked inpainting: a window
+of ``F`` state tokens whose first ``N`` (= ``num_history_states``) are the recent
+measured states held clean as conditioning (anchor = step N-1), with the novel
+prediction occupying tokens ``N..F-1``. The velocity command is a per-step
+profile over the window, strided into conditioning tokens.
 
-* ``sweep_command`` -- fix a state history, sweep the velocity command, overlay
-  the predicted futures. If the predictions barely move as the command changes,
-  the model is ignoring the command / overfitting to the history. By default
-  only the decoder ``future_cmd`` is varied (the encoder/history token is kept
-  byte-identical); ``--match-past-cmd`` additionally overwrites the history
-  token's past command columns.
-* ``sweep_history`` -- fix the velocity command, sweep several canonical
-  histories (standing / walking / running / turning), overlay the futures. Shows
-  how sensitive the output is to the history.
-* ``rollout`` -- autoregressively feed the FM's own first predicted step back as
-  new history for many steps and check stability (NaN / height collapse /
+Four experiments:
+
+* ``sweep_command`` -- fix the N conditioning states, sweep the (window-constant)
+  velocity command, overlay the predicted futures. If the predictions barely move
+  as the command changes, the model is ignoring the command.
+* ``sweep_history`` -- fix the command, sweep several canonical conditioning
+  states (standing / walking / running / turning), overlay the futures. Shows how
+  sensitive the output is to the conditioning.
+* ``sweep_phase`` -- fix the command, shift the conditioning across one gait
+  period; tests whether the prediction tracks the conditioning's gait phase.
+* ``rollout`` -- autoregressively feed the FM's own novel predicted step back as
+  new conditioning for many steps and check stability (NaN / height collapse /
   velocity tracking).
 
-Canonical histories are pulled from a real ``record_data.py`` recording (the
-same data the FM was trained on), selected by matching their recorded
-``target_vel`` to a desired command -- realistic walking/running histories
-cannot be synthesized by hand.
+Conditioning states are pulled from a real ``record_data.py`` recording (the same
+data the FM was trained on), selected by matching their recorded ``target_vel`` to
+a desired command -- realistic walking/running gaits cannot be synthesized by hand.
 
 Plots are shown in an interactive matplotlib window with Left/Right arrow-key
 paging when a display is available, and saved as PNGs otherwise (``--save DIR``
@@ -35,8 +39,7 @@ forces PNG output).
 Example::
 
     python scripts/flow_matching/fm_test_bench.py \
-        --fm_checkpoint logs/flow_matching/2026-06-24_19-00-54_fm-basic-actual-noise/best.pt \
-        --device cpu --mode all
+        --fm_checkpoint logs/flow_matching/<run>/best.pt --device cpu --mode all
 """
 
 from __future__ import annotations
@@ -61,7 +64,8 @@ if ROOT not in sys.path:
 from transfer.fm import (  # noqa: E402
     BatchedHistory,
     FmOnlineContext,
-    build_history_token,
+    build_cmd_tokens,
+    build_cond_states,
     load_fm_context,
     sample_world,
 )
@@ -336,7 +340,7 @@ class Window:
     """A fixed history window pulled from the recording (batch dim = 1)."""
 
     label: str
-    # raw world-frame history inputs for build_history_token, each (1, H, .)
+    # raw world-frame conditioning inputs for build_cond_states, each (1, N, .)
     inputs: dict[str, torch.Tensor]
     past_cmd: torch.Tensor          # (1, H, cmd_dim)
     hist_traj: dict[str, np.ndarray]   # parsed history for plotting (H, .)
@@ -419,6 +423,25 @@ def find_steady_rows(
     return rows, cmd_w.mean(axis=0), cmd_w.std(axis=0), best[0]
 
 
+def _frames_from_rows(
+    layout: StateLayout, rows_np: np.ndarray, frame_names: list[str], device: torch.device
+) -> torch.Tensor | None:
+    """Extract ``(1, L, K, 13)`` world ee-frame states ``[pos, quat(xyzw), lin, ang]``."""
+    if not frame_names:
+        return None
+    parts = []
+    for f in frame_names:
+        pa, pb = layout.s[f"{f}:pos_w"]
+        qa, qb = layout.s[f"{f}:quat_w"]
+        la, lb = layout.s[f"{f}:lin_vel_w"]
+        aa, ab = layout.s[f"{f}:ang_vel_w"]
+        parts.append(np.concatenate(
+            [rows_np[:, pa:pb], rows_np[:, qa:qb], rows_np[:, la:lb], rows_np[:, aa:ab]], axis=-1
+        ))  # (L, 13)
+    fr = np.stack(parts, axis=1)  # (L, K, 13)
+    return torch.from_numpy(np.ascontiguousarray(fr)).float().unsqueeze(0).to(device)
+
+
 def build_window_from_rows(
     data: dict[str, np.ndarray],
     layout: StateLayout,
@@ -427,15 +450,16 @@ def build_window_from_rows(
     device: torch.device,
     label: str,
 ) -> Window:
-    """Build a :class:`Window` from ``H+F`` contiguous absolute row indices.
+    """Build a :class:`Window` from ``F`` contiguous absolute row indices.
 
-    History inputs come from the first ``H`` rows; the recorded actual future and
-    its command come from the last ``F``.
+    The first ``N`` rows are the clean conditioning states (anchored at ``N-1``); the
+    recorded *novel* future (and its command) is rows ``N..F-1`` -- what the model's
+    novel prediction is compared against.
     """
-    H, F = ctx.H, ctx.F
-    ws = data["state"][rows]            # (H+F, state_dim)
-    cmd_w = data["target_vel"][rows]    # (H+F, cmd_dim)
-    hist_rows, fut_rows = ws[:H], ws[H:]
+    N, F = ctx.N, ctx.F
+    ws = data["state"][rows]            # (F, state_dim)
+    cmd_w = data["target_vel"][rows]    # (F, cmd_dim)
+    hist_rows = ws[:N]
 
     def t3(term: str, rows_np: np.ndarray) -> torch.Tensor:
         a, b = layout.s[term]
@@ -448,12 +472,13 @@ def build_window_from_rows(
         "root_ang_vel": t3("root_link_ang_vel_w", hist_rows),
         "joint_pos": t3("joint_pos", hist_rows),
         "joint_vel": t3("joint_vel", hist_rows),
+        "frames": _frames_from_rows(layout, hist_rows, ctx.target_frame_names, device),  # (1,N,K,13) or None
     }
-    past_cmd = torch.from_numpy(np.ascontiguousarray(cmd_w[:H])).float().unsqueeze(0).to(device)
+    past_cmd = torch.from_numpy(np.ascontiguousarray(cmd_w[:N])).float().unsqueeze(0).to(device)
     return Window(
         label=label, inputs=inputs, past_cmd=past_cmd,
-        hist_traj=layout.parse(hist_rows), actual_fut_traj=layout.parse(fut_rows),
-        actual_fut_cmd=cmd_w[H:], mean_cmd=cmd_w.mean(axis=0),
+        hist_traj=layout.parse(hist_rows), actual_fut_traj=layout.parse(ws[N:]),
+        actual_fut_cmd=cmd_w[N:], mean_cmd=cmd_w.mean(axis=0),
     )
 
 
@@ -474,7 +499,7 @@ def find_window(
     ``steady_weight=0`` reverts to pure mean-command matching.
     """
     rows, mean_cmd, cmd_std, score = find_steady_rows(
-        data, ctx, target_cmd, ctx.H + ctx.F, n_envs_scan, cmd_weights, steady_weight
+        data, ctx, target_cmd, ctx.F, n_envs_scan, cmd_weights, steady_weight
     )
     print(f"[bench]   window {label!r}: target={target_cmd} achieved_mean={np.round(mean_cmd, 3).tolist()} "
           f"cmd_std={np.round(cmd_std, 3).tolist()} (score={score:.3f})")
@@ -486,6 +511,45 @@ def layout_num_envs(data: dict[str, np.ndarray]) -> int:
     return int(data["_num_envs"]) if "_num_envs" in data else int(data["num_envs"])
 
 
+def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) -> tuple[np.ndarray, int]:
+    """Recorded command around a contiguous env-stream stretch, padded for context.
+
+    ``rows`` are the absolute (step-major) indices of one env's consecutive steps.
+    Returns ``(cmd, left_pad)`` where ``cmd`` is the recorded ``target_vel`` over
+    ``[stretch_start - pad, stretch_end + pad]`` (truncated at episode resets and
+    array bounds) and ``left_pad`` is how many real steps precede the stretch, so the
+    stretch occupies ``cmd[left_pad : left_pad + len(rows)]``.
+
+    Args:
+        data: Recording arrays.
+        rows: Absolute indices of the stretch (contiguous in one env stream).
+        pad: Desired context length (steps) on each side.
+
+    Returns:
+        ``(cmd, left_pad)``.
+    """
+    num_envs = layout_num_envs(data)
+    n_total = data["target_vel"].shape[0]
+    e = int(rows[0]) % num_envs
+    p0 = (int(rows[0]) - e) // num_envs          # stretch-start position in the env stream
+    L = len(rows)
+    lo = max(0, p0 - pad)
+    hi = min((n_total - 1 - e) // num_envs + 1, p0 + L + pad)
+    abs_idx = e + np.arange(lo, hi) * num_envs   # candidate window, time-ordered
+    sie = data["step_in_episode"][abs_idx]
+    dn = data["done"].astype(np.int64)[abs_idx]
+    cons = (np.diff(sie) == 1) & (dn[:-1] == 0)  # cons[i]: i -> i+1 stays in one episode
+    sp = p0 - lo                                 # stretch start within the candidate window
+    ep = sp + L - 1                              # stretch end (inclusive)
+    left, right = sp, ep
+    while left - 1 >= 0 and cons[left - 1]:
+        left -= 1
+    while right + 1 < len(abs_idx) and cons[right]:
+        right += 1
+    sel = abs_idx[left : right + 1]
+    return data["target_vel"][sel], sp - left
+
+
 # ======================================================================
 # 5. inference + the three modes
 # ======================================================================
@@ -494,35 +558,37 @@ def predict(
     win: Window,
     future_cmd: torch.Tensor,
     seed: int,
-    match_past_cmd: torch.Tensor | None = None,
+    include_history: bool = False,
 ) -> dict[str, np.ndarray]:
     """Run the FM on one window and return the predicted future as a traj dict.
 
     Args:
         ctx: Loaded FM context.
-        win: History window providing the encoder inputs.
-        future_cmd: Decoder command ``(1, F, future_cmd_dim)`` (raw, un-normalized).
+        win: Conditioning window providing the N clean states (incl. ee frames).
+        future_cmd: Command profile over the window ``(1, F, cmd_dim)`` (raw).
         seed: Global RNG seed set right before sampling (fair/repro overlays).
-        match_past_cmd: If given ``(1, 1, cmd_dim)``, overwrite the history token's
-            past command columns with this value (rebuilds the token).
+        include_history: If True, return the full window (frames ``0..F-1``): the
+            first ``N`` are the conditioning echo (clamped, should equal the input),
+            the rest are novel. If False (default), return only the novel frames.
 
     Returns:
-        Predicted future trajectory dict (F, .).
+        Trajectory dict -- length ``F`` if ``include_history`` else ``F - N``
+        (novel frames ``N..F-1``).
     """
-    cmd = win.past_cmd
-    if match_past_cmd is not None:
-        cmd = match_past_cmd.expand(1, ctx.H, ctx.cmd_dim).contiguous()
-    token = build_history_token(
+    cond, known = build_cond_states(
         ctx, win.inputs["root_pos"], win.inputs["root_quat"],
         win.inputs["root_lin_vel"], win.inputs["root_ang_vel"],
-        win.inputs["joint_pos"], win.inputs["joint_vel"], cmd, frames=None, scan=None,
+        win.inputs["joint_pos"], win.inputs["joint_vel"], frames=win.inputs["frames"],
     )
-    p_ref = win.inputs["root_pos"][:, ctx.H - 1]
-    q_ref = win.inputs["root_quat"][:, ctx.H - 1]
+    p_ref = win.inputs["root_pos"][:, ctx.N - 1]
+    q_ref = win.inputs["root_quat"][:, ctx.N - 1]
+    cmd_tokens = build_cmd_tokens(ctx, future_cmd) if ctx.cmd_dim > 0 else None
     torch.manual_seed(seed)
-    fc = future_cmd if ctx.future_cmd_dim > 0 else None
-    pred = sample_world(ctx, token, p_ref, q_ref, future_cmd=fc)
-    return pred_to_traj(pred)
+    pred = sample_world(ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)
+    tr = pred_to_traj(pred)
+    if include_history:
+        return tr  # full window: 0..N-1 conditioning echo, N..F-1 novel
+    return {k: v[ctx.N:] for k, v in tr.items()}  # novel frames N..F-1
 
 
 @dataclass
@@ -564,33 +630,58 @@ def _full_cmd(base: list[float], axis: str, value: float) -> list[float]:
     return out
 
 
+def window_cmd_profile(
+    win: Window, target_vec: list[float], ctx: FmOnlineContext, dt: float, accel: float
+) -> np.ndarray:
+    """Per-step command profile ``(F, 3)`` fed over the window.
+
+    With ``accel <= 0`` the target is held constant across the whole window (a step
+    change relative to the history). With ``accel > 0`` the profile is in-distribution
+    instead: the recorded command on the ``N`` conditioning steps, then a linear ramp
+    from the current command toward ``target_vec`` at ``|accel|`` per component
+    (m/s^2 for vx/vy, rad/s^2 for wz) over the novel steps -- mirroring how the
+    training ``target_vel`` slews (env ``max_acc``, nominally 1.0). With a short
+    window the far targets may not be reached, exactly as the model sees them.
+    """
+    N, F = ctx.N, ctx.F
+    target = np.asarray(target_vec, dtype=np.float64)
+    if accel <= 0:
+        return np.tile(target, (F, 1))
+    past = win.past_cmd[0].detach().cpu().numpy().astype(np.float64)  # (N, 3) recorded
+    prof = np.empty((F, 3), dtype=np.float64)
+    prof[:N] = past
+    cur = past[-1].copy()
+    step = accel * dt
+    for t in range(N, F):
+        cur = cur + np.clip(target - cur, -step, step)
+        prof[t] = cur
+    return prof
+
+
 def run_sweep_command(ctx, win, args, device) -> Scenario:
     """Fix a history; sweep the command along one axis; overlay predicted futures."""
     values = [float(v) for v in args.values.split(",")]
     base = parse_vec3(args.base_cmd)
-    sweep_past = args.match_past_cmd or ctx.future_cmd_dim == 0
-    channel = "future+past" if (args.match_past_cmd and ctx.future_cmd_dim > 0) else (
-        "past (no decoder cmd)" if ctx.future_cmd_dim == 0 else "future")
-    print(f"[bench] sweep_command on {win.label!r}: axis={args.sweep_axis} values={values} "
-          f"channel={channel}")
+    fnov = ctx.F - ctx.N
+    accel = args.ramp_accel if args.cmd_ramp else 0.0
+    print(f"[bench] sweep_command on {win.label!r}: axis={args.sweep_axis} values={values}"
+          f"{f' (ramp @ {accel} /s^2 from history cmd)' if accel > 0 else ''}")
     norm = mcolors.Normalize(vmin=min(values), vmax=max(values))
     cmap = matplotlib.colormaps["viridis"]
     vf = args.vel_frame
     series: list[Series] = []
     for v in values:
         cmd_vec = _full_cmd(base, args.sweep_axis, v)
-        fut_cmd = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3).expand(1, ctx.F, 3).contiguous()
-        match = None
-        if sweep_past:
-            match = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3)
-        tr = predict(ctx, win, fut_cmd, args.seed if not args.vary_noise else args.seed + int(v * 1000), match)
+        prof = window_cmd_profile(win, cmd_vec, ctx, ctx.dt_attr, accel)  # (F, 3)
+        fut_cmd = torch.from_numpy(prof).float().unsqueeze(0).to(device)  # (1, F, 3)
+        tr = predict(ctx, win, fut_cmd, args.seed if not args.vary_noise else args.seed + int(v * 1000))
         series.append(Series(
             label=f"{args.sweep_axis}={v:g}", color=cmap(norm(v)), fut=disp_traj(tr, vf),
-            fut_cmd=np.tile(cmd_vec, (ctx.F, 1)),
+            fut_cmd=prof[ctx.N:],  # novel-region command (ramp or constant)
         ))
     return Scenario(
-        name=f"sweep_command [{win.label}] axis={args.sweep_axis} ({channel})",
-        dt=ctx.dt_attr, H=ctx.H, F=ctx.F, series=series,
+        name=f"sweep_command [{win.label}] axis={args.sweep_axis}",
+        dt=ctx.dt_attr, H=ctx.N, F=fnov, series=series,
         shared_hist=disp_traj(win.hist_traj, vf), shared_past_cmd=win.past_cmd[0].cpu().numpy(),
         actual_fut=disp_traj(win.actual_fut_traj, vf), actual_fut_cmd=win.actual_fut_cmd,
         colorbar=(values, f"command {args.sweep_axis}"),
@@ -601,20 +692,23 @@ def run_sweep_command(ctx, win, args, device) -> Scenario:
 def run_sweep_history(ctx, windows, args, device) -> Scenario:
     """Fix the command; sweep canonical histories; overlay predicted futures."""
     cmd_vec = parse_vec3(args.future_cmd)
-    print(f"[bench] sweep_history: future_cmd={cmd_vec} histories={[w.label for w in windows]}")
-    fut_cmd = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3).expand(1, ctx.F, 3).contiguous()
+    fnov = ctx.F - ctx.N
+    accel = args.ramp_accel if args.cmd_ramp else 0.0
+    print(f"[bench] sweep_history: future_cmd={cmd_vec} histories={[w.label for w in windows]}"
+          f"{f' (ramp @ {accel} /s^2 from each history cmd)' if accel > 0 else ''}")
     cmap = matplotlib.colormaps["tab10"]
     vf = args.vel_frame
     series: list[Series] = []
     for i, win in enumerate(windows):
-        match = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3) if ctx.future_cmd_dim == 0 else None
-        tr = predict(ctx, win, fut_cmd, args.seed, match)
+        prof = window_cmd_profile(win, cmd_vec, ctx, ctx.dt_attr, accel)  # (F, 3), ramps from this history's cmd
+        fut_cmd = torch.from_numpy(prof).float().unsqueeze(0).to(device)
+        tr = predict(ctx, win, fut_cmd, args.seed)
         series.append(Series(
-            label=win.label, color=cmap(i % 10), fut=disp_traj(tr, vf), fut_cmd=np.tile(cmd_vec, (ctx.F, 1)),
+            label=win.label, color=cmap(i % 10), fut=disp_traj(tr, vf), fut_cmd=prof[ctx.N:],
             hist=disp_traj(win.hist_traj, vf), past_cmd=win.past_cmd[0].cpu().numpy(),
         ))
     return Scenario(
-        name=f"sweep_history future_cmd={cmd_vec}", dt=ctx.dt_attr, H=ctx.H, F=ctx.F,
+        name=f"sweep_history future_cmd={cmd_vec}", dt=ctx.dt_attr, H=ctx.N, F=fnov,
         series=series, frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
     )
 
@@ -653,8 +747,9 @@ def run_sweep_phase(ctx, data, layout, args, device) -> Scenario:
     window's recorded continuation, drawn dotted); if not, the futures collapse
     onto one curve regardless of phase.
     """
-    H, F = ctx.H, ctx.F
-    W = H + F
+    N, F = ctx.N, ctx.F
+    W = F
+    fnov = F - N
     cmd_vec = parse_vec3(args.future_cmd)
     if args.phase_hist not in CANONICAL_CMDS:
         raise ValueError(f"unknown --phase-hist {args.phase_hist!r}; choose from {list(CANONICAL_CMDS)}")
@@ -677,7 +772,6 @@ def run_sweep_phase(ctx, data, layout, args, device) -> Scenario:
           f"cmd_std={np.round(cmd_std, 3).tolist()}")
 
     fut_cmd = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3).expand(1, F, 3).contiguous()
-    match = torch.tensor(cmd_vec, dtype=torch.float32, device=device).reshape(1, 1, 3)
     cmap = matplotlib.colormaps["viridis"]
     fracs = [o / period for o in offsets]
     norm = mcolors.Normalize(vmin=0.0, vmax=max(fracs) if max(fracs) > 0 else 1.0)
@@ -685,16 +779,16 @@ def run_sweep_phase(ctx, data, layout, args, device) -> Scenario:
     series: list[Series] = []
     for o, frac in zip(offsets, fracs):
         win = build_window_from_rows(data, layout, ctx, rows[o : o + W], device, f"phase {o}")
-        tr = predict(ctx, win, fut_cmd, args.seed, match)  # same seed -> identical noise across phases
+        tr = predict(ctx, win, fut_cmd, args.seed)  # same seed -> identical noise across phases
         series.append(Series(
             label=f"phase {o} ({frac * 100:.0f}%)", color=cmap(norm(frac)),
-            fut=disp_traj(tr, vf), fut_cmd=np.tile(cmd_vec, (F, 1)),
+            fut=disp_traj(tr, vf), fut_cmd=np.tile(cmd_vec, (fnov, 1)),
             hist=disp_traj(win.hist_traj, vf), actual=disp_traj(win.actual_fut_traj, vf),
         ))
     return Scenario(
         name=f"sweep_phase [{args.phase_hist}] cmd={cmd_vec} period={period}",
-        dt=ctx.dt_attr, H=H, F=F, series=series,
-        shared_past_cmd=np.tile(cmd_vec, (H, 1)),
+        dt=ctx.dt_attr, H=N, F=fnov, series=series,
+        shared_past_cmd=np.tile(cmd_vec, (N, 1)),
         colorbar=(fracs, "gait phase (frac)"),
         frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
     )
@@ -730,23 +824,26 @@ def rollout_cmd_schedule(spec: str, n: int) -> np.ndarray:
 
 def run_rollout(ctx, win, args, device) -> RolloutResult:
     """Autoregressively feed the FM's first predicted step back as history."""
-    H, F = ctx.H, ctx.F
-    advance = max(1, min(args.advance, F))
+    N, F = ctx.N, ctx.F
+    advance = max(1, min(args.advance, F - N))
     schedule = rollout_cmd_schedule(args.rollout_cmd, args.rollout_steps + F + advance)
     print(f"[bench] rollout from {win.label!r}: steps={args.rollout_steps} advance={advance} "
           f"cmd={args.rollout_cmd}")
 
-    hist = BatchedHistory(1, H, device)
-    for k in range(H):
-        hist.append({
+    have_ee = ctx.target_num_extra_frames > 0
+    hist = BatchedHistory(1, N, device)
+    for k in range(N):
+        step = {
             "root_pos": win.inputs["root_pos"][:, k],
             "root_quat": win.inputs["root_quat"][:, k],
             "root_lin_vel": win.inputs["root_lin_vel"][:, k],
             "root_ang_vel": win.inputs["root_ang_vel"][:, k],
             "joint_pos": win.inputs["joint_pos"][:, k],
             "joint_vel": win.inputs["joint_vel"][:, k],
-            "cmd": win.past_cmd[:, k],
-        })
+        }
+        if have_ee:
+            step["frames"] = win.inputs["frames"][:, k]  # (1, K, 13)
+        hist.append(step)
 
     rec: dict[str, list] = {k: [] for k in
                             ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel",
@@ -754,33 +851,37 @@ def run_rollout(ctx, win, args, device) -> RolloutResult:
     cmd_rec: list[np.ndarray] = []
     diverged_at = None
     t = 0
-    have_ee = ctx.target_num_extra_frames > 0
 
     while t < args.rollout_steps and diverged_at is None:
         rp = hist.stack("root_pos"); rq = hist.stack("root_quat")
         rlv = hist.stack("root_lin_vel"); rav = hist.stack("root_ang_vel")
         jp = hist.stack("joint_pos"); jv = hist.stack("joint_vel")
-        cmd_hist = hist.stack("cmd")
-        token = build_history_token(ctx, rp, rq, rlv, rav, jp, jv, cmd_hist, frames=None, scan=None)
+        frames = hist.stack("frames") if have_ee else None
+        cond, known = build_cond_states(ctx, rp, rq, rlv, rav, jp, jv, frames=frames)
         fut_cmd_np = schedule[t : t + F]
         fut_cmd = torch.from_numpy(np.ascontiguousarray(fut_cmd_np)).float().unsqueeze(0).to(device)
+        cmd_tokens = build_cmd_tokens(ctx, fut_cmd) if ctx.cmd_dim > 0 else None
         torch.manual_seed(args.seed + t)
-        fc = fut_cmd if ctx.future_cmd_dim > 0 else None
-        pred = sample_world(ctx, token, rp[:, -1], rq[:, -1], future_cmd=fc)
+        pred = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens=cmd_tokens)
 
         for j in range(advance):
             if t >= args.rollout_steps:
                 break
+            pj = N + j  # novel frame index (frames 0..N-1 reproduce the conditioning)
             step_cmd = schedule[t]
             new = {
-                "root_pos": pred["root_pos_w"][:, j],
-                "root_quat": pred["root_quat_w"][:, j],
-                "root_lin_vel": pred["root_link_lin_vel_w"][:, j],
-                "root_ang_vel": pred["root_link_ang_vel_w"][:, j],
-                "joint_pos": pred["joint_pos"][:, j],
-                "joint_vel": pred["joint_vel"][:, j],
-                "cmd": torch.from_numpy(np.ascontiguousarray(step_cmd)).float().unsqueeze(0).to(device),
+                "root_pos": pred["root_pos_w"][:, pj],
+                "root_quat": pred["root_quat_w"][:, pj],
+                "root_lin_vel": pred["root_link_lin_vel_w"][:, pj],
+                "root_ang_vel": pred["root_link_ang_vel_w"][:, pj],
+                "joint_pos": pred["joint_pos"][:, pj],
+                "joint_vel": pred["joint_vel"][:, pj],
             }
+            if have_ee:
+                new["frames"] = torch.cat(
+                    [pred["frame_pos_w"][:, pj], pred["frame_quat_w"][:, pj],
+                     pred["frame_lin_vel_w"][:, pj], pred["frame_ang_vel_w"][:, pj]], dim=-1
+                )  # (1, K, 13)
             finite = all(torch.isfinite(v).all().item() for v in new.values())
             z = float(new["root_pos"][0, 2].item())
             if (not finite) or not (0.2 < z < 2.0):
@@ -791,10 +892,10 @@ def run_rollout(ctx, win, args, device) -> RolloutResult:
             for key in ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel", "joint_pos", "joint_vel"):
                 rec[key].append(new[key][0].detach().cpu().numpy())
             if have_ee:
-                rec["ee_pos"].append(pred["frame_pos_w"][0, j].detach().cpu().numpy())
-                rec["ee_quat"].append(pred["frame_quat_w"][0, j].detach().cpu().numpy())
-                rec["ee_lin_vel"].append(pred["frame_lin_vel_w"][0, j].detach().cpu().numpy())
-                rec["ee_ang_vel"].append(pred["frame_ang_vel_w"][0, j].detach().cpu().numpy())
+                rec["ee_pos"].append(pred["frame_pos_w"][0, pj].detach().cpu().numpy())
+                rec["ee_quat"].append(pred["frame_quat_w"][0, pj].detach().cpu().numpy())
+                rec["ee_lin_vel"].append(pred["frame_lin_vel_w"][0, pj].detach().cpu().numpy())
+                rec["ee_ang_vel"].append(pred["frame_ang_vel_w"][0, pj].detach().cpu().numpy())
             cmd_rec.append(step_cmd.copy())
             t += 1
 
@@ -808,6 +909,62 @@ def run_rollout(ctx, win, args, device) -> RolloutResult:
         dt=ctx.dt_attr, diverged_at=diverged_at,
         frame_names=ctx.target_frame_names if have_ee else [], joint_names=ctx.joint_names,
         vel_frame=args.vel_frame,
+    )
+
+
+@dataclass
+class ForecastResult:
+    """Open-loop forecasts overlaid on a ground-truth recording."""
+
+    gt: dict[str, np.ndarray]            # ground-truth trajectory (L, .)
+    preds: list[tuple[int, dict[str, np.ndarray]]]  # (anchor_step, FULL-window traj (F, .))
+    cmd_context: np.ndarray              # recorded command incl. before/after context (M, 3)
+    cmd_context_offset: int              # steps of context before the FM region (stretch start)
+    N: int                               # conditioning states (first N frames are the echo)
+    dt: float
+    frame_names: list[str]
+    joint_names: list[str]
+    vel_frame: str = "body"
+
+
+def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
+    """Forecast the FM along a real recording and overlay each on the ground truth.
+
+    Take one contiguous ground-truth stretch; at every ``--forecast-stride`` steps,
+    condition on the N real states ending there and the *recorded* (in-distribution,
+    already-ramped) command over the window, predict the novel horizon (N..F-1), and
+    place it on the absolute timeline so it branches off the ground-truth curve.
+    """
+    N, F = ctx.N, ctx.F
+    fnov = F - N
+    vf = args.vel_frame
+    length = max(F, args.forecast_len)
+    rows, mean_cmd, cmd_std, score = find_steady_rows(
+        data, ctx, CANONICAL_CMDS[args.forecast_hist], length, args.n_envs_scan,
+        steady_weight=args.steady_weight,
+    )
+    L = len(rows)
+    gt = layout.parse(data["state"][rows])      # (L, .)
+    cmd_w = data["target_vel"][rows]            # (L, 3) recorded command (ramps as in training)
+    stride = max(1, args.forecast_stride)
+    preds: list[tuple[int, dict[str, np.ndarray]]] = []
+    # Anchor = the most-recent conditioning step (window start s0 = a-(N-1)); need the
+    # full F-window of recorded rows and the horizon to land inside the ground truth.
+    for a in range(N - 1, L - fnov, stride):
+        s0 = a - (N - 1)
+        win = build_window_from_rows(data, layout, ctx, rows[s0 : s0 + F], device, f"a{a}")
+        prof = np.ascontiguousarray(cmd_w[s0 : s0 + F])  # recorded command over the window
+        fut_cmd = torch.from_numpy(prof).float().unsqueeze(0).to(device)
+        tr = predict(ctx, win, fut_cmd, args.seed, include_history=True)  # full window: echo + novel
+        preds.append((a, disp_traj(tr, vf)))
+    cmd_ctx, left_pad = cmd_context_window(data, rows, args.forecast_pad)
+    print(f"[bench] forecast on {args.forecast_hist!r}: L={L} steps ({L * ctx.dt_attr:.1f}s) "
+          f"stride={stride} -> {len(preds)} forecasts (horizon {fnov} steps / {fnov * ctx.dt_attr:.2f}s) "
+          f"cmd_std={np.round(cmd_std, 3).tolist()} context=+/-{left_pad}/{cmd_ctx.shape[0]-left_pad-L} steps")
+    return ForecastResult(
+        gt=disp_traj(gt, vf), preds=preds, cmd_context=np.ascontiguousarray(cmd_ctx),
+        cmd_context_offset=int(left_pad), N=ctx.N, dt=ctx.dt_attr,
+        frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
     )
 
 
@@ -961,12 +1118,13 @@ def draw_rollout(fig, res: RolloutResult) -> None:
     speed = np.linalg.norm(rlv[:, :2], axis=1)
     axs[0, 1].plot(t, rlv[:, 0], label="vx", color="C0")
     axs[0, 1].plot(t, rlv[:, 1], label="vy", color="C1")
-    axs[0, 1].plot(t, speed, label="|v|", color="C2", lw=1.0)
+    axs[0, 1].plot(t, rlv[:, 2], label="vz", color="C3", lw=1.0)
+    axs[0, 1].plot(t, speed, label="|vxy|", color="C2", lw=1.0)
     if res.cmd.shape[0] == T:
         axs[0, 1].plot(t, res.cmd[:, 0], ls="--", color="C0", lw=1.0, label="cmd vx")
         axs[0, 1].plot(t, res.cmd[:, 1], ls="--", color="C1", lw=1.0, label="cmd vy")
-    axs[0, 1].set_title(f"base lin vel vs cmd ({res.vel_frame}, m/s)", fontsize=9)
-    axs[0, 1].legend(fontsize=7)
+    axs[0, 1].set_title(f"base lin vel (vx/vy/vz) vs cmd ({res.vel_frame}, m/s)", fontsize=9)
+    axs[0, 1].legend(fontsize=7, ncol=2)
 
     axs[0, 2].plot(t, rav[:, 2], label="wz", color="C0")
     if res.cmd.shape[0] == T:
@@ -996,6 +1154,128 @@ def draw_rollout(fig, res: RolloutResult) -> None:
         ax.set_xlabel("time (s)" if ax is not axs[1, 0] else "x (m)")
     status = f"DIVERGED @ step {res.diverged_at}" if res.diverged_at is not None else f"stable for {T} steps"
     fig.suptitle(f"rollout  --  {status}", fontsize=12)
+
+
+def _forecast_color(res: ForecastResult):
+    """Viridis normalizer over anchor time (s) + colormap for the forecast fans."""
+    L = res.gt["root_pos"].shape[0]
+    return mcolors.Normalize(vmin=0.0, vmax=max(1e-6, (L - 1) * res.dt)), matplotlib.colormaps["viridis"]
+
+
+def draw_forecast(fig, res: ForecastResult) -> None:
+    """Ground-truth spine (black) with each forecast branching off it.
+
+    Each branch is the full predicted window: the first N frames are the FM's
+    history echo (dotted -- should lie on the ground truth) and the rest are the
+    novel prediction (solid). Colored by anchor time.
+    """
+    fig.clear()
+    axs = fig.subplots(3, 3)
+    L = res.gt["root_pos"].shape[0]
+    n = res.N
+    fwin = res.preds[0][1]["root_pos"].shape[0] if res.preds else 0  # full window length F
+    fnov = max(0, fwin - n)
+    dt, vf = res.dt, res.vel_frame
+    norm, cmap = _forecast_color(res)
+    t_gt = np.arange(L) * dt
+
+    def branch(ax, ys, col) -> None:
+        """Plot one full-window signal: echo (dotted) then novel (solid), in absolute time."""
+        for a, pred in res.preds:
+            tw = (np.arange(fwin) + (a - (n - 1))) * dt   # window starts n-1 steps before anchor
+            y = ys(pred)
+            ax.plot(tw[:n], y[:n], color=col(a), lw=0.9, ls=":", alpha=0.8, zorder=3)        # FM history echo
+            ax.plot(tw[n - 1:], y[n - 1:], color=col(a), lw=1.0, alpha=0.85, zorder=4)        # novel
+
+    def fan(ax, getter) -> None:
+        ax.plot(t_gt, getter(res.gt), color="k", lw=1.6, zorder=5)
+        branch(ax, getter, lambda a: cmap(norm(a * dt)))
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("time (s)")
+
+    lab = ["x", "y", "z"]
+    for i in range(3):
+        fan(axs[0, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i))
+        axs[0, i].set_title(f"root pos {lab[i]} (m, world)", fontsize=9)
+        fan(axs[1, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i))
+        axs[1, i].set_title(f"root lin vel {lab[i]} ({vf}, m/s)", fontsize=9)
+
+    ax = axs[2, 0]
+    ax.plot(res.gt["root_pos"][:, 0], res.gt["root_pos"][:, 1], color="k", lw=1.6, zorder=5)
+    for a, pred in res.preds:
+        col = cmap(norm(a * dt))
+        px, py = pred["root_pos"][:, 0], pred["root_pos"][:, 1]
+        ax.plot(px[:n], py[:n], color=col, ls=":", lw=0.9, alpha=0.8, zorder=3)
+        ax.plot(px[n - 1:], py[n - 1:], color=col, lw=1.0, alpha=0.85, zorder=4)
+    ax.set_title("root xy path (m, world)", fontsize=9)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("x (m)")
+
+    fan(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])))
+    axs[2, 1].set_title("root yaw (rad)", fontsize=9)
+    if "ee_pos" in res.gt:
+        fan(axs[2, 2], lambda tr: tr["ee_pos"][:, 0, 2])
+        axs[2, 2].set_title(f"{res.frame_names[0]} pos z (m, world)", fontsize=8)
+    else:
+        axs[2, 2].set_visible(False)
+
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm.set_array([])
+    fig.colorbar(sm, ax=list(axs.ravel()), label="forecast anchor time (s)", fraction=0.02, pad=0.01)
+    fig.suptitle(f"forecast vs ground truth  ({len(res.preds)} forecasts, horizon {fnov * dt:.2f}s; "
+                 f"dotted = FM history echo, solid = novel)  --  ROOT", fontsize=12)
+
+
+def draw_forecast_path(fig, res: ForecastResult) -> None:
+    """Dedicated top-down xy view: ground-truth path with the forecast branches."""
+    fig.clear()
+    ax = fig.subplots(1, 1)
+    dt, n = res.dt, res.N
+    norm, cmap = _forecast_color(res)
+    ax.plot(res.gt["root_pos"][:, 0], res.gt["root_pos"][:, 1], color="k", lw=2.2, zorder=5, label="ground truth")
+    for a, pred in res.preds:
+        col = cmap(norm(a * dt))
+        px, py = pred["root_pos"][:, 0], pred["root_pos"][:, 1]
+        ax.plot(px[:n], py[:n], color=col, ls=":", lw=1.0, alpha=0.8, zorder=3)       # FM history echo
+        ax.plot(px[n - 1:], py[n - 1:], color=col, lw=1.3, alpha=0.85, zorder=4)      # novel
+    ax.scatter([res.gt["root_pos"][0, 0]], [res.gt["root_pos"][0, 1]], c="g", s=30, zorder=6, label="start")
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.legend(fontsize=9)
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="forecast anchor time (s)")
+    fig.suptitle("forecast vs ground truth  --  root xy path  (dotted = FM history echo, solid = novel)",
+                 fontsize=12)
+
+
+def draw_forecast_cmd(fig, res: ForecastResult) -> None:
+    """Recorded commanded velocity (vx, vy, wz) with before/after context.
+
+    The shaded band + dashed lines mark the FM region (where forecasts condition on
+    and predict the recording); the command outside it shows whether that region is
+    coming out of / heading into a ramp. Time 0 = FM region start.
+    """
+    fig.clear()
+    ax = fig.subplots(1, 1)
+    cmd, off = res.cmd_context, res.cmd_context_offset
+    L = res.gt["root_pos"].shape[0]
+    M = cmd.shape[0]
+    t = (np.arange(M) - off) * res.dt            # stretch (FM region) starts at t=0
+    t_start, t_stop = 0.0, (L - 1) * res.dt
+    ax.axvspan(t_start, t_stop, color="0.85", alpha=0.5, zorder=0, label="FM region")
+    ax.axvline(t_start, color="0.3", ls="--", lw=1.1)
+    ax.axvline(t_stop, color="0.3", ls="--", lw=1.1)
+    for i, (name, c) in enumerate(zip(["vx", "vy", "wz"], ["C0", "C1", "C2"])):
+        ax.plot(t, cmd[:, i], color=c, lw=1.6, label=name)
+    ax.set_xlabel("time (s)   (0 = FM region start; shaded = where the FM is used)")
+    ax.set_ylabel("command (m/s, rad/s)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    fig.suptitle("forecast vs ground truth  --  recorded commanded velocity (+ context)", fontsize=12)
 
 
 # ======================================================================
@@ -1070,6 +1350,50 @@ def scenario_pages(scn: Scenario) -> list[Page]:
 
 
 # ======================================================================
+# 7b. data dump (.npz) for offline analysis
+# ======================================================================
+def dump_forecast(res: ForecastResult, path: str) -> None:
+    """Write the forecast ground truth + per-anchor predictions + command to ``.npz``.
+
+    Keys: ``gt_<field>`` (L, .) ground truth; ``anchors`` (n,) anchor steps and
+    ``pred_<field>`` (n, F, .) full-window forecasts (frames 0..N-1 are the FM history
+    echo, N..F-1 novel); ``cmd_context`` (M,3), ``cmd_context_offset``, ``N``, ``dt``,
+    ``vel_frame``, ``frame_names``, ``joint_names``.
+    """
+    out: dict[str, np.ndarray] = {f"gt_{k}": v for k, v in res.gt.items()}
+    if res.preds:
+        out["anchors"] = np.array([a for a, _ in res.preds], dtype=np.int64)
+        for k in res.preds[0][1]:
+            out[f"pred_{k}"] = np.stack([p[k] for _, p in res.preds], axis=0)
+    out["cmd_context"] = res.cmd_context
+    out["cmd_context_offset"] = np.int64(res.cmd_context_offset)
+    out["N"] = np.int64(res.N)
+    out["dt"] = np.float64(res.dt)
+    out["vel_frame"] = np.array(res.vel_frame)
+    out["frame_names"] = np.array(res.frame_names)
+    out["joint_names"] = np.array(res.joint_names)
+    np.savez_compressed(path, **out)
+    print(f"[bench]   dumped {path}")
+
+
+def dump_rollout(res: RolloutResult, path: str) -> None:
+    """Write the autoregressive rollout's realized trajectory + command to ``.npz``.
+
+    Keys: ``traj_<field>`` (T, .) realized states; ``cmd`` (T,3); ``dt``;
+    ``diverged_at`` (-1 if stable); ``vel_frame``, ``frame_names``, ``joint_names``.
+    """
+    out: dict[str, np.ndarray] = {f"traj_{k}": v for k, v in res.traj.items()}
+    out["cmd"] = res.cmd
+    out["dt"] = np.float64(res.dt)
+    out["diverged_at"] = np.int64(-1 if res.diverged_at is None else res.diverged_at)
+    out["vel_frame"] = np.array(res.vel_frame)
+    out["frame_names"] = np.array(res.frame_names)
+    out["joint_names"] = np.array(res.joint_names)
+    np.savez_compressed(path, **out)
+    print(f"[bench]   dumped {path}")
+
+
+# ======================================================================
 # 8. CLI + main
 # ======================================================================
 def choose_backend(save: bool):
@@ -1088,7 +1412,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fm_checkpoint", default=None,
                    help="Path to the FM .pt checkpoint (default: latest logs/flow_matching/*/best.pt).")
     p.add_argument("--data", default=None, help="Recording .npz (default: auto-resolve from the run dir).")
-    p.add_argument("--mode", choices=["sweep_command", "sweep_history", "sweep_phase", "rollout", "all"],
+    p.add_argument("--mode",
+                   choices=["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout", "all"],
                    default="all")
     p.add_argument("--device", default="cpu")
     p.add_argument("--num_sampling_steps", type=int, default=None, help="Override Euler step count.")
@@ -1101,12 +1426,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--sweep-axis", choices=["vx", "vy", "wz"], default="vx")
     p.add_argument("--values", default="0,0.5,1.0,1.5,2.0,3.0")
     p.add_argument("--base-cmd", default="0,0,0", help="(vx,vy,wz) base; the swept axis overrides one entry.")
-    p.add_argument("--match-past-cmd", action="store_true",
-                   help="Also overwrite the history token's past command columns with the swept value.")
     p.add_argument("--sweep-hist", default="walking", help="Canonical history used for sweep_command.")
     # sweep_history
     p.add_argument("--histories", default="standing,walking,running,turning")
     p.add_argument("--future-cmd", default="1.0,0,0", help="Fixed command for sweep_history and sweep_phase.")
+    # command profile (sweep_command / sweep_history): ramp toward the target instead
+    # of stepping to it, so the swept command stays in-distribution vs the history.
+    p.add_argument("--cmd-ramp", action="store_true",
+                   help="Ramp the swept command from each history's current command toward the target "
+                        "(in-distribution; training target_vel slews) instead of a constant step.")
+    p.add_argument("--ramp-accel", type=float, default=1.0,
+                   help="Ramp rate for --cmd-ramp in m/s^2 (vx,vy) and rad/s^2 (wz); matches the training "
+                        "env max_acc (1.0). Over a short window far targets may not be reached.")
     # sweep_phase (does the prediction track the history's gait phase?)
     p.add_argument("--phase-hist", default="walking", help="Canonical gait used for the phase sweep.")
     p.add_argument("--n-phases", type=int, default=8, help="Number of phase offsets across one gait period.")
@@ -1114,6 +1445,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Gait period in steps (0 = auto-estimate via foot-height autocorrelation).")
     p.add_argument("--gait-max-period", type=int, default=80,
                    help="Upper bound (steps) for the period / extra steady stretch length to scan.")
+    # forecast (open-loop predictions overlaid on a ground-truth recording)
+    p.add_argument("--forecast-hist", default="walking",
+                   help="Canonical command used to locate the ground-truth stretch for the forecast.")
+    p.add_argument("--forecast-len", type=int, default=150,
+                   help="Ground-truth stretch length (steps) for the forecast overlay.")
+    p.add_argument("--forecast-stride", type=int, default=5,
+                   help="Re-forecast every this many ground-truth steps.")
+    p.add_argument("--forecast-pad", type=int, default=60,
+                   help="Steps of recorded command context to show before/after the FM region "
+                        "(trimmed at episode resets) so you can see ramps into/out of it.")
     # rollout
     p.add_argument("--rollout_steps", type=int, default=200)
     p.add_argument("--advance", type=int, default=1, help="Predicted steps consumed per inference (<=F).")
@@ -1124,6 +1465,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Frame for plotted linear/angular velocities (body = base/heading frame, "
                         "directly comparable to the command; world = raw recorded frame).")
     p.add_argument("--vary-noise", action="store_true", help="Use different sampling noise per overlay.")
+    p.add_argument("--dump-data", action="store_true",
+                   help="Also write the forecast (ground truth + forecasts + command) and rollout "
+                        "trajectories as .npz alongside the plots, for offline analysis.")
     p.add_argument("--save", default=None, help="Force PNG output to this directory.")
     p.add_argument("--out", default=os.path.join(ROOT, "logs", "flow_matching", "test_bench"))
     return p
@@ -1139,16 +1483,23 @@ def main() -> int:
     args.fm_checkpoint = args.fm_checkpoint or default_fm_checkpoint()
     print(f"[bench] FM checkpoint: {os.path.abspath(args.fm_checkpoint)}"
           f"{'  (auto: latest run -- pass --fm_checkpoint to pin)' if auto else ''}")
-    ctx = load_fm_context(args.fm_checkpoint, device, num_sampling_steps=args.num_sampling_steps)
-    # dt is not on the context; the recording carries it -- patched on below.
-    print(f"[bench] FM: H={ctx.H} F={ctx.F} nj={ctx.nj} state_dim={ctx.D} "
-          f"future_cmd_dim={ctx.future_cmd_dim} history_extra_frames={ctx.history_num_extra_frames} "
-          f"target_frames={ctx.target_frame_names} steps={ctx.num_steps}")
-    if ctx.history_num_extra_frames != 0:
-        raise NotImplementedError(
-            "This bench assumes history_num_extra_frames==0 (the deployment design). "
-            f"Got {ctx.history_num_extra_frames}; feeding measured EE history is not wired."
+    # Guard against pre-PARC checkpoints: the new loader needs ``state_normalizer``;
+    # old encoder-decoder checkpoints (target/history split) would die with a cryptic
+    # KeyError. Load once on CPU and pass the dict through to avoid a double load.
+    ckpt_raw = torch.load(args.fm_checkpoint, map_location="cpu", weights_only=False)
+    if "state_normalizer" not in ckpt_raw:
+        norms = sorted(k for k in ckpt_raw if "norm" in k.lower())
+        raise SystemExit(
+            f"[bench] {args.fm_checkpoint} looks like a pre-PARC FM checkpoint "
+            f"(no 'state_normalizer'; found {norms}). This bench targets the PARC "
+            f"single-transformer arch -- train or pull a new-arch checkpoint, or pass "
+            f"--fm_checkpoint to a PARC run."
         )
+    ctx = load_fm_context(ckpt_raw, device, num_sampling_steps=args.num_sampling_steps)
+    # dt is not on the context; the recording carries it -- patched on below.
+    print(f"[bench] FM: N={ctx.N} F={ctx.F} nj={ctx.nj} state_dim={ctx.D} "
+          f"cmd_dim={ctx.cmd_dim} num_cmd_tokens={ctx.num_cmd_tokens} "
+          f"target_frames={ctx.target_frame_names} steps={ctx.num_steps}")
 
     data_path = resolve_data_path(args.fm_checkpoint, args.data)
     data, meta = load_recording_lite(data_path)
@@ -1175,8 +1526,10 @@ def main() -> int:
                            steady_weight=args.steady_weight)
 
     pages: list[Page] = []
-    modes = (["sweep_command", "sweep_history", "sweep_phase", "rollout"]
+    modes = (["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout"]
              if args.mode == "all" else [args.mode])
+    forecast_result: ForecastResult | None = None
+    rollout_result: RolloutResult | None = None
 
     if "sweep_command" in modes:
         win = get_window(args.sweep_hist)
@@ -1187,16 +1540,27 @@ def main() -> int:
         pages += scenario_pages(run_sweep_history(ctx, windows, args, device))
     if "sweep_phase" in modes:
         pages += scenario_pages(run_sweep_phase(ctx, data, layout, args, device))
+    if "forecast" in modes:
+        forecast_result = run_forecast(ctx, data, layout, args, device)
+        pages.append(Page("forecast / root", lambda fig, r=forecast_result: draw_forecast(fig, r)))
+        pages.append(Page("forecast / xy path", lambda fig, r=forecast_result: draw_forecast_path(fig, r)))
+        pages.append(Page("forecast / command", lambda fig, r=forecast_result: draw_forecast_cmd(fig, r)))
     if "rollout" in modes:
         win = get_window(args.rollout_seed_history)
-        res = run_rollout(ctx, win, args, device)
-        pages.append(Page("rollout / stability", lambda fig, r=res: draw_rollout(fig, r)))
+        rollout_result = run_rollout(ctx, win, args, device)
+        pages.append(Page("rollout / stability", lambda fig, r=rollout_result: draw_rollout(fig, r)))
 
     browser = FigureBrowser(pages, plt)
+    out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+    if args.dump_data:
+        os.makedirs(out_dir, exist_ok=True)
+        if forecast_result is not None:
+            dump_forecast(forecast_result, os.path.join(out_dir, "forecast_data.npz"))
+        if rollout_result is not None:
+            dump_rollout(rollout_result, os.path.join(out_dir, "rollout_data.npz"))
     if interactive:
         browser.show()
     else:
-        out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         browser.save_all(out_dir)
     return 0
 

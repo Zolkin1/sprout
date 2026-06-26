@@ -58,7 +58,7 @@ def main() -> int:
 
     # ---- Part 1: measured FM-input parity (per probe) ----
     print("\n=== Part 1: measured FM-input parity (MuJoCo vs IsaacLab) ===")
-    qkeys = ["cur_root_lin", "cur_root_ang", "cur_ee_pos", "cur_ee_quat", "cur_ee_lin", "cur_ee_ang", "token"]
+    qkeys = ["cur_root_lin", "cur_root_ang", "cur_ee_pos", "cur_ee_quat", "cur_ee_lin", "cur_ee_ang", "cond"]
     hdr = "step  " + "".join(f"{k.replace('cur_',''):>11s}" for k in qkeys)
     print(hdr)
     worst = {k: 0.0 for k in qkeys}
@@ -83,10 +83,16 @@ def main() -> int:
         from deploy.fm_session import load_fm_context as load_onnx  # noqa: E402
         octx = load_onnx(args.fm_onnx)
         noise = m["noise"].astype(np.float32)
+        N, cmd_steps = octx.N, list(octx.cmd_steps)
 
-        def onnx_pred(tok: np.ndarray, fut: np.ndarray) -> np.ndarray:
-            feed = {"history_token": tok[None].astype(np.float32),
-                    "future_cmd": fut[None].astype(np.float32), "noise": noise}
+        def _known(f: int) -> np.ndarray:
+            k = np.zeros((1, f), dtype=np.float32)
+            k[:, :N] = 1.0
+            return k
+
+        def onnx_pred(cond: np.ndarray, fut: np.ndarray) -> np.ndarray:
+            feed = {"cond": cond[None].astype(np.float32), "known": _known(cond.shape[0]),
+                    "cmd_tokens": fut[cmd_steps][None].astype(np.float32), "noise": noise}
             return octx.sess.run(["trajectory"], feed)[0][0]
 
         tw = None
@@ -97,24 +103,25 @@ def main() -> int:
             from robot_rl.flow_matching.online import load_fm_context as load_torch  # noqa: E402
             wrap = _FmSamplerOnnx(load_torch(args.ckpt, device="cpu")).eval()
 
-            def torch_pred(tok: np.ndarray, fut: np.ndarray) -> np.ndarray:
+            def torch_pred(cond: np.ndarray, fut: np.ndarray) -> np.ndarray:
                 with torch.no_grad():
-                    return wrap(torch.tensor(tok[None], dtype=torch.float32),
-                                torch.tensor(fut[None], dtype=torch.float32),
+                    return wrap(torch.tensor(cond[None], dtype=torch.float32),
+                                torch.tensor(_known(cond.shape[0]), dtype=torch.float32),
+                                torch.tensor(fut[cmd_steps][None], dtype=torch.float32),
                                 torch.tensor(noise, dtype=torch.float32)).numpy()[0]
             tw = torch_pred
 
         faith, tok_impact = 0.0, 0.0
         for i in range(len(steps)):
             fut_i = iz["future_cmd"][i]
-            o_iz = onnx_pred(iz["token"][i], fut_i)
-            o_mj = onnx_pred(m["token"][i], m["future_cmd"][i])
+            o_iz = onnx_pred(iz["cond"][i], fut_i)
+            o_mj = onnx_pred(m["cond"][i], m["future_cmd"][i])
             tok_impact = max(tok_impact, _mx(o_iz, o_mj))
             if tw is not None:
-                faith = max(faith, _mx(o_iz, tw(iz["token"][i], fut_i)))
+                faith = max(faith, _mx(o_iz, tw(iz["cond"][i], fut_i)))
         if tw is not None:
-            print(f"onnx-vs-torch (isaac token) : {faith:.2e}  (FM export faithful if ~1e-4)")
-        print(f"onnx(isaac)-vs-onnx(mujoco)  : {tok_impact:.2e}  (prediction impact of the token diff)")
+            print(f"onnx-vs-torch (isaac cond)  : {faith:.2e}  (FM export faithful if ~1e-4)")
+        print(f"onnx(isaac)-vs-onnx(mujoco)  : {tok_impact:.2e}  (prediction impact of the cond diff)")
     else:
         print("(pass --fm_onnx [--ckpt] to re-run the FM map on both tokens)")
     return 0

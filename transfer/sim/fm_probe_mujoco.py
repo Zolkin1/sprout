@@ -27,7 +27,7 @@ import mujoco
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # transfer/ on path
-from deploy.fm_session import build_history_token, load_fm_context  # noqa: E402
+from deploy.fm_session import build_cmd_tokens, build_cond_states, load_fm_context  # noqa: E402
 from deploy.quat_math_np import quat_apply_inverse  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 
@@ -49,14 +49,14 @@ def main() -> int:
     args = p.parse_args()
 
     ctx = load_fm_context(args.fm_onnx)
-    H, F, Din, D = ctx.H, ctx.F, ctx.Din, ctx.D
-    hist_frames = list(ctx.history_frame_names)
-    K = len(hist_frames)
+    N, F, D = ctx.N, ctx.F, ctx.D
+    ee_frames = list(ctx.frame_names)
+    K = len(ee_frames)
     joints = list(ctx.joint_names)
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
-    clip = ClipReference(args.clip, joints, hist_frames, base_frame_name="pelvis_link")
+    clip = ClipReference(args.clip, joints, ee_frames, base_frame_name="pelvis_link")
     steps = [int(s) for s in args.steps.split(",") if s != ""]
     noise = np.random.default_rng(args.seed).standard_normal((1, F, D)).astype(np.float32)
 
@@ -74,42 +74,42 @@ def main() -> int:
 
     out: dict[str, list] = {k: [] for k in (
         "cur_root_lin", "cur_root_ang", "cur_ee_pos", "cur_ee_quat", "cur_ee_lin", "cur_ee_ang",
-        "token", "pred", "future_cmd")}
+        "cond", "pred", "future_cmd")}
     set_err = 0.0
     for s in steps:
-        window = [max(0, s - H + 1 + i) for i in range(H)]  # H steps, clamped at clip start
-        rp, rq = np.zeros((1, H, 3)), np.zeros((1, H, 4))
-        rl, ra = np.zeros((1, H, 3)), np.zeros((1, H, 3))
-        jp, jv = np.zeros((1, H, ctx.nj)), np.zeros((1, H, ctx.nj))
-        cmd = np.zeros((1, H, ctx.cmd_dim))
-        frames = np.zeros((1, H, K, 13))
+        window = [max(0, s - N + 1 + i) for i in range(N)]  # N steps, clamped at clip start
+        rp, rq = np.zeros((1, N, 3)), np.zeros((1, N, 4))
+        rl, ra = np.zeros((1, N, 3)), np.zeros((1, N, 3))
+        jp, jv = np.zeros((1, N, ctx.nj)), np.zeros((1, N, ctx.nj))
+        frames = np.zeros((1, N, K, 13))
         for i, j in enumerate(window):
             st = clip.state_at(j)
             set_state(st)
             lin_w, ang_w = robot.get_base_world_velocity("pelvis_link")
-            ee = robot.get_body_world_states(hist_frames)  # [K,13] pos,quat(xyzw),lin,ang
+            ee = robot.get_body_world_states(ee_frames)  # [K,13] pos,quat(xyzw),lin,ang
             set_err = max(set_err, float(np.abs(lin_w - st["root_lin"]).max()),
                           float(np.abs(ang_w - st["root_ang"]).max()))
             rp[0, i], rq[0, i] = st["root_pos"], st["root_quat"]
             rl[0, i], ra[0, i] = lin_w, ang_w
             jp[0, i], jv[0, i] = st["jp"], st["jv"]
-            cmd[0, i] = clip.command_at(j)
             frames[0, i] = ee
-        token = build_history_token(ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames)[0]  # (H,Din)
-        fut = clip.future_command_horizon(s, F)[None].astype(np.float32)               # (1,F,cmd)
-        feed = {"history_token": token[None].astype(np.float32), "future_cmd": fut, "noise": noise}
+        cond, known = build_cond_states(ctx, rp, rq, rl, ra, jp, jv, frames=frames)   # (1,F,D),(1,F)
+        fut = clip.future_command_horizon(s, F)[None].astype(np.float64)              # (1,F,cmd)
+        cmd_tokens = build_cmd_tokens(ctx, fut)
+        feed = {"cond": cond.astype(np.float32), "known": known.astype(np.float32),
+                "cmd_tokens": cmd_tokens.astype(np.float32), "noise": noise}
         pred = ctx.sess.run(["trajectory"], feed)[0][0]  # (F,D) denormalized relative state
 
-        ee_cur = frames[0, -1]  # measured ee at the current step
+        ee_cur = frames[0, -1]  # measured ee at the current (anchor) step
         out["cur_root_lin"].append(rl[0, -1]); out["cur_root_ang"].append(ra[0, -1])
         out["cur_ee_pos"].append(ee_cur[:, 0:3]); out["cur_ee_quat"].append(ee_cur[:, 3:7])
         out["cur_ee_lin"].append(ee_cur[:, 7:10]); out["cur_ee_ang"].append(ee_cur[:, 10:13])
-        out["token"].append(token); out["pred"].append(pred); out["future_cmd"].append(fut[0])
+        out["cond"].append(cond[0]); out["pred"].append(pred); out["future_cmd"].append(fut[0])
 
     np.savez(
         args.out,
         sim="mujoco", steps=np.array(steps), joint_names=np.array(joints),
-        ee_frame_names=np.array(hist_frames), H=H, F=F, Din=Din, D=D, nj=ctx.nj,
+        ee_frame_names=np.array(ee_frames), N=N, F=F, D=D, nj=ctx.nj,
         cmd_dim=ctx.cmd_dim, seed=args.seed, noise=noise,
         **{k: np.asarray(v) for k, v in out.items()},
     )

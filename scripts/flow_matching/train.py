@@ -99,6 +99,17 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--num_sampling_steps", type=int, default=8)
     parser.add_argument("--ori6d_aux_weight", type=float, default=0.0)
+    # Frame finite-difference consistency regularizers (root + ee frames). dt defaults
+    # to the recording's control period. Both weights default off; the consistency
+    # losses are in physical units (m/s, rad/s and m/s^2, rad/s^2).
+    parser.add_argument("--dt", type=float, default=None,
+                        help="Control dt (s) for the consistency finite differences; default: recording meta.")
+    parser.add_argument("--vel_consistency_weight", type=float, default=0.0,
+                        help="Weight on the frame velocity finite-difference consistency loss "
+                             "(predicted pose d/dt vs predicted velocity).")
+    parser.add_argument("--accel_consistency_weight", type=float, default=0.0,
+                        help="Weight on the frame acceleration finite-difference consistency loss "
+                             "(predicted velocity d/dt vs data velocity d/dt).")
     # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
@@ -132,6 +143,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
         num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
+        vel_consistency_weight=args.vel_consistency_weight,
+        accel_consistency_weight=args.accel_consistency_weight,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
@@ -222,6 +235,7 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     model.eval()
     n = cfg.num_history_states
     flow_sum, flow_unc_sum, n_batches = 0.0, 0.0, 0
+    cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
     for batch in loader:
         state = batch["state"].to(device)
@@ -230,7 +244,16 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
         b = state.shape[0]
         known = make_known_mask(b, cfg, device, True)
         none = make_known_mask(b, cfg, device, False)
-        flow_sum += flow_matching_loss(model, state, cond, known, cmd_tokens)["flow_mse"].item()
+        cond_out = flow_matching_loss(
+            model, state, cond, known, cmd_tokens,
+            state_norm=state_normalizer, dt=cfg.dt, num_joints=num_joints,
+            num_extra_frames=num_extra_frames,
+            vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
+        )
+        flow_sum += cond_out["flow_mse"].item()
+        for k in ("vel_consistency", "accel_consistency"):
+            if k in cond_out:
+                cons_sums[k] = cons_sums.get(k, 0.0) + cond_out[k].item()
         flow_unc_sum += flow_matching_loss(model, state, cond, none, cmd_tokens)["flow_mse"].item()
         n_batches += 1
         pred = sample_trajectory(
@@ -245,6 +268,8 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
         "flow_mse": flow_sum / max(n_batches, 1),
         "flow_mse_uncond": flow_unc_sum / max(n_batches, 1),
     }
+    for k, v in cons_sums.items():
+        out[k] = v / max(n_batches, 1)
     for k, v in metric_sums.items():
         out[k] = v / max(n_batches, 1)
     return out
@@ -269,6 +294,8 @@ def main() -> None:
     # an explicit --cmd_array / --target_source always wins).
     cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
     cfg.target_source = _resolve_target_source(cfg.target_source, data)
+    # Control dt for the consistency finite differences: --dt wins, else the recording's.
+    cfg.dt = float(args.dt) if args.dt is not None else float(meta.dt)
     print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
@@ -363,7 +390,10 @@ def main() -> None:
             known = make_known_mask(state.shape[0], cfg, device, use_hist)
             opt.zero_grad()
             out = flow_matching_loss(
-                model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight
+                model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight,
+                state_norm=train_ds.state_normalizer, dt=cfg.dt, num_joints=num_joints,
+                num_extra_frames=train_ds.num_extra_frames,
+                vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
             )
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -372,6 +402,9 @@ def main() -> None:
             n += 1
             global_step += 1
             writer.add_scalar("train/loss_step", out["loss"].item(), global_step)
+            for k in ("flow_mse", "vel_consistency", "accel_consistency"):
+                if k in out:
+                    writer.add_scalar(f"train/{k}_step", out[k].item(), global_step)
         if scheduler is not None:
             scheduler.step()
 

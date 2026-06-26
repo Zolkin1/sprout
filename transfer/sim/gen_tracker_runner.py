@@ -148,8 +148,8 @@ def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> 
         "joint_vel": jv,
         "command": np.asarray(command, dtype=np.float64),
     }
-    if policy.ctx.history_num_extra_frames > 0:
-        fr = robot.get_body_world_states(policy.ctx.history_frame_names)  # [K, 13]
+    if policy.ctx.num_extra_frames > 0:
+        fr = robot.get_body_world_states(policy.ctx.frame_names)  # [K, 13]
         state.update(frame_pos=fr[:, 0:3], frame_quat=fr[:, 3:7], frame_lin=fr[:, 7:10], frame_ang=fr[:, 10:13])
     return state
 
@@ -316,7 +316,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         print(f"[INFO] Hold gains: leg kp x{hold_kp_scale}, kv x{hold_kv_scale} "
               "(reverts to RL gains at handoff).")
     if clip is None:
-        warmup_steps = max(policy.ctx.H, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
+        warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
         if warmup_steps == 0:
             # No hold: fall back to a static warm-start fill so the FM is valid at step 0.
             policy.warm_start(build_state(robot, policy, np.zeros(3)))
@@ -330,7 +330,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     # Manual handoff gate: in interactive (joystick) viewer runs, hold the stand until the
     # operator presses the start button, so standing can be verified before going live.
     gate = (not headless) and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None
-    min_hold = max(warmup_steps, policy.ctx.H) if gate else warmup_steps
+    min_hold = max(warmup_steps, policy.ctx.N) if gate else warmup_steps
 
     # Velocity-command rate limit, matching training. Prefer the value embedded in the
     # tracker metadata; otherwise fall back to --cmd_max_acc (the clip-library ramp rate).

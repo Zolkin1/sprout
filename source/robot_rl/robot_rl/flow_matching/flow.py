@@ -19,7 +19,12 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .transforms import ori6d_orthonormality_penalty
+from .transforms import (
+    frame_block_start,
+    ori6d_orthonormality_penalty,
+    rot6d_to_matrix,
+    so3_log,
+)
 
 
 def sample_flow_batch(
@@ -50,6 +55,66 @@ def sample_flow_batch(
     return x_tau, tau, target_v
 
 
+def frame_consistency_loss(
+    pred_phys: torch.Tensor,
+    data_phys: torch.Tensor,
+    known: torch.Tensor,
+    dt: float,
+    num_joints: int,
+    num_extra_frames: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Velocity + acceleration finite-difference consistency over the frame blocks.
+
+    Operates on the root + each extra (end-effector) frame block (joints excluded),
+    in DENORMALIZED (physical) relative-frame units. Builds a single consistency
+    trajectory that uses the clean *data* at the known (conditioning) tokens and the
+    *prediction* at the unknown tokens, so the history->prediction boundary jump is
+    penalized just like the interior of the predicted window.
+
+    - velocity loss: forward finite difference of the frame **pose** (positions, and a
+      proper SO(3) difference of orientations) vs the predicted linear/angular
+      velocities -- ``pos[t+1] - pos[t] ≈ vel[t]·dt`` and
+      ``so3_log(R[t+1] R[t]^T) ≈ ang_vel[t]·dt``. Ties the predicted velocity to the
+      predicted pose trajectory (a no-op if velocity outputs are later dropped and
+      velocity is taken straight from the pose finite difference).
+    - acceleration loss: forward finite difference of the predicted velocities vs the
+      same finite difference of the **data** velocities.
+
+    Args:
+        pred_phys: Predicted clean endpoint ``x1_hat`` (denormalized), ``(B, F, D)``.
+        data_phys: Target ``x1`` (denormalized), ``(B, F, D)``.
+        known: Per-token conditioning mask, ``(B, F)`` bool.
+        dt: Control step period (seconds).
+        num_joints: ``nj``.
+        num_extra_frames: ``K`` extra body frames (the root is always included).
+
+    Returns:
+        ``(vel_loss, accel_loss)`` scalars (physical units).
+    """
+    x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)  # clean history + prediction
+    vel_terms: list[torch.Tensor] = []
+    accel_terms: list[torch.Tensor] = []
+    for fi in range(1 + num_extra_frames):
+        b = frame_block_start(num_joints, fi)
+        pos, lin = x[..., b:b + 3], x[..., b + 3:b + 6]
+        ori, ang = x[..., b + 6:b + 12], x[..., b + 12:b + 15]
+        data_lin, data_ang = data_phys[..., b + 3:b + 6], data_phys[..., b + 12:b + 15]
+
+        # velocity consistency: d(pose)/dt (forward difference) vs the predicted velocity.
+        lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
+        vel_terms.append(F.mse_loss(lin_fd, lin[:, :-1]))
+        rmat = rot6d_to_matrix(ori)  # (B, F, 3, 3)
+        ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
+        vel_terms.append(F.mse_loss(ang_fd, ang[:, :-1]))
+
+        # acceleration consistency: d(predicted vel)/dt vs d(data vel)/dt.
+        accel_terms.append(F.mse_loss((lin[:, 1:] - lin[:, :-1]) / dt,
+                                      (data_lin[:, 1:] - data_lin[:, :-1]) / dt))
+        accel_terms.append(F.mse_loss((ang[:, 1:] - ang[:, :-1]) / dt,
+                                      (data_ang[:, 1:] - data_ang[:, :-1]) / dt))
+    return torch.stack(vel_terms).mean(), torch.stack(accel_terms).mean()
+
+
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
@@ -58,8 +123,14 @@ def flow_matching_loss(
     cmd_tokens: torch.Tensor | None = None,
     ori_slice: tuple[int, int] | None = None,
     aux_weight: float = 0.0,
+    state_norm: object | None = None,
+    dt: float = 0.02,
+    num_joints: int = 0,
+    num_extra_frames: int = 0,
+    vel_weight: float = 0.0,
+    accel_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
-    """Compute the masked flow-matching loss for one batch.
+    """Compute the masked flow-matching loss (+ optional consistency terms) for one batch.
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
@@ -70,10 +141,18 @@ def flow_matching_loss(
             ``(B, num_cmd_tokens, cmd_dim)``, or ``None`` when not command-conditioned.
         ori_slice: ``(start, end)`` of the root 6D orientation block, for the optional aux loss.
         aux_weight: Weight of the orientation orthonormality penalty (0 disables).
+        state_norm: The state :class:`Normalizer` (needed to denormalize for the
+            physical-units consistency losses); ``None`` disables them.
+        dt: Control step period (seconds) for the finite differences.
+        num_joints: ``nj`` (for locating the frame blocks).
+        num_extra_frames: ``K`` extra body frames.
+        vel_weight: Weight of the frame velocity finite-difference consistency loss (0 disables).
+        accel_weight: Weight of the frame acceleration finite-difference consistency loss (0 disables).
 
     Returns:
         Dict with ``loss`` (the optimized scalar), ``flow_mse`` (detached), and
-        optionally ``ori_aux`` (detached). The MSE is over the unknown tokens only.
+        optionally ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` (detached).
+        The flow MSE is over the unknown tokens only.
     """
     x_tau, tau, target_v = sample_flow_batch(x1, cond, known)
     v = model(x_tau, tau, cmd_tokens)
@@ -82,14 +161,25 @@ def flow_matching_loss(
     denom = unknown.sum().clamp_min(1.0) * v.shape[-1]
     flow_mse = sq.sum() / denom
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
-    if aux_weight > 0.0 and ori_slice is not None:
+
+    do_consistency = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0)
+    if (aux_weight > 0.0 and ori_slice is not None) or do_consistency:
         # Recover the predicted endpoint along the linear path: x1_hat = x_tau + (1 - tau) * v.
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v
-        ori = x1_hat[..., ori_slice[0]:ori_slice[1]][~known]  # (num_unknown, 6)
-        aux = ori6d_orthonormality_penalty(ori)
-        out["ori_aux"] = aux.detach()
-        out["loss"] = flow_mse + aux_weight * aux
+        if aux_weight > 0.0 and ori_slice is not None:
+            ori = x1_hat[..., ori_slice[0]:ori_slice[1]][~known]  # (num_unknown, 6)
+            aux = ori6d_orthonormality_penalty(ori)
+            out["ori_aux"] = aux.detach()
+            out["loss"] = out["loss"] + aux_weight * aux
+        if do_consistency:
+            vel_loss, accel_loss = frame_consistency_loss(
+                state_norm.denormalize(x1_hat), state_norm.denormalize(x1),
+                known, dt, num_joints, num_extra_frames,
+            )
+            out["vel_consistency"] = vel_loss.detach()
+            out["accel_consistency"] = accel_loss.detach()
+            out["loss"] = out["loss"] + vel_weight * vel_loss + accel_weight * accel_loss
     return out
 
 

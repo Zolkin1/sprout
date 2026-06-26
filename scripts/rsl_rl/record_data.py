@@ -207,12 +207,10 @@ def _build_recording_meta(
     robot = env.unwrapped.scene.articulations["robot"]
     action_joint_names = list(robot.data.joint_names)
 
-    # TODO(asymmetric-frames): record the UNION of history+target frames here, and
-    # persist both meta.history_frame_names (history token; deployment = []) and
-    # meta.target_frame_names (predicted; the ee frames) in addition to / instead of
-    # state_frame_names. The vendored transfer/fm/online.py reads those two keys
-    # (falling back to state_frame_names for both when absent). See config.py +
-    # dataset.py for the matching build-side change.
+    # ``state_frames`` are the extra ee frames; the PARC-style FM conditions on AND
+    # predicts the same set (no history/target asymmetry), so ``state_frame_names``
+    # below is the single frame set. Training persists it as ``target_frame_names`` in
+    # the checkpoint meta; online.load_fm_context falls back to ``state_frame_names``.
     # Raw robot-state layout recorded by collect_pairs (world frame, absolute).
     # Order and dims MUST match the torch.cat in collect_pairs.
     num_joints = len(action_joint_names)

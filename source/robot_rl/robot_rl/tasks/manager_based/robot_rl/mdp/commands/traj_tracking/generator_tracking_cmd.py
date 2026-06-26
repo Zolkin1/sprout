@@ -37,7 +37,8 @@ from isaaclab.utils.math import quat_apply, quat_conjugate, quat_from_euler_xyz,
 
 from robot_rl.flow_matching.online import (
     BatchedHistory,
-    build_history_token,
+    build_cmd_tokens,
+    build_cond_states,
     load_fm_context,
     sample_world,
 )
@@ -75,18 +76,15 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         if not self.cfg.fm_checkpoint:
             raise ValueError("GeneratorTrackingCommandCfg.fm_checkpoint must be set.")
 
-        # The motion-sequence task is flat ground -> the FM history token has no
-        # height-scan columns. (Update scan_dim here if a perceptive variant is added.)
         self.ctx = load_fm_context(
             self.cfg.fm_checkpoint,
             device=self.cfg.fm_device or dev,
             num_sampling_steps=self.cfg.fm_num_sampling_steps,
-            scan_dim=0,
         )
-        if self.ctx.future_cmd_dim <= 0:
+        if self.ctx.cmd_dim <= 0:
             raise ValueError(
-                "GeneratorTrackingCommand expects a future-command (cmd_array='target_vel') "
-                "flow-matching checkpoint; the loaded checkpoint has no decoder command "
+                "GeneratorTrackingCommand expects a command-conditioned (cmd_array='target_vel') "
+                "flow-matching checkpoint; the loaded checkpoint has no command "
                 "conditioning (cmd_dim=0)."
             )
 
@@ -103,16 +101,16 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._joint_perm = torch.tensor(
             [robot_joints.index(j) for j in self.ctx.joint_names], dtype=torch.long, device=dev
         )
-        # Body indices for the *history* extra frames only (the encoder input). With
-        # the deployment design (history_frame_names = []) this is None, so no
-        # end-effector measurement is snapshotted into the FM history -- only the
-        # target frames (predicted, never measured) feed the tracker's ee_ref obs.
+        # Body indices for the FM extra frames. The PARC-style design conditions on
+        # AND predicts the same end-effector frames, so every history snapshot carries
+        # them in the predicted-frame order ``ctx.frame_names`` (consumed both as clean
+        # conditioning and, on the predicted side, by the tracker's ee_ref obs).
         self._hist_ee_body_idx = (
-            torch.tensor([self.robot.body_names.index(f) for f in self.ctx.history_frame_names],
+            torch.tensor([self.robot.body_names.index(f) for f in self.ctx.frame_names],
                          dtype=torch.long, device=dev)
-            if self.ctx.history_num_extra_frames > 0 else None
+            if self.ctx.num_extra_frames > 0 else None
         )
-        self._history = BatchedHistory(n, self.ctx.H, dev)
+        self._history = BatchedHistory(n, self.ctx.N, dev)
 
         # Rebuild the world-frame index maps (base built them in resolve_ee_frames
         # order) so the frame order matches the FM prediction layout exactly --
@@ -287,7 +285,6 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             "root_ang": wp.to_torch(self.robot.data.root_link_ang_vel_w).clone(),  # link ang vel
             "jp": wp.to_torch(self.robot.data.joint_pos)[:, perm].clone(),
             "jv": wp.to_torch(self.robot.data.joint_vel)[:, perm].clone(),
-            "cmd": self.get_command_velocity().clone(),                        # past target_vel [N,3]
         }
         if self._hist_ee_body_idx is not None:
             fpos = wp.to_torch(self.robot.data.body_pos_w)[:, self._hist_ee_body_idx]
@@ -317,19 +314,19 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     def _run_fm(self, mask: torch.Tensor) -> None:
         """Run batched flow-matching inference for the masked envs and store predictions."""
         ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-        rp = self._history.stack("root_pos")[ids]    # [V,H,3]
+        rp = self._history.stack("root_pos")[ids]    # [V,N,3]
         rq = self._history.stack("root_quat")[ids]
         rl = self._history.stack("root_lin")[ids]
         ra = self._history.stack("root_ang")[ids]
-        jp = self._history.stack("jp")[ids]          # [V,H,nj] FM order
+        jp = self._history.stack("jp")[ids]          # [V,N,nj] FM order
         jv = self._history.stack("jv")[ids]
-        cmd = self._history.stack("cmd")[ids]         # [V,H,3] past target_vel
         frames = self._history.stack("frames")[ids] if self._hist_ee_body_idx is not None else None
 
-        token = build_history_token(self.ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames, scan=None)
-        # Future command horizon (steps s+1..s+F) for the decoder, current-step subset.
+        cond, known = build_cond_states(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
+        # Commanded-velocity profile over the window -> strided command tokens.
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
-        # Default: anchor each prediction at the current base pose (the deployable relative frame).
+        cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
+        # Default: anchor each prediction at the current base pose (step N-1).
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
         if self.cfg.fm_anchor_on_prev_traj:
@@ -350,7 +347,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             q_ref_prev = quat_mul(dz_yaw, q_ref)          # robot tilt, re-yawed to prior heading
             p_ref = torch.where(had_prev[:, None], p_ref_prev, p_ref)
             q_ref = torch.where(had_prev[:, None], q_ref_prev, q_ref)
-        world = sample_world(self.ctx, token, p_ref, q_ref, future_cmd=fut_cmd)
+        world = sample_world(self.ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)
 
         self._pred_root_pos[ids] = world["root_pos_w"]
         self._pred_root_quat[ids] = world["root_quat_w"]
@@ -363,7 +360,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             self._pred_frame_quat[ids] = world["frame_quat_w"]
             self._pred_frame_lin[ids] = world["frame_lin_vel_w"]
             self._pred_frame_ang[ids] = world["frame_ang_vel_w"]
-        self._pred_idx[ids] = 0
+        # Frames 0..N-1 reproduce the conditioning; novel future starts at N, so the
+        # tracker's "current reference" index begins one step ahead of "now" (= N-1).
+        self._pred_idx[ids] = self.ctx.N
         self._pred_valid[ids] = True
 
     def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -404,10 +403,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         sees privileged clip look-ahead -- only the generator's own prediction
         (available at deployment from the same FM + tracker pair).
 
-        The FM prediction stores ``F`` future steps anchored at the current base;
-        index ``_pred_idx`` is "now", so future offset ``o`` reads prediction
-        index ``_pred_idx + o`` (clamped to the predicted horizon ``F - 1``, the
-        FM-side analogue of the clip's clamp-to-clip-end).
+        The FM prediction stores ``F`` window steps anchored at the current base
+        (steps ``0..N-1`` reproduce the recent past; novel future is ``N..F-1``);
+        ``_pred_idx`` is the currently-tracked reference step (starts at ``N``, one
+        ahead of "now" = ``N-1``), so future offset ``o`` reads prediction index
+        ``_pred_idx + o`` (clamped to the predicted horizon ``F - 1``, the FM-side
+        analogue of the clip's clamp-to-clip-end).
 
         Returns:
             ``(pos_w, quat_w, lin_w, ang_w)`` of shapes ``[N, K, 3]``,

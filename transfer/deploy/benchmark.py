@@ -81,7 +81,7 @@ def main() -> None:
     # ---- 2. full end-to-end step (the real deploy cost) ----
     npd = GenTrackerPolicy(os.path.join(exp, "tracker.onnx"), os.path.join(exp, "fm.onnx"))
     npd.load()
-    nj, K = npd.ctx.nj, npd.ctx.history_num_extra_frames
+    nj, K = npd.ctx.nj, npd.ctx.num_extra_frames
     state = _synthetic_state(nj, K, rng)
     npd.warm_start(state)
 

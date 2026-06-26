@@ -88,6 +88,32 @@ def rot6d_to_quat(d6: torch.Tensor) -> torch.Tensor:
     return quat_from_matrix(rot6d_to_matrix(d6))
 
 
+def so3_log(r: torch.Tensor) -> torch.Tensor:
+    """Rotation vector (axis * angle) of rotation matrices ``(..., 3, 3)``.
+
+    The SO(3) log map. Numerically stable near identity -- uses ``atan2`` (not
+    ``arccos``, whose gradient is singular at ``cos = 1``) and a finite small-angle
+    limit -- so a finite-difference angular velocity between nearly-equal consecutive
+    rotations (``so3_log(R[t+1] @ R[t]^T)``) has well-behaved values and gradients.
+
+    Args:
+        r: Rotation matrices, shape ``(..., 3, 3)``.
+
+    Returns:
+        Rotation vectors ``(..., 3)``.
+    """
+    v_raw = torch.stack(
+        [r[..., 2, 1] - r[..., 1, 2], r[..., 0, 2] - r[..., 2, 0], r[..., 1, 0] - r[..., 0, 1]],
+        dim=-1,
+    )  # = 2 * sin(theta) * axis
+    s = 0.5 * torch.linalg.norm(v_raw, dim=-1)                    # sin(theta) >= 0
+    c = 0.5 * (r[..., 0, 0] + r[..., 1, 1] + r[..., 2, 2] - 1.0)  # cos(theta)
+    theta = torch.atan2(s, c)                                     # [0, pi]
+    # rotation vector = theta * axis = v_raw * theta / (2 sin theta); -> v_raw/2 as theta->0.
+    factor = torch.where(s < 1e-6, torch.full_like(s, 0.5), theta / (2.0 * s.clamp_min(1e-12)))
+    return v_raw * factor.unsqueeze(-1)
+
+
 # Per-frame block width: [pos(3), lin_vel(3), ori6d(6), ang_vel(3)]. The base
 # (root) block and every extra body frame share this layout.
 FRAME_BLOCK_DIM = 3 + 3 + 6 + 3  # = 15

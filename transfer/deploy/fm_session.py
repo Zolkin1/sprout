@@ -4,10 +4,10 @@
 
 Numpy + onnxruntime counterpart of ``transfer/fm/online.py``. The ONNX
 (``fm.onnx``, exported by ``scripts/flow_matching/export_fm_onnx.py``) folds in the
-normalizers and the unrolled Euler sampler, so this builds the **raw** history
-token (numpy ``relative_state``), runs one ``session.run`` for the whole sampler,
-and lifts the predicted relative state to the world frame (numpy
-``state_to_absolute``). No torch.
+normalizers and the unrolled masked-Euler sampler, so this builds the **raw**
+conditioning window (numpy ``relative_state``) + known mask + raw strided command
+tokens, runs one ``session.run`` for the whole sampler, and lifts the predicted
+relative state to the world frame (numpy ``state_to_absolute``). No torch.
 """
 
 from __future__ import annotations
@@ -27,26 +27,27 @@ class FmContext:
     """Loaded ``fm.onnx`` session + metadata (mirrors ``transfer/fm`` FmOnlineContext)."""
 
     sess: ort.InferenceSession
-    H: int
+    N: int
     F: int
     D: int
-    history_D: int
-    Din: int
     nj: int
-    history_num_extra_frames: int
     target_num_extra_frames: int
     num_steps: int
     cmd_dim: int
-    future_cmd_dim: int
-    scan_dim: int
+    cmd_steps: list[int]
+    num_cmd_tokens: int
     joint_names: list[str]
-    history_frame_names: list[str]
     target_frame_names: list[str]
 
     @property
     def frame_names(self) -> list[str]:
         """Predicted (target) extra-frame order -- what ``ee_ref`` consumes."""
         return self.target_frame_names
+
+    @property
+    def num_extra_frames(self) -> int:
+        """Alias for the predicted (target) extra-frame count."""
+        return self.target_num_extra_frames
 
 
 def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
@@ -57,33 +58,34 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
     m = json.loads(raw["fm_meta"])
     return FmContext(
-        sess=sess, H=m["H"], F=m["F"], D=m["D"], history_D=m["history_D"], Din=m["Din"], nj=m["nj"],
-        history_num_extra_frames=len(m["history_frame_names"]),
+        sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         target_num_extra_frames=len(m["target_frame_names"]),
-        num_steps=m["num_steps"], cmd_dim=m["cmd_dim"], future_cmd_dim=m["future_cmd_dim"],
-        scan_dim=m["scan_dim"], joint_names=list(m["joint_names"]),
-        history_frame_names=list(m["history_frame_names"]), target_frame_names=list(m["target_frame_names"]),
+        num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
+        cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
+        joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
     )
 
 
-def build_history_token(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel,
-                        cmd, frames=None) -> np.ndarray:
-    """Build the **raw** (un-normalized) history token ``(V, H, Din)``.
+def build_cond_states(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel,
+                      frames=None) -> tuple[np.ndarray, np.ndarray]:
+    """Build the **raw** conditioning window ``(V, F, D)`` and known mask ``(V, F)``.
 
     Unlike the torch ``transfer/fm`` builder, this does NOT normalize -- the
-    ``fm.onnx`` graph folds in the history normalization. Inputs ``(V, H, ·)`` in
-    FM joint/frame order, world frame, xyzw quats; ``frames`` is ``(V,H,K_hist,13)``
-    or None.
+    ``fm.onnx`` graph folds in the state normalization. Inputs are the ``N``
+    most-recent steps ``(V, N, ·)`` in FM joint/frame order, world frame, xyzw quats;
+    ``frames`` is ``(V,N,K,13)`` (required when the model predicts extra frames).
+    The N relative states fill the first N tokens (anchored at step N-1); the rest
+    are zeros with ``known = 0``.
     """
-    v, h = root_pos.shape[0], root_pos.shape[1]
-    nj, k, m = ctx.nj, ctx.history_num_extra_frames, root_pos.shape[0] * root_pos.shape[1]
-    p_ref = np.broadcast_to(root_pos[:, h - 1 : h], (v, h, 3)).reshape(m, 3)
-    q_ref = np.broadcast_to(root_quat[:, h - 1 : h], (v, h, 4)).reshape(m, 4)
+    v, n = root_pos.shape[0], root_pos.shape[1]
+    nj, k, m = ctx.nj, ctx.target_num_extra_frames, root_pos.shape[0] * root_pos.shape[1]
+    p_ref = np.broadcast_to(root_pos[:, n - 1 : n], (v, n, 3)).reshape(m, 3)
+    q_ref = np.broadcast_to(root_quat[:, n - 1 : n], (v, n, 4)).reshape(m, 4)
 
     fpos = fquat = flin = fang = None
     if k > 0:
         if frames is None:
-            raise ValueError(f"Context expects {k} history extra frames but none were provided.")
+            raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
         fr = frames.reshape(m, k, 13)
         fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
 
@@ -92,27 +94,49 @@ def build_history_token(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, jo
         root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
         joint_pos.reshape(m, nj), joint_vel.reshape(m, nj), p_ref, q_ref,
         frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
-    ).reshape(v, h, ctx.history_D)
-    return np.concatenate([rel, cmd], axis=-1)
+    ).reshape(v, n, ctx.D)
+
+    cond = np.zeros((v, ctx.F, ctx.D), dtype=rel.dtype)
+    cond[:, :n] = rel
+    known = np.zeros((v, ctx.F), dtype=np.float32)
+    known[:, :n] = 1.0
+    return cond, known
 
 
-def sample_world(ctx: FmContext, history_token, p_ref, q_ref, future_cmd, noise) -> dict:
+def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
+    """Stride the per-step commanded-velocity profile into **raw** command tokens.
+
+    Args:
+        ctx: Loaded FM context.
+        future_cmd: Raw command profile over the window ``(V, F, cmd_dim)``.
+
+    Returns:
+        Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)`` (the ``fm.onnx``
+        graph folds in the command normalization).
+    """
+    return future_cmd[:, ctx.cmd_steps, :]
+
+
+def sample_world(ctx: FmContext, cond, known, p_ref, q_ref, cmd_tokens, noise) -> dict:
     """Run the ONNX sampler and lift the predicted relative state to the world frame.
 
     Args:
         ctx: Loaded FM context.
-        history_token: Raw history token ``(V, H, Din)``.
+        cond: Raw conditioning window ``(V, F, D)``.
+        known: Known mask ``(V, F)`` (1.0 at conditioning tokens).
         p_ref: World anchor position ``(V, 3)``.
         q_ref: World anchor quaternion ``(V, 4, xyzw)``.
-        future_cmd: Raw future command ``(V, F, future_cmd_dim)``.
+        cmd_tokens: Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)``.
         noise: Sampling noise ``(V, F, D)`` (caller-supplied for determinism).
 
     Returns:
         World-frame prediction dict (same keys as ``transfer/fm`` ``sample_world``).
+        Novel (predicted) frames are ``N..F-1``.
     """
     feed = {
-        "history_token": history_token.astype(np.float32),
-        "future_cmd": future_cmd.astype(np.float32),
+        "cond": cond.astype(np.float32),
+        "known": known.astype(np.float32),
+        "cmd_tokens": cmd_tokens.astype(np.float32),
         "noise": noise.astype(np.float32),
     }
     pred = ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D) denormalized rel-state

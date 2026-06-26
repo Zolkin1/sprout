@@ -65,10 +65,10 @@ from export_fm_onnx import _FmSamplerOnnx  # noqa: E402
 def main() -> int:
     """Set clip-derived probe states in IsaacLab, read FM inputs, run the FM, dump npz."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ctx = load_fm_context(args.ckpt, device=device, scan_dim=0)
-    H, F, Din, D, nj = ctx.H, ctx.F, ctx.Din, ctx.D, ctx.nj
-    hist_frames = list(ctx.history_frame_names)
-    K = len(hist_frames)
+    ctx = load_fm_context(args.ckpt, device=device)
+    N, F, D, nj = ctx.N, ctx.F, ctx.D, ctx.nj
+    ee_frames = list(ctx.frame_names)
+    K = len(ee_frames)
     joints = list(ctx.joint_names)
     wrap = _FmSamplerOnnx(ctx).to(device).eval()
 
@@ -84,11 +84,11 @@ def main() -> int:
     asset_joints = list(robot.data.joint_names)
     asset_bodies = list(robot.data.body_names)
     j_ctx2asset = [joints.index(n) for n in asset_joints]   # asset[a] <- ctx[j_ctx2asset[a]]
-    ee_body_idx = [asset_bodies.index(f) for f in hist_frames]
+    ee_body_idx = [asset_bodies.index(f) for f in ee_frames]
     sim_dt = env.sim.get_physics_dt()
     eids = torch.tensor([0], device=device)
 
-    clip = ClipReference(args.clip, joints, hist_frames, base_frame_name="pelvis_link")
+    clip = ClipReference(args.clip, joints, ee_frames, base_frame_name="pelvis_link")
     steps = [int(s) for s in args.steps.split(",") if s != ""]
     noise = np.random.default_rng(args.seed).standard_normal((1, F, D)).astype(np.float32)
     noise_t = torch.tensor(noise, device=device)
@@ -123,15 +123,14 @@ def main() -> int:
 
     out: dict[str, list] = {k: [] for k in (
         "cur_root_lin", "cur_root_ang", "cur_ee_pos", "cur_ee_quat", "cur_ee_lin", "cur_ee_ang",
-        "token", "pred", "future_cmd")}
+        "cond", "pred", "future_cmd")}
     set_err = 0.0
     for s in steps:
-        window = [max(0, s - H + 1 + i) for i in range(H)]
-        rp, rq = np.zeros((1, H, 3)), np.zeros((1, H, 4))
-        rl, ra = np.zeros((1, H, 3)), np.zeros((1, H, 3))
-        jp, jv = np.zeros((1, H, nj)), np.zeros((1, H, nj))
-        cmd = np.zeros((1, H, ctx.cmd_dim))
-        frames = np.zeros((1, H, K, 13))
+        window = [max(0, s - N + 1 + i) for i in range(N)]
+        rp, rq = np.zeros((1, N, 3)), np.zeros((1, N, 4))
+        rl, ra = np.zeros((1, N, 3)), np.zeros((1, N, 3))
+        jp, jv = np.zeros((1, N, nj)), np.zeros((1, N, nj))
+        frames = np.zeros((1, N, K, 13))
         for i, j in enumerate(window):
             st = clip.state_at(j)
             mrl, mra, mee = set_and_measure(st)
@@ -140,38 +139,41 @@ def main() -> int:
             rp[0, i], rq[0, i] = st["root_pos"], st["root_quat"]
             rl[0, i], ra[0, i] = mrl, mra
             jp[0, i], jv[0, i] = st["jp"], st["jv"]
-            cmd[0, i] = clip.command_at(j)
             frames[0, i] = mee
 
-        # RAW token (matches the deploy raw token; the FM wrapper normalizes internally).
+        # RAW conditioning window (the FM wrapper normalizes internally).
         def tt(a):
             return torch.tensor(np.asarray(a, dtype=np.float32), device=device)
-        m = H  # V=1
+        m = N  # V=1
         rp_t, rq_t, rl_t, ra_t = tt(rp), tt(rq), tt(rl), tt(ra)
-        jp_t, jv_t, cmd_t, fr = tt(jp), tt(jv), tt(cmd), tt(frames).reshape(m, K, 13)
-        p_ref = rp_t[:, -1:].expand(1, H, 3).reshape(m, 3)
-        q_ref = rq_t[:, -1:].expand(1, H, 4).reshape(m, 4)
+        jp_t, jv_t, fr = tt(jp), tt(jv), tt(frames).reshape(m, K, 13)
+        p_ref = rp_t[:, -1:].expand(1, N, 3).reshape(m, 3)
+        q_ref = rq_t[:, -1:].expand(1, N, 4).reshape(m, 4)
         rel = relative_state(
             rp_t.reshape(m, 3), rq_t.reshape(m, 4), rl_t.reshape(m, 3), ra_t.reshape(m, 3),
             jp_t.reshape(m, nj), jv_t.reshape(m, nj), p_ref, q_ref,
             frame_pos_w=fr[..., 0:3], frame_quat_w=fr[..., 3:7],
             frame_lin_vel_w=fr[..., 7:10], frame_ang_vel_w=fr[..., 10:13],
-        ).reshape(1, H, ctx.history_D)
-        raw_token = torch.cat([rel, cmd_t], dim=-1)  # (1,H,Din)
+        ).reshape(1, N, D)
+        cond_t = torch.zeros(1, F, D, device=device)
+        cond_t[:, :N] = rel
+        known_t = torch.zeros(1, F, device=device)
+        known_t[:, :N] = 1.0
         fut = clip.future_command_horizon(s, F).astype(np.float32)  # (F,cmd)
+        cmd_tokens_t = torch.tensor(fut[ctx.cmd_steps], device=device)[None]  # (1, n_cmd, cmd)
         with torch.no_grad():
-            pred = wrap(raw_token, torch.tensor(fut, device=device)[None], noise_t).cpu().numpy()[0]
+            pred = wrap(cond_t, known_t, cmd_tokens_t, noise_t).cpu().numpy()[0]
 
         out["cur_root_lin"].append(rl[0, -1]); out["cur_root_ang"].append(ra[0, -1])
         out["cur_ee_pos"].append(frames[0, -1, :, 0:3]); out["cur_ee_quat"].append(frames[0, -1, :, 3:7])
         out["cur_ee_lin"].append(frames[0, -1, :, 7:10]); out["cur_ee_ang"].append(frames[0, -1, :, 10:13])
-        out["token"].append(raw_token[0].cpu().numpy()); out["pred"].append(pred)
+        out["cond"].append(cond_t[0].cpu().numpy()); out["pred"].append(pred)
         out["future_cmd"].append(fut)
 
     np.savez(
         args.out,
         sim="isaac", steps=np.array(steps), joint_names=np.array(joints),
-        ee_frame_names=np.array(hist_frames), H=H, F=F, Din=Din, D=D, nj=nj,
+        ee_frame_names=np.array(ee_frames), N=N, F=F, D=D, nj=nj,
         cmd_dim=ctx.cmd_dim, seed=args.seed, noise=noise,
         **{k: np.asarray(v) for k, v in out.items()},
     )

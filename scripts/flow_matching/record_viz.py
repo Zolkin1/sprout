@@ -62,7 +62,8 @@ from robot_rl.flow_matching.dataset import resolve_term_slice
 from robot_rl.flow_matching.online import (
     BatchedHistory,
     FmOnlineContext,
-    build_history_token,
+    build_cmd_tokens,
+    build_cond_states,
     load_fm_context,
     sample_world,
 )
@@ -264,10 +265,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ctx = _build_fm_context(env, robot, device)
         ctx["dt"] = float(env.unwrapped.step_dt)
         print(
-            f"[INFO] FM ready: H={ctx['H']} F={ctx['F']} D={ctx['D']} Din={ctx['Din']} "
+            f"[INFO] FM ready: N={ctx['N']} F={ctx['F']} D={ctx['D']} "
             f"nj={ctx['nj']} sampling_steps={ctx['num_steps']} "
-            f"(cmd_dim={ctx['vel_dim']}, future_cmd={'on' if ctx['future_cmd_dim'] > 0 else 'off'}, "
-            f"scan_dim={ctx['scan_dim']}, command={'on' if ctx['cmd_term'] is not None else 'none'})"
+            f"(cmd_dim={ctx['vel_dim']}, command={'on' if ctx['cmd_term'] is not None else 'none'})"
         )
 
         # The viewer wants world-frame ray hit points, which only the sensor has
@@ -286,7 +286,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         latest_pred_idx = np.full(num_envs, -1, dtype=np.int32)
 
         sim = SimulationContext.instance()
-        history = BatchedHistory(num_envs, ctx["H"], device)
+        history = BatchedHistory(num_envs, ctx["N"], device)
         obs = env.get_observations()
         step = 0
         try:
@@ -401,22 +401,18 @@ def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, device) -> F
     nj = len(live_joint_names)
     cfg = FlowMatchingConfig()
     d = target_state_dim(nj)
-    din = d + scan_dim
     model = FlowMatchingTransformer(
-        history_in_dim=din, state_dim=d, history_len=cfg.history_len, future_len=cfg.future_len,
-        d_model=cfg.d_model, nhead=cfg.nhead, num_encoder_layers=cfg.num_encoder_layers,
-        num_decoder_layers=cfg.num_decoder_layers, dim_feedforward=cfg.dim_feedforward,
-        dropout=cfg.dropout, cmd_dim=0,
+        state_dim=d, future_len=cfg.future_len, cmd_dim=0, cmd_stride=cfg.cmd_stride,
+        d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
+        dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(device).eval()
     return FmOnlineContext(
-        model=model, target_norm=_identity_normalizer(d, device),
-        history_norm=_identity_normalizer(din, device), H=cfg.history_len, F=cfg.future_len,
-        D=d, history_D=d, Din=din, nj=nj,
-        history_num_extra_frames=0, target_num_extra_frames=0,
+        model=model, state_norm=_identity_normalizer(d, device), cmd_norm=None,
+        N=cfg.num_history_states, F=cfg.future_len, D=d, nj=nj,
+        target_num_extra_frames=0,
         num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps,
-        cmd_dim=0, future_cmd_dim=0, scan_dim=scan_dim,
-        joint_names=list(live_joint_names), history_frame_names=[], target_frame_names=[],
-        device=device,
+        cmd_dim=0, cmd_steps=list(range(0, cfg.future_len, cfg.cmd_stride)), num_cmd_tokens=0,
+        joint_names=list(live_joint_names), target_frame_names=[], device=device,
     )
 
 
@@ -447,25 +443,24 @@ def _build_fm_context(env, robot, device) -> dict:
     scan_dim = (scan_slice[1] - scan_slice[0]) if scan_slice is not None else 0
 
     if _FM_CKPT is not None:
-        fm = load_fm_context(_FM_CKPT, device, args_cli.num_sampling_steps, scan_dim=scan_dim)
+        fm = load_fm_context(_FM_CKPT, device, args_cli.num_sampling_steps)
     else:
         # --dry_run: random model, no command, no extra frames -- exercises shapes only.
         fm = _dry_run_fm_context(live_joint_names, scan_dim, device)
         print("[INFO] --dry_run: using a randomly-initialized model and identity normalizers.")
 
-    # History extra body frames (ee): resolve their live body indices in FM history
-    # frame order so the per-step capture mirrors record_data.py --state_frames
-    # (body_pos_w / body_quat_w / body_link_vel_w), the exact layout
-    # online.build_history_token consumes. Empty for the deployment design
-    # (history_frame_names = []): no measured end-effectors feed the history token.
+    # Extra body frames (ee): resolve their live body indices in FM frame order so the
+    # per-step capture mirrors record_data.py --state_frames (body_pos_w / body_quat_w /
+    # body_link_vel_w), the exact layout online.build_cond_states consumes. The PARC-style
+    # FM conditions on AND predicts the same frames, so the history carries them.
     frame_body_idx = None
-    if fm.history_num_extra_frames > 0:
+    if fm.num_extra_frames > 0:
         body_names = list(robot.data.body_names)
-        missing_f = [f for f in fm.history_frame_names if f not in body_names]
+        missing_f = [f for f in fm.frame_names if f not in body_names]
         if missing_f:
-            raise ValueError(f"FM history extra frames absent from the live robot bodies: {missing_f}")
+            raise ValueError(f"FM extra frames absent from the live robot bodies: {missing_f}")
         frame_body_idx = torch.tensor(
-            [body_names.index(f) for f in fm.history_frame_names], dtype=torch.long, device=device
+            [body_names.index(f) for f in fm.frame_names], dtype=torch.long, device=device
         )
 
     # Joint permutation: reorder live joints into the FM training order.
@@ -490,10 +485,9 @@ def _build_fm_context(env, robot, device) -> dict:
     return {
         "fm": fm, "joint_perm": joint_perm, "scan_slice": scan_slice,
         "cmd_term": cmd_term, "frame_body_idx": frame_body_idx,
-        "H": fm.H, "F": fm.F, "D": fm.D, "Din": fm.Din, "nj": fm.nj,
+        "N": fm.N, "F": fm.F, "D": fm.D, "nj": fm.nj,
         "num_steps": fm.num_steps, "joint_names": fm.joint_names,
-        "vel_dim": fm.cmd_dim, "scan_dim": fm.scan_dim, "future_cmd_dim": fm.future_cmd_dim,
-        "num_extra_frames": fm.num_extra_frames, "device": device,
+        "vel_dim": fm.cmd_dim, "num_extra_frames": fm.num_extra_frames, "device": device,
     }
 
 
@@ -538,9 +532,6 @@ def _record_step(history: BatchedHistory, robot, obs, ctx: dict, wp) -> dict[str
     if ctx["cmd_term"] is not None:
         step["vel_cmd"] = ctx["cmd_term"].get_command_velocity().clone()                  # (N, cmd_dim)
         step["future_cmd"] = ctx["cmd_term"].get_command_velocity_horizon(ctx["F"]).clone()  # (N, F, cmd_dim)
-    if ctx["scan_slice"] is not None:
-        ss = ctx["scan_slice"]
-        step["scan"] = obs["policy"][:, ss[0]:ss[1]].clone()
     history.append(step)
     return step
 
@@ -565,29 +556,27 @@ def _infer_predictions(
     if not bool(valid.any()):
         return None
     env_ids = torch.nonzero(valid, as_tuple=False).squeeze(-1)
-    H = fm.H
+    n = fm.N
 
-    p = history.stack("root_pos")[env_ids]        # (V, H, 3)
-    q = history.stack("root_quat")[env_ids]       # (V, H, 4) xyzw
-    v = history.stack("root_lin_vel")[env_ids]    # (V, H, 3)
-    w = history.stack("root_ang_vel")[env_ids]    # (V, H, 3)
-    jp = history.stack("joint_pos")[env_ids]      # (V, H, nj)
-    jv = history.stack("joint_vel")[env_ids]      # (V, H, nj)
-    scan = history.stack("scan")[env_ids] if fm.scan_dim > 0 else None
-    frames = history.stack("frames")[env_ids] if fm.history_num_extra_frames > 0 else None  # (V, H, K_hist, 13)
-    # Command (when the checkpoint is command-conditioned): past in the token, future
-    # horizon to the decoder. The horizon for the current step is at the last index.
+    p = history.stack("root_pos")[env_ids]        # (V, N, 3)
+    q = history.stack("root_quat")[env_ids]       # (V, N, 4) xyzw
+    v = history.stack("root_lin_vel")[env_ids]    # (V, N, 3)
+    w = history.stack("root_ang_vel")[env_ids]    # (V, N, 3)
+    jp = history.stack("joint_pos")[env_ids]      # (V, N, nj)
+    jv = history.stack("joint_vel")[env_ids]      # (V, N, nj)
+    frames = history.stack("frames")[env_ids] if fm.num_extra_frames > 0 else None  # (V, N, K, 13)
+    # Command (when the checkpoint is command-conditioned): the future horizon captured
+    # at the most recent step is strided into command tokens.
     if fm.cmd_dim > 0:
-        cmd = history.stack("vel_cmd")[env_ids]                       # (V, H, cmd_dim)
-        future_cmd = history.stack("future_cmd")[env_ids][:, H - 1]   # (V, F, cmd_dim)
+        future_cmd = history.stack("future_cmd")[env_ids][:, n - 1]   # (V, F, cmd_dim)
+        cmd_tokens = build_cmd_tokens(fm, future_cmd)
     else:
-        cmd = p.new_zeros(p.shape[0], H, 0)
-        future_cmd = None
+        cmd_tokens = None
 
-    # online.build_history_token does the (training-matched) relative transform +
+    # online.build_cond_states does the (training-matched) relative transform +
     # normalization; sample_world samples, denormalizes, and lifts to world frame.
-    token = build_history_token(fm, p, q, v, w, jp, jv, cmd, frames=frames, scan=scan)
-    world = sample_world(fm, token, p[:, H - 1], q[:, H - 1], future_cmd=future_cmd)
+    cond, known = build_cond_states(fm, p, q, v, w, jp, jv, frames=frames)
+    world = sample_world(fm, cond, known, p[:, n - 1], q[:, n - 1], cmd_tokens=cmd_tokens)
     return env_ids, {
         "root_pos": world["root_pos_w"],
         "root_quat": world["root_quat_w"],
@@ -642,7 +631,7 @@ def _save(
         update_every=int(args_cli.update_every),
         num_envs=num_envs,
         num_steps=num_steps,
-        history_len=ctx["H"],
+        history_len=ctx["N"],
         future_len=F,
         num_joints=nj,
         num_scan_rays=num_scan_rays,

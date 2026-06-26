@@ -37,9 +37,9 @@ def test_hardware_offline() -> None:
     enc_names = list(reversed(isaac))
     rng = np.random.default_rng(0)
 
-    # Legacy symmetric checkpoints carry ee frames in the FM history; the
-    # hardware-portable asymmetric checkpoint needs none (frames stays None there).
-    khist = policy.ctx.history_num_extra_frames
+    # The FM conditions on (and predicts) the same ee frames, so the hardware state
+    # supplies them every step (from FK on the measured joints).
+    khist = policy.ctx.num_extra_frames
 
     def reading(cmd):
         frames = None

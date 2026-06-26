@@ -23,6 +23,8 @@ from robot_rl.flow_matching import (
     build_train_val,
     episode_windows,
     flow_matching_loss,
+    frame_block_start,
+    frame_consistency_loss,
     matrix_to_rot6d,
     orientation_slice,
     orientation_slices,
@@ -34,6 +36,7 @@ from robot_rl.flow_matching import (
     rot6d_to_quat,
     sample_flow_batch,
     sample_trajectory,
+    so3_log,
     state_to_absolute,
     target_state_dim,
 )
@@ -627,3 +630,101 @@ def test_target_source_reference_requires_ref_state():
     )
     with pytest.raises(ValueError, match="ref_state"):
         FutureStateDataset(data, meta, cfg, windows)
+
+
+# ---------------------------------------------------------------------------
+# Consistency regularization: SO(3) log + frame velocity/acceleration losses
+# ---------------------------------------------------------------------------
+def _rodrigues(w: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices ``(B, 3, 3)`` from rotation vectors ``w`` (B, 3) (Rodrigues)."""
+    theta = w.norm(dim=-1, keepdim=True)               # (B, 1)
+    k = w / theta.clamp_min(1e-12)
+    kx, ky, kz = k[:, 0], k[:, 1], k[:, 2]
+    K = torch.zeros(w.shape[0], 3, 3, dtype=w.dtype)
+    K[:, 0, 1], K[:, 0, 2] = -kz, ky
+    K[:, 1, 0], K[:, 1, 2] = kz, -kx
+    K[:, 2, 0], K[:, 2, 1] = -ky, kx
+    eye = torch.eye(3, dtype=w.dtype).expand(w.shape[0], 3, 3)
+    th = theta[:, :, None]                              # (B, 1, 1)
+    return eye + torch.sin(th) * K + (1.0 - torch.cos(th)) * (K @ K)
+
+
+def test_so3_log_recovers_rotation_vector():
+    torch.manual_seed(20)
+    # mix of tiny (near-identity, the gradient-singular regime), moderate, and large angles
+    dirs = torch.randn(200, 3, dtype=torch.float64)
+    dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+    angles = torch.cat([
+        torch.full((100,), 1e-7, dtype=torch.float64),   # essentially identity
+        torch.rand(100, dtype=torch.float64) * 2.5,       # up to ~143 deg
+    ])
+    w = dirs * angles.unsqueeze(-1)
+    rec = so3_log(_rodrigues(w))
+    assert torch.allclose(rec, w, atol=1e-7), float((rec - w).abs().max())
+    assert torch.isfinite(so3_log(_rodrigues(w))).all()
+
+
+def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> torch.Tensor:
+    """A physically self-consistent ``(1, F, D)`` trajectory: positions integrate the
+    (constant) linear velocity and orientations integrate the (constant) angular
+    velocity, so every frame block satisfies pos/ori finite-difference == velocity."""
+    g = torch.Generator().manual_seed(seed)
+    d = target_state_dim(nj, k)
+    x = torch.zeros(1, nf, d, dtype=torch.float64)
+    for fi in range(1 + k):
+        b = frame_block_start(nj, fi)
+        pos0 = torch.randn(3, generator=g, dtype=torch.float64)
+        vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+        omega = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+        for t in range(nf):
+            r = _rodrigues((omega * (t * dt)).unsqueeze(0))[0]   # (3, 3)
+            x[0, t, b:b + 3] = pos0 + vel * (t * dt)
+            x[0, t, b + 3:b + 6] = vel
+            x[0, t, b + 6:b + 12] = matrix_to_rot6d(r)
+            x[0, t, b + 12:b + 15] = omega
+    return x
+
+
+def test_frame_consistency_zero_for_consistent_traj():
+    nf, nj, k, dt = 6, 2, 1, 0.05
+    x = _consistent_frame_traj(nf, nj, k, dt, seed=1)
+    known = torch.zeros(1, nf, dtype=torch.bool)  # all unknown -> consistency on the prediction itself
+    vel, accel = frame_consistency_loss(x, x, known, dt, nj, k)
+    # A self-consistent constant-velocity trajectory has ~zero finite-difference residual.
+    assert vel.item() < 1e-10, vel.item()
+    assert accel.item() < 1e-10, accel.item()
+
+
+def test_frame_consistency_penalizes_jump():
+    nf, nj, k, dt = 6, 2, 1, 0.05
+    x = _consistent_frame_traj(nf, nj, k, dt, seed=2)
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    pred = x.clone()
+    pred[0, 3, frame_block_start(nj, 0):frame_block_start(nj, 0) + 3] += 1.0  # jump the root position
+    vel, _ = frame_consistency_loss(pred, x, known, dt, nj, k)
+    assert vel.item() > 1e-2, vel.item()  # the position jump breaks pos-FD == velocity
+
+
+def test_flow_matching_loss_consistency_terms_present():
+    """flow_matching_loss reports + adds the consistency terms when weighted."""
+    torch.manual_seed(21)
+    nj, k, f, n = 3, 1, 8, 2
+    d = target_state_dim(nj, k)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32)
+    model.eval()
+    x1 = torch.randn(4, f, d)
+    cond = torch.randn(4, f, d)
+    known = torch.zeros(4, f, dtype=torch.bool)
+    known[:, :n] = True
+    norm = Normalizer.fit(x1.reshape(-1, d), torch.ones(d, dtype=torch.bool))
+    out = flow_matching_loss(
+        model, x1, cond, known, None, state_norm=norm, dt=0.05,
+        num_joints=nj, num_extra_frames=k, vel_weight=0.1, accel_weight=0.01,
+    )
+    assert "vel_consistency" in out and "accel_consistency" in out
+    assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    # Disabled (zero weights) -> no consistency terms, loss == flow_mse.
+    out0 = flow_matching_loss(model, x1, cond, known, None, state_norm=norm, dt=0.05,
+                              num_joints=nj, num_extra_frames=k)
+    assert "vel_consistency" not in out0

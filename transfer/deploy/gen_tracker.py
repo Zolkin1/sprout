@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .fm_session import build_history_token, load_fm_context, sample_world
+from .fm_session import build_cmd_tokens, build_cond_states, load_fm_context, sample_world
 from .history import BatchedHistory
 from .quat_math_np import quat_apply, quat_box_minus, quat_inv
 from .tracker_session import TrackerSession
@@ -72,12 +72,12 @@ class GenTrackerPolicy:
         print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} "
               f"({'from tracker metadata' if meta_every is not None else 'from constructor default'})")
         self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
-        if self.ctx.future_cmd_dim <= 0:
-            raise ValueError("GenTrackerPolicy expects a future-command-conditioned fm.onnx.")
+        if self.ctx.cmd_dim <= 0:
+            raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
         self._build_orderings()
         self._build_future_offsets()
         F, nj, k = self.ctx.F, self.ctx.nj, self.ctx.target_num_extra_frames
-        self._history = BatchedHistory(1, self.ctx.H)
+        self._history = BatchedHistory(1, self.ctx.N)
         self._pred = {
             "root_pos": np.zeros((1, F, 3)), "root_quat": np.zeros((1, F, 4)),
             "root_lin": np.zeros((1, F, 3)), "root_ang": np.zeros((1, F, 3)),
@@ -130,7 +130,7 @@ class GenTrackerPolicy:
             "root_lin": a(state["root_lin_vel_w"]), "root_ang": a(state["root_ang_vel_w"]),
             "jp": a(state["joint_pos"]), "jv": a(state["joint_vel"]), "cmd": a(state["command"]),
         }
-        if self.ctx.history_num_extra_frames > 0:
+        if self.ctx.num_extra_frames > 0:
             frames = np.concatenate(
                 [state["frame_pos"], state["frame_quat"], state["frame_lin"], state["frame_ang"]], axis=-1
             )
@@ -176,9 +176,9 @@ class GenTrackerPolicy:
         jp = self._history.stack("jp")
         jv = self._history.stack("jv")
         cmd = self._history.stack("cmd")
-        frames = self._history.stack("frames") if ctx.history_num_extra_frames > 0 else None
+        frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
 
-        token = build_history_token(ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames)
+        cond, known = build_cond_states(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip→FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -187,8 +187,9 @@ class GenTrackerPolicy:
             fut_cmd = np.asarray(self._future_cmd_override, dtype=np.float64).reshape(1, ctx.F, ctx.cmd_dim)
         else:
             fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
+        cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
         noise = self._rng.standard_normal((1, ctx.F, ctx.D))
-        world = sample_world(ctx, token, rp[:, -1], rq[:, -1], fut_cmd, noise)
+        world = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens, noise)
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]
@@ -201,7 +202,9 @@ class GenTrackerPolicy:
             self._pred["frame_quat"] = world["frame_quat_w"]
             self._pred["frame_lin"] = world["frame_lin_vel_w"]
             self._pred["frame_ang"] = world["frame_ang_vel_w"]
-        self._pred_idx = 0
+        # Frames 0..N-1 reproduce the conditioning; novel future starts at N, so the
+        # tracked reference index begins one step ahead of "now" (= N-1).
+        self._pred_idx = ctx.N
         self._pred_valid = True
 
     def _pred_at(self, idx: int) -> dict[str, np.ndarray]:
@@ -323,7 +326,7 @@ class GenTrackerPolicy:
     def reset(self) -> None:
         """Reset the rolling history + prediction state (the tracker is stateless)."""
         if self._loaded:
-            self._history = BatchedHistory(1, self.ctx.H)
+            self._history = BatchedHistory(1, self.ctx.N)
             self._pred_idx = 0
             self._pred_valid = False
             self._ctrl_step = -1

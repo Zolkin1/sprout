@@ -95,11 +95,10 @@ def build_hardware_state(
         command: Velocity command ``(vx, vy, wz)``.
         base_ang_vel_w: Base world-frame angular velocity ``(3,)``; if ``None`` it is
             derived as ``quat_apply(base_quat, base_ang_vel_b)``.
-        frames: Only for legacy *symmetric* checkpoints whose FM history carries
-            end-effector frames -- world states ``(K, 13)`` =
+        frames: End-effector frame world states ``(K, 13)`` =
             ``[pos(3), quat(4 xyzw), lin_vel(3), ang_vel(3)]`` in
-            ``policy.ctx.history_frame_names`` order. The hardware-portable
-            asymmetric checkpoint needs **no** frames (leave ``None``).
+            ``policy.ctx.frame_names`` order, required when the FM conditions on extra
+            frames (compute them from forward kinematics on the measured joints).
 
     Returns:
         State dict consumed by :meth:`GenTrackerPolicy.create_obs`.
@@ -118,12 +117,12 @@ def build_hardware_state(
         "joint_vel": convert_joint_order(np.asarray(joint_vel, dtype=np.float64), list(joint_names), isaac),
         "command": np.asarray(command, dtype=np.float64),
     }
-    if policy.ctx.history_num_extra_frames > 0:
+    if policy.ctx.num_extra_frames > 0:
         if frames is None:
             raise ValueError(
-                f"This FM's history needs {policy.ctx.history_num_extra_frames} end-effector frames "
-                f"({policy.ctx.history_frame_names}); the hardware-portable asymmetric checkpoint needs "
-                "none. Retrain asymmetric, or pass `frames` (K, 13) in history_frame_names order."
+                f"This FM conditions on {policy.ctx.num_extra_frames} end-effector frames "
+                f"({policy.ctx.frame_names}); pass `frames` (K, 13) in that order "
+                "(compute them from forward kinematics on the measured joints)."
             )
         fr = np.asarray(frames, dtype=np.float64)
         state.update(frame_pos=fr[:, 0:3], frame_quat=fr[:, 3:7], frame_lin=fr[:, 7:10], frame_ang=fr[:, 10:13])

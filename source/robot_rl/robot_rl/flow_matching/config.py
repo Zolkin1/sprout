@@ -87,6 +87,16 @@ class FlowMatchingConfig:
     num_sampling_steps: int = 8
     ori6d_aux_weight: float = 0.0
 
+    # -- frame consistency regularization (finite-difference, on root + ee frame blocks) --
+    # ``dt`` is the control step period (seconds), resolved from the recording meta at
+    # train time. ``vel_consistency_weight`` ties each frame's predicted velocity to the
+    # finite difference of its predicted pose (penalizes the prediction jumping off the
+    # last history pose); ``accel_consistency_weight`` matches the finite difference of
+    # the predicted velocity to that of the data velocity. Both default off.
+    dt: float = 0.02
+    vel_consistency_weight: float = 0.0
+    accel_consistency_weight: float = 0.0
+
     # -- training --
     batch_size: int = 256
     lr: float = 3e-4

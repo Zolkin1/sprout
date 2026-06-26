@@ -19,11 +19,10 @@ Per control step (mirrors ``generator_tracking_cmd._snapshot_and_infer`` +
 3. Build the tracker's policy observation from the prediction (current step +
    future window) and the measured proprioception.
 
-The deployment FM consumes **no** end-effector frames in its history
-(``ctx.history_num_extra_frames == 0``) but still predicts them
-(``ctx.target_num_extra_frames``) for the ``ee_ref`` term. The class is fully
-checkpoint-driven, so it also runs the legacy symmetric checkpoints (history
-*with* ee frames) -- handy for validating against the current trained pair.
+The PARC-style FM conditions on AND predicts the same end-effector frames
+(``ctx.num_extra_frames``), so every history snapshot carries them (for hardware,
+from forward kinematics on the measured joints); the predicted frames feed the
+``ee_ref`` term. The class is fully checkpoint-driven.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ from rl_policy import RLPolicy
 # Vendored, isaaclab-free flow-matching inference (transfer/ on sys.path).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fm import BatchedHistory, load_fm_context  # noqa: E402
-from fm.online import build_history_token, sample_world  # noqa: E402
+from fm.online import build_cmd_tokens, build_cond_states, sample_world  # noqa: E402
 from fm.quat_math import quat_apply, quat_box_minus, quat_inv  # noqa: E402
 
 # Observation clip bounds that are set on the obs terms in the env cfg
@@ -109,18 +108,18 @@ class GeneratorTrackerPolicy:
 
         self.ctx = load_fm_context(
             self.fm_checkpoint, device=self.fm_device,
-            num_sampling_steps=self.num_sampling_steps, scan_dim=0,
+            num_sampling_steps=self.num_sampling_steps,
         )
-        if self.ctx.future_cmd_dim <= 0:
+        if self.ctx.cmd_dim <= 0:
             raise ValueError(
-                "GeneratorTrackerPolicy expects a future-command (cmd_array='target_vel') "
-                "flow-matching checkpoint; the loaded one has no decoder command conditioning."
+                "GeneratorTrackerPolicy expects a command-conditioned (cmd_array='target_vel') "
+                "flow-matching checkpoint; the loaded one has no command conditioning."
             )
 
         self._build_orderings()
         self._build_future_offsets()
         n, F, nj, k = 1, self.ctx.F, self.ctx.nj, self.ctx.target_num_extra_frames
-        self._history = BatchedHistory(n, self.ctx.H, self.fm_device)
+        self._history = BatchedHistory(n, self.ctx.N, self.fm_device)
         self._pred = {
             "root_pos": torch.zeros(n, F, 3, device=self.fm_device),
             "root_quat": torch.zeros(n, F, 4, device=self.fm_device),
@@ -217,10 +216,10 @@ class GeneratorTrackerPolicy:
             "jv": tf(state["joint_vel"])[None],
             "cmd": tf(state["command"])[None],
         }
-        if self.ctx.history_num_extra_frames > 0:
+        if self.ctx.num_extra_frames > 0:
             frames = np.concatenate(
                 [state["frame_pos"], state["frame_quat"], state["frame_lin"], state["frame_ang"]], axis=-1
-            )  # (K_hist, 13)
+            )  # (K, 13)
             snap["frames"] = tf(frames)[None]
         return snap
 
@@ -255,12 +254,13 @@ class GeneratorTrackerPolicy:
         jp = self._history.stack("jp")
         jv = self._history.stack("jv")
         cmd = self._history.stack("cmd")
-        frames = self._history.stack("frames") if ctx.history_num_extra_frames > 0 else None
+        frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
 
-        token = build_history_token(ctx, rp, rq, rl, ra, jp, jv, cmd, frames=frames, scan=None)
+        cond, known = build_cond_states(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         # Held command over the future horizon (no clip to read ahead from).
         fut_cmd = cmd[:, -1:].expand(1, ctx.F, ctx.cmd_dim).clone()
-        world = sample_world(ctx, token, rp[:, -1], rq[:, -1], future_cmd=fut_cmd)
+        cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
+        world = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens=cmd_tokens)
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]
@@ -273,7 +273,8 @@ class GeneratorTrackerPolicy:
             self._pred["frame_quat"] = world["frame_quat_w"]
             self._pred["frame_lin"] = world["frame_lin_vel_w"]
             self._pred["frame_ang"] = world["frame_ang_vel_w"]
-        self._pred_idx = 0
+        # Frames 0..N-1 reproduce the conditioning; novel future starts at N.
+        self._pred_idx = ctx.N
         self._pred_valid = True
 
     def _pred_at(self, idx: int) -> dict[str, torch.Tensor]:
@@ -435,7 +436,7 @@ class GeneratorTrackerPolicy:
         """Reset the tracker recurrent state, history buffer, and prediction buffers."""
         self._rl.reset()
         if self._loaded:
-            self._history = BatchedHistory(1, self.ctx.H, self.fm_device)
+            self._history = BatchedHistory(1, self.ctx.N, self.fm_device)
             self._pred_idx = 0
             self._pred_valid = False
             self._ctrl_step = -1
