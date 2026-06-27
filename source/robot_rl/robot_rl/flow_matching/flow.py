@@ -267,6 +267,10 @@ def flow_matching_loss(
     contact_pts: torch.Tensor | None = None,
     terrain_weight: float = 0.0,
     terrain_tau_gated: bool = False,
+    terrain_sample_weight: float = 0.0,
+    terrain_sample_size: int = 64,
+    terrain_sample_steps: int = 8,
+    terrain_sample_grad_steps: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Compute the masked flow-matching loss (+ optional consistency / FK terms).
 
@@ -299,6 +303,10 @@ def flow_matching_loss(
         terrain / foot_idxs / contact_pts / terrain_weight: terrain-penetration pieces.
         terrain_tau_gated: if True, restrict the terrain term to ``tau >= tau_min`` like
             accel/FK; default False applies it across all flow-times.
+        terrain_sample_weight: weight on the *sampled-rollout* terrain penalty (penalizes
+            ``sample_trajectory`` directly instead of ``x1_hat``); 0 disables it.
+        terrain_sample_size / terrain_sample_steps / terrain_sample_grad_steps: sub-batch
+            size, Euler steps, and truncated-backprop depth for that rollout.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
@@ -360,6 +368,26 @@ def flow_matching_loss(
             pen = _masked_mean(pen_ps, gate) if terrain_tau_gated else pen_ps.mean()
             out["terrain_penetration"] = pen.detach()
             out["loss"] = out["loss"] + terrain_weight * pen
+
+    # Sampled-rollout terrain penalty: penalize the actual multi-step sample (the deployed
+    # output), not the teacher-forced x1_hat. Differentiable rollout with truncated
+    # backprop on a sub-batch; always "ungated" (one trajectory, no per-sample tau).
+    do_terrain_sample = (terrain is not None and state_norm is not None and terrain_sample_weight > 0.0
+                         and foot_idxs and p_ref is not None and q_ref is not None)
+    if do_terrain_sample:
+        s = x1.shape[0] if terrain_sample_size <= 0 else min(terrain_sample_size, x1.shape[0])
+        cmd_s = None if cmd_tokens is None else cmd_tokens[:s]
+        samp = sample_trajectory_grad(
+            model, cond[:s], known[:s], x1.shape[1], x1.shape[2],
+            terrain_sample_steps, cmd_s, terrain_sample_grad_steps,
+        )
+        samp_phys = state_norm.denormalize(samp)
+        pen_s = terrain_penetration_term(
+            samp_phys, samp_phys, known[:s], p_ref[:s], q_ref[:s],
+            num_joints, foot_idxs, contact_pts, terrain,
+        ).mean()
+        out["terrain_penetration_sample"] = pen_s.detach()
+        out["loss"] = out["loss"] + terrain_sample_weight * pen_s
     return out
 
 
@@ -407,4 +435,49 @@ def sample_trajectory(
         v = model(x, tau, cmd_tokens)
         x = x + dt * v
         x = torch.where(km, cond, x)
+    return x
+
+
+def sample_trajectory_grad(
+    model: torch.nn.Module,
+    cond: torch.Tensor,
+    known: torch.Tensor,
+    future_len: int,
+    state_dim: int,
+    num_steps: int = 8,
+    cmd_tokens: torch.Tensor | None = None,
+    grad_steps: int = 1,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Differentiable Euler rollout with truncated backprop, for sample-space losses.
+
+    Same integration as :func:`sample_trajectory`, but gradient-enabled: the first
+    ``num_steps - grad_steps`` steps run under ``no_grad`` and only the final
+    ``grad_steps`` steps build the autograd graph (truncated backprop through time). This
+    bounds memory/compute while still letting a loss on the *generated sample* shape the
+    field near the end of the trajectory, where the penetrating pose forms -- unlike a
+    loss on the one-step ``x1_hat``, which never sees the sampler's real path.
+
+    Args mirror :func:`sample_trajectory`; ``grad_steps`` is clamped to ``[1, num_steps]``.
+
+    Returns:
+        Generated window (standardized), shape ``(B, F, D)``.
+    """
+    b = cond.shape[0]
+    device = cond.device
+    km = known.unsqueeze(-1)
+    x = torch.randn(b, future_len, state_dim, device=device, dtype=cond.dtype, generator=generator)
+    x = torch.where(km, cond, x)
+    step = 1.0 / num_steps
+    keep = min(max(grad_steps, 1), num_steps)
+    no_grad_steps = num_steps - keep
+    for i in range(num_steps):
+        tau = torch.full((b,), i * step, device=device, dtype=cond.dtype)
+        if i < no_grad_steps:
+            with torch.no_grad():
+                v = model(x, tau, cmd_tokens)
+                x = torch.where(km, cond, x + step * v)
+        else:
+            v = model(x, tau, cmd_tokens)
+            x = torch.where(km, cond, x + step * v)
     return x

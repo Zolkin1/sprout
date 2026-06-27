@@ -50,6 +50,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     orientation_slice,
     rot6d_to_matrix,
     sample_trajectory,
+    terrain_penetration_term,
 )
 
 
@@ -157,6 +158,16 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="Restrict the terrain-penetration loss to tau >= consistency_tau_min "
                              "(like accel/FK). Default off: the low-tau endpoint penetrates like the "
                              "deployed sample, so gating hides the signal.")
+    parser.add_argument("--terrain_sample_weight", type=float, default=_wc.terrain_sample_weight,
+                        help="Weight on the sampled-rollout terrain penalty (penalizes the actual "
+                             "multi-step sample, not x1_hat). >0 enables it; same m^2 units as "
+                             "--terrain_penetration_weight (expect a similar ~1e2 scale).")
+    parser.add_argument("--terrain_sample_size", type=int, default=_wc.terrain_sample_size,
+                        help="Sub-batch size for the differentiable sampled rollout (caps cost).")
+    parser.add_argument("--terrain_sample_steps", type=int, default=_wc.terrain_sample_steps,
+                        help="Euler steps for the training-time sampled rollout.")
+    parser.add_argument("--terrain_sample_grad_steps", type=int, default=_wc.terrain_sample_grad_steps,
+                        help="Truncated-backprop depth: only the last N rollout steps carry gradient.")
     # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
@@ -202,6 +213,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         terrain_contact_grid=tuple(args.terrain_contact_grid),
         terrain_floor_percentile=args.terrain_floor_percentile,
         terrain_tau_gated=args.terrain_tau_gated,
+        terrain_sample_weight=args.terrain_sample_weight,
+        terrain_sample_size=args.terrain_sample_size,
+        terrain_sample_steps=args.terrain_sample_steps,
+        terrain_sample_grad_steps=args.terrain_sample_grad_steps,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
@@ -283,7 +298,7 @@ def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_histor
 
 
 _CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel",
-              "terrain_penetration")
+              "terrain_penetration", "terrain_penetration_sample")
 
 
 @torch.no_grad()
@@ -401,10 +416,20 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
             model, cond, known, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
             cmd_tokens=cmd_tokens,
         )
-        pred_d = state_normalizer.denormalize(pred)[:, n:]
+        pred_full = state_normalizer.denormalize(pred)
+        pred_d = pred_full[:, n:]
         tgt_d = state_normalizer.denormalize(state)[:, n:]
         for k, v in channel_metrics(pred_d, tgt_d, num_joints, num_extra_frames).items():
             metric_sums[k] = metric_sums.get(k, 0.0) + v
+        # The metric we actually care about: terrain penetration of the deployed multi-step
+        # sample (reported regardless of whether the sampled-rollout penalty is weighted).
+        if terrain is not None and foot_idxs:
+            pen_s = terrain_penetration_term(
+                pred_full, pred_full, known, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain,
+            ).mean()
+            metric_sums["terrain_penetration_sample"] = (
+                metric_sums.get("terrain_penetration_sample", 0.0) + pen_s.item()
+            )
     out = {
         "flow_mse": flow_sum / max(n_batches, 1),
         "flow_mse_uncond": flow_unc_sum / max(n_batches, 1),
@@ -516,8 +541,10 @@ def main() -> None:
             _fk_sanity_check(fk, train_ds, num_joints, device)
 
     # Terrain-penetration loss: foot frames + contact points + flat-ground terrain.
+    # Built when either the x1_hat term or the sampled-rollout term is active (and so the
+    # eval-time sample-penetration metric can be reported).
     terrain = foot_idxs = contact_pts = None
-    if cfg.terrain_penetration_weight > 0.0:
+    if cfg.terrain_penetration_weight > 0.0 or cfg.terrain_sample_weight > 0.0:
         foot_idxs = [i for i, fn in enumerate(train_ds.target_frame_names)
                      if "ankle" in fn.lower() or "foot" in fn.lower()]
         if not foot_idxs:
@@ -530,8 +557,16 @@ def main() -> None:
                         else _terrain_calibrate(train_ds, foot_idxs, contact_pts, num_joints, device,
                                                 cfg.terrain_floor_percentile))
             terrain = FlatTerrain(ground_z).to(device)
+            terms = []
+            if cfg.terrain_penetration_weight > 0.0:
+                terms.append(f"x1_hat(w={cfg.terrain_penetration_weight:g}, "
+                             f"{'gated' if cfg.terrain_tau_gated else 'ungated'})")
+            if cfg.terrain_sample_weight > 0.0:
+                terms.append(f"sample(w={cfg.terrain_sample_weight:g}, size={cfg.terrain_sample_size}, "
+                             f"steps={cfg.terrain_sample_steps}, grad_steps={cfg.terrain_sample_grad_steps})")
             print(f"[INFO] terrain loss: mode={cfg.terrain_penetration_mode}, foot frames="
-                  f"{[train_ds.target_frame_names[i] for i in foot_idxs]}, ground_z={ground_z:.4f}")
+                  f"{[train_ds.target_frame_names[i] for i in foot_idxs]}, ground_z={ground_z:.4f} | "
+                  f"terms: {', '.join(terms) if terms else 'metric-only'}")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = (
@@ -564,6 +599,10 @@ def main() -> None:
             out = flow_matching_loss(
                 model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight,
                 state_norm=train_ds.state_normalizer, p_ref=p_ref, q_ref=q_ref,
+                terrain_sample_weight=cfg.terrain_sample_weight,
+                terrain_sample_size=cfg.terrain_sample_size,
+                terrain_sample_steps=cfg.terrain_sample_steps,
+                terrain_sample_grad_steps=cfg.terrain_sample_grad_steps,
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk,
                                      terrain, foot_idxs, contact_pts),
             )

@@ -45,6 +45,7 @@ from robot_rl.flow_matching import (
     rot6d_to_quat,
     sample_flow_batch,
     sample_trajectory,
+    sample_trajectory_grad,
     so3_log,
     state_to_absolute,
     target_state_dim,
@@ -1026,6 +1027,61 @@ def test_flow_loss_terrain_term_and_tau_gate():
     # Opt-in τ-gating restores the old behavior: tau_min>1 -> nothing contributes.
     out_g = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, terrain_tau_gated=True, **ckw)
     assert out_g["terrain_penetration"].item() == 0.0  # τ-gated out
+
+
+def test_sample_trajectory_grad_shape_and_truncated_backprop():
+    """sample_trajectory_grad matches sample_trajectory's shape/clamping and only the last
+    grad_steps carry gradient (truncated backprop), with grad reaching the model params."""
+    torch.manual_seed(41)
+    nj, k, f, n = 3, 1, 6, 2
+    d = target_state_dim(nj, k)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32).eval()
+    cond = torch.randn(4, f, d)
+    known = torch.zeros(4, f, dtype=torch.bool); known[:, :n] = True
+    out = sample_trajectory_grad(model, cond, known, f, d, num_steps=4, grad_steps=1)
+    assert out.shape == (4, f, d)
+    # Known (history) tokens are re-clamped to cond, exactly like sample_trajectory.
+    assert torch.allclose(out[:, :n], cond[:, :n])
+    # Gradient of the generated sample reaches the model parameters (graph is alive).
+    model.zero_grad(set_to_none=True)
+    out.sum().backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and any(g.abs().sum() > 0 for g in grads)
+    # grad_steps is clamped to >=1: grad_steps=0 still builds a graph (no silent detach-all).
+    out0 = sample_trajectory_grad(model, cond, known, f, d, num_steps=4, grad_steps=0)
+    assert out0.requires_grad
+
+
+def test_flow_loss_sampled_rollout_terrain_penalty():
+    """terrain_sample_weight>0 adds a differentiable terrain_penetration_sample term; the
+    sub-batch caps it and the key is absent when the weight is 0."""
+    torch.manual_seed(42)
+    nj, k, f, n = 3, 1, 8, 2
+    d = target_state_dim(nj, k)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32).eval()
+    x1 = torch.randn(16, f, d)
+    cond = torch.randn(16, f, d)
+    known = torch.zeros(16, f, dtype=torch.bool); known[:, :n] = True
+    p_ref = torch.randn(16, 3)
+    q_ref = torch.randn(16, 4); q_ref = q_ref / q_ref.norm(dim=-1, keepdim=True)
+    norm = Normalizer.fit(x1.reshape(-1, d), torch.ones(d, dtype=torch.bool))
+    base = dict(state_norm=norm, num_joints=nj, num_extra_frames=k, p_ref=p_ref, q_ref=q_ref,
+                terrain=FlatTerrain(0.0), foot_idxs=[0], contact_pts=None)
+    # Off by default (no x1_hat term, no sample term) -> key absent.
+    out_off = flow_matching_loss(model, x1, cond, known, None, **base)
+    assert "terrain_penetration_sample" not in out_off
+    # Enabled: differentiable, reported, and contributes to the loss.
+    out = flow_matching_loss(model, x1, cond, known, None, terrain_sample_weight=10.0,
+                             terrain_sample_size=8, terrain_sample_steps=4,
+                             terrain_sample_grad_steps=1, **base)
+    assert "terrain_penetration_sample" in out
+    assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    assert out["terrain_penetration_sample"].item() >= 0.0
+    model.zero_grad(set_to_none=True)
+    out["loss"].backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())
 
 
 def test_flow_matching_loss_consistency_terms_present():

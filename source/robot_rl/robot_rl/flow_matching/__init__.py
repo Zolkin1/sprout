@@ -24,6 +24,7 @@ from .flow import (
     joint_vel_consistency_term,
     sample_flow_batch,
     sample_trajectory,
+    sample_trajectory_grad,
     terrain_penetration_term,
 )
 from .model import FlowMatchingTransformer
@@ -65,6 +66,7 @@ __all__ = [
     "terrain_penetration_term",
     "sample_flow_batch",
     "sample_trajectory",
+    "sample_trajectory_grad",
     "matrix_from_quat",
     "matrix_to_rot6d",
     "rot6d_to_matrix",

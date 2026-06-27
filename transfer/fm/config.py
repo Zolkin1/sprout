@@ -127,6 +127,20 @@ class FlowMatchingConfig:
     terrain_floor_percentile: float = 1.0
     terrain_tau_gated: bool = False
 
+    # -- sampled-rollout terrain penalty (penalize the actual multi-step sample) --
+    # The ``terrain_penetration_weight`` term acts on the teacher-forced endpoint
+    # ``x1_hat``; measured, that suppresses ``x1_hat`` penetration ~40x while the deployed
+    # multi-step sample barely improves (the penalty never sees the sampler's real path).
+    # This term penalizes ``sample_trajectory`` directly. ``terrain_sample_weight`` (>0
+    # enables it; same m² units as the x1_hat term so a similar ~1e2 scale is expected).
+    # To bound cost it samples a ``terrain_sample_size`` sub-batch with
+    # ``terrain_sample_steps`` Euler steps and truncated backprop through only the last
+    # ``terrain_sample_grad_steps`` steps (the rest run under no_grad).
+    terrain_sample_weight: float = 0.0
+    terrain_sample_size: int = 64
+    terrain_sample_steps: int = 8
+    terrain_sample_grad_steps: int = 1
+
     # -- training --
     batch_size: int = 256
     lr: float = 3e-4
