@@ -42,6 +42,15 @@ class FlowMatchingConfig:
     # conditioning (the clean history tokens) is always the actual recorded state.
     target_source: str = "actual"
 
+    # Recovery-aware windowing for perturbed recordings (record_data.py --perturb,
+    # which logs a per-step ``perturb_active`` flag). "clean_prediction" (default)
+    # keeps only windows whose PREDICTION region (steps N..F) is fully clean, while
+    # the HISTORY (steps 0..N) may be perturbed -- so the model learns to predict the
+    # clean recovery from a bad-state history. "all" uses every valid window
+    # (perturbed steps in history and prediction alike). Recordings without a
+    # ``perturb_active`` array fall back to "all" regardless.
+    recovery_mode: str = "clean_prediction"
+
     # Dedicated recorded command array (e.g. "target_vel") giving the per-step
     # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
     # (indices 0, cmd_stride, ...) and each sample becomes its own conditioning token
@@ -107,6 +116,25 @@ class FlowMatchingConfig:
     fk_vel_weight: float = 0.001 #0.0
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
+
+    # -- terrain penetration (penalize predicted feet going below the ground) --
+    # ``terrain_penetration_mode``: "ankle" (penalize the ankle-frame origin) or
+    # "contact" (sample a grid on the foot box sole and penalize each point, using the
+    # predicted foot orientation). ``terrain_ground_z``: world ground height; ``None``
+    # auto-calibrates the floor from the recording at train time (a low percentile of
+    # the lifted recorded foot z, so clean data has ~0 penetration). ``terrain_contact_grid``
+    # is the (nx, ny) sole-grid for contact mode.
+    # ``terrain_tau_gated`` (default False) keeps the penalty on ALL flow-times. Unlike the
+    # accel/FK terms, the low-τ predicted endpoint penetrates ~as much as the deployed
+    # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
+    # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
+    # all the signal. Set True only to restrict it to the high-τ regime.
+    terrain_penetration_weight: float = 200.0 #1.0 #0.1 #0.0
+    terrain_penetration_mode: str = "ankle"
+    terrain_ground_z: float | None = None
+    terrain_contact_grid: tuple[int, int] = (3, 2)
+    terrain_floor_percentile: float = 1.0
+    terrain_tau_gated: bool = False
 
     # -- training --
     batch_size: int = 256

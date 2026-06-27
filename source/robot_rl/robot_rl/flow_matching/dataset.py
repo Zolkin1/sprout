@@ -131,6 +131,44 @@ def episode_windows(
     return windows
 
 
+def filter_windows_by_recovery(
+    windows: list[np.ndarray],
+    perturb_active: np.ndarray | None,
+    num_history_states: int,
+    mode: str,
+) -> list[np.ndarray]:
+    """Drop windows whose prediction region overlaps a perturbation (recovery mode).
+
+    For perturbed recordings (``perturb_active`` flags steps where action-noise /
+    pushes were active), ``"clean_prediction"`` keeps a window only when its
+    prediction region (steps ``num_history_states..F``) is entirely clean; the
+    history (steps ``0..num_history_states``) may be perturbed. This yields both
+    fully-clean windows and bad-state-history -> clean-recovery windows, dropping
+    only the "predict-the-perturbation" windows. ``"all"`` keeps everything.
+
+    Args:
+        windows: Valid window index arrays (each length ``F``), from
+            :func:`episode_windows`.
+        perturb_active: Per-pair perturbation flag (``1`` = active), or ``None``
+            (recordings without it always fall back to keeping all windows).
+        num_history_states: ``N`` -- the number of leading history tokens.
+        mode: ``"all"`` or ``"clean_prediction"``.
+
+    Returns:
+        The filtered list of windows.
+
+    Raises:
+        ValueError: If ``mode`` is not recognized.
+    """
+    if mode == "all" or perturb_active is None:
+        return windows
+    if mode != "clean_prediction":
+        raise ValueError(f"Unknown recovery_mode {mode!r}; expected 'clean_prediction' or 'all'.")
+    pa = np.asarray(perturb_active)
+    n = num_history_states
+    return [w for w in windows if not pa[w[n:]].any()]
+
+
 class FutureStateDataset(Dataset):
     """Precomputed fixed-length state windows in the relative-frame representation."""
 
@@ -420,6 +458,27 @@ def build_train_val(
     )
     if len(windows) == 0:
         raise ValueError("No valid windows produced from the dataset.")
+
+    # Recovery-aware filtering: keep windows whose prediction region is clean when
+    # the recording carries a per-step perturbation flag (record_data.py --perturb).
+    recovery_mode = getattr(cfg, "recovery_mode", "all")
+    perturb_active = data.get("perturb_active")
+    if recovery_mode != "all" and perturb_active is None:
+        print(f"[fm-data] recovery_mode={recovery_mode!r} but recording has no 'perturb_active'; "
+              "using all windows.")
+    elif recovery_mode != "all":
+        n_before = len(windows)
+        windows = filter_windows_by_recovery(
+            windows, perturb_active, cfg.num_history_states, recovery_mode
+        )
+        print(f"[fm-data] recovery_mode={recovery_mode!r}: kept {len(windows)}/{n_before} windows "
+              f"(dropped {n_before - len(windows)} with a perturbed prediction region).")
+        if len(windows) == 0:
+            raise ValueError(
+                f"recovery_mode={recovery_mode!r} dropped all windows; the prediction region of "
+                "every window overlaps a perturbation. Lower the perturbation duty cycle or use "
+                "--recovery-mode all."
+            )
 
     ep_of_window = np.array([data["episode_id"][w[0]] for w in windows])
     unique_eps = np.unique(ep_of_window)

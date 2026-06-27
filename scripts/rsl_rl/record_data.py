@@ -59,6 +59,7 @@ from recorded_data_io import (  # isort: skip
     save_recorded_data,
 )
 from provenance import auto_clip_device, git_snapshot  # isort: skip
+from perturbation_scheduler import PerturbationScheduler  # isort: skip
 from isaaclab.utils.io import dump_yaml  # isort: skip
 
 with contextlib.suppress(ImportError):
@@ -117,6 +118,33 @@ parser.add_argument(
     "--disable_fabric", action="store_true", default=False,
     help="Disable fabric and use USD I/O operations.",
 )
+# -- Perturbation / recovery-data options (see perturbation_scheduler.py) --
+parser.add_argument(
+    "--perturb", action="store_true", default=False,
+    help="Gather recovery data: run a clean fraction of envs (play DR) and a perturbed "
+         "fraction with windowed action-noise + push toggled on/off. Logs a per-step "
+         "'perturb_active' flag. Record on a PLAY task (e.g. G1-teacher-clf-play) so the "
+         "clean group is play-DR and perturbations are layered per-env in the loop.",
+)
+parser.add_argument("--clean-fraction", type=float, default=0.5,
+                    help="[--perturb] Fraction of envs that stay clean (never perturbed).")
+parser.add_argument("--perturb-on-range-s", type=float, nargs=2, default=(0.3, 1.0),
+                    metavar=("MIN", "MAX"), help="[--perturb] Seconds a perturbation window stays ON.")
+parser.add_argument("--perturb-off-range-s", type=float, nargs=2, default=(1.5, 4.0),
+                    metavar=("MIN", "MAX"), help="[--perturb] Seconds between windows (recovery).")
+parser.add_argument("--action-noise-scale", type=float, default=0.3,
+                    help="[--perturb] Std of Gaussian noise added to actions while ON (0 disables).")
+parser.add_argument("--push-vel", type=float, default=0.75,
+                    help="[--perturb] Magnitude (m/s) of the planar x/y push impulse on each "
+                         "OFF->ON edge (0 disables pushes).")
+parser.add_argument("--obs-noise-scale", type=float, default=0.0,
+                    help="[--perturb] Std of Gaussian noise added to the policy obs while ON "
+                         "(0 disables; the recorded state is always ground truth).")
+parser.add_argument("--ood-dr", action="store_true", default=False,
+                    help="[--perturb] Re-apply the perturbed group's DR terms with widened "
+                         "(out-of-distribution) ranges at each reset.")
+parser.add_argument("--ood-dr-scale", type=float, default=1.5,
+                    help="[--perturb] Range-widening factor for --ood-dr (1.5 = 50%% wider).")
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -259,6 +287,7 @@ def collect_pairs(
     ref_cmd=None,
     ref_base_frame: str = "pelvis_link",
     state_frames: list[str] | None = None,
+    scheduler: PerturbationScheduler | None = None,
 ) -> dict[str, np.ndarray]:
     """Roll out the policy and collect flattened (obs, action) pairs.
 
@@ -320,17 +349,36 @@ def collect_pairs(
     record_cmd_vel = ref_cmd is not None and getattr(ref_cmd, "command_velocity_available", False)
     if record_cmd_vel:
         buf["target_vel"] = []
+    # Per-step perturbation flag (1 while a perturbation window was active for that env).
+    if scheduler is not None:
+        buf["perturb_active"] = []
+        scheduler.reset(env, torch.arange(n_envs, device=device))  # assign groups + initial OOD DR
+        print(f"[INFO] {scheduler.summary()}")
 
     print(f"[INFO] Collecting {num_steps} steps on {n_envs} envs "
           f"({num_steps * n_envs} pairs, trimming to {num_pairs})...")
     for step in range(num_steps):
+        # Advance perturbation windows (applies pushes on OFF->ON edges) and corrupt
+        # the policy's obs for active envs *before* the forward pass.
+        active = None
+        if scheduler is not None:
+            active = scheduler.step(env)
+            if scheduler.obs_noise_scale > 0.0:
+                obs["policy"] = scheduler.corrupt_obs(obs["policy"], active)
         with torch.inference_mode():
             actions = policy(obs, stochastic_output=stochastic)
+        # The action actually stepped is the (optionally) noise-corrupted action.
+        actions_applied = (
+            scheduler.corrupt_actions(actions, active) if scheduler is not None else actions
+        )
 
         # Snapshot the (obs, action) pair *before* stepping. Clone because the
-        # TensorDict tensors are overwritten by the next env.step.
+        # TensorDict tensors are overwritten by the next env.step. Record the
+        # applied (noisy) action so the pair reflects what drove the transition.
         buf["obs"].append(obs["policy"].detach().cpu().clone())
-        buf["action"].append(actions.detach().cpu().clone())
+        buf["action"].append(actions_applied.detach().cpu().clone())
+        if scheduler is not None:
+            buf["perturb_active"].append(active.detach().cpu().clone())
         # Raw robot world-state at the same timestep as obs. Order/dims MUST match
         # state_term_names/state_term_dims in _build_recording_meta.
         state_parts = [
@@ -371,7 +419,7 @@ def collect_pairs(
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
         with torch.inference_mode():
-            obs, _, dones, extras = env.step(actions)
+            obs, _, dones, extras = env.step(actions_applied)
             # Reset recurrent/transformer state for terminated envs.
             if use_policy_reset:
                 policy.reset(dones)
@@ -401,6 +449,9 @@ def collect_pairs(
             step_in_ep = step_in_ep.clone()
             step_in_ep[done_mask] = 0
             step_in_ep[~done_mask] += 1
+            # Re-roll group / window / OOD DR for envs that just reset.
+            if scheduler is not None:
+                scheduler.reset(env, done_mask.nonzero(as_tuple=False).flatten())
         else:
             step_in_ep = step_in_ep + 1
 
@@ -526,9 +577,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             policy_nn.reset()
 
+        # Optional perturbation scheduler for recovery-data collection.
+        scheduler = None
+        if args_cli.perturb:
+            push_v = float(args_cli.push_vel)
+            push_range = {"x": (-push_v, push_v), "y": (-push_v, push_v)} if push_v > 0 else None
+            scheduler = PerturbationScheduler(
+                num_envs=env.num_envs,
+                dt=float(env.unwrapped.step_dt),
+                device=env.unwrapped.device,
+                clean_fraction=args_cli.clean_fraction,
+                on_range_s=tuple(args_cli.perturb_on_range_s),
+                off_range_s=tuple(args_cli.perturb_off_range_s),
+                action_noise_scale=args_cli.action_noise_scale,
+                push_vel_range=push_range,
+                ood_dr=args_cli.ood_dr,
+                ood_dr_scale=args_cli.ood_dr_scale,
+                obs_noise_scale=args_cli.obs_noise_scale,
+                seed=agent_cfg.seed,
+            )
+
         data = collect_pairs(
             env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic,
             ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame, state_frames=state_frames,
+            scheduler=scheduler,
         )
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")
@@ -541,6 +613,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         try:
             dump_yaml(os.path.join(prov_dir, "params", "env.yaml"), env_cfg)
             dump_yaml(os.path.join(prov_dir, "params", "agent.yaml"), agent_cfg)
+            if scheduler is not None:
+                dump_yaml(os.path.join(prov_dir, "params", "perturb.yaml"), {
+                    "clean_fraction": args_cli.clean_fraction,
+                    "perturb_on_range_s": list(args_cli.perturb_on_range_s),
+                    "perturb_off_range_s": list(args_cli.perturb_off_range_s),
+                    "action_noise_scale": args_cli.action_noise_scale,
+                    "push_vel": args_cli.push_vel,
+                    "obs_noise_scale": args_cli.obs_noise_scale,
+                    "ood_dr": args_cli.ood_dr,
+                    "ood_dr_scale": args_cli.ood_dr_scale,
+                })
         except Exception as exc:
             print(f"[WARN] recording params dump skipped: {exc}")
         print(f"[INFO] Saved {meta.num_pairs} (obs, action) pairs to: {out_path}")
@@ -551,6 +634,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
               f"state shape={data['state'].shape}, ref_state shape={ref_shape}, "
               f"target_vel shape={tvel_shape}, "
               f"terminations flagged={int(data['terminated'].sum())}")
+        if "perturb_active" in data and data["perturb_active"] is not None:
+            pa = data["perturb_active"]
+            print(f"[INFO]   perturb_active: {int(pa.sum()):,}/{pa.size:,} steps "
+                  f"({100.0 * float(pa.mean()):.1f}%) perturbed")
 
         env.close()
 

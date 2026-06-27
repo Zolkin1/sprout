@@ -18,18 +18,23 @@ from isaaclab.utils.math import matrix_from_quat
 
 from robot_rl.flow_matching import (
     FKChain,
+    FlatTerrain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
     FutureStateDataset,
     Normalizer,
+    box_sole_points,
     build_train_val,
     episode_windows,
+    filter_windows_by_recovery,
     fk_consistency_terms,
     flow_matching_loss,
     frame_block_start,
     frame_consistency_terms,
     joint_vel_consistency_term,
+    matrix_from_quat,
     matrix_to_rot6d,
+    terrain_penetration_term,
     orientation_slice,
     orientation_slices,
     quat_to_rot6d,
@@ -372,6 +377,57 @@ def test_episode_windows_respect_boundaries():
         assert np.all(done[w][:-1] == 0)               # no internal done
     # episode 0 -> 3 windows (starts 0,1,2), episode 1 -> 1 window. Total 4.
     assert len(wins) == 4
+
+
+def test_filter_windows_by_recovery():
+    """clean_prediction keeps clean + bad-history windows, drops perturbed predictions."""
+    n_history = 2
+    # 8 contiguous steps; perturbation active on steps 2 and 3.
+    perturb = np.zeros(8, dtype=np.uint8)
+    perturb[2:4] = 1
+    windows = [np.arange(s, s + 4) for s in range(0, 5)]  # length-4 windows, starts 0..4
+
+    # mode='all' is a no-op.
+    assert filter_windows_by_recovery(windows, perturb, n_history, "all") == windows
+    # No flag array -> no-op regardless of mode.
+    assert filter_windows_by_recovery(windows, None, n_history, "clean_prediction") == windows
+
+    kept = filter_windows_by_recovery(windows, perturb, n_history, "clean_prediction")
+    kept_starts = {int(w[0]) for w in kept}
+    # Prediction region is the window's steps [2,3] (absolute [start+2, start+3]).
+    #   start 0: prediction {2,3} -> overlaps perturb -> dropped.
+    #   start 1: prediction {3,4} -> overlaps 3       -> dropped.
+    #   start 2: prediction {4,5} -> clean            -> kept (history {2,3} IS perturbed).
+    #   start 3: prediction {5,6} -> clean            -> kept.
+    #   start 4: prediction {6,7} -> clean            -> kept.
+    assert kept_starts == {2, 3, 4}, kept_starts
+    # The bad-state-history -> clean-recovery window (start 2) is exactly what we want kept.
+    assert any(int(w[0]) == 2 for w in kept)
+
+
+def test_filter_windows_by_recovery_bad_mode():
+    """An unrecognized mode raises (with a flag array present)."""
+    with pytest.raises(ValueError):
+        filter_windows_by_recovery([np.arange(4)], np.zeros(8, np.uint8), 2, "bogus")
+
+
+def test_build_train_val_recovery_mode():
+    """build_train_val honors recovery_mode: clean_prediction drops perturbed-prediction windows."""
+    data, meta = _synthetic_dataset(num_envs=6, steps=30, nj=21)
+    # Mark a mid-episode perturbation burst in every env (steps 10..14 of each).
+    perturb = (data["step_in_episode"] >= 10) & (data["step_in_episode"] < 15)
+    data["perturb_active"] = perturb.astype(np.uint8)
+
+    cfg_all = FlowMatchingConfig(future_len=10, num_history_states=2, recovery_mode="all", seed=0)
+    train_all, _ = build_train_val(data, meta, cfg_all)
+
+    cfg_clean = FlowMatchingConfig(future_len=10, num_history_states=2,
+                                   recovery_mode="clean_prediction", seed=0)
+    train_clean, _ = build_train_val(data, meta, cfg_clean)
+
+    # Filtering can only remove windows.
+    assert len(train_clean) < len(train_all)
+    assert len(train_clean) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +908,124 @@ def test_flow_loss_fk_terms_and_tau_gate():
     out_g = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, **ckw)
     assert out_g["accel_consistency"].item() == 0.0
     assert out_g["fk_pose"].item() == 0.0 and out_g["fk_vel"].item() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Terrain-penetration loss
+# ---------------------------------------------------------------------------
+_IDENT_QUAT = torch.tensor([0.0, 0.0, 0.0, 1.0])           # xyzw
+_IDENT_ORI6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])  # rot6d of identity
+
+
+def _foot_state(nj: int, k: int, nf: int, foot_pos: torch.Tensor, foot_R: torch.Tensor | None = None) -> torch.Tensor:
+    """A (1,nf,D) state with foot frame 0 at ``foot_pos`` (and optional rotation)."""
+    d = target_state_dim(nj, k)
+    x = torch.zeros(1, nf, d, dtype=torch.float64)
+    rb = frame_block_start(nj, 0)
+    x[..., rb + 6:rb + 12] = _IDENT_ORI6D.to(torch.float64)        # root ori = identity
+    eb = frame_block_start(nj, 1)                                   # first extra (foot) frame
+    x[..., eb:eb + 3] = foot_pos.to(torch.float64)
+    ori = _IDENT_ORI6D if foot_R is None else matrix_to_rot6d(foot_R)
+    x[..., eb + 6:eb + 12] = ori.to(torch.float64)
+    return x
+
+
+def test_box_sole_points():
+    pts = box_sole_points(grid=(3, 2))
+    assert pts.shape == (6, 3)
+    sole_z = -0.02517 - 0.009255  # box center_z - half_z
+    assert torch.allclose(pts[:, 2], torch.full((6,), sole_z), atol=1e-6)
+
+
+def test_flat_terrain_penetration():
+    t = FlatTerrain(ground_z=0.0)
+    p = torch.tensor([[0.0, 0.0, -0.05], [0.0, 0.0, 0.1]])
+    d = t.penetration(p)
+    assert torch.allclose(d, torch.tensor([0.05, 0.0]))
+
+
+def test_terrain_ankle_mode_identity_anchor():
+    nj, k, nf = 2, 1, 3
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    p_ref = torch.zeros(1, 3, dtype=torch.float64)
+    q_ref = _IDENT_QUAT.to(torch.float64)[None]
+    terrain = FlatTerrain(0.0)
+    # foot ankle origin 5 cm below ground -> penetration 0.05 (world z == rel z under identity anchor)
+    x_lo = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, -0.05]))
+    pen_lo = terrain_penetration_term(x_lo, x_lo, known, p_ref, q_ref, nj, [0], None, terrain)
+    assert abs(pen_lo.item() - 0.05 ** 2) < 1e-9
+    # foot above ground -> ~0
+    x_hi = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.05]))
+    assert terrain_penetration_term(x_hi, x_hi, known, p_ref, q_ref, nj, [0], None, terrain).item() < 1e-12
+
+
+def test_terrain_contact_mode_sole_and_tilt():
+    nj, k, nf = 2, 1, 2
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    p_ref = torch.zeros(1, 3, dtype=torch.float64)
+    q_ref = _IDENT_QUAT.to(torch.float64)[None]
+    terrain = FlatTerrain(0.0)
+    cpts = box_sole_points(grid=(3, 2)).to(torch.float64)
+    sole_z = -0.02517 - 0.009255  # box sole offset in the foot frame
+
+    # Flat foot with the ankle origin lifted exactly to +|sole_z| -> sole at ground -> ~0.
+    x0 = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, -sole_z]))
+    assert terrain_penetration_term(x0, x0, known, p_ref, q_ref, nj, [0], cpts, terrain).item() < 1e-12
+    # Same, lowered 3 cm -> sole 3 cm below ground -> positive.
+    x1 = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, -sole_z - 0.03]))
+    assert terrain_penetration_term(x1, x1, known, p_ref, q_ref, nj, [0], cpts, terrain).item() > 1e-4
+
+    # Tilt value-add: ankle ORIGIN above ground (ankle mode = 0), but a pitched foot's toe
+    # dips below ground -> contact mode catches it.
+    th = torch.tensor(0.5, dtype=torch.float64)
+    R_pitch = torch.tensor([[torch.cos(th), 0, torch.sin(th)],
+                            [0.0, 1.0, 0.0],
+                            [-torch.sin(th), 0, torch.cos(th)]], dtype=torch.float64)
+    x_tilt = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.04]), foot_R=R_pitch)
+    ankle_pen = terrain_penetration_term(x_tilt, x_tilt, known, p_ref, q_ref, nj, [0], None, terrain)
+    contact_pen = terrain_penetration_term(x_tilt, x_tilt, known, p_ref, q_ref, nj, [0], cpts, terrain)
+    assert ankle_pen.item() < 1e-12          # ankle origin (z=+0.04) is above ground
+    assert contact_pen.item() > 1e-4         # the tilted toe penetrates
+
+
+def test_terrain_nonidentity_anchor_lift():
+    """Penetration is computed in WORLD z: the anchor height shifts the foot world z."""
+    nj, k, nf = 2, 1, 2
+    known = torch.zeros(1, nf, dtype=torch.bool)
+    q_ref = _IDENT_QUAT.to(torch.float64)[None]
+    terrain = FlatTerrain(0.0)
+    x = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.10]))  # foot 10 cm above the anchor
+    # anchor 0.2 m up -> foot world z = 0.30 -> no penetration
+    assert terrain_penetration_term(x, x, known, torch.tensor([[0.0, 0.0, 0.2]], dtype=torch.float64),
+                                    q_ref, nj, [0], None, terrain).item() < 1e-12
+    # anchor 0.2 m below ground -> foot world z = -0.10 -> penetration 0.10
+    pen = terrain_penetration_term(x, x, known, torch.tensor([[0.0, 0.0, -0.2]], dtype=torch.float64),
+                                   q_ref, nj, [0], None, terrain)
+    assert abs(pen.item() - 0.10 ** 2) < 1e-9
+
+
+def test_flow_loss_terrain_term_and_tau_gate():
+    torch.manual_seed(40)
+    nj, k, f, n = 3, 1, 8, 2
+    d = target_state_dim(nj, k)
+    model = FlowMatchingTransformer(state_dim=d, future_len=f, cmd_dim=0,
+                                    d_model=16, nhead=2, num_layers=1, dim_feedforward=32).eval()
+    x1 = torch.randn(16, f, d)
+    cond = torch.randn(16, f, d)
+    known = torch.zeros(16, f, dtype=torch.bool); known[:, :n] = True
+    p_ref = torch.randn(16, 3)
+    q_ref = torch.randn(16, 4); q_ref = q_ref / q_ref.norm(dim=-1, keepdim=True)
+    norm = Normalizer.fit(x1.reshape(-1, d), torch.ones(d, dtype=torch.bool))
+    ckw = dict(state_norm=norm, num_joints=nj, num_extra_frames=k, p_ref=p_ref, q_ref=q_ref,
+               terrain=FlatTerrain(0.0), foot_idxs=[0], contact_pts=None, terrain_weight=0.1)
+    out = flow_matching_loss(model, x1, cond, known, None, tau_min=0.0, **ckw)
+    assert "terrain_penetration" in out and torch.isfinite(out["loss"]) and out["loss"].requires_grad
+    # Ungated by default: the term survives even when no sample passes the τ-gate.
+    out_u = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, **ckw)
+    assert out_u["terrain_penetration"].item() > 0.0
+    # Opt-in τ-gating restores the old behavior: tau_min>1 -> nothing contributes.
+    out_g = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, terrain_tau_gated=True, **ckw)
+    assert out_g["terrain_penetration"].item() == 0.0  # τ-gated out
 
 
 def test_flow_matching_loss_consistency_terms_present():

@@ -170,6 +170,11 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
     # used by the flow-matching dataset for future-horizon command conditioning.
     if data.get("target_vel") is not None:
         optional_arrays["target_vel"] = data["target_vel"].astype(np.float32)
+    # Per-step perturbation flag (1 while action-noise/push was active for that env);
+    # written only for recovery recordings (record_data.py --perturb). Consumed by the
+    # flow-matching dataset's recovery-aware window filter.
+    if data.get("perturb_active") is not None:
+        optional_arrays["perturb_active"] = data["perturb_active"].astype(np.uint8)
     np.savez_compressed(
         path,
         # per-pair arrays
@@ -230,6 +235,8 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         "ref_state": z["ref_state"] if "ref_state" in z.files else None,
         # Present only when recorded on a clip task exposing a command velocity.
         "target_vel": z["target_vel"] if "target_vel" in z.files else None,
+        # Present only for recovery recordings (record_data.py --perturb).
+        "perturb_active": z["perturb_active"] if "perturb_active" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],

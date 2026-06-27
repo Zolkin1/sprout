@@ -37,13 +37,16 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
+    FlatTerrain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
     FutureStateDataset,
+    box_sole_points,
     build_train_val,
     episode_windows,
     flow_matching_loss,
     frame_block_start,
+    matrix_from_quat,
     orientation_slice,
     rot6d_to_matrix,
     sample_trajectory,
@@ -94,31 +97,43 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     )
     parser.add_argument("--cmd_stride", type=int, default=5,
                         help="Keep every cmd_stride-th step of the command profile as a token.")
+    parser.add_argument(
+        "--recovery_mode", type=str, default="clean_prediction",
+        choices=["clean_prediction", "all"],
+        help="For perturbed recordings (record_data.py --perturb, which logs 'perturb_active'): "
+             "'clean_prediction' (default) keeps only windows whose prediction region is clean while "
+             "the history may be perturbed (learn recovery refs from a bad-state history); 'all' uses "
+             "every window. Recordings without 'perturb_active' always use all windows.",
+    )
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--nhead", type=int, default=8)
     parser.add_argument("--num_layers", type=int, default=4)
     parser.add_argument("--dim_feedforward", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--num_sampling_steps", type=int, default=8)
-    parser.add_argument("--ori6d_aux_weight", type=float, default=0.0)
+    # Loss-weight CLI flags default to the FlowMatchingConfig() values, so config.py is the
+    # single source of truth -- editing a default there changes a plain `train.py` run (a
+    # bare `default=0.0` here would silently override the config and disable the loss).
+    _wc = FlowMatchingConfig()
+    parser.add_argument("--ori6d_aux_weight", type=float, default=_wc.ori6d_aux_weight)
     # Frame finite-difference consistency regularizers (root + ee frames). dt defaults
-    # to the recording's control period. Both weights default off; the consistency
-    # losses are in physical units (m/s, rad/s and m/s^2, rad/s^2).
+    # to the recording's control period. The consistency losses are in physical units
+    # (m/s, rad/s and m/s^2, rad/s^2).
     parser.add_argument("--dt", type=float, default=None,
                         help="Control dt (s) for the consistency finite differences; default: recording meta.")
-    parser.add_argument("--vel_consistency_weight", type=float, default=0.0,
+    parser.add_argument("--vel_consistency_weight", type=float, default=_wc.vel_consistency_weight,
                         help="Weight on the frame velocity finite-difference consistency loss "
                              "(predicted pose d/dt vs predicted velocity).")
-    parser.add_argument("--accel_consistency_weight", type=float, default=0.0,
+    parser.add_argument("--accel_consistency_weight", type=float, default=_wc.accel_consistency_weight,
                         help="Weight on the frame acceleration finite-difference consistency loss "
                              "(predicted velocity d/dt vs data velocity d/dt). tau-gated.")
-    parser.add_argument("--joint_vel_consistency_weight", type=float, default=0.0,
+    parser.add_argument("--joint_vel_consistency_weight", type=float, default=_wc.joint_vel_consistency_weight,
                         help="Weight on the joint-velocity finite-difference consistency "
                              "(predicted joint_pos d/dt vs predicted joint_vel). Ungated.")
-    parser.add_argument("--fk_pose_weight", type=float, default=0.0,
+    parser.add_argument("--fk_pose_weight", type=float, default=_wc.fk_pose_weight,
                         help="Weight on the FK pose consistency (predicted ee pose vs FK of "
                              "predicted joints). tau-gated.")
-    parser.add_argument("--fk_vel_weight", type=float, default=0.0,
+    parser.add_argument("--fk_vel_weight", type=float, default=_wc.fk_vel_weight,
                         help="Weight on the FK velocity consistency (predicted ee velocity vs "
                              "J(q)*qdot of predicted joints/joint-vels). tau-gated.")
     parser.add_argument("--consistency_tau_min", type=float, default=FlowMatchingConfig().consistency_tau_min,
@@ -126,6 +141,22 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "tau >= this (velocity/joint-velocity stay ungated).")
     parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
                         help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
+    # Terrain penetration (penalize predicted feet below the ground). tau-gated.
+    parser.add_argument("--terrain_penetration_weight", type=float, default=_wc.terrain_penetration_weight,
+                        help="Weight on the terrain-penetration loss (predicted feet below ground).")
+    parser.add_argument("--terrain_penetration_mode", type=str, default=_wc.terrain_penetration_mode,
+                        choices=["ankle", "contact"],
+                        help="'ankle' (penalize ankle-frame origin) or 'contact' (box-sole grid points).")
+    parser.add_argument("--terrain_ground_z", type=float, default=None,
+                        help="World ground height (m); default None -> auto-calibrate from the recording.")
+    parser.add_argument("--terrain_contact_grid", type=int, nargs=2, default=list(FlowMatchingConfig().terrain_contact_grid),
+                        help="(nx ny) sole-grid resolution for the 'contact' mode.")
+    parser.add_argument("--terrain_floor_percentile", type=float, default=FlowMatchingConfig().terrain_floor_percentile,
+                        help="Low percentile of recorded foot z used as the auto-calibrated ground.")
+    parser.add_argument("--terrain_tau_gated", action="store_true", default=_wc.terrain_tau_gated,
+                        help="Restrict the terrain-penetration loss to tau >= consistency_tau_min "
+                             "(like accel/FK). Default off: the low-tau endpoint penetrates like the "
+                             "deployed sample, so gating hides the signal.")
     # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
@@ -155,6 +186,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         future_len=args.future_len, num_history_states=args.num_history_states,
         history_dropout_prob=args.history_dropout_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
+        recovery_mode=args.recovery_mode,
         cmd_array=args.cmd_array, cmd_stride=args.cmd_stride,
         d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
@@ -164,6 +196,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
         fk_pose_weight=args.fk_pose_weight, fk_vel_weight=args.fk_vel_weight,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
+        terrain_penetration_weight=args.terrain_penetration_weight,
+        terrain_penetration_mode=args.terrain_penetration_mode,
+        terrain_ground_z=args.terrain_ground_z,
+        terrain_contact_grid=tuple(args.terrain_contact_grid),
+        terrain_floor_percentile=args.terrain_floor_percentile,
+        terrain_tau_gated=args.terrain_tau_gated,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
@@ -244,7 +282,8 @@ def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_histor
     return use_history.unsqueeze(1) & is_hist
 
 
-_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel")
+_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel",
+              "terrain_penetration")
 
 
 @torch.no_grad()
@@ -278,19 +317,58 @@ def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> N
               "(joint order/names, base link, or model mismatch); the FK loss will have this floor.")
 
 
-def consistency_kwargs(cfg, num_joints, num_extra_frames, fk) -> dict:
-    """Shared flow_matching_loss kwargs for the consistency + FK regularizers."""
+@torch.no_grad()
+def _terrain_calibrate(train_ds, foot_idxs, contact_pts, num_joints, device, percentile, n_windows: int = 128) -> float:
+    """Calibrate the world ground height from the recording (a low percentile of the
+    lifted recorded foot z), so the clean recorded motion has ~0 penetration.
+
+    Lifts the recorded foot frames (ankle origin, or the box-sole ``contact_pts``) to the
+    world via the per-window anchor ``(p_ref, q_ref)`` and returns ``percentile``-th
+    percentile of their world z.
+    """
+    s = train_ds.state[:n_windows].to(device)
+    x = train_ds.state_normalizer.denormalize(s)            # (W, F, D) physical (ref frame)
+    p_ref = train_ds.p_ref[:n_windows].to(device)
+    q_ref = train_ds.q_ref[:n_windows].to(device)
+    r_ref = matrix_from_quat(q_ref)                          # (W, 3, 3)
+    cpts = None if contact_pts is None else contact_pts.to(x)
+    zs = []
+    for fi in foot_idxs:
+        eb = frame_block_start(num_joints, 1 + fi)
+        p_foot = torch.einsum("wij,wfj->wfi", r_ref, x[..., eb:eb + 3]) + p_ref[:, None, :]
+        if cpts is None:
+            zs.append(p_foot[..., 2].reshape(-1))
+        else:
+            r_foot = torch.einsum("wij,wfjk->wfik", r_ref, rot6d_to_matrix(x[..., eb + 6:eb + 12]))
+            pc = p_foot[:, :, None, :] + torch.einsum("wfik,pk->wfpi", r_foot, cpts)
+            zs.append(pc[..., 2].reshape(-1))
+    z = torch.cat(zs)
+    floor = float(torch.quantile(z, percentile / 100.0))
+    mode = "contact" if contact_pts is not None else "ankle"
+    print(f"[INFO] terrain floor calibrated (mode={mode}): ground_z={floor:.4f} m "
+          f"(recorded foot z: min={float(z.min()):.4f}, p{percentile:g}={floor:.4f}, "
+          f"median={float(z.median()):.4f})")
+    return floor
+
+
+def consistency_kwargs(cfg, num_joints, num_extra_frames, fk,
+                       terrain=None, foot_idxs=None, contact_pts=None) -> dict:
+    """Shared flow_matching_loss kwargs for the consistency + FK + terrain regularizers."""
     return dict(
         dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
         vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
         joint_vel_weight=cfg.joint_vel_consistency_weight,
         fk=fk, fk_pose_weight=cfg.fk_pose_weight, fk_vel_weight=cfg.fk_vel_weight,
         tau_min=cfg.consistency_tau_min,
+        terrain=terrain, foot_idxs=foot_idxs, contact_pts=contact_pts,
+        terrain_weight=cfg.terrain_penetration_weight,
+        terrain_tau_gated=cfg.terrain_tau_gated,
     )
 
 
 @torch.no_grad()
-def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0, fk=None) -> dict[str, float]:
+def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0,
+             fk=None, terrain=None, foot_idxs=None, contact_pts=None) -> dict[str, float]:
     """Compute conditioned/unconditional flow loss and per-channel sampling metrics.
 
     Metrics are over the novel (predicted) frames ``N..F-1`` only; ``flow_mse`` is the
@@ -301,15 +379,18 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     flow_sum, flow_unc_sum, n_batches = 0.0, 0.0, 0
     cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
-    ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk)
+    ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk, terrain, foot_idxs, contact_pts)
     for batch in loader:
         state = batch["state"].to(device)
         cond = batch["cond"].to(device)
         cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
+        p_ref = batch["p_ref"].to(device)
+        q_ref = batch["q_ref"].to(device)
         b = state.shape[0]
         known = make_known_mask(b, cfg, device, True)
         none = make_known_mask(b, cfg, device, False)
-        cond_out = flow_matching_loss(model, state, cond, known, cmd_tokens, state_norm=state_normalizer, **ckw)
+        cond_out = flow_matching_loss(model, state, cond, known, cmd_tokens,
+                                      state_norm=state_normalizer, p_ref=p_ref, q_ref=q_ref, **ckw)
         flow_sum += cond_out["flow_mse"].item()
         for k in _CONS_KEYS:
             if k in cond_out:
@@ -434,6 +515,24 @@ def main() -> None:
             fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)
             _fk_sanity_check(fk, train_ds, num_joints, device)
 
+    # Terrain-penetration loss: foot frames + contact points + flat-ground terrain.
+    terrain = foot_idxs = contact_pts = None
+    if cfg.terrain_penetration_weight > 0.0:
+        foot_idxs = [i for i, fn in enumerate(train_ds.target_frame_names)
+                     if "ankle" in fn.lower() or "foot" in fn.lower()]
+        if not foot_idxs:
+            print("[WARN] terrain_penetration_weight set but no foot frames (ankle/foot) in the "
+                  "target frames; skipping the terrain loss.")
+        else:
+            contact_pts = (box_sole_points(grid=tuple(cfg.terrain_contact_grid)).to(device)
+                           if cfg.terrain_penetration_mode == "contact" else None)
+            ground_z = (cfg.terrain_ground_z if cfg.terrain_ground_z is not None
+                        else _terrain_calibrate(train_ds, foot_idxs, contact_pts, num_joints, device,
+                                                cfg.terrain_floor_percentile))
+            terrain = FlatTerrain(ground_z).to(device)
+            print(f"[INFO] terrain loss: mode={cfg.terrain_penetration_mode}, foot frames="
+                  f"{[train_ds.target_frame_names[i] for i in foot_idxs]}, ground_z={ground_z:.4f}")
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
@@ -456,14 +555,17 @@ def main() -> None:
             state = batch["state"].to(device)
             cond = batch["cond"].to(device)
             cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
+            p_ref = batch["p_ref"].to(device)
+            q_ref = batch["q_ref"].to(device)
             # Per-sample history dropout: use the conditioning tokens w.p. (1 - dropout).
             use_hist = torch.rand(state.shape[0], device=device) >= cfg.history_dropout_prob
             known = make_known_mask(state.shape[0], cfg, device, use_hist)
             opt.zero_grad()
             out = flow_matching_loss(
                 model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight,
-                state_norm=train_ds.state_normalizer,
-                **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk),
+                state_norm=train_ds.state_normalizer, p_ref=p_ref, q_ref=q_ref,
+                **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk,
+                                     terrain, foot_idxs, contact_pts),
             )
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -489,6 +591,7 @@ def main() -> None:
             val = evaluate(
                 model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                terrain=terrain, foot_idxs=foot_idxs, contact_pts=contact_pts,
             )
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
@@ -504,6 +607,7 @@ def main() -> None:
             ev = evaluate(
                 model, eval_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                terrain=terrain, foot_idxs=foot_idxs, contact_pts=contact_pts,
             )
             for k, v in ev.items():
                 writer.add_scalar(f"eval/{k}", v, epoch)

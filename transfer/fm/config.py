@@ -100,13 +100,32 @@ class FlowMatchingConfig:
     # endpoint is a faithful estimate of the clean target); velocity/joint-velocity
     # stay ungated. All weights default off.
     dt: float = 0.02
-    vel_consistency_weight: float = 0.0
+    vel_consistency_weight: float = 0.01 #0.0
     accel_consistency_weight: float = 0.0
-    joint_vel_consistency_weight: float = 0.0
-    fk_pose_weight: float = 0.0
-    fk_vel_weight: float = 0.0
+    joint_vel_consistency_weight: float = 0.01 #0.0
+    fk_pose_weight: float = 0.01 #0.0
+    fk_vel_weight: float = 0.001 #0.0
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
+
+    # -- terrain penetration (penalize predicted feet going below the ground) --
+    # ``terrain_penetration_mode``: "ankle" (penalize the ankle-frame origin) or
+    # "contact" (sample a grid on the foot box sole and penalize each point, using the
+    # predicted foot orientation). ``terrain_ground_z``: world ground height; ``None``
+    # auto-calibrates the floor from the recording at train time (a low percentile of
+    # the lifted recorded foot z, so clean data has ~0 penetration). ``terrain_contact_grid``
+    # is the (nx, ny) sole-grid for contact mode.
+    # ``terrain_tau_gated`` (default False) keeps the penalty on ALL flow-times. Unlike the
+    # accel/FK terms, the low-τ predicted endpoint penetrates ~as much as the deployed
+    # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
+    # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
+    # all the signal. Set True only to restrict it to the high-τ regime.
+    terrain_penetration_weight: float = 0.0
+    terrain_penetration_mode: str = "ankle"
+    terrain_ground_z: float | None = None
+    terrain_contact_grid: tuple[int, int] = (3, 2)
+    terrain_floor_percentile: float = 1.0
+    terrain_tau_gated: bool = False
 
     # -- training --
     batch_size: int = 256

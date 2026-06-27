@@ -116,6 +116,9 @@ class MotionData:
         fmt: ``"clip"``, ``"recorded"``, or ``"mixed"``.
         has_command: Whether a real commanded velocity was available (False if a
             clip lacked ``target_vel``; only skill occupancy is then meaningful).
+        perturb_active: ``[M]`` uint8 per-step perturbation flag (``1`` while a
+            perturbation window was active), aligned to ``vel``/``skill``; ``None``
+            for clips or recordings without it (record_data.py ``--perturb``).
     """
 
     vel: np.ndarray
@@ -128,6 +131,7 @@ class MotionData:
     sources: list[str]
     fmt: str
     has_command: bool
+    perturb_active: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +294,16 @@ def load_recorded_file(path: str, buckets: dict[str, dict]) -> MotionData:
         prev_valid[1:] = (ep_s[1:] == ep_s[:-1]) & (st_s[1:] == st_s[:-1] + 1)
     n_segments = int((~prev_valid).sum())  # segment starts == rows w/o a predecessor
 
+    # Per-step perturbation flag (recovery recordings); sort into the same order.
+    pa = data.get("perturb_active")
+    perturb_active = pa[order].astype(np.uint8) if pa is not None else None
+
     return MotionData(
         vel=tv_s, skill=skill_s, prev_valid=prev_valid, skill_list=skill_list,
         standing_idx=_standing_index(skill_list), dt=float(meta.dt), n_segments=n_segments,
         sources=[f"{os.path.basename(path)} (recorded: {tv_s.shape[0]} steps, "
                  f"{n_segments} episodes, task={meta.task_name})"],
-        fmt="recorded", has_command=True,
+        fmt="recorded", has_command=True, perturb_active=perturb_active,
     )
 
 
@@ -334,6 +342,12 @@ def merge_motion_data(items: list[MotionData]) -> MotionData:
     if len(dts) > 1:
         print(f"[WARN] inputs have differing dt {sorted(dts)}; using {items[0].dt}.")
 
+    # Perturbation flag only carries through if every input has it (else None).
+    if all(md.perturb_active is not None for md in items):
+        perturb_active = np.concatenate([md.perturb_active for md in items])
+    else:
+        perturb_active = None
+
     fmts = {md.fmt for md in items}
     return MotionData(
         vel=np.concatenate(vels), skill=np.concatenate(skills),
@@ -342,6 +356,7 @@ def merge_motion_data(items: list[MotionData]) -> MotionData:
         n_segments=sum(md.n_segments for md in items), sources=sources,
         fmt=fmts.pop() if len(fmts) == 1 else "mixed",
         has_command=all(md.has_command for md in items),
+        perturb_active=perturb_active,
     )
 
 
@@ -415,6 +430,19 @@ def analyze(md: MotionData, lin_thresh: float, ang_thresh: float) -> dict:
     vx_pctl_all = np.percentile(vx, pct) if M else np.full(len(pct), np.nan)
     vx_pctl_moving = np.percentile(vx[moving], pct) if moving.any() else np.full(len(pct), np.nan)
 
+    # Perturbation coverage (recovery recordings): per-step flag -> total time +
+    # window count (contiguous runs of active steps, not spanning segments).
+    has_perturb = md.perturb_active is not None
+    perturb_steps = perturb_windows = 0
+    if has_perturb:
+        active_p = md.perturb_active.astype(bool)
+        perturb_steps = int(active_p.sum())
+        prev_active = np.r_[False, active_p[:-1]]
+        # A window starts at an active step that either follows an inactive step or
+        # begins a new segment (so windows never merge across a segment boundary).
+        starts_p = active_p & (~prev_active | ~pv)
+        perturb_windows = int(starts_p.sum())
+
     return {
         "M": M,
         "dt": md.dt,
@@ -433,6 +461,9 @@ def analyze(md: MotionData, lin_thresh: float, ang_thresh: float) -> dict:
         "vx_pctl_all": vx_pctl_all,
         "vx_pctl_moving": vx_pctl_moving,
         "vx": vx,  # for plotting
+        "has_perturb": has_perturb,
+        "perturb_steps": perturb_steps,
+        "perturb_windows": perturb_windows,
     }
 
 
@@ -510,6 +541,16 @@ def format_report(stats: dict, reference_mix: dict | None = None) -> str:
     L.append(f"  stops  (-> standing) : {stats['n_enter']:,}")
     L.append(f"  starts (<- standing) : {stats['n_exit']:,}")
     L.append(f"  moving speed changes : {stats['n_change']:,}")
+
+    # -- Perturbation coverage (recovery recordings only) --
+    if stats.get("has_perturb"):
+        ps, pw = stats["perturb_steps"], stats["perturb_windows"]
+        L.append("")
+        L.append("-- Perturbation coverage (record_data.py --perturb) --")
+        L.append(f"  perturbed time .............. {_pct(ps, M)}   ({ps:,} steps)")
+        L.append(f"  clean time (FM prediction) . {_pct(M - ps, M)}   ({M - ps:,} steps)")
+        mean_len = (ps / pw * dt) if pw else 0.0
+        L.append(f"  perturbation windows ....... {pw:,}   (mean {mean_len:.2f}s each)")
 
     # -- Skill occupancy --
     occ = stats["occupancy"]

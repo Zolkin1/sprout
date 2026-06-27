@@ -9,7 +9,13 @@ commanded-velocity profile, generating a future trajectory in the current root f
 """
 
 from .config import FlowMatchingConfig
-from .dataset import FutureStateDataset, build_train_val, episode_windows, resolve_term_slice
+from .dataset import (
+    FutureStateDataset,
+    build_train_val,
+    episode_windows,
+    filter_windows_by_recovery,
+    resolve_term_slice,
+)
 from .fk import FKChain
 from .flow import (
     fk_consistency_terms,
@@ -18,12 +24,15 @@ from .flow import (
     joint_vel_consistency_term,
     sample_flow_batch,
     sample_trajectory,
+    terrain_penetration_term,
 )
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
+from .terrain import FlatTerrain, box_sole_points
 from .transforms import (
     FRAME_BLOCK_DIM,
     frame_block_start,
+    matrix_from_quat,
     matrix_to_rot6d,
     orientation_slice,
     orientation_slices,
@@ -44,14 +53,19 @@ __all__ = [
     "Normalizer",
     "build_train_val",
     "episode_windows",
+    "filter_windows_by_recovery",
     "resolve_term_slice",
     "FKChain",
+    "FlatTerrain",
+    "box_sole_points",
     "flow_matching_loss",
     "frame_consistency_terms",
     "joint_vel_consistency_term",
     "fk_consistency_terms",
+    "terrain_penetration_term",
     "sample_flow_batch",
     "sample_trajectory",
+    "matrix_from_quat",
     "matrix_to_rot6d",
     "rot6d_to_matrix",
     "quat_to_rot6d",

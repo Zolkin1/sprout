@@ -37,6 +37,9 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
     OfflineVelocitySampler,
 )
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.scheduled_velocity_sampler import (
+    ScheduledVelocitySampler,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
     OfflineClipGenerator,
 )
@@ -90,9 +93,29 @@ def main() -> int:
     p.add_argument("--dt", type=float, default=0.02, help="Control-step dt (s).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=512, help="Clips generated per rollout batch.")
-    p.add_argument("--resample-min", type=float, default=2.0, help="Min seconds between velocity resamples.")
-    p.add_argument("--resample-max", type=float, default=5.0, help="Max seconds between velocity resamples.")
-    p.add_argument("--max-acc", type=float, default=2.0, help="Velocity ramp max acceleration.")
+    p.add_argument("--sampler", choices=["stochastic", "scheduled"], default="stochastic",
+                   help="Velocity sampler. 'stochastic' (default) = the resample-timer + ramp sampler "
+                        "(--resample-*/--max-acc/--transition-prob). 'scheduled' = an explicit-fraction "
+                        "planner that targets --transition-frac / per-skill --skill-frac / "
+                        "--standing-transition-frac (verify the achieved mix with command_distribution_stats.py).")
+    p.add_argument("--resample-min", type=float, default=2.0, help="[stochastic] Min seconds between velocity resamples.")
+    p.add_argument("--resample-max", type=float, default=5.0, help="[stochastic] Max seconds between velocity resamples.")
+    p.add_argument("--max-acc", type=float, default=2.0, help="Velocity ramp max acceleration (stochastic sampler).")
+    # -- scheduled-sampler knobs --
+    p.add_argument("--transition-frac", type=float, default=0.3,
+                   help="[scheduled] Target fraction of total time spent ramping between settled velocities; "
+                        "the rest is steady (held) time.")
+    p.add_argument("--standing-transition-frac", type=float, default=0.0,
+                   help="[scheduled] Probability a gap between two moving holds becomes a stop (a standing "
+                        "hold inserted between them -> a stop/go cycle, the recovery-relevant start/stop motions).")
+    p.add_argument("--skill-frac", action="append", default=None, metavar="SKILL=FRAC",
+                   help="[scheduled] Target fraction of STEADY time for a skill, e.g. --skill-frac walk_forward=0.5 "
+                        "(repeatable). Skills omitted here default to 0. Overrides any skill_time_fractions in --config. "
+                        "If neither is given, the library's trajectory-count proportions are used.")
+    p.add_argument("--hold-min", type=float, default=2.0,
+                   help="[scheduled] Min held-segment duration (s); with --hold-max sets the average hold length "
+                        "(shorter holds -> more transitions for a given --transition-frac).")
+    p.add_argument("--hold-max", type=float, default=5.0, help="[scheduled] Max held-segment duration (s).")
     p.add_argument("--transition-prob", type=float, default=None,
                    help="Per-resample probability of switching to a DIFFERENT skill mid-clip. "
                         "0.0 = lock each clip to its start skill -- walk/run/stand still vary across "
@@ -123,6 +146,7 @@ def main() -> int:
     # Buckets + skill mix: library-derived defaults, optional JSON override.
     buckets = _library_derived_buckets(manager)
     skill_probs = _default_skill_probs(manager)
+    skill_time_fractions: dict[str, float] | None = None  # scheduled sampler target steady mix
     if args.config:
         cfg = json.loads(Path(args.config).read_text())
         for name, b in cfg.get("velocity_buckets", {}).items():
@@ -130,6 +154,17 @@ def main() -> int:
         if "skill_probs" in cfg:
             sp = cfg["skill_probs"]
             skill_probs = [float(sp[name]) for name in skill_list] if isinstance(sp, dict) else list(sp)
+        if "skill_time_fractions" in cfg:
+            skill_time_fractions = {str(k): float(v) for k, v in cfg["skill_time_fractions"].items()}
+
+    # --skill-frac SKILL=FRAC (repeatable) overrides any config skill_time_fractions.
+    if args.skill_frac:
+        skill_time_fractions = {}
+        for item in args.skill_frac:
+            if "=" not in item:
+                raise SystemExit(f"--skill-frac must be SKILL=FRAC, got {item!r}.")
+            name, val = item.split("=", 1)
+            skill_time_fractions[name.strip()] = float(val)
 
     # Exclude skills: zero their sampling probability (renormalised) and mark
     # them ineligible for stride selection in the generator.
@@ -152,12 +187,30 @@ def main() -> int:
             for name, b in buckets.items()
         }
 
-    sampler = OfflineVelocitySampler(
-        buckets, skill_list, skill_probs,
-        resampling_time_range=(args.resample_min, args.resample_max),
-        max_acc=args.max_acc, command_dt=args.dt,
-        skill_transition_prob=args.transition_prob, device=device, seed=args.seed,
-    )
+    # Scheduled sampler defaults its target steady mix to the library proportions
+    # (minus excluded skills) when neither --skill-frac nor a config block is given.
+    if skill_time_fractions is None:
+        skill_time_fractions = {
+            name: p for name, p in zip(skill_list, skill_probs) if name not in exclude_skills and p > 0
+        }
+
+    if args.sampler == "scheduled":
+        sampler = ScheduledVelocitySampler(
+            buckets, skill_list, skill_probs,
+            skill_time_fractions=skill_time_fractions,
+            transition_fraction=args.transition_frac,
+            standing_transition_fraction=args.standing_transition_frac,
+            hold_duration_range=(args.hold_min, args.hold_max),
+            command_dt=args.dt, clip_length_s=args.clip_length,
+            max_acc=args.max_acc, device=device, seed=args.seed,
+        )
+    else:
+        sampler = OfflineVelocitySampler(
+            buckets, skill_list, skill_probs,
+            resampling_time_range=(args.resample_min, args.resample_max),
+            max_acc=args.max_acc, command_dt=args.dt,
+            skill_transition_prob=args.transition_prob, device=device, seed=args.seed,
+        )
     gen = OfflineClipGenerator(
         manager, sampler, dt=args.dt, clip_length_s=args.clip_length,
         exclude_skills=exclude_skills, project_to_ground=not args.no_ground_projection,
@@ -169,9 +222,15 @@ def main() -> int:
         "num_clips": args.num_clips,
         "clip_length_s": args.clip_length,
         "dt": args.dt,
+        "sampler": args.sampler,
         "resampling_time_range": [args.resample_min, args.resample_max],
         "max_acc": args.max_acc,
         "skill_transition_prob": args.transition_prob,
+        # Scheduled-sampler knobs (None-valued / unused for the stochastic sampler).
+        "transition_fraction": args.transition_frac if args.sampler == "scheduled" else None,
+        "standing_transition_fraction": args.standing_transition_frac if args.sampler == "scheduled" else None,
+        "hold_duration_range": [args.hold_min, args.hold_max] if args.sampler == "scheduled" else None,
+        "skill_time_fractions": skill_time_fractions if args.sampler == "scheduled" else None,
         "skill_list": skill_list,
         "skill_probs": skill_probs,
         "exclude_skills": exclude_skills,
@@ -196,12 +255,23 @@ def main() -> int:
     writer.set_attr("generator_config", gen_config)
     writer.write_batch(0, probe)  # reuse the probe clip as clip 0
 
+    # Report the distribution the chosen sampler actually uses: the scheduled
+    # planner targets skill_time_fractions (+ transition knobs); the stochastic
+    # sampler draws strides from the library-derived skill_probs.
+    if args.sampler == "scheduled":
+        mix_line = (
+            f"skill_time_fractions={{{', '.join(f'{k}: {v:.3f}' for k, v in skill_time_fractions.items())}}}"
+            f"  transition_frac={args.transition_frac}  standing_transition_frac={args.standing_transition_frac}"
+            f"  (skill_probs unused by the scheduled sampler)"
+        )
+    else:
+        mix_line = f"skill_probs={dict(zip(skill_list, [round(x, 3) for x in skill_probs]))}"
     print(
         f"[generate_clips] source={args.source} fp={manager.library_fingerprint['short']} "
         f"clip_fp={clip_fp['short']} -> {args.out}\n"
         f"  {args.num_clips} clips x {probe['meta']['num_steps']} steps @ dt={args.dt}s "
         f"(P={len(probe['meta']['pos_output_names'])}, V={len(probe['meta']['vel_output_names'])})\n"
-        f"  skill_probs={dict(zip(skill_list, [round(x, 3) for x in skill_probs]))}"
+        f"  {mix_line}"
     )
 
     written = 1
