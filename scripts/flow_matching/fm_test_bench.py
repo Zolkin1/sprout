@@ -45,6 +45,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import copy
 import glob
 import os
 import sys
@@ -1014,66 +1015,136 @@ class ForecastResult:
     frame_names: list[str]
     joint_names: list[str]
     vel_frame: str = "body"
+    label: str = "forecast"              # source label (e.g. gait, or teacher/tracker for parity)
 
 
-def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
-    """Forecast the FM along a real recording and overlay each on the ground truth.
+def forecast_along_rows(ctx, data, layout, rows, args, device, vf, label) -> ForecastResult:
+    """Forecast the FM along a given contiguous ``rows`` stretch of a recording.
 
-    Take one contiguous ground-truth stretch; at every ``--forecast-stride`` steps,
-    condition on the N real states ending there and the *recorded* (in-distribution,
-    already-ramped) command over the window, predict the novel horizon (N..F-1), and
-    place it on the absolute timeline so it branches off the ground-truth curve.
+    At every ``--forecast-stride`` steps, condition on the N real states ending there
+    and the *recorded* command over the window, predict the full window (echo + novel),
+    and place it on the absolute timeline so it branches off the ground-truth curve.
+    Shared by :func:`run_forecast` (mined steady stretch) and :func:`run_parity_forecast`
+    (a recording's parity episode).
     """
     N, F = ctx.N, ctx.F
     fnov = F - N
-    vf = args.vel_frame
-    length = max(F, args.forecast_len)
-    rows, mean_cmd, cmd_std, score = find_steady_rows(
-        data, ctx, CANONICAL_CMDS[args.forecast_hist], length, args.n_envs_scan,
-        steady_weight=args.steady_weight,
-    )
     L = len(rows)
-    gt = layout.parse(data["state"][rows])      # (L, .)
-    cmd_w = data["target_vel"][rows]            # (L, 3) recorded command (ramps as in training)
+    gt = layout.parse(data["state"][rows])
+    cmd_w = data["target_vel"][rows]
     stride = max(1, args.forecast_stride)
-    fk = try_build_fk(args, ctx)                # FK of generated joints (None if mujoco/model missing)
+    fk = try_build_fk(args, ctx)
 
     def attach_fk(tr: dict[str, np.ndarray]) -> None:
-        """Add FK consistency fields to a RAW (world-frame) traj, before disp_traj.
-
-        ``fk_ee_pos`` (world); ``fk_lin_err``/``fk_ang_err`` are the world-frame
-        magnitudes ‖generated EE vel - FK(generated joints) vel‖ (frame-invariant, so
-        unaffected by the later body-frame display rotation).
-        """
+        """Add FK consistency fields to a RAW (world-frame) traj, before disp_traj."""
         if fk is None or "ee_pos" not in tr:
             return
         tr["fk_ee_pos"] = fk.positions(tr["root_pos"], tr["root_quat"], tr["joint_pos"])
         lin, ang = fk.velocities(tr["root_pos"], tr["root_quat"], tr["root_lin_vel"],
                                  tr["root_ang_vel"], tr["joint_pos"], tr["joint_vel"])
-        tr["fk_lin_err"] = np.linalg.norm(tr["ee_lin_vel"] - lin, axis=-1).astype(np.float32)  # (T,K)
-        tr["fk_ang_err"] = np.linalg.norm(tr["ee_ang_vel"] - ang, axis=-1).astype(np.float32)  # (T,K)
+        tr["fk_lin_err"] = np.linalg.norm(tr["ee_lin_vel"] - lin, axis=-1).astype(np.float32)
+        tr["fk_ang_err"] = np.linalg.norm(tr["ee_ang_vel"] - ang, axis=-1).astype(np.float32)
 
-    attach_fk(gt)  # baseline ~0 (FK matches the recording exactly)
+    attach_fk(gt)
     preds: list[tuple[int, dict[str, np.ndarray]]] = []
-    # Anchor = the most-recent conditioning step (window start s0 = a-(N-1)); need the
-    # full F-window of recorded rows and the horizon to land inside the ground truth.
     for a in range(N - 1, L - fnov, stride):
         s0 = a - (N - 1)
         win = build_window_from_rows(data, layout, ctx, rows[s0 : s0 + F], device, f"a{a}")
-        prof = np.ascontiguousarray(cmd_w[s0 : s0 + F])  # recorded command over the window
+        prof = np.ascontiguousarray(cmd_w[s0 : s0 + F])
         fut_cmd = torch.from_numpy(prof).float().unsqueeze(0).to(device)
-        tr = predict(ctx, win, fut_cmd, args.seed, include_history=True)  # full window: echo + novel
+        tr = predict(ctx, win, fut_cmd, args.seed, include_history=True)
         attach_fk(tr)
         preds.append((a, disp_traj(tr, vf)))
     cmd_ctx, left_pad = cmd_context_window(data, rows, args.forecast_pad)
-    print(f"[bench] forecast on {args.forecast_hist!r}: L={L} steps ({L * ctx.dt_attr:.1f}s) "
-          f"stride={stride} -> {len(preds)} forecasts (horizon {fnov} steps / {fnov * ctx.dt_attr:.2f}s) "
-          f"cmd_std={np.round(cmd_std, 3).tolist()} context=+/-{left_pad}/{cmd_ctx.shape[0]-left_pad-L} steps")
     return ForecastResult(
         gt=disp_traj(gt, vf), preds=preds, cmd_context=np.ascontiguousarray(cmd_ctx),
         cmd_context_offset=int(left_pad), N=ctx.N, dt=ctx.dt_attr,
-        frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf,
+        frame_names=ctx.target_frame_names, joint_names=ctx.joint_names, vel_frame=vf, label=label,
     )
+
+
+def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
+    """Forecast the FM along a mined steady stretch of the (default) recording."""
+    length = max(ctx.F, args.forecast_len)
+    rows, mean_cmd, cmd_std, score = find_steady_rows(
+        data, ctx, CANONICAL_CMDS[args.forecast_hist], length, args.n_envs_scan,
+        steady_weight=args.steady_weight,
+    )
+    res = forecast_along_rows(ctx, data, layout, rows, args, device, args.vel_frame, args.forecast_hist)
+    print(f"[bench] forecast on {args.forecast_hist!r}: L={len(rows)} steps ({len(rows) * ctx.dt_attr:.1f}s) "
+          f"stride={max(1, args.forecast_stride)} -> {len(res.preds)} forecasts "
+          f"(horizon {ctx.F - ctx.N} steps) cmd_std={np.round(cmd_std, 3).tolist()}")
+    return res
+
+
+def episode_rows(data: dict[str, np.ndarray], n_envs_scan: int | None = None) -> np.ndarray:
+    """Absolute row indices of the LONGEST contiguous, reset-free episode in a recording.
+
+    Scans env streams (step-major) and returns the rows of the single longest run of
+    consecutive ``step_in_episode`` with no intervening ``done`` -- used as the parity
+    episode to forecast along.
+    """
+    num_envs = layout_num_envs(data)
+    n_rows = data["target_vel"].shape[0]
+    sie = data["step_in_episode"]
+    done = data["done"].astype(np.int64)
+    n_scan = num_envs if n_envs_scan is None else min(n_envs_scan, num_envs)
+    best_rows, best_len = None, 0
+    for e in range(n_scan):
+        idx = np.arange(e, n_rows, num_envs)
+        st, dn = sie[idx], done[idx]
+        boundary = np.ones(len(idx), dtype=bool)          # new segment where step jumps or prev was done
+        boundary[1:] = (np.diff(st) != 1) | (dn[:-1] != 0)
+        seg_id = np.cumsum(boundary)
+        vals, counts = np.unique(seg_id, return_counts=True)
+        j = int(np.argmax(counts))
+        if counts[j] > best_len:
+            best_len = int(counts[j])
+            best_rows = idx[seg_id == vals[j]].copy()
+    if best_rows is None:
+        raise RuntimeError("no contiguous episode found in recording")
+    return best_rows
+
+
+def latest_npz(path: str) -> str:
+    """Resolve a path-or-directory to a concrete ``.npz`` (newest in a directory)."""
+    if os.path.isdir(path):
+        cands = glob.glob(os.path.join(path, "*.npz"))
+        if not cands:
+            raise SystemExit(f"[bench] no .npz recording in {path}")
+        return max(cands, key=os.path.getmtime)
+    if not os.path.exists(path):
+        raise SystemExit(f"[bench] recording not found: {path}")
+    return path
+
+
+def reanchor_xy(res: ForecastResult) -> ForecastResult:
+    """Translate the episode + its forecasts so it starts at world (0,0) in xy (z kept).
+
+    Each parity recording's longest episode comes from a different env (different world
+    origin); shifting both to a common start makes the policies' positions/xy paths
+    directly comparable. Velocities/yaw/foot-z/EE-error are translation-invariant.
+    """
+    off = res.gt["root_pos"][0, :2].copy()
+    res.gt["root_pos"][:, :2] -= off
+    for _, pred in res.preds:
+        pred["root_pos"][:, :2] -= off
+    return res
+
+
+def run_parity_forecast(ctx, path: str, label: str, args, device) -> ForecastResult:
+    """Load a policy-on-parity recording and forecast along its longest episode."""
+    data, meta = load_recording_lite(path)
+    data["_num_envs"] = np.int64(meta.num_envs)
+    ctx.dt_attr = meta.dt
+    if meta.state_joint_names != list(ctx.joint_names) or meta.state_frame_names != list(ctx.target_frame_names):
+        raise SystemExit(f"[bench] {label} recording joint/frame names != checkpoint; re-record with the FM's layout.")
+    layout = StateLayout(meta)
+    rows = episode_rows(data, args.n_envs_scan)
+    res = reanchor_xy(forecast_along_rows(ctx, data, layout, rows, args, device, args.vel_frame, label))
+    print(f"[bench] parity[{label}]: episode {len(rows)} steps ({len(rows) * ctx.dt_attr:.1f}s) "
+          f"-> {len(res.preds)} forecasts (re-anchored to xy origin)")
+    return res
 
 
 # ======================================================================
@@ -1473,6 +1544,81 @@ def draw_forecast_fk_vel(fig, res: ForecastResult) -> None:
 
 
 # ======================================================================
+# 6b. parity comparison plots (overlay multiple policy rollouts)
+# ======================================================================
+def _parity_track(ax, getter, res: ForecastResult, color, n, dt) -> None:
+    """Plot one source on an axis: rollout spine (solid) + its FM forecasts (thin)."""
+    L = res.gt["root_pos"].shape[0]
+    ax.plot(np.arange(L) * dt, getter(res.gt), color=color, lw=1.8, zorder=5, label=res.label)
+    fwin = res.preds[0][1]["root_pos"].shape[0] if res.preds else n
+    for a, pred in res.preds:
+        tw = (np.arange(fwin) + (a - (n - 1))) * dt
+        y = getter(pred)
+        ax.plot(tw[n - 1:], y[n - 1:], color=color, lw=0.7, alpha=0.25, zorder=3)  # novel forecast
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("time (s)")
+
+
+def draw_parity(fig, results: list[ForecastResult]) -> None:
+    """Overlay each policy's parity rollout + FM forecasts, colored by source."""
+    fig.clear()
+    axs = fig.subplots(3, 3)
+    n, dt, vf = results[0].N, results[0].dt, results[0].vel_frame
+    colors = [f"C{i}" for i in range(len(results))]
+    lab = ["x", "y", "z"]
+    for i in range(3):
+        for r, c in zip(results, colors):
+            _parity_track(axs[0, i], (lambda a: (lambda tr: tr["root_pos"][:, a]))(i), r, c, n, dt)
+        axs[0, i].set_title(f"root pos {lab[i]} (m, world)", fontsize=9)
+        for r, c in zip(results, colors):
+            _parity_track(axs[1, i], (lambda a: (lambda tr: tr["root_lin_vel"][:, a]))(i), r, c, n, dt)
+        axs[1, i].set_title(f"root lin vel {lab[i]} ({vf}, m/s)", fontsize=9)
+    ax = axs[2, 0]
+    for r, c in zip(results, colors):
+        ax.plot(r.gt["root_pos"][:, 0], r.gt["root_pos"][:, 1], color=c, lw=1.8, zorder=5, label=r.label)
+        for a, pred in r.preds:
+            ax.plot(pred["root_pos"][n - 1:, 0], pred["root_pos"][n - 1:, 1], color=c, lw=0.7, alpha=0.25, zorder=3)
+    ax.set_title("root xy path (m, world)", fontsize=9)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("x (m)")
+    for r, c in zip(results, colors):
+        _parity_track(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), r, c, n, dt)
+    axs[2, 1].set_title("root yaw (rad)", fontsize=9)
+    if "ee_pos" in results[0].gt:
+        for r, c in zip(results, colors):
+            _parity_track(axs[2, 2], lambda tr: tr["ee_pos"][:, 0, 2], r, c, n, dt)
+        axs[2, 2].set_title(f"{results[0].frame_names[0]} pos z (m, world)", fontsize=8)
+    else:
+        axs[2, 2].set_visible(False)
+    h, lbls = axs[0, 0].get_legend_handles_labels()
+    fig.legend(h, lbls, loc="upper right", fontsize=10)
+    fig.suptitle("parity: " + " vs ".join(r.label for r in results)
+                 + "  (solid = rollout, thin = FM forecasts)  --  ROOT", fontsize=12)
+
+
+def draw_parity_cmd(fig, results: list[ForecastResult]) -> None:
+    """Recorded commanded velocity per source over the parity episode (should ~match)."""
+    fig.clear()
+    axs = fig.subplots(1, 3)
+    dt = results[0].dt
+    colors = [f"C{i}" for i in range(len(results))]
+    comps = ["vx", "vy", "wz"]
+    for i in range(3):
+        for r, c in zip(results, colors):
+            L = r.gt["root_pos"].shape[0]
+            off = r.cmd_context_offset
+            cmd = r.cmd_context[off:off + L]
+            axs[i].plot(np.arange(cmd.shape[0]) * dt, cmd[:, i], color=c, lw=1.6, label=r.label)
+        axs[i].set_title(f"command {comps[i]}", fontsize=10)
+        axs[i].set_xlabel("time (s)")
+        axs[i].grid(True, alpha=0.3)
+    h, lbls = axs[0].get_legend_handles_labels()
+    fig.legend(h, lbls, loc="upper right", fontsize=9)
+    fig.suptitle("parity: recorded commanded velocity (" + " vs ".join(r.label for r in results) + ")", fontsize=12)
+
+
+# ======================================================================
 # 7. figure browser + PNG save
 # ======================================================================
 @dataclass
@@ -1588,6 +1734,125 @@ def dump_rollout(res: RolloutResult, path: str) -> None:
 
 
 # ======================================================================
+# 7c. viser visualization (reuses robot_rl.flow_matching.viz, no IsaacSim)
+# ======================================================================
+def _flat_terrain(center_xy: tuple[float, float], half: float = 15.0, z: float = 0.0):
+    """A simple ground-plane mesh (two triangles) centered at ``center_xy``."""
+    cx, cy = center_xy
+    v = np.array([[cx - half, cy - half, z], [cx + half, cy - half, z],
+                  [cx + half, cy + half, z], [cx - half, cy + half, z]], dtype=np.float32)
+    f = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    return v, f
+
+
+def forecast_multi_to_viz(results: list[ForecastResult], ctx: FmOnlineContext, urdf_path: str, args):
+    """Build a multi-robot viz recording: one robot per forecast (GT robot + ghosts).
+
+    Each robot is re-anchored to its own lane (start x=0, y spread across robots) so
+    several gaits can be watched side-by-side; predictions are translated by the same
+    per-robot offset and flattened with a per-robot ``pred_index``.
+    """
+    from robot_rl.flow_matching.viz import VizRecordingMeta  # lazy (viser/yourdfpy)
+
+    r_n = len(results)
+    L = min(res.gt["root_pos"].shape[0] for res in results)  # equal in practice; align defensively
+    n, nj = ctx.N, ctx.nj
+    fwin = results[0].preds[0][1]["root_pos"].shape[0] if results[0].preds else n
+    fnov = max(1, fwin - n)
+    spacing = args.viz_lane_spacing
+
+    root_pos = np.zeros((L, r_n, 3), np.float32)
+    root_quat = np.zeros((L, r_n, 4), np.float32)
+    joint = np.zeros((L, r_n, nj), np.float32)
+    vel_cmd = np.zeros((L, r_n, 3), np.float32)
+    pidx = np.full((L, r_n), -1, np.int32)
+    pred_rp_l: list[np.ndarray] = []
+    pred_rq_l: list[np.ndarray] = []
+    pred_jp_l: list[np.ndarray] = []
+    pred_base = 0
+    for r, res in enumerate(results):
+        rp = res.gt["root_pos"][:L].astype(np.float32).copy()
+        lane_y = (r - (r_n - 1) / 2.0) * spacing
+        off = np.array([-rp[0, 0], lane_y - rp[0, 1], 0.0], np.float32)  # start at (0, lane), keep z
+        rp += off
+        root_pos[:, r] = rp
+        root_quat[:, r] = res.gt["root_quat"][:L]
+        joint[:, r] = res.gt["joint_pos"][:L]
+        o = res.cmd_context_offset
+        cmd = res.cmd_context[o:o + L].astype(np.float32)
+        if cmd.shape[0] < L:
+            cmd = np.concatenate([cmd, np.tile(cmd[-1:], (L - cmd.shape[0], 1))], axis=0)
+        vel_cmd[:, r] = cmd[:L]
+        anchors = [a for a, _ in res.preds]
+        for a, pred in res.preds:
+            prp = pred["root_pos"][n:].astype(np.float32).copy()
+            prp += off
+            pred_rp_l.append(prp)
+            pred_rq_l.append(pred["root_quat"][n:].astype(np.float32))
+            pred_jp_l.append(pred["joint_pos"][n:].astype(np.float32))
+        for p, a in enumerate(anchors):
+            if a >= L:
+                continue
+            nxt = anchors[p + 1] if p + 1 < len(anchors) else L
+            pidx[a:min(nxt, L), r] = pred_base + p
+        pred_base += len(res.preds)
+
+    pred_rp = np.stack(pred_rp_l) if pred_rp_l else np.zeros((1, fnov, 3), np.float32)
+    pred_rq = np.stack(pred_rq_l) if pred_rq_l else np.tile(np.array([0, 0, 0, 1], np.float32), (1, fnov, 1))
+    pred_jp = np.stack(pred_jp_l) if pred_jp_l else np.zeros((1, fnov, nj), np.float32)
+
+    allxy = root_pos[..., :2].reshape(-1, 2)
+    cx, cy = float(allxy[:, 0].mean()), float(allxy[:, 1].mean())
+    half = max(5.0, float((allxy.max(0) - allxy.min(0)).max()) / 2.0 + 3.0)
+    tv, tf = _flat_terrain((cx, cy), half=half)
+    data = {
+        "root_pos": root_pos, "root_quat_xyzw": root_quat, "joint_pos": joint,
+        "vel_cmd": vel_cmd, "done": np.zeros((L, r_n), np.uint8), "pred_index": pidx,
+        "pred_root_pos": pred_rp, "pred_root_quat_xyzw": pred_rq, "pred_joint_pos": pred_jp,
+        "terrain_vertices": tv, "terrain_faces": tf,
+    }
+    meta = VizRecordingMeta(
+        urdf_path=urdf_path, task_name="fm_test_bench/forecast", fm_checkpoint=args.fm_checkpoint,
+        recorded_at=datetime.now().isoformat(timespec="seconds"), quat_format="xyzw", dry_run=False,
+        dt=results[0].dt, update_every=max(1, args.forecast_stride), num_envs=r_n, num_steps=L,
+        history_len=n, future_len=fnov, num_joints=nj, num_scan_rays=0,
+        joint_names=list(ctx.joint_names), terrain_source="plane_fallback",
+    )
+    return data, meta
+
+
+def rollout_to_viz(res: RolloutResult, ctx: FmOnlineContext, urdf_path: str, args):
+    """Build a viz recording (data, meta) from an autoregressive rollout (robot only)."""
+    from robot_rl.flow_matching.viz import VizRecordingMeta  # lazy
+
+    if "root_pos" not in res.traj:
+        raise SystemExit("[bench] rollout produced no steps to visualize.")
+    rp = res.traj["root_pos"].astype(np.float32)
+    rq = res.traj["root_quat"].astype(np.float32)
+    jp = res.traj["joint_pos"].astype(np.float32)
+    t_n, nj = rp.shape[0], jp.shape[1]
+    cmd = res.cmd.astype(np.float32) if res.cmd.shape[0] == t_n else np.zeros((t_n, 3), np.float32)
+    tv, tf = _flat_terrain((float(rp[:, 0].mean()), float(rp[:, 1].mean())))
+    data = {
+        "root_pos": rp[:, None, :], "root_quat_xyzw": rq[:, None, :], "joint_pos": jp[:, None, :],
+        "vel_cmd": cmd[:, None, :], "done": np.zeros((t_n, 1), np.uint8),
+        "pred_index": np.full((t_n, 1), -1, np.int32),  # no prediction ghosts for the rollout
+        "pred_root_pos": np.zeros((1, 1, 3), np.float32),
+        "pred_root_quat_xyzw": np.tile(np.array([0, 0, 0, 1], np.float32), (1, 1, 1)),
+        "pred_joint_pos": np.zeros((1, 1, nj), np.float32),
+        "terrain_vertices": tv, "terrain_faces": tf,
+    }
+    meta = VizRecordingMeta(
+        urdf_path=urdf_path, task_name="fm_test_bench/rollout", fm_checkpoint=args.fm_checkpoint,
+        recorded_at=datetime.now().isoformat(timespec="seconds"), quat_format="xyzw", dry_run=False,
+        dt=res.dt, update_every=max(1, args.advance), num_envs=1, num_steps=t_n,
+        history_len=ctx.N, future_len=1, num_joints=nj, num_scan_rays=0,
+        joint_names=list(ctx.joint_names), terrain_source="plane_fallback",
+    )
+    return data, meta
+
+
+# ======================================================================
 # 8. CLI + main
 # ======================================================================
 def choose_backend(save: bool):
@@ -1607,7 +1872,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to the FM .pt checkpoint (default: latest logs/flow_matching/*/best.pt).")
     p.add_argument("--data", default=None, help="Recording .npz (default: auto-resolve from the run dir).")
     p.add_argument("--mode",
-                   choices=["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout", "all"],
+                   choices=["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout",
+                            "parity", "viz", "all"],
                    default="all")
     p.add_argument("--device", default="cpu")
     p.add_argument("--num_sampling_steps", type=int, default=None, help="Override Euler step count.")
@@ -1653,11 +1919,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="MuJoCo G1 model for the EE-vs-FK consistency page (FK of generated joints).")
     p.add_argument("--no-fk", action="store_true",
                    help="Skip the generated-EE-vs-FK(generated-joints) consistency page.")
+    # parity compare (teacher vs tracker, both tracking the parity clip)
+    p.add_argument("--parity-teacher",
+                   default=os.path.join(ROOT, "logs", "flow_matching", "test_bench", "parity_teacher"),
+                   help="Teacher-on-parity record_data .npz (or a dir; newest .npz is used).")
+    p.add_argument("--parity-tracker",
+                   default=os.path.join(ROOT, "logs", "flow_matching", "test_bench", "parity_tracker"),
+                   help="Tracker-on-parity record_data .npz (or a dir; newest .npz is used). Optional.")
     # rollout
     p.add_argument("--rollout_steps", type=int, default=200)
     p.add_argument("--advance", type=int, default=1, help="Predicted steps consumed per inference (<=F).")
     p.add_argument("--rollout-cmd", default="1.0,0,0", help="'vx,vy,wz' or 'ramp:a:b'.")
     p.add_argument("--rollout-seed-history", default="walking")
+    # viser visualization (--mode viz): play the generated motion as a 3D G1 robot
+    p.add_argument("--viz-source", choices=["forecast", "rollout", "parity"], default="forecast",
+                   help="What --mode viz visualizes: forecast (GT robots + ghosts), rollout, or parity "
+                        "(robot 0 = teacher, robot 1 = tracker, each tracking the parity clip with FM ghosts).")
+    p.add_argument("--urdf", default=os.path.join(ROOT, "robot_assets", "g1", "g1_21j", "g1_21j.urdf"),
+                   help="Robot URDF rendered by the viser viz.")
+    p.add_argument("--viz-port", type=int, default=8080, help="Viser server port for --mode viz.")
+    p.add_argument("--viz-ghosts", type=int, default=6, help="Initially shown prediction ghosts (forecast viz).")
+    p.add_argument("--viz-max-ghosts", type=int, default=10, help="Ghost slot-pool size (forecast viz).")
+    p.add_argument("--viz-robots", type=int, default=4,
+                   help="Forecast viz: number of robots (one per gait from --viz-histories), shown in lanes.")
+    p.add_argument("--viz-histories", default="standing,walking,running,turning",
+                   help="Forecast viz: comma-separated canonical gaits, one robot each (capped at --viz-robots).")
+    p.add_argument("--viz-len", type=int, default=300,
+                   help="Forecast viz: ground-truth steps per robot (default ~2x the forecast-plot default).")
+    p.add_argument("--viz-lane-spacing", type=float, default=2.0,
+                   help="Forecast viz: lateral spacing (m) between the lane-aligned robots.")
     # plotting / output
     p.add_argument("--vel-frame", choices=["body", "world"], default="body",
                    help="Frame for plotted linear/angular velocities (body = base/heading frame, "
@@ -1699,29 +1989,111 @@ def main() -> int:
           f"cmd_dim={ctx.cmd_dim} num_cmd_tokens={ctx.num_cmd_tokens} "
           f"target_frames={ctx.target_frame_names} steps={ctx.num_steps}")
 
-    data_path = resolve_data_path(args.fm_checkpoint, args.data)
-    data, meta = load_recording_lite(data_path)
-    data["_num_envs"] = np.int64(meta.num_envs)
-    ctx.dt_attr = meta.dt  # attach dt for plotting (FmOnlineContext has no dt field)
-
-    if meta.state_joint_names != list(ctx.joint_names):
-        raise ValueError(
-            "joint order mismatch between recording and checkpoint:\n"
-            f"  recording: {meta.state_joint_names}\n  checkpoint: {ctx.joint_names}"
-        )
-    if meta.state_frame_names != list(ctx.target_frame_names):
-        raise ValueError(
-            "frame order mismatch between recording and checkpoint:\n"
-            f"  recording: {meta.state_frame_names}\n  checkpoint: {ctx.target_frame_names}"
-        )
-
-    layout = StateLayout(meta)
+    # Parity modes load their own (teacher/tracker) recordings; everything else needs
+    # the default recording (mined for stretches / canonical histories).
+    parity_run = args.mode == "parity" or (args.mode == "viz" and args.viz_source == "parity")
+    data = layout = None
+    if not parity_run:
+        data_path = resolve_data_path(args.fm_checkpoint, args.data)
+        data, meta = load_recording_lite(data_path)
+        data["_num_envs"] = np.int64(meta.num_envs)
+        ctx.dt_attr = meta.dt  # attach dt for plotting (FmOnlineContext has no dt field)
+        if meta.state_joint_names != list(ctx.joint_names):
+            raise ValueError(
+                "joint order mismatch between recording and checkpoint:\n"
+                f"  recording: {meta.state_joint_names}\n  checkpoint: {ctx.joint_names}"
+            )
+        if meta.state_frame_names != list(ctx.target_frame_names):
+            raise ValueError(
+                "frame order mismatch between recording and checkpoint:\n"
+                f"  recording: {meta.state_frame_names}\n  checkpoint: {ctx.target_frame_names}"
+            )
+        layout = StateLayout(meta)
 
     def get_window(name: str) -> Window:
         if name not in CANONICAL_CMDS:
             raise ValueError(f"unknown canonical history {name!r}; choose from {list(CANONICAL_CMDS)}")
         return find_window(data, layout, ctx, CANONICAL_CMDS[name], name, args.n_envs_scan, device,
                            steady_weight=args.steady_weight)
+
+    def parity_results() -> list[ForecastResult]:
+        """Forecast teacher- and (if available) tracker-on-parity recordings."""
+        results = [run_parity_forecast(ctx, latest_npz(args.parity_teacher), "teacher", args, device)]
+        try:
+            results.append(run_parity_forecast(ctx, latest_npz(args.parity_tracker), "tracker", args, device))
+        except SystemExit as ex:
+            print(f"[bench] parity: tracker recording unavailable ({ex}); teacher only.")
+        return results
+
+    # -- viser visualization mode: build a recording from a forecast/rollout and serve it --
+    if args.mode == "viz":
+        try:
+            from robot_rl.flow_matching.viz import FlowMatchingViewer, save_viz_recording, unique_output_path
+        except Exception as ex:  # viser / yourdfpy / robot_rl viz unavailable
+            raise SystemExit(f"[bench] viz unavailable ({type(ex).__name__}: {str(ex)[:120]}); "
+                             f"needs viser + yourdfpy (and the robot_rl.flow_matching.viz package).")
+        if not os.path.exists(args.urdf):
+            raise SystemExit(f"[bench] --urdf not found: {args.urdf}")
+        if args.viz_source == "parity":
+            results = parity_results()  # robot 0 = teacher, robot 1 = tracker (if available)
+            vdata, vmeta = forecast_multi_to_viz(results, ctx, args.urdf, args)
+            print(f"[bench] viz parity: {len(results)} robots ({', '.join(r.label for r in results)})")
+        elif args.viz_source == "rollout":
+            vdata, vmeta = rollout_to_viz(run_rollout(ctx, get_window(args.rollout_seed_history), args, device),
+                                          ctx, args.urdf, args)
+        else:
+            gaits = [g.strip() for g in args.viz_histories.split(",") if g.strip()][:max(1, args.viz_robots)]
+            results: list[ForecastResult] = []
+            for g in gaits:
+                a = copy.copy(args)
+                a.forecast_hist, a.forecast_len, a.no_fk = g, args.viz_len, True  # FK not needed for viz
+                try:
+                    results.append(run_forecast(ctx, data, layout, a, device))
+                except Exception as ex:  # e.g. no steady stretch of that gait/length
+                    print(f"[bench] viz: skipping gait {g!r} ({type(ex).__name__}: {str(ex)[:80]})")
+            if not results:
+                raise SystemExit("[bench] no viz robots could be built; try other --viz-histories / lower --viz-len.")
+            vdata, vmeta = forecast_multi_to_viz(results, ctx, args.urdf, args)
+            print(f"[bench] viz: {len(results)} robots ({', '.join(gaits[:len(results)])}), "
+                  f"{vmeta.num_steps} steps each")
+        out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        rec_path = unique_output_path(out_dir, prefix=f"viz_{args.viz_source}")
+        save_viz_recording(rec_path, vdata, vmeta)
+        print(f"[bench] saved viz recording: {rec_path}")
+        print(f"[bench] launching viser on port {args.viz_port} -- open http://localhost:{args.viz_port} "
+              f"(Ctrl-C to quit; re-view later with scripts/flow_matching/visualize.py --data <rec>)")
+        viewer = FlowMatchingViewer(vdata, vmeta, args.urdf, port=args.viz_port,
+                                    max_ghosts=args.viz_max_ghosts,
+                                    initial_ghosts=min(args.viz_ghosts, args.viz_max_ghosts))
+        try:
+            viewer.run()
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    # -- parity compare mode: teacher vs tracker on the parity clip (overlay plots) --
+    if args.mode == "parity":
+        results = parity_results()
+        pages = [
+            Page("parity / root", lambda fig, r=results: draw_parity(fig, r)),
+            Page("parity / command", lambda fig, r=results: draw_parity_cmd(fig, r)),
+        ]
+        for r in results:  # per-source detail (the standard forecast pages)
+            pages.append(Page(f"parity / {r.label} / root", lambda fig, rr=r: draw_forecast(fig, rr)))
+            pages.append(Page(f"parity / {r.label} / xy", lambda fig, rr=r: draw_forecast_path(fig, rr)))
+            if "fk_ee_pos" in r.gt:
+                pages.append(Page(f"parity / {r.label} / ee vs fk", lambda fig, rr=r: draw_forecast_fk(fig, rr)))
+        browser = FigureBrowser(pages, plt)
+        out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        if args.dump_data:
+            os.makedirs(out_dir, exist_ok=True)
+            for r in results:
+                dump_forecast(r, os.path.join(out_dir, f"parity_{r.label}.npz"))
+        if interactive:
+            browser.show()
+        else:
+            browser.save_all(out_dir)
+        return 0
 
     pages: list[Page] = []
     modes = (["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout"]
