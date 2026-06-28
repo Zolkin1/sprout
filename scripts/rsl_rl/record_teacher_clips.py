@@ -330,13 +330,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             max_ori_err = torch.zeros(n_envs, device=device)
 
             with torch.inference_mode():
+                # ``env.reset`` does not run the command's ``compute``, so ``y_act``/``y_des``
+                # are stale until the first step. Compute once so frame 0 (the phase-0 spawn
+                # pose) is valid -- we now record the CURRENT phase BEFORE stepping.
+                cmd.compute(env.unwrapped.step_dt)
                 for t in range(T):
-                    actions = policy(obs, stochastic_output=args_cli.stochastic)
-                    obs, _, dones, _ = env.step(actions)
-                    _reset_policy(dones)  # no-op: terminations disabled, but keeps state clean
-
-                    # Measured (achieved) world-frame outputs -> clip-world via the
-                    # inverse of the per-env placement; store as the new clip's y_des/dy_des.
+                    # Record the CURRENT (pre-step) achieved state + source-aligned labels,
+                    # then advance. ``cmd._step == start_step + episode_length_buf`` equals t
+                    # here (before this step increments it), so frame t <-> source clip phase t.
+                    # (Recording AFTER env.step read phase t+1, which shifted the recorded
+                    # target_vel / contact / skill / stride one frame ahead of the source clip.)
                     y_cw, dy_cw = unbake_outputs_from_world(
                         cmd.y_act, cmd.dy_act, cmd.clip_world_pos, cmd.clip_world_quat,
                         pos_names, vel_names,
@@ -361,6 +364,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     ori_err = _base_orientation_error(cmd.y_act[:, base_ori_idx], cmd.y_des[:, base_ori_idx])
                     max_pos_err = torch.maximum(max_pos_err, pos_err)
                     max_ori_err = torch.maximum(max_ori_err, ori_err)
+
+                    # Advance to the next frame.
+                    actions = policy(obs, stochastic_output=args_cli.stochastic)
+                    obs, _, dones, _ = env.step(actions)
+                    _reset_policy(dones)  # no-op: terminations disabled, but keeps state clean
 
             batch = {
                 "y_des": y_buf[:n], "dy_des": dy_buf[:n], "contact": contact_buf[:n],
