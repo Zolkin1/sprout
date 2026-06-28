@@ -26,12 +26,15 @@ def base_pose_error_termination(
     max_ori_rad: float = 0.8,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Terminate when the base pose drifts too far from the clip reference.
+    """Terminate when the base pose drifts too far from the tracking reference.
 
     The single failure termination for open-loop motion-sequence tracking
     (replaces the pelvis-upright / base-height / frame-drift terminations).
-    Compares the robot's world base pose against the clip's reference base
-    pose (from :meth:`MotionSequenceCommand.reference_world_state`):
+    Compares the robot's world base pose against the reference base pose served
+    by :meth:`MotionSequenceCommand.termination_reference_world_state` -- the
+    tracked reference for clip- and open-loop-FM envs, but the **clip** reference
+    for closed-loop-FM envs (so a robot that stalls while the clip marches on
+    terminates instead of riding a stationary FM prediction):
 
       * position: terminate if ``||ref_pos - root_pos|| > max_pos_dist`` (m).
       * orientation: terminate if the geodesic angle between the reference
@@ -49,7 +52,7 @@ def base_pose_error_termination(
     """
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
-    state = cmd.reference_world_state()
+    state = cmd.termination_reference_world_state()
     ref_pos_w = state[:, 0:3]
     ref_quat_w = state[:, 3:7]                      # wxyz
     root_pos_w = wp.to_torch(asset.data.root_pos_w)

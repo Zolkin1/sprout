@@ -32,6 +32,49 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     signal); the remaining ``1 - clip_fraction`` track the FM generator.  The
     per-env assignment is re-rolled on every reset."""
 
+    closed_loop_fraction: float = 0.5
+    """Fraction of the **FM-tracking** envs that are *closed-loop* (the rest are
+    *open-loop*).  Both buckets still track the FM generator's prediction; they
+    differ only in the velocity command fed to the FM and in the pose-drift
+    termination reference:
+
+      * **open-loop FM** (``1 - closed_loop_fraction`` of the FM envs): the FM is
+        fed the clip's open-loop ``target_vel`` and the pose-drift termination is
+        graded against the FM reference (the original behavior);
+      * **closed-loop FM** (``closed_loop_fraction`` of the FM envs): the FM is
+        fed a feedforward + proportional position controller that tracks the
+        clip's *moving* position reference, and the pose-drift termination is
+        graded against the **clip** reference -- so a robot that stalls while the
+        clip marches on accrues a growing corrective command and terminates.
+
+    The actor/critic see no flag identifying the bucket.  ``0`` ⇒ all FM envs are
+    open-loop (the original behavior).  Re-rolled (within the FM envs) on every
+    reset."""
+
+    pd_pos_kp: float = 1.5
+    """Proportional gain (1/s) on the world-frame base position error for the
+    closed-loop velocity command."""
+
+    pd_pos_kd: float = 0.0
+    """Derivative gain on the robot's base-frame planar velocity for the
+    closed-loop velocity command (damping; ``0`` disables)."""
+
+    pd_yaw_kp: float = 1.0
+    """Proportional gain (1/s) on the wrapped base yaw error for the closed-loop
+    yaw-rate command."""
+
+    pd_yaw_kd: float = 0.0
+    """Derivative gain on the robot's base yaw rate for the closed-loop yaw-rate
+    command (damping; ``0`` disables)."""
+
+    pd_max_lin_vel: float = 2.0
+    """Symmetric clamp (m/s) on each planar component of the closed-loop velocity
+    command.  Should bracket the clip library's ``target_vel`` range so the FM's
+    command conditioning stays in-distribution."""
+
+    pd_max_ang_vel: float = 2.0
+    """Symmetric clamp (rad/s) on the closed-loop yaw-rate command."""
+
     fm_handoff_time_s: float = -1.0
     """If ``>= 0``, every env tracks the clip for the first ``fm_handoff_time_s`` seconds
     of the episode, then hands off to the flow-matching generator -- a single time-based

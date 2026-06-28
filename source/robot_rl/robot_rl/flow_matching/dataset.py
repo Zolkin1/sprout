@@ -164,9 +164,15 @@ def filter_windows_by_recovery(
         return windows
     if mode != "clean_prediction":
         raise ValueError(f"Unknown recovery_mode {mode!r}; expected 'clean_prediction' or 'all'.")
-    pa = np.asarray(perturb_active)
-    n = num_history_states
-    return [w for w in windows if not pa[w[n:]].any()]
+    if not windows:
+        return windows
+    # Vectorized over all windows at once (a per-window Python loop is too slow at the
+    # ~10M-window scale of large recordings): keep windows whose prediction region
+    # (steps num_history_states..F) has no active perturbation flag.
+    pa = np.asarray(perturb_active).astype(bool)
+    idx = np.stack(windows)  # (Nw, F)
+    keep = ~pa[idx[:, num_history_states:]].any(axis=1)  # (Nw,)
+    return [windows[i] for i in np.nonzero(keep)[0].tolist()]
 
 
 class FutureStateDataset(Dataset):

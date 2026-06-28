@@ -425,6 +425,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         joint_vel = self.dy_des[:, self._base_idx["joint_vel"]]
         return torch.cat([self._wf_world_frames[:, 0, :], joint_pos, joint_vel], dim=-1)
 
+    def termination_reference_world_state(self) -> torch.Tensor:
+        """World-frame reference state used by the pose-drift termination.
+
+        Defaults to the tracked reference (:meth:`reference_world_state`).
+        :class:`GeneratorTrackingCommand` overrides this so closed-loop FM envs
+        are graded against the clip reference rather than the FM prediction.
+        """
+        return self.reference_world_state()
+
     def _frame_output_indices(self, frame_name: str) -> dict[str, torch.Tensor]:
         """Resolve (and cache) the y_des/dy_des indices for one output frame.
 

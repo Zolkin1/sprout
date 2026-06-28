@@ -110,6 +110,13 @@ parser.add_argument(
          "root+joints only.",
 )
 parser.add_argument(
+    "--clip", type=str, default=None,
+    help="Override the clip library the teacher tracks (sets commands.traj_ref.path), e.g. "
+         "clips/g1_recovery_v1.h5. Default: the task config's clip (clips/g1_flat_v1.h5 for the "
+         "teacher tasks). The recorded distribution mirrors THIS clip, so point it at the library "
+         "you generated.",
+)
+parser.add_argument(
     "--clip_device", type=str, default=None,
     help="Device to hold the motion-clip library on (e.g. 'cpu' to keep the multi-GB "
          "library off a small GPU; gathers copy only the per-env slice). Default: env device.",
@@ -493,6 +500,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.seed = agent_cfg.seed
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
         env_cfg.log_dir = log_dir
+
+        # Override which clip library the teacher tracks (the recorded distribution
+        # mirrors this clip). Done before auto_clip_device so its size check sees it.
+        if args_cli.clip is not None:
+            traj_ref = getattr(getattr(env_cfg, "commands", None), "traj_ref", None)
+            if traj_ref is None or not hasattr(traj_ref, "path"):
+                raise ValueError("--clip given but the task has no commands.traj_ref.path to override.")
+            print(f"[INFO] Overriding clip library: {traj_ref.path} -> {args_cli.clip}")
+            traj_ref.path = args_cli.clip
 
         # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
         # OOM a small card at scene init). Explicit --clip_device overrides.

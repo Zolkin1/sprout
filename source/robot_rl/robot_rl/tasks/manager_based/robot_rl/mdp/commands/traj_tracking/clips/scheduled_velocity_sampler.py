@@ -59,9 +59,13 @@ class ScheduledVelocitySampler(OfflineVelocitySampler):
             are skill names; missing skills default to 0). Normalised internally.
         transition_fraction: Target fraction of total time spent ramping between
             settled velocities (``0..1``). The remainder is steady (held) time.
-        standing_transition_fraction: Probability that a gap between two
-            consecutive moving holds becomes a stop (a standing hold inserted
-            between them -> a stop/go cycle). ``0`` disables inserted stops.
+        standing_transition_fraction: Controls how the standing-time budget
+            (``skill_time_fractions[standing]``) is chunked into stops -- the number
+            of standing holds inserted between moving holds is
+            ``max(1, round(standing_transition_fraction * num_gaps))`` whenever the
+            standing budget is positive. Higher -> more, shorter stops (more stop/go
+            cycles); lower -> fewer, longer stands. The standing *occupancy* is set
+            by ``skill_time_fractions[standing]``, not this knob.
         hold_duration_range: ``(min, max)`` seconds; sets the average held-segment
             length (drives how many holds, hence transitions, a clip contains).
         command_dt: Control-step dt the schedule is sampled at (seconds).
@@ -133,14 +137,6 @@ class ScheduledVelocitySampler(OfflineVelocitySampler):
         )
         if self._moving_idx.size == 0 and self._standing_idx is None:
             raise ValueError("skill_time_fractions selects no usable skills.")
-        p_stand = float(self._skill_frac[self._standing_idx]) if self._standing_idx is not None else 0.0
-        if p_stand > 0.0 and self.standing_transition_fraction == 0.0:
-            print(
-                "[ScheduledVelocitySampler] WARN: standing has a positive time fraction but "
-                "standing_transition_fraction=0, so no stops are inserted and standing time will "
-                "be ~0. Raise --standing-transition-frac to realize standing occupancy."
-            )
-
         # Bucket tables as numpy for the planner (the base class holds them on device).
         self._bx = self.lin_x.cpu().numpy()  # [S, 2]
         self._by = self.lin_y.cpu().numpy()
@@ -205,16 +201,22 @@ class ScheduledVelocitySampler(OfflineVelocitySampler):
         avg_hold_s = 0.5 * (self.hold_duration_range[0] + self.hold_duration_range[1])
         num_moving_holds = max(1, int(round(moving_steady * dt / max(avg_hold_s, dt))))
 
-        # Decide which gaps between consecutive moving holds become stops.
+        # Place the standing-time budget across one or more stops. Standing OCCUPANCY
+        # (skill_time_fractions[standing]) is the budget and is realized whenever it is
+        # positive (>=1 stop, so short clips with few gaps still get their standing
+        # time); standing_transition_fraction scales the NUMBER of separate stops
+        # (chunking): higher -> more, shorter stops spread over more gaps.
         num_gaps = max(0, num_moving_holds - 1)
+        num_stops = 0
         if self._standing_idx is not None and standing_steady > 0 and num_gaps > 0:
-            stop_flags = self._np_rng.random(num_gaps) < self.standing_transition_fraction
-        else:
-            stop_flags = np.zeros(num_gaps, dtype=bool)
-        num_stops = int(stop_flags.sum())
+            num_stops = max(1, int(round(self.standing_transition_fraction * num_gaps)))
+            num_stops = min(num_stops, num_gaps)
         if num_stops == 0:
-            # No standing holds placed: give the standing budget back to moving.
+            # No room for a stop (single hold) or no standing requested: all steady moving.
             moving_steady, standing_steady = n_steady, 0
+        stop_gaps = set()
+        if num_stops > 0:
+            stop_gaps = set(self._np_rng.choice(num_gaps, size=num_stops, replace=False).tolist())
 
         # Assign moving-hold skills + durations.
         if self._moving_idx.size > 0:
@@ -232,7 +234,7 @@ class ScheduledVelocitySampler(OfflineVelocitySampler):
         si = 0
         for i in range(num_moving_holds):
             holds.append((int(move_skills[i]), int(move_durs[i])))
-            if i < num_gaps and stop_flags[i]:
+            if i in stop_gaps:
                 holds.append((int(self._standing_idx), int(stand_durs[si])))
                 si += 1
 

@@ -45,6 +45,8 @@ from robot_rl.flow_matching.online import (
 
 from .motion_sequence_cmd import MotionSequenceCommand
 from .generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
+from .closed_loop_command import compute_closed_loop_command, roll_buckets
+from .world_lift import lift_base_world_state
 
 
 class GeneratorTrackingCommand(MotionSequenceCommand):
@@ -133,6 +135,16 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
 
         # -- per-env source mask (True => FM), prediction buffers, cadence state --
         self._fm_mask = torch.zeros(n, dtype=torch.bool, device=dev)  # re-rolled each reset
+        # Closed-loop FM envs (subset of _fm_mask): feed the FM a position-tracking
+        # PD command instead of the clip's open-loop target_vel, and grade the
+        # pose-drift termination against the clip (re-rolled each reset).
+        self._closed_loop_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-step closed-loop command cache (computed for all envs; applied only
+        # to closed-loop FM envs via the get_command_velocity* overrides).
+        self._cmd_vel_cache = torch.zeros(n, 3, device=dev)
+        # Clip world reference frames at the current step (cached in _update_command
+        # for termination_reference_world_state); placeholder until first update.
+        self._clip_world_frames_buf = self._wf_world_frames
         # Latched per-env episode-reset flag (set in reset(), consumed in
         # _snapshot_and_infer). episode_length_buf == 0 is unobservable here --
         # see reset() for why -- so we record the reset directly.
@@ -209,6 +221,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Clip world reference (base + ee), lifted through the per-env placement
         # (frames in self._wf_frames == [base] + FM ee order).
         clip_frames = self._clip_world_frames()                      # [N, nf, 13]
+        # Cache the clip world frames so the pose-drift termination can grade
+        # closed-loop FM envs against the clip even when they track the FM.
+        self._clip_world_frames_buf = clip_frames
 
         # FM world reference at the current advance index, in the same order.
         fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
@@ -260,9 +275,17 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         just_reset = self._pending_reset.clone()
         self._pending_reset[just_reset] = False
         if bool(just_reset.any()):
-            # Re-roll the per-env source (True => FM) for envs that just reset.
-            roll_fm = torch.rand(self.num_envs, device=self.device) >= self.cfg.clip_fraction
-            self._fm_mask = torch.where(just_reset, roll_fm, self._fm_mask)
+            # Re-roll the per-env source (True => FM) for envs that just reset, and
+            # the open/closed-loop split within the FM envs (closed-loop is a subset
+            # of FM).
+            new_fm, new_cl = roll_buckets(
+                torch.rand(self.num_envs, device=self.device),
+                torch.rand(self.num_envs, device=self.device),
+                self.cfg.clip_fraction,
+                self.cfg.closed_loop_fraction,
+            )
+            self._fm_mask = torch.where(just_reset, new_fm, self._fm_mask)
+            self._closed_loop_mask = torch.where(just_reset, new_cl, self._closed_loop_mask)
             self._pred_valid = self._pred_valid & ~just_reset
             self._pred_idx = torch.where(just_reset, torch.zeros_like(self._pred_idx), self._pred_idx)
 
@@ -275,6 +298,14 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         if self.cfg.fm_handoff_time_s >= 0.0:
             handoff_step = round(self.cfg.fm_handoff_time_s / self.manager.dt)
             self._fm_mask = self._step >= handoff_step
+            # Handoff is an eval/sim2sim-comparison path; keep every env open-loop
+            # so the FM is fed the clip command (matches the MuJoCo runner).
+            self._closed_loop_mask = torch.zeros_like(self._closed_loop_mask)
+
+        # Closed-loop velocity command for this step (computed for all envs; the
+        # get_command_velocity* overrides apply it only to closed-loop FM envs).
+        # Must run before _run_fm so the FM command horizon reads the fresh value.
+        self._refresh_command_velocity_cache()
 
         # Snapshot the current world state (FM joint/frame order) into the history.
         perm = self._joint_perm
@@ -383,6 +414,101 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             self._pred_frame_lin[ar, idx], self._pred_frame_ang[ar, idx],
         ], dim=-1)  # [N,K,13]
         return base, ee, self._pred_jp[ar, idx], self._pred_jv[ar, idx]
+
+    # ------------------------------------------------------------------
+    # Closed-loop velocity command (position-tracking PD over the clip)
+    # ------------------------------------------------------------------
+
+    def _use_pd_mask(self) -> torch.Tensor:
+        """Per-env ``[N]`` bool: True where the closed-loop PD command is active.
+
+        Closed-loop FM envs use the PD command once their history window is valid
+        (the FM is live); during the brief warmup they track the clip, so they
+        fall back to the clip ``target_vel`` -- keeping the command consistent
+        with the reference each env is actually following.
+        """
+        return self._closed_loop_mask & self._history.valid()
+
+    @torch.no_grad()
+    def _refresh_command_velocity_cache(self) -> None:
+        """Recompute the per-env closed-loop velocity command for this step.
+
+        Tracks the clip's *moving* base position reference with feedforward (the
+        clip ``target_vel``) plus a proportional position controller, expressed
+        in the robot heading frame (the ``(vx, vy, wz)`` ``target_vel``
+        convention).  Computed for every env (cheap); only closed-loop FM envs
+        consume it (see :meth:`_use_pd_mask`).
+        """
+        # Clip base world pose at the current step.  Gather + lift directly (this
+        # runs before _update_command repopulates the clip y_des/dy_des).
+        y = self.manager.gather(self.manager.lib.y_des, self.clip_id, self._step)
+        dy = self.manager.gather(self.manager.lib.dy_des, self.clip_id, self._step)
+        pose = torch.cat([self.clip_world_pos, self.clip_world_quat], dim=-1)  # [N, 7]
+        clip_base = lift_base_world_state(y, dy, pose, self._base_idx)         # [N, ...]
+        clip_pos_w = clip_base[:, 0:3]
+        clip_quat_w = clip_base[:, 3:7]                                        # xyzw
+
+        v_ff = self.manager.gather_target_vel(self.clip_id, self._step)        # [N, 3] feedforward
+        self._cmd_vel_cache = compute_closed_loop_command(
+            v_ff,
+            clip_pos_w,
+            clip_quat_w,
+            wp.to_torch(self.robot.data.root_pos_w),
+            wp.to_torch(self.robot.data.root_quat_w),                          # xyzw
+            wp.to_torch(self.robot.data.root_link_lin_vel_b),
+            wp.to_torch(self.robot.data.root_link_ang_vel_b),
+            kp_pos=self.cfg.pd_pos_kp,
+            kd_pos=self.cfg.pd_pos_kd,
+            kp_yaw=self.cfg.pd_yaw_kp,
+            kd_yaw=self.cfg.pd_yaw_kd,
+            max_lin=self.cfg.pd_max_lin_vel,
+            max_ang=self.cfg.pd_max_ang_vel,
+        )
+
+    def get_command_velocity(self) -> torch.Tensor:
+        """Per-env commanded base velocity ``[N, 3]``: PD command for closed-loop
+        FM envs, the clip ``target_vel`` for the rest (clip + open-loop FM)."""
+        base = super().get_command_velocity()
+        use_pd = self._use_pd_mask()
+        return torch.where(use_pd[:, None], self._cmd_vel_cache, base)
+
+    def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
+        """Commanded-velocity horizon ``[N, num_future, 3]`` (the FM conditioning).
+
+        Closed-loop FM envs hold the current PD command constant across the
+        horizon; the rest use the clip's open-loop ``target_vel`` horizon.
+        """
+        base = super().get_command_velocity_horizon(num_future)
+        use_pd = self._use_pd_mask()
+        pd = self._cmd_vel_cache[:, None, :].expand_as(base)
+        return torch.where(use_pd[:, None, None], pd, base)
+
+    def get_future_command_velocity(self, offsets: torch.Tensor) -> torch.Tensor:
+        """Look-ahead commanded velocity ``[N, K, 3]`` (the ``future_command_velocity`` obs).
+
+        Closed-loop FM envs broadcast the current PD command over the look-ahead
+        window; the rest use the clip's open-loop ``target_vel``.
+        """
+        base = super().get_future_command_velocity(offsets)
+        use_pd = self._use_pd_mask()
+        pd = self._cmd_vel_cache[:, None, :].expand_as(base)
+        return torch.where(use_pd[:, None, None], pd, base)
+
+    def termination_reference_world_state(self) -> torch.Tensor:
+        """Reference state for the pose-drift termination, clip-relative for
+        closed-loop FM envs.
+
+        Open-loop FM envs keep the FM reference (the original behavior); clip
+        envs already use the clip.  For closed-loop FM envs the base row is
+        overwritten with the clip world base pose so a robot that stalls while
+        the clip marches on accrues drift and terminates.
+        """
+        state = self.reference_world_state()
+        cl = self._closed_loop_mask
+        if bool(cl.any()):
+            state = state.clone()
+            state[cl, 0:13] = self._clip_world_frames_buf[cl, 0, :]
+        return state
 
     # ------------------------------------------------------------------
     # Introspection for play-time logging / plots
@@ -604,8 +730,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     def _draw_source_markers(self) -> None:
         """Float a colored marker above each robot showing its tracking source.
 
-        Green => FM (history full, prediction live); yellow => assigned to the FM
-        but still warming up (falling back to the clip); white => clip.
+        Green => open-loop FM (history full, prediction live); blue => closed-loop
+        FM (PD command active); yellow => assigned to the FM but still warming up
+        (falling back to the clip); white => clip.
         """
         if self._source_markers is None:
             self._source_markers = self._create_source_markers()
@@ -614,9 +741,11 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
 
         use_fm = self._fm_mask & self._pred_valid
         warmup = self._fm_mask & ~self._pred_valid
+        closed = use_fm & self._closed_loop_mask
         idx = torch.ones(self.num_envs, dtype=torch.long, device=self.device)  # 1 => clip
-        idx[use_fm] = 0   # 0 => fm
+        idx[use_fm] = 0   # 0 => fm (open-loop)
         idx[warmup] = 2   # 2 => warmup
+        idx[closed] = 3   # 3 => fm (closed-loop)
 
         pos = wp.to_torch(self.robot.data.root_pos_w).clone()
         pos[:, 2] += float(self.cfg.debug_vis_source_marker_height)
@@ -655,8 +784,14 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             print(f"[WARN GeneratorTrackingCommand] could not import VisualizationMarkers: {exc}")
             return None
         radius = float(self.cfg.debug_vis_source_marker_radius)
-        # Insertion order fixes the marker_indices mapping: 0 => fm, 1 => clip, 2 => warmup.
-        colors = {"fm": (0.10, 0.90, 0.20), "clip": (0.90, 0.90, 0.90), "warmup": (0.95, 0.85, 0.10)}
+        # Insertion order fixes the marker_indices mapping:
+        # 0 => fm (open-loop), 1 => clip, 2 => warmup, 3 => fm (closed-loop).
+        colors = {
+            "fm": (0.10, 0.90, 0.20),
+            "clip": (0.90, 0.90, 0.90),
+            "warmup": (0.95, 0.85, 0.10),
+            "closed": (0.10, 0.45, 0.95),
+        }
         prototypes = {
             name: sim_utils.SphereCfg(
                 radius=radius,

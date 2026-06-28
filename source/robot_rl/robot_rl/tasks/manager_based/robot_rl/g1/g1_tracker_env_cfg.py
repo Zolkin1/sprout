@@ -67,7 +67,12 @@ class G1TrackerCommandsCfg:
         R_weights=WALKING_R_weights,
         # --- generator-tracking knobs ---
         fm_checkpoint=DEFAULT_FM_CHECKPOINT,
-        clip_fraction=0.35,
+        clip_fraction=0.2,
+        # Half the FM envs are closed-loop: the FM is fed a position-tracking PD
+        # command over the clip and the pose-drift termination is clip-relative,
+        # so stalling (which the open-loop FM lets the robot reward-hack) gets
+        # punished and terminated. The policy sees no flag for the bucket.
+        closed_loop_fraction=0.6,
         fm_update_every=2,
     )
 

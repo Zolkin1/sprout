@@ -121,23 +121,30 @@ def test_steady_occupancy_matches_moving_fractions():
     assert abs(occ_walk - 0.7) < 0.06, occ_walk
 
 
-def test_standing_transition_injects_stops():
-    """standing_transition_fraction > 0 yields standing steady time; 0 yields ~none."""
+def test_standing_occupancy_realized_and_chunked():
+    """Standing time is set by skill_time_fractions (realized at any stf); stf chunks it."""
     frac = {"standing": 0.2, "walk_forward": 0.5, "running": 0.3}
     stand_id = SKILLS.index("standing")
 
-    s_off = _make(frac, transition_fraction=0.3, standing_transition_fraction=0.0, seed=7)
-    vels_off = _roll(s_off, 200)
-    steady_off = ~_changing_mask(vels_off)
-    stand_off = (((_label_skills(vels_off) == stand_id) & steady_off).float().mean().item())
+    def standing_stats(stf):
+        s = _make(frac, transition_fraction=0.3, standing_transition_fraction=stf, seed=7)
+        vels = _roll(s, 200)
+        steady = ~_changing_mask(vels)
+        is_stand = (_label_skills(vels) == stand_id) & steady  # [n, T]
+        occ = is_stand.float().mean().item()
+        prev = torch.cat([torch.zeros(vels.shape[0], 1, dtype=torch.bool), is_stand[:, :-1]], dim=1)
+        n_segments = int((is_stand & ~prev).sum())  # contiguous standing runs (stops)
+        return occ, n_segments
 
-    s_on = _make(frac, transition_fraction=0.3, standing_transition_fraction=0.6, seed=7)
-    vels_on = _roll(s_on, 200)
-    steady_on = ~_changing_mask(vels_on)
-    stand_on = (((_label_skills(vels_on) == stand_id) & steady_on).float().mean().item())
-
-    assert stand_off < 0.02, stand_off
-    assert stand_on > 0.05, stand_on
+    occ_lo, seg_lo = standing_stats(0.0)
+    occ_hi, seg_hi = standing_stats(1.0)
+    # Occupancy is realized at BOTH stf values (the budget, ~0.2 of steady ~= 0.14 of
+    # total, is always placed) -- this is the bug the per-gap Bernoulli used to miss.
+    assert occ_lo > 0.08 and occ_hi > 0.08, (occ_lo, occ_hi)
+    # ...and it's roughly stable across stf (set by the budget, not by stf).
+    assert abs(occ_lo - occ_hi) < 0.05, (occ_lo, occ_hi)
+    # Higher stf chunks the same budget into MORE (shorter) stops.
+    assert seg_hi > seg_lo, (seg_lo, seg_hi)
 
 
 def test_reproducible_with_seed():
