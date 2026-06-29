@@ -526,31 +526,13 @@ if not _registered:
     )
 
     ## =========================================
-    # Tracker: clip + flow-matching generator mix (world-frame CLF)
+    # Tracker: flow-matching generator-tracking deploy (world-frame CLF)
     ## =========================================
-    gym.register(
-        id="G1-tracker-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-tracker-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    # Autoregressive, robot-decoupled FM playback (real-time receding horizon): the
-    # FM conditions on its OWN past output (seeded from the clip), the tracker policy
-    # (--load_run) tracks it. Pass the clip-conditioned FM via --fm_checkpoint.
+    # Play-only: deploy the teacher (--load_run) against the autoregressive,
+    # robot-decoupled FM reference (--fm_checkpoint, clip-conditioned). The FM
+    # conditions on its OWN past output (seeded from the clip), re-anchored onto
+    # the robot root each re-plan (receding horizon). No tracker training task --
+    # the policy is the teacher (G1-teacher-clf).
     gym.register(
         id="G1-tracker-clf-fm-ar-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -561,24 +543,15 @@ if not _registered:
         },
     )
 
+    # Same FM-in-loop receding horizon, but seeded + commanded by the single
+    # deterministic parity clip (a simple profile for investigation). The
+    # clip-only (no-FM) baseline for the same profile is G1-teacher-clf-parity-play.
     gym.register(
         id="G1-tracker-clf-parity-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerParityPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    # Same parity check, but against the teacher-recorded parity clip (for a
-    # tracker trained on teacher-recorded references).
-    gym.register(
-        id="G1-tracker-clf-teacher-parity-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerTeacherParityPlayEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )

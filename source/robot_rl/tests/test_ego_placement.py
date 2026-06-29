@@ -3,7 +3,7 @@
 """Tests for the ego-centric (receding-horizon) clip re-anchor placement.
 
 Pure tensor-level tests on
-``robot_rl...traj_tracking.closed_loop_command.ego_placement`` (no IsaacLab, no
+``robot_rl...traj_tracking.world_lift.ego_placement`` (no IsaacLab, no
 simulator).  ``ego_placement`` returns the per-env yaw+xy *placement* that puts a
 clip's current-step base onto a target root pose.  The runtime then lifts the
 clip-world base through that placement; for the pure-yaw placement this reduces to
@@ -22,7 +22,7 @@ import math
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.closed_loop_command import (
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
     ego_placement,
     _yaw_from_quat,
 )

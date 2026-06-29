@@ -8,9 +8,9 @@ ramp to a run speed -> hold -> ramp down to stand`` -- and stitches the matching
 strides into a single dense clip stored as a one-clip HDF5 library (the same
 format ``generate_clips.py`` produces, so the runtime tracks it open-loop).
 
-The exact same clip can then be played in IsaacLab (the tracker task with
-``clip_fraction=1.0``) and in the MuJoCo sim2sim runner (``--clip``), giving a
-deterministic, FM-free reference for checking sim2sim parity.
+The exact same clip can then be played in IsaacLab (clip-only, FM-free, via
+``G1-teacher-clf-parity-play``) and in the MuJoCo sim2sim runner (``--clip``),
+giving a deterministic reference for checking sim2sim parity.
 
 Example::
 

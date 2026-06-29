@@ -2,23 +2,20 @@
 
 """Flow-matching generator-tracking command (world-frame CLF).
 
-Extends :class:`MotionSequenceCommand`.  Every env is reset onto a pre-made clip
-(supplying the FM velocity command ``target_vel`` and the spawn pose), but a
-configurable fraction of envs track the **flow-matching generator's** predicted
-future state instead of the clip reference:
+Extends :class:`MotionSequenceCommand` into a single, robot-decoupled mode:
+every env runs the **flow-matching generator** autoregressively as a receding-
+horizon reference source.  The FM conditions on its OWN past reference output
+(seeded from the clip at reset and during the warmup) -- it never sees the
+robot -- and each freshly sampled trajectory is re-anchored onto the robot root
+(planar xy + heading, keeping the FM's natural height + tilt).  The clip library
+only supplies the reset spawn pose and the ``target_vel`` velocity command; the
+clip reference is the warmup fallback until the history window fills.
 
-  * **clip-tracking envs** (fraction ``clip_fraction``) follow the clip -- the
-    stable teacher signal that lets the tracker bootstrap while its own rollout
-    history (the FM input) is still garbage;
-  * **FM-tracking envs** follow the generator's predicted next state, after the
-    rolling history fills (they fall back to the clip during the warmup window).
-
-Both sources drive a single **world-frame** CLF: the desired outputs
-``y_des``/``dy_des`` and the measured outputs ``y_act``/``dy_act`` are expressed
-in the world frame (no stance-anchor re-anchoring), so the inherited CLF reward,
-observations, and terminations work uniformly for either source.  The world
-frame is a single stationary inertial frame, valid for the CLF's finite-
-difference ``vdot``.
+The desired outputs ``y_des``/``dy_des`` and the measured outputs
+``y_act``/``dy_act`` are expressed in the world frame (no stance-anchor
+re-anchoring), so the inherited CLF reward, observations, and terminations work
+uniformly.  The world frame is a single stationary inertial frame, valid for the
+CLF's finite-difference ``vdot``.
 
 Base-velocity convention: every base/ee velocity is the **link** (actor-frame)
 twist.  The FM is trained and conditioned on ``root_link_{lin,ang}_vel_w`` (see
@@ -45,7 +42,6 @@ from robot_rl.flow_matching.online import (
 
 from .motion_sequence_cmd import MotionSequenceCommand
 from .generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
-from .closed_loop_command import compute_closed_loop_command, roll_buckets
 from .world_lift import lift_base_world_state, lift_orientation, lift_position, lift_vector
 
 
@@ -66,7 +62,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     # ------------------------------------------------------------------
 
     def _post_init(self) -> None:
-        """Set up the FM context, history buffer, source mask, and world index maps."""
+        """Set up the FM context, history buffer, prediction buffers, and world index maps."""
         super()._post_init()
         n, dev = self.num_envs, self.device
 
@@ -98,20 +94,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
                 f"frames {ee_frames}; re-record/-train the FM with --state_frames matching them."
             )
 
-        # -- history buffer + joint/frame permutations (robot order -> FM order) --
-        robot_joints = list(self.robot.data.joint_names)
-        self._joint_perm = torch.tensor(
-            [robot_joints.index(j) for j in self.ctx.joint_names], dtype=torch.long, device=dev
-        )
-        # Body indices for the FM extra frames. The PARC-style design conditions on
-        # AND predicts the same end-effector frames, so every history snapshot carries
-        # them in the predicted-frame order ``ctx.frame_names`` (consumed both as clean
-        # conditioning and, on the predicted side, by the tracker's ee_ref obs).
-        self._hist_ee_body_idx = (
-            torch.tensor([self.robot.body_names.index(f) for f in self.ctx.frame_names],
-                         dtype=torch.long, device=dev)
-            if self.ctx.num_extra_frames > 0 else None
-        )
+        # The PARC-style FM conditions on AND predicts the same end-effector frames
+        # (``ctx.frame_names``), so each autoregressive history snapshot carries them
+        # in that order -- assembled from the applied reference, never the robot.
         self._history = BatchedHistory(n, self.ctx.N, dev)
 
         # Rebuild the world-frame index maps (base built them in resolve_ee_frames
@@ -136,26 +121,11 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # used to express the applied/clip reference joints in the FM history layout
         # for the autoregressive history source.
         self._clip_to_fm_jperm = torch.argsort(self._fm_jperm)
-        if self.cfg.fm_history_source not in ("robot", "reference"):
-            raise ValueError(
-                f"fm_history_source must be 'robot' or 'reference', got {self.cfg.fm_history_source!r}."
-            )
-        # Cached previous-step applied reference (FM history format) for the
-        # autoregressive ('reference') history source; None until the first update.
+        # Cached previous-step applied reference (FM history format), the
+        # autoregressive history input; None until the first update.
         self._applied_ref: dict[str, torch.Tensor] | None = None
 
-        # -- per-env source mask (True => FM), prediction buffers, cadence state --
-        self._fm_mask = torch.zeros(n, dtype=torch.bool, device=dev)  # re-rolled each reset
-        # Closed-loop FM envs (subset of _fm_mask): feed the FM a position-tracking
-        # PD command instead of the clip's open-loop target_vel, and grade the
-        # pose-drift termination against the clip (re-rolled each reset).
-        self._closed_loop_mask = torch.zeros(n, dtype=torch.bool, device=dev)
-        # Per-step closed-loop command cache (computed for all envs; applied only
-        # to closed-loop FM envs via the get_command_velocity* overrides).
-        self._cmd_vel_cache = torch.zeros(n, 3, device=dev)
-        # Clip world reference frames at the current step (cached in _update_command
-        # for termination_reference_world_state); placeholder until first update.
-        self._clip_world_frames_buf = self._wf_world_frames
+        # -- prediction buffers + cadence state (every env runs the FM) --
         # Latched per-env episode-reset flag (set in reset(), consumed in
         # _snapshot_and_infer). episode_length_buf == 0 is unobservable here --
         # see reset() for why -- so we record the reset directly.
@@ -230,16 +200,14 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self.get_desired_outputs()
 
         # Clip world reference (base + ee), lifted through the per-env placement
-        # (frames in self._wf_frames == [base] + FM ee order).
+        # (frames in self._wf_frames == [base] + FM ee order). Used as the warmup
+        # fallback until each env's FM history window fills.
         clip_frames = self._clip_world_frames()                      # [N, nf, 13]
-        # Cache the clip world frames so the pose-drift termination can grade
-        # closed-loop FM envs against the clip even when they track the FM.
-        self._clip_world_frames_buf = clip_frames
 
         # FM world reference at the current advance index, in the same order.
         fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
         fm_frames = torch.cat([fm_base[:, None, :], fm_ee], dim=1)    # [N, nf, 13]
-        use_fm = self._fm_mask & self._pred_valid
+        use_fm = self._pred_valid
 
         # Per-env source select, then write the world-frame Cartesian channels.
         sel = torch.where(use_fm[:, None, None], fm_frames, clip_frames)
@@ -257,9 +225,8 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         )
 
         # Cache this step's applied reference (FM history format) so the next step's
-        # autoregressive history append feeds the FM its own output (reference mode).
-        if self.cfg.fm_history_source == "reference":
-            self._applied_ref = self._reference_snapshot()
+        # autoregressive history append feeds the FM its own output.
+        self._applied_ref = self._reference_snapshot()
 
         # Measured outputs in the world frame (identity reference -> no alignment).
         self.compute_measured_output(self._zeros3, self._ident_quat)
@@ -273,12 +240,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     # ------------------------------------------------------------------
 
     def _snapshot_and_infer(self) -> None:
-        """Append the current world state to history and (re-)run FM inference.
+        """Append the current reference output to history and (re-)run FM inference.
 
         Guarded to run once per control step (Isaac Lab computes commands twice
         per step: once via ``command_manager.reset`` inside ``_reset_idx`` and
         once via ``command_manager.compute``). Freshly-reset envs (latched in
-        :meth:`reset`) get a fresh source assignment and an invalidated history
+        :meth:`reset`) are re-seeded from the clip and get an invalidated history
         window.
         """
         step = int(getattr(self.env, "common_step_counter", self._last_step_seen + 1))
@@ -291,81 +258,35 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         just_reset = self._pending_reset.clone()
         self._pending_reset[just_reset] = False
         if bool(just_reset.any()):
-            # Re-roll the per-env source (True => FM) for envs that just reset, and
-            # the open/closed-loop split within the FM envs (closed-loop is a subset
-            # of FM).
-            new_fm, new_cl = roll_buckets(
-                torch.rand(self.num_envs, device=self.device),
-                torch.rand(self.num_envs, device=self.device),
-                self.cfg.clip_fraction,
-                self.cfg.closed_loop_fraction,
-            )
-            self._fm_mask = torch.where(just_reset, new_fm, self._fm_mask)
-            self._closed_loop_mask = torch.where(just_reset, new_cl, self._closed_loop_mask)
             self._pred_valid = self._pred_valid & ~just_reset
             self._pred_idx = torch.where(just_reset, torch.zeros_like(self._pred_idx), self._pred_idx)
 
-        # Time-based clip->FM handoff (mirrors the MuJoCo runner's --clip_handoff_time):
-        # when set, every env tracks the clip until it passes the handoff step, then the
-        # FM -- a single mid-episode switch overriding the random clip_fraction roll, so
-        # the IsaacLab side can reproduce the sim2sim handoff for comparison. The FM
-        # history is filled for all envs every step above, so the prediction is valid
-        # the moment an env crosses the handoff.
-        if self.cfg.fm_handoff_time_s >= 0.0:
-            handoff_step = round(self.cfg.fm_handoff_time_s / self.manager.dt)
-            self._fm_mask = self._step >= handoff_step
-            # Handoff is an eval/sim2sim-comparison path; keep every env open-loop
-            # so the FM is fed the clip command (matches the MuJoCo runner).
-            self._closed_loop_mask = torch.zeros_like(self._closed_loop_mask)
-
-        # Closed-loop velocity command for this step (computed for all envs; the
-        # get_command_velocity* overrides apply it only to closed-loop FM envs).
-        # Must run before _run_fm so the FM command horizon reads the fresh value.
-        self._refresh_command_velocity_cache()
-
-        # Build the history snapshot (FM joint/frame order) for this step.
-        if self.cfg.fm_history_source == "reference":
-            # Autoregressive, robot-decoupled: the history is the FM's OWN past
-            # reference output. ``self._applied_ref`` holds the previous step's
-            # applied reference (cached at the end of _update_command; clip during
-            # the warmup). Just-reset envs are (re-)seeded from the clip spawn pose
-            # so the first window is clip references, not a stale prior episode.
-            if self._applied_ref is None:
-                self._applied_ref = self._clip_reference_snapshot(self._arange_n)
-            if bool(just_reset.any()):
-                rids = torch.nonzero(just_reset, as_tuple=False).squeeze(-1)
-                seed = self._clip_reference_snapshot(rids)
-                for key in self._applied_ref:
-                    self._applied_ref[key][rids] = seed[key]
-            snap = {k: v.clone() for k, v in self._applied_ref.items()}
-        else:
-            perm = self._joint_perm
-            snap = {
-                "root_pos": wp.to_torch(self.robot.data.root_pos_w).clone(),
-                "root_quat": wp.to_torch(self.robot.data.root_quat_w).clone(),     # xyzw
-                "root_lin": wp.to_torch(self.robot.data.root_link_lin_vel_w).clone(),  # link vel
-                "root_ang": wp.to_torch(self.robot.data.root_link_ang_vel_w).clone(),  # link ang vel
-                "jp": wp.to_torch(self.robot.data.joint_pos)[:, perm].clone(),
-                "jv": wp.to_torch(self.robot.data.joint_vel)[:, perm].clone(),
-            }
-            if self._hist_ee_body_idx is not None:
-                fpos = wp.to_torch(self.robot.data.body_pos_w)[:, self._hist_ee_body_idx]
-                fquat = wp.to_torch(self.robot.data.body_quat_w)[:, self._hist_ee_body_idx]
-                flink = wp.to_torch(self.robot.data.body_link_vel_w)[:, self._hist_ee_body_idx]
-                snap["frames"] = torch.cat([fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1).clone()  # [N,K,13]
+        # Build the history snapshot (FM joint/frame order) for this step:
+        # autoregressive and robot-decoupled -- the history is the FM's OWN past
+        # reference output. ``self._applied_ref`` holds the previous step's applied
+        # reference (cached at the end of _update_command; the clip during the
+        # warmup). Just-reset envs are (re-)seeded from the clip spawn pose so the
+        # first window is clip references, not a stale prior episode.
+        if self._applied_ref is None:
+            self._applied_ref = self._clip_reference_snapshot(self._arange_n)
+        if bool(just_reset.any()):
+            rids = torch.nonzero(just_reset, as_tuple=False).squeeze(-1)
+            seed = self._clip_reference_snapshot(rids)
+            for key in self._applied_ref:
+                self._applied_ref[key][rids] = seed[key]
+        snap = {k: v.clone() for k, v in self._applied_ref.items()}
 
         # Invalidate reset envs' windows, then append (this snapshot = step 1 of the new episode).
         self._history.invalidate(just_reset)
         self._history.append(snap)
 
-        # Decide which FM envs to (re-)infer vs advance the prediction index.
+        # Decide which envs to (re-)infer vs advance the prediction index.
         valid = self._history.valid()
         self._pred_valid = self._pred_valid & valid          # lose validity if the window broke
-        fm_valid = valid & self._fm_mask
         reinfer = (step % max(int(self.cfg.fm_update_every), 1)) == 0
         exhausted = self._pred_idx >= (self.ctx.F - 1)
-        infer_mask = fm_valid & (reinfer | ~self._pred_valid | exhausted)
-        advance = fm_valid & ~infer_mask
+        infer_mask = valid & (reinfer | ~self._pred_valid | exhausted)
+        advance = valid & ~infer_mask
         self._pred_idx = torch.where(
             advance, torch.clamp(self._pred_idx + 1, max=self.ctx.F - 1), self._pred_idx
         )
@@ -382,45 +303,24 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         ra = self._history.stack("root_ang")[ids]
         jp = self._history.stack("jp")[ids]          # [V,N,nj] FM order
         jv = self._history.stack("jv")[ids]
-        frames = self._history.stack("frames")[ids] if self._hist_ee_body_idx is not None else None
+        frames = self._history.stack("frames")[ids] if self.ctx.num_extra_frames > 0 else None
 
         cond, known = build_cond_states(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         # Commanded-velocity profile over the window -> strided command tokens.
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
-        # Default: anchor each prediction at the current base pose (step N-1).
+        # Snap the prediction's current step onto the ROBOT root (planar: robot xy +
+        # heading), keeping the FM's natural height + tilt. The conditioning is still
+        # the FM's own past output (the network never sees the robot) -- only the
+        # world placement is re-anchored, so the autoregressive rollout follows the
+        # robot (receding horizon) instead of drifting on its own prior trajectory.
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
-        if self.cfg.fm_anchor_on_robot:
-            # Snap the prediction's current step onto the ROBOT root (planar: robot
-            # xy + heading), keeping the FM's natural height + tilt. The conditioning
-            # is still the FM's own past output (the network never sees the robot) --
-            # only the world placement is re-anchored, so the autoregressive rollout
-            # follows the robot (receding horizon) instead of drifting on its own
-            # prior trajectory.
-            robot_p = wp.to_torch(self.robot.data.root_pos_w)[ids]
-            robot_q = wp.to_torch(self.robot.data.root_quat_w)[ids]
-            p_ref[:, :2] = robot_p[:, :2]
-            dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
-            q_ref = quat_mul(dz_yaw, q_ref)               # FM tilt, re-yawed to the robot heading
-        elif self.cfg.fm_anchor_on_prev_traj:
-            # Re-anchor on the *previous* prediction's ground pose so the reference
-            # drifts globally with poor tracking (clip-like). Envs with a stored
-            # prior prediction re-anchor; the rest (first inference after a reset /
-            # window break -- _pred_valid still False here, before the set below)
-            # stay robot-anchored. _pred_root_* / _pred_idx still hold the prior
-            # trajectory and consumed index at this point (overwritten further down).
-            had_prev = self._pred_valid[ids]              # [V] bool
-            off = self._pred_idx[ids]                     # [V] currently-applied ref step
-            prev_p = self._pred_root_pos[ids, off]        # [V, 3] world (prior traj)
-            prev_q = self._pred_root_quat[ids, off]       # [V, 4] xyzw
-            # Ground-corrected anchor: prior reference's xy + yaw, robot's z + tilt.
-            p_ref_prev = p_ref.clone()
-            p_ref_prev[:, :2] = prev_p[:, :2]
-            dz_yaw = quat_mul(yaw_quat(prev_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
-            q_ref_prev = quat_mul(dz_yaw, q_ref)          # robot tilt, re-yawed to prior heading
-            p_ref = torch.where(had_prev[:, None], p_ref_prev, p_ref)
-            q_ref = torch.where(had_prev[:, None], q_ref_prev, q_ref)
+        robot_p = wp.to_torch(self.robot.data.root_pos_w)[ids]
+        robot_q = wp.to_torch(self.robot.data.root_quat_w)[ids]
+        p_ref[:, :2] = robot_p[:, :2]
+        dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
+        q_ref = quat_mul(dz_yaw, q_ref)               # FM tilt, re-yawed to the robot heading
         world = sample_world(self.ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)
 
         self._pred_root_pos[ids] = world["root_pos_w"]
@@ -518,101 +418,6 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         return base, ee, self._pred_jp[ar, idx], self._pred_jv[ar, idx]
 
     # ------------------------------------------------------------------
-    # Closed-loop velocity command (position-tracking PD over the clip)
-    # ------------------------------------------------------------------
-
-    def _use_pd_mask(self) -> torch.Tensor:
-        """Per-env ``[N]`` bool: True where the closed-loop PD command is active.
-
-        Closed-loop FM envs use the PD command once their history window is valid
-        (the FM is live); during the brief warmup they track the clip, so they
-        fall back to the clip ``target_vel`` -- keeping the command consistent
-        with the reference each env is actually following.
-        """
-        return self._closed_loop_mask & self._history.valid()
-
-    @torch.no_grad()
-    def _refresh_command_velocity_cache(self) -> None:
-        """Recompute the per-env closed-loop velocity command for this step.
-
-        Tracks the clip's *moving* base position reference with feedforward (the
-        clip ``target_vel``) plus a proportional position controller, expressed
-        in the robot heading frame (the ``(vx, vy, wz)`` ``target_vel``
-        convention).  Computed for every env (cheap); only closed-loop FM envs
-        consume it (see :meth:`_use_pd_mask`).
-        """
-        # Clip base world pose at the current step.  Gather + lift directly (this
-        # runs before _update_command repopulates the clip y_des/dy_des).
-        y = self.manager.gather(self.manager.lib.y_des, self.clip_id, self._step)
-        dy = self.manager.gather(self.manager.lib.dy_des, self.clip_id, self._step)
-        pose = torch.cat([self.clip_world_pos, self.clip_world_quat], dim=-1)  # [N, 7]
-        clip_base = lift_base_world_state(y, dy, pose, self._base_idx)         # [N, ...]
-        clip_pos_w = clip_base[:, 0:3]
-        clip_quat_w = clip_base[:, 3:7]                                        # xyzw
-
-        v_ff = self.manager.gather_target_vel(self.clip_id, self._step)        # [N, 3] feedforward
-        self._cmd_vel_cache = compute_closed_loop_command(
-            v_ff,
-            clip_pos_w,
-            clip_quat_w,
-            wp.to_torch(self.robot.data.root_pos_w),
-            wp.to_torch(self.robot.data.root_quat_w),                          # xyzw
-            wp.to_torch(self.robot.data.root_link_lin_vel_b),
-            wp.to_torch(self.robot.data.root_link_ang_vel_b),
-            kp_pos=self.cfg.pd_pos_kp,
-            kd_pos=self.cfg.pd_pos_kd,
-            kp_yaw=self.cfg.pd_yaw_kp,
-            kd_yaw=self.cfg.pd_yaw_kd,
-            max_lin=self.cfg.pd_max_lin_vel,
-            max_ang=self.cfg.pd_max_ang_vel,
-        )
-
-    def get_command_velocity(self) -> torch.Tensor:
-        """Per-env commanded base velocity ``[N, 3]``: PD command for closed-loop
-        FM envs, the clip ``target_vel`` for the rest (clip + open-loop FM)."""
-        base = super().get_command_velocity()
-        use_pd = self._use_pd_mask()
-        return torch.where(use_pd[:, None], self._cmd_vel_cache, base)
-
-    def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
-        """Commanded-velocity horizon ``[N, num_future, 3]`` (the FM conditioning).
-
-        Closed-loop FM envs hold the current PD command constant across the
-        horizon; the rest use the clip's open-loop ``target_vel`` horizon.
-        """
-        base = super().get_command_velocity_horizon(num_future)
-        use_pd = self._use_pd_mask()
-        pd = self._cmd_vel_cache[:, None, :].expand_as(base)
-        return torch.where(use_pd[:, None, None], pd, base)
-
-    def get_future_command_velocity(self, offsets: torch.Tensor) -> torch.Tensor:
-        """Look-ahead commanded velocity ``[N, K, 3]`` (the ``future_command_velocity`` obs).
-
-        Closed-loop FM envs broadcast the current PD command over the look-ahead
-        window; the rest use the clip's open-loop ``target_vel``.
-        """
-        base = super().get_future_command_velocity(offsets)
-        use_pd = self._use_pd_mask()
-        pd = self._cmd_vel_cache[:, None, :].expand_as(base)
-        return torch.where(use_pd[:, None, None], pd, base)
-
-    def termination_reference_world_state(self) -> torch.Tensor:
-        """Reference state for the pose-drift termination, clip-relative for
-        closed-loop FM envs.
-
-        Open-loop FM envs keep the FM reference (the original behavior); clip
-        envs already use the clip.  For closed-loop FM envs the base row is
-        overwritten with the clip world base pose so a robot that stalls while
-        the clip marches on accrues drift and terminates.
-        """
-        state = self.reference_world_state()
-        cl = self._closed_loop_mask
-        if bool(cl.any()):
-            state = state.clone()
-            state[cl, 0:13] = self._clip_world_frames_buf[cl, 0, :]
-        return state
-
-    # ------------------------------------------------------------------
     # Introspection for play-time logging / plots
     # ------------------------------------------------------------------
 
@@ -621,12 +426,11 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         """Per-env ``[N]`` bool: True where the FM prediction (not the clip) drives the reference.
 
         This is the exact authoritative-source mask used in :meth:`_update_command`
-        (``_fm_mask & _pred_valid``): True only for envs assigned to the generator
-        *and* past their history warmup.  Flips False->True at the clip->FM handoff
-        (or end of warmup) and True->False on a window break -- the boundary the
-        play plots mark with a transition line.
+        (``_pred_valid``): True once an env is past its history warmup.  Flips
+        False->True at the end of warmup and True->False on a window break -- the
+        boundary the play plots mark with a transition line.
         """
-        return self._fm_mask & self._pred_valid
+        return self._pred_valid
 
     @property
     def fm_pred_idx(self) -> torch.Tensor:
@@ -708,11 +512,11 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         (consumed by the ``future_base_pose`` / ``future_base_velocity`` policy
         observations) comes from whichever source actually drives each env's
         reference: the **flow-matching generator's** predicted future for envs
-        currently tracking it (``_fm_mask & _pred_valid``), the **clip** for the
-        rest (clip-tracking and FM-warmup envs).  This mirrors the current-step
-        source selection in :meth:`_update_command`, so a deployed FM env never
-        sees privileged clip look-ahead -- only the generator's own prediction
-        (available at deployment from the same FM + tracker pair).
+        past their warmup (``_pred_valid``), the **clip** for the rest (FM-warmup
+        envs).  This mirrors the current-step source selection in
+        :meth:`_update_command`, so a deployed FM env never sees privileged clip
+        look-ahead -- only the generator's own prediction (available at deployment
+        from the same FM + tracker pair).
 
         The FM prediction stores ``F`` window steps anchored at the current base
         (steps ``0..N-1`` reproduce the recent past; novel future is ``N..F-1``);
@@ -736,7 +540,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         lin_f = self._pred_root_lin[ar, idx]    # [N, K, 3]
         ang_f = self._pred_root_ang[ar, idx]    # [N, K, 3]
 
-        use_fm = (self._fm_mask & self._pred_valid)[:, None, None]
+        use_fm = self._pred_valid[:, None, None]
         return (
             torch.where(use_fm, pos_f, pos_c),
             torch.where(use_fm, quat_f, quat_c),
@@ -781,20 +585,19 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     def _clip_ribbon_env_mask(self) -> torch.Tensor:
         """Draw the clip ribbon only where the env is NOT actively tracking the FM.
 
-        FM-active envs (``_fm_mask & _pred_valid``) show the FM-prediction
-        spheres instead; clip-tracking and FM-warmup envs (still following the
-        clip) keep the clip ribbon.
+        FM-active envs (``_pred_valid``) show the FM-prediction spheres instead;
+        FM-warmup envs (still following the clip) keep the clip ribbon.
         """
-        return ~(self._fm_mask & self._pred_valid)
+        return ~self._pred_valid
 
     def _draw_fm_prediction_ribbon(self) -> None:
         """Draw the FM generator's predicted world trajectory as per-frame spheres.
 
-        Only the envs currently tracking the FM (``_fm_mask & _pred_valid``) are
-        drawn; the predicted positions are read straight from the world-frame
-        prediction buffers (subsampled over the F-step horizon). Sphere colors
-        match the clip ribbon's per-frame colors, so the FM prediction (spheres)
-        can be compared directly to the clip baseline (cylinders).
+        Only the envs currently tracking the FM (``_pred_valid``) are drawn; the
+        predicted positions are read straight from the world-frame prediction
+        buffers (subsampled over the F-step horizon). Sphere colors match the clip
+        ribbon's per-frame colors, so the FM prediction (spheres) can be compared
+        directly to the clip baseline (cylinders).
         """
         if self._fm_markers is None:
             self._fm_markers = self._create_fm_markers()
@@ -804,7 +607,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             self._fm_markers.set_visibility(False)
             return
 
-        use_fm = self._fm_mask & self._pred_valid
+        use_fm = self._pred_valid
         ids = torch.nonzero(use_fm, as_tuple=False).squeeze(-1)
         if ids.numel() == 0:
             self._fm_markers.set_visibility(False)
@@ -832,22 +635,16 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
     def _draw_source_markers(self) -> None:
         """Float a colored marker above each robot showing its tracking source.
 
-        Green => open-loop FM (history full, prediction live); blue => closed-loop
-        FM (PD command active); yellow => assigned to the FM but still warming up
-        (falling back to the clip); white => clip.
+        Green => FM (history full, prediction live); yellow => still warming up
+        (history not yet full, falling back to the clip).
         """
         if self._source_markers is None:
             self._source_markers = self._create_source_markers()
             if self._source_markers is None:
                 return
 
-        use_fm = self._fm_mask & self._pred_valid
-        warmup = self._fm_mask & ~self._pred_valid
-        closed = use_fm & self._closed_loop_mask
-        idx = torch.ones(self.num_envs, dtype=torch.long, device=self.device)  # 1 => clip
-        idx[use_fm] = 0   # 0 => fm (open-loop)
-        idx[warmup] = 2   # 2 => warmup
-        idx[closed] = 3   # 3 => fm (closed-loop)
+        idx = torch.ones(self.num_envs, dtype=torch.long, device=self.device)  # 1 => warmup
+        idx[self._pred_valid] = 0   # 0 => fm (prediction live)
 
         pos = wp.to_torch(self.robot.data.root_pos_w).clone()
         pos[:, 2] += float(self.cfg.debug_vis_source_marker_height)
@@ -878,7 +675,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             return None
 
     def _create_source_markers(self):
-        """Build the three-color (fm / clip / warmup) tracking-source indicator set."""
+        """Build the two-color (fm / warmup) tracking-source indicator set."""
         try:
             import isaaclab.sim as sim_utils
             from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
@@ -886,13 +683,10 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             print(f"[WARN GeneratorTrackingCommand] could not import VisualizationMarkers: {exc}")
             return None
         radius = float(self.cfg.debug_vis_source_marker_radius)
-        # Insertion order fixes the marker_indices mapping:
-        # 0 => fm (open-loop), 1 => clip, 2 => warmup, 3 => fm (closed-loop).
+        # Insertion order fixes the marker_indices mapping: 0 => fm, 1 => warmup.
         colors = {
             "fm": (0.10, 0.90, 0.20),
-            "clip": (0.90, 0.90, 0.90),
             "warmup": (0.95, 0.85, 0.10),
-            "closed": (0.10, 0.45, 0.95),
         }
         prototypes = {
             name: sim_utils.SphereCfg(

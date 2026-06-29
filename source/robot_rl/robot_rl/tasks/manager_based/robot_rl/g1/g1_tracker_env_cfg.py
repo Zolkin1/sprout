@@ -1,20 +1,24 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 tracker policy: flow-matching generator-tracking environment (flat ground).
+"""G1 tracker: flow-matching generator-tracking environment (flat ground).
 
-Tracks a learned flow-matching *generator* instead of (only) the pre-made clips:
-a fraction of envs follow the clip reference (the stable teacher signal), the
-rest follow the generator's predicted future state. Both sources drive a single
-**world-frame** CLF reward, so the tracker can ultimately be deployed sim2sim /
-sim2real with the generator + tracker pair (no privileged info in the policy).
+Deploys a trained teacher policy against an **autoregressive, robot-decoupled**
+flow-matching reference instead of a fixed clip: the FM conditions on its OWN
+past predicted reference (seeded from a clip at reset + during the warmup -- it
+never sees the robot) and each sampled trajectory is re-anchored onto the robot
+root (a receding horizon).  The clip library only supplies the reset spawn pose
+and the ``target_vel`` velocity command.  The reference drives a single
+**world-frame** CLF, so the same teacher trained on world/ego-anchored clips can
+track the generator with no privileged info in the policy.
+
+There is no separate tracker *training* task: the policy is the teacher
+(:mod:`g1_teacher_env_cfg`, ``G1-teacher-clf``).  These configs are play-only
+deploy entry points -- pass the teacher via ``--load_run`` and the
+**clip-conditioned** FM via ``--fm_checkpoint``.
 
 Differs from :class:`G1TeacherEnvCfg` only in the command term
-(:class:`GeneratorTrackingCommand`, the clip + generator mix).  Both tasks now
-run a world-frame CLF, so they share one observation layout
-(:class:`G1TeacherObservationsCfg`): the raw ``ref_traj``/``act_traj``/
-``*_vel`` tracking vectors are critic-only (absolute world coords), and the
-policy's reference terms (base-pose error, joint refs, ee refs, future windows)
-are all relative / heading-invariant.
+(:class:`GeneratorTrackingCommand`).  Both run a world-frame CLF, so they share
+one observation layout (:class:`G1TeacherObservationsCfg`).
 """
 
 from __future__ import annotations
@@ -27,25 +31,18 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
 from .g1_teacher_env_cfg import (
     DEFAULT_CLIP_PATH,
+    DEFAULT_PARITY_CLIP_PATH,
     G1TeacherObservationsCfg,
     G1TeacherTerminationCfg,
     G1TeacherEnvCfg,
 )
 from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
 
-# Default flow-matching generator checkpoint (override per-run via the cfg / CLI).
-DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt"
-
-# Single deterministic parity clip (see scripts/rsl_rl/generate_parity_clip.py),
-# played open-loop in the clip-only parity variant for IsaacLab <-> MuJoCo checks.
-DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
-
-# Teacher-recorded counterpart of the parity clip: the motion the teacher actually
-# achieved while tracking DEFAULT_PARITY_CLIP_PATH, recorded by
-# scripts/rsl_rl/record_teacher_clips.py (--source-clip clips/g1_parity_v1.h5).
-# Use this to run the identical sim2sim parity check on a tracker trained against
-# teacher-recorded clips (an on-distribution, physically realizable reference).
-DEFAULT_TEACHER_PARITY_CLIP_PATH = "clips/g1_teacher_parity_v1.h5"
+# Default flow-matching generator checkpoint (override per-run via --fm_checkpoint).
+# MUST be a clip-conditioned, command-conditioned FM (cmd_array='target_vel',
+# target_source='actual'); the command validates this at startup and errors if the
+# file is missing or the checkpoint has no command conditioning.
+DEFAULT_FM_CHECKPOINT = "logs/flow_matching/2026-06-29_11-00-10/best.pt"
 
 
 ##
@@ -53,11 +50,11 @@ DEFAULT_TEACHER_PARITY_CLIP_PATH = "clips/g1_teacher_parity_v1.h5"
 ##
 @configclass
 class G1TrackerCommandsCfg:
-    """Clip + flow-matching-generator tracking command."""
+    """Flow-matching-generator tracking command (autoregressive, robot-anchored)."""
 
     traj_ref = GeneratorTrackingCommandCfg(
         contact_bodies=[".*_ankle_roll_link"],
-        path="clips/g1_teacher_v1.h5", #DEFAULT_CLIP_PATH,
+        path=DEFAULT_CLIP_PATH,
         base_frame_name="pelvis_link",
         random_start_phase=True,
         random_start_min_remaining_s=2.0,
@@ -67,12 +64,8 @@ class G1TrackerCommandsCfg:
         R_weights=WALKING_R_weights,
         # --- generator-tracking knobs ---
         fm_checkpoint=DEFAULT_FM_CHECKPOINT,
-        clip_fraction=0.2,
-        # Half the FM envs are closed-loop: the FM is fed a position-tracking PD
-        # command over the clip and the pose-drift termination is clip-relative,
-        # so stalling (which the open-loop FM lets the robot reward-hack) gets
-        # punished and terminated. The policy sees no flag for the bucket.
-        closed_loop_fraction=0.6,
+        # Re-run FM inference every K control steps (the receding-horizon re-plan
+        # cadence); the prediction advances through the F-step window in between.
         fm_update_every=2,
     )
 
@@ -102,10 +95,13 @@ class G1TrackerTerminationCfg(G1TeacherTerminationCfg):
 ##
 @configclass
 class G1TrackerEnvCfg(G1TeacherEnvCfg):
-    """Flat-ground tracker env (clip + flow-matching generator mix, world-frame CLF)."""
+    """Flat-ground generator-tracking env (FM-autoregressive, world-frame CLF).
+
+    Shared base for the play-only deploy configs below; not registered as a
+    standalone task (the policy is trained as the teacher, not here)."""
 
     # Shared world-frame observation layout (policy base-relative, critic
-    # privileged); only the command term differs from the clip-only task.
+    # privileged); only the command term differs from the clip-only teacher task.
     observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
     commands: G1TrackerCommandsCfg = G1TrackerCommandsCfg()
     terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
@@ -113,7 +109,7 @@ class G1TrackerEnvCfg(G1TeacherEnvCfg):
 
 @configclass
 class G1TrackerEnvCfgPlay(G1TrackerEnvCfg):
-    """Smaller, noise-free variant for play / debugging."""
+    """Smaller, noise-free play base for the deploy configs below."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -129,63 +125,37 @@ class G1TrackerEnvCfgPlay(G1TrackerEnvCfg):
 class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
     """Autoregressive, robot-decoupled FM playback (real-time receding horizon).
 
-    Runs the flow-matching generator as a self-contained receding-horizon reference
-    source: its history is its OWN past output (seeded from the clip at reset), so it
-    never sees the robot (``fm_history_source='reference'``).  Every env runs the FM
-    open-loop (``clip_fraction=0``, ``closed_loop_fraction=0``); the tracker policy
-    loaded via ``--load_run`` (e.g. the ego teacher) tracks the emitted reference.
+    Runs the flow-matching generator as a self-contained receding-horizon
+    reference source: its history is its OWN past output (seeded from the clip at
+    reset), so it never sees the robot.  Each sampled trajectory is re-anchored
+    onto the robot root.  The tracker policy loaded via ``--load_run`` (the
+    teacher) tracks the emitted reference.
 
-    Pass the trained **clip-conditioned** FM with ``--fm_checkpoint <flow_matching_run>/best.pt``
-    -- the inherited default is the state-conditioned FM and will not behave correctly
-    here.  The clip library only supplies the reset seed + the velocity command
-    (``target_vel``); use ``--clip_device cpu`` for the multi-GB library.
+    Pass the trained **clip-conditioned** FM with
+    ``--fm_checkpoint <flow_matching_run>/best.pt``.  The clip library only
+    supplies the reset seed + the velocity command (``target_vel``); use
+    ``--clip_device cpu`` for the multi-GB library.
     """
 
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 1
         self.commands.traj_ref.path = DEFAULT_CLIP_PATH       # FM-training clips (seed + command)
-        self.commands.traj_ref.clip_fraction = 0.0            # every env runs the FM
-        self.commands.traj_ref.closed_loop_fraction = 0.0     # open-loop command (clip target_vel)
-        self.commands.traj_ref.fm_history_source = "reference"  # autoregressive (FM's own output)
-        self.commands.traj_ref.fm_anchor_on_robot = True      # but place it on the robot root each infer
-        self.commands.traj_ref.fm_anchor_on_prev_traj = False
         self.commands.traj_ref.random_start_phase = False     # seed from clip step 0
 
 
 @configclass
-class G1TrackerParityPlayEnvCfg(G1TrackerEnvCfgPlay):
-    """Deterministic clip-only playback for IsaacLab <-> MuJoCo parity checks.
+class G1TrackerParityPlayEnvCfg(G1TrackerFMAutoregPlayEnvCfg):
+    """Autoregressive FM playback seeded + commanded by the single parity clip.
 
-    Plays the single hand-authored parity clip (stand -> walk -> run -> stand)
-    open-loop through the *deployed* tracker policy: ``clip_fraction = 1.0`` makes
-    every env track the clip (the FM is loaded but never sampled -- the per-env
-    source roll ``rand() >= 1.0`` is always False), and ``random_start_phase =
-    False`` starts at clip step 0 on the clip's spawn pose, so the run is fully
-    deterministic and matches the MuJoCo ``--clip`` clip-only mode reference.
+    Identical FM-in-loop receding horizon to :class:`G1TrackerFMAutoregPlayEnvCfg`,
+    but the seed pose + ``target_vel`` command come from the deterministic
+    hand-authored parity clip (stand -> walk -> run -> stand) -- a simple, known
+    profile for investigating the FM-in-loop behavior.  The clip-only baseline
+    (no FM) for the same profile is ``G1-teacher-clf-parity-play``.
     """
 
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 1
         self.commands.traj_ref.path = DEFAULT_PARITY_CLIP_PATH
-        self.commands.traj_ref.clip_fraction = 1.0          # all envs clip, FM idle
-        self.commands.traj_ref.random_start_phase = False   # start at clip step 0
         self.commands.traj_ref.randomize_heading = False
-
-
-@configclass
-class G1TrackerTeacherParityPlayEnvCfg(G1TrackerParityPlayEnvCfg):
-    """Parity playback against the *teacher-recorded* parity clip.
-
-    Identical clip-only, deterministic playback to ``G1TrackerParityPlayEnvCfg``,
-    but tracks the motion the teacher actually achieved on the parity profile
-    (``DEFAULT_TEACHER_PARITY_CLIP_PATH``) instead of the hand-authored kinematic
-    clip.  Use this to run the same IsaacLab <-> MuJoCo parity check on a tracker
-    trained against teacher-recorded clips, whose reference distribution is the
-    teacher's realizable motion rather than the raw stitched strides.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.traj_ref.path = DEFAULT_TEACHER_PARITY_CLIP_PATH

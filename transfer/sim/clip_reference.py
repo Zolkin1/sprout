@@ -140,7 +140,7 @@ class ClipReference:
 
         The receding-horizon, ego-centric counterpart of the fixed placement:
         mirrors IsaacLab ``MotionSequenceCommand._reanchor_ego_envs`` /
-        ``closed_loop_command.ego_placement`` exactly -- solve a yaw-only placement
+        ``world_lift.ego_placement`` exactly -- solve a yaw-only placement
         so lifting the clip-world base at ``step`` reproduces the robot's planar
         position and heading, keeping the clip's natural height (z) and tilt.  Call
         every ``ego_anchor_every`` steps while the clip drives the reference; the

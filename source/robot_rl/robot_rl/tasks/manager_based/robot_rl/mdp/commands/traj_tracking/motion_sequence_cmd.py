@@ -31,8 +31,8 @@ from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .clips.clip_io import load_clip_library
 from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from .clips.clip_manager import MotionClipManager
-from .closed_loop_command import ego_placement
 from .world_lift import (
+    ego_placement,
     lift_base_world_state,
     lift_orientation,
     lift_orientation_batched,

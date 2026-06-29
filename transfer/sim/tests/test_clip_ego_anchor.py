@@ -4,7 +4,7 @@
 
 Numpy-only (no torch / isaaclab / simulator): builds a tiny synthetic clip-library
 ``.h5`` and drives :class:`clip_reference.ClipReference`.  Verifies the
-``reanchor_ego`` math mirrors IsaacLab's ``closed_loop_command.ego_placement`` /
+``reanchor_ego`` math mirrors IsaacLab's ``world_lift.ego_placement`` /
 ``MotionSequenceCommand._reanchor_ego_envs`` -- after re-anchoring, the served
 reference's current-step base reproduces the robot's planar position + heading,
 keeps the clip's natural height (z) and tilt, and the future window recedes from
