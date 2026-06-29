@@ -31,6 +31,7 @@ from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .clips.clip_io import load_clip_library
 from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from .clips.clip_manager import MotionClipManager
+from .closed_loop_command import ego_placement
 from .world_lift import (
     lift_base_world_state,
     lift_orientation,
@@ -114,6 +115,10 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.clip_world_pos = torch.zeros(n, 3, device=dev)
         self.clip_world_quat = torch.zeros(n, 4, device=dev)
         self.clip_world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
+        # Per-env ego-centric re-anchor assignment (re-rolled per reset in
+        # reset_on_motion_sequence): True => this env's clip placement is
+        # periodically snapped onto the robot root (receding-horizon reference).
+        self._ego_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         # Phase carrier so the base ``_update_command`` can read manager.phase.
         self.manager.phase = torch.zeros(n, device=dev)
 
@@ -222,6 +227,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def _update_command(self) -> None:
         """Advance the step, build world-frame desired + measured, update CLF."""
         self._advance_step()
+        self._reanchor_ego_envs()                  # ego-centric re-placement (subset of envs)
         self.get_desired_outputs()                 # clip-world y_des/dy_des
         frames = self._clip_world_frames()         # lift through the placement
         self._write_world_des(frames)              # base+ee Cartesian -> world
@@ -240,6 +246,42 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         T = self.manager.num_steps
         self._step = torch.clamp(self.start_step + self.env.episode_length_buf, max=T - 1)
         self.manager.phase = self._step.float() / max(T - 1, 1)
+
+    def _reanchor_ego_envs(self) -> None:
+        """Re-place the clip on the robot's current root for ego-anchored envs.
+
+        For envs in ``self._ego_mask`` whose per-episode step hits the re-anchor
+        cadence (``cfg.ego_anchor_every``), recompute the per-env placement
+        (yaw + xy) so the clip's *current-step* base coincides with the robot's
+        measured root (planar position + heading), keeping the clip's natural
+        height and tilt.  Between re-anchors the placement is fixed, so the
+        reference recedes ahead of the robot like a receding-horizon controller
+        that re-plans every few steps.
+
+        Fast early-return unless ``cfg.ego_anchor_fraction > 0``.  Naturally
+        idempotent across Isaac Lab's twice-per-step compute (same robot pose +
+        clip step -> same placement), so no extra once-per-step guard is needed.
+        """
+        if self.cfg.ego_anchor_fraction <= 0.0:
+            return
+        period = max(int(self.cfg.ego_anchor_every), 1)
+        due = self._ego_mask & (self.env.episode_length_buf % period == 0)
+        ids = torch.nonzero(due, as_tuple=False).squeeze(-1)
+        if ids.numel() == 0:
+            return
+        # Clip-world base pose at each env's current step.
+        y, _ = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
+        base_pos_cf = y[:, self._base_idx["pos"]]   # [k, 3]
+        base_ori_cf = y[:, self._base_idx["ori"]]   # [k, 4] xyzw
+        # Target = robot root link (planar position + heading); keep natural height.
+        target_pos_w = wp.to_torch(self.robot.data.root_pos_w)[ids]
+        target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
+        ground_z = self.env.scene.env_origins[ids, 2]
+        world_pos, world_quat = ego_placement(
+            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w, ground_z
+        )
+        self.clip_world_pos[ids] = world_pos
+        self.clip_world_quat[ids] = world_quat
 
     def _placement(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-env world placement of the clip (yaw-only ground frame, fixed at reset)."""

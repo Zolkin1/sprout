@@ -335,6 +335,16 @@ def reset_on_motion_sequence(
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
 
+    # Re-roll the ego-centric re-anchor assignment for the reset envs (mirrors the
+    # tracker's per-reset FM-bucket roll): these envs get their clip placement
+    # periodically snapped onto the robot root during the episode (see
+    # MotionSequenceCommand._reanchor_ego_envs). A no-op when the feature is off.
+    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
+    if ego_frac > 0.0:
+        cmd._ego_mask[env_ids] = torch.rand(k, device=device) < ego_frac
+    else:
+        cmd._ego_mask[env_ids] = False
+
     # 5. Write to sim.
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)

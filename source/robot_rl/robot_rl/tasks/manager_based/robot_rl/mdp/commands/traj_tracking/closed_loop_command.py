@@ -59,6 +59,58 @@ def _yaw_from_quat(quat_xyzw: torch.Tensor) -> torch.Tensor:
     return torch.atan2(siny_cosp, cosy_cosp)
 
 
+def ego_placement(
+    base_pos_cf: torch.Tensor,
+    base_ori_cf: torch.Tensor,
+    target_pos_w: torch.Tensor,
+    target_quat_w: torch.Tensor,
+    ground_z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-env yaw+xy placement putting a clip's current-step base onto a target root.
+
+    Solves for the runtime *placement* (a yaw-only ground frame: ``world_pos`` xy
+    plus a pure-yaw ``world_quat``) such that lifting the clip-world base pose
+    ``(base_pos_cf, base_ori_cf)`` through it reproduces the target root's planar
+    position and heading, while keeping the clip's natural height (``ground_z`` plus
+    the clip's own base z) and tilt.  This is the runtime, robot-targeting
+    counterpart of the reset placement in ``reset_on_motion_sequence`` (which
+    targets the env origin at the start step): it re-anchors an ego-centric,
+    receding-horizon clip onto the robot's root every few steps.
+
+    All quaternions are ``(x, y, z, w)`` (scalar-last).  The returned ``world_quat``
+    is pure-yaw, so lifting with it reduces to a planar rotation + translation (see
+    ``world_lift.anchor_inv_yaw``: ``anchor_inv_yaw(Q) == Q`` for pure-yaw ``Q``).
+    Kept dependency-free (only ``torch``) so the math is unit-testable without a
+    running IsaacLab / simulator.
+
+    Args:
+        base_pos_cf: ``[N, 3]`` clip-world base position at the current step.
+        base_ori_cf: ``[N, 4]`` clip-world base orientation (xyzw) at the current step.
+        target_pos_w: ``[N, 3]`` target root world position (the robot's root).
+        target_quat_w: ``[N, 4]`` target root world orientation (xyzw).
+        ground_z: ``[N]`` ground datum (env-origin z) the clip height is kept above.
+
+    Returns:
+        ``(world_pos[N, 3], world_quat[N, 4] xyzw)`` -- the per-env placement.
+    """
+    yaw = _yaw_from_quat(target_quat_w) - _yaw_from_quat(base_ori_cf)  # [N]
+    half = 0.5 * yaw
+    zeros = torch.zeros_like(yaw)
+    world_quat = torch.stack([zeros, zeros, torch.sin(half), torch.cos(half)], dim=-1)
+
+    # Planar rotation R(yaw) applied to the clip base xy (z is yaw-invariant); this
+    # equals quat_apply(world_quat, base_pos_cf)[:, :2] for the pure-yaw world_quat.
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    rot_x = cos_y * base_pos_cf[:, 0] - sin_y * base_pos_cf[:, 1]
+    rot_y = sin_y * base_pos_cf[:, 0] + cos_y * base_pos_cf[:, 1]
+
+    world_pos = torch.empty_like(target_pos_w)
+    world_pos[:, 0] = target_pos_w[:, 0] - rot_x  # so lifted base xy == target xy
+    world_pos[:, 1] = target_pos_w[:, 1] - rot_y
+    world_pos[:, 2] = ground_z                     # keep the clip's natural height
+    return world_pos, world_quat
+
+
 def compute_closed_loop_command(
     v_ff: torch.Tensor,
     clip_pos_w: torch.Tensor,

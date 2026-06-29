@@ -44,6 +44,12 @@ DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
 # (e.g. in the tracker, with clip_fraction controlling the clip-vs-FM mix).
 DEFAULT_TEACHER_CLIP_PATH = "clips/g1_teacher_v1.h5"
 
+# Single deterministic parity clip (stand -> walk -> run -> stand; see
+# scripts/rsl_rl/generate_parity_clip.py).  Shared with the tracker parity-play
+# tasks; the teacher parity-play variant tracks it open-loop for a quick, clean
+# look at how the teacher follows a known profile (and IsaacLab <-> MuJoCo checks).
+DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
+
 
 ##
 # Commands
@@ -62,6 +68,12 @@ class G1TeacherCommandsCfg:
         debug_vis=False,  # training: off (enabled in the -play variant)
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
+        # Ego-centric receding-horizon reference: half the envs have their clip
+        # periodically re-placed onto the robot's root (planar pos + heading), so
+        # the reference looks like an MPC plan that re-plans every few steps. The
+        # rest keep the fixed world-frame clip. Set ego_anchor_fraction=0 to disable.
+        ego_anchor_fraction=0.5,
+        ego_anchor_every=10,  # re-plan every 10 control steps (~0.2 s at dt=0.02)
     )
 
 
@@ -272,3 +284,25 @@ class G1TeacherEnvCfgPlay(G1TeacherEnvCfg):
         self.events.randomize_ground_contact_friction = None
         # Draw the reference-trajectory markers in the viewer.
         self.commands.traj_ref.debug_vis = True
+
+
+@configclass
+class G1TeacherParityPlayEnvCfg(G1TeacherEnvCfgPlay):
+    """Deterministic single-clip playback of the trained teacher.
+
+    Tracks the hand-authored parity clip (stand -> walk -> run -> stand) open-loop
+    from step 0 in a single env, so you can watch how the teacher follows a known
+    profile (and reuse it for IsaacLab <-> MuJoCo parity).  Ego re-anchoring is
+    turned OFF here so the reference placement is fixed and the playback is
+    deterministic; override ``env.commands.traj_ref.ego_anchor_fraction=1.0`` on
+    the play command line to instead watch the receding-horizon re-anchoring on
+    the parity clip.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.commands.traj_ref.path = DEFAULT_PARITY_CLIP_PATH
+        self.commands.traj_ref.random_start_phase = False   # start at clip step 0
+        self.commands.traj_ref.randomize_heading = False
+        self.commands.traj_ref.ego_anchor_fraction = 0.0    # fixed placement (deterministic)

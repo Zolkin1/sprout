@@ -47,6 +47,20 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Recorded clip-library fingerprint (set at train, verified at play).
     Populated by the command at construction; serialised into env.yaml."""
 
+    # --- Ego-centric (receding-horizon) clip re-anchoring ---
+    ego_anchor_fraction: float = 0.0
+    """Fraction of envs whose clip placement is periodically re-anchored onto the
+    robot's current root link (planar position + heading), turning the reference
+    into an ego-centric, receding-horizon trajectory.  The assignment is re-rolled
+    per reset (like the tracker's FM bucket).  ``0.0`` (default) keeps every env on
+    the fixed world placement chosen at reset."""
+
+    ego_anchor_every: int = 25
+    """Re-anchor cadence in control steps for ego-anchored envs: the clip is
+    re-placed on the robot's root every this many steps (a receding-horizon
+    re-plan).  Smaller = more frequent, smaller per-step reference jumps.  Only
+    used when ``ego_anchor_fraction > 0``."""
+
     # --- Debug visualization (set ``debug_vis = True`` to enable) ---
     debug_vis_horizon_s: float = 3.0
     """Forward window (seconds) of the reference trajectory drawn as markers."""

@@ -512,6 +512,19 @@ if not _registered:
         },
     )
 
+    # Deterministic single-clip playback of the trained teacher on the parity clip
+    # (stand -> walk -> run -> stand); ego re-anchoring off by default (override
+    # env.commands.traj_ref.ego_anchor_fraction=1.0 to watch the re-anchoring).
+    gym.register(
+        id="G1-teacher-clf-parity-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherParityPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     ## =========================================
     # Tracker: clip + flow-matching generator mix (world-frame CLF)
     ## =========================================
