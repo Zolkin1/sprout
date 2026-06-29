@@ -105,6 +105,16 @@ class TrackerSession:
         """Instance alias for :func:`convert_joint_order` (drop-in for Robot.set_initial_condition)."""
         return convert_joint_order(values, names_in, names_out)
 
+    def get_ee_frame_names(self) -> list[str] | None:
+        """End-effector reference frame names (the ``ee_ref`` output frames), if exported.
+
+        Returns the resolved ee frame order (``traj_ref.resolve_ee_frames()`` at
+        export time) used by ``ee_ref`` and, in tracker-only sim2sim, by the clip
+        reference.  ``None`` when the export predates the metadata key.
+        """
+        names = self.params.get("ee_frame_names")
+        return list(names) if names is not None else None
+
     def get_joint_out_names(self) -> list[str] | None:
         """CLF output joint order, if exported (else None -> caller falls back)."""
         if "joint_out_names" in self.params:

@@ -32,13 +32,38 @@ def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     return np.array([q[1], q[2], q[3], q[0]], dtype=np.float64)
 
 
+class _TrackerOnlyCtx:
+    """Minimal FM-context stand-in for tracker-only (no-FM) clip playback.
+
+    When the generator is disabled (a pure clip-tracking teacher has no
+    ``fm.onnx``), the clip reference drives the tracker directly.  This exposes
+    only the fields the shared obs assembly (:meth:`GenTrackerPolicy._build_obs`)
+    and the MuJoCo runner read in that mode: the joint order and the ee/target
+    frame names (for ``ee_ref`` and the clip reference).  ``num_extra_frames`` is
+    0 so the runner skips FM history-frame bookkeeping; ``N``/``F``/``D``/
+    ``cmd_dim`` are inert placeholders (the generator is never sampled).
+    """
+
+    def __init__(self, joint_names: list[str], target_frame_names: list[str]):
+        self.joint_names = list(joint_names)
+        self.nj = len(joint_names)
+        self.target_frame_names = list(target_frame_names)
+        self.target_num_extra_frames = len(target_frame_names)
+        self.frame_names: list[str] = []   # FM conditioning frames (none without FM)
+        self.num_extra_frames = 0
+        self.N = 1                          # history length (unused without FM)
+        self.F = 1                          # prediction horizon (unused without FM)
+        self.D = 0
+        self.cmd_dim = 0
+
+
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
 
     def __init__(
         self,
         tracker_onnx: str,
-        fm_onnx: str,
+        fm_onnx: str | None,
         fm_update_every: int = 2,
         future_horizon_s: float = 0.5,
         future_stride: int = 5,
@@ -46,7 +71,11 @@ class GenTrackerPolicy:
         num_threads: int = 0,
         seed: int | None = 0,
     ):
-        """Configure the generator + tracker pair from two ONNX artifacts."""
+        """Configure the generator + tracker pair from the ONNX artifacts.
+
+        ``fm_onnx`` may be ``None`` for tracker-only (no-FM) clip playback: the
+        clip reference then drives the tracker directly (see :class:`_TrackerOnlyCtx`).
+        """
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
         self.fm_update_every = max(int(fm_update_every), 1)
@@ -71,9 +100,18 @@ class GenTrackerPolicy:
             self.fm_update_every = max(int(meta_every), 1)
         print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} "
               f"({'from tracker metadata' if meta_every is not None else 'from constructor default'})")
-        self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
-        if self.ctx.cmd_dim <= 0:
-            raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+        self.fm_enabled = self.fm_onnx is not None
+        if self.fm_enabled:
+            self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
+            if self.ctx.cmd_dim <= 0:
+                raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+        else:
+            # Tracker-only (no FM): a clip reference drives the tracker directly. Build a
+            # lightweight ctx from the tracker metadata so the shared obs assembly + the
+            # runner's frame/ee bookkeeping work without a generator (clip-only playback).
+            self.ctx = self._tracker_only_ctx()
+            print("[INFO GenTrackerPolicy] No fm.onnx -> tracker-only mode: the clip reference "
+                  "drives the tracker; the generator is disabled.")
         self._build_orderings()
         self._build_future_offsets()
         F, nj, k = self.ctx.F, self.ctx.nj, self.ctx.target_num_extra_frames
@@ -91,10 +129,25 @@ class GenTrackerPolicy:
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
         self._loaded = True
 
+    def _tracker_only_ctx(self) -> _TrackerOnlyCtx:
+        """Build a minimal FM-context stand-in from the tracker metadata (no generator).
+
+        The ee/target frame names come from the tracker's ``ee_frame_names``
+        metadata (the ``ee_ref`` output frames); re-export the tracker if absent.
+        """
+        ee = self._trk.get_ee_frame_names()
+        if ee is None:
+            raise ValueError(
+                "Tracker-only (no-FM) playback needs 'ee_frame_names' in the tracker.onnx "
+                "metadata; re-export the tracker with the updated export_parameters.py "
+                "(scripts/rsl_rl/export_tracker_onnx.py)."
+            )
+        return _TrackerOnlyCtx(list(self._trk.get_joint_names()), list(ee))
+
     def _build_orderings(self) -> None:
         """Resolve joint perms between the FM (isaac) order and the CLF output order."""
         isaac = list(self._trk.get_joint_names())
-        if list(self.ctx.joint_names) != isaac:
+        if self.fm_enabled and list(self.ctx.joint_names) != isaac:
             raise ValueError(
                 f"FM joint order {self.ctx.joint_names} != tracker joint_names_isaac {isaac}."
             )
@@ -150,7 +203,11 @@ class GenTrackerPolicy:
         while the FM stays dormant (``_pred_valid`` False), so the first live
         ``create_obs`` cleanly triggers the first FM sample anchored on a settled
         stand rather than on a static repeated snapshot.
+
+        No-op in tracker-only (no-FM) mode: there is no generator history to keep.
         """
+        if not self.fm_enabled:
+            return
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
 
@@ -225,6 +282,11 @@ class GenTrackerPolicy:
         """Step the generator and build the tracker policy observation ``[1, num_obs]``."""
         if not self._loaded:
             raise RuntimeError("Call load() before create_obs().")
+        if not self.fm_enabled:
+            raise RuntimeError(
+                "create_obs() needs the FM generator; tracker-only (no-FM) playback must drive "
+                "the tracker via _build_obs(state, reference=<clip reference>)."
+            )
         self._update_generator(state)
         return self._build_obs(state, reference=None)
 

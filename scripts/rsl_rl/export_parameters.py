@@ -109,6 +109,12 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params["joint_out_names"] = [
             n.split(":", 1)[1] for n in traj_cmd.ordered_pos_output_names if n.startswith("joint:")
         ]
+        # End-effector reference frames (the ee_ref output frames), in the single
+        # source-of-truth order. Needed for tracker-only (no-FM) sim2sim clip playback
+        # (transfer/sim/gen_tracker_runner.py --clip), where the ee frame names cannot
+        # come from the FM context; matches the FM ctx.target_frame_names when an FM is used.
+        if hasattr(traj_cmd, "resolve_ee_frames"):
+            params["ee_frame_names"] = list(traj_cmd.resolve_ee_frames())
     except (KeyError, AttributeError):
         pass
 
