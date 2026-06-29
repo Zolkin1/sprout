@@ -373,8 +373,6 @@ def find_steady_rows(
         stretch (length ``length``) and its command mean/std/score.
     """
     L = length
-    num_envs = layout_num_envs(data)
-    n_rows = data["target_vel"].shape[0]
     tv = data["target_vel"].astype(np.float64)
     sie = data["step_in_episode"]
     done = data["done"].astype(np.int64)
@@ -382,8 +380,8 @@ def find_steady_rows(
     wts = np.asarray(cmd_weights, dtype=np.float64)
 
     best = None  # (score, rows)
-    for e in range(min(n_envs_scan, num_envs)):
-        idx = np.arange(e, n_rows, num_envs)
+    for e in range(min(n_envs_scan, _num_streams(data))):
+        idx = _stream_indices(data, e)            # env stream, or episode for clip data
         n_e = len(idx)
         if n_e < L:
             continue
@@ -415,8 +413,9 @@ def find_steady_rows(
 
     if best is None:
         raise RuntimeError(
-            f"no valid {L}-step stretch found near {target_cmd} in {n_envs_scan} env streams; "
-            f"increase --n-envs-scan or lower --gait-max-period"
+            f"no valid {L}-step stretch found near {target_cmd} in the first {n_envs_scan} "
+            f"streams/episodes; increase --n-envs-scan (clip recordings have one short episode "
+            f"per stream, so more must be scanned) or lower --gait-max-period"
         )
     rows = best[1]
     cmd_w = data["target_vel"][rows]
@@ -511,6 +510,30 @@ def layout_num_envs(data: dict[str, np.ndarray]) -> int:
     return int(data["_num_envs"]) if "_num_envs" in data else int(data["num_envs"])
 
 
+def _num_streams(data: dict[str, np.ndarray]) -> int:
+    """Number of scannable time-series streams in the recording.
+
+    Teacher rollouts are step-major env-interleaved -> one stream per env
+    (``num_envs``).  Clip-derived recordings (``clip_to_fm_data.py``) are
+    episode-contiguous with ``num_envs == 0`` -> one stream per clip/episode.
+    """
+    num_envs = layout_num_envs(data)
+    return num_envs if num_envs > 0 else int(data["episode_id"].max()) + 1
+
+
+def _stream_indices(data: dict[str, np.ndarray], e: int) -> np.ndarray:
+    """Absolute, time-ordered row indices of stream ``e``.
+
+    Env-interleaved (``num_envs > 0``): env ``e`` is ``arr[e::num_envs]``.
+    Episode-contiguous (``num_envs == 0``, clip data): episode ``e`` is the
+    contiguous block of rows with ``episode_id == e``.
+    """
+    num_envs = layout_num_envs(data)
+    if num_envs > 0:
+        return np.arange(e, data["target_vel"].shape[0], num_envs)
+    return np.nonzero(data["episode_id"] == e)[0]
+
+
 def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) -> tuple[np.ndarray, int]:
     """Recorded command around a contiguous env-stream stretch, padded for context.
 
@@ -528,20 +551,22 @@ def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) 
     Returns:
         ``(cmd, left_pad)``.
     """
-    num_envs = layout_num_envs(data)
-    n_total = data["target_vel"].shape[0]
-    e = int(rows[0]) % num_envs
-    p0 = (int(rows[0]) - e) // num_envs          # stretch-start position in the env stream
+    # Stream (env timeline, or episode for clip data) containing the stretch start.
+    if layout_num_envs(data) > 0:
+        stream = _stream_indices(data, int(rows[0]) % layout_num_envs(data))
+    else:
+        stream = _stream_indices(data, int(data["episode_id"][int(rows[0])]))
     L = len(rows)
+    p0 = int(np.searchsorted(stream, int(rows[0])))  # stretch-start position within the stream
     lo = max(0, p0 - pad)
-    hi = min((n_total - 1 - e) // num_envs + 1, p0 + L + pad)
-    abs_idx = e + np.arange(lo, hi) * num_envs   # candidate window, time-ordered
+    hi = min(len(stream), p0 + L + pad)
+    abs_idx = stream[lo:hi]                       # candidate window, time-ordered
     sie = data["step_in_episode"][abs_idx]
     dn = data["done"].astype(np.int64)[abs_idx]
     cons = (np.diff(sie) == 1) & (dn[:-1] == 0)  # cons[i]: i -> i+1 stays in one episode
     sp = p0 - lo                                 # stretch start within the candidate window
-    ep = sp + L - 1                              # stretch end (inclusive)
-    left, right = sp, ep
+    end = sp + L - 1                             # stretch end (inclusive)
+    left, right = sp, end
     while left - 1 >= 0 and cons[left - 1]:
         left -= 1
     while right + 1 < len(abs_idx) and cons[right]:
