@@ -1104,6 +1104,125 @@ def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
     )
 
 
+@dataclass
+class ForecastStepResult:
+    """Per-anchor comparison for the step scrubber.
+
+    At each anchor step the FM is run twice with the SAME clip command: once on the
+    clean clip history (``clip_branches``) and once on its own free-running
+    autoregressive history (``auto_branches``); ``gt`` is the nominal clip and
+    ``auto_spine`` the realized autoregressive trajectory.  All branches are FULL
+    ``F``-windows (frames ``0..N-1`` echo the conditioning, ``N..F-1`` are novel).
+    """
+
+    gt: dict[str, np.ndarray]                  # nominal clip over the stretch (L, .)
+    auto_spine: dict[str, np.ndarray]          # realized autoregressive trajectory (<=L, .)
+    anchors: list[int]                         # clip-step index of each anchor
+    clip_branches: list[dict[str, np.ndarray]]      # (F, .) per anchor, clip-history forecast
+    auto_branches: list[dict[str, np.ndarray]]      # (F, .) per anchor, autoregressive forecast (may be short)
+    diverged_at: int | None                    # anchor index where the autoregressive rollout blew up
+    N: int
+    F: int
+    dt: float
+    frame_names: list[str]
+    joint_names: list[str]
+    vel_frame: str = "body"
+
+
+def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
+    """Build the per-step (a) clip / (b) clip-history forecast / (c) autoregressive
+    forecast comparison over one contiguous clip stretch.
+
+    For each anchor step both forecasts share the clip's recorded command over the
+    window, so the only difference is the conditioning: clean clip states vs the
+    FM's own free-running output. Used by the arrow-key step scrubber.
+    """
+    N, F = ctx.N, ctx.F
+    vf = args.vel_frame
+    length = max(F, args.forecast_len)
+    rows, mean_cmd, cmd_std, score = find_steady_rows(
+        data, ctx, CANONICAL_CMDS[args.forecast_hist], length, args.n_envs_scan,
+        steady_weight=args.steady_weight,
+    )
+    L = len(rows)
+    n_anchor = L - F + 1
+    if n_anchor < 1:
+        raise RuntimeError(
+            f"clip stretch too short ({L} steps) for one F={F} window; raise --forecast-len"
+        )
+    gt = disp_traj(layout.parse(data["state"][rows]), vf)
+    cmd_w = data["target_vel"][rows]
+    anchors = [N - 1 + i for i in range(n_anchor)]
+    have_ee = ctx.target_num_extra_frames > 0
+    print(f"[bench] forecast_step on {args.forecast_hist!r}: L={L} steps, {n_anchor} anchors "
+          f"(F={F} window) -> {2 * n_anchor} FM samples (clip-history + autoregressive)...")
+
+    # (b) clip-history forecast at each anchor (clean clip window conditioning).
+    clip_branches: list[dict[str, np.ndarray]] = []
+    for i in range(n_anchor):
+        win = build_window_from_rows(data, layout, ctx, rows[i:i + F], device, f"a{anchors[i]}")
+        fut = torch.from_numpy(np.ascontiguousarray(cmd_w[i:i + F])).float().unsqueeze(0).to(device)
+        clip_branches.append(disp_traj(predict(ctx, win, fut, args.seed, include_history=True), vf))
+
+    # (c) autoregressive forecast: free-run from the clip seed, same command profile.
+    hist = BatchedHistory(1, N, device)
+    seed_win = build_window_from_rows(data, layout, ctx, rows[0:F], device, "seed")
+    for kk in range(N):
+        step = {key: seed_win.inputs[key][:, kk] for key in
+                ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel", "joint_pos", "joint_vel")}
+        if have_ee:
+            step["frames"] = seed_win.inputs["frames"][:, kk]
+        hist.append(step)
+    auto_branches: list[dict[str, np.ndarray]] = []
+    diverged_at = None
+    for i in range(n_anchor):
+        rp = hist.stack("root_pos"); rq = hist.stack("root_quat")
+        rlv = hist.stack("root_lin_vel"); rav = hist.stack("root_ang_vel")
+        jp = hist.stack("joint_pos"); jv = hist.stack("joint_vel")
+        frames = hist.stack("frames") if have_ee else None
+        cond, known = build_cond_states(ctx, rp, rq, rlv, rav, jp, jv, frames=frames)
+        fut = torch.from_numpy(np.ascontiguousarray(cmd_w[i:i + F])).float().unsqueeze(0).to(device)
+        cmd_tokens = build_cmd_tokens(ctx, fut) if ctx.cmd_dim > 0 else None
+        torch.manual_seed(args.seed)  # same seed as the clip-history branch (fair compare)
+        pred = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens=cmd_tokens)
+        auto_branches.append(disp_traj(pred_to_traj(pred), vf))
+        # Advance one novel step (frame N) back into the history for the next anchor.
+        new = {
+            "root_pos": pred["root_pos_w"][:, N], "root_quat": pred["root_quat_w"][:, N],
+            "root_lin_vel": pred["root_link_lin_vel_w"][:, N], "root_ang_vel": pred["root_link_ang_vel_w"][:, N],
+            "joint_pos": pred["joint_pos"][:, N], "joint_vel": pred["joint_vel"][:, N],
+        }
+        if have_ee:
+            new["frames"] = torch.cat(
+                [pred["frame_pos_w"][:, N], pred["frame_quat_w"][:, N],
+                 pred["frame_lin_vel_w"][:, N], pred["frame_ang_vel_w"][:, N]], dim=-1)
+        finite = all(torch.isfinite(v).all().item() for v in new.values())
+        z = float(new["root_pos"][0, 2].item())
+        if (not finite) or not (0.2 < z < 2.0):
+            diverged_at = i
+            print(f"[bench]   autoregressive DIVERGED at anchor {anchors[i]} (finite={finite}, z={z:.3f})")
+            break
+        hist.append(new)
+
+    # Realized autoregressive spine = clip seed (0..N-1) + each branch's first novel frame.
+    spine_keys = [k for k in ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel",
+                              "ee_pos", "ee_quat", "ee_lin_vel", "ee_ang_vel") if k in gt]
+
+    def _spine(key: str) -> np.ndarray:
+        parts = [gt[key][0:N]]
+        if auto_branches:
+            parts.append(np.stack([b[key][N] for b in auto_branches]))
+        return np.concatenate(parts, axis=0)
+
+    auto_spine = {key: _spine(key) for key in spine_keys}
+    return ForecastStepResult(
+        gt=gt, auto_spine=auto_spine, anchors=anchors,
+        clip_branches=clip_branches, auto_branches=auto_branches, diverged_at=diverged_at,
+        N=N, F=F, dt=ctx.dt_attr, frame_names=ctx.target_frame_names if have_ee else [],
+        joint_names=ctx.joint_names, vel_frame=vf,
+    )
+
+
 # ======================================================================
 # 6. plot builders (each draws into a passed-in, cleared figure)
 # ======================================================================
@@ -1292,6 +1411,41 @@ def draw_rollout(fig, res: RolloutResult) -> None:
     fig.suptitle(f"rollout  --  {status}", fontsize=12)
 
 
+def draw_rollout_ee_pos(fig, res: RolloutResult) -> None:
+    """Predicted ankle-link world x,y,z over the autoregressive rollout.
+
+    One row per ankle frame (falls back to all ee frames if none are named
+    ``*ankle*``), columns x/y/z in the world frame -- the FM's predicted foot
+    placement as the rollout free-runs (z is the foot-height / stepping signal).
+    """
+    fig.clear()
+    if "ee_pos" not in res.traj or not res.frame_names:
+        ax = fig.subplots(1, 1)
+        ax.text(0.5, 0.5, "FM checkpoint has no ee frames -- nothing to plot",
+                ha="center", va="center", fontsize=11)
+        ax.set_axis_off()
+        fig.suptitle("rollout  --  ankle positions (unavailable)", fontsize=12)
+        return
+    ee = res.traj["ee_pos"]                 # (T, K, 3) world
+    T = ee.shape[0]
+    t = np.arange(T) * res.dt
+    idx = [i for i, nm in enumerate(res.frame_names) if "ankle" in nm.lower()] or list(range(len(res.frame_names)))
+    axs = fig.subplots(len(idx), 3, squeeze=False)
+    lab = ["x", "y", "z"]
+    for r, k in enumerate(idx):
+        for c in range(3):
+            ax = axs[r, c]
+            ax.plot(t, ee[:, k, c], color="C0")
+            ax.set_title(f"{res.frame_names[k]}  {lab[c]} (m, world)", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            if res.diverged_at is not None:
+                ax.axvline(res.diverged_at * res.dt, color="r", lw=1.2)
+            if r == len(idx) - 1:
+                ax.set_xlabel("time (s)")
+    status = f"DIVERGED @ step {res.diverged_at}" if res.diverged_at is not None else f"{T} steps"
+    fig.suptitle(f"rollout  --  predicted ankle-link positions ({status})", fontsize=12)
+
+
 def _forecast_color(res: ForecastResult):
     """Viridis normalizer over anchor time (s) + colormap for the forecast fans."""
     L = res.gt["root_pos"].shape[0]
@@ -1386,6 +1540,95 @@ def draw_forecast_path(fig, res: ForecastResult) -> None:
     fig.colorbar(sm, ax=ax, label="forecast anchor time (s)")
     fig.suptitle("forecast vs ground truth  --  root xy path  (dotted = FM history echo, solid = novel)",
                  fontsize=12)
+
+
+def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
+    """One scrub step: the nominal clip + the clip-history forecast + the
+    autoregressive forecast launched at anchor ``k`` (echo dotted, novel solid).
+
+    Black = nominal clip (a); blue = clip-history forecast (b); red = autoregressive
+    forecast (c); grey = realized autoregressive trajectory. Arrow keys move ``k``.
+    """
+    from matplotlib.lines import Line2D
+
+    fig.clear()
+    axs = fig.subplots(3, 3)
+    n, F, dt, vf = res.N, res.F, res.dt, res.vel_frame
+    gt, spine = res.gt, res.auto_spine
+    L = gt["root_pos"].shape[0]
+    t_gt = np.arange(L) * dt
+    t_sp = np.arange(spine["root_pos"].shape[0]) * dt
+    a = res.anchors[k]
+    clip = res.clip_branches[k]
+    auto = res.auto_branches[k] if k < len(res.auto_branches) else None
+    tw = (np.arange(F) + (a - (n - 1))) * dt        # window frames in clip time
+
+    C_CLIP, C_SPINE, C_CB, C_AB = "k", "0.6", "C0", "C3"
+
+    def branch(ax, getter, br, col) -> None:
+        y = getter(br)
+        ax.plot(tw[:n], y[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)   # echo
+        ax.plot(tw[n - 1:], y[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)   # novel
+
+    def panel(ax, getter, title) -> None:
+        ax.plot(t_gt, getter(gt), color=C_CLIP, lw=1.4, alpha=0.55, zorder=2)
+        if spine["root_pos"].shape[0]:
+            ax.plot(t_sp, getter(spine), color=C_SPINE, lw=1.2, alpha=0.8, zorder=3)
+        branch(ax, getter, clip, C_CB)
+        if auto is not None:
+            branch(ax, getter, auto, C_AB)
+        ax.axvline(a * dt, color="0.3", lw=0.8, ls=":")
+        ax.grid(True, alpha=0.3)
+        ax.set_title(title, fontsize=9)
+
+    lab = ["x", "y", "z"]
+    for i in range(3):
+        panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
+              f"root lin vel {lab[i]} ({vf}, m/s)")
+        panel(axs[1, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i),
+              f"root pos {lab[i]} (m, world)")
+
+    # xy path (world)
+    ax = axs[2, 0]
+    ax.plot(gt["root_pos"][:, 0], gt["root_pos"][:, 1], color=C_CLIP, lw=1.4, alpha=0.55, zorder=2)
+    if spine["root_pos"].shape[0]:
+        ax.plot(spine["root_pos"][:, 0], spine["root_pos"][:, 1], color=C_SPINE, lw=1.2, alpha=0.8, zorder=3)
+
+    def xy(br, col) -> None:
+        px, py = br["root_pos"][:, 0], br["root_pos"][:, 1]
+        ax.plot(px[:n], py[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)
+        ax.plot(px[n - 1:], py[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)
+
+    xy(clip, C_CB)
+    if auto is not None:
+        xy(auto, C_AB)
+    ax.set_title("root xy path (m, world)", fontsize=9)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlabel("x (m)")
+
+    panel(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), "root yaw (rad)")
+
+    if "ee_pos" in gt and res.frame_names:
+        ai = next((j for j, nm in enumerate(res.frame_names) if "ankle" in nm.lower()), 0)
+        panel(axs[2, 2], (lambda jj: (lambda tr: tr["ee_pos"][:, jj, 2]))(ai),
+              f"{res.frame_names[ai]} z (m, world)")
+    else:
+        axs[2, 2].set_visible(False)
+
+    handles = [Line2D([0], [0], color=C_CLIP, lw=1.4, alpha=0.6),
+               Line2D([0], [0], color=C_SPINE, lw=1.2),
+               Line2D([0], [0], color=C_CB, lw=1.8),
+               Line2D([0], [0], color=C_AB, lw=1.8)]
+    labels = ["clip (nominal)", "autoregressive (realized)",
+              "clip-history forecast", "autoregressive forecast"]
+    fig.legend(handles, labels, loc="upper right", fontsize=8)
+    div = "" if auto is not None else "   [autoregressive DIVERGED here]"
+    fig.suptitle(
+        f"forecast step {k + 1}/{len(res.anchors)}  --  anchor step {a}  (t={a * dt:.2f}s){div}\n"
+        f"dotted = FM history echo, solid = novel prediction",
+        fontsize=11,
+    )
 
 
 def draw_forecast_cmd(fig, res: ForecastResult) -> None:
@@ -1559,6 +1802,61 @@ class FigureBrowser:
         print(f"[bench] {len(self.pages)} PNGs in {out_dir}")
 
 
+class ForecastStepBrowser:
+    """Scrub the per-step forecast comparison with Left/Right arrows.
+
+    Unlike :class:`FigureBrowser` (which pages between figures), here Left/Right
+    move through the anchor STEPS of a single :class:`ForecastStepResult`, redrawing
+    the clip / clip-history forecast / autoregressive forecast at each step.
+    """
+
+    def __init__(self, res: ForecastStepResult, plt):
+        """Store the precomputed per-step result and the bound pyplot module."""
+        self.res = res
+        self.plt = plt
+        self.k = 0
+        self.n = len(res.anchors)
+
+    def _render(self, fig) -> None:
+        draw_forecast_step(fig, self.res, self.k)
+        fig.canvas.manager.set_window_title(
+            f"[step {self.k + 1}/{self.n}] forecast_step  anchor={self.res.anchors[self.k]}"
+        )
+        fig.canvas.draw_idle()
+
+    def _on_key(self, event, fig) -> None:
+        if event.key in ("right", "down", " "):
+            self.k = (self.k + 1) % self.n
+            self._render(fig)
+        elif event.key in ("left", "up"):
+            self.k = (self.k - 1) % self.n
+            self._render(fig)
+        elif event.key in ("q", "escape"):
+            self.plt.close(fig)
+
+    def show(self) -> None:
+        """Open one interactive window and bind arrow-key step scrubbing."""
+        fig = self.plt.figure(figsize=(15, 9))
+        fig.canvas.mpl_connect("key_press_event", lambda e: self._on_key(e, fig))
+        self._render(fig)
+        print(f"[bench] forecast_step: {self.n} steps -- Left/Right to scrub steps, q to quit")
+        self.plt.show()
+
+    def save_all(self, out_dir: str, stride: int) -> None:
+        """Render a strided subset of steps to PNGs (interactive shows every step)."""
+        os.makedirs(out_dir, exist_ok=True)
+        idxs = list(range(0, self.n, max(1, stride)))
+        for k in idxs:
+            fig = self.plt.figure(figsize=(15, 9))
+            draw_forecast_step(fig, self.res, k)
+            path = os.path.join(out_dir, f"forecast_step_{self.res.anchors[k]:04d}.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            self.plt.close(fig)
+            print(f"[bench]   saved {path}")
+        print(f"[bench] {len(idxs)} step PNGs in {out_dir} "
+              f"(every {max(1, stride)} steps via --forecast-stride; interactive scrubs all {self.n})")
+
+
 def scenario_pages(scn: Scenario) -> list[Page]:
     """Build the per-scenario page list (root, each EE, joints, command)."""
     pages = [Page(f"{scn.name} / root", lambda fig, s=scn: draw_root(fig, s))]
@@ -1635,8 +1933,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Path to the FM .pt checkpoint (default: latest logs/flow_matching/*/best.pt).")
     p.add_argument("--data", default=None, help="Recording .npz (default: auto-resolve from the run dir).")
     p.add_argument("--mode",
-                   choices=["sweep_command", "sweep_history", "sweep_phase", "forecast", "rollout", "all"],
-                   default="all")
+                   choices=["sweep_command", "sweep_history", "sweep_phase", "forecast",
+                            "forecast_step", "rollout", "all"],
+                   default="all",
+                   help="'forecast_step' is a standalone, arrow-key step scrubber comparing the "
+                        "nominal clip vs clip-history forecast vs autoregressive forecast per step "
+                        "(not included in 'all').")
     p.add_argument("--device", default="cpu")
     p.add_argument("--num_sampling_steps", type=int, default=None, help="Override Euler step count.")
     p.add_argument("--seed", type=int, default=0)
@@ -1746,6 +2048,18 @@ def main() -> int:
 
     layout = StateLayout(meta)
 
+    # forecast_step is a standalone arrow-key step scrubber (its own browser binds
+    # Left/Right to STEPS, not pages), so handle it up front and return.
+    if args.mode == "forecast_step":
+        step_res = run_forecast_step(ctx, data, layout, args, device)
+        scrubber = ForecastStepBrowser(step_res, plt)
+        out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
+        if interactive:
+            scrubber.show()
+        else:
+            scrubber.save_all(out_dir, args.forecast_stride)
+        return 0
+
     def get_window(name: str) -> Window:
         if name not in CANONICAL_CMDS:
             raise ValueError(f"unknown canonical history {name!r}; choose from {list(CANONICAL_CMDS)}")
@@ -1779,6 +2093,8 @@ def main() -> int:
         win = get_window(args.rollout_seed_history)
         rollout_result = run_rollout(ctx, win, args, device)
         pages.append(Page("rollout / stability", lambda fig, r=rollout_result: draw_rollout(fig, r)))
+        pages.append(Page("rollout / ankle positions",
+                          lambda fig, r=rollout_result: draw_rollout_ee_pos(fig, r)))
 
     browser = FigureBrowser(pages, plt)
     out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
