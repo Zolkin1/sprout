@@ -28,9 +28,13 @@ Four experiments:
   new conditioning for many steps and check stability (NaN / height collapse /
   velocity tracking).
 
-Conditioning states are pulled from a real ``record_data.py`` recording (the same
-data the FM was trained on), selected by matching their recorded ``target_vel`` to
-a desired command -- realistic walking/running gaits cannot be synthesized by hand.
+The clip-conditioned FM never sees robot state, and neither does this bench: the
+conditioning states are pulled from a clean **clip** recording (the
+``clip_to_fm_data.py`` ``.npz`` the FM trained on -- the clip reference, episode-
+contiguous, ``num_envs == 0``), selected by matching the recorded ``target_vel`` to
+a desired command (realistic gaits cannot be synthesized by hand), or come from the
+FM's own autoregressive rollout. Robot-rollout recordings (``record_data.py``,
+``num_envs > 0``) are rejected at load.
 
 Plots are shown in an interactive matplotlib window with Left/Right arrow-key
 paging when a display is available, and saved as PNGs otherwise (``--save DIR``
@@ -201,14 +205,19 @@ def _read_member(zf: zipfile.ZipFile, name: str) -> np.ndarray:
 
 
 def load_recording_lite(path: str) -> tuple[dict[str, np.ndarray], DuckMeta]:
-    """Load only the arrays the bench needs from a ``record_data.py`` ``.npz``.
+    """Load only the arrays the bench needs from a ``clip_to_fm_data.py`` ``.npz``.
 
     Args:
-        path: Path to the recording ``.npz``.
+        path: Path to the clean clip recording ``.npz`` (episode-contiguous,
+            ``num_envs == 0``).
 
     Returns:
         ``(data, meta)`` where ``data`` holds the numpy arrays in
         :data:`_NEEDED_ARRAYS` and ``meta`` is a :class:`DuckMeta`.
+
+    Raises:
+        ValueError: If the recording is a robot rollout (``num_envs > 0``); the
+            clip-conditioned FM (and this bench) never use robot state.
     """
     print(f"[bench] loading recording (state + small arrays only): {path}")
     data: dict[str, np.ndarray] = {}
@@ -232,6 +241,14 @@ def load_recording_lite(path: str) -> tuple[dict[str, np.ndarray], DuckMeta]:
         dt=float(raw_meta["dt"]),
     )
     print(f"[bench]   state {data['state'].shape}, num_envs={meta.num_envs}, dt={meta.dt}")
+    if meta.num_envs > 0:
+        raise ValueError(
+            f"fm_test_bench operates only on clean clip recordings (clip_to_fm_data.py: "
+            f"num_envs=0, episode-contiguous), not robot rollouts -- {path} has "
+            f"num_envs={meta.num_envs} (step-major env-interleaved record_data.py data). "
+            f"The clip-conditioned FM never sees robot state; point --data at a "
+            f"clip_to_fm_data .npz (e.g. clips/<lib>_fm.npz)."
+        )
     return data, meta
 
 
@@ -360,8 +377,8 @@ def find_steady_rows(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Find the steadiest contiguous ``length``-step stretch matching ``target_cmd``.
 
-    Scans the first ``n_envs_scan`` env streams (step-major: env ``e`` is
-    ``arr[e::num_envs]``). A stretch is valid iff ``step_in_episode`` is strictly
+    Scans the first ``n_envs_scan`` episode streams (clip recordings have one
+    episode per clip). A stretch is valid iff ``step_in_episode`` is strictly
     consecutive and no row before the last is a ``done`` (mirrors
     ``dataset.episode_windows``). The score is ``||mean(cmd) - target||`` plus
     ``steady_weight`` times the combined within-stretch command std, so a
@@ -381,7 +398,7 @@ def find_steady_rows(
 
     best = None  # (score, rows)
     for e in range(min(n_envs_scan, _num_streams(data))):
-        idx = _stream_indices(data, e)            # env stream, or episode for clip data
+        idx = _stream_indices(data, e)            # episode (clip) stream
         n_e = len(idx)
         if n_e < L:
             continue
@@ -505,39 +522,28 @@ def find_window(
     return build_window_from_rows(data, layout, ctx, rows, device, label)
 
 
-def layout_num_envs(data: dict[str, np.ndarray]) -> int:
-    """Number of envs (step-major interleave stride) -- carried in the recording."""
-    return int(data["_num_envs"]) if "_num_envs" in data else int(data["num_envs"])
-
-
 def _num_streams(data: dict[str, np.ndarray]) -> int:
-    """Number of scannable time-series streams in the recording.
+    """Number of scannable time-series streams (one per clip/episode).
 
-    Teacher rollouts are step-major env-interleaved -> one stream per env
-    (``num_envs``).  Clip-derived recordings (``clip_to_fm_data.py``) are
-    episode-contiguous with ``num_envs == 0`` -> one stream per clip/episode.
+    Clip recordings (``clip_to_fm_data.py``) are episode-contiguous, so each
+    ``episode_id`` is one stream. Robot rollouts are rejected at load.
     """
-    num_envs = layout_num_envs(data)
-    return num_envs if num_envs > 0 else int(data["episode_id"].max()) + 1
+    return int(data["episode_id"].max()) + 1
 
 
 def _stream_indices(data: dict[str, np.ndarray], e: int) -> np.ndarray:
-    """Absolute, time-ordered row indices of stream ``e``.
+    """Absolute, time-ordered row indices of episode ``e``.
 
-    Env-interleaved (``num_envs > 0``): env ``e`` is ``arr[e::num_envs]``.
-    Episode-contiguous (``num_envs == 0``, clip data): episode ``e`` is the
-    contiguous block of rows with ``episode_id == e``.
+    Episode-contiguous (clip data): episode ``e`` is the contiguous block of rows
+    with ``episode_id == e``.
     """
-    num_envs = layout_num_envs(data)
-    if num_envs > 0:
-        return np.arange(e, data["target_vel"].shape[0], num_envs)
     return np.nonzero(data["episode_id"] == e)[0]
 
 
 def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) -> tuple[np.ndarray, int]:
-    """Recorded command around a contiguous env-stream stretch, padded for context.
+    """Recorded command around a contiguous episode stretch, padded for context.
 
-    ``rows`` are the absolute (step-major) indices of one env's consecutive steps.
+    ``rows`` are the absolute indices of one episode's consecutive steps.
     Returns ``(cmd, left_pad)`` where ``cmd`` is the recorded ``target_vel`` over
     ``[stretch_start - pad, stretch_end + pad]`` (truncated at episode resets and
     array bounds) and ``left_pad`` is how many real steps precede the stretch, so the
@@ -545,17 +551,14 @@ def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) 
 
     Args:
         data: Recording arrays.
-        rows: Absolute indices of the stretch (contiguous in one env stream).
+        rows: Absolute indices of the stretch (contiguous in one episode).
         pad: Desired context length (steps) on each side.
 
     Returns:
         ``(cmd, left_pad)``.
     """
-    # Stream (env timeline, or episode for clip data) containing the stretch start.
-    if layout_num_envs(data) > 0:
-        stream = _stream_indices(data, int(rows[0]) % layout_num_envs(data))
-    else:
-        stream = _stream_indices(data, int(data["episode_id"][int(rows[0])]))
+    # Episode containing the stretch start.
+    stream = _stream_indices(data, int(data["episode_id"][int(rows[0])]))
     L = len(rows)
     p0 = int(np.searchsorted(stream, int(rows[0])))  # stretch-start position within the stream
     lo = max(0, p0 - pad)
@@ -1637,7 +1640,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="cpu")
     p.add_argument("--num_sampling_steps", type=int, default=None, help="Override Euler step count.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--n-envs-scan", type=int, default=8, help="Env streams to scan for histories.")
+    p.add_argument("--n-envs-scan", type=int, default=8,
+                   help="Episode (clip) streams to scan for matching histories. Clip recordings "
+                        "have one short episode per clip, so raise this to scan more clips.")
     p.add_argument("--steady-weight", type=float, default=1.0,
                    help="Penalty on within-window command std when picking histories: higher prefers "
                         "constant-velocity (steady-state) segments over transients. 0 = pure mean-match.")
@@ -1726,7 +1731,6 @@ def main() -> int:
 
     data_path = resolve_data_path(args.fm_checkpoint, args.data)
     data, meta = load_recording_lite(data_path)
-    data["_num_envs"] = np.int64(meta.num_envs)
     ctx.dt_attr = meta.dt  # attach dt for plotting (FmOnlineContext has no dt field)
 
     if meta.state_joint_names != list(ctx.joint_names):
