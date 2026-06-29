@@ -1596,6 +1596,14 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
     for i in range(3):
         panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
               f"root lin vel {lab[i]} ({vf}, m/s)")
+        # Clip mean velocity (dotted black line + value). NOTE: this is the DISPLAYED
+        # ({vf}) frame; the green ∫vel below integrates the WORLD velocity, so in body
+        # frame the mean here will NOT equal the green drift (forward speed leaks into
+        # body-z via pelvis tilt). Use --vel-frame world to compare like-for-like.
+        vmean = float(gt["root_lin_vel"][:, i].mean())
+        axs[0, i].axhline(vmean, color=C_CLIP, ls=":", lw=0.9, alpha=0.7)
+        axs[0, i].text(0.98, 0.03, f"clip mean {vmean:+.3f}", transform=axs[0, i].transAxes,
+                       ha="right", va="bottom", fontsize=7, color=C_CLIP)
         panel(axs[1, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i),
               f"root pos {lab[i]} (m, world)")
         # Clip position from integrating the clip's WORLD velocity (consistency check).
