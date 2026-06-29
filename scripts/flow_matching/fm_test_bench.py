@@ -1116,6 +1116,7 @@ class ForecastStepResult:
     """
 
     gt: dict[str, np.ndarray]                  # nominal clip over the stretch (L, .)
+    gt_pos_intvel: np.ndarray                  # clip root pos from integrating its world vel (L, 3)
     auto_spine: dict[str, np.ndarray]          # realized autoregressive trajectory (<=L, .)
     anchors: list[int]                         # clip-step index of each anchor
     clip_branches: list[dict[str, np.ndarray]]      # (F, .) per anchor, clip-history forecast
@@ -1150,7 +1151,16 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
         raise RuntimeError(
             f"clip stretch too short ({L} steps) for one F={F} window; raise --forecast-len"
         )
-    gt = disp_traj(layout.parse(data["state"][rows]), vf)
+    raw_gt = layout.parse(data["state"][rows])      # world-frame velocities
+    gt = disp_traj(raw_gt, vf)                       # body-frame velocities for display
+    # Root position obtained by trapezoidally integrating the clip's recorded WORLD
+    # root linear velocity from the first sample. Overlaid on the position plots, it
+    # shows how kinematically self-consistent the clip's (position, velocity) are.
+    v_w = raw_gt["root_lin_vel"]                     # (L, 3) world
+    seg = 0.5 * (v_w[:-1] + v_w[1:]) * ctx.dt_attr   # trapezoid increments
+    gt_pos_intvel = np.concatenate(
+        [raw_gt["root_pos"][0:1], raw_gt["root_pos"][0:1] + np.cumsum(seg, axis=0)], axis=0
+    ).astype(np.float32)                             # (L, 3) world
     cmd_w = data["target_vel"][rows]
     anchors = [N - 1 + i for i in range(n_anchor)]
     have_ee = ctx.target_num_extra_frames > 0
@@ -1216,7 +1226,7 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
 
     auto_spine = {key: _spine(key) for key in spine_keys}
     return ForecastStepResult(
-        gt=gt, auto_spine=auto_spine, anchors=anchors,
+        gt=gt, gt_pos_intvel=gt_pos_intvel, auto_spine=auto_spine, anchors=anchors,
         clip_branches=clip_branches, auto_branches=auto_branches, diverged_at=diverged_at,
         N=N, F=F, dt=ctx.dt_attr, frame_names=ctx.target_frame_names if have_ee else [],
         joint_names=ctx.joint_names, vel_frame=vf,
@@ -1563,7 +1573,7 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
     auto = res.auto_branches[k] if k < len(res.auto_branches) else None
     tw = (np.arange(F) + (a - (n - 1))) * dt        # window frames in clip time
 
-    C_CLIP, C_SPINE, C_CB, C_AB = "k", "0.6", "C0", "C3"
+    C_CLIP, C_SPINE, C_CB, C_AB, C_IV = "k", "0.6", "C0", "C3", "C2"
 
     def branch(ax, getter, br, col) -> None:
         y = getter(br)
@@ -1581,16 +1591,20 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
         ax.grid(True, alpha=0.3)
         ax.set_title(title, fontsize=9)
 
+    iv = res.gt_pos_intvel
     lab = ["x", "y", "z"]
     for i in range(3):
         panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
               f"root lin vel {lab[i]} ({vf}, m/s)")
         panel(axs[1, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i),
               f"root pos {lab[i]} (m, world)")
+        # Clip position from integrating the clip's WORLD velocity (consistency check).
+        axs[1, i].plot(t_gt, iv[:, i], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
 
     # xy path (world)
     ax = axs[2, 0]
     ax.plot(gt["root_pos"][:, 0], gt["root_pos"][:, 1], color=C_CLIP, lw=1.4, alpha=0.55, zorder=2)
+    ax.plot(iv[:, 0], iv[:, 1], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
     if spine["root_pos"].shape[0]:
         ax.plot(spine["root_pos"][:, 0], spine["root_pos"][:, 1], color=C_SPINE, lw=1.2, alpha=0.8, zorder=3)
 
@@ -1617,10 +1631,11 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
         axs[2, 2].set_visible(False)
 
     handles = [Line2D([0], [0], color=C_CLIP, lw=1.4, alpha=0.6),
+               Line2D([0], [0], color=C_IV, lw=1.3, ls="--"),
                Line2D([0], [0], color=C_SPINE, lw=1.2),
                Line2D([0], [0], color=C_CB, lw=1.8),
                Line2D([0], [0], color=C_AB, lw=1.8)]
-    labels = ["clip (nominal)", "autoregressive (realized)",
+    labels = ["clip (nominal)", "clip ∫vel (world)", "autoregressive (realized)",
               "clip-history forecast", "autoregressive forecast"]
     fig.legend(handles, labels, loc="upper right", fontsize=8)
     div = "" if auto is not None else "   [autoregressive DIVERGED here]"
