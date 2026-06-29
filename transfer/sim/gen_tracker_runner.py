@@ -538,6 +538,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 obs = policy.create_obs(state)  # FM reference (history warm from observe())
                 ref = None                       # log against the FM reference
             else:
+                # Ego-centric (receding-horizon) reference: periodically re-place the
+                # clip onto the robot's current root (planar pos + heading) so the
+                # reference recedes ahead of the robot, mirroring the teacher's
+                # training-time ego re-anchoring. World-anchored mode (default) leaves
+                # the fixed placement untouched.
+                if clip.ego_anchor and (clip_step - clip.start_step) % max(clip.ego_anchor_every, 1) == 0:
+                    clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
                 policy.observe(state)            # keep the FM history warm for handoff
                 ref = clip.reference_at(s, policy.future_offsets)
                 obs = policy._build_obs(state, reference=ref)
@@ -643,6 +650,14 @@ def main() -> None:
                              "The robot spawns on the clip pose at this time and the reference is "
                              "served from here -- e.g. to skip a standing prefix. Sim time and the "
                              "--clip_handoff_time gate are still measured from this start.")
+    parser.add_argument("--clip_ego_anchor", action="store_true", default=False,
+                        help="In --clip mode, use the ego-centric (receding-horizon) reference: "
+                             "periodically re-place the clip onto the robot's current root (planar "
+                             "pos + heading), matching the teacher's ego-anchored training. Default "
+                             "(off) is the world-anchored fixed-placement clip.")
+    parser.add_argument("--clip_ego_anchor_every", type=int, default=10,
+                        help="Re-anchor cadence (control steps) for --clip_ego_anchor; should match "
+                             "the teacher's ego_anchor_every (default 10, ~0.2s at dt=0.02).")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -656,10 +671,20 @@ def main() -> None:
     exported = os.path.join(run_dir, "exported")
     tracker_onnx = os.path.join(exported, "tracker.onnx")
     fm_onnx = args.fm_onnx or os.path.join(exported, "fm.onnx")
-    for p in (tracker_onnx, fm_onnx):
-        if not os.path.exists(p):
-            sys.exit(f"[ERROR] Missing {p}. Export with export_tracker_onnx.py / export_fm_onnx.py first.")
-    print(f"[INFO] Tracker run: {run_name}\n[INFO] tracker.onnx: {tracker_onnx}\n[INFO] fm.onnx: {fm_onnx}")
+    # Clip-only playback (a clip with no FM handoff) drives the tracker straight from the
+    # clip reference, so the generator is optional -- this is how a pure clip-tracking
+    # teacher (which has no fm.onnx) is played in MuJoCo. Every other mode (joystick/eval,
+    # or a clip->FM handoff) needs the generator.
+    clip_only = bool(args.clip) and args.clip_handoff_time is None
+    if not os.path.exists(tracker_onnx):
+        sys.exit(f"[ERROR] Missing {tracker_onnx}. Export with export_tracker_onnx.py first.")
+    if clip_only:
+        fm_onnx = None
+    elif not os.path.exists(fm_onnx):
+        sys.exit(f"[ERROR] Missing {fm_onnx}. Export with export_fm_onnx.py, or play clip-only "
+                 f"(--clip <h5> without --clip_handoff_time) to run the tracker with no FM.")
+    print(f"[INFO] Tracker run: {run_name}\n[INFO] tracker.onnx: {tracker_onnx}\n"
+          f"[INFO] fm.onnx: {fm_onnx if fm_onnx else '(none -- tracker-only clip playback)'}")
 
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
@@ -671,7 +696,14 @@ def main() -> None:
     if args.use_ic:
         robot.set_initial_condition(policy._trk)
 
-    if args.mode == "joystick":
+    if args.clip:
+        # Clip playback drives the velocity command from the clip's target_vel, so the
+        # joystick / scripted command source is unused (run_clip_loop ignores command_fn).
+        # Skip building it -- in particular the pygame/SDL joystick init, which otherwise
+        # conflicts with the MuJoCo viewer's GLFW context at interpreter teardown and
+        # produces a benign-but-ugly shutdown segfault.
+        command_fn = lambda _t: np.zeros(3)
+    elif args.mode == "joystick":
         command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz, args.start_button)
     else:
         if not hasattr(vc, args.command):
@@ -699,7 +731,9 @@ def main() -> None:
         clip_path = args.clip if os.path.isabs(args.clip) else os.path.join(root_dir, args.clip)
         clip = ClipReference(clip_path, policy.get_joint_names(),
                              list(policy.ctx.target_frame_names), policy.base_frame_name,
-                             start_time=args.clip_start_time)
+                             start_time=args.clip_start_time,
+                             ego_anchor=args.clip_ego_anchor,
+                             ego_anchor_every=args.clip_ego_anchor_every)
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
@@ -712,6 +746,7 @@ def main() -> None:
               f"[INFO] {clip.num_steps} steps, {clip.clip_length_s:.2f}s @ dt={clip.dt}; "
               f"start={clip.start_step * clip.dt:.2f}s (step {clip.start_step}); "
               f"handoff={'clip-only' if clip_handoff_time < 0 else f'{clip_handoff_time:.2f}s'}; "
+              f"anchor={f'ego/every {args.clip_ego_anchor_every}' if args.clip_ego_anchor else 'world'}; "
               f"total_time={total_time:.2f}s")
 
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,

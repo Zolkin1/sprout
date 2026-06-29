@@ -32,11 +32,15 @@ import numpy as np
 from deploy.quat_math_np import quat_apply, quat_inv, quat_mul
 
 
+def _yaw_angle(q: np.ndarray) -> float:
+    """Yaw angle (rad) about world z of an ``(x, y, z, w)`` quaternion."""
+    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
 def _yaw_quat(q: np.ndarray) -> np.ndarray:
     """Yaw-only ``(x, y, z, w)`` quaternion of an ``(x, y, z, w)`` quaternion."""
-    x, y, z, w = float(q[0]), float(q[1]), float(q[2]), float(q[3])
-    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    h = 0.5 * yaw
+    h = 0.5 * _yaw_angle(q)
     return np.array([0.0, 0.0, math.sin(h), math.cos(h)], dtype=np.float64)
 
 
@@ -61,6 +65,13 @@ class ClipReference:
         start_time: Seconds into the clip at which playback begins.  The robot
             spawns on the clip pose at this time and the reference is served from
             here (e.g. to skip a standing prefix).  Clamped to ``[0, clip_end)``.
+        ego_anchor: If True, the placement is meant to be periodically re-anchored
+            onto the robot's root (via :meth:`reanchor_ego`), turning the clip into
+            an ego-centric, receding-horizon reference -- the MuJoCo counterpart of
+            the teacher's training-time ego re-anchoring.  Default (False) keeps the
+            fixed world placement (world-anchored playback).
+        ego_anchor_every: Re-anchor cadence in control steps (only meaningful when
+            ``ego_anchor`` is True); should match the teacher's ``ego_anchor_every``.
     """
 
     def __init__(
@@ -71,6 +82,8 @@ class ClipReference:
         base_frame_name: str = "pelvis_link",
         clip_id: int = 0,
         start_time: float = 0.0,
+        ego_anchor: bool = False,
+        ego_anchor_every: int = 10,
     ) -> None:
         with h5py.File(str(path), "r") as f:
             self.y = np.asarray(f["y_des"][clip_id], dtype=np.float64)    # [T, P] clip-world
@@ -106,6 +119,10 @@ class ClipReference:
         self._ee_ang = [[vi(f"{fr}:ori_{a}") for a in ("x", "y", "z")] for fr in ee_frame_names]
         self._num_ee = len(ee_frame_names)
 
+        # Ego-centric (receding-horizon) re-anchoring config (see reanchor_ego).
+        self.ego_anchor = bool(ego_anchor)
+        self.ego_anchor_every = int(ego_anchor_every)
+
         # Identity placement (clip-world == sim-world) -> lift is a pass-through.
         self.set_placement(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
 
@@ -117,6 +134,39 @@ class ClipReference:
         """Set the per-clip world placement (yaw-only ground frame)."""
         self._anchor_pos = np.asarray(anchor_pos, dtype=np.float64)
         self._inv_yaw = _anchor_inv_yaw(np.asarray(anchor_quat_xyzw, dtype=np.float64))
+
+    def reanchor_ego(self, step: int, robot_pos_w: np.ndarray, robot_quat_xyzw: np.ndarray) -> None:
+        """Re-place the clip so its ``step`` base lands on the robot's root (planar).
+
+        The receding-horizon, ego-centric counterpart of the fixed placement:
+        mirrors IsaacLab ``MotionSequenceCommand._reanchor_ego_envs`` /
+        ``closed_loop_command.ego_placement`` exactly -- solve a yaw-only placement
+        so lifting the clip-world base at ``step`` reproduces the robot's planar
+        position and heading, keeping the clip's natural height (z) and tilt.  Call
+        every ``ego_anchor_every`` steps while the clip drives the reference; the
+        whole served horizon (current + future) then recedes from the robot's pose.
+
+        Args:
+            step: Clip step whose base pose is snapped onto the robot.
+            robot_pos_w: ``[3]`` robot root world position.
+            robot_quat_xyzw: ``[4]`` robot root world orientation (xyzw).
+        """
+        s = int(min(max(step, 0), self.num_steps - 1))
+        base_pos_cf = self.y[s][self._base_pos]
+        base_ori_cf = self.y[s][self._base_ori]  # xyzw
+        yaw = _yaw_angle(np.asarray(robot_quat_xyzw, dtype=np.float64)) - _yaw_angle(base_ori_cf)
+        h = 0.5 * yaw
+        world_quat = np.array([0.0, 0.0, math.sin(h), math.cos(h)], dtype=np.float64)
+        # R(yaw) @ base_pos_cf[:2]; equals quat_apply(world_quat, base_pos_cf)[:2].
+        c, sn = math.cos(yaw), math.sin(yaw)
+        rot_x = c * base_pos_cf[0] - sn * base_pos_cf[1]
+        rot_y = sn * base_pos_cf[0] + c * base_pos_cf[1]
+        world_pos = np.array([
+            float(robot_pos_w[0]) - rot_x,   # so the lifted base xy == robot xy
+            float(robot_pos_w[1]) - rot_y,
+            0.0,                              # natural clip height above flat ground (z=0)
+        ], dtype=np.float64)
+        self.set_placement(world_pos, world_quat)
 
     def _lift_pos(self, p_rel: np.ndarray) -> np.ndarray:
         return self._anchor_pos + quat_apply(self._inv_yaw, p_rel)
