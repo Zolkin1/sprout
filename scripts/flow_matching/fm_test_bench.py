@@ -1131,6 +1131,20 @@ def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
     )
 
 
+# Reference-obs noise the teacher policy is trained with -- mirrors the Unoise
+# amplitudes on the reference terms in g1_teacher_env_cfg.py PolicyCfg. Shaded as a
+# +/- band around the clip so you can see whether the FM reference stays within what
+# the policy was trained to tolerate (outside the band ~ out-of-distribution). The
+# obs are base-relative/heading-frame; in world/body plots these bands are a close
+# proxy. Keep in sync with the cfg (or pass --no-train-noise to hide).
+TRAIN_NOISE = {
+    "root_lin_vel": 0.1,   # base_vel_ref / future_base_vel (m/s, base frame)
+    "root_pos": 0.03,      # base_pose_error / future_base_pose position (m)
+    "root_yaw": 0.03,      # base_pose_error orientation (rad)
+    "ee_pos": 0.02,        # ee_ref relative-to-base (m)
+}
+
+
 @dataclass
 class ForecastStepResult:
     """Per-step comparison for the scrubber: nominal clip vs clip-history forecast vs a
@@ -1163,6 +1177,7 @@ class ForecastStepResult:
     dt: float
     frame_names: list[str]
     joint_names: list[str]
+    train_noise: dict | None = None            # teacher obs-noise band amplitudes (None = hide)
     vel_frame: str = "body"
 
 
@@ -1304,7 +1319,8 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
         auto_windows=auto_windows, auto_win_start=auto_win_start, auto_pred_idx=auto_pred_idx,
         diverged_at=diverged_at, fm_update_every=every,
         N=N, F=F, dt=ctx.dt_attr, frame_names=ctx.target_frame_names if have_ee else [],
-        joint_names=ctx.joint_names, vel_frame=vf,
+        joint_names=ctx.joint_names, train_noise=(None if args.no_train_noise else TRAIN_NOISE),
+        vel_frame=vf,
     )
 
 
@@ -1665,8 +1681,14 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
         ax.plot(tw[:n], y[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)   # echo
         ax.plot(tw[n - 1:], y[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)   # novel
 
-    def panel(ax, getter, title) -> None:
-        ax.plot(t_gt, getter(gt), color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
+    nz = res.train_noise
+
+    def panel(ax, getter, title, noise_key=None) -> None:
+        base = getter(gt)
+        if nz is not None and noise_key is not None:        # teacher training-noise band
+            ax.fill_between(t_gt, base - nz[noise_key], base + nz[noise_key],
+                            color="0.55", alpha=0.18, lw=0, zorder=1)
+        ax.plot(t_gt, base, color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
         if T:
             ax.plot(t_sp, getter(spine), color=C_SPINE, lw=1.5, alpha=0.9, zorder=3)
             if reinfer_m:
@@ -1684,7 +1706,7 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
     lab = ["x", "y", "z"]
     for i in range(3):
         panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
-              f"root lin vel {lab[i]} ({vf}, m/s)")
+              f"root lin vel {lab[i]} ({vf}, m/s)", noise_key="root_lin_vel")
         # Clip mean velocity (dotted line + value). NOTE: this is the DISPLAYED ({vf})
         # frame; the green ∫vel below integrates the WORLD velocity, so in body frame the
         # mean here will NOT equal the green drift (forward speed leaks into body-z via
@@ -1694,7 +1716,7 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
         axs[0, i].text(0.98, 0.03, f"clip mean {vmean:+.3f}", transform=axs[0, i].transAxes,
                        ha="right", va="bottom", fontsize=7, color=C_CLIP)
         panel(axs[1, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i),
-              f"root pos {lab[i]} (m, world)")
+              f"root pos {lab[i]} (m, world)", noise_key="root_pos")
         # Clip position from integrating the clip's WORLD velocity (consistency check).
         axs[1, i].plot(t_gt, iv[:, i], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
 
@@ -1719,15 +1741,17 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("x (m)")
 
-    panel(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), "root yaw (rad)")
+    panel(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), "root yaw (rad)",
+          noise_key="root_yaw")
 
     if "ee_pos" in gt and res.frame_names:
         ai = next((j for j, nm in enumerate(res.frame_names) if "ankle" in nm.lower()), 0)
         panel(axs[2, 2], (lambda jj: (lambda tr: tr["ee_pos"][:, jj, 2]))(ai),
-              f"{res.frame_names[ai]} z (m, world)")
+              f"{res.frame_names[ai]} z (m, world)", noise_key="ee_pos")
     else:
         axs[2, 2].set_visible(False)
 
+    from matplotlib.patches import Patch
     handles = [Line2D([0], [0], color=C_CLIP, lw=1.4, alpha=0.6),
                Line2D([0], [0], color=C_IV, lw=1.3, ls="--"),
                Line2D([0], [0], color=C_SPINE, lw=1.5),
@@ -1735,6 +1759,9 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
                Line2D([0], [0], color=C_AB, lw=1.8)]
     labels = ["clip (nominal)", "clip ∫vel (world)", "autoregressive (realized)",
               "clip-history forecast", f"FM window (re-infer/{res.fm_update_every}, ●=applied)"]
+    if res.train_noise is not None:
+        handles.append(Patch(facecolor="0.55", alpha=0.18))
+        labels.append("teacher train-noise band")
     fig.legend(handles, labels, loc="upper right", fontsize=8)
     div = "" if have_auto else "   [autoregressive DIVERGED before here]"
     fig.suptitle(
@@ -2098,6 +2125,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "GeneratorTrackingCommandCfg.fm_update_every. Between re-infers the applied "
                         "reference advances through the F-window; each re-infer re-anchors onto the "
                         "clip (xy+z+yaw).")
+    p.add_argument("--no-train-noise", action="store_true",
+                   help="forecast_step: hide the +/- band around the clip showing the teacher's "
+                        "training obs-noise (TRAIN_NOISE, mirrors g1_teacher_env_cfg.py); the band "
+                        "indicates how far the FM reference can stray before the policy is OOD.")
     p.add_argument("--forecast-pad", type=int, default=60,
                    help="Steps of recorded command context to show before/after the FM region "
                         "(trimmed at episode resets) so you can see ramps into/out of it.")
