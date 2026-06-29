@@ -34,19 +34,13 @@ from .g1_clf_tracking_base import (
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
 # Default clip library (generate with scripts/rsl_rl/generate_clips.py at the
-# env control dt, e.g. --dt 0.02).  Override per-run via the cfg.
+# env control dt, e.g. --dt 0.02).  Override per-run via the cfg.  Clean
+# reference clips only -- no sim-recorded clips in this paradigm.
 DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
-
-# Teacher-recorded clip library: the motion the trained teacher actually
-# achieved while tracking DEFAULT_CLIP_PATH, recorded by
-# scripts/rsl_rl/record_teacher_clips.py.  Identical schema to a generated
-# clip library, so it is selected the same way -- set traj_ref.path to this
-# (e.g. in the tracker, with clip_fraction controlling the clip-vs-FM mix).
-DEFAULT_TEACHER_CLIP_PATH = "clips/g1_teacher_v1.h5"
 
 # Single deterministic parity clip (stand -> walk -> run -> stand; see
 # scripts/rsl_rl/generate_parity_clip.py).  Shared with the tracker parity-play
-# tasks; the teacher parity-play variant tracks it open-loop for a quick, clean
+# task; the teacher parity-play variant tracks it open-loop for a quick, clean
 # look at how the teacher follows a known profile (and IsaacLab <-> MuJoCo checks).
 DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
 

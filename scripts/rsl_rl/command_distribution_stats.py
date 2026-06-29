@@ -48,7 +48,7 @@ The tool is numpy-only (plus ``h5py`` for clips, optional ``matplotlib`` for
 Examples::
 
     # A single clip library
-    python scripts/rsl_rl/command_distribution_stats.py clips/g1_teacher_v1.h5
+    python scripts/rsl_rl/command_distribution_stats.py clips/g1_flat_v1.h5
 
     # All recorded shards used for an FM run, aggregated, with plots
     python scripts/rsl_rl/command_distribution_stats.py \

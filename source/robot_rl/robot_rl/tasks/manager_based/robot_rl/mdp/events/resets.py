@@ -281,19 +281,9 @@ def reset_on_motion_sequence(
     num_clips = cmd.manager.num_clips
     num_steps = cmd.manager.num_steps
 
-    # 1. Sample a clip and a start step per env.  ``forced_clip_id`` /
-    #    ``forced_start_step`` (default None) override the random draw when set,
-    #    so a recorder can roll out every clip deterministically exactly once
-    #    (see scripts/rsl_rl/record_teacher_clips.py); training leaves them None.
-    forced_clip = getattr(cmd, "forced_clip_id", None)
-    if forced_clip is not None:
-        clip_id = forced_clip[env_ids].to(device=device, dtype=torch.long)
-    else:
-        clip_id = torch.randint(0, num_clips, (k,), device=device)
-    forced_start = getattr(cmd, "forced_start_step", None)
-    if forced_start is not None:
-        start_step = forced_start[env_ids].to(device=device, dtype=torch.long)
-    elif cmd.cfg.random_start_phase:
+    # 1. Sample a clip and a start step per env.
+    clip_id = torch.randint(0, num_clips, (k,), device=device)
+    if cmd.cfg.random_start_phase:
         # Leave at least random_start_min_remaining_s of clip after the start.
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
         hi = max(1, num_steps - margin)
