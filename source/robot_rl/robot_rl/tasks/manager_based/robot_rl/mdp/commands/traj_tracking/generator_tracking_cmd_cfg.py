@@ -101,6 +101,16 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     ``clip_fraction = 0`` / ``closed_loop_fraction = 0`` so every env runs the FM
     open-loop. The tracker policy still tracks the emitted reference."""
 
+    fm_anchor_on_robot: bool = False
+    """If True, place each sampled FM trajectory's current step on the ROBOT root
+    (planar: robot xy + heading), keeping the FM's natural height (z) + tilt. The
+    conditioning is unchanged -- with ``fm_history_source='reference'`` the FM still
+    only sees its OWN past output (never the robot); only the world *placement* is
+    snapped to the robot. This turns the autoregressive rollout into a receding
+    horizon re-anchored to the robot each inference, instead of drifting on its own
+    prior trajectory. Takes precedence over ``fm_anchor_on_prev_traj``. ``False``
+    (default) anchors on the most recent history pose."""
+
     fm_anchor_on_prev_traj: bool = False
     """If True, FM-tracking envs plant each newly sampled trajectory on the *previous*
     generated trajectory (at the step it has advanced to, ``dt = fm_update_every``

@@ -147,7 +147,8 @@ class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
         self.commands.traj_ref.path = DEFAULT_CLIP_PATH       # FM-training clips (seed + command)
         self.commands.traj_ref.clip_fraction = 0.0            # every env runs the FM
         self.commands.traj_ref.closed_loop_fraction = 0.0     # open-loop command (clip target_vel)
-        self.commands.traj_ref.fm_history_source = "reference"  # autoregressive, robot-decoupled
+        self.commands.traj_ref.fm_history_source = "reference"  # autoregressive (FM's own output)
+        self.commands.traj_ref.fm_anchor_on_robot = True      # but place it on the robot root each infer
         self.commands.traj_ref.fm_anchor_on_prev_traj = False
         self.commands.traj_ref.random_start_phase = False     # seed from clip step 0
 

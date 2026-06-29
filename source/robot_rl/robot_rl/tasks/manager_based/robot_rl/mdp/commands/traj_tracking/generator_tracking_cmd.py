@@ -391,7 +391,19 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Default: anchor each prediction at the current base pose (step N-1).
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
-        if self.cfg.fm_anchor_on_prev_traj:
+        if self.cfg.fm_anchor_on_robot:
+            # Snap the prediction's current step onto the ROBOT root (planar: robot
+            # xy + heading), keeping the FM's natural height + tilt. The conditioning
+            # is still the FM's own past output (the network never sees the robot) --
+            # only the world placement is re-anchored, so the autoregressive rollout
+            # follows the robot (receding horizon) instead of drifting on its own
+            # prior trajectory.
+            robot_p = wp.to_torch(self.robot.data.root_pos_w)[ids]
+            robot_q = wp.to_torch(self.robot.data.root_quat_w)[ids]
+            p_ref[:, :2] = robot_p[:, :2]
+            dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
+            q_ref = quat_mul(dz_yaw, q_ref)               # FM tilt, re-yawed to the robot heading
+        elif self.cfg.fm_anchor_on_prev_traj:
             # Re-anchor on the *previous* prediction's ground pose so the reference
             # drifts globally with poor tracking (clip-like). Envs with a stored
             # prior prediction re-anchor; the rest (first inference after a reset /
