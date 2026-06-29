@@ -15,8 +15,8 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     mode: every env runs the **flow-matching generator** autoregressively (the FM
     conditions on its OWN past reference output, seeded from the clip at reset and
     during the warmup -- it never sees the robot), and each sampled trajectory is
-    re-anchored onto the robot root (planar xy + heading, keeping the FM's natural
-    height + tilt) -- a receding horizon. The clip only supplies the reset spawn
+    re-anchored onto the robot root (xy + z + heading, keeping only the FM's tilt)
+    -- a receding horizon. The clip only supplies the reset spawn
     pose and the ``target_vel`` velocity command. The CLF tracking error is
     computed in the world frame.
     """

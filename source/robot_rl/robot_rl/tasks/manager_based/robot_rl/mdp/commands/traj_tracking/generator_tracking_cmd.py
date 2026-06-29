@@ -7,7 +7,7 @@ every env runs the **flow-matching generator** autoregressively as a receding-
 horizon reference source.  The FM conditions on its OWN past reference output
 (seeded from the clip at reset and during the warmup) -- it never sees the
 robot -- and each freshly sampled trajectory is re-anchored onto the robot root
-(planar xy + heading, keeping the FM's natural height + tilt).  The clip library
+(xy + z + heading onto the robot root, keeping only the FM's tilt).  The clip library
 only supplies the reset spawn pose and the ``target_vel`` velocity command; the
 clip reference is the warmup fallback until the history window fills.
 
@@ -326,16 +326,26 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Commanded-velocity profile over the window -> strided command tokens.
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
-        # Snap the prediction's current step onto the ROBOT root (planar: robot xy +
-        # heading), keeping the FM's natural height + tilt. The conditioning is still
-        # the FM's own past output (the network never sees the robot) -- only the
-        # world placement is re-anchored, so the autoregressive rollout follows the
-        # robot (receding horizon) instead of drifting on its own prior trajectory.
+        # Snap the prediction's current step onto the ROBOT root: planar position (xy),
+        # HEIGHT (z), and heading (yaw), keeping only the FM's natural tilt (roll/pitch).
+        # The conditioning is still the FM's own past output (the network never sees the
+        # robot) -- only the world placement is re-anchored, so the autoregressive rollout
+        # follows the robot (receding horizon) instead of drifting on its own prior
+        # trajectory. Anchoring z (not just xy) keeps the FM's free-running height drift
+        # (the autoregressive root z climbs/sinks unboundedly -- see the bench rollout)
+        # from pulling the reference height off the robot.
+        # TODO(fm-in-loop): investigate the effect of anchoring z here -- does pinning the
+        # reference height to the robot help it stay up, vs. letting the FM impose its own
+        # (drifting) height? And consider matching this in the TEACHER's ego-anchor during
+        # training: world_lift.ego_placement / MotionSequenceCommand._reanchor_ego_envs
+        # currently keep the clip's NATURAL z, so the train-time ego reference height and
+        # this deploy-time placement disagree. Aligning them (anchor z in training too, or
+        # NOT here) would remove that train/deploy mismatch.
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
         robot_p = wp.to_torch(self.robot.data.root_pos_w)[ids]
         robot_q = wp.to_torch(self.robot.data.root_quat_w)[ids]
-        p_ref[:, :2] = robot_p[:, :2]
+        p_ref[:, :3] = robot_p[:, :3]                 # anchor xy + z onto the robot root
         dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))  # world z-rot
         q_ref = quat_mul(dz_yaw, q_ref)               # FM tilt, re-yawed to the robot heading
         world = sample_world(self.ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)

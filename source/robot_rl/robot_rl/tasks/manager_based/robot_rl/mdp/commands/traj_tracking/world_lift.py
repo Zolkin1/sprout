@@ -147,6 +147,13 @@ def ego_placement(
     world_pos[:, 0] = target_pos_w[:, 0] - rot_x  # so lifted base xy == target xy
     world_pos[:, 1] = target_pos_w[:, 1] - rot_y
     world_pos[:, 2] = ground_z                     # keep the clip's natural height
+    # TODO(fm-in-loop): the FM deploy-time ego anchor (GeneratorTrackingCommand._run_fm)
+    # now snaps the reference HEIGHT (z) onto the robot root as well, not just xy + yaw,
+    # to counter the FM's free-running height drift. This teacher-training ego anchor
+    # still keeps the clip's natural z (matches its xy=env-origin reset). Investigate
+    # whether the teacher should also see z anchored onto the robot during training so
+    # the train-time ego reference matches the deploy-time placement (would need the
+    # robot root z passed in here instead of ground_z).
     return world_pos, world_quat
 
 
