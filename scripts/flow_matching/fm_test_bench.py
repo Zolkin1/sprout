@@ -1643,133 +1643,181 @@ def draw_forecast_path(fig, res: ForecastResult) -> None:
                  fontsize=12)
 
 
-def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
-    """One scrub step of the sim-faithful autoregressive rollout.
+class _FSCtx:
+    """Per-step shared plotting context + overlay helper for the forecast_step views.
 
-    Black = nominal clip; green dashed = clip ∫(world vel); blue = clip-history forecast
-    at this anchor; orange = realized autoregressive reference (what the tracker would
-    follow); red = the ACTIVE FM window (re-inferred every ``fm_update_every`` steps,
-    re-anchored on the clip), with a dot at the currently-applied index. Arrow keys move
-    ``k``; the red window is static between re-infers while the dot walks it.
+    Builds the time axes and the clip / realized-autoregressive / clip-history-forecast /
+    active-FM-window arrays for step ``k`` once, and exposes :meth:`panel` which draws the
+    standard overlay (training-noise band + clip + realized spine + the two forecast
+    branches + the currently-applied dot) for any scalar getter, so the root and feet views
+    share one consistent style.
     """
-    from matplotlib.lines import Line2D
 
-    fig.clear()
-    axs = fig.subplots(3, 3)
-    n, F, dt, vf = res.N, res.F, res.dt, res.vel_frame
-    gt, spine, iv = res.gt, res.auto_spine, res.gt_pos_intvel
-    L = gt["root_pos"].shape[0]
-    t_gt = np.arange(L) * dt
-    T = spine["root_pos"].shape[0] if spine else 0
-    t_sp = (res.auto_spine_t0 + np.arange(T)) * dt
-    # Re-infer steps (where the active window was freshly sampled): win_start[m] == m.
-    reinfer_m = [m for m, ws in enumerate(res.auto_win_start) if ws == m]
-    a = res.anchors[k]
-    clip = res.clip_branches[k]
-    tw_clip = (np.arange(F) + k) * dt               # clip-history window in clip time
-    have_auto = k < len(res.auto_windows)
-    if have_auto:
-        auto = res.auto_windows[k]
-        pidx = res.auto_pred_idx[k]
-        tw_auto = (np.arange(F) + res.auto_win_start[k]) * dt
-    now_t = (res.auto_spine_t0 + k) * dt            # the currently-applied reference time
+    def __init__(self, res: ForecastStepResult, k: int):
+        self.res, self.k = res, k
+        self.n, self.F, self.dt, self.vf = res.N, res.F, res.dt, res.vel_frame
+        self.gt, self.spine, self.iv = res.gt, res.auto_spine, res.gt_pos_intvel
+        L = self.gt["root_pos"].shape[0]
+        self.t_gt = np.arange(L) * self.dt
+        self.T = self.spine["root_pos"].shape[0] if self.spine else 0
+        self.t_sp = (res.auto_spine_t0 + np.arange(self.T)) * self.dt
+        self.reinfer_m = [m for m, ws in enumerate(res.auto_win_start) if ws == m]
+        self.clip = res.clip_branches[k]
+        self.tw_clip = (np.arange(self.F) + k) * self.dt
+        self.have_auto = k < len(res.auto_windows)
+        self.auto = res.auto_windows[k] if self.have_auto else None
+        self.pidx = res.auto_pred_idx[k] if self.have_auto else None
+        self.tw_auto = (np.arange(self.F) + res.auto_win_start[k]) * self.dt if self.have_auto else None
+        self.now_t = (res.auto_spine_t0 + k) * self.dt
+        self.nz = res.train_noise
+        self.C_CLIP, self.C_IV, self.C_SPINE, self.C_CB, self.C_AB = "k", "C2", "C1", "C0", "C3"
 
-    C_CLIP, C_IV, C_SPINE, C_CB, C_AB = "k", "C2", "C1", "C0", "C3"
-
-    def branch(ax, getter, br, tw, col) -> None:
-        y = getter(br)
+    def _branch(self, ax, getter, br, tw, col) -> None:
+        n, y = self.n, getter(br)
         ax.plot(tw[:n], y[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)   # echo
         ax.plot(tw[n - 1:], y[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)   # novel
 
-    nz = res.train_noise
-
-    def panel(ax, getter, title, noise_key=None) -> None:
-        base = getter(gt)
-        if nz is not None and noise_key is not None:        # teacher training-noise band
-            ax.fill_between(t_gt, base - nz[noise_key], base + nz[noise_key],
+    def panel(self, ax, getter, title, noise_key=None) -> None:
+        base = getter(self.gt)
+        if self.nz is not None and noise_key is not None:      # teacher training-noise band
+            ax.fill_between(self.t_gt, base - self.nz[noise_key], base + self.nz[noise_key],
                             color="0.55", alpha=0.18, lw=0, zorder=1)
-        ax.plot(t_gt, base, color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
-        if T:
-            ax.plot(t_sp, getter(spine), color=C_SPINE, lw=1.5, alpha=0.9, zorder=3)
-            if reinfer_m:
-                ax.plot(t_sp[reinfer_m], getter(spine)[reinfer_m], ls="none", marker="|",
-                        ms=7, mew=1.2, color=C_SPINE, zorder=3)
-        branch(ax, getter, clip, tw_clip, C_CB)
-        if have_auto:
-            branch(ax, getter, auto, tw_auto, C_AB)
-            ax.plot([tw_auto[pidx]], [getter(auto)[pidx]], marker="o", ms=5,
-                    color=C_AB, zorder=6)  # currently-applied reference
-        ax.axvline(now_t, color="0.3", lw=0.8, ls=":")
+        ax.plot(self.t_gt, base, color=self.C_CLIP, lw=1.4, alpha=0.5, zorder=2)
+        if self.T:
+            sp = getter(self.spine)
+            ax.plot(self.t_sp, sp, color=self.C_SPINE, lw=1.5, alpha=0.9, zorder=3)
+            if self.reinfer_m:
+                ax.plot(self.t_sp[self.reinfer_m], sp[self.reinfer_m], ls="none", marker="|",
+                        ms=7, mew=1.2, color=self.C_SPINE, zorder=3)
+        self._branch(ax, getter, self.clip, self.tw_clip, self.C_CB)
+        if self.have_auto:
+            self._branch(ax, getter, self.auto, self.tw_auto, self.C_AB)
+            ax.plot([self.tw_auto[self.pidx]], [getter(self.auto)[self.pidx]], marker="o", ms=5,
+                    color=self.C_AB, zorder=6)  # currently-applied reference
+        ax.axvline(self.now_t, color="0.3", lw=0.8, ls=":")
         ax.grid(True, alpha=0.3)
         ax.set_title(title, fontsize=9)
 
+    def legend(self, fig) -> None:
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+        handles = [Line2D([0], [0], color=self.C_CLIP, lw=1.4, alpha=0.6),
+                   Line2D([0], [0], color=self.C_SPINE, lw=1.5),
+                   Line2D([0], [0], color=self.C_CB, lw=1.8),
+                   Line2D([0], [0], color=self.C_AB, lw=1.8)]
+        labels = ["clip (nominal)", "autoregressive (realized)", "clip-history forecast",
+                  f"FM window (re-infer/{self.res.fm_update_every}, ●=applied)"]
+        if self.nz is not None:
+            handles.append(Patch(facecolor="0.55", alpha=0.18))
+            labels.append("teacher train-noise band")
+        fig.legend(handles, labels, loc="upper right", fontsize=8)
+
+    def suptitle(self, fig, view: str) -> None:
+        div = "" if self.have_auto else "   [autoregressive DIVERGED before here]"
+        fig.suptitle(
+            f"forecast_step [{view}] {self.k + 1}/{len(self.res.anchors)}  --  applied clip-step "
+            f"{self.res.auto_spine_t0 + self.k} (t={self.now_t:.2f}s)   re-infer every "
+            f"{self.res.fm_update_every} steps, re-anchored on clip{div}\n"
+            f"dotted = FM history echo, solid = novel; orange = realized (| = re-infer);  "
+            f"Left/Right = step, Up/Down = root/feet view",
+            fontsize=10,
+        )
+
+
+def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
+    """Root view: root lin vel + root pos (x/y/z) + xy path / yaw / lead-ankle z."""
+    fig.clear()
+    axs = fig.subplots(3, 3)
+    c = _FSCtx(res, k)
+    vf = c.vf
     lab = ["x", "y", "z"]
     for i in range(3):
-        panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
-              f"root lin vel {lab[i]} ({vf}, m/s)", noise_key="root_lin_vel")
-        # Clip mean velocity (dotted line + value). NOTE: this is the DISPLAYED ({vf})
-        # frame; the green ∫vel below integrates the WORLD velocity, so in body frame the
-        # mean here will NOT equal the green drift (forward speed leaks into body-z via
-        # pelvis tilt). Use --vel-frame world to compare like-for-like.
-        vmean = float(gt["root_lin_vel"][:, i].mean())
-        axs[0, i].axhline(vmean, color=C_CLIP, ls=":", lw=0.9, alpha=0.7)
+        c.panel(axs[0, i], (lambda cc: (lambda tr: tr["root_lin_vel"][:, cc]))(i),
+                f"root lin vel {lab[i]} ({vf}, m/s)", noise_key="root_lin_vel")
+        # Clip mean velocity (dotted line + value). NOTE: DISPLAYED ({vf}) frame; the green
+        # ∫vel below integrates the WORLD velocity, so in body frame the mean here will NOT
+        # equal the green drift (forward speed leaks into body-z via pelvis tilt).
+        vmean = float(c.gt["root_lin_vel"][:, i].mean())
+        axs[0, i].axhline(vmean, color=c.C_CLIP, ls=":", lw=0.9, alpha=0.7)
         axs[0, i].text(0.98, 0.03, f"clip mean {vmean:+.3f}", transform=axs[0, i].transAxes,
-                       ha="right", va="bottom", fontsize=7, color=C_CLIP)
-        panel(axs[1, i], (lambda c: (lambda tr: tr["root_pos"][:, c]))(i),
-              f"root pos {lab[i]} (m, world)", noise_key="root_pos")
-        # Clip position from integrating the clip's WORLD velocity (consistency check).
-        axs[1, i].plot(t_gt, iv[:, i], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
+                       ha="right", va="bottom", fontsize=7, color=c.C_CLIP)
+        c.panel(axs[1, i], (lambda cc: (lambda tr: tr["root_pos"][:, cc]))(i),
+                f"root pos {lab[i]} (m, world)", noise_key="root_pos")
+        axs[1, i].plot(c.t_gt, c.iv[:, i], color=c.C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
 
-    # xy path (world)
     ax = axs[2, 0]
-    ax.plot(gt["root_pos"][:, 0], gt["root_pos"][:, 1], color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
-    ax.plot(iv[:, 0], iv[:, 1], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
-    if T:
-        ax.plot(spine["root_pos"][:, 0], spine["root_pos"][:, 1], color=C_SPINE, lw=1.5, alpha=0.9, zorder=3)
+    ax.plot(c.gt["root_pos"][:, 0], c.gt["root_pos"][:, 1], color=c.C_CLIP, lw=1.4, alpha=0.5, zorder=2)
+    ax.plot(c.iv[:, 0], c.iv[:, 1], color=c.C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
+    if c.T:
+        ax.plot(c.spine["root_pos"][:, 0], c.spine["root_pos"][:, 1], color=c.C_SPINE, lw=1.5, alpha=0.9, zorder=3)
 
     def xy(br, col) -> None:
-        px, py = br["root_pos"][:, 0], br["root_pos"][:, 1]
+        n, px, py = c.n, br["root_pos"][:, 0], br["root_pos"][:, 1]
         ax.plot(px[:n], py[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)
         ax.plot(px[n - 1:], py[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)
 
-    xy(clip, C_CB)
-    if have_auto:
-        xy(auto, C_AB)
-        ax.plot([auto["root_pos"][pidx, 0]], [auto["root_pos"][pidx, 1]], marker="o", ms=5, color=C_AB, zorder=6)
+    xy(c.clip, c.C_CB)
+    if c.have_auto:
+        xy(c.auto, c.C_AB)
+        ax.plot([c.auto["root_pos"][c.pidx, 0]], [c.auto["root_pos"][c.pidx, 1]],
+                marker="o", ms=5, color=c.C_AB, zorder=6)
     ax.set_title("root xy path (m, world)", fontsize=9)
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, alpha=0.3)
     ax.set_xlabel("x (m)")
 
-    panel(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), "root yaw (rad)",
-          noise_key="root_yaw")
-
-    if "ee_pos" in gt and res.frame_names:
+    c.panel(axs[2, 1], lambda tr: np.unwrap(quat_to_yaw_np(tr["root_quat"])), "root yaw (rad)",
+            noise_key="root_yaw")
+    if "ee_pos" in c.gt and res.frame_names:
         ai = next((j for j, nm in enumerate(res.frame_names) if "ankle" in nm.lower()), 0)
-        panel(axs[2, 2], (lambda jj: (lambda tr: tr["ee_pos"][:, jj, 2]))(ai),
-              f"{res.frame_names[ai]} z (m, world)", noise_key="ee_pos")
+        c.panel(axs[2, 2], (lambda jj: (lambda tr: tr["ee_pos"][:, jj, 2]))(ai),
+                f"{res.frame_names[ai]} z (m, world)", noise_key="ee_pos")
     else:
         axs[2, 2].set_visible(False)
 
-    from matplotlib.patches import Patch
-    handles = [Line2D([0], [0], color=C_CLIP, lw=1.4, alpha=0.6),
-               Line2D([0], [0], color=C_IV, lw=1.3, ls="--"),
-               Line2D([0], [0], color=C_SPINE, lw=1.5),
-               Line2D([0], [0], color=C_CB, lw=1.8),
-               Line2D([0], [0], color=C_AB, lw=1.8)]
-    labels = ["clip (nominal)", "clip ∫vel (world)", "autoregressive (realized)",
-              "clip-history forecast", f"FM window (re-infer/{res.fm_update_every}, ●=applied)"]
-    if res.train_noise is not None:
-        handles.append(Patch(facecolor="0.55", alpha=0.18))
-        labels.append("teacher train-noise band")
-    fig.legend(handles, labels, loc="upper right", fontsize=8)
-    div = "" if have_auto else "   [autoregressive DIVERGED before here]"
-    fig.suptitle(
-        f"forecast_step {k + 1}/{len(res.anchors)}  --  applied clip-step {res.auto_spine_t0 + k} "
-        f"(t={now_t:.2f}s)   re-infer every {res.fm_update_every} steps, re-anchored on clip{div}\n"
-        f"dotted = FM history echo, solid = novel; orange = realized reference (| = re-infer)",
-        fontsize=10,
-    )
+    c.legend(fig)
+    c.suptitle(fig, "root")
+
+
+def draw_forecast_step_feet(fig, res: ForecastStepResult, k: int) -> None:
+    """Feet view: per-foot world x/y/z (with the train-noise band) + foot vertical
+    velocity, using the same clip / clip-history / autoregressive overlays as the root
+    view. One row per ankle link, plus a bottom row of foot vz + both-feet clip z.
+    """
+    fig.clear()
+    c = _FSCtx(res, k)
+    feet = [j for j, nm in enumerate(res.frame_names) if "ankle" in nm.lower()][:2]
+    if not ("ee_pos" in c.gt and feet):
+        ax = fig.subplots(1, 1)
+        ax.text(0.5, 0.5, "FM checkpoint has no foot/ankle frames -- nothing to plot",
+                ha="center", va="center", fontsize=11)
+        ax.set_axis_off()
+        c.suptitle(fig, "feet")
+        return
+    axs = fig.subplots(len(feet) + 1, 3, squeeze=False)
+    lab = ["x", "y", "z"]
+    short = [res.frame_names[j].replace("_roll_link", "").replace("_link", "") for j in range(len(res.frame_names))]
+    for r, fidx in enumerate(feet):
+        for ci in range(3):
+            c.panel(axs[r, ci], (lambda jj, cc: (lambda tr: tr["ee_pos"][:, jj, cc]))(fidx, ci),
+                    f"{short[fidx]} pos {lab[ci]} (m, world)", noise_key="ee_pos")
+    # Bottom row: foot vertical velocity per foot + both-feet clip z (stepping phase).
+    last = len(feet)
+    for i, fidx in enumerate(feet):
+        c.panel(axs[last, i], (lambda jj: (lambda tr: tr["ee_lin_vel"][:, jj, 2]))(fidx),
+                f"{short[fidx]} vz ({c.vf}, m/s)")
+    axz = axs[last, 2]
+    for fidx in feet:
+        axz.plot(c.t_gt, c.gt["ee_pos"][:, fidx, 2], lw=1.4, alpha=0.85, label=short[fidx])
+    axz.axvline(c.now_t, color="0.3", lw=0.8, ls=":")
+    axz.grid(True, alpha=0.3)
+    axz.set_title("clip foot z -- both (m, world)", fontsize=9)
+    axz.legend(fontsize=6)
+    for i in range(len(feet), 2):       # hide any unused bottom-row vz cells (single-foot FMs)
+        axs[last, i].set_visible(False)
+
+    c.legend(fig)
+    c.suptitle(fig, "feet")
 
 
 def draw_forecast_cmd(fig, res: ForecastResult) -> None:
@@ -1944,57 +1992,67 @@ class FigureBrowser:
 
 
 class ForecastStepBrowser:
-    """Scrub the per-step forecast comparison with Left/Right arrows.
+    """Scrub the per-step forecast comparison with the arrow keys.
 
-    Unlike :class:`FigureBrowser` (which pages between figures), here Left/Right
-    move through the anchor STEPS of a single :class:`ForecastStepResult`, redrawing
-    the clip / clip-history forecast / autoregressive forecast at each step.
+    Unlike :class:`FigureBrowser` (which pages between figures), here Left/Right move
+    through the anchor STEPS of a single :class:`ForecastStepResult` and Up/Down toggle
+    between the ``root`` and ``feet`` views, redrawing the clip / clip-history forecast /
+    autoregressive rollout at each step.
     """
+
+    _VIEWS = (("root", draw_forecast_step), ("feet", draw_forecast_step_feet))
 
     def __init__(self, res: ForecastStepResult, plt):
         """Store the precomputed per-step result and the bound pyplot module."""
         self.res = res
         self.plt = plt
         self.k = 0
+        self.view = 0
         self.n = len(res.anchors)
 
     def _render(self, fig) -> None:
-        draw_forecast_step(fig, self.res, self.k)
+        name, draw = self._VIEWS[self.view]
+        draw(fig, self.res, self.k)
         fig.canvas.manager.set_window_title(
-            f"[step {self.k + 1}/{self.n}] forecast_step  anchor={self.res.anchors[self.k]}"
+            f"[step {self.k + 1}/{self.n} | {name}] forecast_step  anchor={self.res.anchors[self.k]}"
         )
         fig.canvas.draw_idle()
 
     def _on_key(self, event, fig) -> None:
-        if event.key in ("right", "down", " "):
+        if event.key in ("right", " "):
             self.k = (self.k + 1) % self.n
             self._render(fig)
-        elif event.key in ("left", "up"):
+        elif event.key == "left":
             self.k = (self.k - 1) % self.n
+            self._render(fig)
+        elif event.key in ("up", "down"):
+            self.view = (self.view + 1) % len(self._VIEWS)
             self._render(fig)
         elif event.key in ("q", "escape"):
             self.plt.close(fig)
 
     def show(self) -> None:
-        """Open one interactive window and bind arrow-key step scrubbing."""
+        """Open one interactive window and bind arrow-key scrubbing + view toggle."""
         fig = self.plt.figure(figsize=(15, 9))
         fig.canvas.mpl_connect("key_press_event", lambda e: self._on_key(e, fig))
         self._render(fig)
-        print(f"[bench] forecast_step: {self.n} steps -- Left/Right to scrub steps, q to quit")
+        print(f"[bench] forecast_step: {self.n} steps -- Left/Right scrub steps, "
+              f"Up/Down toggle root/feet view, q to quit")
         self.plt.show()
 
     def save_all(self, out_dir: str, stride: int) -> None:
-        """Render a strided subset of steps to PNGs (interactive shows every step)."""
+        """Render a strided subset of steps (both views) to PNGs (interactive shows all)."""
         os.makedirs(out_dir, exist_ok=True)
         idxs = list(range(0, self.n, max(1, stride)))
         for k in idxs:
-            fig = self.plt.figure(figsize=(15, 9))
-            draw_forecast_step(fig, self.res, k)
-            path = os.path.join(out_dir, f"forecast_step_{self.res.anchors[k]:04d}.png")
-            fig.savefig(path, dpi=150, bbox_inches="tight")
-            self.plt.close(fig)
-            print(f"[bench]   saved {path}")
-        print(f"[bench] {len(idxs)} step PNGs in {out_dir} "
+            for name, draw in self._VIEWS:
+                fig = self.plt.figure(figsize=(15, 9))
+                draw(fig, self.res, k)
+                path = os.path.join(out_dir, f"forecast_step_{name}_{self.res.anchors[k]:04d}.png")
+                fig.savefig(path, dpi=150, bbox_inches="tight")
+                self.plt.close(fig)
+                print(f"[bench]   saved {path}")
+        print(f"[bench] {len(idxs)} steps x {len(self._VIEWS)} views in {out_dir} "
               f"(every {max(1, stride)} steps via --forecast-stride; interactive scrubs all {self.n})")
 
 
