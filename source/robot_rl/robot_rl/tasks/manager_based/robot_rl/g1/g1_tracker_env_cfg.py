@@ -126,6 +126,33 @@ class G1TrackerEnvCfgPlay(G1TrackerEnvCfg):
 
 
 @configclass
+class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
+    """Autoregressive, robot-decoupled FM playback (real-time receding horizon).
+
+    Runs the flow-matching generator as a self-contained receding-horizon reference
+    source: its history is its OWN past output (seeded from the clip at reset), so it
+    never sees the robot (``fm_history_source='reference'``).  Every env runs the FM
+    open-loop (``clip_fraction=0``, ``closed_loop_fraction=0``); the tracker policy
+    loaded via ``--load_run`` (e.g. the ego teacher) tracks the emitted reference.
+
+    Pass the trained **clip-conditioned** FM with ``--fm_checkpoint <flow_matching_run>/best.pt``
+    -- the inherited default is the state-conditioned FM and will not behave correctly
+    here.  The clip library only supplies the reset seed + the velocity command
+    (``target_vel``); use ``--clip_device cpu`` for the multi-GB library.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.commands.traj_ref.path = DEFAULT_CLIP_PATH       # FM-training clips (seed + command)
+        self.commands.traj_ref.clip_fraction = 0.0            # every env runs the FM
+        self.commands.traj_ref.closed_loop_fraction = 0.0     # open-loop command (clip target_vel)
+        self.commands.traj_ref.fm_history_source = "reference"  # autoregressive, robot-decoupled
+        self.commands.traj_ref.fm_anchor_on_prev_traj = False
+        self.commands.traj_ref.random_start_phase = False     # seed from clip step 0
+
+
+@configclass
 class G1TrackerParityPlayEnvCfg(G1TrackerEnvCfgPlay):
     """Deterministic clip-only playback for IsaacLab <-> MuJoCo parity checks.
 

@@ -89,6 +89,18 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     envs; the predicted next reference advances through the F-step prediction
     between re-infers (``K = 1`` re-infers every step).  Amortizes FM compute."""
 
+    fm_history_source: str = "robot"
+    """What the FM conditions on as history: ``"robot"`` (the robot's measured
+    state each step -- the original generator-tracking behaviour, for an
+    FM trained on recorded rollouts) or ``"reference"`` (the FM's OWN past
+    reference output, seeded from the clip at reset and during the warmup).
+
+    ``"reference"`` makes the generator a true autoregressive, **robot-decoupled**
+    receding-horizon reference source -- it never sees the robot. Use it with a
+    clip-conditioned FM (history = past clip; see ``clip_to_fm_data.py``) and
+    ``clip_fraction = 0`` / ``closed_loop_fraction = 0`` so every env runs the FM
+    open-loop. The tracker policy still tracks the emitted reference."""
+
     fm_anchor_on_prev_traj: bool = False
     """If True, FM-tracking envs plant each newly sampled trajectory on the *previous*
     generated trajectory (at the step it has advanced to, ``dt = fm_update_every``

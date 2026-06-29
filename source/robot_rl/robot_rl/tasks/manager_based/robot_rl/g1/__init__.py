@@ -548,6 +548,19 @@ if not _registered:
         },
     )
 
+    # Autoregressive, robot-decoupled FM playback (real-time receding horizon): the
+    # FM conditions on its OWN past output (seeded from the clip), the tracker policy
+    # (--load_run) tracks it. Pass the clip-conditioned FM via --fm_checkpoint.
+    gym.register(
+        id="G1-tracker-clf-fm-ar-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerFMAutoregPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     gym.register(
         id="G1-tracker-clf-parity-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",

@@ -46,7 +46,7 @@ from robot_rl.flow_matching.online import (
 from .motion_sequence_cmd import MotionSequenceCommand
 from .generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
 from .closed_loop_command import compute_closed_loop_command, roll_buckets
-from .world_lift import lift_base_world_state
+from .world_lift import lift_base_world_state, lift_orientation, lift_position, lift_vector
 
 
 class GeneratorTrackingCommand(MotionSequenceCommand):
@@ -132,6 +132,17 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._fm_jperm = torch.tensor(
             [self.ctx.joint_names.index(n) for n in joint_out_names], dtype=torch.long, device=dev
         )
+        # Inverse perm: clip-output (joint_out) joint order -> FM (ctx) joint order,
+        # used to express the applied/clip reference joints in the FM history layout
+        # for the autoregressive history source.
+        self._clip_to_fm_jperm = torch.argsort(self._fm_jperm)
+        if self.cfg.fm_history_source not in ("robot", "reference"):
+            raise ValueError(
+                f"fm_history_source must be 'robot' or 'reference', got {self.cfg.fm_history_source!r}."
+            )
+        # Cached previous-step applied reference (FM history format) for the
+        # autoregressive ('reference') history source; None until the first update.
+        self._applied_ref: dict[str, torch.Tensor] | None = None
 
         # -- per-env source mask (True => FM), prediction buffers, cadence state --
         self._fm_mask = torch.zeros(n, dtype=torch.bool, device=dev)  # re-rolled each reset
@@ -245,6 +256,11 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             use_fm[:, None], fm_jv_slots, self.dy_des[:, self._joint_slots_vel]
         )
 
+        # Cache this step's applied reference (FM history format) so the next step's
+        # autoregressive history append feeds the FM its own output (reference mode).
+        if self.cfg.fm_history_source == "reference":
+            self._applied_ref = self._reference_snapshot()
+
         # Measured outputs in the world frame (identity reference -> no alignment).
         self.compute_measured_output(self._zeros3, self._ident_quat)
 
@@ -307,21 +323,36 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Must run before _run_fm so the FM command horizon reads the fresh value.
         self._refresh_command_velocity_cache()
 
-        # Snapshot the current world state (FM joint/frame order) into the history.
-        perm = self._joint_perm
-        snap = {
-            "root_pos": wp.to_torch(self.robot.data.root_pos_w).clone(),
-            "root_quat": wp.to_torch(self.robot.data.root_quat_w).clone(),     # xyzw
-            "root_lin": wp.to_torch(self.robot.data.root_link_lin_vel_w).clone(),  # link vel
-            "root_ang": wp.to_torch(self.robot.data.root_link_ang_vel_w).clone(),  # link ang vel
-            "jp": wp.to_torch(self.robot.data.joint_pos)[:, perm].clone(),
-            "jv": wp.to_torch(self.robot.data.joint_vel)[:, perm].clone(),
-        }
-        if self._hist_ee_body_idx is not None:
-            fpos = wp.to_torch(self.robot.data.body_pos_w)[:, self._hist_ee_body_idx]
-            fquat = wp.to_torch(self.robot.data.body_quat_w)[:, self._hist_ee_body_idx]
-            flink = wp.to_torch(self.robot.data.body_link_vel_w)[:, self._hist_ee_body_idx]
-            snap["frames"] = torch.cat([fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1).clone()  # [N,K,13]
+        # Build the history snapshot (FM joint/frame order) for this step.
+        if self.cfg.fm_history_source == "reference":
+            # Autoregressive, robot-decoupled: the history is the FM's OWN past
+            # reference output. ``self._applied_ref`` holds the previous step's
+            # applied reference (cached at the end of _update_command; clip during
+            # the warmup). Just-reset envs are (re-)seeded from the clip spawn pose
+            # so the first window is clip references, not a stale prior episode.
+            if self._applied_ref is None:
+                self._applied_ref = self._clip_reference_snapshot(self._arange_n)
+            if bool(just_reset.any()):
+                rids = torch.nonzero(just_reset, as_tuple=False).squeeze(-1)
+                seed = self._clip_reference_snapshot(rids)
+                for key in self._applied_ref:
+                    self._applied_ref[key][rids] = seed[key]
+            snap = {k: v.clone() for k, v in self._applied_ref.items()}
+        else:
+            perm = self._joint_perm
+            snap = {
+                "root_pos": wp.to_torch(self.robot.data.root_pos_w).clone(),
+                "root_quat": wp.to_torch(self.robot.data.root_quat_w).clone(),     # xyzw
+                "root_lin": wp.to_torch(self.robot.data.root_link_lin_vel_w).clone(),  # link vel
+                "root_ang": wp.to_torch(self.robot.data.root_link_ang_vel_w).clone(),  # link ang vel
+                "jp": wp.to_torch(self.robot.data.joint_pos)[:, perm].clone(),
+                "jv": wp.to_torch(self.robot.data.joint_vel)[:, perm].clone(),
+            }
+            if self._hist_ee_body_idx is not None:
+                fpos = wp.to_torch(self.robot.data.body_pos_w)[:, self._hist_ee_body_idx]
+                fquat = wp.to_torch(self.robot.data.body_quat_w)[:, self._hist_ee_body_idx]
+                flink = wp.to_torch(self.robot.data.body_link_vel_w)[:, self._hist_ee_body_idx]
+                snap["frames"] = torch.cat([fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1).clone()  # [N,K,13]
 
         # Invalidate reset envs' windows, then append (this snapshot = step 1 of the new episode).
         self._history.invalidate(just_reset)
@@ -395,6 +426,65 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # tracker's "current reference" index begins one step ahead of "now" (= N-1).
         self._pred_idx[ids] = self.ctx.N
         self._pred_valid[ids] = True
+
+    # ------------------------------------------------------------------
+    # Autoregressive ('reference') history snapshots (robot-decoupled)
+    # ------------------------------------------------------------------
+
+    def _reference_snapshot(self) -> dict[str, torch.Tensor]:
+        """This step's applied reference (clip-or-FM selected) in the FM history format.
+
+        Reads the world-frame reference written by :meth:`_write_world_des`
+        (``_wf_world_frames`` = ``[base] + ee`` in FM frame order) plus the applied
+        joints (``_joint_slots_*`` in clip-output order -> FM order). Cached as the
+        next step's autoregressive history input.
+        """
+        base = self._wf_world_frames[:, 0, :]  # [N, 13] = [pos(3), quat(4), lin(3), ang(3)]
+        snap = {
+            "root_pos": base[:, 0:3].clone(),
+            "root_quat": base[:, 3:7].clone(),
+            "root_lin": base[:, 7:10].clone(),
+            "root_ang": base[:, 10:13].clone(),
+            "jp": self.y_des[:, self._joint_slots_pos][:, self._clip_to_fm_jperm].clone(),
+            "jv": self.dy_des[:, self._joint_slots_vel][:, self._clip_to_fm_jperm].clone(),
+        }
+        if self.ctx.num_extra_frames > 0:
+            snap["frames"] = self._wf_world_frames[:, 1:, :].clone()  # [N, K, 13], FM ee order
+        return snap
+
+    def _clip_reference_snapshot(self, ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Clip reference at each env's start step (FM history format) for ``ids``.
+
+        Used to seed the autoregressive history at reset (and the warmup), so the
+        first FM window conditions on clip references rather than a stale prior
+        episode. Lifts the clip-world base + ee outputs through the per-env placement
+        (the same transform the runtime applies) and reorders joints to FM order.
+        """
+        step = self.start_step[ids]
+        y, dy = self.manager.gather_desired(self.clip_id[ids], step)
+        wpos, wquat = self.clip_world_pos[ids], self.clip_world_quat[ids]
+        base = lift_base_world_state(y, dy, torch.cat([wpos, wquat], dim=-1), self._base_idx)
+        nj = len(self.ctx.joint_names)
+        snap = {
+            "root_pos": base[:, 0:3].clone(),
+            "root_quat": base[:, 3:7].clone(),
+            "root_lin": base[:, 7:10].clone(),
+            "root_ang": base[:, 10:13].clone(),
+            "jp": base[:, 13:13 + nj][:, self._clip_to_fm_jperm].clone(),
+            "jv": base[:, 13 + nj:13 + 2 * nj][:, self._clip_to_fm_jperm].clone(),
+        }
+        if self.ctx.num_extra_frames > 0:
+            ee = []
+            for f in self._wf_frames[1:]:  # ctx.frame_names order
+                fi = self._frame_output_indices(f)
+                ee.append(torch.cat([
+                    lift_position(wpos, wquat, y[:, fi["pos"]]),
+                    lift_orientation(wquat, y[:, fi["ori"]]),
+                    lift_vector(wquat, dy[:, fi["lin_vel"]]),
+                    lift_vector(wquat, dy[:, fi["ang_vel"]]),
+                ], dim=-1))
+            snap["frames"] = torch.stack(ee, dim=1)  # [k, K, 13]
+        return snap
 
     def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Gather the FM prediction at each env's current advance index.
