@@ -27,6 +27,8 @@ anywhere, so the FM reference and the CLF's measured outputs share one frame
 
 from __future__ import annotations
 
+import os
+
 import torch
 import warp as wp
 
@@ -72,7 +74,22 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
                 "(the FM velocity command). Regenerate clips with a generator that writes it."
             )
         if not self.cfg.fm_checkpoint:
-            raise ValueError("GeneratorTrackingCommandCfg.fm_checkpoint must be set.")
+            raise ValueError(
+                "GeneratorTrackingCommandCfg.fm_checkpoint must be set to a trained, "
+                "clip-conditioned flow-matching .pt checkpoint (pass --fm_checkpoint "
+                "<flow_matching_run>/best.pt at play time, or set the cfg default)."
+            )
+        if not os.path.isfile(self.cfg.fm_checkpoint):
+            raise FileNotFoundError(
+                f"GeneratorTrackingCommandCfg.fm_checkpoint '{self.cfg.fm_checkpoint}' does not "
+                "exist. Pass an existing clip-conditioned FM checkpoint via --fm_checkpoint "
+                "<flow_matching_run>/best.pt (paths are relative to the run cwd)."
+            )
+        if int(self.cfg.fm_update_every) < 1:
+            raise ValueError(
+                f"GeneratorTrackingCommandCfg.fm_update_every must be >= 1 (the FM re-plan "
+                f"cadence in control steps), got {self.cfg.fm_update_every}."
+            )
 
         self.ctx = load_fm_context(
             self.cfg.fm_checkpoint,

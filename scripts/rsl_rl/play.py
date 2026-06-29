@@ -49,7 +49,12 @@ with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
 
 # -- argparse ----------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+# allow_abbrev=False: never accept a prefix of a long option as that option.
+# Otherwise ``--clip <h5>`` would silently bind to ``--clip_device`` (the only
+# ``--clip*`` flag), feeding a clip PATH as a torch device string. With it off,
+# the explicit ``--clip`` flag below is the only thing ``--clip`` can mean, and
+# any other ambiguous prefix falls through to hydra as a loud error.
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.", allow_abbrev=False)
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
@@ -148,6 +153,13 @@ parser.add_argument(
     "--no-debug-vis", dest="no_debug_vis", action="store_true", default=False,
     help="Force the trajectory command's debug visualization off "
          "(env_cfg.commands.traj_ref.debug_vis = False) to A/B test its cost.",
+)
+parser.add_argument(
+    "--clip", type=str, default=None,
+    help="Path to the clip / trajectory library (.h5) to track, overriding the "
+         "cfg default. Applied to any command term exposing a `path` field "
+         "(traj_ref). Equivalent to the hydra override "
+         "env.commands.traj_ref.path=<h5>, but without the hydra syntax.",
 )
 parser.add_argument(
     "--clip_device", type=str, default=None,
@@ -267,6 +279,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.no_debug_vis and hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
             env_cfg.commands.traj_ref.debug_vis = False
             print("[profiling] traj_ref.debug_vis forced OFF for this run.")
+
+        # Optionally override the clip/trajectory library path (the file each
+        # command term tracks).  Applied to any command term exposing a `path`
+        # field; equivalent to env.commands.traj_ref.path=<h5> but without hydra.
+        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "path"):
+                    term.path = args_cli.clip
+                    print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
 
         # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
         # hydra: the cfg field default is None so hydra rejects a str override).

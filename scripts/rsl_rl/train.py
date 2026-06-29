@@ -48,7 +48,11 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 # -- argparse ----------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+# allow_abbrev=False: never accept a prefix of a long option as that option, so
+# ``--clip <h5>`` can't silently bind to ``--clip_device`` (feeding a clip PATH
+# as a torch device string). The explicit ``--clip`` flag below is the only
+# meaning of ``--clip``; any other ambiguous prefix falls through to hydra.
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.", allow_abbrev=False)
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
@@ -88,6 +92,12 @@ parser.add_argument(
          "boundary for true, correctly-nested per-phase costs (incl. Warp "
          "physics on its own stream). Slower than the default async timers; "
          "use it to resolve cross-stream mis-attribution.",
+)
+parser.add_argument(
+    "--clip", type=str, default=None,
+    help="Path to the clip / trajectory library (.h5) to track, overriding the "
+         "cfg default. Applied to any command term exposing a `path` field "
+         "(traj_ref). Equivalent to env.commands.traj_ref.path=<h5> without hydra.",
 )
 parser.add_argument(
     "--clip_device", type=str, default=None,
@@ -135,6 +145,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # override configurations with non-hydra CLI arguments
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+        # Optionally override the clip/trajectory library path (the file each
+        # command term tracks); equivalent to env.commands.traj_ref.path=<h5>.
+        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "path"):
+                    term.path = args_cli.clip
+                    print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
 
         # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
         # hydra: the cfg field default is None so hydra rejects a str override).
