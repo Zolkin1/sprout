@@ -31,7 +31,6 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
 from .g1_teacher_env_cfg import (
     DEFAULT_CLIP_PATH,
-    DEFAULT_PARITY_CLIP_PATH,
     G1TeacherObservationsCfg,
     G1TeacherTerminationCfg,
     G1TeacherEnvCfg,
@@ -142,20 +141,3 @@ class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
         self.scene.num_envs = 1
         self.commands.traj_ref.path = DEFAULT_CLIP_PATH       # FM-training clips (seed + command)
         self.commands.traj_ref.random_start_phase = False     # seed from clip step 0
-
-
-@configclass
-class G1TrackerParityPlayEnvCfg(G1TrackerFMAutoregPlayEnvCfg):
-    """Autoregressive FM playback seeded + commanded by the single parity clip.
-
-    Identical FM-in-loop receding horizon to :class:`G1TrackerFMAutoregPlayEnvCfg`,
-    but the seed pose + ``target_vel`` command come from the deterministic
-    hand-authored parity clip (stand -> walk -> run -> stand) -- a simple, known
-    profile for investigating the FM-in-loop behavior.  The clip-only baseline
-    (no FM) for the same profile is ``G1-teacher-clf-parity-play``.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.commands.traj_ref.path = DEFAULT_PARITY_CLIP_PATH
-        self.commands.traj_ref.randomize_heading = False

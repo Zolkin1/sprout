@@ -32,7 +32,9 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--ckpt", required=True, help="FM .pt checkpoint (defines joints/frames/dims).")
 parser.add_argument("--clip", required=True, help="Parity clip .h5 the probe states come from.")
-parser.add_argument("--task", default="G1-tracker-clf-parity-play")
+# Needs a GeneratorTrackingCommand task (the cfg has fm_checkpoint, set below);
+# --clip overrides the clip path, so any such task works.
+parser.add_argument("--task", default="G1-tracker-clf-fm-ar-play")
 parser.add_argument("--steps", default="50,160,300,470,540")
 parser.add_argument("--out", default="/tmp/fm_probe_isaac.npz")
 parser.add_argument("--seed", type=int, default=0)
