@@ -114,6 +114,11 @@ class G1TeacherObservationsCfg:
                                 noise=Unoise(n_min=-0.5, n_max=0.5), clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"},
                          noise=Unoise(n_min=-0.02, n_max=0.02))
+        # Reference base velocity (current step), rotated into the base frame
+        # (heading-invariant, deployable). The FM predicts this (the achieved-reference
+        # velocity, not the command); noised like the other reference-motion terms.
+        base_vel_ref = ObsTerm(func=mdp.ref_base_velocity_local, params={"command_name": "traj_ref"},
+                               noise=Unoise(n_min=-0.1, n_max=0.1))
         # Joystick-level velocity command that generated the clip (target_vel =
         # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards. No noise:
         # this is the upstream command, not the FM-predicted reference.
@@ -136,7 +141,7 @@ class G1TeacherObservationsCfg:
         future_base_vel = ObsTerm(
             func=mdp.future_base_velocity,
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-            noise=Unoise(n_min=-0.5, n_max=0.5),
+            noise=Unoise(n_min=-0.1, n_max=0.1),
         )
 
         def __post_init__(self):
