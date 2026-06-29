@@ -127,6 +127,33 @@ def quat_rotate_inverse_np(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return (2.0 * w * w - 1.0) * v - 2.0 * w * cross + 2.0 * dot * u
 
 
+def _quat_mul_t(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of xyzw quaternions ``(..., 4)`` (a ⊗ b)."""
+    ax, ay, az, aw = a.unbind(-1)
+    bx, by, bz, bw = b.unbind(-1)
+    return torch.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], dim=-1)
+
+
+def _quat_conj_t(q: torch.Tensor) -> torch.Tensor:
+    """Conjugate of xyzw quaternions ``(..., 4)``."""
+    x, y, z, w = q.unbind(-1)
+    return torch.stack([-x, -y, -z, w], dim=-1)
+
+
+def _yaw_quat_t(q: torch.Tensor) -> torch.Tensor:
+    """Yaw-only (z-rotation) xyzw quaternion of ``q`` ``(..., 4)`` -- mirrors isaaclab yaw_quat."""
+    x, y, z, w = q.unbind(-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    half = 0.5 * yaw
+    zr = torch.zeros_like(yaw)
+    return torch.stack([zr, zr, torch.sin(half), torch.cos(half)], dim=-1)
+
+
 def to_body_frame_traj(tr: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Return a copy of ``tr`` with all velocities rotated into the base frame.
 
@@ -1106,22 +1133,31 @@ def run_forecast(ctx, data, layout, args, device) -> ForecastResult:
 
 @dataclass
 class ForecastStepResult:
-    """Per-anchor comparison for the step scrubber.
+    """Per-step comparison for the scrubber: nominal clip vs clip-history forecast vs a
+    sim-faithful autoregressive FM rollout.
 
-    At each anchor step the FM is run twice with the SAME clip command: once on the
-    clean clip history (``clip_branches``) and once on its own free-running
-    autoregressive history (``auto_branches``); ``gt`` is the nominal clip and
-    ``auto_spine`` the realized autoregressive trajectory.  All branches are FULL
-    ``F``-windows (frames ``0..N-1`` echo the conditioning, ``N..F-1`` are novel).
+    The autoregressive rollout is a copy of the in-sim FM loop (GeneratorTrackingCommand)
+    with the CLIP as the robot: it re-infers every ``fm_update_every`` steps, re-anchors
+    each fresh window onto the clip's current root (xy+z+yaw), advances the applied index
+    through the window in between, and feeds its own applied output back as history.
+    ``auto_spine`` is the realized applied reference (what the tracker would follow);
+    ``auto_windows[k]`` is the active F-window at step ``k`` (static between re-infers),
+    ``auto_pred_idx[k]`` the applied index within it, ``auto_win_start[k]`` the step it was
+    inferred at (for time placement). ``clip_branches[k]`` is the fresh open-loop forecast
+    from the clean clip history at that anchor.
     """
 
     gt: dict[str, np.ndarray]                  # nominal clip over the stretch (L, .)
     gt_pos_intvel: np.ndarray                  # clip root pos from integrating its world vel (L, 3)
-    auto_spine: dict[str, np.ndarray]          # realized autoregressive trajectory (<=L, .)
+    auto_spine: dict[str, np.ndarray]          # realized applied autoregressive reference (T, .)
+    auto_spine_t0: int                         # clip-step index of auto_spine[0]
     anchors: list[int]                         # clip-step index of each anchor
     clip_branches: list[dict[str, np.ndarray]]      # (F, .) per anchor, clip-history forecast
-    auto_branches: list[dict[str, np.ndarray]]      # (F, .) per anchor, autoregressive forecast (may be short)
-    diverged_at: int | None                    # anchor index where the autoregressive rollout blew up
+    auto_windows: list[dict[str, np.ndarray]]       # (F, .) active FM window per step (T entries)
+    auto_win_start: list[int]                       # step the active window was inferred at (T entries)
+    auto_pred_idx: list[int]                        # applied index within the active window (T entries)
+    diverged_at: int | None                    # step where the autoregressive rollout blew up
+    fm_update_every: int                       # re-inference cadence used
     N: int
     F: int
     dt: float
@@ -1164,8 +1200,10 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
     cmd_w = data["target_vel"][rows]
     anchors = [N - 1 + i for i in range(n_anchor)]
     have_ee = ctx.target_num_extra_frames > 0
+    every = max(1, int(args.fm_update_every))
     print(f"[bench] forecast_step on {args.forecast_hist!r}: L={L} steps, {n_anchor} anchors "
-          f"(F={F} window) -> {2 * n_anchor} FM samples (clip-history + autoregressive)...")
+          f"(F={F} window); clip-history forecast per step + autoregressive rollout "
+          f"(re-infer every {every} steps, re-anchored on the clip)...")
 
     # (b) clip-history forecast at each anchor (clean clip window conditioning).
     clip_branches: list[dict[str, np.ndarray]] = []
@@ -1174,7 +1212,15 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
         fut = torch.from_numpy(np.ascontiguousarray(cmd_w[i:i + F])).float().unsqueeze(0).to(device)
         clip_branches.append(disp_traj(predict(ctx, win, fut, args.seed, include_history=True), vf))
 
-    # (c) autoregressive forecast: free-run from the clip seed, same command profile.
+    # (c) autoregressive rollout -- a faithful copy of the in-sim FM loop
+    # (GeneratorTrackingCommand) with the CLIP standing in for the robot:
+    #   * conditions on its OWN past applied output (autoregressive history, clip-seeded);
+    #   * RE-INFERS only every `every` steps (the sim's fm_update_every), advancing the
+    #     applied index through the F-window in between;
+    #   * each re-infer RE-ANCHORS the window's current step onto the CLIP's current root
+    #     pose (xy + z + heading, keeping the FM tilt) -- exactly _run_fm onto the robot.
+    rp_all = torch.from_numpy(np.ascontiguousarray(raw_gt["root_pos"])).float().to(device)    # (L,3) clip world
+    rq_all = torch.from_numpy(np.ascontiguousarray(raw_gt["root_quat"])).float().to(device)   # (L,4)
     hist = BatchedHistory(1, N, device)
     seed_win = build_window_from_rows(data, layout, ctx, rows[0:F], device, "seed")
     for kk in range(N):
@@ -1183,51 +1229,80 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
         if have_ee:
             step["frames"] = seed_win.inputs["frames"][:, kk]
         hist.append(step)
-    auto_branches: list[dict[str, np.ndarray]] = []
+
+    def _applied_step(pred: dict, j: int) -> dict:
+        """Applied reference (world) at window index ``j`` -- the history-feedback step."""
+        s = {"root_pos": pred["root_pos_w"][:, j], "root_quat": pred["root_quat_w"][:, j],
+             "root_lin_vel": pred["root_link_lin_vel_w"][:, j], "root_ang_vel": pred["root_link_ang_vel_w"][:, j],
+             "joint_pos": pred["joint_pos"][:, j], "joint_vel": pred["joint_vel"][:, j]}
+        if have_ee:
+            s["frames"] = torch.cat([pred["frame_pos_w"][:, j], pred["frame_quat_w"][:, j],
+                                     pred["frame_lin_vel_w"][:, j], pred["frame_ang_vel_w"][:, j]], dim=-1)
+        return s
+
+    auto_windows: list[dict[str, np.ndarray]] = []
+    auto_win_start: list[int] = []
+    auto_pred_idx: list[int] = []
+    spine_rec: dict[str, list] = {k: [] for k in
+                                  ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel",
+                                   "ee_pos", "ee_quat", "ee_lin_vel", "ee_ang_vel")}
+    pred_win = None          # active world prediction window (reused between re-infers)
+    pred_win_disp = None     # display copy (body-frame velocities)
+    pred_valid = False
+    pred_idx = 0
+    win_start = 0
     diverged_at = None
     for i in range(n_anchor):
-        rp = hist.stack("root_pos"); rq = hist.stack("root_quat")
-        rlv = hist.stack("root_lin_vel"); rav = hist.stack("root_ang_vel")
-        jp = hist.stack("joint_pos"); jv = hist.stack("joint_vel")
-        frames = hist.stack("frames") if have_ee else None
-        cond, known = build_cond_states(ctx, rp, rq, rlv, rav, jp, jv, frames=frames)
-        fut = torch.from_numpy(np.ascontiguousarray(cmd_w[i:i + F])).float().unsqueeze(0).to(device)
-        cmd_tokens = build_cmd_tokens(ctx, fut) if ctx.cmd_dim > 0 else None
-        torch.manual_seed(args.seed)  # same seed as the clip-history branch (fair compare)
-        pred = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens=cmd_tokens)
-        auto_branches.append(disp_traj(pred_to_traj(pred), vf))
-        # Advance one novel step (frame N) back into the history for the next anchor.
-        new = {
-            "root_pos": pred["root_pos_w"][:, N], "root_quat": pred["root_quat_w"][:, N],
-            "root_lin_vel": pred["root_link_lin_vel_w"][:, N], "root_ang_vel": pred["root_link_ang_vel_w"][:, N],
-            "joint_pos": pred["joint_pos"][:, N], "joint_vel": pred["joint_vel"][:, N],
-        }
-        if have_ee:
-            new["frames"] = torch.cat(
-                [pred["frame_pos_w"][:, N], pred["frame_quat_w"][:, N],
-                 pred["frame_lin_vel_w"][:, N], pred["frame_ang_vel_w"][:, N]], dim=-1)
-        finite = all(torch.isfinite(v).all().item() for v in new.values())
-        z = float(new["root_pos"][0, 2].item())
+        a = anchors[i]       # current clip step = the "robot" pose to re-anchor onto
+        reinfer = (i % every == 0) or (not pred_valid) or (pred_idx >= F - 1)
+        if reinfer:
+            rp = hist.stack("root_pos"); rq = hist.stack("root_quat")
+            rlv = hist.stack("root_lin_vel"); rav = hist.stack("root_ang_vel")
+            jp = hist.stack("joint_pos"); jv = hist.stack("joint_vel")
+            frames = hist.stack("frames") if have_ee else None
+            cond, known = build_cond_states(ctx, rp, rq, rlv, rav, jp, jv, frames=frames)
+            fut = torch.from_numpy(np.ascontiguousarray(cmd_w[i:i + F])).float().unsqueeze(0).to(device)
+            cmd_tokens = build_cmd_tokens(ctx, fut) if ctx.cmd_dim > 0 else None
+            # Re-anchor onto the clip root (clip-as-robot): xy + z + yaw, keep FM tilt.
+            p_ref = rp[:, -1].clone()
+            q_fm = rq[:, -1]
+            p_ref[:, :3] = rp_all[a:a + 1, :3]
+            dz_yaw = _quat_mul_t(_yaw_quat_t(rq_all[a:a + 1]), _quat_conj_t(_yaw_quat_t(q_fm)))
+            q_ref = _quat_mul_t(dz_yaw, q_fm)
+            torch.manual_seed(args.seed + i)
+            pred_win = sample_world(ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)
+            pred_win_disp = disp_traj(pred_to_traj(pred_win), vf)
+            pred_valid, pred_idx, win_start = True, N, i
+        else:
+            pred_idx = min(pred_idx + 1, F - 1)
+
+        applied = _applied_step(pred_win, pred_idx)
+        finite = all(torch.isfinite(v).all().item() for v in applied.values())
+        z = float(applied["root_pos"][0, 2].item())
         if (not finite) or not (0.2 < z < 2.0):
             diverged_at = i
-            print(f"[bench]   autoregressive DIVERGED at anchor {anchors[i]} (finite={finite}, z={z:.3f})")
+            print(f"[bench]   autoregressive DIVERGED at step {i} (anchor {a}; finite={finite}, z={z:.3f})")
             break
-        hist.append(new)
+        auto_windows.append(pred_win_disp)
+        auto_win_start.append(win_start)
+        auto_pred_idx.append(pred_idx)
+        for key, src in (("root_pos", "root_pos_w"), ("root_quat", "root_quat_w"),
+                         ("root_lin_vel", "root_link_lin_vel_w"), ("root_ang_vel", "root_link_ang_vel_w")):
+            spine_rec[key].append(pred_win[src][0, pred_idx].detach().cpu().numpy())
+        if have_ee:
+            for key, src in (("ee_pos", "frame_pos_w"), ("ee_quat", "frame_quat_w"),
+                             ("ee_lin_vel", "frame_lin_vel_w"), ("ee_ang_vel", "frame_ang_vel_w")):
+                spine_rec[key].append(pred_win[src][0, pred_idx].detach().cpu().numpy())
+        hist.append(applied)
 
-    # Realized autoregressive spine = clip seed (0..N-1) + each branch's first novel frame.
-    spine_keys = [k for k in ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel",
-                              "ee_pos", "ee_quat", "ee_lin_vel", "ee_ang_vel") if k in gt]
-
-    def _spine(key: str) -> np.ndarray:
-        parts = [gt[key][0:N]]
-        if auto_branches:
-            parts.append(np.stack([b[key][N] for b in auto_branches]))
-        return np.concatenate(parts, axis=0)
-
-    auto_spine = {key: _spine(key) for key in spine_keys}
+    auto_spine = {k: np.stack(v) for k, v in spine_rec.items() if v}
+    if auto_spine:
+        auto_spine = disp_traj(auto_spine, vf)
     return ForecastStepResult(
-        gt=gt, gt_pos_intvel=gt_pos_intvel, auto_spine=auto_spine, anchors=anchors,
-        clip_branches=clip_branches, auto_branches=auto_branches, diverged_at=diverged_at,
+        gt=gt, gt_pos_intvel=gt_pos_intvel, auto_spine=auto_spine, auto_spine_t0=N,
+        anchors=anchors, clip_branches=clip_branches,
+        auto_windows=auto_windows, auto_win_start=auto_win_start, auto_pred_idx=auto_pred_idx,
+        diverged_at=diverged_at, fm_update_every=every,
         N=N, F=F, dt=ctx.dt_attr, frame_names=ctx.target_frame_names if have_ee else [],
         joint_names=ctx.joint_names, vel_frame=vf,
     )
@@ -1553,53 +1628,67 @@ def draw_forecast_path(fig, res: ForecastResult) -> None:
 
 
 def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
-    """One scrub step: the nominal clip + the clip-history forecast + the
-    autoregressive forecast launched at anchor ``k`` (echo dotted, novel solid).
+    """One scrub step of the sim-faithful autoregressive rollout.
 
-    Black = nominal clip (a); blue = clip-history forecast (b); red = autoregressive
-    forecast (c); grey = realized autoregressive trajectory. Arrow keys move ``k``.
+    Black = nominal clip; green dashed = clip ∫(world vel); blue = clip-history forecast
+    at this anchor; orange = realized autoregressive reference (what the tracker would
+    follow); red = the ACTIVE FM window (re-inferred every ``fm_update_every`` steps,
+    re-anchored on the clip), with a dot at the currently-applied index. Arrow keys move
+    ``k``; the red window is static between re-infers while the dot walks it.
     """
     from matplotlib.lines import Line2D
 
     fig.clear()
     axs = fig.subplots(3, 3)
     n, F, dt, vf = res.N, res.F, res.dt, res.vel_frame
-    gt, spine = res.gt, res.auto_spine
+    gt, spine, iv = res.gt, res.auto_spine, res.gt_pos_intvel
     L = gt["root_pos"].shape[0]
     t_gt = np.arange(L) * dt
-    t_sp = np.arange(spine["root_pos"].shape[0]) * dt
+    T = spine["root_pos"].shape[0] if spine else 0
+    t_sp = (res.auto_spine_t0 + np.arange(T)) * dt
+    # Re-infer steps (where the active window was freshly sampled): win_start[m] == m.
+    reinfer_m = [m for m, ws in enumerate(res.auto_win_start) if ws == m]
     a = res.anchors[k]
     clip = res.clip_branches[k]
-    auto = res.auto_branches[k] if k < len(res.auto_branches) else None
-    tw = (np.arange(F) + (a - (n - 1))) * dt        # window frames in clip time
+    tw_clip = (np.arange(F) + k) * dt               # clip-history window in clip time
+    have_auto = k < len(res.auto_windows)
+    if have_auto:
+        auto = res.auto_windows[k]
+        pidx = res.auto_pred_idx[k]
+        tw_auto = (np.arange(F) + res.auto_win_start[k]) * dt
+    now_t = (res.auto_spine_t0 + k) * dt            # the currently-applied reference time
 
-    C_CLIP, C_SPINE, C_CB, C_AB, C_IV = "k", "0.6", "C0", "C3", "C2"
+    C_CLIP, C_IV, C_SPINE, C_CB, C_AB = "k", "C2", "C1", "C0", "C3"
 
-    def branch(ax, getter, br, col) -> None:
+    def branch(ax, getter, br, tw, col) -> None:
         y = getter(br)
         ax.plot(tw[:n], y[:n], color=col, ls=":", lw=1.0, alpha=0.85, zorder=4)   # echo
         ax.plot(tw[n - 1:], y[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)   # novel
 
     def panel(ax, getter, title) -> None:
-        ax.plot(t_gt, getter(gt), color=C_CLIP, lw=1.4, alpha=0.55, zorder=2)
-        if spine["root_pos"].shape[0]:
-            ax.plot(t_sp, getter(spine), color=C_SPINE, lw=1.2, alpha=0.8, zorder=3)
-        branch(ax, getter, clip, C_CB)
-        if auto is not None:
-            branch(ax, getter, auto, C_AB)
-        ax.axvline(a * dt, color="0.3", lw=0.8, ls=":")
+        ax.plot(t_gt, getter(gt), color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
+        if T:
+            ax.plot(t_sp, getter(spine), color=C_SPINE, lw=1.5, alpha=0.9, zorder=3)
+            if reinfer_m:
+                ax.plot(t_sp[reinfer_m], getter(spine)[reinfer_m], ls="none", marker="|",
+                        ms=7, mew=1.2, color=C_SPINE, zorder=3)
+        branch(ax, getter, clip, tw_clip, C_CB)
+        if have_auto:
+            branch(ax, getter, auto, tw_auto, C_AB)
+            ax.plot([tw_auto[pidx]], [getter(auto)[pidx]], marker="o", ms=5,
+                    color=C_AB, zorder=6)  # currently-applied reference
+        ax.axvline(now_t, color="0.3", lw=0.8, ls=":")
         ax.grid(True, alpha=0.3)
         ax.set_title(title, fontsize=9)
 
-    iv = res.gt_pos_intvel
     lab = ["x", "y", "z"]
     for i in range(3):
         panel(axs[0, i], (lambda c: (lambda tr: tr["root_lin_vel"][:, c]))(i),
               f"root lin vel {lab[i]} ({vf}, m/s)")
-        # Clip mean velocity (dotted black line + value). NOTE: this is the DISPLAYED
-        # ({vf}) frame; the green ∫vel below integrates the WORLD velocity, so in body
-        # frame the mean here will NOT equal the green drift (forward speed leaks into
-        # body-z via pelvis tilt). Use --vel-frame world to compare like-for-like.
+        # Clip mean velocity (dotted line + value). NOTE: this is the DISPLAYED ({vf})
+        # frame; the green ∫vel below integrates the WORLD velocity, so in body frame the
+        # mean here will NOT equal the green drift (forward speed leaks into body-z via
+        # pelvis tilt). Use --vel-frame world to compare like-for-like.
         vmean = float(gt["root_lin_vel"][:, i].mean())
         axs[0, i].axhline(vmean, color=C_CLIP, ls=":", lw=0.9, alpha=0.7)
         axs[0, i].text(0.98, 0.03, f"clip mean {vmean:+.3f}", transform=axs[0, i].transAxes,
@@ -1611,10 +1700,10 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
 
     # xy path (world)
     ax = axs[2, 0]
-    ax.plot(gt["root_pos"][:, 0], gt["root_pos"][:, 1], color=C_CLIP, lw=1.4, alpha=0.55, zorder=2)
+    ax.plot(gt["root_pos"][:, 0], gt["root_pos"][:, 1], color=C_CLIP, lw=1.4, alpha=0.5, zorder=2)
     ax.plot(iv[:, 0], iv[:, 1], color=C_IV, ls="--", lw=1.3, alpha=0.9, zorder=3)
-    if spine["root_pos"].shape[0]:
-        ax.plot(spine["root_pos"][:, 0], spine["root_pos"][:, 1], color=C_SPINE, lw=1.2, alpha=0.8, zorder=3)
+    if T:
+        ax.plot(spine["root_pos"][:, 0], spine["root_pos"][:, 1], color=C_SPINE, lw=1.5, alpha=0.9, zorder=3)
 
     def xy(br, col) -> None:
         px, py = br["root_pos"][:, 0], br["root_pos"][:, 1]
@@ -1622,8 +1711,9 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
         ax.plot(px[n - 1:], py[n - 1:], color=col, lw=1.8, alpha=0.95, zorder=5)
 
     xy(clip, C_CB)
-    if auto is not None:
+    if have_auto:
         xy(auto, C_AB)
+        ax.plot([auto["root_pos"][pidx, 0]], [auto["root_pos"][pidx, 1]], marker="o", ms=5, color=C_AB, zorder=6)
     ax.set_title("root xy path (m, world)", fontsize=9)
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(True, alpha=0.3)
@@ -1640,17 +1730,18 @@ def draw_forecast_step(fig, res: ForecastStepResult, k: int) -> None:
 
     handles = [Line2D([0], [0], color=C_CLIP, lw=1.4, alpha=0.6),
                Line2D([0], [0], color=C_IV, lw=1.3, ls="--"),
-               Line2D([0], [0], color=C_SPINE, lw=1.2),
+               Line2D([0], [0], color=C_SPINE, lw=1.5),
                Line2D([0], [0], color=C_CB, lw=1.8),
                Line2D([0], [0], color=C_AB, lw=1.8)]
     labels = ["clip (nominal)", "clip ∫vel (world)", "autoregressive (realized)",
-              "clip-history forecast", "autoregressive forecast"]
+              "clip-history forecast", f"FM window (re-infer/{res.fm_update_every}, ●=applied)"]
     fig.legend(handles, labels, loc="upper right", fontsize=8)
-    div = "" if auto is not None else "   [autoregressive DIVERGED here]"
+    div = "" if have_auto else "   [autoregressive DIVERGED before here]"
     fig.suptitle(
-        f"forecast step {k + 1}/{len(res.anchors)}  --  anchor step {a}  (t={a * dt:.2f}s){div}\n"
-        f"dotted = FM history echo, solid = novel prediction",
-        fontsize=11,
+        f"forecast_step {k + 1}/{len(res.anchors)}  --  applied clip-step {res.auto_spine_t0 + k} "
+        f"(t={now_t:.2f}s)   re-infer every {res.fm_update_every} steps, re-anchored on clip{div}\n"
+        f"dotted = FM history echo, solid = novel; orange = realized reference (| = re-infer)",
+        fontsize=10,
     )
 
 
@@ -2001,6 +2092,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Ground-truth stretch length (steps) for the forecast overlay.")
     p.add_argument("--forecast-stride", type=int, default=5,
                    help="Re-forecast every this many ground-truth steps.")
+    p.add_argument("--fm-update-every", type=int, default=10,
+                   help="forecast_step: re-inference cadence of the autoregressive rollout "
+                        "(control steps between FM re-infers), mirroring the sim's "
+                        "GeneratorTrackingCommandCfg.fm_update_every. Between re-infers the applied "
+                        "reference advances through the F-window; each re-infer re-anchors onto the "
+                        "clip (xy+z+yaw).")
     p.add_argument("--forecast-pad", type=int, default=60,
                    help="Steps of recorded command context to show before/after the FM region "
                         "(trimmed at episode resets) so you can see ramps into/out of it.")
