@@ -54,6 +54,21 @@ def quat_apply_inverse(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return quat_apply(quat_conjugate(q), v)
 
 
+def yaw_quat(q: np.ndarray) -> np.ndarray:
+    """Heading-only xyzw quaternion: drop roll/pitch, keep the yaw (z-rotation).
+
+    Numpy/xyzw port of ``isaaclab.utils.math.yaw_quat``: extracts the yaw angle and
+    rebuilds the pure-z rotation ``(0, 0, sin(yaw/2), cos(yaw/2))`` (already unit).
+    """
+    qx, qy, qz, qw = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    half = 0.5 * yaw
+    out = np.zeros_like(q)
+    out[..., 2] = np.sin(half)
+    out[..., 3] = np.cos(half)
+    return out
+
+
 def matrix_from_quat(q: np.ndarray) -> np.ndarray:
     """Rotation matrix ``(..., 3, 3)`` from an xyzw quaternion ``(..., 4)``."""
     x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]

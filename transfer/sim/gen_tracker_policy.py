@@ -12,17 +12,22 @@ prediction (the future terms from the FM horizon).
 Per control step (mirrors ``generator_tracking_cmd._snapshot_and_infer`` +
 ``_update_command`` for a single env):
 
-1. Snapshot the current world state into a rolling history (FM joint/frame order).
+1. Append the FM's OWN previous applied reference to a rolling history (the
+   autoregressive history input; the measured stand seeds it during the warmup).
 2. Every ``fm_update_every`` steps, sample an ``F``-step world-frame trajectory
-   anchored at the current base pose, conditioned on the (held) command horizon.
-   Otherwise advance the read index through the existing prediction.
+   conditioned on that history + the (held) command horizon, then re-anchor it onto
+   the robot root (xy + z + heading, keeping the FM tilt). Otherwise advance the
+   read index through the existing prediction.
 3. Build the tracker's policy observation from the prediction (current step +
    future window) and the measured proprioception.
 
-The PARC-style FM conditions on AND predicts the same end-effector frames
-(``ctx.num_extra_frames``), so every history snapshot carries them (for hardware,
-from forward kinematics on the measured joints); the predicted frames feed the
-``ee_ref`` term. The class is fully checkpoint-driven.
+The generator runs autoregressively (it never conditions on the live robot state),
+exactly like ``GeneratorTrackingCommand``. The PARC-style FM conditions on AND
+predicts the same end-effector frames (``ctx.num_extra_frames``); the autoregressive
+history carries the predicted frames, and the warmup seed gets them from the
+measured state. The FM joint order need not equal the robot's isaac order (a
+clip-conditioned FM is trained in the clip-library order). The class is fully
+checkpoint-driven.
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ from rl_policy import RLPolicy
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fm import BatchedHistory, load_fm_context  # noqa: E402
 from fm.online import build_cmd_tokens, build_cond_states, sample_world  # noqa: E402
-from fm.quat_math import quat_apply, quat_box_minus, quat_inv  # noqa: E402
+from fm.quat_math import quat_apply, quat_box_minus, quat_conjugate, quat_inv, quat_mul, yaw_quat  # noqa: E402
 
 # Observation clip bounds that are set on the obs terms in the env cfg
 # (G1TeacherObservationsCfg) but not carried in policy_parameters.yaml.
@@ -139,30 +144,31 @@ class GeneratorTrackerPolicy:
         self._loaded = True
 
     def _build_orderings(self) -> None:
-        """Resolve the joint/frame permutations between MuJoCo, the FM, and the tracker.
+        """Resolve the joint/frame permutations between the robot (isaac), the FM, and the CLF.
 
-        - ``joint_names_isaac`` is the robot (and FM) joint order -- the tracker's
+        - ``joint_names_isaac`` is the robot joint order -- the tracker's
           ``joint_pos``/``joint_vel``/``actions`` order.
+        - ``ctx.joint_names`` is the FM joint order; it need NOT equal the isaac order
+          (a clip-conditioned FM is trained in the clip-library order). ``_isaac_to_fm``
+          permutes the measured joints into the FM order for the autoregressive history.
         - ``joint_out_names`` is the CLF output joint order (clip
           ``ordered_pos_output_names``); ``joint_pos_ref``/``joint_vel_ref`` use it.
-          It differs from the isaac order, so it must be exported in
-          ``policy_parameters.yaml`` (key ``joint_out_names`` or the full
-          ``ordered_pos_output_names``). Falls back to the isaac order with a warning.
+          ``_fm_to_out`` permutes the FM prediction (FM order) into it. It must be
+          exported in ``policy_parameters.yaml``; falls back to the isaac order.
         - ``ee_ref`` frame order == the FM's predicted (target) frame order.
         """
         isaac = list(self._rl.get_joint_names())
-        if list(self.ctx.joint_names) != isaac:
-            raise ValueError(
-                f"FM joint order {self.ctx.joint_names} != tracker joint_names_isaac {isaac}; "
-                "the generator and tracker were trained on different robots."
-            )
         self.joint_names_isaac = isaac
-
+        fm = list(self.ctx.joint_names)
         joint_out = self._resolve_joint_out_names(isaac)
         self.joint_out_names = joint_out
-        # FM (isaac order) -> CLF output joint order, for joint_pos_ref / joint_vel_ref.
+        # Measured (isaac order) -> FM order, for the autoregressive history input.
+        self._isaac_to_fm = torch.tensor(
+            [isaac.index(n) for n in fm], dtype=torch.long, device=self.fm_device
+        )
+        # FM prediction (FM order) -> CLF output joint order, for joint_pos_ref / joint_vel_ref.
         self._fm_to_out = torch.tensor(
-            [isaac.index(n) for n in joint_out], dtype=torch.long, device=self.fm_device
+            [fm.index(n) for n in joint_out], dtype=torch.long, device=self.fm_device
         )
         # ee_ref frames == FM target frames (sorted ee), already in prediction order.
         self.ee_frame_names = list(self.ctx.target_frame_names)
@@ -198,22 +204,26 @@ class GeneratorTrackerPolicy:
     # Per-step state snapshot + generator inference
     # ------------------------------------------------------------------
     def _make_snapshot(self, state: dict) -> dict[str, torch.Tensor]:
-        """Pack one control step of world state into the FM history layout (1 env).
+        """Pack one MEASURED world state into the FM history layout (1 env).
 
-        ``state`` keys (numpy, FM/isaac joint order, world frame, xyzw quats):
-        ``root_pos``, ``root_quat``, ``root_lin_vel_w``, ``root_ang_vel_w``,
-        ``joint_pos``, ``joint_vel``, ``command``, and -- only when the history
-        token carries extra frames -- ``frame_pos``/``frame_quat``/``frame_lin``/
-        ``frame_ang`` each ``(K_hist, ·)``.
+        Seeds the autoregressive history during the warmup. ``state`` keys (numpy,
+        robot/isaac joint order, world frame, xyzw quats): ``root_pos``,
+        ``root_quat``, ``root_lin_vel_w``, ``root_ang_vel_w``, ``joint_pos``,
+        ``joint_vel``, ``command``, and -- only when the history token carries extra
+        frames -- ``frame_pos``/``frame_quat``/``frame_lin``/``frame_ang`` each
+        ``(K_hist, ·)``. Measured joints are permuted isaac->FM order.
         """
-        dev, tf = self.fm_device, lambda a: torch.as_tensor(a, dtype=torch.float32, device=self.fm_device)
+        tf = lambda a: torch.as_tensor(a, dtype=torch.float32, device=self.fm_device)
+        jp, jv = tf(state["joint_pos"]), tf(state["joint_vel"])
+        if self._isaac_to_fm is not None:
+            jp, jv = jp[self._isaac_to_fm], jv[self._isaac_to_fm]
         snap = {
             "root_pos": tf(state["root_pos"])[None],
             "root_quat": tf(state["root_quat"])[None],
             "root_lin": tf(state["root_lin_vel_w"])[None],
             "root_ang": tf(state["root_ang_vel_w"])[None],
-            "jp": tf(state["joint_pos"])[None],
-            "jv": tf(state["joint_vel"])[None],
+            "jp": jp[None],
+            "jv": jv[None],
             "cmd": tf(state["command"])[None],
         }
         if self.ctx.num_extra_frames > 0:
@@ -221,6 +231,32 @@ class GeneratorTrackerPolicy:
                 [state["frame_pos"], state["frame_quat"], state["frame_lin"], state["frame_ang"]], axis=-1
             )  # (K, 13)
             snap["frames"] = tf(frames)[None]
+        return snap
+
+    def _applied_ref_snapshot(self, state: dict) -> dict[str, torch.Tensor]:
+        """The autoregressive history snapshot to append THIS step (FM history layout).
+
+        Mirrors ``GeneratorTrackingCommand``: once the prediction is live the FM
+        conditions on its OWN previously-applied reference (the prediction at the
+        current read index, already in FM joint/frame order); during the warmup it
+        falls back to the measured state (the deploy analogue of Isaac's clip seed).
+        The command is always the current measured command (the FM
+        command-conditioning horizon, independent of the pose reference).
+        """
+        if not self._pred_valid:
+            return self._make_snapshot(state)
+        cur = self._pred_at(self._pred_idx)
+        cmd = torch.as_tensor(np.asarray(state["command"]), dtype=torch.float32, device=self.fm_device)
+        snap = {
+            "root_pos": cur["root_pos"][None], "root_quat": cur["root_quat"][None],
+            "root_lin": cur["root_lin"][None], "root_ang": cur["root_ang"][None],
+            "jp": cur["jp"][None], "jv": cur["jv"][None], "cmd": cmd[None],
+        }
+        if self.ctx.num_extra_frames > 0:
+            frames = torch.cat(
+                [cur["frame_pos"], cur["frame_quat"], cur["frame_lin"], cur["frame_ang"]], dim=-1
+            )  # (k, 13)
+            snap["frames"] = frames[None]
         return snap
 
     def warm_start(self, state: dict) -> None:
@@ -231,9 +267,14 @@ class GeneratorTrackerPolicy:
         self._warm = True
 
     def _update_generator(self, state: dict) -> None:
-        """Append the snapshot and (re-)run or advance the generator prediction."""
+        """Append the autoregressive history snapshot and (re-)run or advance the prediction.
+
+        The appended snapshot is the FM's OWN previous applied reference (or the
+        measured stand during the warmup) -- the generator never conditions on the
+        live robot state, mirroring ``GeneratorTrackingCommand._snapshot_and_infer``.
+        """
         self._ctrl_step += 1
-        self._history.append(self._make_snapshot(state))
+        self._history.append(self._applied_ref_snapshot(state))
 
         valid = bool(self._history.valid()[0].item())
         exhausted = self._pred_idx >= (self.ctx.F - 1)
@@ -245,7 +286,12 @@ class GeneratorTrackerPolicy:
 
     @torch.no_grad()
     def _run_fm(self, state: dict) -> None:
-        """Sample an F-step world trajectory anchored at the current base pose."""
+        """Sample an F-step world trajectory, re-anchored onto the robot root.
+
+        The conditioning is the FM's OWN past reference (the autoregressive history);
+        only the world placement is re-anchored onto the robot's measured root (xy +
+        z + heading, keeping the FM tilt), mirroring ``GeneratorTrackingCommand._run_fm``.
+        """
         ctx = self.ctx
         rp = self._history.stack("root_pos")
         rq = self._history.stack("root_quat")
@@ -260,7 +306,18 @@ class GeneratorTrackerPolicy:
         # Held command over the future horizon (no clip to read ahead from).
         fut_cmd = cmd[:, -1:].expand(1, ctx.F, ctx.cmd_dim).clone()
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
-        world = sample_world(ctx, cond, known, rp[:, -1], rq[:, -1], cmd_tokens=cmd_tokens)
+
+        # Re-anchor the prediction onto the robot root (xy + z + yaw), keeping the FM
+        # tilt -- the network still conditions on its own past output (rp/rq), only the
+        # world placement follows the robot. Matches generator_tracking_cmd._run_fm.
+        p_ref = rp[:, -1].clone()
+        q_ref = rq[:, -1].clone()
+        robot_p = torch.as_tensor(state["root_pos"], dtype=rp.dtype, device=self.fm_device)[None]
+        robot_q = torch.as_tensor(state["root_quat"], dtype=rq.dtype, device=self.fm_device)[None]
+        p_ref[:] = robot_p                                              # anchor xy + z
+        dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))
+        q_ref = quat_mul(dz_yaw, q_ref)                                 # FM tilt, robot heading
+        world = sample_world(ctx, cond, known, p_ref, q_ref, cmd_tokens=cmd_tokens)
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]
@@ -354,6 +411,16 @@ class GeneratorTrackerPolicy:
                 ee_parts.append(quat_apply(inv_ref_quat, frame_pos[kf] - ref_pos))
         ee_ref = torch.cat(ee_parts, dim=-1) if ee_parts else torch.zeros(0, device=dev, dtype=torch.float64)
 
+        # -- term 10: base_vel_ref -- reference base lin+ang velocity (world frame)
+        # rotated into the current base frame (observations.ref_base_velocity_local).
+        # Guarded so an injected reference without velocity channels (parity tests)
+        # simply omits the term.
+        base_vel_ref = None
+        if "root_lin" in cur:
+            ref_lin = cur["root_lin"].to(torch.float64)
+            ref_ang = cur["root_ang"].to(torch.float64)
+            base_vel_ref = torch.cat([quat_apply(inv_root, ref_lin), quat_apply(inv_root, ref_ang)], dim=-1)
+
         # -- terms 11/12/13: future window. future_base_pose/vel come from the FM
         # horizon (matches GeneratorTrackingCommand.get_future_world_base, now
         # FM-sourced); future_command_vel is the held command (deployment has no
@@ -392,6 +459,8 @@ class GeneratorTrackerPolicy:
             "future_base_pose": future_base_pose,
             "future_base_vel": future_base_vel,
         }
+        if base_vel_ref is not None:
+            values["base_vel_ref"] = base_vel_ref
         return self._assemble(values)
 
     def _projected_gravity(self, root_quat_xyzw: torch.Tensor) -> torch.Tensor:

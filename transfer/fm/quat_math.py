@@ -58,6 +58,21 @@ def quat_apply_inverse(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return quat_apply(quat_conjugate(q), v)
 
 
+def yaw_quat(q: torch.Tensor) -> torch.Tensor:
+    """Heading-only xyzw quaternion: drop roll/pitch, keep the yaw (z-rotation).
+
+    Torch/xyzw port of ``isaaclab.utils.math.yaw_quat``: extracts the yaw angle and
+    rebuilds the pure-z rotation ``(0, 0, sin(yaw/2), cos(yaw/2))`` (already unit).
+    """
+    qx, qy, qz, qw = q.unbind(-1)
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    half = 0.5 * yaw
+    out = torch.zeros_like(q)
+    out[..., 2] = torch.sin(half)
+    out[..., 3] = torch.cos(half)
+    return out
+
+
 def matrix_from_quat(q: torch.Tensor) -> torch.Tensor:
     """Rotation matrix ``(..., 3, 3)`` from an xyzw quaternion ``(..., 4)``."""
     x, y, z, w = q.unbind(-1)
