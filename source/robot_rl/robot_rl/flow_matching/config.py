@@ -31,7 +31,15 @@ class FlowMatchingConfig:
     # Window length F: the full denoised state sequence. The first ``num_history_states``
     # tokens are the recent past (conditioning), the rest are the predicted future. The
     # relative-frame anchor is the most recent history step (index num_history_states-1).
-    future_len: int = 25
+    # Sized so the novel horizon (F - num_history_states = 38 steps = 0.76 s at dt=0.02)
+    # comfortably covers the deploy-time policy lookahead (future_base_pose/velocity reach
+    # 0.5 s = 25 steps ahead of the currently-applied window index) even as that index
+    # advances during a re-plan block: with GeneratorTrackingCommand fm_update_every=K the
+    # applied index climbs to (N-1)+K, so un-truncated lookahead needs F-1 >= (N-1)+K+25,
+    # i.e. F=40 covers K up to 13 (K=10 today, with margin). Also a multiple of cmd_stride
+    # (=5) -> 8 evenly-spaced command tokens. Raising F grows per-window memory; bump
+    # --stride / --num_workers if training OOMs.
+    future_len: int = 40
     num_history_states: int = 2
     stride: int = 1
     val_fraction: float = 0.1

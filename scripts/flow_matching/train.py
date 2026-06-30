@@ -74,9 +74,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--wandb", action="store_true", help="Also log to Weights & Biases.")
     parser.add_argument("--wandb_project", type=str, default="robot_rl_flow_matching")
     # config fields
-    parser.add_argument("--future_len", type=int, default=25,
+    parser.add_argument("--future_len", type=int, default=FlowMatchingConfig().future_len,
                         help="Window length F (state tokens). Effective novel horizon is "
-                             "F - num_history_states.")
+                             "F - num_history_states (default from config.py, sized to cover the "
+                             "deploy-time policy lookahead; see FlowMatchingConfig.future_len).")
     parser.add_argument("--num_history_states", type=int, default=2,
                         help="N most-recent measured states used as clean conditioning tokens.")
     parser.add_argument("--history_dropout_prob", type=float, default=0.8,
