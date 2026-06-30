@@ -325,15 +325,28 @@ def reset_on_motion_sequence(
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
 
-    # Re-roll the ego-centric re-anchor assignment for the reset envs (mirrors the
-    # tracker's per-reset FM-bucket roll): these envs get their clip placement
-    # periodically snapped onto the robot root during the episode (see
-    # MotionSequenceCommand._reanchor_ego_envs). A no-op when the feature is off.
-    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
-    if ego_frac > 0.0:
-        cmd._ego_mask[env_ids] = torch.rand(k, device=device) < ego_frac
+    # Re-roll the per-reset reference-source buckets for the reset envs (three buckets:
+    # world-anchored clip, ego-anchored clip, ego-anchored FM). The FM bucket only
+    # exists on GeneratorTrackingCommand (it owns ``_fm_mask``); the plain clip teacher
+    # has no ``_fm_mask``/``fm_fraction`` and falls through to the ego-only roll.
+    fm_frac = float(getattr(cmd.cfg, "fm_fraction", 0.0))
+    if hasattr(cmd, "_fm_mask") and fm_frac > 0.0:
+        fm_sel = torch.rand(k, device=device) < fm_frac
+        cmd._fm_mask[env_ids] = fm_sel
+    elif hasattr(cmd, "_fm_mask"):
+        fm_sel = torch.zeros(k, dtype=torch.bool, device=device)
+        cmd._fm_mask[env_ids] = fm_sel
     else:
-        cmd._ego_mask[env_ids] = False
+        fm_sel = torch.zeros(k, dtype=torch.bool, device=device)
+
+    # Ego re-anchor: FM-bucket envs are always ego-anchored (the FM re-anchors onto the
+    # robot root, so its clip warmup fallback must too); the remaining clip envs are
+    # ego-anchored with probability ``ego_anchor_fraction``, else world-anchored. These
+    # envs get their clip placement periodically snapped onto the robot root during the
+    # episode (see MotionSequenceCommand._reanchor_ego_envs / GeneratorTrackingCommand).
+    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
+    ego_roll = torch.rand(k, device=device) < ego_frac
+    cmd._ego_mask[env_ids] = fm_sel | (~fm_sel & ego_roll)
 
     # 5. Write to sim.
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)

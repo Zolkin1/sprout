@@ -526,6 +526,32 @@ if not _registered:
     )
 
     ## =========================================
+    # Teacher training with the FM mixed into the loop (per-env reference mix)
+    ## =========================================
+    # Trains the teacher with each env on one of three reference buckets, re-rolled
+    # per reset: world-anchored clip / ego-anchored clip / ego-anchored FM. Closes the
+    # train/deploy gap with the FM tracker. fm_fraction sets the FM share (default 1/3).
+    # Pass the clip-conditioned FM via --fm_checkpoint and --clip_device cpu.
+    gym.register(
+        id="G1-teacher-clf-fm",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TeacherFMEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-teacher-clf-fm-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TeacherFMPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    ## =========================================
     # Tracker: flow-matching generator-tracking deploy (world-frame CLF)
     ## =========================================
     # Play-only: deploy the teacher (--load_run) against the autoregressive,

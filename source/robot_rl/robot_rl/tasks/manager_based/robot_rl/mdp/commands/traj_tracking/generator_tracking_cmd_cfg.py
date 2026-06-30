@@ -42,6 +42,15 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""
 
+    fm_fraction: float = 1.0
+    """Fraction of envs whose reference is driven by the flow-matching generator
+    (ego-anchored onto the robot root); re-rolled per reset (see
+    :func:`reset_on_motion_sequence`).  The remaining envs track the clip, split into
+    world- vs ego-anchored by ``ego_anchor_fraction``, giving three buckets:
+    world-anchored clip, ego-anchored clip, and ego-anchored FM.  Only the FM-bucket
+    envs pay the FM inference cost.  ``1.0`` (default) puts every env on the FM (the
+    deploy / play behaviour)."""
+
     drive_with_clip: bool = False
     """Diagnostic mode: drive the robot with the **clip** while running the FM
     **passively**.  When True the applied reference (what the policy tracks, what the
