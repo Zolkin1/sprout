@@ -137,7 +137,7 @@ class FlowMatchingConfig:
     # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
     # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
     # all the signal. Set True only to restrict it to the high-τ regime.
-    terrain_penetration_weight: float = 0.0 #200.0 #1.0 #0.1 #0.0
+    terrain_penetration_weight: float = 200.0 #200.0 #1.0 #0.1 #0.0
     terrain_penetration_mode: str = "ankle"
     terrain_ground_z: float | None = None
     terrain_contact_grid: tuple[int, int] = (3, 2)
