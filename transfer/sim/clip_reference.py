@@ -142,7 +142,7 @@ class ClipReference:
         mirrors IsaacLab ``MotionSequenceCommand._reanchor_ego_envs`` /
         ``world_lift.ego_placement`` exactly -- solve a yaw-only placement
         so lifting the clip-world base at ``step`` reproduces the robot's planar
-        position and heading, keeping the clip's natural height (z) and tilt.  Call
+        position, heading, AND height (z), keeping only the clip's natural tilt.  Call
         every ``ego_anchor_every`` steps while the clip drives the reference; the
         whole served horizon (current + future) then recedes from the robot's pose.
 
@@ -164,7 +164,9 @@ class ClipReference:
         world_pos = np.array([
             float(robot_pos_w[0]) - rot_x,   # so the lifted base xy == robot xy
             float(robot_pos_w[1]) - rot_y,
-            0.0,                              # natural clip height above flat ground (z=0)
+            # Snap the current-step base HEIGHT onto the robot root too (z is yaw-invariant,
+            # so lifted_z == world_pos.z + base_pos_cf.z): lifted base z == robot root z.
+            float(robot_pos_w[2]) - float(base_pos_cf[2]),
         ], dtype=np.float64)
         self.set_placement(world_pos, world_quat)
 

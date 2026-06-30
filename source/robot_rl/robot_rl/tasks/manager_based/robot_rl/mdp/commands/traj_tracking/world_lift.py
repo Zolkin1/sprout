@@ -105,18 +105,22 @@ def ego_placement(
     base_ori_cf: torch.Tensor,
     target_pos_w: torch.Tensor,
     target_quat_w: torch.Tensor,
-    ground_z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-env yaw+xy placement putting a clip's current-step base onto a target root.
+    """Per-env yaw+xy+z placement putting a clip's current-step base onto a target root.
 
-    Solves for the runtime *placement* (a yaw-only ground frame: ``world_pos`` xy
+    Solves for the runtime *placement* (a yaw-only ground frame: ``world_pos``
     plus a pure-yaw ``world_quat``) such that lifting the clip-world base pose
     ``(base_pos_cf, base_ori_cf)`` through it reproduces the target root's planar
-    position and heading, while keeping the clip's natural height (``ground_z`` plus
-    the clip's own base z) and tilt.  This is the runtime, robot-targeting
-    counterpart of the reset placement in ``reset_on_motion_sequence`` (which
-    targets the env origin at the start step): it re-anchors an ego-centric,
-    receding-horizon clip onto the robot's root every few steps.
+    position, heading, AND height (z) -- keeping only the clip's natural tilt
+    (roll/pitch).  This mirrors the FM deploy-time anchor
+    (:meth:`GeneratorTrackingCommand._run_fm`), which snaps the reference base
+    xy+z+yaw onto the robot root so the receding-horizon reference rides at the
+    robot's actual height rather than the clip's natural height; the future window
+    then recedes from this placement with the clip's natural z variation.  This is
+    the runtime, robot-targeting counterpart of the reset placement in
+    ``reset_on_motion_sequence`` (which targets the env origin at the start step):
+    it re-anchors an ego-centric, receding-horizon clip onto the robot's root every
+    few steps.
 
     All quaternions are ``(x, y, z, w)`` (scalar-last).  The returned ``world_quat``
     is pure-yaw, so lifting with it reduces to a planar rotation + translation (see
@@ -125,9 +129,9 @@ def ego_placement(
     Args:
         base_pos_cf: ``[N, 3]`` clip-world base position at the current step.
         base_ori_cf: ``[N, 4]`` clip-world base orientation (xyzw) at the current step.
-        target_pos_w: ``[N, 3]`` target root world position (the robot's root).
+        target_pos_w: ``[N, 3]`` target root world position (the robot's root) --
+            its z is snapped onto, not just its xy.
         target_quat_w: ``[N, 4]`` target root world orientation (xyzw).
-        ground_z: ``[N]`` ground datum (env-origin z) the clip height is kept above.
 
     Returns:
         ``(world_pos[N, 3], world_quat[N, 4] xyzw)`` -- the per-env placement.
@@ -146,14 +150,15 @@ def ego_placement(
     world_pos = torch.empty_like(target_pos_w)
     world_pos[:, 0] = target_pos_w[:, 0] - rot_x  # so lifted base xy == target xy
     world_pos[:, 1] = target_pos_w[:, 1] - rot_y
-    world_pos[:, 2] = ground_z                     # keep the clip's natural height
-    # TODO(fm-in-loop): the FM deploy-time ego anchor (GeneratorTrackingCommand._run_fm)
-    # now snaps the reference HEIGHT (z) onto the robot root as well, not just xy + yaw,
-    # to counter the FM's free-running height drift. This teacher-training ego anchor
-    # still keeps the clip's natural z (matches its xy=env-origin reset). Investigate
-    # whether the teacher should also see z anchored onto the robot during training so
-    # the train-time ego reference matches the deploy-time placement (would need the
-    # robot root z passed in here instead of ground_z).
+    # Snap the current-step base HEIGHT onto the target root too. z is yaw-invariant
+    # (the pure-yaw lift leaves it as lifted_z = world_pos.z + base_pos_cf.z), so this
+    # makes the lifted current-step base z == target_pos_w.z exactly. Matches the FM
+    # deploy anchor (GeneratorTrackingCommand._run_fm pins reference z to the robot
+    # root); the future window recedes with the clip's natural z variation relative to
+    # this anchor. Anchoring z (not the clip's natural height) means a sinking robot
+    # drags the reference height down with it -- there is no free recovery-height target
+    # -- so the teacher must learn to stay up / avoid states the reference cannot hold.
+    world_pos[:, 2] = target_pos_w[:, 2] - base_pos_cf[:, 2]
     return world_pos, world_quat
 
 

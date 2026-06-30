@@ -6,8 +6,8 @@ Numpy-only (no torch / isaaclab / simulator): builds a tiny synthetic clip-libra
 ``.h5`` and drives :class:`clip_reference.ClipReference`.  Verifies the
 ``reanchor_ego`` math mirrors IsaacLab's ``world_lift.ego_placement`` /
 ``MotionSequenceCommand._reanchor_ego_envs`` -- after re-anchoring, the served
-reference's current-step base reproduces the robot's planar position + heading,
-keeps the clip's natural height (z) and tilt, and the future window recedes from
+reference's current-step base reproduces the robot's planar position + heading
+AND height (z), keeps only the clip's tilt, and the future window recedes from
 the re-anchored placement.  Also pins the world-anchored default (identity
 placement = pass-through) so both modes are covered.
 
@@ -107,10 +107,10 @@ def main() -> None:
             "ego current base xy must match the robot root xy"
         assert abs(_wrap(_yaw_angle(cur["root_quat"]) - _yaw_angle(robot_quat))) < 1e-9, \
             "ego current base heading must match the robot yaw"
-        assert abs(cur["root_pos"][2] - base_pos_cf[2]) < 1e-9, \
-            "ego must keep the clip's natural base height (z), not snap to the robot z"
-        # The robot z (0.93) must NOT leak into the reference height.
-        assert abs(cur["root_pos"][2] - robot_pos[2]) > 1e-3
+        assert abs(cur["root_pos"][2] - robot_pos[2]) < 1e-9, \
+            "ego must snap the current base height (z) onto the robot root z (matches the FM anchor)"
+        # The clip's natural base height (~0.80) must NOT survive -- it is overwritten by robot z.
+        assert abs(cur["root_pos"][2] - base_pos_cf[2]) > 1e-3
 
         # --- Future window recedes from the re-anchored placement (same transform). ---
         ref = ce.reference_at(step, [1, 2])
@@ -126,7 +126,7 @@ def main() -> None:
         # Ego differs from world-anchored at the same step (sanity).
         assert not np.allclose(cur["root_pos"][:2], st["root_pos"][:2])
 
-    print("OK: clip ego re-anchor matches ego_placement (planar pos + heading, natural z); "
+    print("OK: clip ego re-anchor matches ego_placement (planar pos + heading + robot z); "
           "world-anchored pass-through preserved")
 
 

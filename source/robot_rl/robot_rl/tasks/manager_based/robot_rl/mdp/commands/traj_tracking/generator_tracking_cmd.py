@@ -375,13 +375,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # trajectory. Anchoring z (not just xy) keeps the FM's free-running height drift
         # (the autoregressive root z climbs/sinks unboundedly -- see the bench rollout)
         # from pulling the reference height off the robot.
-        # TODO(fm-in-loop): investigate the effect of anchoring z here -- does pinning the
-        # reference height to the robot help it stay up, vs. letting the FM impose its own
-        # (drifting) height? And consider matching this in the TEACHER's ego-anchor during
-        # training: world_lift.ego_placement / MotionSequenceCommand._reanchor_ego_envs
-        # currently keep the clip's NATURAL z, so the train-time ego reference height and
-        # this deploy-time placement disagree. Aligning them (anchor z in training too, or
-        # NOT here) would remove that train/deploy mismatch.
+        # The TEACHER's ego-anchor during training now matches this: world_lift.ego_placement
+        # / MotionSequenceCommand._reanchor_ego_envs snap the clip's current-step base z onto
+        # the robot root too (not the clip's NATURAL z), so the train-time ego reference height
+        # and this deploy-time placement agree. A sinking robot drags the reference down with it
+        # (no free recovery-height target) in both train and deploy, so the teacher must learn to
+        # stay up / avoid states where the robot-anchored reference becomes infeasible.
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
         robot_p = wp.to_torch(self.robot.data.root_pos_w)[ids]

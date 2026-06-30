@@ -245,11 +245,13 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
 
         For envs in ``self._ego_mask`` whose per-episode step hits the re-anchor
         cadence (``cfg.ego_anchor_every``), recompute the per-env placement
-        (yaw + xy) so the clip's *current-step* base coincides with the robot's
-        measured root (planar position + heading), keeping the clip's natural
-        height and tilt.  Between re-anchors the placement is fixed, so the
-        reference recedes ahead of the robot like a receding-horizon controller
-        that re-plans every few steps.
+        (yaw + xy + z) so the clip's *current-step* base coincides with the robot's
+        measured root (planar position + heading + height), keeping only the clip's
+        natural tilt.  Between re-anchors the placement is fixed, so the reference
+        recedes ahead of the robot like a receding-horizon controller that re-plans
+        every few steps.  Snapping z (not the clip's natural height) matches the FM
+        deploy anchor (:meth:`GeneratorTrackingCommand._run_fm`), so the teacher
+        trains against the same robot-height-anchored reference it sees at deploy.
 
         Fast early-return unless ``cfg.ego_anchor_fraction > 0``.  Naturally
         idempotent across Isaac Lab's twice-per-step compute (same robot pose +
@@ -267,8 +269,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         The placement update shared by the cadence-based ego re-anchor
         (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
         re-anchor on a different schedule (e.g. the generator command re-anchoring
-        the clip on the FM's re-plan steps). Yaw + xy onto the robot root, keeping
-        the clip's natural height + tilt. No-op for empty ``ids``.
+        the clip on the FM's re-plan steps). Yaw + xy + z onto the robot root,
+        keeping only the clip's natural tilt. No-op for empty ``ids``.
         """
         if ids.numel() == 0:
             return
@@ -276,12 +278,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         y, _ = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
         base_pos_cf = y[:, self._base_idx["pos"]]   # [k, 3]
         base_ori_cf = y[:, self._base_idx["ori"]]   # [k, 4] xyzw
-        # Target = robot root link (planar position + heading); keep natural height.
+        # Target = robot root link (planar position + heading + HEIGHT); keep tilt.
         target_pos_w = wp.to_torch(self.robot.data.root_pos_w)[ids]
         target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
-        ground_z = self.env.scene.env_origins[ids, 2]
         world_pos, world_quat = ego_placement(
-            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w, ground_z
+            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w
         )
         self.clip_world_pos[ids] = world_pos
         self.clip_world_quat[ids] = world_quat
