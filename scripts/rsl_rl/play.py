@@ -636,7 +636,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if is_moe and gate_weights_log:
                     data["gate_weights"] = torch.stack(gate_weights_log).cpu().numpy()
                     metadata["num_experts"] = _moe_net.num_experts
-                plots_dir = os.path.join(log_dir, "plots")
+                # Task-specific subfolder so different tasks loading the SAME run
+                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-clip-driven-play) keep
+                # their plots side by side instead of overwriting each other.
+                plots_dir = os.path.join(log_dir, "plots", task_name)
                 time_range = None
                 if args_cli.plot_time_range:
                     parts = args_cli.plot_time_range.split(",")
