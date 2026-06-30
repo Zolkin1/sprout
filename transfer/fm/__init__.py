@@ -20,7 +20,8 @@ from .online import (
     BatchedHistory,
     FmOnlineContext,
     build_cmd_tokens,
-    build_cond_states,
+    build_height_token,
+    build_history_tokens,
     load_fm_context,
     sample_world,
 )
@@ -32,7 +33,8 @@ __all__ = [
     "BatchedHistory",
     "FmOnlineContext",
     "build_cmd_tokens",
-    "build_cond_states",
+    "build_height_token",
+    "build_history_tokens",
     "load_fm_context",
     "sample_world",
 ]
