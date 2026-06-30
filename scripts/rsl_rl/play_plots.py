@@ -1548,6 +1548,8 @@ def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
             if clip is not None:
                 bundle[clip_key] = clip
         if bundle:
+            if "fm_pred_idx" in data:        # applied window index (re-plan = it resets)
+                bundle["fm_pred_idx"] = data["fm_pred_idx"][:, e]
             bundle["time_s"] = np.arange(next(iter(bundle.values())).shape[0]) * dt
             np.savez(os.path.join(save_dir, f"trajectory_obs_data_env{e}.npz"), **bundle)
     print(f"[plot] trajectory_obs: wrote per-term CSVs + trajectory_obs_data_env*.npz to {save_dir}")
