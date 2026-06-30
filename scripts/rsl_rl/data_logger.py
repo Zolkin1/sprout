@@ -16,7 +16,14 @@ import numpy as np
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+    base_pose_error,
+    ee_ref_relative_to_base,
+    future_base_pose,
+    future_base_velocity,
+    joint_pos_ref,
+    joint_vel_ref,
     multiskill_phase,
+    ref_base_velocity_local,
     ref_cos_phase,
     ref_sin_phase,
 )
@@ -61,6 +68,10 @@ class DataLogger:
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
         self._log_fm_window = log_fm_window
+        # Look-ahead params for the future_base_* reference obs; overridden from the
+        # policy obs cfg in _collect_metadata so the logged obs match what the policy sees.
+        self._future_horizon_s: float = 0.5
+        self._future_stride: int = 5
         self.metadata: dict[str, Any] = {}
         # Per-step termination signals, stacked in finalize() into a
         # "successful tracking" mask (steps in episodes that ended via
@@ -203,6 +214,26 @@ class DataLogger:
                     step["target_vel"] = ref.get_command_velocity().clone()
             except Exception as exc:
                 self._warn("target_vel", f"Could not read commanded target velocity: {exc}")
+
+        # 1b'. Trajectory-reference POLICY OBSERVATIONS (computed clean, no obs
+        # corruption) -- the exact base-relative reference signals the policy
+        # consumes, for obs-level diagnostics (e.g. spotting lookahead truncation
+        # / re-plan jumps in the FM-in-loop). Keyed ``obs_*``; plotted by the
+        # "trajectory_obs" play plot. Skipped silently for commands that don't
+        # expose the reference (the helpers raise).
+        if self._traj_term_name is not None:
+            name = self._traj_term_name
+            hs, st = self._future_horizon_s, self._future_stride
+            try:
+                step["obs_base_pose_error"] = base_pose_error(unwrapped, name).clone()
+                step["obs_base_vel_ref"] = ref_base_velocity_local(unwrapped, name).clone()
+                step["obs_joint_pos_ref"] = joint_pos_ref(unwrapped, name).clone()
+                step["obs_joint_vel_ref"] = joint_vel_ref(unwrapped, name).clone()
+                step["obs_ee_ref"] = ee_ref_relative_to_base(unwrapped, name).clone()
+                step["obs_future_base_pose"] = future_base_pose(unwrapped, name, hs, st).clone()
+                step["obs_future_base_velocity"] = future_base_velocity(unwrapped, name, hs, st).clone()
+            except Exception as exc:
+                self._warn("traj_obs", f"Could not compute trajectory reference obs: {exc}")
 
         # 1c. Flow-matching generator source mask + (optionally) the predicted
         # window.  ``fm_active`` ([N] bool) marks the envs whose reference is
@@ -471,6 +502,20 @@ class DataLogger:
                 self.metadata["phase_obs_labels"] = ["sin_phase", "cos_phase"]
         except Exception as exc:
             print(f"[WARN DataLogger] Could not detect phase observations: {exc}")
+
+        # Look-ahead params for the future_base_* reference obs: read from the policy
+        # obs cfg so the logged obs match exactly what the policy is fed.
+        try:
+            obs_mgr = unwrapped.observation_manager
+            policy_terms = list(obs_mgr.active_terms.get("policy", []))
+            if "future_base_pose" in policy_terms:
+                cfg = obs_mgr._group_obs_term_cfgs["policy"][policy_terms.index("future_base_pose")]
+                self._future_horizon_s = float(cfg.params.get("horizon_s", self._future_horizon_s))
+                self._future_stride = int(cfg.params.get("stride", self._future_stride))
+            self.metadata["future_horizon_s"] = self._future_horizon_s
+            self.metadata["future_stride"] = self._future_stride
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not read future-obs lookahead params: {exc}")
 
         # Joint names
         try:
