@@ -1468,6 +1468,70 @@ def _plot_future_obs(
         plt.close(fig)
 
 
+def _traj_obs_labels(data: dict[str, np.ndarray], metadata: dict[str, Any]):
+    """(flat-term -> dim labels, future-term -> component labels) for plots + dump."""
+    pos_names = metadata.get("pos_names", [])
+    vel_names = metadata.get("vel_names", [])
+    jp = [n.split(":", 1)[1] for n in pos_names if n.startswith("joint:")]
+    jv = [n.split(":", 1)[1] for n in vel_names if n.startswith("joint:")]
+    ee = [f"{f}:{ax}" for f in metadata.get("ee_frames", []) for ax in ("x", "y", "z")]
+    flat = {
+        "obs_base_pose_error": ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
+        "obs_base_vel_ref": ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+        "obs_joint_pos_ref": jp, "obs_joint_vel_ref": jv, "obs_ee_ref": ee,
+    }
+    fut = {
+        "obs_future_base_pose": ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
+        "obs_future_base_velocity": ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+    }
+    return flat, fut
+
+
+def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
+                         save_dir: str, env_ids: list[int]) -> None:
+    """Write the logged reference obs (FM ``obs_*`` + clip ``obs_clip_*``) to per-term
+    CSVs (time + FM cols + clip cols) and a combined ``.npz`` per env, for exact
+    numeric inspection alongside the plots."""
+    import csv as _csv
+    dt = metadata.get("dt") or 1.0
+    stride = int(metadata.get("future_stride", 5))
+    flat, fut = _traj_obs_labels(data, metadata)
+    for e in env_ids:
+        bundle: dict[str, np.ndarray] = {}
+        for key in list(flat) + list(fut):
+            if key not in data:
+                continue
+            fm = data[key][:, e, :]
+            T = fm.shape[0]
+            clip_key = "obs_clip_" + key[len("obs_"):]
+            clip = data[clip_key][:, e, :] if clip_key in data else None
+            if key in fut:
+                comps, k = fut[key], fm.shape[1] // 6
+                labels = [f"{comps[c]} +{(j + 1) * stride * dt:.2f}s" for j in range(k) for c in range(6)]
+            else:
+                labels = flat[key]
+                if len(labels) != fm.shape[1]:
+                    labels = [f"dim{i}" for i in range(fm.shape[1])]
+            t = np.arange(T) * dt
+            header = ["time_s"] + [f"{l} (fm)" for l in labels]
+            cols = [t[:, None], fm]
+            if clip is not None:
+                header += [f"{l} (clip)" for l in labels]
+                cols.append(clip)
+            fname = key[len("obs_"):]
+            with open(os.path.join(save_dir, f"trajectory_obs_{fname}_env{e}.csv"), "w", newline="") as fh:
+                w = _csv.writer(fh)
+                w.writerow(header)
+                w.writerows(np.column_stack(cols))
+            bundle[key] = fm
+            if clip is not None:
+                bundle[clip_key] = clip
+        if bundle:
+            bundle["time_s"] = np.arange(next(iter(bundle.values())).shape[0]) * dt
+            np.savez(os.path.join(save_dir, f"trajectory_obs_data_env{e}.npz"), **bundle)
+    print(f"[plot] trajectory_obs: wrote per-term CSVs + trajectory_obs_data_env*.npz to {save_dir}")
+
+
 def plot_trajectory_obs(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
@@ -1534,6 +1598,8 @@ def plot_trajectory_obs(
                      ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
                      "future_base_velocity (rel base)", "future_base_velocity",
                      save_dir, env_ids, dt, t_off, stride, fm_active) if "obs_future_base_velocity" in data else None
+
+    _dump_trajectory_obs(data, metadata, save_dir, env_ids)
 
 
 PLOT_REGISTRY: dict[str, Callable] = {

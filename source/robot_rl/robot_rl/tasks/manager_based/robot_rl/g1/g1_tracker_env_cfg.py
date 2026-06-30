@@ -141,3 +141,7 @@ class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
         self.scene.num_envs = 1
         self.commands.traj_ref.path = DEFAULT_CLIP_PATH       # FM-training clips (seed + command)
         self.commands.traj_ref.random_start_phase = False     # seed from clip step 0
+        # Ego-anchor the clip onto the robot (like the FM) so the warmup fallback +
+        # the as_clip_reference() obs comparison are robot-anchored, not drifting on a
+        # fixed world placement. Re-plan cadence matches the FM (ego_anchor_every ~ fm_update_every).
+        self.commands.traj_ref.ego_anchor_fraction = 1.0

@@ -222,6 +222,14 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._advance_step()
         self._snapshot_and_infer()
 
+        # Ego-re-anchor the CLIP onto the robot root (the inherited knob), every
+        # ego_anchor_every steps for the ego_anchor_fraction envs -- so the clip
+        # reference (the warmup fallback AND the as_clip_reference() obs comparison)
+        # is robot-anchored just like the FM, instead of marching on its fixed reset
+        # placement. Inert when ego_anchor_fraction == 0. (MotionSequenceCommand calls
+        # this in its own _update_command; this override must invoke it explicitly.)
+        self._reanchor_ego_envs()
+
         # Clip desired outputs (clip-world). Joints are frame-invariant; the
         # base/ee Cartesian channels are overwritten with world values below.
         self.get_desired_outputs()
