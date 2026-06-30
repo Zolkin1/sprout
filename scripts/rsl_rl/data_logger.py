@@ -246,6 +246,27 @@ class DataLogger:
                     with ref.as_clip_reference():
                         for k, v in _traj_obs().items():
                             step[f"obs_clip_{k}"] = v
+                        # Also capture the clip's full WORLD reference output (y_des/
+                        # dy_des) so the positions/velocities plots can overlay the clip
+                        # reference alongside the FM one (world-frame FM-vs-clip view).
+                        # as_clip_reference() swaps ref.y_des/dy_des to the clip.
+                        if isinstance(getattr(ref, "y_des", None), torch.Tensor):
+                            step["y_des_clip"] = ref.y_des.clone()
+                        if isinstance(getattr(ref, "dy_des", None), torch.Tensor):
+                            step["dy_des_clip"] = ref.dy_des.clone()
+                # Symmetrically capture the FM reference: the per-term reference OBS
+                # (obs_fm_*, for the clip-vs-FM obs-diff plot) and the full world
+                # reference output (y_des_fm/dy_des_fm, for the positions overlay). The
+                # passive FM in drive_with_clip mode; == applied otherwise. Logging both
+                # obs_clip_* and obs_fm_* makes the comparison work in either direction.
+                if hasattr(ref, "as_fm_reference"):
+                    with ref.as_fm_reference():
+                        for k, v in _traj_obs().items():
+                            step[f"obs_fm_{k}"] = v
+                        if isinstance(getattr(ref, "y_des", None), torch.Tensor):
+                            step["y_des_fm"] = ref.y_des.clone()
+                        if isinstance(getattr(ref, "dy_des", None), torch.Tensor):
+                            step["dy_des_fm"] = ref.dy_des.clone()
             except Exception as exc:
                 self._warn("traj_obs", f"Could not compute trajectory reference obs: {exc}")
 
@@ -489,6 +510,11 @@ class DataLogger:
                 if hasattr(ref, "fm_window_len") and hasattr(ref, "fm_novel_start"):
                     self.metadata["fm_window_len"] = int(ref.fm_window_len)
                     self.metadata["fm_novel_start"] = int(ref.fm_novel_start)
+                # Which source drives the robot (FM by default, clip in drive_with_clip
+                # mode) -- lets the positions/velocities plots label the applied line.
+                cmd_cfg = getattr(ref, "cfg", None)
+                if cmd_cfg is not None and hasattr(cmd_cfg, "drive_with_clip"):
+                    self.metadata["drive_with_clip"] = bool(cmd_cfg.drive_with_clip)
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)

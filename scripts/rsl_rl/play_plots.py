@@ -222,6 +222,7 @@ def _grid_plot(
     env_ids: list[int],
     label_a: str = "Reference",
     label_b: str = "Actual",
+    overlays: list[tuple[str, str, str]] | None = None,
     n_cols: int = 4,
     dt: float | None = None,
     legend_loc: str = "best",
@@ -236,8 +237,23 @@ def _grid_plot(
     given, every subplot is overlaid with the clip<->FM transition lines and a
     light shade over the FM-active span -- so it's clear at a glance where the
     reference (``key_a``) stops being the clip and becomes the FM prediction.
+
+    ``overlays`` is an optional list of ``(key, label, color)`` extra series drawn
+    dotted alongside ``key_a``/``key_b`` -- used to show the CLIP and/or FM reference
+    next to the applied one (and the actual), for a world-frame FM-vs-clip
+    comparison.  An overlay is skipped when it's absent from ``data`` or when it
+    coincides with the applied series ``key_a`` (i.e. it IS the driver, already drawn
+    solid) -- so whichever of clip/FM drives is shown once (solid) and the other
+    once (dotted), in either drive direction.
     """
     arr_a = data[key_a]
+    # Keep only overlays present in data and not identical to the applied (driver)
+    # series -- the driver coincides with key_a everywhere, so drawing it again is
+    # redundant. Decided once globally (drive source is the same for all envs/dims).
+    active_overlays = [
+        (k, lbl, col) for (k, lbl, col) in (overlays or [])
+        if k in data and not np.allclose(data[k], arr_a)
+    ]
     n_dims = arr_a.shape[2] if arr_a.ndim >= 3 else arr_a.shape[1]
     n_rows = max(1, (n_dims + n_cols - 1) // n_cols)
     if dt is not None:
@@ -260,10 +276,14 @@ def _grid_plot(
         for i in range(n_dims):
             ax = axs_flat[i]
             y_a = arr_a[:, env_id, i] if arr_a.ndim >= 3 else arr_a[:, env_id]
-            ax.plot(x_axis, y_a, label=label_a, linewidth=2)
+            ax.plot(x_axis, y_a, label=label_a, linewidth=2, color="C0")
+            for (k, lbl, col) in active_overlays:
+                arr_c = data[k]
+                y_c = arr_c[:, env_id, i] if arr_c.ndim >= 3 else arr_c[:, env_id]
+                ax.plot(x_axis, y_c, label=lbl, linestyle=":", linewidth=1.8, color=col)
             if key_b is not None:
                 y_b = data[key_b][:, env_id, i] if data[key_b].ndim >= 3 else data[key_b][:, env_id]
-                ax.plot(x_axis, y_b, label=label_b, linestyle="--", linewidth=2)
+                ax.plot(x_axis, y_b, label=label_b, linestyle="--", linewidth=2, color="C1")
             for j, vt in enumerate(replan):                      # FM/clip re-plan instants
                 ax.axvline(vt, color="0.55", lw=0.6, ls=":", alpha=0.55, zorder=1,
                            label="re-plan" if (i == 0 and j == 0) else None)
@@ -276,7 +296,7 @@ def _grid_plot(
             ax.set_xlabel(x_label)
             ax.set_ylabel(y_label_fmt.format(unit=unit) if unit else y_label_fmt.format(unit=""))
             ax.grid(True, alpha=0.3)
-            if i == 0 and (key_b is not None or has_fm):
+            if i == 0 and (key_b is not None or has_fm or active_overlays):
                 ax.legend(loc=legend_loc)
 
         # Hide unused subplots
@@ -293,6 +313,21 @@ def _grid_plot(
 # Individual plot functions
 # ---------------------------------------------------------------------------
 
+def _applied_ref_label(data: dict[str, np.ndarray], metadata: dict[str, Any]) -> str:
+    """Label for the applied (solid) reference line, by which source drives the robot.
+
+    When a clip/FM comparison overlay is logged (the generator-tracking command), the
+    applied series is specifically the FM (default) or the clip (``drive_with_clip``);
+    otherwise it's just the tracked reference.
+    """
+    has_overlay = any(
+        k in data for k in ("y_des_clip", "y_des_fm", "dy_des_clip", "dy_des_fm")
+    )
+    if not has_overlay:
+        return "Tracked ref (clip/FM)" if "fm_active" in data else "Reference"
+    return "Clip ref (applied)" if metadata.get("drive_with_clip", False) else "FM ref (applied)"
+
+
 def plot_positions(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
@@ -304,17 +339,14 @@ def plot_positions(
         print("[WARN plot_positions] Missing y_des or y_act data, skipping.")
         return
     names = metadata.get("pos_names", [f"Dim {i}" for i in range(data["y_des"].shape[2])])
-    # When the FM source is in play, ``y_des`` is the *tracked* reference (the
-    # clip while clip-tracking, the FM prediction while FM-active) -- not always
-    # the clip -- so name it accordingly.
-    ref_label = "Tracked ref (clip/FM)" if "fm_active" in data else "Reference"
     _grid_plot(
         data, "y_des", "y_act", names,
         title_fmt="Reference vs Actual Positions (Env {env_id})",
         y_label_fmt="Position ({unit})",
         filename_fmt="positions_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
-        label_a=ref_label,
+        label_a=_applied_ref_label(data, metadata),
+        overlays=[("y_des_clip", "Clip ref", "C2"), ("y_des_fm", "FM ref", "C4")],
         dt=metadata.get("dt"),
         legend_loc="lower left",
         t_offset=metadata.get("t_offset", 0.0),
@@ -333,14 +365,14 @@ def plot_velocities(
         print("[WARN plot_velocities] Missing dy_des or dy_act data, skipping.")
         return
     names = metadata.get("vel_names", [f"Dim {i}" for i in range(data["dy_des"].shape[2])])
-    ref_label = "Tracked ref (clip/FM)" if "fm_active" in data else "Reference"
     _grid_plot(
         data, "dy_des", "dy_act", names,
         title_fmt="Reference vs Actual Velocities (Env {env_id})",
         y_label_fmt="Velocity ({unit}/s)",
         filename_fmt="velocities_env{env_id}.png",
         save_dir=save_dir, env_ids=env_ids,
-        label_a=ref_label,
+        label_a=_applied_ref_label(data, metadata),
+        overlays=[("dy_des_clip", "Clip ref", "C2"), ("dy_des_fm", "FM ref", "C4")],
         dt=metadata.get("dt"),
         t_offset=metadata.get("t_offset", 0.0),
         fm_active=data.get("fm_active"),
@@ -1626,9 +1658,137 @@ def plot_trajectory_obs(
     _dump_trajectory_obs(data, metadata, save_dir, env_ids)
 
 
+# Reference-obs terms compared between the clip and the FM (bare names; the logger
+# keys them obs_clip_<term> / obs_fm_<term>).
+_OBS_DIFF_TERMS = [
+    "base_pose_error", "base_vel_ref", "joint_pos_ref", "joint_vel_ref",
+    "ee_ref", "future_base_pose", "future_base_velocity",
+]
+
+
+def _obs_column_labels(term: str, n_cols: int, metadata: dict[str, Any]) -> list[str]:
+    """Per-column labels for a reference-obs term (reuses the trajectory_obs labeling)."""
+    flat, fut = _traj_obs_labels({}, metadata)
+    fkey = "obs_" + term
+    if fkey in fut:
+        comps = fut[fkey]
+        dt = metadata.get("dt") or 1.0
+        stride = int(metadata.get("future_stride", 5))
+        k = max(1, n_cols // 6)
+        return [f"{comps[c]} +{(j + 1) * stride * dt:.2f}s" for j in range(k) for c in range(6)]
+    labels = flat.get(fkey, [])
+    return labels if len(labels) == n_cols else [f"dim{i}" for i in range(n_cols)]
+
+
+def plot_obs_clip_fm_diff(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+) -> None:
+    """Ranked clip-vs-FM reference-OBSERVATION differences (max + mean abs).
+
+    Triggers whenever both the clip (``obs_clip_*``) and FM (``obs_fm_*``) reference
+    obs are logged -- i.e. the generator-tracking command in EITHER drive direction
+    (FM-driven or clip-driven), so you can compare both ways.  For each obs term and
+    each column it computes ``|FM - clip|`` over the rollout, then ranks:
+
+      * per term (aggregated over its columns + time), and
+      * per individual column (top-N),
+
+    by both MAX and MEAN abs difference -- so the terms/signals where the FM and clip
+    diverge most stand out.  Also writes the full ranking to a CSV.
+
+    NOTE: terms carry different units (m / rad / m·s⁻¹ / rad·s⁻¹), so the cross-term
+    ranking is only a rough guide -- compare within a unit family.  Bars are colored
+    by term to make the families easy to read.
+    """
+    import csv as _csv
+    pairs = [(t, f"obs_clip_{t}", f"obs_fm_{t}") for t in _OBS_DIFF_TERMS]
+    pairs = [(t, c, f) for (t, c, f) in pairs if c in data and f in data]
+    if not pairs:
+        print("[WARN plot_obs_clip_fm_diff] No clip+FM obs pairs logged "
+              "(needs the generator-tracking command); skipping.")
+        return
+
+    topn = 25
+    for e in env_ids:
+        col_labels: list[str] = []
+        col_term: list[str] = []
+        col_max: list[float] = []
+        col_mean: list[float] = []
+        term_names: list[str] = []
+        term_max: list[float] = []
+        term_mean: list[float] = []
+        for (term, ckey, fkey) in pairs:
+            clip = data[ckey][:, e, :]            # [T, D]
+            fm = data[fkey][:, e, :]              # [T, D]
+            d = np.abs(fm - clip)                 # [T, D]
+            labels = _obs_column_labels(term, d.shape[1], metadata)
+            term_names.append(term)
+            term_max.append(float(d.max()))
+            term_mean.append(float(d.mean()))
+            for c in range(d.shape[1]):
+                col_labels.append(f"{term}: {labels[c]}")
+                col_term.append(term)
+                col_max.append(float(d[:, c].max()))
+                col_mean.append(float(d[:, c].mean()))
+
+        col_max_a = np.asarray(col_max)
+        col_mean_a = np.asarray(col_mean)
+        term_max_a = np.asarray(term_max)
+        term_mean_a = np.asarray(term_mean)
+        cmap = {t: f"C{i % 10}" for i, t in enumerate(term_names)}
+
+        fig, axs = plt.subplots(2, 2, figsize=(18, 13))
+        fig.suptitle(
+            f"Clip vs FM reference-obs difference  (Env {e})\n"
+            "|FM - clip| over the rollout -- units differ per term, compare within a family",
+            fontsize=14,
+        )
+
+        def _barh(ax, vals, names, colors, title):
+            order = np.argsort(vals)[::-1]
+            y = np.arange(len(order))
+            ax.barh(y, vals[order], color=[colors[i] for i in order])
+            ax.set_yticks(y)
+            ax.set_yticklabels([names[i] for i in order], fontsize=(9 if len(order) <= 8 else 7))
+            ax.invert_yaxis()
+            ax.set_title(title, fontsize=11)
+            ax.grid(True, axis="x", alpha=0.3)
+
+        _barh(axs[0, 0], term_max_a, term_names, [cmap[t] for t in term_names],
+              "Per-term  MAX |FM - clip|")
+        _barh(axs[0, 1], term_mean_a, term_names, [cmap[t] for t in term_names],
+              "Per-term  MEAN |FM - clip|")
+
+        top_by_max = np.argsort(col_max_a)[::-1][:topn]
+        top_by_mean = np.argsort(col_mean_a)[::-1][:topn]
+        _barh(axs[1, 0], col_max_a[top_by_max], [col_labels[i] for i in top_by_max],
+              [cmap[col_term[i]] for i in top_by_max], f"Top {topn} columns by MAX |FM - clip|")
+        _barh(axs[1, 1], col_mean_a[top_by_mean], [col_labels[i] for i in top_by_mean],
+              [cmap[col_term[i]] for i in top_by_mean], f"Top {topn} columns by MEAN |FM - clip|")
+
+        plt.tight_layout(rect=[0, 0.02, 1, 0.94])
+        plt.savefig(os.path.join(save_dir, f"obs_clip_fm_diff_env{e}.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        # Full ranking (all columns) to CSV for exact numbers, sorted by max diff.
+        order = np.argsort(col_max_a)[::-1]
+        with open(os.path.join(save_dir, f"obs_clip_fm_diff_env{e}.csv"), "w", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["term", "column", "max_abs_diff", "mean_abs_diff"])
+            for i in order:
+                term, _, col = col_labels[i].partition(": ")
+                w.writerow([term, col, f"{col_max_a[i]:.6g}", f"{col_mean_a[i]:.6g}"])
+    print(f"[plot] obs_clip_fm_diff: wrote ranked bar charts + obs_clip_fm_diff_env*.csv to {save_dir}")
+
+
 PLOT_REGISTRY: dict[str, Callable] = {
     "positions": plot_positions,
     "trajectory_obs": plot_trajectory_obs,
+    "obs_clip_fm_diff": plot_obs_clip_fm_diff,
     "velocities": plot_velocities,
     "joint_targets": plot_joint_targets,
     "teacher_vs_student": plot_teacher_vs_student_actions,
@@ -1646,7 +1806,7 @@ PLOT_REGISTRY: dict[str, Callable] = {
     "moe_tsne": plot_moe_tsne,
 }
 
-DEFAULT_PLOTS = ["positions", "velocities", "velocity_tracking"]
+DEFAULT_PLOTS = ["positions", "velocities", "velocity_tracking", "obs_clip_fm_diff"]
 
 
 # ---------------------------------------------------------------------------
