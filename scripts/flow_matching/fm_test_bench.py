@@ -567,6 +567,34 @@ def _stream_indices(data: dict[str, np.ndarray], e: int) -> np.ndarray:
     return np.nonzero(data["episode_id"] == e)[0]
 
 
+def whole_clip_rows(data: dict[str, np.ndarray], ctx: FmOnlineContext, episode_id: int) -> np.ndarray:
+    """Absolute row indices spanning an ENTIRE clip (episode stream).
+
+    Used by ``forecast_step`` so the scrubber covers the whole motion rather than a
+    fixed steady window: returns every row of ``episode_id`` in time order. Keeps
+    only the leading strictly-consecutive run of ``step_in_episode`` so a stray gap
+    (or a mid-stream ``done``) cannot break window construction. Raises if the id is
+    out of range or the clip is shorter than one ``F``-step prediction window.
+    """
+    n_streams = _num_streams(data)
+    if not (0 <= episode_id < n_streams):
+        raise RuntimeError(
+            f"--forecast-clip {episode_id} out of range; the recording has {n_streams} "
+            f"clip(s) (valid ids 0..{n_streams - 1})."
+        )
+    rows = _stream_indices(data, episode_id)
+    sie = data["step_in_episode"][rows]
+    consec = np.concatenate([[True], np.diff(sie) == 1])
+    if not consec.all():
+        rows = rows[: int(np.argmin(consec))]  # truncate at the first gap
+    if len(rows) < ctx.F:
+        raise RuntimeError(
+            f"clip {episode_id} has {len(rows)} contiguous steps (< F={ctx.F}); pick another "
+            f"--forecast-clip or regenerate longer clips."
+        )
+    return rows
+
+
 def cmd_context_window(data: dict[str, np.ndarray], rows: np.ndarray, pad: int) -> tuple[np.ndarray, int]:
     """Recorded command around a contiguous episode stretch, padded for context.
 
@@ -1191,16 +1219,24 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
     """
     N, F = ctx.N, ctx.F
     vf = args.vel_frame
-    length = max(F, args.forecast_len)
-    rows, mean_cmd, cmd_std, score = find_steady_rows(
-        data, ctx, CANONICAL_CMDS[args.forecast_hist], length, args.n_envs_scan,
-        steady_weight=args.steady_weight,
-    )
+    # forecast_step spans an ENTIRE clip (episode stream) so the scrubber covers the
+    # whole motion, not a fixed steady window. Pick the clip explicitly with
+    # --forecast-clip; otherwise locate the clip whose steadiest F-window best matches
+    # --forecast-hist and use its full length.
+    if args.forecast_clip >= 0:
+        ep = int(args.forecast_clip)
+    else:
+        sel_rows, _, _, _ = find_steady_rows(
+            data, ctx, CANONICAL_CMDS[args.forecast_hist], F, args.n_envs_scan,
+            steady_weight=args.steady_weight,
+        )
+        ep = int(data["episode_id"][sel_rows[0]])
+    rows = whole_clip_rows(data, ctx, ep)
     L = len(rows)
     n_anchor = L - F + 1
     if n_anchor < 1:
         raise RuntimeError(
-            f"clip stretch too short ({L} steps) for one F={F} window; raise --forecast-len"
+            f"clip {ep} too short ({L} steps) for one F={F} window; pick another --forecast-clip"
         )
     raw_gt = layout.parse(data["state"][rows])      # world-frame velocities
     gt = disp_traj(raw_gt, vf)                       # body-frame velocities for display
@@ -1216,9 +1252,11 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
     anchors = [N - 1 + i for i in range(n_anchor)]
     have_ee = ctx.target_num_extra_frames > 0
     every = max(1, int(args.fm_update_every))
-    print(f"[bench] forecast_step on {args.forecast_hist!r}: L={L} steps, {n_anchor} anchors "
-          f"(F={F} window); clip-history forecast per step + autoregressive rollout "
-          f"(re-infer every {every} steps, re-anchored on the clip)...")
+    sel = (f"clip {ep} (--forecast-clip)" if args.forecast_clip >= 0
+           else f"clip {ep} (best match to {args.forecast_hist!r})")
+    print(f"[bench] forecast_step on whole {sel}: L={L} steps ({L * ctx.dt_attr:.1f}s), "
+          f"{n_anchor} anchors (F={F} window); clip-history forecast per step "
+          f"+ autoregressive rollout (re-infer every {every} steps, re-anchored on the clip)...")
 
     # (b) clip-history forecast at each anchor (clean clip window conditioning).
     clip_branches: list[dict[str, np.ndarray]] = []
@@ -2295,9 +2333,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Upper bound (steps) for the period / extra steady stretch length to scan.")
     # forecast (open-loop predictions overlaid on a ground-truth recording)
     p.add_argument("--forecast-hist", default="walking",
-                   help="Canonical command used to locate the ground-truth stretch for the forecast.")
+                   help="Canonical command used to locate the ground-truth stretch for the forecast. "
+                        "In forecast_step (whole-clip) this only picks WHICH clip when --forecast-clip "
+                        "is unset (the clip whose steadiest F-window best matches it).")
     p.add_argument("--forecast-len", type=int, default=150,
-                   help="Ground-truth stretch length (steps) for the forecast overlay.")
+                   help="Ground-truth stretch length (steps) for the 'forecast' overlay. "
+                        "Unused by forecast_step, which always spans the whole clip.")
+    p.add_argument("--forecast-clip", type=int, default=-1,
+                   help="forecast_step: clip/episode id to scrub over its FULL length (whole clip). "
+                        "-1 (default) picks the clip best matching --forecast-hist and uses its whole "
+                        "length.")
     p.add_argument("--forecast-stride", type=int, default=5,
                    help="Re-forecast every this many ground-truth steps.")
     p.add_argument("--fm-update-every", type=int, default=10,

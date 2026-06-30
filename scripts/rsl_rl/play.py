@@ -123,6 +123,13 @@ parser.add_argument(
     help='Restrict plots to a time window in seconds. Format: "start,end" — '
          'either end may be empty (e.g. "5,", ",10"). Requires logging.',
 )
+parser.add_argument(
+    "--dump_play_data", action="store_true", default=False,
+    help="Also save the raw per-step world-frame reference arrays (y_des/y_act + "
+         "clip/FM references + the FM prediction window) to play_data.npz in the plots "
+         "dir, for offline analysis (e.g. scripts/flow_matching/fm_sim_height_probe.py). "
+         "Pair with --plots fm_predictions to include the full FM prediction window.",
+)
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
     "--train_mode",
@@ -640,6 +647,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # (e.g. G1-teacher-clf-play vs G1-tracker-clf-clip-driven-play) keep
                 # their plots side by side instead of overwriting each other.
                 plots_dir = os.path.join(log_dir, "plots", task_name)
+                if args_cli.dump_play_data:
+                    os.makedirs(plots_dir, exist_ok=True)
+                    # Raw world-frame references + FM prediction window for offline
+                    # height-drift analysis. Save the world arrays that exist (the
+                    # FM-window ones need --plots fm_predictions) plus the channel-name
+                    # metadata the post-processor needs to locate pelvis/feet z.
+                    dump_keys = (
+                        "y_des", "y_act", "dy_des", "dy_act",
+                        "y_des_clip", "dy_des_clip", "y_des_fm", "dy_des_fm",
+                        "fm_pred_y", "fm_pred_dy", "fm_active", "fm_pred_idx",
+                    )
+                    bundle = {k: data[k] for k in dump_keys if k in data}
+                    for mk in ("pos_names", "vel_names", "dt", "t_offset",
+                               "fm_window_len", "fm_novel_start", "ee_frames"):
+                        if mk in metadata:
+                            bundle[mk] = np.asarray(metadata[mk], dtype=object)
+                    dump_path = os.path.join(plots_dir, "play_data.npz")
+                    np.savez(dump_path, **bundle)
+                    print(f"[INFO] Dumped raw play data ({len(bundle)} arrays) to {dump_path}")
                 time_range = None
                 if args_cli.plot_time_range:
                     parts = args_cli.plot_time_range.split(",")
