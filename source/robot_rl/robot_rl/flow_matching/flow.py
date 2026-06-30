@@ -1,17 +1,16 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Masked rectified-flow / conditional-OT training objective and sampler.
+"""Rectified-flow / conditional-OT training objective and sampler.
 
 Linear interpolant path: ``x_tau = (1 - tau) * x0 + tau * x1`` with ``x0 ~ N(0, I)``
-and ``x1`` the (standardized) target window. The target vector field is the constant
-``v* = x1 - x0``; the model regresses it with MSE. Sampling integrates
-``dx/dtau = v_theta`` from ``tau = 0`` (noise) to ``tau = 1`` with Euler steps.
+and ``x1`` the (standardized) future window. The target vector field is the constant
+``v* = x1 - x0``; the model regresses it with MSE over ALL F future tokens. Sampling
+integrates ``dx/dtau = v_theta`` from ``tau = 0`` (noise) to ``tau = 1`` with Euler steps.
 
-History conditioning is *inpainting* (PARC-style): a per-token boolean mask ``known``
-marks the recent-past tokens. Their (observed, possibly noised) values ``cond`` are
-held fixed at every flow-time and re-clamped after every Euler step, and the loss is
-computed only on the unknown tokens. When ``known`` is all-False the whole window is
-generated unconditionally (history dropout).
+Conditioning is passed as SEPARATE tokens to the model (history / height / command) --
+it is NOT part of the denoised window, so there is no inpainting / known-mask / re-clamp.
+History (phase) conditioning may be replaced by the model's learned null embedding for a
+fraction of samples via ``history_null_mask`` (classifier-free-guidance / phase-agnostic).
 """
 
 from __future__ import annotations
@@ -24,23 +23,18 @@ from .transforms import (
     ori6d_orthonormality_penalty,
     rot6d_to_matrix,
     so3_log,
+    yaw_quat,
 )
 
 
 def sample_flow_batch(
     x1: torch.Tensor,
-    cond: torch.Tensor,
-    known: torch.Tensor,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Draw a masked rectified-flow training triplet.
+    """Draw a rectified-flow training triplet over the full future window.
 
     Args:
-        x1: Target window (standardized), shape ``(B, F, D)``.
-        cond: Observed values for the conditioning tokens (standardized), shape
-            ``(B, F, D)``; only its ``known`` tokens are read.
-        known: Per-token conditioning mask, shape ``(B, F)`` bool. Known tokens are
-            held at ``cond``; unknown tokens follow the noise->data path.
+        x1: Target future window (standardized), shape ``(B, F, D)``.
         generator: Optional RNG for reproducibility.
 
     Returns:
@@ -50,7 +44,6 @@ def sample_flow_batch(
     tau = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype, generator=generator)
     t = tau.view(-1, *([1] * (x1.dim() - 1)))
     x_tau = (1.0 - t) * x0 + t * x1
-    x_tau = torch.where(known.unsqueeze(-1), cond, x_tau)
     target_v = x1 - x0
     return x_tau, tau, target_v
 
@@ -64,7 +57,6 @@ def _masked_mean(per_sample: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 def frame_consistency_terms(
     pred_phys: torch.Tensor,
     data_phys: torch.Tensor,
-    known: torch.Tensor,
     dt: float,
     num_joints: int,
     num_extra_frames: int,
@@ -72,10 +64,9 @@ def frame_consistency_terms(
     """Per-sample velocity + acceleration finite-difference consistency over frame blocks.
 
     Operates on the root + each extra (end-effector) frame block (joints handled
-    separately), in DENORMALIZED (physical) relative-frame units. Uses a single
-    consistency trajectory: clean *data* at the known (conditioning) tokens and the
-    *prediction* at the unknown tokens, so the history->prediction boundary jump is
-    penalized like the interior of the predicted window.
+    separately), in DENORMALIZED (physical) relative-frame units, over the pure F-step
+    future prediction (no clean-history stitch -- the history is separate conditioning
+    tokens, not part of the denoised window).
 
     - velocity: forward finite difference of the frame **pose** (positions, and a proper
       SO(3) difference of orientations) vs the predicted linear/angular velocities.
@@ -85,7 +76,7 @@ def frame_consistency_terms(
     Returns:
         ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
     """
-    x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)  # clean history + prediction
+    x = pred_phys
     b_ = x.shape[0]
     vel = x.new_zeros(b_)
     accel = x.new_zeros(b_)
@@ -109,14 +100,13 @@ def frame_consistency_terms(
 
 
 def joint_vel_consistency_term(
-    pred_phys: torch.Tensor, data_phys: torch.Tensor, known: torch.Tensor, dt: float, num_joints: int
+    pred_phys: torch.Tensor, dt: float, num_joints: int
 ) -> torch.Tensor:
     """Per-sample joint-velocity consistency: ``(joint_pos[t+1]-joint_pos[t])/dt ≈ joint_vel[t]``.
 
-    Returns ``(B,)`` in physical units (rad/s). Linear in the state, so it is left
-    ungated like the frame velocity term.
+    Returns ``(B,)`` in physical units (rad/s). Operates on the pure F-step prediction.
     """
-    x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)
+    x = pred_phys
     jp = x[..., 0:num_joints]
     jv = x[..., num_joints:2 * num_joints]
     jp_fd = (jp[:, 1:] - jp[:, :-1]) / dt
@@ -125,8 +115,6 @@ def joint_vel_consistency_term(
 
 def fk_consistency_terms(
     pred_phys: torch.Tensor,
-    data_phys: torch.Tensor,
-    known: torch.Tensor,
     dt: float,
     num_joints: int,
     num_extra_frames: int,
@@ -141,13 +129,13 @@ def fk_consistency_terms(
     - velocity: the joint-induced EE velocity (the FM EE twist with the predicted base
       motion removed, rotated into the base frame) vs ``J(q)·q̇``.
 
-    All on the DENORMALIZED consistency trajectory (clean history + prediction). ``fk``
-    is a :class:`~robot_rl.flow_matching.fk.FKChain` exposing ``pose_and_jacobian``.
+    All on the DENORMALIZED F-step prediction. ``fk`` is a
+    :class:`~robot_rl.flow_matching.fk.FKChain` exposing ``pose_and_jacobian``.
 
     Returns:
         ``(fk_pose_per_sample, fk_vel_per_sample)`` each ``(B,)``.
     """
-    x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)
+    x = pred_phys
     b_, f_, _ = x.shape
     nj, k = num_joints, num_extra_frames
 
@@ -194,8 +182,6 @@ def fk_consistency_terms(
 
 def terrain_penetration_term(
     pred_phys: torch.Tensor,
-    data_phys: torch.Tensor,
-    known: torch.Tensor,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
     num_joints: int,
@@ -205,15 +191,15 @@ def terrain_penetration_term(
 ) -> torch.Tensor:
     """Per-sample squared terrain penetration of the predicted feet (world frame).
 
-    Lifts each foot frame from the anchor (ref) frame to the world via the per-window
-    anchor pose ``(p_ref, q_ref)`` and asks the terrain how far it is below the surface.
-    ``contact_pts=None`` -> the ankle-frame origin (ankle mode); otherwise the box-sole
-    points ``(P, 3)`` in the foot frame are placed with the predicted foot orientation
-    (contact mode). Uses the clean-history / predicted consistency trajectory.
+    Lifts each foot frame from the xyz+yaw anchor frame to the world via the per-window
+    anchor pose ``(p_ref, yaw_quat(q_ref))`` -- matching the relative-state frame -- and
+    asks the terrain how far it is below the surface. ``contact_pts=None`` -> the
+    ankle-frame origin (ankle mode); otherwise the box-sole points ``(P, 3)`` in the foot
+    frame are placed with the predicted foot orientation (contact mode). Operates on the
+    pure F-step prediction.
 
     Args:
-        pred_phys/data_phys: Predicted endpoint / target (denormalized), ``(B, F, D)``.
-        known: Per-token conditioning mask, ``(B, F)`` bool.
+        pred_phys: Predicted endpoint / sample (denormalized), ``(B, F, D)``.
         p_ref: World anchor position ``(B, 3)``; q_ref: anchor quat ``(B, 4 xyzw)``.
         num_joints: ``nj``.
         foot_idxs: Indices (into the extra frames) of the foot frames.
@@ -223,8 +209,8 @@ def terrain_penetration_term(
     Returns:
         Per-sample penetration ``(B,)`` (mean of depth² over feet, [points], frames).
     """
-    x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)
-    r_ref = matrix_from_quat(q_ref)  # (B, 3, 3) base->world
+    x = pred_phys
+    r_ref = matrix_from_quat(yaw_quat(q_ref))  # (B, 3, 3) yaw-ground->world (matches the rel frame)
     pen = x.new_zeros(x.shape[0])
     cpts = None if contact_pts is None else contact_pts.to(x)
     for fi in foot_idxs:
@@ -244,9 +230,10 @@ def terrain_penetration_term(
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
-    cond: torch.Tensor,
-    known: torch.Tensor,
+    history: torch.Tensor,
+    height: torch.Tensor,
     cmd_tokens: torch.Tensor | None = None,
+    history_null_mask: torch.Tensor | None = None,
     ori_slice: tuple[int, int] | None = None,
     aux_weight: float = 0.0,
     state_norm: object | None = None,
@@ -272,28 +259,26 @@ def flow_matching_loss(
     terrain_sample_steps: int = 8,
     terrain_sample_grad_steps: int = 1,
 ) -> dict[str, torch.Tensor]:
-    """Compute the masked flow-matching loss (+ optional consistency / FK terms).
+    """Compute the flow-matching loss (+ optional consistency / FK / terrain terms).
 
-    All auxiliary terms act on the predicted endpoint ``x1_hat`` (denormalized). The
-    velocity and joint-velocity consistency are computed over the whole batch (ungated,
-    since they are linear and τ-robust). The acceleration and FK terms are **τ-gated**:
-    only samples with ``tau >= tau_min`` contribute, because there ``x1_hat ≈ x1`` (at
-    low τ ``x1_hat`` is the blurry conditional mean, where these nonlinear / data-matched
-    terms are unreliable). The terrain term is **ungated by default**
-    (``terrain_tau_gated=False``): unlike accel/FK, its low-τ endpoint penetrates ~as much
-    as the deployed multi-step sample while the high-τ endpoint ≈ clean data and barely
-    crosses the floor, so gating it would hide nearly all the penetration signal.
+    The flow MSE is over ALL F future tokens (the conditioning is separate tokens, not
+    part of the window). All auxiliary terms act on the predicted endpoint ``x1_hat``
+    (denormalized). Velocity + joint-velocity consistency are ungated; the acceleration
+    and FK terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``). The
+    terrain term is **ungated by default**.
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
-        x1: Target window (standardized), ``(B, F, D)``.
-        cond: Observed conditioning values (standardized), ``(B, F, D)``.
-        known: Per-token conditioning mask, ``(B, F)`` bool.
-        cmd_tokens: Strided command tokens (normalized) or ``None``.
+        x1: Target future window (standardized), ``(B, F, D)``.
+        history: Clean history (phase) conditioning (standardized), ``(B, N, D)``.
+        height: Height conditioning (standardized), ``(B, 1)``.
+        cmd_tokens: Strided future command tokens (normalized) or ``None``.
+        history_null_mask: ``(B,)`` bool; where True the history is replaced by the
+            model's learned null embedding (classifier-free-guidance / phase-agnostic).
         ori_slice: ``(start, end)`` of the root 6D orientation block, for the aux loss.
         aux_weight: Weight of the orientation orthonormality penalty (0 disables).
         state_norm: State :class:`Normalizer` (needed to denormalize); ``None`` disables
-            all consistency/FK terms.
+            all consistency/FK/terrain terms.
         dt: Control step period (seconds) for the finite differences.
         num_joints: ``nj``; num_extra_frames: ``K``.
         vel_weight / accel_weight / joint_vel_weight: consistency weights.
@@ -301,24 +286,19 @@ def flow_matching_loss(
         fk_pose_weight / fk_vel_weight: FK consistency weights.
         tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
         terrain / foot_idxs / contact_pts / terrain_weight: terrain-penetration pieces.
-        terrain_tau_gated: if True, restrict the terrain term to ``tau >= tau_min`` like
-            accel/FK; default False applies it across all flow-times.
-        terrain_sample_weight: weight on the *sampled-rollout* terrain penalty (penalizes
-            ``sample_trajectory`` directly instead of ``x1_hat``); 0 disables it.
+        terrain_tau_gated: if True, restrict the terrain term to ``tau >= tau_min``.
+        terrain_sample_weight: weight on the *sampled-rollout* terrain penalty; 0 disables.
         terrain_sample_size / terrain_sample_steps / terrain_sample_grad_steps: sub-batch
             size, Euler steps, and truncated-backprop depth for that rollout.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
         ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` /
-        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel``.
+        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel`` / ``terrain_penetration``.
     """
-    x_tau, tau, target_v = sample_flow_batch(x1, cond, known)
-    v = model(x_tau, tau, cmd_tokens)
-    unknown = (~known).unsqueeze(-1).to(v.dtype)  # (B, F, 1)
-    sq = (v - target_v) ** 2 * unknown
-    denom = unknown.sum().clamp_min(1.0) * v.shape[-1]
-    flow_mse = sq.sum() / denom
+    x_tau, tau, target_v = sample_flow_batch(x1)
+    v = model(x_tau, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+    flow_mse = ((v - target_v) ** 2).mean()
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
 
     do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
@@ -329,7 +309,7 @@ def flow_matching_loss(
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
         if aux_weight > 0.0 and ori_slice is not None:
-            ori = x1_hat[..., ori_slice[0]:ori_slice[1]][~known]
+            ori = x1_hat[..., ori_slice[0]:ori_slice[1]].reshape(-1, ori_slice[1] - ori_slice[0])
             aux = ori6d_orthonormality_penalty(ori)
             out["ori_aux"] = aux.detach()
             out["loss"] = out["loss"] + aux_weight * aux
@@ -338,8 +318,8 @@ def flow_matching_loss(
             data_phys = state_norm.denormalize(x1)
             gate = tau >= tau_min  # (B,) bool; gates the accel + FK + terrain terms
         if do_frame:
-            vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, known, dt, num_joints, num_extra_frames)
-            jvel_ps = joint_vel_consistency_term(pred_phys, data_phys, known, dt, num_joints)
+            vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, dt, num_joints, num_extra_frames)
+            jvel_ps = joint_vel_consistency_term(pred_phys, dt, num_joints)
             vel, jvel = vel_ps.mean(), jvel_ps.mean()           # ungated
             accel = _masked_mean(accel_ps, gate)                # τ-gated
             out["vel_consistency"] = vel.detach()
@@ -351,7 +331,7 @@ def flow_matching_loss(
             idx = gate.nonzero(as_tuple=True)[0]
             if idx.numel() > 0:
                 fkp_ps, fkv_ps = fk_consistency_terms(
-                    pred_phys[idx], data_phys[idx], known[idx], dt, num_joints, num_extra_frames, fk
+                    pred_phys[idx], dt, num_joints, num_extra_frames, fk
                 )
                 fkp, fkv = fkp_ps.mean(), fkv_ps.mean()
             else:
@@ -361,30 +341,28 @@ def flow_matching_loss(
             out["loss"] = out["loss"] + fk_pose_weight * fkp + fk_vel_weight * fkv
         if do_terrain:
             pen_ps = terrain_penetration_term(
-                pred_phys, data_phys, known, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain
+                pred_phys, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain
             )
-            # Ungated by default: the low-τ endpoint penetrates like the deployed sample,
-            # whereas the high-τ endpoint ≈ clean data, so gating would hide the signal.
             pen = _masked_mean(pen_ps, gate) if terrain_tau_gated else pen_ps.mean()
             out["terrain_penetration"] = pen.detach()
             out["loss"] = out["loss"] + terrain_weight * pen
 
     # Sampled-rollout terrain penalty: penalize the actual multi-step sample (the deployed
-    # output), not the teacher-forced x1_hat. Differentiable rollout with truncated
-    # backprop on a sub-batch; always "ungated" (one trajectory, no per-sample tau).
+    # output) instead of the teacher-forced x1_hat. Differentiable rollout with truncated
+    # backprop on a sub-batch.
     do_terrain_sample = (terrain is not None and state_norm is not None and terrain_sample_weight > 0.0
                          and foot_idxs and p_ref is not None and q_ref is not None)
     if do_terrain_sample:
         s = x1.shape[0] if terrain_sample_size <= 0 else min(terrain_sample_size, x1.shape[0])
         cmd_s = None if cmd_tokens is None else cmd_tokens[:s]
+        nm_s = None if history_null_mask is None else history_null_mask[:s]
         samp = sample_trajectory_grad(
-            model, cond[:s], known[:s], x1.shape[1], x1.shape[2],
-            terrain_sample_steps, cmd_s, terrain_sample_grad_steps,
+            model, history[:s], height[:s], cmd_s, x1.shape[1], x1.shape[2],
+            terrain_sample_steps, terrain_sample_grad_steps, history_null_mask=nm_s,
         )
         samp_phys = state_norm.denormalize(samp)
         pen_s = terrain_penetration_term(
-            samp_phys, samp_phys, known[:s], p_ref[:s], q_ref[:s],
-            num_joints, foot_idxs, contact_pts, terrain,
+            samp_phys, p_ref[:s], q_ref[:s], num_joints, foot_idxs, contact_pts, terrain,
         ).mean()
         out["terrain_penetration_sample"] = pen_s.detach()
         out["loss"] = out["loss"] + terrain_sample_weight * pen_s
@@ -394,90 +372,82 @@ def flow_matching_loss(
 @torch.no_grad()
 def sample_trajectory(
     model: torch.nn.Module,
-    cond: torch.Tensor,
-    known: torch.Tensor,
+    history: torch.Tensor,
+    height: torch.Tensor,
+    cmd_tokens: torch.Tensor | None,
     future_len: int,
     state_dim: int,
     num_steps: int = 8,
-    cmd_tokens: torch.Tensor | None = None,
+    history_null_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Generate a state window by Euler-integrating the learned flow with inpainting.
+    """Generate the F-step future window by Euler-integrating the learned flow.
 
-    Known tokens are clamped to ``cond`` at init and after every step. The output is
-    in the standardized space; the caller denormalizes and Gram-Schmidts the
-    orientation block.
+    The conditioning (history / height / command) is fed as separate tokens, held fixed
+    across integration; there is no inpainting / re-clamp. The output is in the
+    standardized space; the caller denormalizes and Gram-Schmidts the orientation block.
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
-        cond: Observed conditioning values (standardized), shape ``(B, F, D)``;
-            only its ``known`` tokens are used.
-        known: Per-token conditioning mask, shape ``(B, F)`` bool.
-        future_len: Window length ``F``.
+        history: History (phase) conditioning (standardized), ``(B, N, D)``.
+        height: Height conditioning (standardized), ``(B, 1)``.
+        cmd_tokens: Strided command tokens (normalized) or ``None``, held fixed.
+        future_len: Future window length ``F``.
         state_dim: Per-step state width ``D``.
         num_steps: Number of Euler integration steps.
-        cmd_tokens: Strided command tokens (normalized), shape
-            ``(B, num_cmd_tokens, cmd_dim)``, held fixed across integration.
+        history_null_mask: Optional ``(B,)`` bool to null the history (guidance).
         generator: Optional RNG for the initial noise.
 
     Returns:
-        Generated window (standardized), shape ``(B, F, D)``. Tokens ``0..N-1`` are
-        the (re-clamped) conditioning; novel predictions are ``N..F-1``.
+        Generated future window (standardized), shape ``(B, F, D)`` -- all F are novel.
     """
-    b = cond.shape[0]
-    device = cond.device
-    km = known.unsqueeze(-1)
-    x = torch.randn(b, future_len, state_dim, device=device, dtype=cond.dtype, generator=generator)
-    x = torch.where(km, cond, x)
+    b = history.shape[0]
+    device = history.device
+    x = torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype, generator=generator)
     dt = 1.0 / num_steps
     for i in range(num_steps):
-        tau = torch.full((b,), i * dt, device=device)
-        v = model(x, tau, cmd_tokens)
+        tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
+        v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
         x = x + dt * v
-        x = torch.where(km, cond, x)
     return x
 
 
 def sample_trajectory_grad(
     model: torch.nn.Module,
-    cond: torch.Tensor,
-    known: torch.Tensor,
+    history: torch.Tensor,
+    height: torch.Tensor,
+    cmd_tokens: torch.Tensor | None,
     future_len: int,
     state_dim: int,
     num_steps: int = 8,
-    cmd_tokens: torch.Tensor | None = None,
     grad_steps: int = 1,
+    history_null_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Differentiable Euler rollout with truncated backprop, for sample-space losses.
 
     Same integration as :func:`sample_trajectory`, but gradient-enabled: the first
     ``num_steps - grad_steps`` steps run under ``no_grad`` and only the final
-    ``grad_steps`` steps build the autograd graph (truncated backprop through time). This
-    bounds memory/compute while still letting a loss on the *generated sample* shape the
-    field near the end of the trajectory, where the penetrating pose forms -- unlike a
-    loss on the one-step ``x1_hat``, which never sees the sampler's real path.
+    ``grad_steps`` steps build the autograd graph (truncated backprop through time).
 
     Args mirror :func:`sample_trajectory`; ``grad_steps`` is clamped to ``[1, num_steps]``.
 
     Returns:
-        Generated window (standardized), shape ``(B, F, D)``.
+        Generated future window (standardized), shape ``(B, F, D)``.
     """
-    b = cond.shape[0]
-    device = cond.device
-    km = known.unsqueeze(-1)
-    x = torch.randn(b, future_len, state_dim, device=device, dtype=cond.dtype, generator=generator)
-    x = torch.where(km, cond, x)
+    b = history.shape[0]
+    device = history.device
+    x = torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype, generator=generator)
     step = 1.0 / num_steps
     keep = min(max(grad_steps, 1), num_steps)
     no_grad_steps = num_steps - keep
     for i in range(num_steps):
-        tau = torch.full((b,), i * step, device=device, dtype=cond.dtype)
+        tau = torch.full((b,), i * step, device=device, dtype=history.dtype)
         if i < no_grad_steps:
             with torch.no_grad():
-                v = model(x, tau, cmd_tokens)
-                x = torch.where(km, cond, x + step * v)
+                v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+                x = x + step * v
         else:
-            v = model(x, tau, cmd_tokens)
-            x = torch.where(km, cond, x + step * v)
+            v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+            x = x + step * v
     return x

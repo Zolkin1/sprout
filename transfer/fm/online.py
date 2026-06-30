@@ -6,17 +6,17 @@ Vendored, deployment-side copy of ``robot_rl.flow_matching.online`` for the
 sim2sim / hardware tracker runner: it carries **no** isaaclab or robot_rl import
 (the frame math comes from the local :mod:`quat_math` / :mod:`transforms`).
 
-It maintains a rolling per-env history of the robot state, builds the clean
-conditioning tokens (the N most-recent measured states, in the relative-frame
-representation) plus the strided command tokens, samples the future window by
-masked inpainting, and lifts it back to the world frame.
+It maintains a rolling per-env history of the robot state, builds the ``N`` history
+(phase) conditioning tokens (in the xyz+yaw relative-frame representation), the
+root-height token, and the strided future command tokens, samples the ``F``-step
+future window, and lifts it back to the world frame.
 
 The conditioning matches ``robot_rl.flow_matching.dataset.FutureStateDataset``:
-the N most-recent states occupy the first N tokens of a length-F window, anchored
-at the most recent step (index N-1); the predicted novel frames are ``N..F-1``.
-History and target share one full-state representation (every recorded extra
-frame), so the conditioning carries the same end-effector frames the model
-predicts. Keep in lock-step with ``source/robot_rl/robot_rl/flow_matching/online.py``.
+``N`` real-robot-state history tokens anchored at the most recent step (index N-1,
+the xyz+yaw ground frame), a single root-height token, the strided command tokens,
+and the ``F`` predicted FUTURE states (node 0 = current step, offset ≈ 0). There is
+no inpainting / known-mask: conditioning is separate tokens. Keep in lock-step with
+``source/robot_rl/robot_rl/flow_matching/online.py``.
 """
 
 from __future__ import annotations
@@ -93,14 +93,16 @@ class FmOnlineContext:
 
     Attributes:
         model: The loaded :class:`FlowMatchingTransformer` (eval mode).
-        state_norm: Normalizer for the state tokens (conditioning and prediction).
+        state_norm: Normalizer for the state tokens (history conditioning + future).
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
-        N: Number of conditioning (history) states (the first N tokens).
-        F: Window length (number of state tokens); novel frames are ``N..F-1``.
-        D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``).
+        height_norm: Normalizer for the scalar root-height token.
+        ground_z: World floor height under the anchor for the height token.
+        N: Number of history (phase) conditioning tokens.
+        F: Future window length (all F are predicted; node 0 = current step).
+        D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``); also history_dim.
         nj: Number of joints.
         target_num_extra_frames: Extra body frames the generator predicts (and that
-            the conditioning carries).
+            the history carries).
         num_steps: Euler sampling steps.
         cmd_dim: Per-step command width (0 if not command-conditioned).
         cmd_steps: Strided window indices that become command tokens.
@@ -113,6 +115,8 @@ class FmOnlineContext:
     model: FlowMatchingTransformer
     state_norm: Normalizer
     cmd_norm: Normalizer | None
+    height_norm: Normalizer
+    ground_z: float
     N: int
     F: int
     D: int
@@ -179,9 +183,12 @@ def load_fm_context(
         if ckpt.get("cmd_normalizer") is not None
         else None
     )
+    height_norm = Normalizer.from_state_dict(ckpt["height_normalizer"]).to(dev)
 
     model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+        state_dim=cfg.state_dim, future_len=cfg.future_len,
+        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
+        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(dev)
@@ -199,6 +206,7 @@ def load_fm_context(
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
+        height_norm=height_norm, ground_z=float(cfg.ground_z),
         N=cfg.num_history_states, F=cfg.future_len, D=target_d, nj=nj,
         target_num_extra_frames=target_k,
         num_steps=int(num_sampling_steps or cfg.num_sampling_steps),
@@ -211,7 +219,7 @@ def load_fm_context(
 # ----------------------------------------------------------------------
 # Conditioning construction + world-frame sampling.
 # ----------------------------------------------------------------------
-def build_cond_states(
+def build_history_tokens(
     ctx: FmOnlineContext,
     root_pos: torch.Tensor,
     root_quat: torch.Tensor,
@@ -220,14 +228,13 @@ def build_cond_states(
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
     frames: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build the conditioning window ``(V, F, D)`` and its known mask ``(V, F)``.
+) -> torch.Tensor:
+    """Build the ``N`` history (phase) conditioning tokens ``(V, N, D)`` (normalized).
 
-    All raw inputs are the ``N`` most-recent steps ``(V, N, ·)`` in the FM's
-    joint/frame order, world frame. The reference frame is the most recent step
-    (index ``N-1``), matching training. The N relative states fill tokens ``0..N-1``
-    (clean conditioning); tokens ``N..F-1`` are left zero (overwritten by noise at
-    sampling) with ``known=False``.
+    All raw inputs are the ``N`` most-recent real-robot steps ``(V, N, ·)`` in the FM's
+    joint/frame order, world frame. The relative frame is the **xyz+yaw** ground frame
+    at the most recent step (index ``N-1``), matching training. Returns ONLY the N
+    history tokens (no length-F window, no known mask -- history is separate conditioning).
 
     Args:
         ctx: The loaded context.
@@ -238,7 +245,7 @@ def build_cond_states(
             predicts extra frames), or None.
 
     Returns:
-        ``(cond, known)`` with shapes ``(V, F, D)`` (normalized) and ``(V, F)`` bool.
+        Normalized history tokens ``(V, N, D)``.
     """
     v, n = root_pos.shape[0], root_pos.shape[1]
     nj, k = ctx.nj, ctx.target_num_extra_frames
@@ -260,13 +267,23 @@ def build_cond_states(
         p_ref, q_ref,
         frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
     ).reshape(v, n, ctx.D)
-    rel = ctx.state_norm.normalize(rel)
+    return ctx.state_norm.normalize(rel)
 
-    cond = torch.zeros(v, ctx.F, ctx.D, device=rel.device, dtype=rel.dtype)
-    cond[:, :n] = rel
-    known = torch.zeros(v, ctx.F, dtype=torch.bool, device=rel.device)
-    known[:, :n] = True
-    return cond, known
+
+def build_height_token(ctx: FmOnlineContext, anchor_root_z: torch.Tensor) -> torch.Tensor:
+    """Build the normalized root-height token ``(V, 1)`` from the anchor root z.
+
+    Args:
+        ctx: The loaded context.
+        anchor_root_z: World z of the robot root at the anchor step, shape ``(V,)`` or
+            ``(V, 1)``. At deployment this is the live robot root z (the ground-clearance
+            stand-in for a heightmap).
+
+    Returns:
+        Normalized height token ``(V, 1)``.
+    """
+    raw = anchor_root_z.reshape(-1, 1) - ctx.ground_z
+    return ctx.height_norm.normalize(raw)
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:
@@ -290,25 +307,26 @@ def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Te
 @torch.no_grad()
 def sample_world(
     ctx: FmOnlineContext,
-    cond: torch.Tensor,
-    known: torch.Tensor,
+    history: torch.Tensor,
+    height: torch.Tensor,
+    cmd_tokens: torch.Tensor | None,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
-    cmd_tokens: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Sample the future window by masked inpainting and lift it to the world frame.
+    """Sample the ``F``-step future window and lift it to the world frame.
 
-    The novel (predicted) frames are ``N..F-1``; tokens ``0..N-1`` reproduce the
-    conditioning. All frames are expressed relative to ``p_ref``/``q_ref`` (the
-    current base pose = the anchor at step N-1).
+    All F frames are predicted FUTURE (node 0 = the current step, base offset ≈ 0).
+    Every frame is expressed relative to the **xyz+yaw** ground frame at
+    ``p_ref``/``q_ref`` (the current robot base pose = the anchor at step N-1), so no
+    re-centering is needed.
 
     Args:
         ctx: The loaded context.
-        cond: Conditioning window ``(V, F, D)`` (from :func:`build_cond_states`).
-        known: Per-token known mask ``(V, F)`` bool.
-        p_ref: World reference position ``(V, 3)`` (the current base position).
-        q_ref: World reference quaternion ``(V, 4, xyzw)``.
+        history: History (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
+        height: Normalized root-height token ``(V, 1)`` (from :func:`build_height_token`).
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
+        p_ref: World reference position ``(V, 3)`` (the current robot base position).
+        q_ref: World reference quaternion ``(V, 4, xyzw)``.
 
     Returns:
         World-frame prediction dict with ``root_pos_w (V,F,3)``,
@@ -318,12 +336,12 @@ def sample_world(
         ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``
         each ``(V,F,K_target,·)``.
     """
-    v = cond.shape[0]
+    v = history.shape[0]
     f, d, nj, k = ctx.F, ctx.D, ctx.nj, ctx.target_num_extra_frames
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
 
-    pred_std = sample_trajectory(ctx.model, cond, known, f, d, ctx.num_steps, cmd_tokens=cmd_tokens)
+    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps)
     pred = ctx.state_norm.denormalize(pred_std)  # (V, F, D)
 
     p_ref_f = p_ref[:, None, :].expand(v, f, 3).reshape(v * f, 3)

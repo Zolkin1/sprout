@@ -17,38 +17,38 @@ class FlowMatchingConfig:
     depend on the joint/extra-frame count and the command width), so the defaults
     here are placeholders.
 
-    Architecture (PARC-style single transformer, inpainting): the model denoises a
-    window of ``future_len`` state tokens. The ``num_history_states`` most-recent
-    measured states are dropped in as *clean* conditioning tokens (held fixed at
-    every flow-time and excluded from the loss); the rest of the window is the
-    predicted future. Effective novel horizon is ``future_len - num_history_states``.
-    During training the history is dropped with probability ``history_dropout_prob``
-    (the whole window is denoised unconditionally), which regularizes away history
-    over-reliance and lets the model predict from step 0 after a reset.
+    Architecture (single transformer, robot-state conditioned): tokens are assembled
+    as ``[history(N) | height(1) | cmd(Ncmd) | future(F)]``. The ``num_history_states``
+    real-robot-state history tokens (whose job is to supply *phase*), the root-height
+    token, and the strided future-command tokens are SEPARATE conditioning tokens
+    (never noised, not part of the denoised window). The model denoises the ``F``
+    future state tokens -- ALL future, no past echo, no inpainting / known-mask. During
+    training the history is replaced by a learned null embedding with probability
+    ``null_cond_prob`` (classifier-free-guidance / phase-agnostic nominal).
     """
 
     # -- data / windowing --
-    # Window length F: the full denoised state sequence. The first ``num_history_states``
-    # tokens are the recent past (conditioning), the rest are the predicted future. The
-    # relative-frame anchor is the most recent history step (index num_history_states-1).
-    # Sized so the novel horizon (F - num_history_states = 38 steps = 0.76 s at dt=0.02)
-    # comfortably covers the deploy-time policy lookahead (future_base_pose/velocity reach
-    # 0.5 s = 25 steps ahead of the currently-applied window index) even as that index
-    # advances during a re-plan block: with GeneratorTrackingCommand fm_update_every=K the
-    # applied index climbs to (N-1)+K, so un-truncated lookahead needs F-1 >= (N-1)+K+25,
-    # i.e. F=40 covers K up to 13 (K=10 today, with margin). Also a multiple of cmd_stride
-    # (=5) -> 8 evenly-spaced command tokens. Raising F grows per-window memory; bump
-    # --stride / --num_workers if training OOMs.
+    # Future window length F: the full denoised state sequence (node 0 = the current /
+    # anchor step, ego-anchored onto the robot so its base offset ≈ 0; nodes 1..F-1 are
+    # the future). The relative-frame anchor is the robot base at the most recent history
+    # step. F=40 = 0.8 s at dt=0.02 -- covers the deploy-time policy lookahead
+    # (future_base_pose/velocity reach 0.5 s = 25 steps) plus the re-plan block. Also a
+    # multiple of cmd_stride (=5) -> 8 evenly-spaced command tokens. Raising F grows
+    # per-window memory; bump --stride / --num_workers if training OOMs.
     future_len: int = 40
+    # N real-robot-state history (phase) conditioning tokens. Default 2: enough to read
+    # gait phase (the FM predicts nominal phase-dependent motion, not recovery).
     num_history_states: int = 2
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
 
-    # Future-target source: "actual" predicts the recorded robot state; "reference"
-    # predicts the tracked reference (requires ``ref_state`` in the recording). The
-    # conditioning (the clean history tokens) is always the actual recorded state.
-    target_source: str = "actual"
+    # Future-target source. "ego_anchored_clip_future": predict the motion clip
+    # ego-anchored onto the robot at the snap (re-anchor) event -- the new robot-state-
+    # conditioned paradigm (requires ``ref_future`` + a snap flag in the recording).
+    # "actual" predicts the recorded robot state; "reference" predicts the per-step
+    # tracked reference. Auto-resolved from the recording's ``ref_source`` when unset.
+    target_source: str = "ego_anchored_clip_future"
 
     # Recovery-aware windowing for perturbed recordings (record_data.py --perturb,
     # which logs a per-step ``perturb_active`` flag). "clean_prediction" (default)
@@ -68,20 +68,27 @@ class FlowMatchingConfig:
 
     # -- dimensions (resolved from the dataset at build time) --
     # Per-step state width of every token: 2*nj + 15*(1 + num_extra_frames). History
-    # and predicted states share this single representation (no asymmetry).
+    # and predicted states share this single representation (one shared normalizer).
     state_dim: int = 57
+    # Per-step history-token width (= state_dim; resolved at build time).
+    history_dim: int = 57
+    # Width of the height conditioning token (root z above ground; a heightmap stand-in).
+    height_dim: int = 1
+    # World floor height under the anchor for the height token (flat ground -> 0.0).
+    # Reuse the terrain-calibrated floor when the terrain loss is on.
+    ground_z: float = 0.0
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
-    # -- model (single transformer; no separate history encoder) --
+    # -- model (single transformer; history/height/cmd are separate conditioning tokens) --
     d_model: int = 256
     nhead: int = 8
     num_layers: int = 4
     dim_feedforward: int = 512
     dropout: float = 0.0
-    # Probability that a training sample drops its history (all tokens denoised
-    # unconditionally). Regularizes history over-reliance; enables step-0 prediction.
-    history_dropout_prob: float = 0.8
+    # Probability that a training sample's history (phase) tokens are replaced by the
+    # model's learned null embedding -- classifier-free-guidance / phase-agnostic nominal.
+    null_cond_prob: float = 0.2
 
     # -- observation noise (train-time augmentation on the clean history tokens) --
     # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
