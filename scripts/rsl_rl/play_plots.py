@@ -1421,99 +1421,119 @@ def plot_fm_predictions(
 # Registry
 # ---------------------------------------------------------------------------
 
+def _plot_future_obs(
+    data: dict[str, np.ndarray], key: str, comp_labels: list[str], title: str, fname: str,
+    save_dir: str, env_ids: list[int], dt: float | None, t_off: float, stride: int,
+    fm_active: np.ndarray | None,
+) -> None:
+    """One figure for a strided future_* obs: 6 subplots (one per component), each with
+    one line per lookahead step colored by horizon. Overlays the clip (dashed) when
+    ``obs_clip_<key>`` is present, so FM vs clip is visible per horizon/component."""
+    clip_key = "obs_clip_" + key[len("obs_"):]
+    has_clip = clip_key in data
+    cmap = plt.cm.viridis
+    for env_id in env_ids:
+        a = data[key][:, env_id, :]
+        T = a.shape[0]
+        k = a.shape[1] // 6
+        a = a.reshape(T, k, 6)
+        ac = data[clip_key][:, env_id, :].reshape(T, k, 6) if has_clip else None
+        x = np.arange(T) * dt + t_off if dt is not None else np.arange(T)
+        xlabel = "Time (s)" if dt is not None else "Time Steps"
+        fig, axs = plt.subplots(2, 3, figsize=(18, 8))
+        sub = "  solid = FM/applied, dashed = clip;  color = lookahead horizon" if has_clip \
+            else "  color = lookahead horizon"
+        fig.suptitle(f"{title}  (Env {env_id}){sub}", fontsize=14)
+        axs = np.array(axs).flatten()
+        fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {}, env_id, dt, t_off)
+        has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
+        for c in range(min(6, len(comp_labels))):
+            ax = axs[c]
+            for j in range(k):
+                col = cmap(j / max(1, k - 1))
+                hs = (j + 1) * stride * (dt or 1.0)
+                ax.plot(x, a[:, j, c], color=col, lw=1.4, label=f"+{hs:.2f}s")
+                if has_clip:
+                    ax.plot(x, ac[:, j, c], color=col, lw=1.1, ls="--", alpha=0.8)
+            if has_fm:
+                _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=False)
+            ax.set_title(comp_labels[c], fontsize=10)
+            ax.set_xlabel(xlabel)
+            ax.grid(True, alpha=0.3)
+            if c == 0:
+                ax.legend(fontsize=6, ncol=2, title="lookahead")
+        plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+        plt.savefig(os.path.join(save_dir, f"trajectory_obs_{fname}_env{env_id}.png"),
+                    dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
 def plot_trajectory_obs(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
     save_dir: str,
     env_ids: list[int],
 ) -> None:
-    """Dashboard of the policy's trajectory-reference OBSERVATIONS over the rollout.
+    """Per-term plots of the policy's trajectory-reference OBSERVATIONS over the rollout.
 
-    Plots the clean (no-corruption) base-relative reference signals the policy
-    actually consumes -- ``base_pose_error``, ``base_vel_ref``, ``ee_ref``,
-    ``joint_pos_ref``, ``joint_vel_ref``, and the strided ``future_base_pose`` /
-    ``future_base_velocity`` lookahead -- so obs-level artifacts are visible (e.g.
-    the FM-in-loop lookahead truncation / re-plan jumps caught analytically). The
-    future_* panels draw one line per strided lookahead step, colored by horizon, so
-    a far sample that flat-lines (clamped) or jumps at a re-plan stands out. Run it
-    on the clip-ego task and the FM-in-loop task and compare the two dashboards.
+    Emits one figure per obs term (zoomable, like the positions/velocities plots),
+    plotting the clean (no-corruption) base-relative reference the policy consumes:
+    ``base_pose_error``, ``base_vel_ref``, ``joint_pos_ref``, ``joint_vel_ref``,
+    ``ee_ref`` (one subplot per dimension), and ``future_base_pose`` /
+    ``future_base_velocity`` (one subplot per component, one line per strided lookahead
+    step colored by horizon). When the FM-in-loop command also logged the clip
+    reference (``obs_clip_*``), the clip is overlaid (dashed) so the FM vs clip
+    difference -- and obs-level artifacts like the lookahead truncation / re-plan jumps
+    -- is visible directly. Otherwise only the applied reference is shown.
     """
-    keys = ["obs_base_pose_error", "obs_base_vel_ref", "obs_ee_ref",
-            "obs_joint_pos_ref", "obs_joint_vel_ref",
-            "obs_future_base_pose", "obs_future_base_velocity"]
-    present = [k for k in keys if k in data]
-    if not present:
+    if not any(k.startswith("obs_") for k in data):
         print("[WARN plot_trajectory_obs] No obs_* trajectory observations logged, skipping.")
         return
     dt = metadata.get("dt")
     t_off = metadata.get("t_offset", 0.0)
     stride = int(metadata.get("future_stride", 5))
     fm_active = data.get("fm_active")
-    cmap = plt.cm.viridis
+    pos_names = metadata.get("pos_names", [])
+    vel_names = metadata.get("vel_names", [])
+    jp_names = [n.split(":", 1)[1] for n in pos_names if n.startswith("joint:")]
+    jv_names = [n.split(":", 1)[1] for n in vel_names if n.startswith("joint:")]
+    ee_names = [f"{f}:{ax}" for f in metadata.get("ee_frames", []) for ax in ("x", "y", "z")]
 
-    for env_id in env_ids:
-        T = data[present[0]].shape[0]
-        x = np.arange(T) * dt + t_off if dt is not None else np.arange(T)
-        xlabel = "Time (s)" if dt is not None else "Time Steps"
-        fig, axs = plt.subplots(3, 3, figsize=(18, 11))
-        fig.suptitle(f"Trajectory reference observations (Env {env_id})", fontsize=15)
-        fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {}, env_id, dt, t_off)
-        has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
+    # Per-dimension terms (one subplot per dim); FM solid + clip dashed when present.
+    flat = [
+        ("obs_base_pose_error", ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
+         "base_pose_error (base frame)", "base_pose_error"),
+        ("obs_base_vel_ref", ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+         "base_vel_ref (base frame)", "base_vel_ref"),
+        ("obs_joint_pos_ref", jp_names, "joint_pos_ref", "joint_pos_ref"),
+        ("obs_joint_vel_ref", jv_names, "joint_vel_ref", "joint_vel_ref"),
+        ("obs_ee_ref", ee_names, "ee_ref (rel base)", "ee_ref"),
+    ]
+    for key, names, title, fname in flat:
+        if key not in data:
+            continue
+        clip_key = "obs_clip_" + key[len("obs_"):]
+        has_clip = clip_key in data
+        if not names or len(names) != data[key].shape[2]:
+            names = [f"dim {i}" for i in range(data[key].shape[2])]
+        _grid_plot(
+            data, key, clip_key if has_clip else None, names,
+            title_fmt=f"{title}  (Env {{env_id}})",
+            y_label_fmt="{unit}", filename_fmt=f"trajectory_obs_{fname}_env{{env_id}}.png",
+            save_dir=save_dir, env_ids=env_ids,
+            label_a="FM (applied)" if has_clip else "reference (applied)", label_b="clip",
+            dt=dt, t_offset=t_off, fm_active=fm_active,
+        )
 
-        def _finish(ax) -> None:
-            if has_fm:
-                _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=False)
-            ax.grid(True, alpha=0.3)
-            ax.set_xlabel(xlabel)
-
-        def _components(ax, key, title, labels=None, lw=1.2, alpha=1.0, legend=True):
-            if key not in data:
-                ax.set_visible(False)
-                return
-            a = data[key][:, env_id, :]
-            for i in range(a.shape[1]):
-                lab = labels[i] if (labels and i < len(labels)) else None
-                ax.plot(x, a[:, i], lw=lw, alpha=alpha, label=lab)
-            ax.set_title(title, fontsize=10)
-            if legend and labels:
-                ax.legend(fontsize=6, ncol=2)
-            _finish(ax)
-
-        def _lookahead(ax, key, comp, title):
-            if key not in data:
-                ax.set_visible(False)
-                return
-            a = data[key][:, env_id, :]
-            k = a.shape[1] // 6
-            a = a.reshape(T, k, 6)
-            for j in range(k):
-                hs = (j + 1) * stride * (dt or 1.0)
-                ax.plot(x, a[:, j, comp], color=cmap(j / max(1, k - 1)), lw=1.3, label=f"+{hs:.2f}s")
-            ax.set_title(title, fontsize=10)
-            ax.legend(fontsize=6, ncol=2, title="lookahead")
-            _finish(ax)
-
-        _components(axs[0, 0], "obs_base_pose_error", "base_pose_error (base frame)",
-                    ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"])
-        _components(axs[0, 1], "obs_base_vel_ref", "base_vel_ref (base frame)",
-                    ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"])
-        ee_frames = (data["obs_ee_ref"].shape[2] // 3) if "obs_ee_ref" in data else 0
-        _components(axs[0, 2], "obs_ee_ref", f"ee_ref (rel base, {ee_frames} frames x xyz)",
-                    labels=None, lw=0.9, alpha=0.8, legend=False)
-        _components(axs[1, 0], "obs_joint_pos_ref",
-                    f"joint_pos_ref ({data['obs_joint_pos_ref'].shape[2] if 'obs_joint_pos_ref' in data else 0} joints)",
-                    labels=None, lw=0.7, alpha=0.6, legend=False)
-        _components(axs[1, 1], "obs_joint_vel_ref",
-                    f"joint_vel_ref ({data['obs_joint_vel_ref'].shape[2] if 'obs_joint_vel_ref' in data else 0} joints)",
-                    labels=None, lw=0.7, alpha=0.6, legend=False)
-        _lookahead(axs[1, 2], "obs_future_base_velocity", 2, "future_base_velocity: lin z (per lookahead)")
-        _lookahead(axs[2, 0], "obs_future_base_pose", 0, "future_base_pose: pos x (per lookahead)")
-        _lookahead(axs[2, 1], "obs_future_base_pose", 2, "future_base_pose: pos z (per lookahead)")
-        _lookahead(axs[2, 2], "obs_future_base_velocity", 0, "future_base_velocity: lin x (per lookahead)")
-
-        plt.tight_layout(rect=[0, 0.02, 1, 0.96])
-        plt.savefig(os.path.join(save_dir, f"trajectory_obs_env{env_id}.png"), dpi=200, bbox_inches="tight")
-        plt.close(fig)
+    # Strided lookahead terms (per-component subplots, per-horizon lines).
+    _plot_future_obs(data, "obs_future_base_pose",
+                     ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
+                     "future_base_pose (rel base)", "future_base_pose",
+                     save_dir, env_ids, dt, t_off, stride, fm_active) if "obs_future_base_pose" in data else None
+    _plot_future_obs(data, "obs_future_base_velocity",
+                     ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+                     "future_base_velocity (rel base)", "future_base_velocity",
+                     save_dir, env_ids, dt, t_off, stride, fm_active) if "obs_future_base_velocity" in data else None
 
 
 PLOT_REGISTRY: dict[str, Callable] = {

@@ -224,14 +224,28 @@ class DataLogger:
         if self._traj_term_name is not None:
             name = self._traj_term_name
             hs, st = self._future_horizon_s, self._future_stride
+            def _traj_obs() -> dict[str, torch.Tensor]:
+                return {
+                    "base_pose_error": base_pose_error(unwrapped, name).clone(),
+                    "base_vel_ref": ref_base_velocity_local(unwrapped, name).clone(),
+                    "joint_pos_ref": joint_pos_ref(unwrapped, name).clone(),
+                    "joint_vel_ref": joint_vel_ref(unwrapped, name).clone(),
+                    "ee_ref": ee_ref_relative_to_base(unwrapped, name).clone(),
+                    "future_base_pose": future_base_pose(unwrapped, name, hs, st).clone(),
+                    "future_base_velocity": future_base_velocity(unwrapped, name, hs, st).clone(),
+                }
             try:
-                step["obs_base_pose_error"] = base_pose_error(unwrapped, name).clone()
-                step["obs_base_vel_ref"] = ref_base_velocity_local(unwrapped, name).clone()
-                step["obs_joint_pos_ref"] = joint_pos_ref(unwrapped, name).clone()
-                step["obs_joint_vel_ref"] = joint_vel_ref(unwrapped, name).clone()
-                step["obs_ee_ref"] = ee_ref_relative_to_base(unwrapped, name).clone()
-                step["obs_future_base_pose"] = future_base_pose(unwrapped, name, hs, st).clone()
-                step["obs_future_base_velocity"] = future_base_velocity(unwrapped, name, hs, st).clone()
+                for k, v in _traj_obs().items():
+                    step[f"obs_{k}"] = v
+                # If the command can also serve the CLIP reference (the FM-in-loop
+                # GeneratorTrackingCommand), log the clip's version of every obs under
+                # the same robot state -> the FM (obs_*) and clip (obs_clip_*) signals
+                # overlay in the trajectory_obs plot, the obs-level FM-vs-clip view.
+                ref = unwrapped.command_manager.get_term(name)
+                if hasattr(ref, "as_clip_reference"):
+                    with ref.as_clip_reference():
+                        for k, v in _traj_obs().items():
+                            step[f"obs_clip_{k}"] = v
             except Exception as exc:
                 self._warn("traj_obs", f"Could not compute trajectory reference obs: {exc}")
 
@@ -461,6 +475,8 @@ class DataLogger:
                     self.metadata["vel_names"] = list(ref.ordered_vel_output_names)
                 if hasattr(ref, "ref_frames"):
                     self.metadata["ref_frames"] = list(ref.ref_frames)
+                if hasattr(ref, "resolve_ee_frames"):  # ee_ref obs column labels
+                    self.metadata["ee_frames"] = list(ref.resolve_ee_frames())
                 # Flow-matching prediction-window geometry (generator command only):
                 # ``fm_window_len`` = F steps stored per inference, ``fm_novel_start``
                 # = window index N where the novel future begins.  Lets the

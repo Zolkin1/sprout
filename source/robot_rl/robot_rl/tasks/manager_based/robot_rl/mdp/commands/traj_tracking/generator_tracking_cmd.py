@@ -27,6 +27,7 @@ anywhere, so the FM reference and the CLF's measured outputs share one frame
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -142,6 +143,15 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # autoregressive history input; None until the first update.
         self._applied_ref: dict[str, torch.Tensor] | None = None
 
+        # Per-step CLIP reference cache (parallel to the applied FM reference), for
+        # obs-level FM-vs-clip comparison logging: the clip's current-step desired
+        # outputs + world frames, populated in _update_command and served through the
+        # normal obs interface via as_clip_reference(). None until the first update.
+        self._clip_y_des: torch.Tensor | None = None
+        self._clip_dy_des: torch.Tensor | None = None
+        self._clip_wf: torch.Tensor | None = None
+        self._serve_clip: bool = False
+
         # -- prediction buffers + cadence state (every env runs the FM) --
         # Latched per-env episode-reset flag (set in reset(), consumed in
         # _snapshot_and_infer). episode_length_buf == 0 is unobservable here --
@@ -220,6 +230,18 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # (frames in self._wf_frames == [base] + FM ee order). Used as the warmup
         # fallback until each env's FM history window fills.
         clip_frames = self._clip_world_frames()                      # [N, nf, 13]
+
+        # Cache the CLIP-only reference (clip joints from get_desired_outputs above +
+        # clip world base/ee) so as_clip_reference() can serve the clip's version of
+        # every reference obs for FM-vs-clip diagnostics. Cloned here, before the FM
+        # joints/frames overwrite y_des/dy_des below; mirrors _write_world_des's scatter.
+        n = self.num_envs
+        clip_y, clip_dy = self.y_des.clone(), self.dy_des.clone()     # clip joints already present
+        clip_y[:, self._wf_pos_flat] = clip_frames[:, :, 0:3].reshape(n, -1)
+        clip_y[:, self._wf_ori_flat] = clip_frames[:, :, 3:7].reshape(n, -1)
+        clip_dy[:, self._wf_lin_flat] = clip_frames[:, :, 7:10].reshape(n, -1)
+        clip_dy[:, self._wf_ang_flat] = clip_frames[:, :, 10:13].reshape(n, -1)
+        self._clip_y_des, self._clip_dy_des, self._clip_wf = clip_y, clip_dy, clip_frames
 
         # FM world reference at the current advance index, in the same order.
         fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
@@ -557,6 +579,10 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             ``[N, K, 4]`` (xyzw), ``[N, K, 3]``, ``[N, K, 3]`` -- same layout and
             world frame as the base clip-only implementation.
         """
+        # as_clip_reference(): serve the clip look-ahead (the base impl) so the
+        # FM-vs-clip obs comparison sees the clip's future, not the FM's.
+        if self._serve_clip:
+            return super().get_future_world_base(offsets)
         pos_c, quat_c, lin_c, ang_c = super().get_future_world_base(offsets)
 
         # FM-predicted future at the same offsets (world frame, current-base anchored).
@@ -574,6 +600,30 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             torch.where(use_fm, lin_f, lin_c),
             torch.where(use_fm, ang_f, ang_c),
         )
+
+    @contextlib.contextmanager
+    def as_clip_reference(self):
+        """Temporarily serve the CLIP reference through the normal obs interface.
+
+        Swaps ``y_des``/``dy_des`` and the world-frame cache to the cached clip
+        reference and routes :meth:`get_future_world_base` to the clip (base) impl,
+        so the standard reference obs (``base_pose_error``, ``joint_*_ref``,
+        ``ee_ref``, ``base_vel_ref``, ``future_base_pose``/``velocity``) computed
+        inside the ``with`` block report what the policy WOULD see tracking the clip
+        instead of the FM -- for obs-level FM-vs-clip comparison (e.g. in the play
+        DataLogger). No-op-safe to call before the first update (clip cache is None).
+        """
+        if self._clip_y_des is None:
+            yield
+            return
+        saved = (self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip)
+        self.y_des, self.dy_des = self._clip_y_des, self._clip_dy_des
+        self._wf_world_frames = self._clip_wf
+        self._serve_clip = True
+        try:
+            yield
+        finally:
+            self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip = saved
 
     # ------------------------------------------------------------------
     # Debug visualization (extends the inherited clip ribbon)
