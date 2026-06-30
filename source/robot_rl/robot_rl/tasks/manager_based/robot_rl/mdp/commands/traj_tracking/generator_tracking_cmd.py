@@ -152,6 +152,16 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._clip_wf: torch.Tensor | None = None
         self._serve_clip: bool = False
 
+        # Per-step FM reference cache (symmetric to the clip cache above), so the FM
+        # prediction can be served through the normal obs interface via
+        # as_fm_reference() -- for plotting the FM alongside the clip whichever drives.
+        # In the default mode this equals the applied reference; in drive_with_clip
+        # mode (clip drives) it is the passive FM. None until the first update.
+        self._fm_y_des: torch.Tensor | None = None
+        self._fm_dy_des: torch.Tensor | None = None
+        self._fm_wf: torch.Tensor | None = None
+        self._serve_fm: bool = False
+
         # -- prediction buffers + cadence state (every env runs the FM) --
         # Latched per-env episode-reset flag (set in reset(), consumed in
         # _snapshot_and_infer). episode_length_buf == 0 is unobservable here --
@@ -277,8 +287,24 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         )
 
         # Cache this step's applied reference (FM history format) so the next step's
-        # autoregressive history append feeds the FM its own output.
+        # autoregressive history append feeds the FM its own output. Snapshotted from
+        # the FM-selected reference NOW, before any drive_with_clip swap below, so the
+        # FM stays autoregressive on its OWN output regardless of what drives the robot.
         self._applied_ref = self._reference_snapshot()
+
+        # Cache the FM reference (symmetric to the clip cache) for as_fm_reference():
+        # y_des/dy_des/_wf_world_frames currently hold the FM selection (FM where valid,
+        # clip during warmup) -- the same world reference the FM just fed its history.
+        self._fm_y_des, self._fm_dy_des = self.y_des.clone(), self.dy_des.clone()
+        self._fm_wf = self._wf_world_frames.clone()
+
+        # Diagnostic mode: hand the robot the CLIP instead of the FM. The FM keeps
+        # running (cached above + history snapshotted above), but the applied reference
+        # the policy tracks / CLF / rewards / obs see becomes the ego-anchored clip --
+        # so we can record + plot the FM passively while the robot tracks the clip.
+        if self.cfg.drive_with_clip and self._clip_y_des is not None:
+            self.y_des, self.dy_des = self._clip_y_des.clone(), self._clip_dy_des.clone()
+            self._wf_world_frames = self._clip_wf.clone()
 
         # Measured outputs in the world frame (identity reference -> no alignment).
         self.compute_measured_output(self._zeros3, self._ident_quat)
@@ -496,7 +522,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         (``_pred_valid``): True once an env is past its history warmup.  Flips
         False->True at the end of warmup and True->False on a window break -- the
         boundary the play plots mark with a transition line.
+
+        In ``drive_with_clip`` mode the FM never drives the reference (the clip does),
+        so this is all-False -- the FM is shown as a passive overlay, not a driver.
         """
+        if self.cfg.drive_with_clip:
+            return torch.zeros_like(self._pred_valid)
         return self._pred_valid
 
     @property
@@ -597,9 +628,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             ``[N, K, 4]`` (xyzw), ``[N, K, 3]``, ``[N, K, 3]`` -- same layout and
             world frame as the base clip-only implementation.
         """
-        # as_clip_reference(): serve the clip look-ahead (the base impl) so the
-        # FM-vs-clip obs comparison sees the clip's future, not the FM's.
-        if self._serve_clip:
+        # Serve the look-ahead from the applied source: the clip (base impl) when the
+        # clip drives (drive_with_clip) or under as_clip_reference(); the FM otherwise
+        # or under as_fm_reference(). Keeps future_base_pose/velocity consistent with
+        # the current-step y_des the policy tracks, and lets each comparison context
+        # see its source's future.
+        if not self._serving_fm():
             return super().get_future_world_base(offsets)
         pos_c, quat_c, lin_c, ang_c = super().get_future_world_base(offsets)
 
@@ -619,6 +653,19 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
             torch.where(use_fm, ang_f, ang_c),
         )
 
+    def _serving_fm(self) -> bool:
+        """Whether the served reference / look-ahead should be the FM (vs the clip).
+
+        Explicit comparison contexts win (:meth:`as_clip_reference` /
+        :meth:`as_fm_reference`); otherwise it's the applied source -- the FM by
+        default, the clip under ``drive_with_clip``.
+        """
+        if self._serve_clip:
+            return False
+        if self._serve_fm:
+            return True
+        return not self.cfg.drive_with_clip
+
     @contextlib.contextmanager
     def as_clip_reference(self):
         """Temporarily serve the CLIP reference through the normal obs interface.
@@ -634,14 +681,40 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         if self._clip_y_des is None:
             yield
             return
-        saved = (self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip)
+        saved = (self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip, self._serve_fm)
         self.y_des, self.dy_des = self._clip_y_des, self._clip_dy_des
         self._wf_world_frames = self._clip_wf
-        self._serve_clip = True
+        self._serve_clip, self._serve_fm = True, False
         try:
             yield
         finally:
-            self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip = saved
+            (self.y_des, self.dy_des, self._wf_world_frames,
+             self._serve_clip, self._serve_fm) = saved
+
+    @contextlib.contextmanager
+    def as_fm_reference(self):
+        """Temporarily serve the FM reference through the normal obs interface.
+
+        The mirror of :meth:`as_clip_reference`: swaps ``y_des``/``dy_des`` + the
+        world-frame cache to the cached FM prediction and routes
+        :meth:`get_future_world_base` to the FM, so the standard reference obs report
+        what the policy WOULD see tracking the FM.  Used to record/plot the (passive)
+        FM alongside the clip in ``drive_with_clip`` mode -- the inverse comparison.
+        In the default mode the FM cache equals the applied reference, so this is a
+        no-op view of ``y_des``.  No-op-safe before the first update (FM cache None).
+        """
+        if self._fm_y_des is None:
+            yield
+            return
+        saved = (self.y_des, self.dy_des, self._wf_world_frames, self._serve_clip, self._serve_fm)
+        self.y_des, self.dy_des = self._fm_y_des, self._fm_dy_des
+        self._wf_world_frames = self._fm_wf
+        self._serve_clip, self._serve_fm = False, True
+        try:
+            yield
+        finally:
+            (self.y_des, self.dy_des, self._wf_world_frames,
+             self._serve_clip, self._serve_fm) = saved
 
     # ------------------------------------------------------------------
     # Debug visualization (extends the inherited clip ribbon)

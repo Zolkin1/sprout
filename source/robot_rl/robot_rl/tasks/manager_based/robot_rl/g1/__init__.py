@@ -542,6 +542,19 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+    # Inverse diagnostic: the robot tracks the ego-anchored CLIP while the FM runs
+    # passively (autoregressive, robot-anchored) as a recorded/plotted overlay. Same
+    # teacher policy + clip-conditioned FM (--fm_checkpoint); compare FM vs clip with
+    # the robot safely on the clip (--plots positions overlays both references).
+    gym.register(
+        id="G1-tracker-clf-clip-driven-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerClipDrivenPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 

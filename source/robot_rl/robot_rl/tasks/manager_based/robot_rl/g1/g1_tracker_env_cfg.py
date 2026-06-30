@@ -145,3 +145,22 @@ class G1TrackerFMAutoregPlayEnvCfg(G1TrackerEnvCfgPlay):
         # the as_clip_reference() obs comparison are robot-anchored, not drifting on a
         # fixed world placement. Re-plan cadence matches the FM (ego_anchor_every ~ fm_update_every).
         self.commands.traj_ref.ego_anchor_fraction = 1.0
+
+
+@configclass
+class G1TrackerClipDrivenPlayEnvCfg(G1TrackerFMAutoregPlayEnvCfg):
+    """Clip-driven playback with the flow-matching generator running PASSIVELY.
+
+    The inverse of :class:`G1TrackerFMAutoregPlayEnvCfg`: the robot tracks the
+    ego-anchored **clip** (exactly the clip-tracking deploy), while the FM still runs
+    in its full deploy configuration (autoregressive on its own output, re-anchored on
+    the robot root each re-plan) but only as a recorded/plotted **overlay** -- never
+    driving the robot.  Lets you compare the FM against the clip with the robot safely
+    on the clip (``--plots positions`` overlays both references).  Still requires the
+    trained clip-conditioned FM via ``--fm_checkpoint`` -- it runs every step.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Clip drives; FM is the passive comparison (cached, served via as_fm_reference()).
+        self.commands.traj_ref.drive_with_clip = True

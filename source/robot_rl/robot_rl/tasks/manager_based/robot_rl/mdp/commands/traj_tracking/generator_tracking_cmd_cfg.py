@@ -42,6 +42,18 @@ class GeneratorTrackingCommandCfg(MotionSequenceCommandCfg):
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""
 
+    drive_with_clip: bool = False
+    """Diagnostic mode: drive the robot with the **clip** while running the FM
+    **passively**.  When True the applied reference (what the policy tracks, what the
+    CLF/rewards grade, the ``y_des`` obs) is the ego-anchored clip -- exactly the
+    clip-tracking deploy -- but the flow-matching generator still runs in its full
+    deploy configuration (autoregressive on its own output, re-anchored on the robot)
+    and its prediction is cached so it can be recorded/plotted alongside the clip via
+    :meth:`GeneratorTrackingCommand.as_fm_reference`.  This is the inverse of the
+    default (FM drives, clip is the comparison overlay): here the clip drives and the
+    FM is the comparison overlay, so you can compare the two with the robot safely on
+    the clip.  Default False (FM drives)."""
+
     # --- Debug visualization (generator-tracking specific) ---
     # These augment the inherited clip-ribbon viz (cylinder segments). Set
     # ``debug_vis = True`` to enable.
