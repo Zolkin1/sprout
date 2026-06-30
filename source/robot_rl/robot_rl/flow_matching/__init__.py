@@ -12,9 +12,8 @@ from .config import FlowMatchingConfig
 from .dataset import (
     FutureStateDataset,
     build_train_val,
-    episode_windows,
-    filter_windows_by_recovery,
     resolve_term_slice,
+    snap_windows,
 )
 from .fk import FKChain
 from .flow import (
@@ -44,6 +43,7 @@ from .transforms import (
     rot6d_to_quat,
     so3_log,
     state_to_absolute,
+    yaw_quat,
     target_state_dim,
 )
 
@@ -51,10 +51,9 @@ __all__ = [
     "FlowMatchingConfig",
     "FlowMatchingTransformer",
     "FutureStateDataset",
+    "snap_windows",
     "Normalizer",
     "build_train_val",
-    "episode_windows",
-    "filter_windows_by_recovery",
     "resolve_term_slice",
     "FKChain",
     "FlatTerrain",
@@ -73,6 +72,7 @@ __all__ = [
     "quat_to_rot6d",
     "rot6d_to_quat",
     "so3_log",
+    "yaw_quat",
     "relative_state",
     "relative_state_from_window",
     "state_to_absolute",

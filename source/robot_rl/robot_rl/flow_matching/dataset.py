@@ -1,20 +1,27 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Turn recorded rollouts into fixed-length state windows for flow matching.
+"""Turn recorded teacher rollouts into robot-state-conditioned FM training items.
 
 The dataset operates on already-loaded numpy arrays plus a ``meta`` object (duck
 -typed; only its layout attributes are read), so it has no dependency on the
 recording scripts and is unit-testable with synthetic data. The training script
-is responsible for loading the ``.npz`` via ``recorded_data_io.load_recorded_data``
-and passing ``(data, meta)`` here.
+loads the ``.npz`` via ``recorded_data_io.load_recorded_data`` and passes
+``(data, meta)`` here.
 
-Each window is ``future_len`` (F) consecutive recorded steps in one relative-frame
-representation, anchored at the most recent history step (index ``num_history_states
-- 1``). The first ``num_history_states`` (N) steps are the recent past used as clean
-conditioning tokens; the rest are the predicted future. The commanded-velocity
-profile over the window is sampled every ``cmd_stride`` steps into conditioning
-command tokens. There is one state normalizer (history and target share the
-representation) and a separate command normalizer.
+Paradigm (``target_source="ego_anchored_clip_future"``): each training item is
+sampled at a **snap (re-anchor) event** of a recorded teacher rollout. It pairs
+
+* ``history``: the ``N`` most-recent REAL robot-state steps ending at the snap, in
+  the xyz+yaw ground frame anchored on the robot base at the snap (phase only);
+* ``height``: the robot root z above ground at the snap (a heightmap stand-in);
+* ``cmd_tokens``: the strided FUTURE velocity command over the F-step window;
+* ``state`` (the target): the ``F``-node clip future **ego-anchored onto the robot**
+  at the snap (recorded ``ref_future``), re-expressed in the SAME robot xyz+yaw
+  frame -- node 0 offset ≈ 0 by construction.
+
+One state normalizer (history + target share it), a command normalizer, and a 1-D
+height normalizer. Snap events are exactly the FM's deploy re-inference points, so
+the training anchors match the teacher's actual rollout.
 """
 
 from __future__ import annotations
@@ -64,7 +71,7 @@ def _stack_frame_tensors(
         split_fn: ``name -> (..., dim)`` slicer over the windowed state (the local
             ``_split``), where ``...`` flattens to ``rows``.
         frame_names: Ordered extra body-frame names; ``[]`` returns all ``None``.
-        rows: Flattened leading dimension (e.g. ``n_win * window_len``).
+        rows: Flattened leading dimension.
 
     Returns:
         ``(frame_pos_w, frame_quat_w, frame_lin_vel_w, frame_ang_vel_w)`` each
@@ -80,36 +87,36 @@ def _stack_frame_tensors(
     return fp, fq, fl, fa
 
 
-def episode_windows(
+def snap_windows(
     episode_id: np.ndarray,
     step_in_episode: np.ndarray,
     done: np.ndarray,
-    window_len: int,
-    stride: int,
+    reanchor_active: np.ndarray,
+    num_history: int,
+    stride: int = 1,
 ) -> list[np.ndarray]:
-    """Build valid window index arrays from flat per-pair bookkeeping.
+    """History-row windows ending at each snap (re-anchor) event.
 
-    A window is valid iff all its rows share one ``episode_id``, the
-    ``step_in_episode`` values are strictly consecutive, and no row before the
-    last is a ``done`` (resets are never crossed). Returns row indices into the
-    original flat arrays.
+    Returns one int array of length ``num_history`` per usable snap: the ``N``
+    consecutive rows of one episode ending at a row where ``reanchor_active`` is set
+    (the FM's deploy re-inference points). A snap is usable iff it has ``N-1`` prior
+    consecutive steps in the same episode with no ``done`` before the snap.
 
     Args:
-        episode_id: Per-pair episode id, shape ``(N,)``.
-        step_in_episode: Per-pair step index within its episode, shape ``(N,)``.
-        done: Per-pair episode-end flag, shape ``(N,)``.
-        window_len: Window length ``F``.
-        stride: Sliding stride.
+        episode_id / step_in_episode / done / reanchor_active: Per-pair flat arrays.
+        num_history: ``N`` history steps (the snap is the last of the ``N``).
+        stride: Keep every ``stride``-th usable snap (per episode).
 
     Returns:
-        List of int arrays, each of length ``window_len``.
+        List of int arrays, each of length ``num_history`` (last entry = the snap row).
     """
-    order = np.lexsort((step_in_episode, episode_id))  # primary: episode_id, secondary: step
+    order = np.lexsort((step_in_episode, episode_id))
     ep_sorted = episode_id[order]
     step_sorted = step_in_episode[order]
     done_sorted = done[order]
+    snap_sorted = reanchor_active[order].astype(bool)
 
-    windows: list[np.ndarray] = []
+    out: list[np.ndarray] = []
     n = len(order)
     start = 0
     while start < n:
@@ -119,64 +126,26 @@ def episode_windows(
         ep_rows = order[start : end + 1]
         ep_steps = step_sorted[start : end + 1]
         ep_done = done_sorted[start : end + 1]
+        ep_snap = snap_sorted[start : end + 1]
         length = len(ep_rows)
-        for s in range(0, length - window_len + 1, stride):
-            sl = slice(s, s + window_len)
+        kept = 0
+        for j in range(num_history - 1, length):
+            if not ep_snap[j]:
+                continue
+            sl = slice(j - (num_history - 1), j + 1)
             if not np.all(np.diff(ep_steps[sl]) == 1):
                 continue
-            if np.any(ep_done[sl][:-1] != 0):
+            if np.any(ep_done[sl][:-1] != 0):  # no reset within the history window
                 continue
-            windows.append(ep_rows[sl].copy())
+            if kept % stride == 0:
+                out.append(ep_rows[sl].copy())
+            kept += 1
         start = end + 1
-    return windows
-
-
-def filter_windows_by_recovery(
-    windows: list[np.ndarray],
-    perturb_active: np.ndarray | None,
-    num_history_states: int,
-    mode: str,
-) -> list[np.ndarray]:
-    """Drop windows whose prediction region overlaps a perturbation (recovery mode).
-
-    For perturbed recordings (``perturb_active`` flags steps where action-noise /
-    pushes were active), ``"clean_prediction"`` keeps a window only when its
-    prediction region (steps ``num_history_states..F``) is entirely clean; the
-    history (steps ``0..num_history_states``) may be perturbed. This yields both
-    fully-clean windows and bad-state-history -> clean-recovery windows, dropping
-    only the "predict-the-perturbation" windows. ``"all"`` keeps everything.
-
-    Args:
-        windows: Valid window index arrays (each length ``F``), from
-            :func:`episode_windows`.
-        perturb_active: Per-pair perturbation flag (``1`` = active), or ``None``
-            (recordings without it always fall back to keeping all windows).
-        num_history_states: ``N`` -- the number of leading history tokens.
-        mode: ``"all"`` or ``"clean_prediction"``.
-
-    Returns:
-        The filtered list of windows.
-
-    Raises:
-        ValueError: If ``mode`` is not recognized.
-    """
-    if mode == "all" or perturb_active is None:
-        return windows
-    if mode != "clean_prediction":
-        raise ValueError(f"Unknown recovery_mode {mode!r}; expected 'clean_prediction' or 'all'.")
-    if not windows:
-        return windows
-    # Vectorized over all windows at once (a per-window Python loop is too slow at the
-    # ~10M-window scale of large recordings): keep windows whose prediction region
-    # (steps num_history_states..F) has no active perturbation flag.
-    pa = np.asarray(perturb_active).astype(bool)
-    idx = np.stack(windows)  # (Nw, F)
-    keep = ~pa[idx[:, num_history_states:]].any(axis=1)  # (Nw,)
-    return [windows[i] for i in np.nonzero(keep)[0].tolist()]
+    return out
 
 
 class FutureStateDataset(Dataset):
-    """Precomputed fixed-length state windows in the relative-frame representation."""
+    """Robot-state-conditioned FM items: (history, height, cmd) -> ego-anchored clip future."""
 
     def __init__(
         self,
@@ -186,122 +155,153 @@ class FutureStateDataset(Dataset):
         windows: list[np.ndarray],
         state_normalizer: Normalizer | None = None,
         cmd_normalizer: Normalizer | None = None,
+        height_normalizer: Normalizer | None = None,
         add_noise: bool = False,
     ):
-        """Build and (optionally) fit normalizers over the provided windows.
+        """Build and (optionally) fit normalizers over the provided snap windows.
 
         Args:
-            data: Recorded arrays (must include ``state``; ``ref_state`` for the
-                reference target; the command array when ``cfg.cmd_array`` is set).
-            meta: Layout metadata (reads ``state_term_names/dims``, ``state_frame_names``).
-            cfg: Config; ``state_dim`` and ``cmd_dim`` are written back here.
-            windows: Valid window index arrays (from :func:`episode_windows`).
-            state_normalizer: If given, reused (val split); else fit on these windows.
-            cmd_normalizer: If given, reused (val split); else fit on these windows.
-            add_noise: Add resampled observation noise to the conditioning tokens
-                (first N steps) in ``__getitem__`` (train split only). Gated by
-                ``cfg.obs_noise``; the prediction target is never perturbed.
+            data: Recorded arrays (``state``, ``ref_future``, ``cmd_future``).
+            meta: Layout metadata (``state_term_names/dims``, ``state_frame_names``,
+                ``ref_future_term_names/dims``, ``ref_future_len``).
+            cfg: Config; ``state_dim``/``cmd_dim``/``history_dim`` written back here.
+            windows: History-row windows (length ``N``) from :func:`snap_windows`.
+            state_normalizer / cmd_normalizer / height_normalizer: reused on the val
+                split; fit on the train split when ``None``.
+            add_noise: Add resampled observation noise to the history tokens in
+                ``__getitem__`` (train split only); gated by ``cfg.obs_noise``.
         """
         self.cfg = cfg
         f = cfg.future_len
         n = cfg.num_history_states
         self.N = n
-        if n < 1 or n >= f:
-            raise ValueError(f"num_history_states={n} must satisfy 1 <= N < future_len={f}.")
+        if n < 1:
+            raise ValueError(f"num_history_states={n} must be >= 1.")
+        if cfg.target_source != "ego_anchored_clip_future":
+            raise NotImplementedError(
+                f"FutureStateDataset on this branch supports only "
+                f"target_source='ego_anchored_clip_future' (got {cfg.target_source!r}); "
+                "the robot-state-conditioned FM trains on recorded ego-anchored clip futures."
+            )
+        if data.get("ref_future") is None:
+            raise ValueError(
+                "target_source='ego_anchored_clip_future' requires a 'ref_future' array; "
+                "re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
+            )
         if len(windows) == 0:
-            raise ValueError("No valid windows; check episode lengths vs future_len.")
+            raise ValueError("No valid snap windows; check reanchor_active vs num_history_states.")
 
-        # -- resolve state layout --
+        # -- resolve state layout (the node layout of ref_future == state layout) --
         s_names, s_dims = list(meta.state_term_names), list(meta.state_term_dims)
         s_slc = {name: resolve_term_slice(s_names, s_dims, name) for name in s_names}
         nj = s_dims[s_names.index("joint_pos")]
         self.num_joints = nj
-        # Extra body frames recorded beyond root + joints (e.g. feet/hands for the
-        # CLF). Each contributes a [pos, lin_vel, ori6d, ang_vel] block to the state.
-        # History and target share this single (full) representation.
         recorded_frames = list(getattr(meta, "state_frame_names", []) or [])
         self.target_frame_names = list(recorded_frames)
         self.num_extra_frames = len(self.target_frame_names)
         self.state_dim = target_state_dim(nj, self.num_extra_frames)
         cfg.state_dim = self.state_dim
+        cfg.history_dim = self.state_dim
 
-        # -- resolve the command input (strided commanded-velocity profile) --
+        rf = data["ref_future"]
+        if rf.shape[1] != f:
+            raise ValueError(
+                f"ref_future has F={rf.shape[1]} nodes but cfg.future_len={f}; "
+                "re-record with --ref_future_len matching future_len."
+            )
+
+        # -- command (strided future velocity profile from cmd_future) --
         self.cmd_array = cfg.cmd_array
-        if self.cmd_array is not None:
-            cmd_np = data.get(self.cmd_array)
-            if cmd_np is None:
-                raise ValueError(
-                    f"cmd_array={self.cmd_array!r} not in the recording; re-record with "
-                    f"scripts/rsl_rl/record_data.py on a clip task that exposes it (e.g. target_vel)."
-                )
-            cmd_dim = int(cmd_np.shape[1])
-        else:
-            cmd_dim = 0
+        cmd_future = data.get("cmd_future")
+        if self.cmd_array is not None and cmd_future is None:
+            raise ValueError("cmd_array set but the recording has no 'cmd_future' array.")
+        cmd_dim = int(cmd_future.shape[-1]) if (self.cmd_array is not None and cmd_future is not None) else 0
         self.cmd_dim = cmd_dim
         cfg.cmd_dim = cmd_dim
         self.cmd_steps = list(range(0, f, cfg.cmd_stride))
         self.num_cmd_tokens = len(self.cmd_steps) if cmd_dim > 0 else 0
 
-        idx = np.stack(windows).astype(np.int64)  # (Nw, F)
-        n_win = idx.shape[0]
+        idx_hist = np.stack(windows).astype(np.int64)  # (Nw, N) history rows; last = snap row
+        snap_rows = idx_hist[:, -1]                    # (Nw,)
+        n_win = idx_hist.shape[0]
 
         state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
-        sw = state_t[idx]  # (Nw, F, state_raw)
+        rf_t = torch.from_numpy(np.ascontiguousarray(rf)).float()  # (P, F, node)
 
-        def _split(name: str) -> torch.Tensor:
+        # Anchor = robot base at the snap row (xyz+yaw, applied inside relative_state).
+        root_pos_slc, root_quat_slc = s_slc["root_pos_w"], s_slc["root_quat_w"]
+        p_anchor = state_t[snap_rows, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3)
+        q_anchor = state_t[snap_rows, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
+
+        # -- history: N real robot-state rows ending at the snap, in the anchor frame --
+        hw = state_t[idx_hist]  # (Nw, N, state_raw)
+
+        def _split_hist(name: str) -> torch.Tensor:
             a, b = s_slc[name]
-            return sw[..., a:b]
+            return hw[..., a:b]
 
-        p = _split("root_pos_w")              # (Nw, F, 3)
-        q = _split("root_quat_w")             # (Nw, F, 4)
-        v = _split("root_link_lin_vel_w")     # (Nw, F, 3)
-        wv = _split("root_link_ang_vel_w")    # (Nw, F, 3)
-        jp = _split("joint_pos")              # (Nw, F, nj)
-        jv = _split("joint_vel")              # (Nw, F, nj)
+        m_h = n_win * n
+        pr_h = p_anchor[:, None, :].expand(n_win, n, 3).reshape(m_h, 3)
+        qr_h = q_anchor[:, None, :].expand(n_win, n, 4).reshape(m_h, 4)
+        fp, fq, fl, fa = _stack_frame_tensors(_split_hist, self.target_frame_names, m_h)
+        history = relative_state(
+            _split_hist("root_pos_w").reshape(m_h, 3), _split_hist("root_quat_w").reshape(m_h, 4),
+            _split_hist("root_link_lin_vel_w").reshape(m_h, 3), _split_hist("root_link_ang_vel_w").reshape(m_h, 3),
+            _split_hist("joint_pos").reshape(m_h, nj), _split_hist("joint_vel").reshape(m_h, nj),
+            pr_h, qr_h, frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
+        ).reshape(n_win, n, self.state_dim).contiguous()
 
-        # Relative-frame anchor = most recent history step (index N-1), shared by the
-        # actual-state conditioning and the prediction target.
-        anchor = n - 1
-        p_ref0 = p[:, anchor : anchor + 1, :]
-        q_ref0 = q[:, anchor : anchor + 1, :]
-        m = n_win * f
-        pr = p_ref0.expand(n_win, f, 3).reshape(m, 3)
-        qr = q_ref0.expand(n_win, f, 4).reshape(m, 4)
+        # -- target: the F-node ego-anchored clip future at the snap, in the same frame --
+        tw = rf_t[snap_rows]  # (Nw, F, node)
 
-        fp, fq, fl, fa = _stack_frame_tensors(_split, self.target_frame_names, m)
-        actual = relative_state(
-            p.reshape(m, 3), q.reshape(m, 4), v.reshape(m, 3), wv.reshape(m, 3),
-            jp.reshape(m, nj), jv.reshape(m, nj), pr, qr,
-            frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
-        ).reshape(n_win, f, self.state_dim).contiguous()  # conditioning source
+        def _split_tgt(name: str) -> torch.Tensor:
+            a, b = s_slc[name]
+            return tw[..., a:b]
 
-        if cfg.target_source == "reference":
-            target = self._reference_future(data, s_slc, idx, p, q, anchor, f, nj).contiguous()
-        elif cfg.target_source == "actual":
-            target = actual
-        else:
-            raise ValueError(
-                f"Unknown target_source {cfg.target_source!r}; expected 'actual' or 'reference'."
-            )
+        m_t = n_win * f
+        pr_t = p_anchor[:, None, :].expand(n_win, f, 3).reshape(m_t, 3)
+        qr_t = q_anchor[:, None, :].expand(n_win, f, 4).reshape(m_t, 4)
+        fpt, fqt, flt, fat = _stack_frame_tensors(_split_tgt, self.target_frame_names, m_t)
+        target = relative_state(
+            _split_tgt("root_pos_w").reshape(m_t, 3), _split_tgt("root_quat_w").reshape(m_t, 4),
+            _split_tgt("root_link_lin_vel_w").reshape(m_t, 3), _split_tgt("root_link_ang_vel_w").reshape(m_t, 3),
+            _split_tgt("joint_pos").reshape(m_t, nj), _split_tgt("joint_vel").reshape(m_t, nj),
+            pr_t, qr_t, frame_pos_w=fpt, frame_quat_w=fqt, frame_lin_vel_w=flt, frame_ang_vel_w=fat,
+        ).reshape(n_win, f, self.state_dim).contiguous()
 
-        # Reference pose per window (anchor step), kept raw for eval/denorm to world.
-        self.p_ref = p[:, anchor, :].contiguous()  # (Nw, 3)
-        self.q_ref = q[:, anchor, :].contiguous()  # (Nw, 4)
+        # node-0 invariant: the clip ego-anchored at the snap sits on the robot root,
+        # so target node 0's root position ≈ 0 in the robot frame. Warn if it drifts.
+        rb = frame_block_start(nj, 0)
+        node0_off = target[:, 0, rb:rb + 3].norm(dim=-1).mean().item()
+        if node0_off > 0.15:
+            print(f"[fm-data][WARN] target node-0 root offset mean={node0_off:.3f} m (> 0.15); "
+                  "the recorded ref_future may not be ego-anchored onto the robot at the snap.")
 
-        # Strided command tokens over the window.
+        # Height token = robot root z above ground at the snap.
+        self.height = (p_anchor[:, 2:3] - float(cfg.ground_z)).contiguous()  # (Nw, 1)
+
+        # Reference pose per window (the snap-step robot base), raw for eval/denorm.
+        self.p_ref = p_anchor.contiguous()
+        self.q_ref = q_anchor.contiguous()
+
+        # Strided future command tokens.
         if cmd_dim > 0:
-            cmd_full = torch.from_numpy(np.ascontiguousarray(data[self.cmd_array])).float()[idx]  # (Nw,F,cmd)
-            cmd_strided = cmd_full[:, self.cmd_steps, :].contiguous()  # (Nw, num_cmd_tokens, cmd)
+            cf = torch.from_numpy(np.ascontiguousarray(cmd_future)).float()[snap_rows]  # (Nw, F, cmd)
+            cmd_strided = cf[:, self.cmd_steps, :].contiguous()
         else:
             cmd_strided = None
 
-        # -- normalizers (fit on train; every frame's ori6d block left raw) --
+        # -- normalizers (fit on train; ori6d blocks left raw) --
         state_mask = torch.ones(self.state_dim, dtype=torch.bool)
         for o0, o1 in orientation_slices(nj, self.num_extra_frames):
             state_mask[o0:o1] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
         self.state_normalizer = state_normalizer
+
+        if height_normalizer is None:
+            height_normalizer = Normalizer.fit(self.height, torch.ones(1, dtype=torch.bool))
+        self.height_normalizer = height_normalizer
 
         if cmd_dim > 0:
             if cmd_normalizer is None:
@@ -314,99 +314,24 @@ class FutureStateDataset(Dataset):
             self.cmd_normalizer = None
             self.cmd_tokens = None
 
-        # Pre-normalize once. ``cond`` is the actual-state conditioning; for the
-        # "actual" target it is the same tensor as the (target) ``state``.
-        self.state = state_normalizer.normalize(target)
-        self.cond = self.state if cfg.target_source == "actual" else state_normalizer.normalize(actual)
+        # Pre-normalize once.
+        self.state = state_normalizer.normalize(target)           # (Nw, F, D) target
+        self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
+        self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, 1)
 
-        # -- observation noise (train-time augmentation; conditioning tokens only) --
+        # -- observation noise (train-time augmentation; history tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
         self.state_noise = (
             self._state_noise_std(state_normalizer) if self.add_noise else None
         )
 
-    def _reference_future(
-        self,
-        data: dict[str, np.ndarray],
-        s_slc: dict[str, tuple[int, int]],
-        idx: np.ndarray,
-        p_actual: torch.Tensor,
-        q_actual: torch.Tensor,
-        anchor: int,
-        f: int,
-        nj: int,
-    ) -> torch.Tensor:
-        """Build the prediction target from the recorded reference (``ref_state``).
-
-        The reference window is expressed in the *same* relative frame as the
-        actual-state conditioning: anchored at the actual root pose at the most
-        recent history step (``p_actual``/``q_actual`` at index ``anchor``), so the
-        conditioning is identical regardless of target source.
-
-        Args:
-            data: Recorded arrays; must include a non-``None`` ``ref_state``.
-            s_slc: Per-term ``(start, end)`` slices within the state vector.
-            idx: Window row indices, shape ``(Nw, F)``.
-            p_actual: Actual root positions over the window, shape ``(Nw, F, 3)``.
-            q_actual: Actual root quaternions over the window, shape ``(Nw, F, 4)``.
-            anchor: Index of the anchor (most recent history) step.
-            f: Window length ``F``.
-            nj: Number of joints.
-
-        Returns:
-            Reference window in the relative-frame representation, shape ``(Nw, F, state_dim)``.
-
-        Raises:
-            ValueError: If the recording has no ``ref_state`` array.
-        """
-        ref_np = data.get("ref_state")
-        if ref_np is None:
-            raise ValueError(
-                "target_source='reference' requires a 'ref_state' array in the recording; "
-                "re-record with scripts/rsl_rl/record_data.py on a task that has a trajectory command."
-            )
-        ref_t = torch.from_numpy(np.ascontiguousarray(ref_np)).float()
-        rw = ref_t[idx]  # (Nw, F, state_raw)
-        n_win = rw.shape[0]
-
-        def _split(name: str) -> torch.Tensor:
-            a, b = s_slc[name]
-            return rw[..., a:b]
-
-        pf = _split("root_pos_w")
-        qf = _split("root_quat_w")
-        vf = _split("root_link_lin_vel_w")
-        wf = _split("root_link_ang_vel_w")
-        jpf = _split("joint_pos")
-        jvf = _split("joint_vel")
-
-        p_ref = p_actual[:, anchor : anchor + 1, :].expand(n_win, f, 3)
-        q_ref = q_actual[:, anchor : anchor + 1, :].expand(n_win, f, 4)
-
-        m = n_win * f
-        fpos, fquat, flin, fang = _stack_frame_tensors(_split, self.target_frame_names, m)
-        return relative_state(
-            pf.reshape(m, 3), qf.reshape(m, 4), vf.reshape(m, 3), wf.reshape(m, 3),
-            jpf.reshape(m, nj), jvf.reshape(m, nj),
-            p_ref.reshape(m, 3), q_ref.reshape(m, 4),
-            frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
-        ).reshape(n_win, f, self.state_dim)
-
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
-        """Per-channel uniform noise half-width (normalized space) for a state token.
+        """Per-channel uniform noise half-width (normalized space) for a history token.
 
         Maps the config's physical per-group amplitudes onto the state layout
-        ``[joint_pos | joint_vel | frame blocks x (1+K)]`` (each frame block =
-        ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]``, frame 0 the root), scales by
-        ``cfg.noise_scale``, then divides by the normalizer std so the amplitude is in
-        the same normalized space as ``self.state`` (ori6d channels have ``std == 1``,
-        so their noise stays in raw 6D units).
-
-        Args:
-            state_normalizer: The fitted state normalizer.
-
-        Returns:
-            Non-negative half-widths, shape ``(state_dim,)``.
+        ``[joint_pos | joint_vel | frame blocks x (1+K)]``, scales by ``cfg.noise_scale``,
+        then divides by the normalizer std (ori6d channels have std==1, so their noise
+        stays in raw 6D units).
         """
         cfg = self.cfg
         nj = self.num_joints
@@ -425,15 +350,14 @@ class FutureStateDataset(Dataset):
         return self.state.shape[0]
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        state = self.state[i]
-        cond = self.cond[i]
+        history = self.history[i]
         if self.add_noise:
             noise = (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            cond = cond.clone()
-            cond[: self.N] = cond[: self.N] + noise
+            history = history + noise
         item = {
-            "state": state,
-            "cond": cond,
+            "state": self.state[i],          # (F, D) ego-anchored clip future target
+            "history": history,              # (N, D) real-robot phase conditioning
+            "height": self.height_norm_tokens[i],  # (1,)
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }
@@ -447,46 +371,36 @@ def build_train_val(
 ) -> tuple[FutureStateDataset, FutureStateDataset | None]:
     """Build train/val datasets, splitting by ``episode_id`` to avoid leakage.
 
-    Normalizers are fit on the train split and shared with val. If the val split
-    has no valid windows, ``None`` is returned for it.
+    Uses snap-event windows (the robot-state-conditioned FM paradigm). Normalizers are
+    fit on the train split and shared with val. ``train_ds.val_episode_ids`` records the
+    held-out episode ids so the test bench can label train vs eval. If the val split has
+    no windows, ``None`` is returned for it.
 
     Args:
-        data: Recorded arrays.
+        data: Recorded arrays (must include ``reanchor_active`` + ``ref_future``).
         meta: Layout metadata.
         cfg: Config.
 
     Returns:
         ``(train_ds, val_ds_or_None)``.
     """
-    window_len = cfg.future_len
-    windows = episode_windows(
-        data["episode_id"], data["step_in_episode"], data["done"], window_len, cfg.stride
+    reanchor = data.get("reanchor_active")
+    if reanchor is None:
+        raise ValueError(
+            "Recording has no 'reanchor_active' flag; the robot-state-conditioned FM trains "
+            "on snap (re-anchor) events. Re-record with ego_anchor_fraction=1.0."
+        )
+    windows = snap_windows(
+        data["episode_id"], data["step_in_episode"], data["done"],
+        reanchor, cfg.num_history_states, cfg.stride,
     )
     if len(windows) == 0:
-        raise ValueError("No valid windows produced from the dataset.")
-
-    # Recovery-aware filtering: keep windows whose prediction region is clean when
-    # the recording carries a per-step perturbation flag (record_data.py --perturb).
-    recovery_mode = getattr(cfg, "recovery_mode", "all")
-    perturb_active = data.get("perturb_active")
-    if recovery_mode != "all" and perturb_active is None:
-        print(f"[fm-data] recovery_mode={recovery_mode!r} but recording has no 'perturb_active'; "
-              "using all windows.")
-    elif recovery_mode != "all":
-        n_before = len(windows)
-        windows = filter_windows_by_recovery(
-            windows, perturb_active, cfg.num_history_states, recovery_mode
+        raise ValueError(
+            "No valid snap windows; every snap lacks N prior consecutive steps. "
+            "Check ego_anchor_every >= num_history_states and the recording length."
         )
-        print(f"[fm-data] recovery_mode={recovery_mode!r}: kept {len(windows)}/{n_before} windows "
-              f"(dropped {n_before - len(windows)} with a perturbed prediction region).")
-        if len(windows) == 0:
-            raise ValueError(
-                f"recovery_mode={recovery_mode!r} dropped all windows; the prediction region of "
-                "every window overlaps a perturbation. Lower the perturbation duty cycle or use "
-                "--recovery-mode all."
-            )
 
-    ep_of_window = np.array([data["episode_id"][w[0]] for w in windows])
+    ep_of_window = np.array([data["episode_id"][w[-1]] for w in windows])  # episode of the snap
     unique_eps = np.unique(ep_of_window)
     rng = np.random.default_rng(cfg.seed)
     n_val = int(round(cfg.val_fraction * len(unique_eps)))
@@ -494,14 +408,17 @@ def build_train_val(
 
     train_windows = [w for w, e in zip(windows, ep_of_window) if e not in val_eps]
     val_windows = [w for w, e in zip(windows, ep_of_window) if e in val_eps]
+    print(f"[fm-data] {len(windows)} snap windows ({len(train_windows)} train / "
+          f"{len(val_windows)} val) over {len(unique_eps)} episodes.")
 
-    # Observation noise augments the training split only; val keeps clean inputs.
     train_ds = FutureStateDataset(data, meta, cfg, train_windows, add_noise=True)
+    train_ds.val_episode_ids = sorted(int(e) for e in val_eps)  # for the bench's eval split
     val_ds = None
     if len(val_windows) > 0:
         val_ds = FutureStateDataset(
             data, meta, cfg, val_windows,
             state_normalizer=train_ds.state_normalizer,
             cmd_normalizer=train_ds.cmd_normalizer,
+            height_normalizer=train_ds.height_normalizer,
         )
     return train_ds, val_ds

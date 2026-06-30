@@ -43,14 +43,15 @@ from robot_rl.flow_matching import (  # noqa: E402
     FutureStateDataset,
     box_sole_points,
     build_train_val,
-    episode_windows,
     flow_matching_loss,
     frame_block_start,
     matrix_from_quat,
     orientation_slice,
     rot6d_to_matrix,
     sample_trajectory,
+    snap_windows,
     terrain_penetration_term,
+    yaw_quat,
 )
 
 
@@ -79,17 +80,18 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "F - num_history_states (default from config.py, sized to cover the "
                              "deploy-time policy lookahead; see FlowMatchingConfig.future_len).")
     parser.add_argument("--num_history_states", type=int, default=2,
-                        help="N most-recent measured states used as clean conditioning tokens.")
-    parser.add_argument("--history_dropout_prob", type=float, default=0.8,
-                        help="Probability a training sample drops its history (denoised "
-                             "unconditionally), regularizing history over-reliance.")
+                        help="N most-recent real-robot states used as history (phase) conditioning tokens.")
+    parser.add_argument("--null_cond_prob", type=float, default=FlowMatchingConfig().null_cond_prob,
+                        help="Probability a training sample's history (phase) tokens are replaced by "
+                             "the model's learned null embedding (classifier-free guidance / phase-agnostic).")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument(
-        "--target_source", type=str, default="auto", choices=["auto", "actual", "reference"],
-        help="Future target: 'reference' (tracked clip reference) or 'actual' (recorded robot "
-             "state). Default 'auto' -> 'reference' if the recording has ref_state else 'actual'. "
-             "History conditioning is always the actual state.",
+        "--target_source", type=str, default="auto",
+        choices=["auto", "ego_anchored_clip_future"],
+        help="Future target. 'ego_anchored_clip_future': the clip ego-anchored onto the robot at "
+             "the snap (recorded ref_future) -- the robot-state-conditioned paradigm. Default 'auto' "
+             "resolves to it when the recording has ref_future.",
     )
     parser.add_argument(
         "--cmd_array", type=str, default="auto",
@@ -196,7 +198,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         future_len=args.future_len, num_history_states=args.num_history_states,
-        history_dropout_prob=args.history_dropout_prob, stride=args.stride,
+        null_cond_prob=args.null_cond_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
         recovery_mode=args.recovery_mode,
         cmd_array=args.cmd_array, cmd_stride=args.cmd_stride,
@@ -279,25 +281,6 @@ def channel_metrics(
     return out
 
 
-def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_history) -> torch.Tensor:
-    """Per-token conditioning mask ``(B, F)``: first N tokens known where history is used.
-
-    Args:
-        batch_size: Number of samples ``B``.
-        cfg: Config (reads ``future_len`` and ``num_history_states``).
-        device: Target device.
-        use_history: Per-sample bool ``(B,)`` (history used), or ``True``/``False`` for all.
-
-    Returns:
-        Boolean mask ``(B, F)``.
-    """
-    f, n = cfg.future_len, cfg.num_history_states
-    if isinstance(use_history, bool):
-        use_history = torch.full((batch_size,), use_history, dtype=torch.bool, device=device)
-    is_hist = torch.arange(f, device=device).unsqueeze(0) < n  # (1, F)
-    return use_history.unsqueeze(1) & is_hist
-
-
 _CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel",
               "terrain_penetration", "terrain_penetration_sample")
 
@@ -346,7 +329,7 @@ def _terrain_calibrate(train_ds, foot_idxs, contact_pts, num_joints, device, per
     x = train_ds.state_normalizer.denormalize(s)            # (W, F, D) physical (ref frame)
     p_ref = train_ds.p_ref[:n_windows].to(device)
     q_ref = train_ds.q_ref[:n_windows].to(device)
-    r_ref = matrix_from_quat(q_ref)                          # (W, 3, 3)
+    r_ref = matrix_from_quat(yaw_quat(q_ref))                # (W, 3, 3) yaw-ground->world (matches rel frame)
     cpts = None if contact_pts is None else contact_pts.to(x)
     zs = []
     for fi in foot_idxs:
@@ -385,55 +368,54 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk,
 @torch.no_grad()
 def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0,
              fk=None, terrain=None, foot_idxs=None, contact_pts=None) -> dict[str, float]:
-    """Compute conditioned/unconditional flow loss and per-channel sampling metrics.
+    """Compute conditioned/null-history flow loss and per-channel sampling metrics.
 
-    Metrics are over the novel (predicted) frames ``N..F-1`` only; ``flow_mse`` is the
-    conditioned masked loss and ``flow_mse_uncond`` drops the history.
+    Metrics are over the full F-step prediction; ``flow_mse`` is the history-conditioned
+    loss and ``flow_mse_null`` replaces the history with the learned null embedding.
     """
     model.eval()
-    n = cfg.num_history_states
-    flow_sum, flow_unc_sum, n_batches = 0.0, 0.0, 0
+    flow_sum, flow_null_sum, n_batches = 0.0, 0.0, 0
     cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
     ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk, terrain, foot_idxs, contact_pts)
     for batch in loader:
         state = batch["state"].to(device)
-        cond = batch["cond"].to(device)
+        history = batch["history"].to(device)
+        height = batch["height"].to(device)
         cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
         p_ref = batch["p_ref"].to(device)
         q_ref = batch["q_ref"].to(device)
         b = state.shape[0]
-        known = make_known_mask(b, cfg, device, True)
-        none = make_known_mask(b, cfg, device, False)
-        cond_out = flow_matching_loss(model, state, cond, known, cmd_tokens,
+        cond_out = flow_matching_loss(model, state, history, height, cmd_tokens,
                                       state_norm=state_normalizer, p_ref=p_ref, q_ref=q_ref, **ckw)
         flow_sum += cond_out["flow_mse"].item()
         for k in _CONS_KEYS:
             if k in cond_out:
                 cons_sums[k] = cons_sums.get(k, 0.0) + cond_out[k].item()
-        flow_unc_sum += flow_matching_loss(model, state, cond, none, cmd_tokens)["flow_mse"].item()
+        null_mask = torch.ones(b, dtype=torch.bool, device=device)
+        flow_null_sum += flow_matching_loss(
+            model, state, history, height, cmd_tokens, history_null_mask=null_mask
+        )["flow_mse"].item()
         n_batches += 1
         pred = sample_trajectory(
-            model, cond, known, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
-            cmd_tokens=cmd_tokens,
+            model, history, height, cmd_tokens, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
         )
         pred_full = state_normalizer.denormalize(pred)
-        pred_d = pred_full[:, n:]
-        tgt_d = state_normalizer.denormalize(state)[:, n:]
-        for k, v in channel_metrics(pred_d, tgt_d, num_joints, num_extra_frames).items():
+        tgt_d = state_normalizer.denormalize(state)
+        for k, v in channel_metrics(pred_full, tgt_d, num_joints, num_extra_frames).items():
             metric_sums[k] = metric_sums.get(k, 0.0) + v
-        # The metric we actually care about: terrain penetration of the deployed multi-step
-        # sample (reported regardless of whether the sampled-rollout penalty is weighted).
+        # Terrain penetration of the deployed multi-step sample (reported regardless of
+        # whether the sampled-rollout penalty is weighted).
         if terrain is not None and foot_idxs:
             pen_s = terrain_penetration_term(
-                pred_full, pred_full, known, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain,
+                pred_full, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain,
             ).mean()
             metric_sums["terrain_penetration_sample"] = (
                 metric_sums.get("terrain_penetration_sample", 0.0) + pen_s.item()
             )
     out = {
         "flow_mse": flow_sum / max(n_batches, 1),
-        "flow_mse_uncond": flow_unc_sum / max(n_batches, 1),
+        "flow_mse_null": flow_null_sum / max(n_batches, 1),
     }
     for k, v in cons_sums.items():
         out[k] = v / max(n_batches, 1)
@@ -469,7 +451,7 @@ def main() -> None:
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
-          f"history_dropout={cfg.history_dropout_prob}, train_windows={len(train_ds)}, "
+          f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
     if cfg.obs_noise:
         print(f"[INFO] obs_noise=on (conditioning tokens, train split only), scale={cfg.noise_scale} | "
@@ -500,6 +482,9 @@ def main() -> None:
         "recording_meta": asdict(meta) if hasattr(meta, "__dataclass_fields__") else dict(vars(meta)),
         "eval_data": os.path.abspath(eval_path) if eval_path else None,
         "eval_data_sha256": eval_sha,
+        # Held-out val episode ids (by episode_id) so the test bench can label the
+        # forecast_step --forecast-split eval set deterministically.
+        "val_episode_ids": getattr(train_ds, "val_episode_ids", []),
     })
     print(f"[INFO] Provenance -> {out_dir}/params/{{fm_config,data}}.yaml + git/  (data sha {data_sha256[:12]})")
 
@@ -517,7 +502,9 @@ def main() -> None:
                                  num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
     model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len, cmd_dim=cfg.cmd_dim,
+        state_dim=cfg.state_dim, future_len=cfg.future_len,
+        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
+        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(device)
@@ -527,6 +514,7 @@ def main() -> None:
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
     train_ds.state_normalizer.to(device)
+    train_ds.height_normalizer.to(device)
     if train_ds.cmd_normalizer is not None:
         train_ds.cmd_normalizer.to(device)
 
@@ -589,16 +577,17 @@ def main() -> None:
         epoch_loss, n = 0.0, 0
         for batch in train_loader:
             state = batch["state"].to(device)
-            cond = batch["cond"].to(device)
+            history = batch["history"].to(device)
+            height = batch["height"].to(device)
             cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
             p_ref = batch["p_ref"].to(device)
             q_ref = batch["q_ref"].to(device)
-            # Per-sample history dropout: use the conditioning tokens w.p. (1 - dropout).
-            use_hist = torch.rand(state.shape[0], device=device) >= cfg.history_dropout_prob
-            known = make_known_mask(state.shape[0], cfg, device, use_hist)
+            # Per-sample history null-out (classifier-free guidance / phase-agnostic).
+            null_mask = torch.rand(state.shape[0], device=device) < cfg.null_cond_prob
             opt.zero_grad()
             out = flow_matching_loss(
-                model, state, cond, known, cmd_tokens, ori_slice, cfg.ori6d_aux_weight,
+                model, state, history, height, cmd_tokens,
+                history_null_mask=null_mask, ori_slice=ori_slice, aux_weight=cfg.ori6d_aux_weight,
                 state_norm=train_ds.state_normalizer, p_ref=p_ref, q_ref=q_ref,
                 terrain_sample_weight=cfg.terrain_sample_weight,
                 terrain_sample_size=cfg.terrain_sample_size,
@@ -700,10 +689,15 @@ def _resolve_cmd_array(value, data) -> str | None:
 
 
 def _resolve_target_source(value, data) -> str:
-    """Resolve the ``--target_source`` sentinel: ``auto`` -> 'reference' if the
-    recording has ``ref_state`` else 'actual'."""
+    """Resolve the ``--target_source`` sentinel: ``auto`` -> 'ego_anchored_clip_future'
+    when the recording has ``ref_future`` (the robot-state-conditioned FM target)."""
     if value == "auto":
-        return "reference" if data.get("ref_state") is not None else "actual"
+        if data.get("ref_future") is None:
+            raise ValueError(
+                "Recording has no 'ref_future'; the robot-state-conditioned FM needs it. "
+                "Re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
+            )
+        return "ego_anchored_clip_future"
     return value
 
 
@@ -715,15 +709,19 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
     The eval recording must share the train layout (validated below).
     """
     data, meta = load_recorded_data(eval_path)
-    windows = episode_windows(
-        data["episode_id"], data["step_in_episode"], data["done"], cfg.future_len, cfg.stride
+    if data.get("reanchor_active") is None:
+        raise ValueError(f"--eval_data has no 'reanchor_active' (snap flag): {eval_path}")
+    windows = snap_windows(
+        data["episode_id"], data["step_in_episode"], data["done"],
+        data["reanchor_active"], cfg.num_history_states, cfg.stride,
     )
     if not windows:
-        raise ValueError(f"--eval_data produced no valid windows: {eval_path}")
+        raise ValueError(f"--eval_data produced no valid snap windows: {eval_path}")
     ds = FutureStateDataset(
         data, meta, cfg, windows,
         state_normalizer=train_ds.state_normalizer,
         cmd_normalizer=train_ds.cmd_normalizer,
+        height_normalizer=train_ds.height_normalizer,
     )
     got = (ds.state_dim, ds.cmd_dim, ds.num_extra_frames)
     want = (train_ds.state_dim, train_ds.cmd_dim, train_ds.num_extra_frames)
@@ -752,6 +750,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
         "optimizer": opt.state_dict(),
         "config": cfg.to_dict(),
         "state_normalizer": train_ds.state_normalizer.state_dict(),
+        "height_normalizer": train_ds.height_normalizer.state_dict(),
         "num_joints": train_ds.num_joints,
         "meta": meta_dict,
         "data_path": data_path,
