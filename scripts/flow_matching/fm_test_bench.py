@@ -1260,6 +1260,7 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
     auto_pred_idx: list[int] = []
     spine_rec: dict[str, list] = {k: [] for k in
                                   ("root_pos", "root_quat", "root_lin_vel", "root_ang_vel",
+                                   "joint_pos", "joint_vel",
                                    "ee_pos", "ee_quat", "ee_lin_vel", "ee_ang_vel")}
     pred_win = None          # active world prediction window (reused between re-infers)
     pred_win_disp = None     # display copy (body-frame velocities)
@@ -1302,7 +1303,8 @@ def run_forecast_step(ctx, data, layout, args, device) -> ForecastStepResult:
         auto_win_start.append(win_start)
         auto_pred_idx.append(pred_idx)
         for key, src in (("root_pos", "root_pos_w"), ("root_quat", "root_quat_w"),
-                         ("root_lin_vel", "root_link_lin_vel_w"), ("root_ang_vel", "root_link_ang_vel_w")):
+                         ("root_lin_vel", "root_link_lin_vel_w"), ("root_ang_vel", "root_link_ang_vel_w"),
+                         ("joint_pos", "joint_pos"), ("joint_vel", "joint_vel")):
             spine_rec[key].append(pred_win[src][0, pred_idx].detach().cpu().numpy())
         if have_ee:
             for key, src in (("ee_pos", "frame_pos_w"), ("ee_quat", "frame_quat_w"),
@@ -1719,7 +1721,7 @@ class _FSCtx:
             f"{self.res.auto_spine_t0 + self.k} (t={self.now_t:.2f}s)   re-infer every "
             f"{self.res.fm_update_every} steps, re-anchored on clip{div}\n"
             f"dotted = FM history echo, solid = novel; orange = realized (| = re-infer);  "
-            f"Left/Right = step, Up/Down = root/feet view",
+            f"Left/Right = step, Up/Down = cycle views",
             fontsize=10,
         )
 
@@ -1818,6 +1820,115 @@ def draw_forecast_step_feet(fig, res: ForecastStepResult, k: int) -> None:
 
     c.legend(fig)
     c.suptitle(fig, "feet")
+
+
+def _short_frame_names(names: list[str]) -> list[str]:
+    """Strip the common ``_roll_link`` / ``_link`` suffixes for compact panel titles."""
+    return [nm.replace("_roll_link", "").replace("_link", "") for nm in names]
+
+
+def _fs_grid(fig, res: ForecastStepResult, k: int,
+             specs: list[tuple[str, object, str | None]], view: str, ncols: int) -> None:
+    """Draw a grid of forecast_step panels from ``(title, getter, noise_key)`` specs.
+
+    Each panel reuses :meth:`_FSCtx.panel`, so every output gets the same overlay style
+    as the root/feet views (clip nominal + training-noise band + realized autoregressive
+    spine + clip-history forecast + active FM window with the applied-index dot). ``specs``
+    being empty (e.g. an FM checkpoint with no end-effector frames) draws a placeholder.
+    """
+    fig.clear()
+    c = _FSCtx(res, k)
+    if not specs:
+        ax = fig.subplots(1, 1)
+        ax.text(0.5, 0.5, f"FM checkpoint has no {view} outputs -- nothing to plot",
+                ha="center", va="center", fontsize=11)
+        ax.set_axis_off()
+        c.suptitle(fig, view)
+        return
+    n = len(specs)
+    nrows = (n + ncols - 1) // ncols
+    axs = np.array(fig.subplots(nrows, ncols, squeeze=False)).reshape(nrows, ncols)
+    for i, (title, getter, noise_key) in enumerate(specs):
+        ax = axs.ravel()[i]
+        c.panel(ax, getter, title, noise_key=noise_key)
+        ax.tick_params(labelsize=6)
+    for i in range(n, nrows * ncols):
+        axs.ravel()[i].set_visible(False)
+    c.legend(fig)
+    c.suptitle(fig, view)
+
+
+def draw_forecast_step_root_rot(fig, res: ForecastStepResult, k: int) -> None:
+    """Root angular velocity (x/y/z) + orientation quaternion (w/x/y/z).
+
+    Complements the root view (which carries root pos / lin vel / yaw): together they
+    cover every root output. Quaternion components are raw (sign can flip between steps).
+    """
+    vf = res.vel_frame
+    lab = ["x", "y", "z"]
+    qlab = ["w", "x", "y", "z"]
+    specs: list[tuple[str, object, str | None]] = [
+        (f"root ang vel {lab[i]} ({vf}, rad/s)",
+         (lambda cc: (lambda tr: tr["root_ang_vel"][:, cc]))(i), None) for i in range(3)
+    ]
+    specs += [
+        (f"root quat {qlab[i]}", (lambda cc: (lambda tr: tr["root_quat"][:, cc]))(i), None)
+        for i in range(4)
+    ]
+    _fs_grid(fig, res, k, specs, "root ang vel + quat", ncols=4)
+
+
+def draw_forecast_step_ee_pos(fig, res: ForecastStepResult, k: int) -> None:
+    """World position (x/y/z) for every end-effector frame (one row per frame)."""
+    short = _short_frame_names(res.frame_names)
+    lab = ["x", "y", "z"]
+    specs = [
+        (f"{short[j]} pos {lab[c]} (m, world)",
+         (lambda jj, cc: (lambda tr: tr["ee_pos"][:, jj, cc]))(j, c), "ee_pos")
+        for j in range(len(short)) for c in range(3)
+    ]
+    _fs_grid(fig, res, k, specs, "ee pos", ncols=3)
+
+
+def draw_forecast_step_ee_quat(fig, res: ForecastStepResult, k: int) -> None:
+    """Orientation quaternion (w/x/y/z) for every end-effector frame (raw components)."""
+    short = _short_frame_names(res.frame_names)
+    qlab = ["w", "x", "y", "z"]
+    specs = [
+        (f"{short[j]} quat {qlab[c]}",
+         (lambda jj, cc: (lambda tr: tr["ee_quat"][:, jj, cc]))(j, c), None)
+        for j in range(len(short)) for c in range(4)
+    ]
+    _fs_grid(fig, res, k, specs, "ee quat", ncols=4)
+
+
+def draw_forecast_step_ee_vel(fig, res: ForecastStepResult, k: int) -> None:
+    """Per-frame linear (x/y/z) then angular (x/y/z) velocity -- one row per frame."""
+    short = _short_frame_names(res.frame_names)
+    vf = res.vel_frame
+    lab = ["x", "y", "z"]
+    specs: list[tuple[str, object, str | None]] = []
+    for j in range(len(short)):
+        for c in range(3):
+            specs.append((f"{short[j]} lin vel {lab[c]} ({vf}, m/s)",
+                          (lambda jj, cc: (lambda tr: tr["ee_lin_vel"][:, jj, cc]))(j, c), None))
+        for c in range(3):
+            specs.append((f"{short[j]} ang vel {lab[c]} ({vf}, rad/s)",
+                          (lambda jj, cc: (lambda tr: tr["ee_ang_vel"][:, jj, cc]))(j, c), None))
+    _fs_grid(fig, res, k, specs, "ee vel", ncols=6)
+
+
+def draw_forecast_step_joints(fig, res: ForecastStepResult, k: int, vel: bool = False) -> None:
+    """Every joint position (or velocity) -- one panel per joint, 5 columns."""
+    key = "joint_vel" if vel else "joint_pos"
+    unit = "rad/s" if vel else "rad"
+    names = res.joint_names
+    specs = [
+        (f"{names[j].replace('_joint', '').replace('_', ' ')} ({unit})",
+         (lambda jj: (lambda tr: tr[key][:, jj]))(j), None)
+        for j in range(len(names))
+    ]
+    _fs_grid(fig, res, k, specs, f"joints {'vel' if vel else 'pos'}", ncols=5)
 
 
 def draw_forecast_cmd(fig, res: ForecastResult) -> None:
@@ -1995,12 +2106,22 @@ class ForecastStepBrowser:
     """Scrub the per-step forecast comparison with the arrow keys.
 
     Unlike :class:`FigureBrowser` (which pages between figures), here Left/Right move
-    through the anchor STEPS of a single :class:`ForecastStepResult` and Up/Down toggle
-    between the ``root`` and ``feet`` views, redrawing the clip / clip-history forecast /
-    autoregressive rollout at each step.
+    through the anchor STEPS of a single :class:`ForecastStepResult` and Up/Down cycle
+    through the views (every FM/clip output: root, feet, root ang vel + quat, all EE
+    frame pos/quat/vel, and all joint pos/vel), redrawing the clip / clip-history
+    forecast / autoregressive rollout at each step.
     """
 
-    _VIEWS = (("root", draw_forecast_step), ("feet", draw_forecast_step_feet))
+    _VIEWS = (
+        ("root", draw_forecast_step),
+        ("feet", draw_forecast_step_feet),
+        ("root ang vel + quat", draw_forecast_step_root_rot),
+        ("ee pos", draw_forecast_step_ee_pos),
+        ("ee quat", draw_forecast_step_ee_quat),
+        ("ee vel", draw_forecast_step_ee_vel),
+        ("joints pos", draw_forecast_step_joints),
+        ("joints vel", lambda fig, res, k: draw_forecast_step_joints(fig, res, k, vel=True)),
+    )
 
     def __init__(self, res: ForecastStepResult, plt):
         """Store the precomputed per-step result and the bound pyplot module."""
@@ -2037,7 +2158,8 @@ class ForecastStepBrowser:
         fig.canvas.mpl_connect("key_press_event", lambda e: self._on_key(e, fig))
         self._render(fig)
         print(f"[bench] forecast_step: {self.n} steps -- Left/Right scrub steps, "
-              f"Up/Down toggle root/feet view, q to quit")
+              f"Up/Down cycle {len(self._VIEWS)} views "
+              f"({', '.join(name for name, _ in self._VIEWS)}), q to quit")
         self.plt.show()
 
     def save_all(self, out_dir: str, stride: int) -> None:
@@ -2048,7 +2170,8 @@ class ForecastStepBrowser:
             for name, draw in self._VIEWS:
                 fig = self.plt.figure(figsize=(15, 9))
                 draw(fig, self.res, k)
-                path = os.path.join(out_dir, f"forecast_step_{name}_{self.res.anchors[k]:04d}.png")
+                safe = name.replace(" + ", "_").replace(" ", "_")
+                path = os.path.join(out_dir, f"forecast_step_{safe}_{self.res.anchors[k]:04d}.png")
                 fig.savefig(path, dpi=150, bbox_inches="tight")
                 self.plt.close(fig)
                 print(f"[bench]   saved {path}")
