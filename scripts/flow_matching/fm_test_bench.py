@@ -69,7 +69,8 @@ from transfer.fm import (  # noqa: E402
     BatchedHistory,
     FmOnlineContext,
     build_cmd_tokens,
-    build_cond_states,
+    build_height_token,
+    build_history_tokens,
     load_fm_context,
     sample_world,
 )
@@ -211,6 +212,8 @@ class DuckMeta:
     state_joint_names: list[str]
     num_envs: int
     dt: float
+    ref_source: str = ""
+    ref_future_len: int = 0
 
 
 # ======================================================================
@@ -219,9 +222,12 @@ class DuckMeta:
 # Only these arrays are read; the recording also holds obs (1.6GB), ref_state and
 # action which the bench never needs.
 _NEEDED_ARRAYS = ("state", "target_vel", "episode_id", "step_in_episode", "done")
+# Robot-state-conditioned (ego_anchored_clip_future) recordings carry these too; loaded
+# when present so the teacher-data forecast_step can overlay the real clip future.
+_OPTIONAL_ARRAYS = ("ref_future", "cmd_future", "reanchor_active")
 _NEEDED_META = (
     "state_term_names", "state_term_dims", "state_frame_names",
-    "state_joint_names", "num_envs", "dt",
+    "state_joint_names", "num_envs", "dt", "ref_source", "ref_future_len",
 )
 
 
@@ -255,6 +261,9 @@ def load_recording_lite(path: str) -> tuple[dict[str, np.ndarray], DuckMeta]:
             if key not in present:
                 raise KeyError(f"recording {path} is missing required array {key!r}")
             data[key] = _read_member(zf, key)
+        for key in _OPTIONAL_ARRAYS:
+            if key in present:
+                data[key] = _read_member(zf, key)
         for key in _NEEDED_META:
             if key in present:
                 raw_meta[key] = _read_member(zf, key)
@@ -266,15 +275,20 @@ def load_recording_lite(path: str) -> tuple[dict[str, np.ndarray], DuckMeta]:
         state_joint_names=[str(s) for s in raw_meta["state_joint_names"].tolist()],
         num_envs=int(raw_meta["num_envs"]),
         dt=float(raw_meta["dt"]),
+        ref_source=str(raw_meta["ref_source"]) if "ref_source" in raw_meta else "",
+        ref_future_len=int(raw_meta["ref_future_len"]) if "ref_future_len" in raw_meta else 0,
     )
-    print(f"[bench]   state {data['state'].shape}, num_envs={meta.num_envs}, dt={meta.dt}")
-    if meta.num_envs > 0:
+    print(f"[bench]   state {data['state'].shape}, num_envs={meta.num_envs}, dt={meta.dt}, "
+          f"ref_source={meta.ref_source or 'none'}")
+    # Robot-state-conditioned recordings (ego_anchored_clip_future) ARE robot rollouts
+    # (num_envs>0, step-major) and carry ref_future -- the teacher-data forecast_step uses
+    # them. Only reject robot rollouts that are NOT this kind.
+    is_teacher = meta.ref_source == "ego_anchored_clip_future" and "ref_future" in data
+    if meta.num_envs > 0 and not is_teacher:
         raise ValueError(
-            f"fm_test_bench operates only on clean clip recordings (clip_to_fm_data.py: "
-            f"num_envs=0, episode-contiguous), not robot rollouts -- {path} has "
-            f"num_envs={meta.num_envs} (step-major env-interleaved record_data.py data). "
-            f"The clip-conditioned FM never sees robot state; point --data at a "
-            f"clip_to_fm_data .npz (e.g. clips/<lib>_fm.npz)."
+            f"fm_test_bench operates on clean clip recordings (num_envs=0) or robot-state-"
+            f"conditioned teacher recordings (ref_source='ego_anchored_clip_future' + ref_future) "
+            f"-- {path} has num_envs={meta.num_envs}, ref_source={meta.ref_source!r}."
         )
     return data, meta
 
@@ -2140,6 +2154,218 @@ class FigureBrowser:
         print(f"[bench] {len(self.pages)} PNGs in {out_dir}")
 
 
+# ======================================================================
+# Teacher-data forecast_step (robot-state-conditioned FM)
+# ======================================================================
+@dataclass
+class TeacherStepResult:
+    """Per-snap comparison for a recorded teacher rollout: at each FM re-inference
+    (snap) step, the real ego-anchored clip future (the target) vs the FM prediction
+    conditioned on the recorded robot-state history vs the robot's actual future."""
+
+    anchors: list[int]                         # step_in_episode of each snap
+    real: list[dict[str, np.ndarray]]          # (F, .) ego-anchored clip future (ref_future)
+    fm: list[dict[str, np.ndarray]]            # (F, .) FM prediction (history-conditioned)
+    robot: list[dict[str, np.ndarray]]         # (<=F, .) robot actual future (recorded state)
+    episode_id: int
+    split: str
+    N: int
+    F: int
+    dt: float
+    frame_names: list[str]
+    joint_names: list[str]
+    foot_idxs: list[int]
+
+
+def _episode_rows_sorted(data: dict[str, np.ndarray], ep: int) -> np.ndarray:
+    """Absolute rows of episode ``ep``, time-ordered by ``step_in_episode``.
+
+    Robot rollouts are step-major env-interleaved, so a single ``episode_id``'s rows
+    are scattered; sort them by step to recover the time order.
+    """
+    rows = np.nonzero(data["episode_id"] == ep)[0]
+    return rows[np.argsort(data["step_in_episode"][rows], kind="stable")]
+
+
+def _val_episode_ids(fm_checkpoint: str) -> set[int]:
+    """Read the held-out ``val_episode_ids`` from the checkpoint run's data.yaml (or empty)."""
+    run_dir = os.path.dirname(os.path.abspath(fm_checkpoint))
+    data_yaml = os.path.join(run_dir, "params", "data.yaml")
+    if not os.path.exists(data_yaml):
+        return set()
+    try:
+        import yaml  # noqa: PLC0415
+        with open(data_yaml) as f:
+            d = yaml.safe_load(f)
+        return {int(e) for e in (d.get("val_episode_ids") or [])}
+    except Exception as exc:
+        print(f"[bench] could not read val_episode_ids from {data_yaml}: {exc}")
+        return set()
+
+
+def _select_teacher_episode(data, args) -> tuple[int, str]:
+    """Pick the episode_id to scrub, honoring --forecast-clip and --forecast-split."""
+    val_eps = _val_episode_ids(args.fm_checkpoint)
+    all_eps = [int(e) for e in np.unique(data["episode_id"])]
+    if args.forecast_split == "eval":
+        pool = [e for e in all_eps if e in val_eps]
+        if not pool:
+            raise SystemExit("[bench] --forecast-split eval: no val_episode_ids found in data.yaml.")
+    elif args.forecast_split == "train":
+        pool = [e for e in all_eps if e not in val_eps]
+    else:
+        pool = all_eps
+    if args.forecast_clip >= 0:
+        if args.forecast_clip not in pool:
+            raise SystemExit(f"[bench] episode {args.forecast_clip} not in the '{args.forecast_split}' split.")
+        return args.forecast_clip, args.forecast_split
+    return pool[0], args.forecast_split
+
+
+def _world_pred_to_traj(world: dict[str, "torch.Tensor"]) -> dict[str, np.ndarray]:
+    """Convert a :func:`sample_world` output (batch 0) to the bench traj-dict format."""
+    out = {
+        "root_pos": world["root_pos_w"][0].cpu().numpy(),
+        "root_quat": world["root_quat_w"][0].cpu().numpy(),
+        "root_lin_vel": world["root_link_lin_vel_w"][0].cpu().numpy(),
+        "root_ang_vel": world["root_link_ang_vel_w"][0].cpu().numpy(),
+        "joint_pos": world["joint_pos"][0].cpu().numpy(),
+        "joint_vel": world["joint_vel"][0].cpu().numpy(),
+    }
+    if "frame_pos_w" in world:
+        # sample_world frames are (F, K, .) for batch 0; bench traj uses (F, K, .) too.
+        out["ee_pos"] = world["frame_pos_w"][0].cpu().numpy()
+        out["ee_quat"] = world["frame_quat_w"][0].cpu().numpy()
+        out["ee_lin_vel"] = world["frame_lin_vel_w"][0].cpu().numpy()
+        out["ee_ang_vel"] = world["frame_ang_vel_w"][0].cpu().numpy()
+    return out
+
+
+@torch.no_grad()
+def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherStepResult:
+    """Scrub a recorded teacher rollout at its snap (FM re-inference) steps.
+
+    At each snap with N prior consecutive steps: condition the FM on the recorded
+    robot-state history + height + future command, sample the F-step future, and pair it
+    with the real ego-anchored clip future (``ref_future``) and the robot's actual future.
+    """
+    N, F = ctx.N, ctx.F
+    ep, split = _select_teacher_episode(data, args)
+    rows = _episode_rows_sorted(data, ep)
+    steps = data["step_in_episode"][rows]
+    snap = data["reanchor_active"][rows].astype(bool)
+    state, ref_future, cmd_future = data["state"], data["ref_future"], data["cmd_future"]
+    foot_idxs = [i for i, f in enumerate(meta.state_frame_names) if "ankle" in f.lower() or "foot" in f.lower()]
+
+    def _t(a):
+        return torch.as_tensor(np.ascontiguousarray(a), dtype=torch.float32, device=device)
+
+    anchors, real, fm, robot = [], [], [], []
+    for j in range(N - 1, len(rows)):
+        if not snap[j] or not np.all(np.diff(steps[j - (N - 1):j + 1]) == 1):
+            continue
+        hist_rows, snap_row = rows[j - (N - 1):j + 1], rows[j]
+        h = layout.parse(state[hist_rows])  # (N, .) robot-state history
+        frames = None
+        if meta.state_frame_names:
+            frames = _t(np.concatenate([h["ee_pos"], h["ee_quat"], h["ee_lin_vel"], h["ee_ang_vel"]],
+                                       axis=-1))[None]  # (1, N, K, 13)
+        hist = build_history_tokens(
+            ctx, _t(h["root_pos"])[None], _t(h["root_quat"])[None],
+            _t(h["root_lin_vel"])[None], _t(h["root_ang_vel"])[None],
+            _t(h["joint_pos"])[None], _t(h["joint_vel"])[None], frames=frames,
+        )
+        height = build_height_token(ctx, _t(h["root_pos"][-1, 2]))
+        cmd = build_cmd_tokens(ctx, _t(cmd_future[snap_row])[None]) if ctx.cmd_dim > 0 else None
+        p_ref, q_ref = _t(h["root_pos"][-1])[None], _t(h["root_quat"][-1])[None]
+        world = sample_world(ctx, hist, height, cmd, p_ref, q_ref)
+        fm.append(_world_pred_to_traj(world))
+        real.append(layout.parse(ref_future[snap_row]))          # (F, .) ego-anchored clip future
+        robot.append(layout.parse(state[rows[j:min(j + F, len(rows))]]))  # (<=F, .) robot actual
+        anchors.append(int(steps[j]))
+
+    if not anchors:
+        raise SystemExit(f"[bench] episode {ep} has no usable snaps (need {N} prior consecutive steps).")
+    print(f"[bench] teacher forecast_step: episode {ep} ({split}), {len(anchors)} snaps, F={F} "
+          f"(real clip future = solid, FM prediction = dashed, robot actual = dotted).")
+    return TeacherStepResult(
+        anchors=anchors, real=real, fm=fm, robot=robot, episode_id=ep, split=split,
+        N=N, F=F, dt=ctx.dt_attr, frame_names=meta.state_frame_names,
+        joint_names=meta.state_joint_names, foot_idxs=foot_idxs,
+    )
+
+
+def draw_teacher_step(fig, res: TeacherStepResult, k: int) -> None:
+    """Overlay the real clip future / FM prediction / robot actual at snap ``k``."""
+    real, fm, robot = res.real[k], res.fm[k], res.robot[k]
+    t = np.arange(res.F) * res.dt
+    fig.clear()
+    axes = fig.subplots(2, 3).ravel()
+    series = [("real clip", real, "-", 2.0), ("FM pred", fm, "--", 1.8), ("robot", robot, ":", 1.6)]
+
+    def _plot(ax, getter, title, ylabel):
+        for label, tr, ls, lw in series:
+            y = getter(tr)
+            if y is None:
+                continue
+            ax.plot(t[:len(y)], y, ls, lw=lw, label=label)
+        ax.set_title(title); ax.set_ylabel(ylabel); ax.set_xlabel("future time (s)"); ax.grid(alpha=0.3)
+
+    _plot(axes[0], lambda tr: tr["root_pos"][:, 0], "root x", "m")
+    _plot(axes[1], lambda tr: tr["root_pos"][:, 1], "root y", "m")
+    _plot(axes[2], lambda tr: tr["root_pos"][:, 2], "root height (z)", "m")
+    # two representative joints
+    _plot(axes[3], lambda tr: tr["joint_pos"][:, 0], f"joint[0] {res.joint_names[0]}", "rad")
+    nj = real["joint_pos"].shape[1]
+    ji = min(3, nj - 1)
+    _plot(axes[4], lambda tr: tr["joint_pos"][:, ji], f"joint[{ji}] {res.joint_names[ji]}", "rad")
+    # foot height (first foot frame), else first ee frame z
+    fi = res.foot_idxs[0] if res.foot_idxs else 0
+    if res.frame_names:
+        _plot(axes[5], lambda tr: tr["ee_pos"][:, fi, 2], f"foot z ({res.frame_names[fi]})", "m")
+    else:
+        axes[5].set_visible(False)
+    axes[0].legend(loc="best", fontsize=8)
+    fig.suptitle(f"teacher forecast_step  ep={res.episode_id} ({res.split})  "
+                 f"snap {k + 1}/{len(res.anchors)}  clip-step {res.anchors[k]}")
+    fig.tight_layout()
+
+
+class TeacherForecastBrowser:
+    """Arrow-key scrubber over a :class:`TeacherStepResult` (Left/Right = snaps)."""
+
+    def __init__(self, res: TeacherStepResult, plt):
+        self.res, self.plt, self.k, self.n = res, plt, 0, len(res.anchors)
+
+    def _render(self, fig):
+        draw_teacher_step(fig, self.res, self.k)
+        fig.canvas.draw_idle()
+
+    def _on_key(self, event, fig):
+        if event.key in ("right", " "):
+            self.k = (self.k + 1) % self.n; self._render(fig)
+        elif event.key == "left":
+            self.k = (self.k - 1) % self.n; self._render(fig)
+        elif event.key in ("q", "escape"):
+            self.plt.close(fig)
+
+    def show(self):
+        fig = self.plt.figure(figsize=(15, 9))
+        fig.canvas.mpl_connect("key_press_event", lambda e: self._on_key(e, fig))
+        self._render(fig)
+        print(f"[bench] teacher forecast_step: {self.n} snaps -- Left/Right to scrub, q to quit")
+        self.plt.show()
+
+    def save_all(self, out_dir: str, stride: int):
+        os.makedirs(out_dir, exist_ok=True)
+        for k in range(0, self.n, max(1, stride)):
+            fig = self.plt.figure(figsize=(15, 9))
+            draw_teacher_step(fig, self.res, k)
+            path = os.path.join(out_dir, f"teacher_step_{self.res.anchors[k]:04d}.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); self.plt.close(fig)
+            print(f"[bench]   saved {path}")
+
+
 class ForecastStepBrowser:
     """Scrub the per-step forecast comparison with the arrow keys.
 
@@ -2340,9 +2566,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Ground-truth stretch length (steps) for the 'forecast' overlay. "
                         "Unused by forecast_step, which always spans the whole clip.")
     p.add_argument("--forecast-clip", type=int, default=-1,
-                   help="forecast_step: clip/episode id to scrub over its FULL length (whole clip). "
-                        "-1 (default) picks the clip best matching --forecast-hist and uses its whole "
-                        "length.")
+                   help="forecast_step: clip/episode id to scrub. For teacher (ego_anchored_clip_future) "
+                        "recordings this selects an episode_id (-1 = first in the chosen --forecast-split). "
+                        "For clip recordings it picks the clip; -1 = best match to --forecast-hist.")
+    p.add_argument("--forecast-split", choices=["any", "train", "eval"], default="any",
+                   help="teacher forecast_step: restrict episode selection to the train or held-out eval "
+                        "set (read from the checkpoint's data.yaml val_episode_ids). Default any.")
     p.add_argument("--forecast-stride", type=int, default=5,
                    help="Re-forecast every this many ground-truth steps.")
     p.add_argument("--fm-update-every", type=int, default=10,
@@ -2425,17 +2654,31 @@ def main() -> int:
 
     layout = StateLayout(meta)
 
+    teacher = meta.ref_source == "ego_anchored_clip_future"
+
     # forecast_step is a standalone arrow-key step scrubber (its own browser binds
     # Left/Right to STEPS, not pages), so handle it up front and return.
     if args.mode == "forecast_step":
-        step_res = run_forecast_step(ctx, data, layout, args, device)
-        scrubber = ForecastStepBrowser(step_res, plt)
+        if teacher:
+            step_res = run_forecast_step_teacher(ctx, data, meta, layout, args, device)
+            scrubber = TeacherForecastBrowser(step_res, plt)
+        else:
+            step_res = run_forecast_step(ctx, data, layout, args, device)
+            scrubber = ForecastStepBrowser(step_res, plt)
         out_dir = args.save or os.path.join(args.out, datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
         if interactive:
             scrubber.show()
         else:
             scrubber.save_all(out_dir, args.forecast_stride)
         return 0
+
+    if teacher:
+        raise SystemExit(
+            f"[bench] mode {args.mode!r} is for clip recordings; a robot-state-conditioned "
+            f"teacher recording (ref_source=ego_anchored_clip_future) only supports "
+            f"--mode forecast_step (step through recorded teacher data, real clip future vs "
+            f"FM prediction vs robot actual)."
+        )
 
     def get_window(name: str) -> Window:
         if name not in CANONICAL_CMDS:
