@@ -49,6 +49,13 @@ class RecordingMeta:
         state_frame_names: Ordered extra body frames appended to the state vector beyond
             root + joints (each contributes ``pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)``).
             Empty when only root + joints were recorded.
+        ref_source: Kind of recorded reference. "" (none/legacy), "reference" (per-step
+            tracked ``ref_state``), or "ego_anchored_clip_future" (the robot-state-conditioned
+            FM target: a per-step F-node future of the clip ego-anchored onto the robot, in
+            ``ref_future``, with snap events flagged by ``reanchor_active``).
+        ref_future_len: Number of future nodes ``F`` stored per step in ``ref_future`` (0 if absent).
+        ref_future_term_names: Per-node layout names of ``ref_future`` (== ``state_term_names``).
+        ref_future_term_dims: Per-node layout dims of ``ref_future`` (== ``state_term_dims``).
         content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
             set after collection. Compression-robust dataset identity; empty for older files.
     """
@@ -74,6 +81,10 @@ class RecordingMeta:
     state_joint_names: list[str]
     state_vel_frame: str
     state_frame_names: list[str] = field(default_factory=list)
+    ref_source: str = ""
+    ref_future_len: int = 0
+    ref_future_term_names: list[str] = field(default_factory=list)
+    ref_future_term_dims: list[int] = field(default_factory=list)
     content_sha256: str = ""
 
 
@@ -175,6 +186,17 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
     # flow-matching dataset's recovery-aware window filter.
     if data.get("perturb_active") is not None:
         optional_arrays["perturb_active"] = data["perturb_active"].astype(np.uint8)
+    # Ego-anchored clip FUTURE target (robot-state-conditioned FM): per step an F-node
+    # window ``[num_pairs, F, node_dim]`` (node layout == state layout), the future of
+    # the clip ego-anchored onto the robot. ``cmd_future`` is the aligned future command
+    # ``[num_pairs, F, 3]``; ``reanchor_active`` flags the snap (re-anchor) steps the FM
+    # trains on. Written only when the recording task exposed the look-ahead accessors.
+    if data.get("ref_future") is not None:
+        optional_arrays["ref_future"] = data["ref_future"].astype(np.float32)
+    if data.get("cmd_future") is not None:
+        optional_arrays["cmd_future"] = data["cmd_future"].astype(np.float32)
+    if data.get("reanchor_active") is not None:
+        optional_arrays["reanchor_active"] = data["reanchor_active"].astype(np.uint8)
     np.savez_compressed(
         path,
         # per-pair arrays
@@ -211,6 +233,10 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         state_joint_names=np.array(meta.state_joint_names),
         state_vel_frame=np.array(meta.state_vel_frame),
         state_frame_names=np.array(meta.state_frame_names),
+        ref_source=np.array(meta.ref_source),
+        ref_future_len=np.int64(meta.ref_future_len),
+        ref_future_term_names=np.array(meta.ref_future_term_names),
+        ref_future_term_dims=np.array(meta.ref_future_term_dims, dtype=np.int64),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -237,6 +263,12 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         "target_vel": z["target_vel"] if "target_vel" in z.files else None,
         # Present only for recovery recordings (record_data.py --perturb).
         "perturb_active": z["perturb_active"] if "perturb_active" in z.files else None,
+        # Present only for robot-state-conditioned FM recordings (ref_source=
+        # "ego_anchored_clip_future"): the per-step ego-anchored clip FUTURE target,
+        # the aligned future command, and the snap-event flag.
+        "ref_future": z["ref_future"] if "ref_future" in z.files else None,
+        "cmd_future": z["cmd_future"] if "cmd_future" in z.files else None,
+        "reanchor_active": z["reanchor_active"] if "reanchor_active" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],
@@ -266,6 +298,14 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         state_vel_frame=str(z["state_vel_frame"]),
         state_frame_names=(
             [str(x) for x in z["state_frame_names"]] if "state_frame_names" in z.files else []
+        ),
+        ref_source=str(z["ref_source"]) if "ref_source" in z.files else "",
+        ref_future_len=int(z["ref_future_len"]) if "ref_future_len" in z.files else 0,
+        ref_future_term_names=(
+            [str(x) for x in z["ref_future_term_names"]] if "ref_future_term_names" in z.files else []
+        ),
+        ref_future_term_dims=(
+            [int(x) for x in z["ref_future_term_dims"]] if "ref_future_term_dims" in z.files else []
         ),
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )

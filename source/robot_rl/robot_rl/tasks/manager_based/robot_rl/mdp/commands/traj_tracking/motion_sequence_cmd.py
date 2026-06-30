@@ -112,6 +112,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
         self._ego_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-env per-step flag: True on the steps where the clip placement was just
+        # snapped onto the robot root (a re-anchor event). Consumed by the data
+        # recorder so the FM trains only on snap-event anchors (node-0 offset ~ 0),
+        # matching the deploy regime (each FM re-inference is a snap).
+        self._reanchor_active = torch.zeros(n, dtype=torch.bool, device=dev)
         # Phase carrier so the base ``_update_command`` can read manager.phase.
         self.manager.phase = torch.zeros(n, device=dev)
 
@@ -258,9 +263,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         clip step -> same placement), so no extra once-per-step guard is needed.
         """
         if self.cfg.ego_anchor_fraction <= 0.0:
+            self._reanchor_active[:] = False
             return
         period = max(int(self.cfg.ego_anchor_every), 1)
         due = self._ego_mask & (self.env.episode_length_buf % period == 0)
+        self._reanchor_active = due
         self._reanchor_clip_ids(torch.nonzero(due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
@@ -454,6 +461,57 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         lin_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["lin_vel"]])
         ang_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["ang_vel"]])
         return pos_w, quat_w, lin_w, ang_w
+
+    def get_future_joint_state(
+        self, offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Clip joint pos/vel ``([N, K, nj], [N, K, nj])`` at the future ``offsets``.
+
+        Joints are frame-invariant (no lift), so this gathers the clip-library
+        ``y_des``/``dy_des`` joint channels at steps ``self._step + offsets`` -- the
+        look-ahead counterpart of the joint block in :meth:`reference_world_state`.
+        Used by the data recorder to capture the ego-anchored clip future target.
+        """
+        cid, steps = self._future_step_indices(offsets)
+        y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P]
+        dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)  # [N, K, V]
+        joint_pos = y[:, :, self._base_idx["joint_pos"]]
+        joint_vel = dy[:, :, self._base_idx["joint_vel"]]
+        return joint_pos, joint_vel
+
+    def get_future_world_frames(
+        self, frame_names: list[str], offsets: torch.Tensor
+    ) -> torch.Tensor:
+        """World-frame reference for extra (ee) frames over the future ``offsets``.
+
+        The look-ahead counterpart of :meth:`reference_world_frames`: lifts each
+        frame's clip-library ``y_des``/``dy_des`` channels at steps ``self._step +
+        offsets`` through the per-env placement (``clip_world_pos``/``clip_world_quat``),
+        exactly like :meth:`get_future_world_base`. At ``offset == 0`` this matches the
+        current-step ego-anchored frames. Used by the data recorder.
+
+        Args:
+            frame_names: Output ee-frame names (each in ``self._wf_frames`` minus base).
+            offsets: Future step offsets ``[K]``.
+
+        Returns:
+            ``[N, K, len(frame_names), 13]`` = ``[pos_w(3), quat_w(4 xyzw), lin_w(3),
+            ang_w(3)]`` per frame, in the given order.
+        """
+        cid, steps = self._future_step_indices(offsets)
+        y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P]
+        dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)  # [N, K, V]
+        wpos, wquat = self.clip_world_pos, self.clip_world_quat
+        out = []
+        for f in frame_names:
+            fi = self._frame_output_indices(f)
+            out.append(torch.cat([
+                lift_position_batched(wpos, wquat, y[:, :, fi["pos"]]),
+                lift_orientation_batched(wquat, y[:, :, fi["ori"]]),
+                lift_vector_batched(wquat, dy[:, :, fi["lin_vel"]]),
+                lift_vector_batched(wquat, dy[:, :, fi["ang_vel"]]),
+            ], dim=-1))
+        return torch.stack(out, dim=2)  # [N, K, F, 13]
 
     # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)

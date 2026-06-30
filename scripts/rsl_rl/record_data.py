@@ -110,6 +110,17 @@ parser.add_argument(
          "root+joints only.",
 )
 parser.add_argument(
+    "--ref_future_len", type=int, default=40,
+    help="Number of FUTURE nodes F to record per step in 'ref_future' (the ego-anchored "
+         "clip future = the robot-state-conditioned FM target). Match the FM future_len.",
+)
+parser.add_argument(
+    "--no_ref_future", action="store_true", default=False,
+    help="Disable recording the ego-anchored clip future ('ref_future'/'cmd_future'/"
+         "'reanchor_active'). By default it is recorded whenever the command exposes the "
+         "look-ahead accessors (get_future_world_base) -- the data the new FM trains on.",
+)
+parser.add_argument(
     "--clip", type=str, default=None,
     help="Override the clip library the teacher tracks (sets commands.traj_ref.path), e.g. "
          "clips/g1_recovery_v1.h5. Default: the task config's clip (clips/g1_flat_v1.h5 for the "
@@ -295,6 +306,7 @@ def collect_pairs(
     ref_base_frame: str = "pelvis_link",
     state_frames: list[str] | None = None,
     scheduler: PerturbationScheduler | None = None,
+    ref_future_len: int = 0,
 ) -> dict[str, np.ndarray]:
     """Roll out the policy and collect flattened (obs, action) pairs.
 
@@ -356,6 +368,18 @@ def collect_pairs(
     record_cmd_vel = ref_cmd is not None and getattr(ref_cmd, "command_velocity_available", False)
     if record_cmd_vel:
         buf["target_vel"] = []
+    # Ego-anchored clip FUTURE target (robot-state-conditioned FM): per step an F-node
+    # window of the clip ego-anchored onto the robot, plus the aligned future command and
+    # the snap-event flag. Requires the look-ahead accessors + a command velocity.
+    record_ref_future = (
+        ref_future_len > 0 and ref_cmd is not None
+        and hasattr(ref_cmd, "get_future_world_base") and record_cmd_vel
+    )
+    if record_ref_future:
+        future_offsets = torch.arange(int(ref_future_len), device=device)
+        buf["ref_future"] = []
+        buf["cmd_future"] = []
+        buf["reanchor_active"] = []
     # Per-step perturbation flag (1 while a perturbation window was active for that env).
     if scheduler is not None:
         buf["perturb_active"] = []
@@ -422,6 +446,23 @@ def collect_pairs(
             buf["ref_state"].append(ref_state.detach().cpu().clone())
         if record_cmd_vel:
             buf["target_vel"].append(ref_cmd.get_command_velocity().detach().cpu().clone())
+        # Ego-anchored clip future (the FM target), captured at the same pre-step moment
+        # as state/ref_state: the clip ego-anchored onto the robot at THIS step, lifted F
+        # nodes forward through the current placement (no internal re-snap). Node layout
+        # matches 'state': [root_pos(3), root_quat(4 xyzw), root_lin(3), root_ang(3),
+        # joint_pos(nj), joint_vel(nj), <per frame pos(3)/quat(4)/lin(3)/ang(3)>].
+        if record_ref_future:
+            pos_w, quat_w, lin_w, ang_w = ref_cmd.get_future_world_base(future_offsets)  # [N,F,·]
+            jp, jv = ref_cmd.get_future_joint_state(future_offsets)                        # [N,F,nj]
+            node = torch.cat([pos_w, quat_w, lin_w, ang_w, jp, jv], dim=-1)               # [N,F,13+2nj]
+            if state_frames:
+                ff = ref_cmd.get_future_world_frames(state_frames, future_offsets)        # [N,F,K,13]
+                node = torch.cat([node, ff.reshape(n_envs, ff.shape[1], -1)], dim=-1)
+            buf["ref_future"].append(node.detach().cpu().clone())
+            buf["cmd_future"].append(
+                ref_cmd.get_future_command_velocity(future_offsets).detach().cpu().clone()
+            )
+            buf["reanchor_active"].append(ref_cmd._reanchor_active.detach().cpu().clone())
         buf["episode_id"].append(episode_id.detach().cpu().clone())
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
@@ -564,6 +605,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_pairs, state_frames)
 
+        # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
+        # command exposes the look-ahead accessors + a command velocity, unless disabled.
+        rf_len = 0 if args_cli.no_ref_future else int(args_cli.ref_future_len)
+        will_record_ref_future = (
+            rf_len > 0 and ref_cmd is not None and hasattr(ref_cmd, "get_future_world_base")
+            and getattr(ref_cmd, "command_velocity_available", False)
+        )
+        if will_record_ref_future:
+            meta.ref_source = "ego_anchored_clip_future"
+            meta.ref_future_len = rf_len
+            meta.ref_future_term_names = list(meta.state_term_names)  # node layout == state
+            meta.ref_future_term_dims = list(meta.state_term_dims)
+            print(f"[INFO] Recording ego-anchored clip future (ref_future): F={rf_len} nodes/step "
+                  f"+ cmd_future + reanchor_active (snap events).")
+        elif ref_cmd is not None:
+            meta.ref_source = "reference"
+
         # Single observation fetch reused for the memory estimate, the provenance
         # export, and the start of collection. compute() defaults to
         # update_history=False, so this does not mutate observation history.
@@ -616,7 +674,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         data = collect_pairs(
             env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic,
             ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame, state_frames=state_frames,
-            scheduler=scheduler,
+            scheduler=scheduler, ref_future_len=rf_len,
         )
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")
@@ -650,6 +708,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
               f"state shape={data['state'].shape}, ref_state shape={ref_shape}, "
               f"target_vel shape={tvel_shape}, "
               f"terminations flagged={int(data['terminated'].sum())}")
+        if data.get("ref_future") is not None:
+            rf = data["ref_future"]; ra = data["reanchor_active"]
+            print(f"[INFO]   ref_future shape={rf.shape}, cmd_future shape={data['cmd_future'].shape}, "
+                  f"reanchor_active (snap steps)={int(ra.sum()):,}/{ra.size:,} "
+                  f"({100.0 * float(ra.mean()):.1f}%)")
         if "perturb_active" in data and data["perturb_active"] is not None:
             pa = data["perturb_active"]
             print(f"[INFO]   perturb_active: {int(pa.sum()):,}/{pa.size:,} steps "
