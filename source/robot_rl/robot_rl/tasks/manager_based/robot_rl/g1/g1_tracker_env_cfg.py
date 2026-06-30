@@ -65,7 +65,7 @@ class G1TrackerCommandsCfg:
         fm_checkpoint=DEFAULT_FM_CHECKPOINT,
         # Re-run FM inference every K control steps (the receding-horizon re-plan
         # cadence); the prediction advances through the F-step window in between.
-        fm_update_every=2,
+        fm_update_every=10, #2,
     )
 
 
