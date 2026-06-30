@@ -264,11 +264,16 @@ class DataLogger:
                 fm_active = getattr(ref, "fm_active", None)
                 if isinstance(fm_active, torch.Tensor):
                     step["fm_active"] = fm_active.clone()
+                    # Applied window index, logged every step (cheap, [N] long): a
+                    # re-plan is where it resets to fm_novel_start (non-increase), used
+                    # to mark the FM/clip re-anchor instants on the trajectory_obs plots.
+                    pred_idx = getattr(ref, "fm_pred_idx", None)
+                    if isinstance(pred_idx, torch.Tensor):
+                        step["fm_pred_idx"] = pred_idx.clone()
                     if self._log_fm_window and hasattr(ref, "predicted_outputs_window"):
                         y_win, dy_win = ref.predicted_outputs_window()
                         step["fm_pred_y"] = y_win.clone()
                         step["fm_pred_dy"] = dy_win.clone()
-                        step["fm_pred_idx"] = ref.fm_pred_idx.clone()
             except Exception as exc:
                 self._warn("fm_source", f"Could not read FM source / predicted window: {exc}")
 

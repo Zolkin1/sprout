@@ -259,7 +259,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             return
         period = max(int(self.cfg.ego_anchor_every), 1)
         due = self._ego_mask & (self.env.episode_length_buf % period == 0)
-        ids = torch.nonzero(due, as_tuple=False).squeeze(-1)
+        self._reanchor_clip_ids(torch.nonzero(due, as_tuple=False).squeeze(-1))
+
+    def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
+        """Re-place the clip's current-step base onto the robot root for env ``ids``.
+
+        The placement update shared by the cadence-based ego re-anchor
+        (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
+        re-anchor on a different schedule (e.g. the generator command re-anchoring
+        the clip on the FM's re-plan steps). Yaw + xy onto the robot root, keeping
+        the clip's natural height + tilt. No-op for empty ``ids``.
+        """
         if ids.numel() == 0:
             return
         # Clip-world base pose at each env's current step.

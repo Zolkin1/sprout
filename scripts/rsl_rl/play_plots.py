@@ -197,6 +197,19 @@ def _slice_to_time_range(
     return sliced, new_metadata
 
 
+def _replan_times(pred_idx_env: np.ndarray | None, dt: float | None, t_offset: float) -> np.ndarray:
+    """Times (s, or step indices) where the FM re-planned for one env.
+
+    A re-plan is where the applied window index ``fm_pred_idx`` resets to its novel
+    start, i.e. does not increase between consecutive steps. Used to mark the FM (and,
+    now, clip) re-anchor instants on the trajectory_obs plots.
+    """
+    if pred_idx_env is None or pred_idx_env.shape[0] < 2:
+        return np.empty(0)
+    drops = np.nonzero(pred_idx_env[1:] <= pred_idx_env[:-1])[0] + 1
+    return drops * dt + t_offset if dt is not None else drops.astype(float)
+
+
 def _grid_plot(
     data: dict[str, np.ndarray],
     key_a: str,
@@ -214,6 +227,7 @@ def _grid_plot(
     legend_loc: str = "best",
     t_offset: float = 0.0,
     fm_active: np.ndarray | None = None,
+    fm_pred_idx: np.ndarray | None = None,
 ) -> None:
     """Shared helper for grid-of-subplots plots (positions, velocities, joints, torques).
 
@@ -241,6 +255,7 @@ def _grid_plot(
         fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {},
                          env_id, dt, t_offset)
         has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
+        replan = _replan_times(fm_pred_idx[:, env_id] if fm_pred_idx is not None else None, dt, t_offset)
 
         for i in range(n_dims):
             ax = axs_flat[i]
@@ -249,6 +264,9 @@ def _grid_plot(
             if key_b is not None:
                 y_b = data[key_b][:, env_id, i] if data[key_b].ndim >= 3 else data[key_b][:, env_id]
                 ax.plot(x_axis, y_b, label=label_b, linestyle="--", linewidth=2)
+            for j, vt in enumerate(replan):                      # FM/clip re-plan instants
+                ax.axvline(vt, color="0.55", lw=0.6, ls=":", alpha=0.55, zorder=1,
+                           label="re-plan" if (i == 0 and j == 0) else None)
             if has_fm:
                 _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=(i == 0))
 
@@ -1424,7 +1442,7 @@ def plot_fm_predictions(
 def _plot_future_obs(
     data: dict[str, np.ndarray], key: str, comp_labels: list[str], title: str, fname: str,
     save_dir: str, env_ids: list[int], dt: float | None, t_off: float, stride: int,
-    fm_active: np.ndarray | None,
+    fm_active: np.ndarray | None, fm_pred_idx: np.ndarray | None = None,
 ) -> None:
     """One figure for a strided future_* obs: 6 subplots (one per component), each with
     one line per lookahead step colored by horizon. Overlays the clip (dashed) when
@@ -1447,6 +1465,7 @@ def _plot_future_obs(
         axs = np.array(axs).flatten()
         fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {}, env_id, dt, t_off)
         has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
+        replan = _replan_times(fm_pred_idx[:, env_id] if fm_pred_idx is not None else None, dt, t_off)
         for c in range(min(6, len(comp_labels))):
             ax = axs[c]
             for j in range(k):
@@ -1455,6 +1474,8 @@ def _plot_future_obs(
                 ax.plot(x, a[:, j, c], color=col, lw=1.4, label=f"+{hs:.2f}s")
                 if has_clip:
                     ax.plot(x, ac[:, j, c], color=col, lw=1.1, ls="--", alpha=0.8)
+            for vt in replan:                                    # FM/clip re-plan instants
+                ax.axvline(vt, color="0.55", lw=0.6, ls=":", alpha=0.55, zorder=1)
             if has_fm:
                 _draw_fm_transitions(ax, fm[0], fm[1], fm[2], label=False)
             ax.set_title(comp_labels[c], fontsize=10)
@@ -1586,18 +1607,19 @@ def plot_trajectory_obs(
             y_label_fmt="{unit}", filename_fmt=f"trajectory_obs_{fname}_env{{env_id}}.png",
             save_dir=save_dir, env_ids=env_ids,
             label_a="FM (applied)" if has_clip else "reference (applied)", label_b="clip",
-            dt=dt, t_offset=t_off, fm_active=fm_active,
+            dt=dt, t_offset=t_off, fm_active=fm_active, fm_pred_idx=data.get("fm_pred_idx"),
         )
 
     # Strided lookahead terms (per-component subplots, per-horizon lines).
+    fpi = data.get("fm_pred_idx")
     _plot_future_obs(data, "obs_future_base_pose",
                      ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
                      "future_base_pose (rel base)", "future_base_pose",
-                     save_dir, env_ids, dt, t_off, stride, fm_active) if "obs_future_base_pose" in data else None
+                     save_dir, env_ids, dt, t_off, stride, fm_active, fpi) if "obs_future_base_pose" in data else None
     _plot_future_obs(data, "obs_future_base_velocity",
                      ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
                      "future_base_velocity (rel base)", "future_base_velocity",
-                     save_dir, env_ids, dt, t_off, stride, fm_active) if "obs_future_base_velocity" in data else None
+                     save_dir, env_ids, dt, t_off, stride, fm_active, fpi) if "obs_future_base_velocity" in data else None
 
     _dump_trajectory_obs(data, metadata, save_dir, env_ids)
 

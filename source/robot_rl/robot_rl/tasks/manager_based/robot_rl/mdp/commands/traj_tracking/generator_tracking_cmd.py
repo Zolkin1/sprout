@@ -170,6 +170,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._pred_frame_ang = torch.zeros(n, f, k, 3, device=dev)
         self._pred_idx = torch.zeros(n, dtype=torch.long, device=dev)
         self._pred_valid = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-env mask of which envs the FM re-inferred (re-planned) this step; used to
+        # re-anchor the clip on the SAME steps/envs as the FM (set in _snapshot_and_infer).
+        self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
 
         # (_zeros3 / _ident_quat / _wf_world_frames are set by the base _post_init.)
         self._last_step_seen = -1
@@ -222,13 +225,15 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._advance_step()
         self._snapshot_and_infer()
 
-        # Ego-re-anchor the CLIP onto the robot root (the inherited knob), every
-        # ego_anchor_every steps for the ego_anchor_fraction envs -- so the clip
-        # reference (the warmup fallback AND the as_clip_reference() obs comparison)
-        # is robot-anchored just like the FM, instead of marching on its fixed reset
-        # placement. Inert when ego_anchor_fraction == 0. (MotionSequenceCommand calls
-        # this in its own _update_command; this override must invoke it explicitly.)
-        self._reanchor_ego_envs()
+        # Ego-re-anchor the CLIP onto the robot root on the SAME steps/envs the FM
+        # just re-planned (``_fm_reinfer_mask`` from _snapshot_and_infer), gated by the
+        # ego_anchor_fraction roll (``_ego_mask``) -- NOT the inherited episode-step
+        # cadence, which is on a different clock and drifts out of phase with the FM.
+        # This keeps the clip reference (warmup fallback + as_clip_reference() obs) and
+        # the FM re-anchored at identical instants. Inert when ego_anchor_fraction == 0.
+        if self.cfg.ego_anchor_fraction > 0.0:
+            due = self._ego_mask & self._fm_reinfer_mask
+            self._reanchor_clip_ids(torch.nonzero(due, as_tuple=False).squeeze(-1))
 
         # Clip desired outputs (clip-world). Joints are frame-invariant; the
         # base/ee Cartesian channels are overwritten with world values below.
@@ -330,9 +335,15 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Decide which envs to (re-)infer vs advance the prediction index.
         valid = self._history.valid()
         self._pred_valid = self._pred_valid & valid          # lose validity if the window broke
-        reinfer = (step % max(int(self.cfg.fm_update_every), 1)) == 0
+        # Re-plan cadence on the PER-ENV episode clock (episode_length_buf), not the
+        # global common_step_counter: re-plans land at deterministic episode steps from
+        # each reset (every fm_update_every), so the post-reset phase is fixed and aligned
+        # with the clip ego re-anchor -- instead of an arbitrary, per-env-staggered global
+        # phase. (The once-per-step guard above still uses the global step.) Per-env bool.
+        reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
         exhausted = self._pred_idx >= (self.ctx.F - 1)
         infer_mask = valid & (reinfer | ~self._pred_valid | exhausted)
+        self._fm_reinfer_mask = infer_mask         # re-anchor the clip on these same steps/envs
         advance = valid & ~infer_mask
         self._pred_idx = torch.where(
             advance, torch.clamp(self._pred_idx + 1, max=self.ctx.F - 1), self._pred_idx
