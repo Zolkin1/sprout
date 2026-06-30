@@ -164,3 +164,55 @@ class G1TrackerClipDrivenPlayEnvCfg(G1TrackerFMAutoregPlayEnvCfg):
         super().__post_init__()
         # Clip drives; FM is the passive comparison (cached, served via as_fm_reference()).
         self.commands.traj_ref.drive_with_clip = True
+
+
+##
+# Teacher training with a per-env reference mix (world-clip / ego-clip / ego-FM)
+##
+@configclass
+class G1TeacherFMEnvCfg(G1TrackerEnvCfg):
+    """Teacher training with the FM mixed into the loop per environment.
+
+    To close the train/deploy gap, each env's reference is drawn from one of three
+    buckets, re-rolled at every episode reset (see
+    :func:`reset_on_motion_sequence`):
+
+      1. world-anchored clip  (fixed clip placement at reset),
+      2. ego-anchored clip    (clip re-snapped onto the robot root every
+         ``ego_anchor_every`` steps),
+      3. ego-anchored FM      (the flow-matching generator, autoregressive,
+         re-anchored onto the robot root each re-plan).
+
+    ``fm_fraction`` sets the share of envs in bucket 3; ``ego_anchor_fraction`` splits
+    the remaining clip envs into buckets 1 vs 2.  Defaults to even thirds.  The same
+    world-frame CLF, observations, rewards, and (``base_fallen`` + base-drift)
+    terminations apply uniformly across buckets.  Train with ``--fm_checkpoint`` (the
+    clip-conditioned FM) and ``--clip_device cpu`` for the multi-GB clip library."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # ~1/3 of envs on the FM; split the remaining ~2/3 evenly into world- vs
+        # ego-anchored clip (-> ~1/3 each).  All three tunable.
+        self.commands.traj_ref.fm_fraction = 1.0 / 3.0
+        self.commands.traj_ref.ego_anchor_fraction = 0.5
+        # Match the ego-clip re-anchor cadence to the FM re-plan cadence so buckets 2
+        # and 3 re-plan at the same rate (default ego_anchor_every is 25, fm is 10).
+        self.commands.traj_ref.ego_anchor_every = int(self.commands.traj_ref.fm_update_every)
+
+
+@configclass
+class G1TeacherFMPlayEnvCfg(G1TeacherFMEnvCfg):
+    """Smaller, noise-free viewer to watch all three reference buckets at once.
+
+    Keeps the parent's ``fm_fraction`` / ``ego_anchor_fraction`` so a 16-env viewer
+    shows a mix: FM-driven robots (green source marker + FM-prediction spheres) and
+    clip-driven robots (clip ribbon), some of the latter re-anchoring onto the robot
+    (ego-clip) and some fixed in the world (world-clip)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 16
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None
+        self.commands.traj_ref.debug_vis = True

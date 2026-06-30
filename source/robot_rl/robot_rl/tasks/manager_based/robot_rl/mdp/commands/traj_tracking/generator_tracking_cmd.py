@@ -183,6 +183,12 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # Per-env mask of which envs the FM re-inferred (re-planned) this step; used to
         # re-anchor the clip on the SAME steps/envs as the FM (set in _snapshot_and_infer).
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-env FM-bucket mask: True where the FM (not the clip) drives the reference.
+        # Re-rolled per reset (prob cfg.fm_fraction) in reset_on_motion_sequence; FM-bucket
+        # envs are forced ego-anchored there too. Gates FM inference below, so _pred_valid
+        # (and thus use_fm / fm_active) only ever becomes True for these envs. Allocated
+        # all-False; the reset event sets it before the first post-reset inference.
+        self._fm_mask = torch.zeros(n, dtype=torch.bool, device=dev)
 
         # (_zeros3 / _ident_quat / _wf_world_frames are set by the base _post_init.)
         self._last_step_seen = -1
@@ -235,15 +241,19 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         self._advance_step()
         self._snapshot_and_infer()
 
-        # Ego-re-anchor the CLIP onto the robot root on the SAME steps/envs the FM
-        # just re-planned (``_fm_reinfer_mask`` from _snapshot_and_infer), gated by the
-        # ego_anchor_fraction roll (``_ego_mask``) -- NOT the inherited episode-step
-        # cadence, which is on a different clock and drifts out of phase with the FM.
-        # This keeps the clip reference (warmup fallback + as_clip_reference() obs) and
-        # the FM re-anchored at identical instants. Inert when ego_anchor_fraction == 0.
-        if self.cfg.ego_anchor_fraction > 0.0:
-            due = self._ego_mask & self._fm_reinfer_mask
-            self._reanchor_clip_ids(torch.nonzero(due, as_tuple=False).squeeze(-1))
+        # Ego-re-anchor the CLIP onto the robot root, on TWO cadences for the two
+        # clip-using buckets:
+        #   - FM-bucket envs (``_fm_mask``): on the SAME steps the FM just re-planned
+        #     (``_fm_reinfer_mask``), so the clip warmup fallback + as_clip_reference()
+        #     obs stay re-anchored at identical instants to the FM (matches deploy).
+        #     This fires regardless of ego_anchor_fraction -- the FM is always ego.
+        #   - ego-anchored clip-bucket envs (``_ego_mask & ~_fm_mask``): on the inherited
+        #     episode-step cadence (``ego_anchor_every``), like MotionSequenceCommand.
+        # World-anchored clip envs (``~_ego_mask & ~_fm_mask``) are never re-anchored.
+        fm_due = self._fm_mask & self._fm_reinfer_mask
+        period = max(int(self.cfg.ego_anchor_every), 1)
+        ego_due = self._ego_mask & ~self._fm_mask & ((self.env.episode_length_buf % period) == 0)
+        self._reanchor_clip_ids(torch.nonzero(fm_due | ego_due, as_tuple=False).squeeze(-1))
 
         # Clip desired outputs (clip-world). Joints are frame-invariant; the
         # base/ee Cartesian channels are overwritten with world values below.
@@ -269,7 +279,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # FM world reference at the current advance index, in the same order.
         fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
         fm_frames = torch.cat([fm_base[:, None, :], fm_ee], dim=1)    # [N, nf, 13]
-        use_fm = self._pred_valid
+        # FM drives only the FM-bucket envs past their warmup. ``_pred_valid`` already
+        # implies ``_fm_mask`` (inference is gated by it), but make the bucket explicit.
+        use_fm = self._pred_valid & self._fm_mask
 
         # Per-env source select, then write the world-frame Cartesian channels.
         sel = torch.where(use_fm[:, None, None], fm_frames, clip_frames)
@@ -368,7 +380,9 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         # phase. (The once-per-step guard above still uses the global step.) Per-env bool.
         reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
         exhausted = self._pred_idx >= (self.ctx.F - 1)
-        infer_mask = valid & (reinfer | ~self._pred_valid | exhausted)
+        # Only FM-bucket envs (``_fm_mask``) ever run inference, so clip-bucket envs pay
+        # no FM cost and their ``_pred_valid`` stays False (-> use_fm False -> clip drives).
+        infer_mask = valid & self._fm_mask & (reinfer | ~self._pred_valid | exhausted)
         self._fm_reinfer_mask = infer_mask         # re-anchor the clip on these same steps/envs
         advance = valid & ~infer_mask
         self._pred_idx = torch.where(
@@ -645,7 +659,7 @@ class GeneratorTrackingCommand(MotionSequenceCommand):
         lin_f = self._pred_root_lin[ar, idx]    # [N, K, 3]
         ang_f = self._pred_root_ang[ar, idx]    # [N, K, 3]
 
-        use_fm = self._pred_valid[:, None, None]
+        use_fm = (self._pred_valid & self._fm_mask)[:, None, None]
         return (
             torch.where(use_fm, pos_f, pos_c),
             torch.where(use_fm, quat_f, quat_c),
