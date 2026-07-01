@@ -331,10 +331,16 @@ class FutureStateDataset(Dataset):
         self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
         self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, 1)
 
-        # -- observation noise (train-time augmentation; history tokens only) --
+        # -- observation noise (train-time augmentation; conditioning tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
         self.state_noise = (
             self._state_noise_std(state_normalizer) if self.add_noise else None
+        )
+        # Height-scan noise (normalized space = raw m / std), per ray. The height token is a
+        # real (noisy) sensor at deploy, so it is noised in training like the history tokens.
+        self.height_noise = (
+            (float(cfg.noise_height_scan) * float(cfg.noise_scale)) / height_normalizer.std
+            if self.add_noise else None
         )
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
@@ -363,13 +369,14 @@ class FutureStateDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         history = self.history[i]
+        height = self.height_norm_tokens[i]
         if self.add_noise:
-            noise = (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            history = history + noise
+            history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
+            height = height + (torch.rand(self.height_dim) * 2.0 - 1.0) * self.height_noise
         item = {
             "state": self.state[i],          # (F, D) ego-anchored clip future target
             "history": history,              # (N, D) real-robot phase conditioning
-            "height": self.height_norm_tokens[i],  # (1,)
+            "height": height,                # (K,) height-scan token (noised in train)
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }

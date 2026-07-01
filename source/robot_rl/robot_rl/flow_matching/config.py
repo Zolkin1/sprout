@@ -115,6 +115,10 @@ class FlowMatchingConfig:
     noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
     noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
     noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
+    # Per-ray height-scan noise (m). The height token is a real sensor at deploy (noisy
+    # depth/lidar/estimated heightmap), so noise it in training too -- matches the RL
+    # policy's height_scan Unoise(±0.1). Applied per ray (independent), train split only.
+    noise_height_scan: float = 0.1  # m          (RL match)
 
     # -- flow --
     num_sampling_steps: int = 8
