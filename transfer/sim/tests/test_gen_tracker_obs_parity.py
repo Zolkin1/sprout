@@ -34,8 +34,8 @@ import robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations as O 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 CLIP = os.path.join(ROOT, "clips", "g1_flat_v1.h5")
-RUN = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-22_09-47-52_TM2_generator_tracking_test/exported")
-FM = os.path.join(ROOT, "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt")
+RUN = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-29_19-58-38_teacher_ego_z_anchor/exported")
+FM = os.path.join(ROOT, "logs/flow_matching/2026-06-30_17-16-27_fm_robot_hist_v1/best.pt")
 
 BASE = "pelvis_link"
 HORIZON_S, STRIDE, DT = 0.5, 5, 0.02
@@ -190,6 +190,7 @@ def test_obs_parity() -> None:
         reference = {
             "current": {
                 "root_pos": truth["ref_pos"][e], "root_quat": truth["ref_quat"][e],
+                "root_lin": truth["ref_lin"][e], "root_ang": truth["ref_ang"][e],
                 "jp": truth["ref_jp_isaac"][e], "jv": truth["ref_jv_isaac"][e],
                 "frame_pos": truth["ref_ee_pos"][e],
             },

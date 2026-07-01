@@ -2,8 +2,8 @@
 
 """Visualize a flow-matching recording in viser (no Isaac Sim required).
 
-Loads a recording produced by ``scripts/flow_matching/record_viz.py`` (the
-newest one in ``logs/flow_matching/viz/`` by default) and serves an
+Loads a flow-matching visualization recording (``viz_*.npz``; the newest one in
+``logs/flow_matching/viz/`` by default) and serves an
 interactive 3D scene in the browser: terrain, every recorded robot, and
 per-robot prediction overlays (ghost robots fading with the future horizon,
 the predicted-root curve, and height-scan points), with play/pause, frame

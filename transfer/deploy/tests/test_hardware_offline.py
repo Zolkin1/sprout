@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(ROOT, "transfer"))
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.hardware import build_hardware_state  # noqa: E402
 
-EXP = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-22_09-47-52_TM2_generator_tracking_test/exported")
+EXP = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-29_19-58-38_teacher_ego_z_anchor/exported")
 
 
 def test_hardware_offline() -> None:

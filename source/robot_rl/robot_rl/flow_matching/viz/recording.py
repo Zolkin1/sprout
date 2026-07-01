@@ -3,8 +3,8 @@
 """Serialization for flow-matching visualization recordings.
 
 This module only depends on ``numpy`` and the standard library so the viser
-viewer can load recordings without pulling in Isaac Sim. The producer side
-lives in ``scripts/flow_matching/record_viz.py``.
+viewer (``scripts/flow_matching/visualize.py``) can load recordings without
+pulling in Isaac Sim.
 
 A recording is a single compressed ``.npz`` file holding, for ``T`` recorded
 steps of ``N`` environments with ``nj`` joints and a future horizon ``F``:
@@ -219,7 +219,6 @@ def find_newest_recording(dir_path: str = VIZ_DIR_DEFAULT) -> str:
     candidates = glob.glob(os.path.join(dir_path, "viz_*.npz"))
     if not candidates:
         raise FileNotFoundError(
-            f"No viz_*.npz recordings found in '{dir_path}'. "
-            "Record one with scripts/flow_matching/record_viz.py or pass --data <path>."
+            f"No viz_*.npz recordings found in '{dir_path}'. Pass --data <path>."
         )
     return os.path.abspath(max(candidates, key=os.path.getmtime))

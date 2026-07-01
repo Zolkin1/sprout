@@ -14,7 +14,7 @@ The CLF runs in the **absolute world frame**: the desired outputs
 ``y_des``/``dy_des`` are the clip's outputs lifted through the placement, and
 the measured outputs ``y_act``/``dy_act`` are read with an identity reference
 (no yaw re-alignment).  This is the same world frame
-:class:`GeneratorTrackingCommand` uses, so the two tasks share one frame.
+:class:`FmTrackingCommand` uses, so the two tasks share one frame.
 Because the placement is fixed per episode, there is no re-anchoring to the
 measured foot during training -- the left/right tracking asymmetry of the
 online command is gone.
@@ -166,10 +166,10 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         stride = max(1, int(self.cfg.debug_vis_stride))
         self._debug_offsets = torch.arange(0, horizon_steps, stride, dtype=torch.long, device=dev)
 
-        # --- World-frame assembly (shared with GeneratorTrackingCommand) ---
+        # --- World-frame assembly (shared with FmTrackingCommand) ---
         # Output frames whose Cartesian channels are lifted clip-world -> world:
         # the base plus every end-effector reference frame, in resolved order.
-        # (GeneratorTrackingCommand rebuilds these in its FM frame order.)
+        # (FmTrackingCommand rebuilds these in its FM frame order.)
         self._build_world_frame_maps([self.cfg.base_frame_name] + self.resolve_ee_frames())
 
         # Identity reference for the world-frame measured outputs (no alignment).
@@ -255,7 +255,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         natural tilt.  Between re-anchors the placement is fixed, so the reference
         recedes ahead of the robot like a receding-horizon controller that re-plans
         every few steps.  Snapping z (not the clip's natural height) matches the FM
-        deploy anchor (:meth:`GeneratorTrackingCommand._run_fm`), so the teacher
+        deploy anchor (:meth:`FmTrackingCommand._run_fm`), so the teacher
         trains against the same robot-height-anchored reference it sees at deploy.
 
         Fast early-return unless ``cfg.ego_anchor_fraction > 0``.  Naturally
@@ -533,7 +533,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """World-frame reference state used by the pose-drift termination.
 
         Defaults to the tracked reference (:meth:`reference_world_state`).
-        :class:`GeneratorTrackingCommand` overrides this so closed-loop FM envs
+        :class:`FmTrackingCommand` overrides this so closed-loop FM envs
         are graded against the clip reference rather than the FM prediction.
         """
         return self.reference_world_state()

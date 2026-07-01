@@ -228,7 +228,7 @@ class ClipReference:
         """Clip ``target_vel`` over steps ``step+1 .. step+num_future`` (clamped), ``[F, 3]``.
 
         The decoder's future-command conditioning, matching IsaacLab
-        ``GeneratorTrackingCommand.get_command_velocity_horizon`` (steps s+1..s+F).
+        ``FmTrackingCommand.get_command_velocity_horizon`` (steps s+1..s+F).
         Lets the clip→FM handoff feed the FM the *actual* upcoming command rather
         than the held current one, so the MuJoCo FM is conditioned exactly as in
         IsaacLab.

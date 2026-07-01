@@ -127,7 +127,7 @@ parser.add_argument(
     "--dump_play_data", action="store_true", default=False,
     help="Also save the raw per-step world-frame reference arrays (y_des/y_act + "
          "clip/FM references + the FM prediction window) to play_data.npz in the plots "
-         "dir, for offline analysis (e.g. scripts/flow_matching/fm_sim_height_probe.py). "
+         "dir, for offline analysis. "
          "Pair with --plots fm_predictions to include the full FM prediction window.",
 )
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
@@ -177,7 +177,7 @@ parser.add_argument(
 parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
     help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
-         "command term exposing an fm_checkpoint field (the GeneratorTrackingCommand), "
+         "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
          "overriding the cfg default.",
 )
 parser.add_argument(
@@ -644,7 +644,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     data["gate_weights"] = torch.stack(gate_weights_log).cpu().numpy()
                     metadata["num_experts"] = _moe_net.num_experts
                 # Task-specific subfolder so different tasks loading the SAME run
-                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-clip-driven-play) keep
+                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-fm-play) keep
                 # their plots side by side instead of overwriting each other.
                 plots_dir = os.path.join(log_dir, "plots", task_name)
                 if args_cli.dump_play_data:

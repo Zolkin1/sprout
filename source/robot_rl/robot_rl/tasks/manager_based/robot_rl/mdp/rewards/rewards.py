@@ -107,7 +107,7 @@ def command_lin_vel_xy_tracking_exp(
     trajectory command's joystick-level ``target_vel`` (``(vx, vy, wz)`` -- what
     a velocity "joystick" would supply) rather than a separate ``base_velocity``
     command term, and grades the measured *link*-frame base velocity (no CoM, see
-    the velocity-convention note on :class:`GeneratorTrackingCommand`).  Paired
+    the velocity-convention note on :class:`FmTrackingCommand`).  Paired
     with :func:`command_ang_vel_z_tracking_exp` for yaw.  Requires a clip library
     carrying ``target_vel``.
     """

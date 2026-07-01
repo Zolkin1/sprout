@@ -218,7 +218,7 @@ def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_re
     """Reference base linear+angular velocity rotated into the current base frame.
 
     Deployable counterpart to :func:`ref_base_velocity` for world-frame trackers
-    (e.g. :class:`GeneratorTrackingCommand`): there ``dy_des`` holds the base
+    (e.g. :class:`FmTrackingCommand`): there ``dy_des`` holds the base
     velocity in the world frame, which would leak absolute heading if shown to
     the policy directly. Rotating it by the inverse current base orientation
     yields a heading-invariant command (available on hardware from the IMU).

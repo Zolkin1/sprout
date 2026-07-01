@@ -2,8 +2,8 @@
 
 """Batched online inference for the flow-matching generator.
 
-Shared by the offline visualizer (``scripts/flow_matching/record_viz.py``) and
-the online RL tracking command: both maintain a rolling per-env history of the
+Used by the online RL tracking command (``FmTrackingCommand``): maintains a
+rolling per-env history of the
 robot state, build the ``N`` history (phase) conditioning tokens (in the xyz+yaw
 relative-frame representation), the root-height token, and the strided future
 command tokens, sample the ``F``-step future window, and lift it back to the world.

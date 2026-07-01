@@ -113,7 +113,7 @@ def ego_placement(
     ``(base_pos_cf, base_ori_cf)`` through it reproduces the target root's planar
     position, heading, AND height (z) -- keeping only the clip's natural tilt
     (roll/pitch).  This mirrors the FM deploy-time anchor
-    (:meth:`GeneratorTrackingCommand._run_fm`), which snaps the reference base
+    (:meth:`FmTrackingCommand._run_fm`), which snaps the reference base
     xy+z+yaw onto the robot root so the receding-horizon reference rides at the
     robot's actual height rather than the clip's natural height; the future window
     then recedes from this placement with the clip's natural z variation.  This is
@@ -153,7 +153,7 @@ def ego_placement(
     # Snap the current-step base HEIGHT onto the target root too. z is yaw-invariant
     # (the pure-yaw lift leaves it as lifted_z = world_pos.z + base_pos_cf.z), so this
     # makes the lifted current-step base z == target_pos_w.z exactly. Matches the FM
-    # deploy anchor (GeneratorTrackingCommand._run_fm pins reference z to the robot
+    # deploy anchor (FmTrackingCommand._run_fm pins reference z to the robot
     # root); the future window recedes with the clip's natural z variation relative to
     # this anchor. Anchoring z (not the clip's natural height) means a sinking robot
     # drags the reference height down with it -- there is no free recovery-height target

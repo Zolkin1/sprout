@@ -108,7 +108,7 @@ parser.add_argument(
 parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
     help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
-         "command term exposing an fm_checkpoint field (the GeneratorTrackingCommand), "
+         "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
          "overriding the cfg default.",
 )
 cli_args.add_rsl_rl_args(parser)

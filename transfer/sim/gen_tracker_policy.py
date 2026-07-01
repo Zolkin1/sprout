@@ -395,7 +395,7 @@ class GeneratorTrackerPolicy:
             base_vel_ref = torch.cat([quat_apply(inv_root, ref_lin), quat_apply(inv_root, ref_ang)], dim=-1)
 
         # -- terms 11/12/13: future window. future_base_pose/vel come from the FM
-        # horizon (matches GeneratorTrackingCommand.get_future_world_base, now
+        # horizon (matches FmTrackingCommand.get_future_world_base, now
         # FM-sourced); future_command_vel is the held command (deployment has no
         # clip to read ahead from -- a known, intended difference from training,
         # which still reads target_vel ahead from the clip).

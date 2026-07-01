@@ -238,7 +238,7 @@ class DataLogger:
                 for k, v in _traj_obs().items():
                     step[f"obs_{k}"] = v
                 # If the command can also serve the CLIP reference (the FM-in-loop
-                # GeneratorTrackingCommand), log the clip's version of every obs under
+                # FmTrackingCommand), log the clip's version of every obs under
                 # the same robot state -> the FM (obs_*) and clip (obs_clip_*) signals
                 # overlay in the trajectory_obs plot, the obs-level FM-vs-clip view.
                 ref = unwrapped.command_manager.get_term(name)

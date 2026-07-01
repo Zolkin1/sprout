@@ -526,61 +526,8 @@ if not _registered:
     )
 
     ## =========================================
-    # Teacher training with the FM mixed into the loop (per-env reference mix)
+    # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
     ## =========================================
-    # Trains the teacher with each env on one of three reference buckets, re-rolled
-    # per reset: world-anchored clip / ego-anchored clip / ego-anchored FM. Closes the
-    # train/deploy gap with the FM tracker. fm_fraction sets the FM share (default 1/3).
-    # Pass the clip-conditioned FM via --fm_checkpoint and --clip_device cpu.
-    gym.register(
-        id="G1-teacher-clf-fm",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TeacherFMEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-    gym.register(
-        id="G1-teacher-clf-fm-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TeacherFMPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    ## =========================================
-    # Tracker: flow-matching generator-tracking deploy (world-frame CLF)
-    ## =========================================
-    # Play-only: deploy the teacher (--load_run) against the autoregressive,
-    # robot-decoupled FM reference (--fm_checkpoint, clip-conditioned). The FM
-    # conditions on its OWN past output (seeded from the clip), re-anchored onto
-    # the robot root each re-plan (receding horizon). No tracker training task --
-    # the policy is the teacher (G1-teacher-clf).
-    gym.register(
-        id="G1-tracker-clf-fm-ar-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerFMAutoregPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-    # Inverse diagnostic: the robot tracks the ego-anchored CLIP while the FM runs
-    # passively (autoregressive, robot-anchored) as a recorded/plotted overlay. Same
-    # teacher policy + clip-conditioned FM (--fm_checkpoint); compare FM vs clip with
-    # the robot safely on the clip (--plots positions overlays both references).
-    gym.register(
-        id="G1-tracker-clf-clip-driven-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1TrackerClipDrivenPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
     # Closed-loop deploy of the ROBOT-STATE-conditioned FM: the teacher (--load_run)
     # tracks the FM predicted from the LIVE robot-state history each step (the new
     # paradigm). Pass the robot-state FM via --fm_checkpoint and --clip_device cpu.
