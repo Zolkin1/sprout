@@ -42,6 +42,10 @@ class FmTrackingCommand(MotionSequenceCommand):
 
     cfg: FmTrackingCommandCfg
 
+    # Debug-viz marker handles (lazily built once the sim is up).
+    _fm_markers: object | None = None
+    _source_markers: object | None = None
+
     def _post_init(self) -> None:
         """Load the FM context, the rolling robot-state history, and prediction buffers."""
         super()._post_init()
@@ -124,6 +128,18 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         self._last_step_seen = -1
         self._arange_n = torch.arange(n, device=dev)
+
+        # --- FM-prediction debug ribbon: map each clip-ribbon frame (base built by the
+        # base _post_init, re-ordered above) to its slot in the FM prediction buffers.
+        self._fm_pred_specs: list[tuple[str, tuple[float, float, float], str, int]] = []
+        for name, color in zip(self._debug_frame_names, self._debug_frame_colors):
+            if name == self.cfg.base_frame_name:
+                self._fm_pred_specs.append((name, color, "base", -1))
+            elif name in self.ctx.frame_names:
+                self._fm_pred_specs.append((name, color, "frame", self.ctx.frame_names.index(name)))
+        self._fm_debug_offsets = torch.arange(
+            0, self.ctx.F, max(1, int(self.cfg.debug_vis_stride)), dtype=torch.long, device=dev
+        )
 
     def reset(self, env_ids=None):
         """Latch the per-env episode reset (consumed in :meth:`_snapshot_and_infer`)."""
@@ -296,3 +312,111 @@ class FmTrackingCommand(MotionSequenceCommand):
             torch.where(use_fm, self._pred_root_lin[ar, idx], lin_c),
             torch.where(use_fm, self._pred_root_ang[ar, idx], ang_c),
         )
+
+    # ------------------------------------------------------------------
+    # Debug visualization (FM-prediction ribbon + source marker on the clip ribbon)
+    # ------------------------------------------------------------------
+    def _set_debug_vis_impl(self, debug_vis: bool) -> None:
+        """Toggle the inherited clip ribbon plus the FM-prediction / source markers."""
+        super()._set_debug_vis_impl(debug_vis)
+        if not debug_vis:
+            for m in (self._fm_markers, self._source_markers):
+                if m is not None:
+                    m.set_visibility(False)
+
+    def _debug_vis_callback(self, event) -> None:
+        """Draw the clip ribbon (cylinders, warmup only) + FM prediction (spheres) + source marker."""
+        super()._debug_vis_callback(event)
+        if self.cfg.debug_vis_show_fm_prediction:
+            self._draw_fm_prediction_ribbon()
+        if self.cfg.debug_vis_show_source:
+            self._draw_source_markers()
+
+    def _clip_ribbon_env_mask(self) -> torch.Tensor:
+        """Draw the inherited clip ribbon only for envs NOT yet tracking the FM (warmup).
+
+        FM-active envs (``_pred_valid``) show the FM-prediction spheres instead."""
+        return ~self._pred_valid
+
+    def _draw_fm_prediction_ribbon(self) -> None:
+        """Draw the FM's predicted world-frame trajectory as per-frame spheres (FM-active envs)."""
+        if self._fm_markers is None:
+            self._fm_markers = self._create_fm_markers()
+            if self._fm_markers is None:
+                return
+        if not self._fm_pred_specs:
+            self._fm_markers.set_visibility(False)
+            return
+        ids = torch.nonzero(self._pred_valid, as_tuple=False).squeeze(-1)
+        if ids.numel() == 0:
+            self._fm_markers.set_visibility(False)
+            return
+        offs = self._fm_debug_offsets
+        translations, marker_indices = [], []
+        for proto_idx, (_name, _color, kind, k) in enumerate(self._fm_pred_specs):
+            pts = (self._pred_root_pos[ids][:, offs] if kind == "base"
+                   else self._pred_frame_pos[ids][:, offs, k]).reshape(-1, 3)
+            translations.append(pts)
+            marker_indices.append(torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device))
+        self._fm_markers.set_visibility(True)
+        self._fm_markers.visualize(
+            translations=torch.cat(translations, dim=0), marker_indices=torch.cat(marker_indices, dim=0),
+        )
+
+    def _draw_source_markers(self) -> None:
+        """Float a marker above each robot: green = FM live, yellow = warming up (clip)."""
+        if self._source_markers is None:
+            self._source_markers = self._create_source_markers()
+            if self._source_markers is None:
+                return
+        idx = torch.ones(self.num_envs, dtype=torch.long, device=self.device)  # 1 => warmup
+        idx[self._pred_valid] = 0                                              # 0 => FM live
+        pos = wp.to_torch(self.robot.data.root_pos_w).clone()
+        pos[:, 2] += float(self.cfg.debug_vis_source_marker_height)
+        self._source_markers.set_visibility(True)
+        self._source_markers.visualize(translations=pos, marker_indices=idx)
+
+    def _create_fm_markers(self):
+        """Build a sphere-per-frame marker set for the FM-prediction ribbon."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN FmTrackingCommand] could not import VisualizationMarkers: {exc}")
+            return None
+        radius = float(self.cfg.debug_vis_fm_marker_radius)
+        prototypes = {
+            f"fm_{name}": sim_utils.SphereCfg(
+                radius=radius, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+            )
+            for name, color, _kind, _k in self._fm_pred_specs
+        }
+        cfg = VisualizationMarkersCfg(prim_path="/Visuals/fm_pred", markers=prototypes)
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN FmTrackingCommand] could not create FM markers: {exc}")
+            return None
+
+    def _create_source_markers(self):
+        """Build the two-color (fm=green / warmup=yellow) tracking-source indicator set."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN FmTrackingCommand] could not import VisualizationMarkers: {exc}")
+            return None
+        radius = float(self.cfg.debug_vis_source_marker_radius)
+        colors = {"fm": (0.10, 0.90, 0.20), "warmup": (0.95, 0.85, 0.10)}  # order fixes idx: 0=fm, 1=warmup
+        prototypes = {
+            name: sim_utils.SphereCfg(
+                radius=radius, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=color),
+            )
+            for name, color in colors.items()
+        }
+        cfg = VisualizationMarkersCfg(prim_path="/Visuals/fm_track_source", markers=prototypes)
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN FmTrackingCommand] could not create source markers: {exc}")
+            return None

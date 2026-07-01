@@ -38,3 +38,22 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""
+
+    # --- Debug visualization (augments the inherited clip-ribbon viz) ---
+    debug_vis_show_fm_prediction: bool = True
+    """Draw the FM's predicted world-frame trajectory as a ribbon of spheres (one color per
+    frame, matching the clip ribbon), for envs whose FM prediction is live (past warmup) --
+    so you can see the FM driving the robot rather than the clip warmup fallback."""
+
+    debug_vis_show_source: bool = True
+    """Float a marker above each robot: green = FM (prediction live), yellow = warming up
+    (history not yet full, still on the clip)."""
+
+    debug_vis_fm_marker_radius: float = 0.02
+    """Sphere radius (m) for the FM-prediction ribbon points."""
+
+    debug_vis_source_marker_radius: float = 0.05
+    """Sphere radius (m) for the per-env tracking-source indicator."""
+
+    debug_vis_source_marker_height: float = 0.4
+    """Height (m) above the robot root to float the tracking-source indicator."""
