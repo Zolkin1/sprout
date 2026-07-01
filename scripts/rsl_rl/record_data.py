@@ -39,12 +39,14 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.assets import retrieve_file_path
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 
 import isaaclab_tasks  # noqa: F401
 import robot_rl  # noqa: F401 — register gym environments
+from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402  height_scan obs fn
 from isaaclab_tasks.utils import add_launcher_args, get_checkpoint_path, launch_simulation
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -340,6 +342,10 @@ def collect_pairs(
     device = env.unwrapped.device
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
+    # Height scan (the FM's height-conditioning token), captured when the recording task
+    # has a height_scanner sensor active (e.g. G1-teacher-clf-record). Same mdp.height_scan
+    # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
+    has_scan = "height_scanner" in env.unwrapped.scene.sensors
 
     # Body indices for the extra frames appended to the state vector (in order).
     state_frames = list(state_frames or [])
@@ -380,6 +386,8 @@ def collect_pairs(
         buf["ref_future"] = []
         buf["cmd_future"] = []
         buf["reanchor_active"] = []
+    if has_scan:
+        buf["height_scan"] = []
     # Per-step perturbation flag (1 while a perturbation window was active for that env).
     if scheduler is not None:
         buf["perturb_active"] = []
@@ -432,6 +440,12 @@ def collect_pairs(
             state_parts.append(frame_state)
         state = torch.cat(state_parts, dim=-1)
         buf["state"].append(state.detach().cpu().clone())
+        # Height scan at the same pre-step moment as state (per-ray ground clearance,
+        # [N, K]); the dataset picks the snap-row scan as the FM height token.
+        if has_scan:
+            buf["height_scan"].append(
+                mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).detach().cpu().clone()
+            )
         # Desired reference at the same timestep, reconstructed to the world-frame
         # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
         # obs (last computed during the previous env.step), so this stays aligned
@@ -676,6 +690,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame, state_frames=state_frames,
             scheduler=scheduler, ref_future_len=rf_len,
         )
+
+        if data.get("height_scan") is not None:
+            meta.height_scan_dim = int(data["height_scan"].shape[1])
+            print(f"[INFO] Recorded height_scan: {data['height_scan'].shape} "
+                  f"(K={meta.height_scan_dim} rays) -- the FM height-conditioning token.")
 
         out_path = unique_output_path(out_dir, prefix="recorded", ext=".npz")
         # Content hash of the recorded arrays -> the dataset self-identifies.
