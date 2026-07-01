@@ -200,7 +200,7 @@ class DuckMeta:
 _NEEDED_ARRAYS = ("state", "target_vel", "episode_id", "step_in_episode", "done")
 # Robot-state-conditioned (ego_anchored_clip_future) recordings carry these too; loaded
 # when present so the teacher-data forecast_step can overlay the real clip future.
-_OPTIONAL_ARRAYS = ("ref_future", "cmd_future", "reanchor_active")
+_OPTIONAL_ARRAYS = ("ref_future", "cmd_future", "reanchor_active", "height_scan")
 _NEEDED_META = (
     "state_term_names", "state_term_dims", "state_frame_names",
     "state_joint_names", "num_envs", "dt", "ref_source", "ref_future_len",
