@@ -467,6 +467,29 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                     viewer.sync()
         pacer.sync(robot.mj_data.time)
 
+    report_every_s = 5.0
+    _next_report_t = [report_every_s]  # next SIM time (s) at which to report (mutable cell)
+
+    def maybe_report_timing() -> None:
+        """Print the mean FM + tracker inference time every ``report_every_s`` sim seconds.
+
+        Cadence is on sim time (``robot.mj_data.time``) so it fires in both the paced
+        viewer (~every 5 real s) and unpaced headless/eval runs. The reported values are
+        real per-call wall-clock compute times (ms), averaged over the window.
+        """
+        if not hasattr(policy, "pop_avg_infer_ms"):
+            return
+        t = robot.mj_data.time
+        if t < _next_report_t[0]:
+            return
+        s = policy.pop_avg_infer_ms()
+        msg = f"[timing t={t:.1f}s] tracker {s['trk_ms']:.2f} ms/step (n={s['trk_n']})"
+        if s["fm_n"]:
+            msg += (f" | FM {s['fm_ms']:.2f} ms/infer (n={s['fm_n']}, "
+                    f"every {policy.fm_update_every} steps)")
+        print(msg)
+        _next_report_t[0] += report_every_s
+
     def run_loop(viewer) -> bool:
         """Warmup hold then live FM + tracker control; return False if the robot fell."""
         nonlocal handoff_time
@@ -508,6 +531,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 return False
             draw_viz(viewer, state)
             advance_physics(state, viewer)
+            maybe_report_timing()
 
     def run_clip_loop(viewer) -> bool:
         """Play the baked clip through the tracker; optionally hand off to the FM.
@@ -558,6 +582,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 return False
             draw_viz(viewer, state)
             advance_physics(state, viewer, ref)
+            maybe_report_timing()
             clip_step += 1
 
     loop_fn = run_clip_loop if clip is not None else run_loop

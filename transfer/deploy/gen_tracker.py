@@ -25,6 +25,8 @@ tracker observation from the FM prediction + measured proprioception;
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from .fm_session import build_cmd_tokens, build_height_token, build_history_tokens, load_fm_context, sample_world
@@ -136,7 +138,15 @@ class GenTrackerPolicy:
         self._pred_valid = False
         self._ctrl_step = -1
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
+        self._reset_timing()
         self._loaded = True
+
+    def _reset_timing(self) -> None:
+        """Zero the FM-generator + tracker inference-time accumulators."""
+        self._fm_infer_s = 0.0
+        self._fm_infer_n = 0
+        self._trk_infer_s = 0.0
+        self._trk_infer_n = 0
 
     def _tracker_only_ctx(self) -> _TrackerOnlyCtx:
         """Build a minimal FM-context stand-in from the tracker metadata (no generator).
@@ -297,7 +307,10 @@ class GenTrackerPolicy:
         # state, so its base pose is the xyz+yaw ground frame the FM was trained on.
         p_ref = rp[:, -1].copy()
         q_ref = rq[:, -1].copy()
+        t0 = time.perf_counter()
         world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref, noise)
+        self._fm_infer_s += time.perf_counter() - t0
+        self._fm_infer_n += 1
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]
@@ -438,7 +451,25 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     def get_action(self, obs: np.ndarray, joint_names_out: list[str]) -> np.ndarray:
         """Run the tracker; return joint position targets in ``joint_names_out`` order."""
-        return self._trk.get_action(obs, joint_names_out)
+        t0 = time.perf_counter()
+        action = self._trk.get_action(obs, joint_names_out)
+        self._trk_infer_s += time.perf_counter() - t0
+        self._trk_infer_n += 1
+        return action
+
+    def pop_avg_infer_ms(self) -> dict[str, float]:
+        """Return the mean FM + tracker inference time (ms) since the last call, then reset.
+
+        Keys: ``fm_ms``/``fm_n`` (FM generator, one per re-plan -- runs every
+        ``fm_update_every`` steps) and ``trk_ms``/``trk_n`` (tracker, one per step).
+        Counts are 0 when a net has not run in the window (e.g. FM during warmup, or
+        tracker-only playback).
+        """
+        fm_ms = 1e3 * self._fm_infer_s / self._fm_infer_n if self._fm_infer_n else 0.0
+        trk_ms = 1e3 * self._trk_infer_s / self._trk_infer_n if self._trk_infer_n else 0.0
+        stats = {"fm_ms": fm_ms, "fm_n": self._fm_infer_n, "trk_ms": trk_ms, "trk_n": self._trk_infer_n}
+        self._reset_timing()
+        return stats
 
     def set_future_command(self, future_cmd: np.ndarray | None) -> None:
         """Override the decoder's future-command horizon for subsequent FM samples.
@@ -456,6 +487,7 @@ class GenTrackerPolicy:
             self._pred_valid = False
             self._ctrl_step = -1
             self._future_cmd_override = None
+            self._reset_timing()
 
     def get_dt(self) -> float:
         return self._trk.get_dt()
