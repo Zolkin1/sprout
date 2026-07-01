@@ -489,6 +489,30 @@ if not _registered:
         },
     )
 
+    # FM-data recording: the teacher env + an ACTIVE height-scan ray-caster on a flat MESH
+    # terrain (the scanner cannot hit the plane primitive). The scan is NOT an observation
+    # (obs group unchanged), so the existing teacher policy records unchanged; the recorder
+    # reads the sensor directly. Record with e.g. --num_envs 64 + ego_anchor overrides.
+    gym.register(
+        id="G1-teacher-clf-record",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherRecordEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-record-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherRecordPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips
     # are full episodic motions with no gait-phase obs, so the Episodic runner
     # is the correct choice (phase negation is a no-op here).
