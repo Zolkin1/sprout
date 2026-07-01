@@ -36,6 +36,11 @@ from .g1_teacher_env_cfg import (
     G1TeacherEnvCfg,
 )
 from ..mdp.commands.traj_tracking.generator_tracking_cmd_cfg import GeneratorTrackingCommandCfg
+from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
+
+# Default robot-state-conditioned FM checkpoint (override per-run via --fm_checkpoint).
+# Trained on ego_anchored_clip_future data; carries a height_normalizer.
+DEFAULT_FM_ROBOT_CKPT = "logs/flow_matching/2026-06-30_17-16-27_fm_robot_hist_v1/best.pt"
 
 # Default flow-matching generator checkpoint (override per-run via --fm_checkpoint).
 # MUST be a clip-conditioned, command-conditioned FM (cmd_array='target_vel',
@@ -208,6 +213,57 @@ class G1TeacherFMPlayEnvCfg(G1TeacherFMEnvCfg):
     shows a mix: FM-driven robots (green source marker + FM-prediction spheres) and
     clip-driven robots (clip ribbon), some of the latter re-anchoring onto the robot
     (ego-clip) and some fixed in the world (world-clip)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 16
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None
+        self.commands.traj_ref.debug_vis = True
+
+
+##
+# Closed-loop deploy: teacher tracks the robot-state-conditioned FM (live robot history)
+##
+@configclass
+class G1FmTrackerCommandsCfg:
+    """Robot-state-conditioned FM tracking command (live robot history, world-frame CLF)."""
+
+    traj_ref = FmTrackingCommandCfg(
+        contact_bodies=[".*_ankle_roll_link"],
+        path=DEFAULT_CLIP_PATH,
+        base_frame_name="pelvis_link",
+        random_start_phase=True,
+        random_start_min_remaining_s=2.0,
+        randomize_heading=False,
+        debug_vis=False,
+        Q_weights=WALKING_Q_weights,
+        R_weights=WALKING_R_weights,
+        fm_checkpoint=DEFAULT_FM_ROBOT_CKPT,
+        fm_update_every=10,
+        # Warmup clip is robot-anchored on the FM re-plan cadence (matches the deploy regime).
+        ego_anchor_fraction=1.0,
+        ego_anchor_every=10,
+    )
+
+
+@configclass
+class G1FmTrackerEnvCfg(G1TeacherEnvCfg):
+    """Flat-ground closed-loop FM tracking env: the teacher tracks the FM predicted from
+    the LIVE robot-state history. Shared world-frame observation layout; adds the
+    reference-independent ``base_fallen`` termination (the FM may steer OOD)."""
+
+    observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
+    commands: G1FmTrackerCommandsCfg = G1FmTrackerCommandsCfg()
+    terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
+
+
+@configclass
+class G1FmTrackerPlayEnvCfg(G1FmTrackerEnvCfg):
+    """Play/deploy viewer: 16 envs, noise-free, no pushes. Load the teacher via
+    ``--load_run`` and the robot-state FM via ``--fm_checkpoint``; ``--clip_device cpu``
+    for the multi-GB clip library (seed spawn + velocity command only)."""
 
     def __post_init__(self):
         super().__post_init__()

@@ -581,6 +581,18 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+    # Closed-loop deploy of the ROBOT-STATE-conditioned FM: the teacher (--load_run)
+    # tracks the FM predicted from the LIVE robot-state history each step (the new
+    # paradigm). Pass the robot-state FM via --fm_checkpoint and --clip_device cpu.
+    gym.register(
+        id="G1-tracker-clf-fm-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 
