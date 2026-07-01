@@ -6,18 +6,17 @@ Shared deployment runtime for the MuJoCo sim2sim runner and the hardware
 controller. Numpy + onnxruntime port of ``transfer/sim/gen_tracker_policy.py``
 (the torch version, validated against Isaac to ~1e-7): runs the flow-matching
 generator (``fm.onnx``) online and feeds its world-frame prediction into the RL
-tracker (``tracker.onnx``), reproducing the ``GeneratorTrackingCommand`` coupling.
+tracker (``tracker.onnx``), reproducing the ``FmTrackingCommand`` coupling.
 No torch / isaaclab / robot_rl imports.
 
-The generator runs **autoregressively**, exactly like the in-loop
-``GeneratorTrackingCommand``: it conditions on its OWN past applied reference
-(seeded from the measured stand during the warmup), never on the live robot
-state, and each freshly sampled trajectory is re-anchored onto the robot root
-(xy + z + heading, keeping the FM's tilt) so the receding-horizon rollout follows
-the robot instead of drifting on its prior path. The FM joint order need not equal
-the robot's isaac order (a clip-conditioned FM is trained in the clip-library
-order); measured joints are permuted isaac->FM for the history and the prediction
-is permuted FM->CLF-output for the joint reference terms.
+The generator is **robot-state-conditioned**, exactly like the in-loop
+``FmTrackingCommand``: the ``N`` history tokens are the LIVE MEASURED robot state
+(phase), NOT the FM's own past output -- this fixes the autoregressive z-drift /
+exposure bias. Each freshly sampled trajectory is anchored on the robot's current
+base pose (xyz+yaw ground frame; node 0 = "now"), with a root-height token restoring
+ground clearance. The FM joint order need not equal the robot's isaac order (the FM
+is trained in the clip-library order); measured joints are permuted isaac->FM for
+the history and the prediction is permuted FM->CLF-output for the joint reference terms.
 
 Same per-step contract as the torch version: ``create_obs(state)`` builds the
 tracker observation from the FM prediction + measured proprioception;
@@ -28,9 +27,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .fm_session import build_cmd_tokens, build_cond_states, load_fm_context, sample_world
+from .fm_session import build_cmd_tokens, build_height_token, build_history_tokens, load_fm_context, sample_world
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_box_minus, quat_conjugate, quat_inv, quat_mul, yaw_quat
+from .quat_math_np import quat_apply, quat_box_minus, quat_inv
 from .tracker_session import TrackerSession
 
 # Obs-term clip bounds set in the env cfg but not carried in the metadata.
@@ -159,8 +158,8 @@ class GenTrackerPolicy:
 
         The FM joint order (``ctx.joint_names``) need NOT equal the robot's isaac
         order -- a clip-conditioned FM is trained in the clip-library joint order.
-        Mirrors the in-loop ``GeneratorTrackingCommand`` (which permutes both ways):
-        measured joints are permuted isaac->FM for the autoregressive history, and the
+        Mirrors the in-loop ``FmTrackingCommand`` (which permutes both ways):
+        measured joints are permuted isaac->FM for the robot-state history, and the
         FM prediction is permuted FM->CLF-output for ``joint_pos_ref``/``joint_vel_ref``.
         """
         isaac = list(self._trk.get_joint_names())
@@ -176,7 +175,7 @@ class GenTrackerPolicy:
         self.joint_out_names = joint_out
         if self.fm_enabled:
             fm = list(self.ctx.joint_names)
-            # Measured (isaac order) -> FM order, for the autoregressive history input.
+            # Measured (isaac order) -> FM order, for the robot-state history input.
             self._isaac_to_fm = np.array([isaac.index(n) for n in fm], dtype=np.int64)
             # FM prediction (FM order) -> CLF output joint order, for joint_*_ref.
             self._fm_to_out = np.array([fm.index(n) for n in joint_out], dtype=np.int64)
@@ -199,9 +198,11 @@ class GenTrackerPolicy:
     def _make_snapshot(self, state: dict) -> dict[str, np.ndarray]:
         """Pack one MEASURED world state into the FM history layout (1 env).
 
-        Seeds the autoregressive history during the warmup (and at a clip->FM
-        handoff). Measured joints are permuted from the robot's isaac order into the
-        FM joint order; measured ee frames are already in the FM frame order.
+        Appended to the rolling history every control step (and used to warm-start
+        it and to keep it warm during clip playback): the robot-state-conditioned FM's
+        history IS the measured robot state. Measured joints are permuted from the
+        robot's isaac order into the FM joint order; measured ee frames are already in
+        the FM frame order.
         """
         a = lambda x: np.asarray(x, dtype=np.float64)[None]
         jp = np.asarray(state["joint_pos"], dtype=np.float64)
@@ -217,33 +218,6 @@ class GenTrackerPolicy:
             frames = np.concatenate(
                 [state["frame_pos"], state["frame_quat"], state["frame_lin"], state["frame_ang"]], axis=-1
             )
-            snap["frames"] = frames[None]
-        return snap
-
-    def _applied_ref_snapshot(self, state: dict) -> dict[str, np.ndarray]:
-        """The autoregressive history snapshot to append THIS step (FM history layout).
-
-        Mirrors ``GeneratorTrackingCommand``: once the prediction is live the FM
-        conditions on its OWN previously-applied reference (the prediction at the
-        current read index, already in FM joint/frame order); during the warmup (and
-        before the first sample) it falls back to the measured state -- the deploy
-        analogue of Isaac's clip seed. The command is always the current measured
-        command (the FM command-conditioning horizon, independent of the pose
-        reference), matching Isaac's separate ``get_command_velocity_horizon``.
-        """
-        if not self._pred_valid:
-            return self._make_snapshot(state)
-        cur = self._pred_at(self._pred_idx)
-        snap = {
-            "root_pos": cur["root_pos"][None], "root_quat": cur["root_quat"][None],
-            "root_lin": cur["root_lin"][None], "root_ang": cur["root_ang"][None],
-            "jp": cur["jp"][None], "jv": cur["jv"][None],
-            "cmd": np.asarray(state["command"], dtype=np.float64)[None],
-        }
-        if self.ctx.num_extra_frames > 0:
-            frames = np.concatenate(
-                [cur["frame_pos"], cur["frame_quat"], cur["frame_lin"], cur["frame_ang"]], axis=-1
-            )  # (k, 13)
             snap["frames"] = frames[None]
         return snap
 
@@ -269,15 +243,16 @@ class GenTrackerPolicy:
         self._history.append(self._make_snapshot(state))
 
     def _update_generator(self, state: dict) -> None:
-        """Append the autoregressive history snapshot and (re-)run or advance the prediction.
+        """Append the LIVE robot-state snapshot and (re-)run or advance the prediction.
 
-        The appended snapshot is the FM's OWN previous applied reference (or the
-        measured stand during the warmup) -- the generator never conditions on the
-        live robot state, mirroring ``GeneratorTrackingCommand._snapshot_and_infer``.
-        The freshly sampled trajectory is re-anchored onto the robot root in ``_run_fm``.
+        The appended snapshot is always the MEASURED robot state (permuted into FM
+        joint/frame order) -- the robot-state-conditioned FM conditions on the real
+        robot history (phase), not its own past output, mirroring
+        ``FmTrackingCommand._snapshot_and_infer``. ``_run_fm`` anchors the freshly
+        sampled trajectory on the robot's current base pose.
         """
         self._ctrl_step += 1
-        self._history.append(self._applied_ref_snapshot(state))
+        self._history.append(self._make_snapshot(state))
         valid = bool(self._history.valid()[0])
         exhausted = self._pred_idx >= (self.ctx.F - 1)
         due = (self._ctrl_step % self.fm_update_every) == 0
@@ -287,14 +262,13 @@ class GenTrackerPolicy:
             self._pred_idx = min(self._pred_idx + 1, self.ctx.F - 1)
 
     def _run_fm(self, state: dict) -> None:
-        """Sample an F-step world trajectory, re-anchored onto the robot root.
+        """Sample an F-step world trajectory anchored on the robot's current base pose.
 
-        The conditioning is the FM's OWN past reference (the autoregressive history);
-        only the world placement is re-anchored onto the robot's measured root --
-        planar position (xy), HEIGHT (z), and heading (yaw), keeping the FM's natural
-        tilt (roll/pitch). Mirrors ``GeneratorTrackingCommand._run_fm`` exactly, so
-        the deployed receding-horizon rollout follows the robot instead of drifting on
-        its own prior trajectory.
+        Conditions the FM on the N most-recent MEASURED robot states (phase history),
+        a root-height token (live root z), and the future velocity command, then lifts
+        the F-step ego-anchored prediction back to the world using the robot's current
+        base pose as the xyz+yaw anchor (node 0 = "now", base offset ~= 0). Mirrors
+        ``FmTrackingCommand._run_fm``.
         """
         ctx = self.ctx
         rp = self._history.stack("root_pos")
@@ -306,7 +280,8 @@ class GenTrackerPolicy:
         cmd = self._history.stack("cmd")
         frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
 
-        cond, known = build_cond_states(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
+        history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
+        height = build_height_token(ctx, rp[:, -1, 2])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip→FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -318,17 +293,11 @@ class GenTrackerPolicy:
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
         noise = self._rng.standard_normal((1, ctx.F, ctx.D))
 
-        # Re-anchor the prediction onto the robot root (xy + z + yaw), keeping the FM
-        # tilt -- the network still conditions on its own past output (rp/rq), only the
-        # world placement follows the robot. Matches generator_tracking_cmd._run_fm.
+        # The robot NOW is the anchor: the most-recent history step IS the live robot
+        # state, so its base pose is the xyz+yaw ground frame the FM was trained on.
         p_ref = rp[:, -1].copy()
         q_ref = rq[:, -1].copy()
-        robot_p = np.asarray(state["root_pos"], dtype=np.float64)[None]   # (1, 3)
-        robot_q = np.asarray(state["root_quat"], dtype=np.float64)[None]  # (1, 4) xyzw
-        p_ref[:] = robot_p                                               # anchor xy + z
-        dz_yaw = quat_mul(yaw_quat(robot_q), quat_conjugate(yaw_quat(q_ref)))
-        q_ref = quat_mul(dz_yaw, q_ref)                                  # FM tilt, robot heading
-        world = sample_world(ctx, cond, known, p_ref, q_ref, cmd_tokens, noise)
+        world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref, noise)
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]
@@ -341,9 +310,8 @@ class GenTrackerPolicy:
             self._pred["frame_quat"] = world["frame_quat_w"]
             self._pred["frame_lin"] = world["frame_lin_vel_w"]
             self._pred["frame_ang"] = world["frame_ang_vel_w"]
-        # Frames 0..N-1 reproduce the conditioning; novel future starts at N, so the
-        # tracked reference index begins one step ahead of "now" (= N-1).
-        self._pred_idx = ctx.N
+        # Node 0 = "now" (base offset ~= 0); the applied index advances from here.
+        self._pred_idx = 0
         self._pred_valid = True
 
     def _pred_at(self, idx: int) -> dict[str, np.ndarray]:

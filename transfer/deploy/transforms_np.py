@@ -24,6 +24,7 @@ from .quat_math_np import (
     quat_apply_inverse,
     quat_from_matrix,
     subtract_frame_transforms,
+    yaw_quat,
 )
 
 FRAME_BLOCK_DIM = 3 + 3 + 6 + 3  # [pos(3), lin_vel(3), ori6d(6), ang_vel(3)] = 15
@@ -68,12 +69,29 @@ def frame_block_start(num_joints: int, frame_index: int) -> int:
     return 2 * num_joints + FRAME_BLOCK_DIM * frame_index
 
 
+def height_above_ground(p_ref: np.ndarray, ground_z: float = 0.0) -> np.ndarray:
+    """Root height above the ground at the anchor, the FM's height token.
+
+    The xyz+yaw relative frame removes the anchor's absolute z, so this scalar
+    (``p_ref.z - ground_z``) restores ground clearance -- a stand-in for a future
+    heightmap. On flat ground ``ground_z = 0`` and it is just the root world z.
+    """
+    return p_ref[..., 2:3] - ground_z
+
+
 def _frame_relative_block(p_ref, q_ref, p_w, q_w, v_w, w_w) -> np.ndarray:
-    """Build one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block."""
-    p_rel, q_rel = subtract_frame_transforms(p_ref, q_ref, p_w, q_w)
+    """Build one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block.
+
+    The reference frame is an **xyz + yaw** ground frame: the anchor's position
+    ``p_ref`` (incl. z) and yaw are removed, roll/pitch are kept (only
+    ``yaw_quat(q_ref)`` is factored out), so ``ori6d`` retains the body's full tilt.
+    Absolute ground clearance is supplied separately by the height token.
+    """
+    q_yaw = yaw_quat(q_ref)
+    p_rel, q_rel = subtract_frame_transforms(p_ref, q_yaw, p_w, q_w)
     ori6d = matrix_to_rot6d(matrix_from_quat(q_rel))
-    v_rel = quat_apply_inverse(q_ref, v_w)
-    w_rel = quat_apply_inverse(q_ref, w_w)
+    v_rel = quat_apply_inverse(q_yaw, v_w)
+    w_rel = quat_apply_inverse(q_yaw, w_w)
     return np.concatenate([p_rel, v_rel, ori6d, w_rel], axis=-1)
 
 
@@ -103,15 +121,20 @@ def relative_state(
 
 
 def _block_to_absolute(block, p_ref, q_ref):
-    """Invert one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block to world."""
+    """Invert one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block to world.
+
+    Uses the same **xyz + yaw** anchor as :func:`_frame_relative_block`
+    (``yaw_quat(q_ref)``); the round-trip is exact (``yaw_quat`` is idempotent).
+    """
+    q_yaw = yaw_quat(q_ref)
     p_rel = block[..., 0:3]
     v_rel = block[..., 3:6]
     ori6d = block[..., 6:12]
     w_rel = block[..., 12:15]
     q_rel = rot6d_to_quat(ori6d)
-    p_w, q_w = combine_frame_transforms(p_ref, q_ref, p_rel, q_rel)
-    v_w = quat_apply(q_ref, v_rel)
-    w_w = quat_apply(q_ref, w_rel)
+    p_w, q_w = combine_frame_transforms(p_ref, q_yaw, p_rel, q_rel)
+    v_w = quat_apply(q_yaw, v_rel)
+    w_w = quat_apply(q_yaw, w_rel)
     return p_w, q_w, v_w, w_w
 
 

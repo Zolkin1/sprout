@@ -2,12 +2,14 @@
 
 """onnxruntime flow-matching generator session (numpy glue + ORT net).
 
-Numpy + onnxruntime counterpart of ``transfer/fm/online.py``. The ONNX
-(``fm.onnx``, exported by ``scripts/flow_matching/export_fm_onnx.py``) folds in the
-normalizers and the unrolled masked-Euler sampler, so this builds the **raw**
-conditioning window (numpy ``relative_state``) + known mask + raw strided command
+Numpy + onnxruntime counterpart of ``transfer/fm/online.py`` (robot-state
+conditioned). The ONNX (``fm.onnx``, exported by
+``scripts/flow_matching/export_fm_onnx.py``) folds in the normalizers and the
+unrolled Euler sampler, so this builds the **raw** N history (phase) tokens (numpy
+``relative_state``), the **raw** root-height token, and the raw strided command
 tokens, runs one ``session.run`` for the whole sampler, and lifts the predicted
-relative state to the world frame (numpy ``state_to_absolute``). No torch.
+F-step future to the world frame (numpy ``state_to_absolute``). There is no
+inpainting / known mask -- conditioning is separate tokens. No torch.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ class FmContext:
     num_cmd_tokens: int
     joint_names: list[str]
     target_frame_names: list[str]
+    ground_z: float
 
     @property
     def frame_names(self) -> list[str]:
@@ -63,19 +66,21 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
+        ground_z=float(m.get("ground_z", 0.0)),
     )
 
 
-def build_cond_states(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel,
-                      frames=None) -> tuple[np.ndarray, np.ndarray]:
-    """Build the **raw** conditioning window ``(V, F, D)`` and known mask ``(V, F)``.
+def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel,
+                         frames=None) -> np.ndarray:
+    """Build the **raw** ``N`` history (phase) tokens ``(V, N, D)`` (relative-state).
 
     Unlike the torch ``transfer/fm`` builder, this does NOT normalize -- the
     ``fm.onnx`` graph folds in the state normalization. Inputs are the ``N``
-    most-recent steps ``(V, N, ·)`` in FM joint/frame order, world frame, xyzw quats;
-    ``frames`` is ``(V,N,K,13)`` (required when the model predicts extra frames).
-    The N relative states fill the first N tokens (anchored at step N-1); the rest
-    are zeros with ``known = 0``.
+    most-recent real-robot steps ``(V, N, ·)`` in FM joint/frame order, world frame,
+    xyzw quats; ``frames`` is ``(V,N,K,13)`` (required when the model predicts extra
+    frames). The relative frame is the **xyz+yaw** ground frame at the most recent
+    step (index ``N-1``), matching training. Returns ONLY the N history tokens (no
+    length-F window, no known mask -- history is separate conditioning).
     """
     v, n = root_pos.shape[0], root_pos.shape[1]
     nj, k, m = ctx.nj, ctx.target_num_extra_frames, root_pos.shape[0] * root_pos.shape[1]
@@ -89,18 +94,22 @@ def build_cond_states(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, join
         fr = frames.reshape(m, k, 13)
         fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
 
-    rel = relative_state(
+    return relative_state(
         root_pos.reshape(m, 3), root_quat.reshape(m, 4),
         root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
         joint_pos.reshape(m, nj), joint_vel.reshape(m, nj), p_ref, q_ref,
         frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
     ).reshape(v, n, ctx.D)
 
-    cond = np.zeros((v, ctx.F, ctx.D), dtype=rel.dtype)
-    cond[:, :n] = rel
-    known = np.zeros((v, ctx.F), dtype=np.float32)
-    known[:, :n] = 1.0
-    return cond, known
+
+def build_height_token(ctx: FmContext, anchor_root_z: np.ndarray) -> np.ndarray:
+    """Build the **raw** root-height token ``(V, 1)`` = root z - ground_z.
+
+    The ``fm.onnx`` graph folds in the height normalization. ``anchor_root_z`` is the
+    world z of the robot root at the anchor step, shape ``(V,)`` or ``(V, 1)`` -- the
+    live ground-clearance stand-in for a heightmap.
+    """
+    return np.asarray(anchor_root_z, dtype=np.float64).reshape(-1, 1) - ctx.ground_z
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
@@ -117,25 +126,28 @@ def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
     return future_cmd[:, ctx.cmd_steps, :]
 
 
-def sample_world(ctx: FmContext, cond, known, p_ref, q_ref, cmd_tokens, noise) -> dict:
-    """Run the ONNX sampler and lift the predicted relative state to the world frame.
+def sample_world(ctx: FmContext, history, height, cmd_tokens, p_ref, q_ref, noise) -> dict:
+    """Run the ONNX sampler and lift the predicted F-step future to the world frame.
+
+    All F frames are predicted FUTURE (node 0 = the current step, base offset ~= 0),
+    expressed relative to the **xyz+yaw** ground frame at ``p_ref``/``q_ref`` (the
+    current robot base pose = the anchor at step N-1).
 
     Args:
         ctx: Loaded FM context.
-        cond: Raw conditioning window ``(V, F, D)``.
-        known: Known mask ``(V, F)`` (1.0 at conditioning tokens).
-        p_ref: World anchor position ``(V, 3)``.
-        q_ref: World anchor quaternion ``(V, 4, xyzw)``.
+        history: Raw N history (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
+        height: Raw root-height token ``(V, 1)`` (from :func:`build_height_token`).
         cmd_tokens: Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)``.
+        p_ref: World anchor position ``(V, 3)`` (the current robot base position).
+        q_ref: World anchor quaternion ``(V, 4, xyzw)``.
         noise: Sampling noise ``(V, F, D)`` (caller-supplied for determinism).
 
     Returns:
         World-frame prediction dict (same keys as ``transfer/fm`` ``sample_world``).
-        Novel (predicted) frames are ``N..F-1``.
     """
     feed = {
-        "cond": cond.astype(np.float32),
-        "known": known.astype(np.float32),
+        "history": history.astype(np.float32),
+        "height": height.astype(np.float32),
         "cmd_tokens": cmd_tokens.astype(np.float32),
         "noise": noise.astype(np.float32),
     }

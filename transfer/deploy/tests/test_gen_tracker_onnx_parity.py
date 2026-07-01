@@ -5,8 +5,9 @@
 Dev-only. Feeds an identical synthetic (state, FM-reference) into both the
 torch obs builder (``transfer/sim/gen_tracker_policy``, validated against Isaac
 to ~1e-7) and the torch-free deploy builder (``transfer/deploy/gen_tracker``),
-and asserts the 207-dim observation matches. The CLF output joint order is
-injected into both (the TM2 export predates ``joint_out_names``).
+and asserts the tracker observation matches term-by-term. The CLF output joint
+order (from the clip library) is injected into both so the comparison is
+independent of the tracker export's ``joint_out_names``.
 
 Requires (build first):
   - tracker.onnx : python scripts/rsl_rl/export_tracker_onnx.py --run_dir <run>
@@ -33,8 +34,8 @@ from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from gen_tracker_policy import GeneratorTrackerPolicy  # noqa: E402
 
 CLIP = os.path.join(ROOT, "clips", "g1_flat_v1.h5")
-RUN = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-22_09-47-52_TM2_generator_tracking_test/exported")
-FM_PT = os.path.join(ROOT, "logs/flow_matching/2026-06-21_17-07-59/ckpt_89.pt")
+RUN = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-29_19-58-38_teacher_ego_z_anchor/exported")
+FM_PT = os.path.join(ROOT, "logs/flow_matching/2026-06-30_17-16-27_fm_robot_hist_v1/best.pt")
 N_NJ = 21
 
 
@@ -71,6 +72,7 @@ def test_gen_tracker_onnx_parity() -> None:
         "command": g.standard_normal(3),
     }
     cur = {"root_pos": g.standard_normal(3), "root_quat": rq(),
+           "root_lin": g.standard_normal(3), "root_ang": g.standard_normal(3),
            "jp": g.standard_normal(nj), "jv": g.standard_normal(nj),
            "frame_pos": g.standard_normal((K, 3))}
     future = [{"root_pos": g.standard_normal(3), "root_quat": rq(),
