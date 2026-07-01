@@ -2167,6 +2167,8 @@ class TeacherStepResult:
     real: list[dict[str, np.ndarray]]          # (F, .) ego-anchored clip future (ref_future)
     fm: list[dict[str, np.ndarray]]            # (F, .) FM prediction (history-conditioned)
     robot: list[dict[str, np.ndarray]]         # (<=F, .) robot actual future (recorded state)
+    spine: dict[str, np.ndarray]               # (L, .) robot actual over the WHOLE episode
+    spine_steps: np.ndarray                    # (L,) step_in_episode of each spine row
     episode_id: int
     split: str
     N: int
@@ -2286,17 +2288,75 @@ def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherS
 
     if not anchors:
         raise SystemExit(f"[bench] episode {ep} has no usable snaps (need {N} prior consecutive steps).")
-    print(f"[bench] teacher forecast_step: episode {ep} ({split}), {len(anchors)} snaps, F={F} "
-          f"(real clip future = solid, FM prediction = dashed, robot actual = dotted).")
+    spine = layout.parse(state[rows])  # robot-actual over the whole episode (the rollout spine)
+    print(f"[bench] teacher forecast_step: episode {ep} ({split}), {len(anchors)} snaps, F={F}, "
+          f"spine L={len(rows)}.")
     return TeacherStepResult(
-        anchors=anchors, real=real, fm=fm, robot=robot, episode_id=ep, split=split,
-        N=N, F=F, dt=ctx.dt_attr, frame_names=meta.state_frame_names,
+        anchors=anchors, real=real, fm=fm, robot=robot, spine=spine, spine_steps=steps,
+        episode_id=ep, split=split, N=N, F=F, dt=ctx.dt_attr, frame_names=meta.state_frame_names,
         joint_names=meta.state_joint_names, foot_idxs=foot_idxs,
     )
 
 
-def draw_teacher_step(fig, res: TeacherStepResult, k: int) -> None:
-    """Overlay the real clip future / FM prediction / robot actual at snap ``k``."""
+def draw_teacher_overlay(fig, res: TeacherStepResult, k: int) -> None:
+    """Full-episode robot rollout (spine) with the FM prediction from every snap
+    branching off it (colored by snap time), the focused snap ``k`` highlighted.
+
+    Black = the robot's actual trajectory over the whole clip; faint viridis = each
+    snap's FM-predicted future placed at its clip-step; crimson = the focused snap
+    (solid = FM prediction, dashed = the real ego-anchored clip future it targets).
+    Left/Right re-focus a snap; the spine + all branches stay drawn.
+    """
+    dt = res.dt
+    sp_t = res.spine_steps.astype(float) * dt
+    norm = mcolors.Normalize(0.0, max(1e-6, max(res.anchors) * dt))
+    cmap = matplotlib.colormaps["viridis"]
+    fig.clear()
+    axs = fig.subplots(2, 2)
+
+    def btime(ki):
+        return (res.anchors[ki] + np.arange(res.F)) * dt
+
+    def panel(ax, getter, title, ylabel):
+        ax.plot(sp_t, getter(res.spine), color="k", lw=1.8, zorder=5, label="robot actual (rollout)")
+        for ki in range(len(res.anchors)):
+            ax.plot(btime(ki), getter(res.fm[ki]), color=cmap(norm(res.anchors[ki] * dt)),
+                    lw=0.8, alpha=0.30, zorder=3)
+        ax.plot(btime(k), getter(res.fm[k]), color="crimson", lw=2.2, zorder=7, label="FM pred @ snap")
+        ax.plot(btime(k), getter(res.real[k]), color="crimson", lw=1.5, ls="--", zorder=7, label="real clip @ snap")
+        ax.set_title(title); ax.set_ylabel(ylabel); ax.set_xlabel("clip time (s)"); ax.grid(alpha=0.3)
+
+    panel(axs[0, 0], lambda tr: tr["root_pos"][:, 0], "root x", "m")
+    panel(axs[0, 1], lambda tr: tr["root_pos"][:, 2], "root height (z)", "m")
+    fi = res.foot_idxs[0] if res.foot_idxs else 0
+    if res.frame_names:
+        panel(axs[1, 1], lambda tr: tr["ee_pos"][:, fi, 2], f"foot z ({res.frame_names[fi]})", "m")
+    else:
+        axs[1, 1].set_visible(False)
+    axs[0, 0].legend(fontsize=7, loc="best")
+
+    # top-down xy path
+    ax = axs[1, 0]
+    ax.plot(res.spine["root_pos"][:, 0], res.spine["root_pos"][:, 1], color="k", lw=1.8, zorder=5)
+    for ki in range(len(res.anchors)):
+        p = res.fm[ki]["root_pos"]
+        ax.plot(p[:, 0], p[:, 1], color=cmap(norm(res.anchors[ki] * dt)), lw=0.8, alpha=0.30, zorder=3)
+    pk, rk = res.fm[k]["root_pos"], res.real[k]["root_pos"]
+    ax.plot(pk[:, 0], pk[:, 1], color="crimson", lw=2.2, zorder=7)
+    ax.plot(rk[:, 0], rk[:, 1], color="crimson", lw=1.5, ls="--", zorder=7)
+    ax.scatter([res.spine["root_pos"][0, 0]], [res.spine["root_pos"][0, 1]], c="g", s=30, zorder=8)
+    ax.set_title("root xy path (world)"); ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)")
+    ax.set_aspect("equal", adjustable="datalim"); ax.grid(alpha=0.3)
+
+    sm = matplotlib.cm.ScalarMappable(norm=norm, cmap="viridis"); sm.set_array([])
+    fig.colorbar(sm, ax=list(axs.ravel()), label="snap time (s)", fraction=0.02, pad=0.01)
+    fig.suptitle(f"teacher forecast_step [overlay]  ep={res.episode_id} ({res.split})  "
+                 f"snap {k + 1}/{len(res.anchors)} @ clip-step {res.anchors[k]}  "
+                 f"(black=rollout, faint=FM branches, crimson=focused: solid FM / dashed real clip)")
+
+
+def draw_teacher_detail(fig, res: TeacherStepResult, k: int) -> None:
+    """Per-node detail at snap ``k``: real clip future / FM prediction / robot actual."""
     real, fm, robot = res.real[k], res.fm[k], res.robot[k]
     t = np.arange(res.F) * res.dt
     fig.clear()
@@ -2332,13 +2392,23 @@ def draw_teacher_step(fig, res: TeacherStepResult, k: int) -> None:
 
 
 class TeacherForecastBrowser:
-    """Arrow-key scrubber over a :class:`TeacherStepResult` (Left/Right = snaps)."""
+    """Scrub a :class:`TeacherStepResult`: Left/Right focus a snap, Up/Down toggle view.
+
+    Two views: ``overlay`` (full-episode rollout spine with every snap's FM branch
+    fanning off it, focused snap highlighted) and ``detail`` (per-node real / FM /
+    robot at the focused snap)."""
+
+    _VIEWS = (("overlay", draw_teacher_overlay), ("detail", draw_teacher_detail))
 
     def __init__(self, res: TeacherStepResult, plt):
-        self.res, self.plt, self.k, self.n = res, plt, 0, len(res.anchors)
+        self.res, self.plt, self.k, self.view, self.n = res, plt, 0, 0, len(res.anchors)
 
     def _render(self, fig):
-        draw_teacher_step(fig, self.res, self.k)
+        name, draw = self._VIEWS[self.view]
+        draw(fig, self.res, self.k)
+        fig.canvas.manager.set_window_title(
+            f"[snap {self.k + 1}/{self.n} | {name}] teacher forecast_step  clip-step {self.res.anchors[self.k]}"
+        )
         fig.canvas.draw_idle()
 
     def _on_key(self, event, fig):
@@ -2346,6 +2416,8 @@ class TeacherForecastBrowser:
             self.k = (self.k + 1) % self.n; self._render(fig)
         elif event.key == "left":
             self.k = (self.k - 1) % self.n; self._render(fig)
+        elif event.key in ("up", "down"):
+            self.view = (self.view + 1) % len(self._VIEWS); self._render(fig)
         elif event.key in ("q", "escape"):
             self.plt.close(fig)
 
@@ -2353,17 +2425,20 @@ class TeacherForecastBrowser:
         fig = self.plt.figure(figsize=(15, 9))
         fig.canvas.mpl_connect("key_press_event", lambda e: self._on_key(e, fig))
         self._render(fig)
-        print(f"[bench] teacher forecast_step: {self.n} snaps -- Left/Right to scrub, q to quit")
+        print(f"[bench] teacher forecast_step: {self.n} snaps -- Left/Right focus a snap, "
+              f"Up/Down toggle overlay/detail, q to quit")
         self.plt.show()
 
     def save_all(self, out_dir: str, stride: int):
         os.makedirs(out_dir, exist_ok=True)
-        for k in range(0, self.n, max(1, stride)):
-            fig = self.plt.figure(figsize=(15, 9))
-            draw_teacher_step(fig, self.res, k)
-            path = os.path.join(out_dir, f"teacher_step_{self.res.anchors[k]:04d}.png")
-            fig.savefig(path, dpi=150, bbox_inches="tight"); self.plt.close(fig)
-            print(f"[bench]   saved {path}")
+        # One overlay per strided snap + a detail for each strided snap.
+        for name, draw in self._VIEWS:
+            for k in range(0, self.n, max(1, stride)):
+                fig = self.plt.figure(figsize=(15, 9))
+                draw(fig, self.res, k)
+                path = os.path.join(out_dir, f"teacher_{name}_{self.res.anchors[k]:04d}.png")
+                fig.savefig(path, dpi=150, bbox_inches="tight"); self.plt.close(fig)
+                print(f"[bench]   saved {path}")
 
 
 class ForecastStepBrowser:
