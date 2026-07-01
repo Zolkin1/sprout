@@ -26,6 +26,9 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import (
 from robot_rl.tasks.manager_based.robot_rl.terrains.meta_composite_importer import (
     MetaCompositeTerrainImporter,
 )
+from robot_rl.tasks.manager_based.robot_rl.terrains.velocity_guidance_cfg import (
+    BlockVelocityGuidanceCfg,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1033,3 +1036,128 @@ def test_slope_block_inside_randomized_composite():
         assert pytest.approx(curr["entry_z"], abs=1e-6) == prev["exit_z"]
 
 
+
+
+# ---------------------------------------------------------------------------
+# Velocity guidance
+# ---------------------------------------------------------------------------
+
+def _guided_flat_cfg(size_x: float = 3.0) -> FlatBlockCfg:
+    """Flat block declaring end-of-block velocity guidance."""
+    return FlatBlockCfg(
+        size_x=size_x,
+        skill_probs={"walk_forward": 1.0},
+        velocity_guidance=BlockVelocityGuidanceCfg(
+            lin_vel_y=(-0.4, 0.4), ang_vel_z=(-0.5, 0.5),
+            y_kp=1.5, y_kd=0.3, heading_kp=0.5,
+        ),
+    )
+
+
+def test_velocity_guidance_packed_into_block_metadata():
+    """``composite_terrain`` carries the block cfg's guidance through to the
+    per-block metadata dicts; unguided blocks carry ``None``."""
+    sub = CompositeSubTerrainCfg(
+        size=(6.0, 2.0),
+        proportion=1.0,
+        blocks=[_guided_flat_cfg(3.0), _flat_cfg(3.0)],
+    )
+    _, _, md = composite_terrain(0.0, sub)
+    assert md["blocks"][0]["velocity_guidance"] is not None
+    assert md["blocks"][1]["velocity_guidance"] is None
+
+
+def test_velocity_guidance_at_targets_and_activity():
+    """Guided blocks expose end-of-block targets; unguided blocks are
+    inactive.  World conversion checked on a single-cell grid (world =
+    local − size/2)."""
+    np.random.seed(4)
+    stair = _stair_up_cfg(4.0)
+    stair.velocity_guidance = BlockVelocityGuidanceCfg()
+    sub = CompositeSubTerrainCfg(
+        size=(10.0, 2.0),
+        proportion=1.0,
+        blocks=[_guided_flat_cfg(3.0), stair, _flat_cfg(3.0)],
+    )
+    _, _, md = composite_terrain(0.5, sub)
+    m = _attach_importer(
+        {(0, 0): md}, grid_shape=(1, 1), sub_size=(10.0, 2.0),
+        skill_list=["stair_up", "walk_forward"],
+    )
+
+    # Query one point per block, in world coords (local − half cell size).
+    pts_local = torch.tensor([[1.0, 1.0], [5.0, 0.5], [8.5, 1.5]])
+    pts_w = pts_local - torch.tensor([5.0, 1.0])
+    q = m.velocity_guidance_at(pts_w)
+
+    assert q.active.tolist() == [True, True, False]
+    # Flat block 0: exit edge x=3.0, walkable y center; stair: exit x=7.0.
+    walkable0 = m._block_walkable_aabbs[0, 0, 0]
+    y_center0 = 0.5 * (walkable0[2] + walkable0[3])
+    expected0_w = torch.tensor([3.0 - 5.0, y_center0 - 1.0])
+    assert torch.allclose(q.target_w[0], expected0_w, atol=1e-5)
+    walkable1 = m._block_walkable_aabbs[0, 0, 1]
+    y_center1 = 0.5 * (walkable1[2] + walkable1[3])
+    expected1_w = torch.tensor([7.0 - 5.0, y_center1 - 1.0])
+    assert torch.allclose(q.target_w[1], expected1_w, atol=1e-5)
+    # Travel direction +x.
+    assert torch.allclose(q.yaw[:2], torch.zeros(2))
+    # Ranges / gains from the cfg.
+    assert torch.allclose(q.lin_vel_y[0], torch.tensor([-0.4, 0.4]))
+    assert torch.allclose(q.ang_vel_z[0], torch.tensor([-0.5, 0.5]))
+    assert torch.allclose(q.gains[0], torch.tensor([1.5, 0.3, 0.5]))
+
+
+def test_velocity_guidance_at_world_offsets_multi_cell():
+    """Targets convert to world frame correctly for a non-origin cell."""
+    sub = CompositeSubTerrainCfg(
+        size=(6.0, 2.0),
+        proportion=1.0,
+        blocks=[_guided_flat_cfg(6.0)],
+    )
+    _, _, md0 = composite_terrain(0.0, sub)
+    _, _, md1 = composite_terrain(0.0, sub)
+    m = _attach_importer(
+        {(0, 0): md0, (1, 1): md1}, grid_shape=(2, 2), sub_size=(6.0, 2.0),
+        skill_list=["walk_forward"],
+    )
+    # Cell (1, 1): local origin sits at world (6 − 6, 2 − 2) = (0, 0).
+    pt_w = torch.tensor([[1.0, 1.0]])  # local (1.0, 1.0) in cell (1, 1)
+    q = m.velocity_guidance_at(pt_w)
+    assert q.active.item() is True
+    # Target local (6.0, 1.0) → world (6.0 + 0, 1.0 + 0).
+    assert torch.allclose(q.target_w[0], torch.tensor([6.0, 1.0]), atol=1e-5)
+
+
+def test_velocity_guidance_legacy_cell():
+    """Legacy full-cell metadata with guidance gets a full-cell target."""
+    legacy_md = {
+        "needs_projection": False,
+        "needs_directional_cmd": False,
+        "is_border": False,
+        "skill_probs": {"stair_up": 1.0},
+        "velocity_guidance": BlockVelocityGuidanceCfg(),
+    }
+    m = _attach_importer(
+        {(0, 0): legacy_md}, grid_shape=(1, 1), sub_size=(10.0, 2.0),
+        skill_list=["stair_up"],
+    )
+    q = m.velocity_guidance_at(torch.tensor([[0.0, 0.0]]))
+    assert q.active.item() is True
+    # Full-cell block: exit x=10, y center=1 → world (10−5, 1−1).
+    assert torch.allclose(q.target_w[0], torch.tensor([5.0, 0.0]), atol=1e-5)
+
+
+def test_velocity_guidance_unknown_mode_raises():
+    legacy_md = {
+        "needs_projection": False,
+        "needs_directional_cmd": False,
+        "is_border": False,
+        "skill_probs": {"walk_forward": 1.0},
+        "velocity_guidance": BlockVelocityGuidanceCfg(mode="banana"),
+    }
+    with pytest.raises(ValueError, match="unknown velocity-guidance mode"):
+        _attach_importer(
+            {(0, 0): legacy_md}, grid_shape=(1, 1), sub_size=(10.0, 2.0),
+            skill_list=["walk_forward"],
+        )

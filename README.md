@@ -14,28 +14,75 @@ This project is a set of tools for end-to-end development of RL for robots. Spec
 interface can be run through a docker/dev-container provided in this repo. See below for more information.
 
 ## Installation
-When you clone this repo, please use **Git Large File System (lfs)**.
+We use a [`uv`](https://docs.astral.sh/uv/) virtual environment named `env_isaaclab` (at the repo root) with a
+**pip-installed Isaac Sim** and an **editable Isaac Lab** checked out as a sibling directory. This repo currently tracks
+Isaac Lab **`v3.0.0-beta`**. For the exact Isaac Sim pip command for your version/CUDA, see the Isaac Lab pip-install
+guide — both the
+[`v3.0.0-beta` page](https://isaac-sim.github.io/IsaacLab/v3.0.0-beta/source/setup/installation/pip_installation.html)
+(the version we track) and the
+[latest page](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/pip_installation.html) are useful
+references. The steps below reflect the setup this repo is currently developed against.
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda installation as it simplifies calling Python scripts from the terminal.
+Prerequisites: a recent NVIDIA driver (the pinned `torch` wheels target CUDA 12.8), [`uv`](https://docs.astral.sh/uv/),
+and [`git-lfs`](https://git-lfs.com/) (run `git lfs install` once). Asset files (`*.usd`, `*.pt`, `*.jit`, ...) are
+stored with **Git LFS**, so clone with LFS enabled.
 
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
+1. Mirror the directory layout — Isaac Lab lives next to (not inside) this repo:
 
     ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/robot_rl
+    mkdir -p Project-Isaac-RL && cd Project-Isaac-RL
+    ```
 
-- Verify that the extension is correctly by attempting to train:
+2. Clone this repo (with LFS) and Isaac Lab, then check out the pinned Isaac Lab tag:
 
-    - Running a task (see below for a full list of tasks):
+    ```bash
+    git clone git@github.com:Zolkin1/sprout.git
+    git -C sprout lfs pull
+    git clone https://github.com/isaac-sim/IsaacLab.git
+    git -C IsaacLab fetch --tags
+    git -C IsaacLab checkout v3.0.0-beta
+    ```
 
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-      
+3. Create and activate the `uv` venv (Python 3.12) at the sprout root:
+
+    ```bash
+    cd sprout
+    uv venv env_isaaclab --python 3.12
+    source env_isaaclab/bin/activate
+    ```
+
+4. Install Isaac Sim (pinned to match this repo) from NVIDIA's pip index. The two extra `uv` flags are required:
+   `--index-strategy unsafe-best-match` lets `uv` pull dependencies such as `mujoco-usd-converter` from PyPI while taking
+   the Isaac Sim wheels from NVIDIA's index, and `--prerelease=allow` permits pinned pre-release deps like
+   `tinyobjloader==2.0.0rc13`. (Plain `pip` does both implicitly, which is why the online guide doesn't mention them.)
+
+    ```bash
+    uv pip install --upgrade pip
+    uv pip install 'isaacsim[all,extscache]==6.0.0' \
+      --extra-index-url https://pypi.nvidia.com \
+      --index-strategy unsafe-best-match \
+      --prerelease=allow
+    ```
+
+5. Let Isaac Lab install all its extensions and RL libraries (e.g. `rsl-rl-lib`) in editable mode:
+
+    ```bash
+    (cd ../IsaacLab && ./isaaclab.sh -i)
+    ```
+
+6. Install this project in editable mode:
+
+    ```bash
+    uv pip install -e source/robot_rl
+    ```
+
+7. Verify the install by listing tasks and running a short headless training:
+
+    ```bash
+    python scripts/list_envs.py --keyword G1
+    python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=64
+    ```
+
 ## Running Tasks
 Get a list of available tasks:
 ```
@@ -75,6 +122,107 @@ NOTE: The policy must already be exported (see `play_policy` above).
 For now we are uploading the policies to the hugging face repo [here](https://huggingface.co/zolkin/robot_rl/tree/main).
 
 These policies are automatically downloaded in the `transfer/obelisk` controller.
+
+## Profiling
+
+`scripts/rsl_rl/train.py` and `scripts/rsl_rl/play.py` ship with an opt-in profiling harness
+(`scripts/rsl_rl/profiling.py`) that breaks the per-step time down by phase — physics vs. the
+MDP managers (observations / rewards / terminations / commands / events) vs. the
+trajectory-command internals. It is zero-cost when off. Use it to find where time is going
+*before* optimizing.
+
+### Quick start
+
+Training — run a short, bounded profile (use a small `--max_iterations`):
+```bash
+python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=4096 \
+    --max_iterations=5 --profile
+```
+
+Play — matches your normal play setup; reports on a rolling window:
+```bash
+python scripts/rsl_rl/play.py --task=<TASK_NAME>-play --num_envs=8 --profile
+```
+
+Each prints a per-phase table to the console and appends it to `profile_report.txt` in the
+run's log directory.
+
+### Reading the output
+
+The table is split into two parts:
+
+- **top-level** — phases that *partition* the step: `obs`, `reward`, `termination`,
+  `command`, `events`, plus an `unaccounted` row that is everything else inside `env.step`
+  (physics + render + scene update). On a headless training run, `unaccounted ≈ physics`.
+- **detail** — phases *nested* inside the top-level ones, shown as % of the frame but **not**
+  subtracted (so they may overlap). This is where the trajectory command is split into
+  selection (`traj.pre_update`), Bezier eval (`traj.get_output`), the CLF (`traj.clf`),
+  measured outputs (`traj.measured`), and the per-event-term breakdown (`evt.reset.*`,
+  `evt.interval.*`).
+
+```
+==================== TRAIN per-step breakdown ====================
+recorded frames: 118   device: cuda
+frame mean: 84.304 ms/frame  (~11.9 FPS)
+-- top-level (partition of frame) --
+  events                         16.331 ms/frame   19.4%
+  command                         4.147 ms/frame    4.9%
+  ...
+  unaccounted (physics/render)   57.841 ms/frame   68.6%
+-- detail (nested; % of frame) --
+  evt.reset.reset_on_reference    9.870 ms/frame   11.7%
+  traj.measured                   7.283 ms/frame    8.6%
+  ...
+==================================================================
+```
+
+rsl_rl already logs `Perf/collection_time`, `Perf/learning_time`, and `Perf/total_fps` every
+iteration — read those alongside the table for the rollout-vs-PPO-update split.
+
+### Flags
+
+`train.py`:
+- `--profile` — enable the harness.
+- `--profile_report_every N` — print a cumulative snapshot every `N` steps (default `50`; also
+  appended to `profile_report.txt`, so a snapshot survives a hard kill). `0` = report only at
+  the end.
+- `--profile_sync` — synchronous mode (see below).
+- `--profile_trace` — also run `torch.profiler` over the (bounded) run, dumping a Chrome trace
+  (`profile_trace.json`) and a top-op table. Use with a small `--max_iterations`.
+
+`play.py`:
+- `--profile` — enable; rolling report every `--profile_steps` frames (default `100`).
+- `--profile_sync` — synchronous mode.
+- `--no-debug-vis` — force the trajectory debug markers off, to A/B their cost.
+- `--no-logging` — disable per-step data logging, to A/B its cost.
+
+### How it works
+
+The harness times named spans with CUDA events (falling back to the wall clock on CPU) and
+also emits NVTX ranges, so the same phase names line up on an
+[Nsight Systems](https://developer.nvidia.com/nsight-systems) timeline if you run the script
+under `nsys`. It wraps the manager `compute` methods (and the trajectory-command / event-term
+functions) at runtime — no Isaac Lab edits. Phase times are read after a single
+`torch.cuda.synchronize()`.
+
+To **stop early, use Ctrl-C** (not `kill`) so the final report prints. The periodic snapshots
+are written to `profile_report.txt` during the run, so even a hard kill leaves the latest
+snapshot on disk.
+
+### Sync mode and a timing caveat
+
+Isaac Lab runs physics/sensors through Warp (a separate CUDA stream) while the timers use
+Torch's stream. With the default **async** timers, a phase that is the first to read physics
+results can absorb the physics wait across the stream boundary — so a *detail* row can read
+larger than its parent. That is an attribution artifact, not real nested cost. When you see
+it, re-run with **`--profile_sync`**: it drains the whole device at each phase boundary and
+times with the wall clock, so phases nest correctly. Sync mode is slower (it serializes the
+pipeline), so read the *proportions*, not the absolute FPS. The script prints
+`sync mode: ON/OFF` at startup so you can confirm it engaged.
+
+For **throughput decisions** (e.g. comparing `decimation` or `num_envs`), prefer the
+artifact-free `Perf/total_fps` that rsl_rl logs every iteration, and change one knob at a time.
+
 ## RL Tasks
 
 RL Task list:

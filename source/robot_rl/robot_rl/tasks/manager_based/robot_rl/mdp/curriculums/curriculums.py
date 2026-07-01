@@ -163,3 +163,55 @@ def terrain_levels(
 
     # Return average terrain level (for logging or scaling)
     return torch.mean(terrain.terrain_levels.float())
+
+def grace_period_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str = "frame_drift",
+    increment_s: float = 2.0,
+    interval_iters: int = 3000,
+    num_steps_per_env: int = 24,
+    max_grace_period_s: float | None = None,
+) -> float:
+    """Anneal a termination's post-transition grace period upward.
+
+    Every ``interval_iters`` training iterations, ``increment_s`` seconds is added
+    to ``term_name``'s ``grace_period_s`` parameter, capped at
+    ``max_grace_period_s``. Because that grace window only suppresses the
+    termination after an in-episode trajectory swap, growing it toward the episode
+    length progressively stops penalizing post-transition transients while leaving
+    steady-state (fresh-episode) frame drift active.
+
+    The interval is expressed in iterations and converted to environment steps via
+    ``num_steps_per_env`` (the RSL-RL ``num_steps_per_env``), since
+    ``env.common_step_counter`` advances by one per environment step.
+
+    Args:
+        env: The IsaacLab environment.
+        env_ids: Environment indices being reset this step. Unused — the grace
+            period is global to the term.
+        term_name: Termination term whose ``grace_period_s`` is annealed.
+        increment_s: Seconds added to the grace period each update.
+        interval_iters: Training iterations between updates.
+        num_steps_per_env: Environment steps per training iteration (keep in sync
+            with the agent cfg's ``num_steps_per_env``); converts
+            ``interval_iters`` to env steps.
+        max_grace_period_s: Upper bound on the grace period in seconds. Defaults to
+            ``env.max_episode_length_s`` so the grace can grow to cover a full
+            episode (frame drift then never fires after a transition).
+
+    Returns:
+        The current ``grace_period_s`` (seconds) for logging.
+    """
+    term_cfg = env.termination_manager.get_term_cfg(term_name)
+    grace = term_cfg.params["grace_period_s"]
+
+    cap = env.max_episode_length_s if max_grace_period_s is None else max_grace_period_s
+    update_interval = interval_iters * num_steps_per_env  # iterations -> env steps
+
+    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
+        grace = min(grace + increment_s, cap)
+        term_cfg.params["grace_period_s"] = grace
+        env.termination_manager.set_term_cfg(term_name, term_cfg)
+
+    return grace

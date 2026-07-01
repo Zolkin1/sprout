@@ -14,6 +14,7 @@ import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.skill_bucket import (
     bucket_for_velocity,
+    clamp_pd_channels_to_buckets,
     commit_pending_at_fire,
     step_skill_pending,
 )
@@ -393,3 +394,39 @@ class TestResetPath:
 
         out = bucket_for_velocity(vel, eligible, lin_x, lin_y, ang_z)
         assert out.tolist() == [SU]
+
+
+# ---------------------------------------------------------------------------
+# clamp_pd_channels_to_buckets
+# ---------------------------------------------------------------------------
+
+class TestClampPdChannelsToBuckets:
+    def test_zero_bucket_pins_channels(self):
+        """Stair/standing-style (0, 0) buckets must zero PD vy / wz leaks."""
+        lin_y = torch.tensor([[0.0, 0.0], [-0.6, 0.6]])
+        ang_z = torch.tensor([[0.0, 0.0], [-0.8, 0.8]])
+        vel = torch.tensor([
+            [0.4, 0.3, -0.5],   # env in skill 0 — vy/wz must clamp to 0
+            [1.0, 0.3, -0.5],   # env in skill 1 — in-range, untouched
+        ])
+        skill_id = torch.tensor([0, 1], dtype=torch.long)
+        out = clamp_pd_channels_to_buckets(vel, skill_id, lin_y, ang_z)
+        assert torch.allclose(out[0], torch.tensor([0.4, 0.0, 0.0]))
+        assert torch.allclose(out[1], vel[1])
+
+    def test_wide_bucket_clamps_to_edges(self):
+        """Out-of-bucket PD outputs clamp to the bucket edge, vx untouched."""
+        lin_y = torch.tensor([[-0.6, 0.6]])
+        ang_z = torch.tensor([[-0.8, 0.8]])
+        vel = torch.tensor([[2.0, 1.5, -2.0]])
+        skill_id = torch.tensor([0], dtype=torch.long)
+        out = clamp_pd_channels_to_buckets(vel, skill_id, lin_y, ang_z)
+        assert torch.allclose(out[0], torch.tensor([2.0, 0.6, -0.8]))
+
+    def test_input_not_mutated(self):
+        lin_y = torch.tensor([[0.0, 0.0]])
+        ang_z = torch.tensor([[0.0, 0.0]])
+        vel = torch.tensor([[1.0, 0.5, 0.5]])
+        original = vel.clone()
+        clamp_pd_channels_to_buckets(vel, torch.tensor([0]), lin_y, ang_z)
+        assert torch.equal(vel, original)

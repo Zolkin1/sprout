@@ -30,6 +30,7 @@ from .manager_base import ManagerBase
 from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .terrain_aware_ref import apply_terrain_aware_ref
 from .trajectory_manager import TrajectoryType
+from .world_lift import lift_base_world_state
 
 
 class BaseTrajectoryCommand(CommandTerm):
@@ -72,6 +73,57 @@ class BaseTrajectoryCommand(CommandTerm):
         initialisation is complete (e.g. building reference-frame maps).
         """
 
+    def _record_library_fingerprint(self, cfg) -> None:
+        """Persist (and verify) the loaded trajectory library's content hash.
+
+        The manager exposes a portable content fingerprint of the library it
+        actually loaded.  This method:
+
+          * warns loudly when ``cfg.library_fingerprint`` was *already* set to a
+            different hash — i.e. this policy is being replayed (play / resume)
+            against a library that differs from the one recorded in the saved
+            ``env.yaml`` it trained on (see ``play.py``, which injects the
+            trained-against value before env construction); and
+          * writes the freshly computed fingerprint + per-skill manifest back
+            onto ``cfg`` so a fresh training run serialises them into
+            ``params/env.yaml`` (``train.py`` dumps the cfg after env construction).
+
+        No-op for managers that do not expose ``library_fingerprint`` (e.g. the
+        single-file :class:`~.trajectory_manager.TrajectoryManager`).
+
+        Args:
+            cfg: This command term's configuration (the same instance the env
+                cfg holds, so mutations are reflected in the dumped yaml).
+        """
+        fingerprint = getattr(self.manager, "library_fingerprint", None)
+        if fingerprint is None:
+            return
+
+        local_hash = fingerprint["hash"]
+        trained_hash = getattr(cfg, "library_fingerprint", None)
+        if trained_hash is not None and trained_hash != local_hash:
+            trained_manifest = getattr(cfg, "library_manifest", None)
+            bar = "=" * 78
+            msg = (
+                f"\n{bar}\n"
+                "TRAJECTORY LIBRARY MISMATCH\n"
+                f"  cfg.path                 : {cfg.path}\n"
+                f"  trained-against hash     : {trained_hash}\n"
+                f"  locally-loaded hash      : {local_hash}\n"
+                f"  trained-against manifest : {trained_manifest}\n"
+                f"  locally-loaded manifest  : {fingerprint['skill_counts']} "
+                f"({fingerprint['num_trajectories']} trajectories)\n"
+                "  This policy is being run against a DIFFERENT trajectory library\n"
+                "  than the one it trained on -- the references may be wrong.\n"
+                f"{bar}\n"
+            )
+            if getattr(cfg, "strict_fingerprint", False):
+                raise RuntimeError(msg)
+            print(f"[WARN] {msg}")
+
+        cfg.library_fingerprint = local_hash
+        cfg.library_manifest = fingerprint["skill_counts"]
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
@@ -88,6 +140,12 @@ class BaseTrajectoryCommand(CommandTerm):
         # --- Manager (subclass-specific) ----------------------------------
         self.manager: ManagerBase = self._create_manager(cfg, env)
         self.trajectory_type = self.manager.get_trajectory_type()
+
+        # --- Trajectory-library provenance --------------------------------
+        # Records the loaded library's portable fingerprint onto ``cfg`` (so it
+        # lands in ``params/env.yaml``) and warns if it differs from a
+        # trained-against value already present on ``cfg`` (play / resume).
+        self._record_library_fingerprint(cfg)
 
         self._verify_contact_frames()
 
@@ -428,6 +486,92 @@ class BaseTrajectoryCommand(CommandTerm):
                 self.dy_des[env_ids[episodic_mask]] *= 0
 
     # ------------------------------------------------------------------
+    # World-frame reference reconstruction
+    # ------------------------------------------------------------------
+
+    def get_reference_world_state(self, base_frame_name: str) -> torch.Tensor:
+        """Reconstruct the current desired reference as a world-frame state vector.
+
+        The returned layout matches the raw robot ``state`` recorded by
+        ``scripts/rsl_rl/record_data.py``::
+
+            [root_pos_w(3), root_quat_w(4, xyzw), root_lin_vel_w(3),
+             root_ang_vel_w(3), joint_pos(nj), joint_vel(nj)]
+
+        The base pose/velocity stored in ``y_des``/``dy_des`` are expressed
+        yaw-aligned relative to the active contact frame ``self.ref_poses``
+        (see :meth:`compute_measured_output`); this inverts that alignment to
+        lift them back to the world frame.  Joint targets are reordered to
+        ``self.robot.joint_names`` so the joint axis matches the recorded
+        ``state``.  Mirrors the extraction in
+        :func:`mdp.events.resets.reset_on_reference`.
+
+        Args:
+            base_frame_name: Trajectory output frame used as the robot root;
+                must expose ``pos_x/y/z`` and ``ori_x/y/z/w`` outputs (e.g.
+                ``"pelvis_link"``).
+
+        Returns:
+            World-frame reference state, shape ``[num_envs, 3 + 4 + 3 + 3 + 2*nj]``.
+        """
+        idx = self._reference_world_indices(base_frame_name)
+
+        # The base pose/vel in ``y_des``/``dy_des`` are yaw-aligned relative to
+        # the active contact frame ``self.ref_poses``; ``lift_base_world_state``
+        # inverts that alignment to lift them (and pass joints through) into the
+        # world frame.  The lift is shared with the offline clip generator so
+        # generation and runtime use an identical transform.
+        return lift_base_world_state(self.y_des, self.dy_des, self.ref_poses, idx)
+
+    def _reference_world_indices(self, base_frame_name: str) -> dict[str, torch.Tensor]:
+        """Resolve (and cache) the output-vector indices used by :meth:`get_reference_world_state`.
+
+        Args:
+            base_frame_name: Trajectory output frame used as the robot root.
+
+        Returns:
+            Dict of long-tensor index sets keyed by ``pos``, ``ori``, ``lin_vel``,
+            ``ang_vel``, ``joint_pos``, ``joint_vel``.
+        """
+        cache = getattr(self, "_ref_world_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._ref_world_idx_cache = cache
+        if base_frame_name in cache:
+            return cache[base_frame_name]
+
+        pos = _find_output_indices(self.ordered_pos_output_names, base_frame_name, "pos_")
+        ori = _find_output_indices(self.ordered_pos_output_names, base_frame_name, "ori_")
+        if len(pos) != 3 or len(ori) != 4:
+            raise ValueError(
+                f"Base frame '{base_frame_name}' must expose pos_x/y/z and ori_x/y/z/w in the "
+                f"trajectory outputs (found {len(pos)} pos, {len(ori)} ori)."
+            )
+        lin_vel = _find_output_indices(self.ordered_vel_output_names, base_frame_name, "pos_")
+        ang_vel = _find_output_indices(self.ordered_vel_output_names, base_frame_name, "ori_")
+
+        joint_pos_idx: list[int] = []
+        joint_vel_idx: list[int] = []
+        for name in self.robot.joint_names:
+            out = f"joint:{name}"
+            if out not in self.ordered_pos_output_names:
+                raise ValueError(f"Joint output '{out}' missing from trajectory outputs.")
+            joint_pos_idx.append(self.ordered_pos_output_names.index(out))
+            joint_vel_idx.append(self.ordered_vel_output_names.index(out))
+
+        dev = self.device
+        entry = {
+            "pos": torch.as_tensor(pos, dtype=torch.long, device=dev),
+            "ori": torch.as_tensor(ori, dtype=torch.long, device=dev),
+            "lin_vel": torch.as_tensor(lin_vel, dtype=torch.long, device=dev),
+            "ang_vel": torch.as_tensor(ang_vel, dtype=torch.long, device=dev),
+            "joint_pos": torch.as_tensor(joint_pos_idx, dtype=torch.long, device=dev),
+            "joint_vel": torch.as_tensor(joint_vel_idx, dtype=torch.long, device=dev),
+        }
+        cache[base_frame_name] = entry
+        return entry
+
+    # ------------------------------------------------------------------
     # Symmetry helpers
     # ------------------------------------------------------------------
 
@@ -447,6 +591,31 @@ class BaseTrajectoryCommand(CommandTerm):
         """
         reflector = self._traj_vel_reflector if traj_type == "vel" else self._traj_pos_reflector
         return reflector.reflect_with_history(traj)
+
+    def get_symmetric_joint_ref(self, joints: torch.Tensor) -> torch.Tensor:
+        """Return the left-right symmetric reflection of reference joint values.
+
+        Mirrors the ``joint:*`` channels of ``y_des`` / ``dy_des`` (the
+        observations :func:`mdp.joint_pos_ref` / :func:`mdp.joint_vel_ref`
+        expose).  Those channels follow the *clip's* joint output order rather
+        than ``robot.joint_names``, so the reflection is built from the
+        command's own joint-output names instead of the robot-joint reflector.
+        Position and velocity share the same joint names, so one reflector
+        serves both.
+
+        Args:
+            joints: ``[N, num_ref_joints]`` or
+                ``[N, history_length * num_ref_joints]`` reference joint tensor.
+
+        Returns:
+            Symmetric reference joints of the same shape.
+        """
+        reflector = getattr(self, "_joint_ref_reflector", None)
+        if reflector is None:
+            joint_names = [n for n in self.ordered_pos_output_names if n.startswith("joint:")]
+            reflector = NamedReflector(SagittalReflectionConfig(), joint_names, self.device)
+            self._joint_ref_reflector = reflector
+        return reflector.reflect_with_history(joints)
 
     # ------------------------------------------------------------------
     # CommandTerm interface
@@ -662,6 +831,23 @@ class BaseTrajectoryCommand(CommandTerm):
 # ======================================================================
 # Module-level helpers
 # ======================================================================
+
+def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:
+    """Return indices of outputs named ``"{frame_name}:...{suffix_pattern}..."``.
+
+    Args:
+        ordered_names: Ordered output names (position or velocity list).
+        frame_name: Frame the outputs belong to (e.g. ``"pelvis_link"``).
+        suffix_pattern: Substring identifying the output kind (e.g. ``"pos_"`` or ``"ori_"``).
+
+    Returns:
+        Matching indices in the order they appear in ``ordered_names``.
+    """
+    return [
+        i for i, name in enumerate(ordered_names)
+        if name.startswith(f"{frame_name}:") and suffix_pattern in name
+    ]
+
 
 def _align_yaw(vec: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:
     """Rotate *vec* into the yaw-aligned frame of *root_quat*."""

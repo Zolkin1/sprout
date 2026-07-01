@@ -85,7 +85,14 @@ class MetaTerrainGenerator(TerrainGenerator):
                 )
             name_idx = sub_terrain_names.index(after_name)
             cum_prop = np.cumsum(proportions)[name_idx]
-            boundary = int(cum_prop * content_num_cols)
+            # Count content columns assigned to sub-terrains up to and
+            # including ``after_name`` using the SAME rule
+            # ``_generate_curriculum_terrains`` uses to assign columns
+            # (``index / N + 0.001 < cumsum``).  ``int(cum_prop * N)``
+            # disagrees with it whenever the product is non-integer, which
+            # would land the border inside ``after_name``'s column range.
+            content_idx = np.arange(content_num_cols)
+            boundary = int(np.sum(content_idx / content_num_cols + 0.001 < cum_prop))
             fixed_border_at_boundary.setdefault(boundary, 0)
             fixed_border_at_boundary[boundary] += border_col_counts[i]
 
@@ -145,15 +152,15 @@ class MetaTerrainGenerator(TerrainGenerator):
         origin = np.array([0.0, 0.0, 0.0])
 
         # Metadata marking this as a border (non-spawnable, steppable). Borders
-        # are flat ground a robot can walk onto, so they advertise the same
-        # locomotion skills a regular flat sub-terrain does — just not the ones
-        # tied to elevation changes (no running on a thin strip). Sampling
-        # probabilities must sum to 1.0.
+        # are flat ground a robot can walk onto, so they advertise the skill
+        # distribution from ``cfg.border_skill_probs`` — typically matched to
+        # the flat sub-terrain's metadata so robots that wander onto the strip
+        # keep valid commands. Sampling probabilities must sum to 1.0.
         meta_data = {
             "needs_projection": False,  # Flat terrain - no projection needed
             "needs_directional_cmd": False,
             "is_border": True,  # Mark as border for spawning exclusion
-            "skill_probs": {"walk_forward": 0.5, "standing": 0.5},
+            "skill_probs": dict(self.cfg.border_skill_probs),
         }
 
         return mesh, origin, meta_data

@@ -41,6 +41,6 @@ def flat_terrain(
         "needs_directional_cmd": False,
         "is_border": False,
         # Sampling probability per skill — must sum to 1.0.
-        "skill_probs": {"walk_forward": 0.45, "running": 0.45, "standing": 0.10},
+        "skill_probs": dict(cfg.skill_probs),
     }
     return [mesh], origin, meta_data

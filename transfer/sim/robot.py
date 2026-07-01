@@ -222,6 +222,67 @@ class Robot:
 
         return v_local
 
+    def get_base_world_velocity(self, body_name: str = "pelvis_link") -> tuple[np.ndarray, np.ndarray]:
+        """World-frame linear and angular velocity of a base LINK frame origin.
+
+        Returns the velocity of ``body_name``'s frame origin (``xpos``) in the world
+        frame, matching the flow-matching generator's training convention (Isaac Lab
+        ``root_link_{lin,ang}_vel_w`` is the link-frame-origin twist). Computed from
+        the body Jacobian (``mj_jacBody`` is evaluated at the frame origin):
+        ``v = Jp @ qvel``, ``omega = Jr @ qvel``.
+
+        NOTE: ``mj_objectVelocity`` reports the twist at the body **CoM**, which
+        differs from the frame origin by ``omega x r_com`` as soon as the body
+        rotates -- a silent error that is zero at standstill but grows with angular
+        velocity (and corrupts the FM's velocity input during walking/running).
+
+        Args:
+            body_name: MuJoCo body whose link-frame velocity to read (the FM/CLF base).
+
+        Returns:
+            ``(lin_vel_w, ang_vel_w)`` each a length-3 numpy array in the world frame.
+        """
+        body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id == -1:
+            raise ValueError(f"Body '{body_name}' not found in MuJoCo model.")
+        jacp = np.zeros((3, self.mj_model.nv))
+        jacr = np.zeros((3, self.mj_model.nv))
+        mujoco.mj_jacBody(self.mj_model, self.mj_data, jacp, jacr, body_id)
+        lin_vel_w = jacp @ self.mj_data.qvel
+        ang_vel_w = jacr @ self.mj_data.qvel
+        return lin_vel_w, ang_vel_w
+
+    def get_body_world_states(self, body_names: list[str]) -> np.ndarray:
+        """World-frame pose + link twist for a list of bodies (for the FM history).
+
+        Only needed when the loaded generator's history token carries extra frames
+        (legacy symmetric checkpoints). The deployment-design generator consumes no
+        end-effector frames, so this is unused there.
+
+        Args:
+            body_names: MuJoCo body names, in the FM's frame order.
+
+        Returns:
+            Array ``[K, 13]`` per frame ``[pos_w(3), quat_w(4, xyzw), lin_vel_w(3),
+            ang_vel_w(3)]`` (link-frame velocity in the world frame).
+        """
+        out = np.zeros((len(body_names), 13))
+        jacp = np.zeros((3, self.mj_model.nv))
+        jacr = np.zeros((3, self.mj_model.nv))
+        for i, name in enumerate(body_names):
+            bid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if bid == -1:
+                raise ValueError(f"Body '{name}' not found in MuJoCo model.")
+            out[i, 0:3] = self.mj_data.xpos[bid]
+            wxyz = self.mj_data.xquat[bid]
+            out[i, 3:7] = [wxyz[1], wxyz[2], wxyz[3], wxyz[0]]  # wxyz -> xyzw
+            # Frame-origin twist in world (matches Isaac body_link_vel_w); see
+            # get_base_world_velocity for why mj_objectVelocity (CoM) is wrong.
+            mujoco.mj_jacBody(self.mj_model, self.mj_data, jacp, jacr, bid)
+            out[i, 7:10] = jacp @ self.mj_data.qvel   # linear (world, frame origin)
+            out[i, 10:13] = jacr @ self.mj_data.qvel  # angular (world)
+        return out
+
     def pd_control(self, qpos: np.ndarray, qvel: np.ndarray):
         """Compute the PD control actions to keep the robot moving straight."""
         kp_y = self.gains["kp_y"]
@@ -300,6 +361,41 @@ class Robot:
         # Forward kinematics to update derived quantities
         mujoco.mj_forward(self.mj_model, self.mj_data)
         print("[INFO] Set initial condition from policy YAML.")
+
+    def set_base_and_joints(self, base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
+                            joint_pos_mujoco: np.ndarray) -> None:
+        """Set the floating-base pose + joint positions (MuJoCo order) and zero velocities.
+
+        Args:
+            base_pos: Base (pelvis) world position ``[x, y, z]``.
+            base_quat_wxyz: Base orientation quaternion in MuJoCo ``(w, x, y, z)`` order.
+            joint_pos_mujoco: Joint positions in MuJoCo joint order (``qpos[7:]``).
+        """
+        self.mj_data.qpos[:3] = base_pos
+        self.mj_data.qpos[3:7] = base_quat_wxyz
+        self.mj_data.qpos[7:] = joint_pos_mujoco
+        self.mj_data.qvel[:] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+    def scale_gains(self, kp_mult: float, kv_mult: float, name_filter: list[str] | None = None) -> None:
+        """Scale position-actuator kp (and kv damping) gains in place.
+
+        Used for a stiff, well-damped standing hold (fixed-joint PD cannot balance the
+        robot at the XML gains); the RL gains set at handoff overwrite these absolutely.
+
+        Args:
+            kp_mult: Multiplier for the proportional gain (``gainprm[0]`` and ``-biasprm[1]``).
+            kv_mult: Multiplier for the derivative/damping gain (``-biasprm[2]``).
+            name_filter: If given, only scale actuators whose name contains one of these
+                substrings (e.g. ``["hip", "knee", "ankle"]`` for the legs).
+        """
+        for a in range(self.mj_model.nu):
+            name = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_ACTUATOR, a)
+            if name_filter is not None and not any(s in name for s in name_filter):
+                continue
+            self.mj_model.actuator_gainprm[a, 0] *= kp_mult
+            self.mj_model.actuator_biasprm[a, 1] *= kp_mult
+            self.mj_model.actuator_biasprm[a, 2] *= kv_mult
 
     def set_pd_gains_from_policy(self, policy) -> None:
         """Set PD gains on MuJoCo actuators from the RLPolicy gains.

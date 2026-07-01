@@ -206,6 +206,31 @@ def _symmetric_data_augmentation(
                         cmd.get_symmetric_traj(obs[group][:, obs_idx:obs_idx + obs_size], "vel")
                     )
 
+                elif name in cfg.joint_ref_obs_terms:
+                    # Reference joint pos/vel follow the clip's joint output order,
+                    # so reflect with the command's own joint-output reflector.
+                    if cmd is None:
+                        cmd = env.unwrapped.command_manager.get_term("traj_ref")
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_joint_ref(obs[group][:, obs_idx:obs_idx + obs_size])
+                    )
+
+                elif name in cfg.ee_pos_obs_terms:
+                    # Base-relative ee positions: swap left/right frames + negate
+                    # pos_y.  Pass the obs term's frame_names so the reflector
+                    # matches the exact frame list/order the obs used.
+                    if cmd is None:
+                        cmd = env.unwrapped.command_manager.get_term("traj_ref")
+                    frame_names = (
+                        env.unwrapped.observation_manager._group_obs_term_cfgs[group][i]
+                        .params.get("frame_names")
+                    )
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        cmd.get_symmetric_ee(
+                            obs[group][:, obs_idx:obs_idx + obs_size], frame_names
+                        )
+                    )
+
                 elif name in cfg.contact_obs_terms:
                     if cmd is None:
                         cmd = env.unwrapped.command_manager.get_term("traj_ref")

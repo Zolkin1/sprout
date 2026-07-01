@@ -91,6 +91,39 @@ def bucket_for_velocity(
     return dist2.argmin(dim=1)                                       # [K]
 
 
+def clamp_pd_channels_to_buckets(
+    vel_cmd: torch.Tensor,
+    skill_id: torch.Tensor,
+    lin_y: torch.Tensor,
+    ang_z: torch.Tensor,
+) -> torch.Tensor:
+    """Clamp the PD-written vy / wz channels into each env's skill bucket.
+
+    The base velocity command's closed-loop modes (y-position PD, heading
+    PD) clip their outputs by the GLOBAL command ranges only.  With wide
+    global ranges (needed for lateral / yaw on flat skills) the PD would
+    leak nonzero vy / wz onto skills whose buckets are ``(0, 0)`` (stairs,
+    standing).  Clamping per env by the sampled skill keeps those envs
+    pinned while flat skills keep the full ranges.
+
+    Args:
+        vel_cmd: ``[K, 3]`` velocity commands (vx, vy, wz); modified copy
+            is returned, the input is not mutated.
+        skill_id: ``[K]`` long skill index per env into the bucket tables.
+        lin_y: ``[S, 2]`` (min, max) lin-y bucket per skill.
+        ang_z: ``[S, 2]`` (min, max) ang-z bucket per skill.
+
+    Returns:
+        ``[K, 3]`` clamped velocity commands.
+    """
+    rng_vy = lin_y[skill_id]                                    # [K, 2]
+    rng_wz = ang_z[skill_id]
+    out = vel_cmd.clone()
+    out[:, 1] = torch.clamp(vel_cmd[:, 1], min=rng_vy[:, 0], max=rng_vy[:, 1])
+    out[:, 2] = torch.clamp(vel_cmd[:, 2], min=rng_wz[:, 0], max=rng_wz[:, 1])
+    return out
+
+
 def step_skill_pending(
     desired: torch.Tensor,
     active: torch.Tensor,

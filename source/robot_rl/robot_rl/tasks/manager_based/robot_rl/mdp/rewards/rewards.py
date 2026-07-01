@@ -64,6 +64,85 @@ def clf_decreasing_condition(
     penalty = torch.clamp(penalty, min=0.0, max=1.0)
     return penalty
 
+
+def _base_vel_output_indices(cmd) -> list[int]:
+    """Indices of the base frame's linear (pos_*) + angular (ori_*) velocity
+    channels within a trajectory command's ``ordered_vel_output_names``."""
+    base = cmd.cfg.base_frame_name
+    names = cmd.ordered_vel_output_names
+    return (
+        [names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]
+        + [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
+    )
+
+
+def ref_base_vel_tracking_exp(
+    env: ManagerBasedRLEnv, command_name: str, std: float = 0.5,
+) -> torch.Tensor:
+    """Dense exp reward for tracking the clip's reference base velocity.
+
+    Compares the measured vs reference base (pelvis) linear + angular velocity
+    -- the ``dy_act`` / ``dy_des`` channels of the trajectory command, both in
+    the same yaw-aligned anchor frame -- giving a smooth, shaped locomotion
+    signal on top of the (harder) CLF tracking reward.  Analogous to the
+    velocity-command ``track_lin_vel_xy_exp`` / ``track_ang_vel_z_exp`` rewards,
+    but graded against the reference trajectory rather than a commanded velocity.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    idx = _base_vel_output_indices(cmd)
+    err = cmd.dy_act[:, idx] - cmd.dy_des[:, idx]
+    return torch.exp(-torch.sum(err * err, dim=1) / (std ** 2))
+
+
+def command_lin_vel_xy_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Dense exp reward for tracking the clip's commanded planar (xy) velocity.
+
+    Mirrors Isaac Lab's :func:`track_lin_vel_xy_exp` (planar linear velocity in
+    the base frame, exponential kernel), but sources the command from the
+    trajectory command's joystick-level ``target_vel`` (``(vx, vy, wz)`` -- what
+    a velocity "joystick" would supply) rather than a separate ``base_velocity``
+    command term, and grades the measured *link*-frame base velocity (no CoM, see
+    the velocity-convention note on :class:`FmTrackingCommand`).  Paired
+    with :func:`command_ang_vel_z_tracking_exp` for yaw.  Requires a clip library
+    carrying ``target_vel``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    target_vel = cmd.get_command_velocity()  # [N, 3] = (vx, vy, wz)
+    asset: Articulation = env.scene[asset_cfg.name]
+    meas = wp.to_torch(asset.data.root_link_lin_vel_b)[:, :2]  # planar linear velocity (link frame)
+    err = torch.sum(torch.square(target_vel[:, :2] - meas), dim=1)
+    return torch.exp(-err / (std ** 2))
+
+
+def command_ang_vel_z_tracking_exp(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Dense exp reward for tracking the clip's commanded yaw rate.
+
+    Mirrors Isaac Lab's :func:`track_ang_vel_z_exp` (yaw rate in the base frame,
+    exponential kernel), but sources the command from the trajectory command's
+    joystick-level ``target_vel`` (the ``wz`` component) rather than a separate
+    ``base_velocity`` command term.  Uses the *link*-frame yaw rate (identical to
+    the CoM yaw rate, but kept link-frame for convention consistency).  Paired
+    with :func:`command_lin_vel_xy_tracking_exp` for planar velocity.  Requires a
+    clip library carrying ``target_vel``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    target_vel = cmd.get_command_velocity()  # [N, 3] = (vx, vy, wz)
+    asset: Articulation = env.scene[asset_cfg.name]
+    meas = wp.to_torch(asset.data.root_link_ang_vel_b)[:, 2]  # yaw rate (link frame)
+    err = torch.square(target_vel[:, 2] - meas)
+    return torch.exp(-err / (std ** 2))
+
+
 def multiple_undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor_cfgs: Sequence[SceneEntityCfg]) -> torch.Tensor:
     """Penalize undesired contacts as the number of violations above a threshold, aggregated across multiple sensors."""
     total = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)

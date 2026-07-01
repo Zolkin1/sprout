@@ -48,7 +48,11 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 # -- argparse ----------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+# allow_abbrev=False: never accept a prefix of a long option as that option, so
+# ``--clip <h5>`` can't silently bind to ``--clip_device`` (feeding a clip PATH
+# as a torch device string). The explicit ``--clip`` flag below is the only
+# meaning of ``--clip``; any other ambiguous prefix falls through to hydra.
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.", allow_abbrev=False)
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
@@ -65,6 +69,47 @@ parser.add_argument(
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
+)
+parser.add_argument(
+    "--profile", action="store_true", default=False,
+    help="Enable the per-phase profiling harness (CUDA-event timers + manager "
+         "breakdown). Run with a small --max_iterations (e.g. 3). Zero cost when off.",
+)
+parser.add_argument(
+    "--profile_trace", action="store_true", default=False,
+    help="Also run torch.profiler during the (bounded) learn and dump a Chrome "
+         "trace + top-op table. Use with a small --max_iterations.",
+)
+parser.add_argument(
+    "--profile_report_every", type=int, default=50,
+    help="With --profile, print a cumulative per-phase snapshot every N env "
+         "steps during the run (also written to logs so it survives a hard "
+         "kill). 0 disables periodic snapshots (report only at the end).",
+)
+parser.add_argument(
+    "--profile_sync", action="store_true", default=False,
+    help="Profile in synchronous mode: drain the whole device at each phase "
+         "boundary for true, correctly-nested per-phase costs (incl. Warp "
+         "physics on its own stream). Slower than the default async timers; "
+         "use it to resolve cross-stream mis-attribution.",
+)
+parser.add_argument(
+    "--clip", type=str, default=None,
+    help="Path to the clip / trajectory library (.h5) to track, overriding the "
+         "cfg default. Applied to any command term exposing a `path` field "
+         "(traj_ref). Equivalent to env.commands.traj_ref.path=<h5> without hydra.",
+)
+parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold a trajectory/clip library on (e.g. 'cpu' to keep a multi-GB "
+         "library off a small GPU). Applied to any command term exposing a clip_device "
+         "field. Set here (not via hydra) because the cfg default is None.",
+)
+parser.add_argument(
+    "--fm_checkpoint", type=str, default=None,
+    help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
+         "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
+         "overriding the cfg default.",
 )
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
@@ -100,6 +145,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # override configurations with non-hydra CLI arguments
         agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+        # Optionally override the clip/trajectory library path (the file each
+        # command term tracks); equivalent to env.commands.traj_ref.path=<h5>.
+        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "path"):
+                    term.path = args_cli.clip
+                    print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
+
+        # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
+        # hydra: the cfg field default is None so hydra rejects a str override).
+        if args_cli.clip_device is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+
+        # Optionally override the flow-matching generator checkpoint to track
+        # (mirrors --clip_device; the cfg default is a str so hydra works too,
+        # but the flag is the convenient way to pick a freshly-trained FM).
+        if args_cli.fm_checkpoint is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "fm_checkpoint"):
+                    term.fm_checkpoint = args_cli.fm_checkpoint
+                    print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )
@@ -199,6 +269,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+
+        # Don't upload model checkpoints to W&B (they eat a lot of cloud storage and
+        # we keep/use the local copies instead). Checkpoints are still written to
+        # ``log_dir`` by the runner, and code/config state still uploads via save_file.
+        if agent_cfg.logger == "wandb":
+            from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+
+            WandbSummaryWriter.save_model = lambda self, model_path, it: None
+
         # print parameter counts
         if isinstance(runner, DistillationRunner):
             student_params = sum(p.numel() for p in runner.alg.student.parameters())
@@ -228,6 +307,53 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
+        # optional profiling harness — instrument the manager computes + env.step
+        # so the rollout time (rsl_rl's logged Perf/collection_time) is broken
+        # down per manager, with the remainder ("unaccounted") ≈ physics.
+        phase_timer = None
+        profile_report_path = None
+        profile_report_kwargs = None
+        if args_cli.profile:
+            from profiling import PhaseTimer, TorchProfilerSession, instrument_env_managers, instrument_frame_step
+
+            profile_report_path = os.path.join(log_dir, "profile_report.txt")
+            profile_report_kwargs = {
+                "total_key": "frame_total",
+                "top_level": ["obs", "reward", "termination", "command", "events"],
+                "title": "TRAIN per-step breakdown",
+                "out_path": profile_report_path,
+            }
+            phase_timer = PhaseTimer(agent_cfg.device, sync=args_cli.profile_sync)
+            instrument_env_managers(env, phase_timer)
+            # Periodic cumulative snapshots during the run (live + kill-safe);
+            # the same snapshot is appended to ``profile_report.txt``.
+            instrument_frame_step(
+                env, phase_timer,
+                report_every=(args_cli.profile_report_every or None),
+                report_kwargs=profile_report_kwargs,
+            )
+            print(
+                f"[profiling] enabled  |  sync mode: "
+                f"{'ON (drains device at each phase; slower but exact nesting)' if phase_timer.sync else 'OFF (async CUDA-event timers)'}"
+                f"  |  requested --profile_sync={args_cli.profile_sync}, device={agent_cfg.device}",
+                flush=True,
+            )
+            print(
+                f"[profiling] periodic snapshots every "
+                f"{args_cli.profile_report_every} steps -> console + "
+                f"{profile_report_path}. Also read rsl_rl's per-iteration "
+                "Perf/collection_time, Perf/learning_time, Perf/total_fps for "
+                "the rollout-vs-update split. To stop early use Ctrl-C (not "
+                "kill) so the final report prints.",
+                flush=True,
+            )
+            if args_cli.max_iterations is None or agent_cfg.max_iterations > 10:
+                print(
+                    "[profiling] WARNING: profiling is meant for a short run; "
+                    "pass a small --max_iterations (e.g. 3).",
+                    flush=True,
+                )
+
         # run training
         try:
             # Debug NaN
@@ -241,12 +367,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 nan_count = torch.isnan(tensor).sum().item()
                 print(f"[DEBUG] Pre-learn obs '{key}': shape={tensor.shape}, NaN count={nan_count}")
 
-            runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+            profiler_ctx = (
+                TorchProfilerSession(log_dir) if (args_cli.profile and args_cli.profile_trace)
+                else contextlib.nullcontext()
+            )
+            with profiler_ctx:
+                runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
             print(f"Training time: {round(time.time() - start_time, 2)} seconds")
-            # close the simulator
-            env.close()
         except KeyboardInterrupt:
             pass
+        finally:
+            if phase_timer is not None:
+                phase_timer.report(**profile_report_kwargs)
+            # close the simulator
+            env.close()
 
 
 if __name__ == "__main__":

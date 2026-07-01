@@ -16,7 +16,14 @@ import numpy as np
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+    base_pose_error,
+    ee_ref_relative_to_base,
+    future_base_pose,
+    future_base_velocity,
+    joint_pos_ref,
+    joint_vel_ref,
     multiskill_phase,
+    ref_base_velocity_local,
     ref_cos_phase,
     ref_sin_phase,
 )
@@ -44,16 +51,33 @@ class DataLogger:
         data, metadata = logger.finalize()
     """
 
-    def __init__(self, env) -> None:
+    def __init__(self, env, log_fm_window: bool = False) -> None:
         """Initialize the logger and capture one-time metadata from the env.
 
         Args:
             env: The RslRlVecEnvWrapper-wrapped environment.
+            log_fm_window: If True and the trajectory term is a flow-matching
+                generator command, additionally log the full F-step predicted
+                window (``fm_pred_y`` / ``fm_pred_dy`` / ``fm_pred_idx``) each
+                step so ``plot_fm_predictions`` can fan the predictions off the
+                tracked reference.  Heavier (``[T, N, F, P]``), so it's opt-in;
+                ``fm_active`` (the cheap source mask used for the transition
+                line) is always logged when available.
         """
         self._data: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
+        self._log_fm_window = log_fm_window
+        # Look-ahead params for the future_base_* reference obs; overridden from the
+        # policy obs cfg in _collect_metadata so the logged obs match what the policy sees.
+        self._future_horizon_s: float = 0.5
+        self._future_stride: int = 5
         self.metadata: dict[str, Any] = {}
+        # Per-step termination signals, stacked in finalize() into a
+        # "successful tracking" mask (steps in episodes that ended via
+        # time_out vs early termination).
+        self._dones: list[torch.Tensor] = []
+        self._time_outs: list[torch.Tensor] = []
 
         self._collect_metadata(env)
 
@@ -88,6 +112,17 @@ class DataLogger:
         """
         unwrapped = env.unwrapped
         step: dict[str, torch.Tensor] = {}
+
+        # 0. Termination signals for this step. Read post-step (before the next
+        # env.step overwrites them) and stored aligned with the per-step data so
+        # finalize() can mask stats down to episodes that ended via time_out
+        # (successful tracking) vs early termination (e.g. a fall).
+        try:
+            tm = unwrapped.termination_manager
+            self._dones.append(tm.dones.clone())
+            self._time_outs.append(tm.time_outs.clone())
+        except Exception as exc:
+            self._warn("term_signals", f"Could not read termination signals: {exc}")
 
         # 1. Trajectory command term attributes
         if self._traj_term_name is not None:
@@ -166,6 +201,103 @@ class DataLogger:
             except Exception as exc:
                 self._warn("traj_term", f"Failed to read trajectory term: {exc}")
 
+        # 1b. Commanded (joystick-level) base velocity for motion-sequence
+        # clips: the upstream (vx, vy, wz) command baked into the clip library
+        # (``target_vel``).  This is the velocity we are *trying* to track -- the
+        # closest analog to the old ``base_velocity`` command term -- and is
+        # paired with the robot's measured body-frame velocity (section 4) for
+        # the velocity-tracking plot.
+        if self._traj_term_name is not None:
+            try:
+                ref = unwrapped.command_manager.get_term(self._traj_term_name)
+                if getattr(ref, "command_velocity_available", False):
+                    step["target_vel"] = ref.get_command_velocity().clone()
+            except Exception as exc:
+                self._warn("target_vel", f"Could not read commanded target velocity: {exc}")
+
+        # 1b'. Trajectory-reference POLICY OBSERVATIONS (computed clean, no obs
+        # corruption) -- the exact base-relative reference signals the policy
+        # consumes, for obs-level diagnostics (e.g. spotting lookahead truncation
+        # / re-plan jumps in the FM-in-loop). Keyed ``obs_*``; plotted by the
+        # "trajectory_obs" play plot. Skipped silently for commands that don't
+        # expose the reference (the helpers raise).
+        if self._traj_term_name is not None:
+            name = self._traj_term_name
+            hs, st = self._future_horizon_s, self._future_stride
+            def _traj_obs() -> dict[str, torch.Tensor]:
+                return {
+                    "base_pose_error": base_pose_error(unwrapped, name).clone(),
+                    "base_vel_ref": ref_base_velocity_local(unwrapped, name).clone(),
+                    "joint_pos_ref": joint_pos_ref(unwrapped, name).clone(),
+                    "joint_vel_ref": joint_vel_ref(unwrapped, name).clone(),
+                    "ee_ref": ee_ref_relative_to_base(unwrapped, name).clone(),
+                    "future_base_pose": future_base_pose(unwrapped, name, hs, st).clone(),
+                    "future_base_velocity": future_base_velocity(unwrapped, name, hs, st).clone(),
+                }
+            try:
+                for k, v in _traj_obs().items():
+                    step[f"obs_{k}"] = v
+                # If the command can also serve the CLIP reference (the FM-in-loop
+                # FmTrackingCommand), log the clip's version of every obs under
+                # the same robot state -> the FM (obs_*) and clip (obs_clip_*) signals
+                # overlay in the trajectory_obs plot, the obs-level FM-vs-clip view.
+                ref = unwrapped.command_manager.get_term(name)
+                if hasattr(ref, "as_clip_reference"):
+                    with ref.as_clip_reference():
+                        for k, v in _traj_obs().items():
+                            step[f"obs_clip_{k}"] = v
+                        # Also capture the clip's full WORLD reference output (y_des/
+                        # dy_des) so the positions/velocities plots can overlay the clip
+                        # reference alongside the FM one (world-frame FM-vs-clip view).
+                        # as_clip_reference() swaps ref.y_des/dy_des to the clip.
+                        if isinstance(getattr(ref, "y_des", None), torch.Tensor):
+                            step["y_des_clip"] = ref.y_des.clone()
+                        if isinstance(getattr(ref, "dy_des", None), torch.Tensor):
+                            step["dy_des_clip"] = ref.dy_des.clone()
+                # Symmetrically capture the FM reference: the per-term reference OBS
+                # (obs_fm_*, for the clip-vs-FM obs-diff plot) and the full world
+                # reference output (y_des_fm/dy_des_fm, for the positions overlay). The
+                # passive FM in drive_with_clip mode; == applied otherwise. Logging both
+                # obs_clip_* and obs_fm_* makes the comparison work in either direction.
+                if hasattr(ref, "as_fm_reference"):
+                    with ref.as_fm_reference():
+                        for k, v in _traj_obs().items():
+                            step[f"obs_fm_{k}"] = v
+                        if isinstance(getattr(ref, "y_des", None), torch.Tensor):
+                            step["y_des_fm"] = ref.y_des.clone()
+                        if isinstance(getattr(ref, "dy_des", None), torch.Tensor):
+                            step["dy_des_fm"] = ref.dy_des.clone()
+            except Exception as exc:
+                self._warn("traj_obs", f"Could not compute trajectory reference obs: {exc}")
+
+        # 1c. Flow-matching generator source mask + (optionally) the predicted
+        # window.  ``fm_active`` ([N] bool) marks the envs whose reference is
+        # being driven by the FM (vs the clip) this step -- the play plots use it
+        # to draw the clip->FM transition line and to know that ``y_des`` is the
+        # FM prediction, not the clip, while it's True.  When ``log_fm_window`` is
+        # set we also capture the full F-step prediction in the y_des/dy_des
+        # layout plus the currently-applied window index, so ``plot_fm_predictions``
+        # can fan each fresh prediction forward off the tracked line.  Both are
+        # no-ops for clip-only commands (no ``fm_active`` attribute).
+        if self._traj_term_name is not None:
+            try:
+                ref = unwrapped.command_manager.get_term(self._traj_term_name)
+                fm_active = getattr(ref, "fm_active", None)
+                if isinstance(fm_active, torch.Tensor):
+                    step["fm_active"] = fm_active.clone()
+                    # Applied window index, logged every step (cheap, [N] long): a
+                    # re-plan is where it resets to fm_novel_start (non-increase), used
+                    # to mark the FM/clip re-anchor instants on the trajectory_obs plots.
+                    pred_idx = getattr(ref, "fm_pred_idx", None)
+                    if isinstance(pred_idx, torch.Tensor):
+                        step["fm_pred_idx"] = pred_idx.clone()
+                    if self._log_fm_window and hasattr(ref, "predicted_outputs_window"):
+                        y_win, dy_win = ref.predicted_outputs_window()
+                        step["fm_pred_y"] = y_win.clone()
+                        step["fm_pred_dy"] = dy_win.clone()
+            except Exception as exc:
+                self._warn("fm_source", f"Could not read FM source / predicted window: {exc}")
+
         # 2. Base velocity command
         try:
             step["base_velocity"] = unwrapped.command_manager.get_command("base_velocity").clone()
@@ -184,6 +316,12 @@ class DataLogger:
             robot = unwrapped.scene.articulations["robot"]
             step["joint_pos"] = _to_torch(robot.data.joint_pos).clone()
             step["applied_torque"] = _to_torch(robot.data.applied_torque).clone()
+            # Measured body-frame base velocity as (vx forward, vy lateral, wz
+            # yaw rate) to pair 1:1 with the clip's (vx, vy, wz) ``target_vel``
+            # in the velocity-tracking plot.
+            lin_b = _to_torch(robot.data.root_lin_vel_b)
+            ang_b = _to_torch(robot.data.root_ang_vel_b)
+            step["robot_base_vel"] = torch.stack([lin_b[:, 0], lin_b[:, 1], ang_b[:, 2]], dim=-1).clone()
         except Exception as exc:
             self._warn("robot_data", f"Could not read robot articulation data: {exc}")
 
@@ -314,72 +452,24 @@ class DataLogger:
             stacked = torch.stack(tensors, dim=0)
             data[key] = stacked.cpu().numpy()
 
-        # Per-trajectory V summary (multiskill only).
-        if "traj_idx" in self._data and "v" in self._data:
-            self._compute_per_traj_summary(data)
+        # Build the "successful tracking" mask: True for logged steps that
+        # belong to an episode that ended via time_out (truncation), False for
+        # steps in early-terminated (fallen) episodes and the trailing
+        # still-running episode. Lets stats.txt report tracking quality
+        # conditioned on not having failed. Only built when per-step
+        # termination signals were captured for every step.
+        if self._dones and len(self._dones) == self._step_count:
+            dones = torch.stack(self._dones, dim=0).cpu().numpy().astype(bool)
+            time_outs = torch.stack(self._time_outs, dim=0).cpu().numpy().astype(bool)
+            data["_timeout_mask"] = _build_timeout_mask(dones, time_outs)
+
+        # Note: per-trajectory CLF/tracking + termination summaries now live in
+        # the dedicated headless eval (scripts/rsl_rl/eval_per_trajectory.py /
+        # per_traj_stats.py), which has far better trajectory coverage than an
+        # interactive play rollout. This logger only collects the per-step
+        # ``traj_idx``/``v`` series used by the play plots.
 
         return data, self.metadata
-
-    def _compute_per_traj_summary(self, data: dict[str, np.ndarray]) -> None:
-        """Aggregate per-trajectory mean V across the rollout.
-
-        Replays collected ``(traj_idx, v)`` through a fresh
-        :class:`TrajectoryCLFStats` in ``mean`` mode and writes
-        ``per_traj_v_mean``, ``per_traj_v_count``, ``per_traj_names`` into
-        ``data``. Uses the same gating as the live training tracker:
-        skip a few frames after env reset (detected via ``v == 0`` on the
-        first reset frame, or ``dones`` if available later) and after
-        skill transitions.
-        """
-        try:
-            from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.traj_clf_stats import (
-                TrajectoryCLFStats,
-            )
-        except Exception as exc:
-            self._warn("per_traj_summary", f"Could not import TrajectoryCLFStats: {exc}")
-            return
-
-        traj_idx_np = data["traj_idx"]  # [T, N]
-        v_np = data["v"]                # [T, N]
-        if traj_idx_np.size == 0:
-            return
-
-        T = self._num_trajectories
-        if T is None:
-            T = int(traj_idx_np.max()) + 1
-
-        traj_idx_t = torch.from_numpy(traj_idx_np).long()
-        v_t = torch.from_numpy(v_np).float()
-
-        # Active mask: skip the first `warmup` frames of the rollout (CLF
-        # buffer warmup) and any frame where the trajectory changed in the
-        # last `warmup` steps (covers both resets and skill transitions
-        # for one bookkeeping pass).
-        warmup = 3
-        T_steps, N = traj_idx_t.shape
-        traj_changed = torch.zeros((T_steps, N), dtype=torch.bool)
-        traj_changed[1:] = traj_idx_t[1:] != traj_idx_t[:-1]
-
-        active = torch.ones_like(traj_changed)
-        active[:warmup] = False
-        # Roll-and-OR over the last `warmup` frames of traj_changed.
-        recent_change = traj_changed.clone()
-        for offset in range(1, warmup):
-            recent_change[offset:] |= traj_changed[: T_steps - offset]
-        active &= ~recent_change
-
-        stats = TrajectoryCLFStats(
-            num_trajectories=T, device="cpu", mode="mean",
-        )
-        for t in range(T_steps):
-            stats.update(traj_idx_t[t], v_t[t], active[t])
-
-        means = stats.get_means().numpy()
-        counts = stats.get_counts().numpy()
-        data["per_traj_v_mean"] = means
-        data["per_traj_v_count"] = counts
-        if self._traj_names is not None:
-            self.metadata["per_traj_names"] = list(self._traj_names)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -411,6 +501,20 @@ class DataLogger:
                     self.metadata["vel_names"] = list(ref.ordered_vel_output_names)
                 if hasattr(ref, "ref_frames"):
                     self.metadata["ref_frames"] = list(ref.ref_frames)
+                if hasattr(ref, "resolve_ee_frames"):  # ee_ref obs column labels
+                    self.metadata["ee_frames"] = list(ref.resolve_ee_frames())
+                # Flow-matching prediction-window geometry (generator command only):
+                # ``fm_window_len`` = F steps stored per inference, ``fm_novel_start``
+                # = window index N where the novel future begins.  Lets the
+                # peel-off plot align each prediction's window steps to sim time.
+                if hasattr(ref, "fm_window_len") and hasattr(ref, "fm_novel_start"):
+                    self.metadata["fm_window_len"] = int(ref.fm_window_len)
+                    self.metadata["fm_novel_start"] = int(ref.fm_novel_start)
+                # Which source drives the robot (FM by default, clip in drive_with_clip
+                # mode) -- lets the positions/velocities plots label the applied line.
+                cmd_cfg = getattr(ref, "cfg", None)
+                if cmd_cfg is not None and hasattr(cmd_cfg, "drive_with_clip"):
+                    self.metadata["drive_with_clip"] = bool(cmd_cfg.drive_with_clip)
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)
@@ -445,6 +549,20 @@ class DataLogger:
                 self.metadata["phase_obs_labels"] = ["sin_phase", "cos_phase"]
         except Exception as exc:
             print(f"[WARN DataLogger] Could not detect phase observations: {exc}")
+
+        # Look-ahead params for the future_base_* reference obs: read from the policy
+        # obs cfg so the logged obs match exactly what the policy is fed.
+        try:
+            obs_mgr = unwrapped.observation_manager
+            policy_terms = list(obs_mgr.active_terms.get("policy", []))
+            if "future_base_pose" in policy_terms:
+                cfg = obs_mgr._group_obs_term_cfgs["policy"][policy_terms.index("future_base_pose")]
+                self._future_horizon_s = float(cfg.params.get("horizon_s", self._future_horizon_s))
+                self._future_stride = int(cfg.params.get("stride", self._future_stride))
+            self.metadata["future_horizon_s"] = self._future_horizon_s
+            self.metadata["future_stride"] = self._future_stride
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not read future-obs lookahead params: {exc}")
 
         # Joint names
         try:
@@ -526,3 +644,34 @@ def _to_torch(data: Any) -> torch.Tensor:
         return wp.to_torch(data)
     except (ImportError, TypeError):
         return torch.as_tensor(data)
+
+
+def _build_timeout_mask(dones: np.ndarray, time_outs: np.ndarray) -> np.ndarray:
+    """Mark each logged step as belonging to a time_out (successful) episode.
+
+    A ``done`` at step ``t`` means the env reset *during* step ``t``; Isaac Lab
+    recomputes the command (and hence ``v``, ``y_act``, ...) after the in-step
+    reset, so the data logged at step ``t`` for that env already belongs to the
+    *next* episode. A logged step ``s`` therefore belongs to the episode that
+    ends at the first ``done`` strictly after ``s``, and is "successful" iff
+    that terminating ``done`` was a ``time_out``. Steps with no later ``done``
+    (the trailing in-progress episode) are marked False. This boundary
+    convention never leaks a fallen episode's divergence into the success set.
+
+    Args:
+        dones: ``[T, N]`` bool array, True where env ``n`` reset at step ``t``.
+        time_outs: ``[T, N]`` bool array, True where that reset was a time_out.
+
+    Returns:
+        ``[T, N]`` bool mask, True for steps in successful (time_out) episodes.
+    """
+    num_steps, num_envs = dones.shape
+    mask = np.zeros((num_steps, num_envs), dtype=bool)
+    pending = np.zeros(num_envs, dtype=bool)      # time_out-ness of nearest done at idx > s
+    has_pending = np.zeros(num_envs, dtype=bool)  # whether any done exists at idx > s
+    for s in range(num_steps - 1, -1, -1):
+        mask[s] = has_pending & pending
+        d = dones[s]
+        pending = np.where(d, time_outs[s], pending)
+        has_pending = has_pending | d
+    return mask

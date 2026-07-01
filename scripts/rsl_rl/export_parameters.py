@@ -100,6 +100,34 @@ def export_policy_parameters(env, obs, actions, save_dir):
     params["default_joint_angles"] = wp.to_torch(robot.data.default_joint_pos)[0].detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
+    # CLF output joint order (the joint:* channels of the trajectory command's
+    # ordered_pos_output_names). The joint_pos_ref / joint_vel_ref observations are
+    # in THIS order, which differs from joint_names_isaac, so sim2sim / hardware
+    # deployment (transfer/sim/gen_tracker_policy.py) needs it to place those terms.
+    try:
+        traj_cmd = unwrapped_env.command_manager.get_term("traj_ref")
+        params["joint_out_names"] = [
+            n.split(":", 1)[1] for n in traj_cmd.ordered_pos_output_names if n.startswith("joint:")
+        ]
+        # End-effector reference frames (the ee_ref output frames), in the single
+        # source-of-truth order. Needed for tracker-only (no-FM) sim2sim clip playback
+        # (transfer/sim/gen_tracker_runner.py --clip), where the ee frame names cannot
+        # come from the FM context; matches the FM ctx.target_frame_names when an FM is used.
+        if hasattr(traj_cmd, "resolve_ee_frames"):
+            params["ee_frame_names"] = list(traj_cmd.resolve_ee_frames())
+    except (KeyError, AttributeError):
+        pass
+
+    # FM generator re-inference cadence (control steps). Only the generator-tracking
+    # command carries it; baking it into the metadata lets sim2sim/hardware re-run the
+    # generator at the same cadence the tracker trained with instead of a runner default.
+    try:
+        params["fm_update_every"] = int(
+            unwrapped_env.command_manager.get_term("traj_ref").cfg.fm_update_every
+        )
+    except (KeyError, AttributeError):
+        pass
+
     # Build valid initial condition vectors (base first, then joints in joint_names order)
     root_pos = wp.to_torch(robot.data.root_pos_w)[0]        # (3,)
     root_quat = wp.to_torch(robot.data.root_quat_w)[0]      # (4,) x,y,z,w
@@ -253,6 +281,8 @@ def export_policy_parameters(env, obs, actions, save_dir):
         params['kd'] = FlowStyleList(params['kd'])
     if 'joint_names_isaac' in params:
         params['joint_names_isaac'] = FlowStyleList(params['joint_names_isaac'])
+    if 'joint_out_names' in params:
+        params['joint_out_names'] = FlowStyleList(params['joint_out_names'])
     if 'gait_period_range' in params:
         params['gait_period_range'] = FlowStyleList(params['gait_period_range'])
     if 'valid_ic_pos' in params:

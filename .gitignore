@@ -110,3 +110,6 @@ todo-report-*
 
 claude_plans/
 .claude/
+# Generated motion-clip libraries (large HDF5) — repo-root only,
+# NOT the source subpackage .../traj_tracking/clips/
+/clips/

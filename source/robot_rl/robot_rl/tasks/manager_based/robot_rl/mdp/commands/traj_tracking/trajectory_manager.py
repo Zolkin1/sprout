@@ -31,12 +31,26 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.sagittal_r
     SagittalReflectionConfig,
 )
 
+# libyaml-backed loader is ~10-20x faster than the pure-Python SafeLoader —
+# noticeable when loading 1000+ trajectory files at env construction.
+try:
+    _YAML_LOADER = yaml.CSafeLoader
+except AttributeError:  # PyYAML built without libyaml
+    _YAML_LOADER = yaml.SafeLoader
+
 
 class TrajectoryType(Enum):
     HALF_PERIODIC = "half_periodic"
-    FULL_PERIODIC = "periodic"
+    FULL_PERIODIC = "full_periodic"
     EPISODIC = "episodic"
     PERPETUAL = "perpetual"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Accept the legacy ``"periodic"`` spelling for full-periodic trajs."""
+        if value == "periodic":
+            return cls.FULL_PERIODIC
+        return None
 
 @dataclass
 class DomainData:
@@ -277,7 +291,7 @@ class TrajectoryManager(ManagerBase):
 
         # Open yaml file
         with open(self.traj_path, 'r') as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=_YAML_LOADER)
 
         # Verify that each domain has the same bezier outputs (frames and joints) and spline order
         # Also get the output information (count and names)

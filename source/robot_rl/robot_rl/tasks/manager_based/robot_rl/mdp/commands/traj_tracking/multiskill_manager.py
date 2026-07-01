@@ -8,6 +8,7 @@ tensor operations. Supports multi-dimensional conditioning (velocity, terrain).
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from dataclasses import dataclass, field
@@ -18,9 +19,17 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
+from .library_fingerprint import fingerprint_skill_folders
 from .manager_base import ManagerBase
 from .sagittal_reflector import swap_left_right
 from .trajectory_manager import TrajectoryManager, TrajectoryType
+
+# Bump whenever the on-disk schema of the merged-tensor cache changes — i.e.
+# whenever the payload dict written by ``MultiSkillManager._save_library_cache``
+# (the ``self.data`` keys, the per-domain metadata lists, or the tau helpers
+# produced by ``_build_global_tensors``) changes shape or meaning.  A bump
+# invalidates every existing cache file so stale layouts are never restored.
+_LIBRARY_CACHE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +83,15 @@ _FULL_PERIODIC_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.FULL_PERIODIC]
 _EPISODIC_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.EPISODIC]
 _PERPETUAL_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.PERPETUAL]
 
+# Terrain-dim matching tolerances (width, height, length — same ordering as
+# the trajectory conditioner's terrain columns) for the per-env trajectory
+# filter (see :meth:`MultiSkillManager._terrain_dim_allowed`).  Heights are
+# exact in both the library and the terrain; lengths absorb the legacy stair
+# generator's tile-to-cell depth rescale while staying far below the
+# library's grid spacing.  Width is currently always unconstrained (NaN from
+# the terrain query) so its tolerance is a placeholder.
+_TERRAIN_DIM_TOLS = (0.010, 0.005, 0.010)
+
 
 # ---------------------------------------------------------------------------
 # MultiSkillManager
@@ -102,6 +120,7 @@ class MultiSkillManager(ManagerBase):
         env: Any = None,
         conditioner_generator_name: str | None = None,
         hf_repo: str | None = None,
+        use_cache: bool = True,
     ):
         """Load trajectory YAMLs from a top-level folder containing per-skill subfolders.
 
@@ -132,6 +151,10 @@ class MultiSkillManager(ManagerBase):
             hf_repo: Optional HuggingFace repo ID (e.g. ``"zolkin/robot_rl"``).
                 When set, ``path`` is treated as a path within the repo and
                 downloaded to a local ``hf/`` cache directory.
+            use_cache: When True (default), cache the merged global tensors to
+                disk keyed by a content hash of the library's YAML files, so an
+                unchanged library skips the (~tens-of-seconds) YAML parse on the
+                next launch.  See :meth:`_load_or_build_library`.
         """
         self.device = torch.device(device)
         self.env = env
@@ -140,73 +163,31 @@ class MultiSkillManager(ManagerBase):
         # --- Discover skill folders from subdirectories --------------------
         skill_folders = self._discover_skill_folders(path, hf_repo)
 
-        # --- Load all trajectories via TrajectoryManager (then discard) ----
-        managers: list[TrajectoryManager] = []
-        skill_labels: list[str] = []
-        conditioner_datas: list[ConditionerData] = []
+        # --- Portable content fingerprint of the loaded library ------------
+        # Machine-independent (relative layout + file contents only), unlike
+        # the local tensor-cache key.  The owning command writes this back onto
+        # its cfg so it is serialised into ``params/env.yaml``; at play / resume
+        # it is compared against the trained-against value to catch a library
+        # that has silently diverged from the one the policy trained on.
+        self.library_fingerprint: dict = fingerprint_skill_folders(skill_folders)
+        print(
+            f"[MultiSkillManager] trajectory library '{path}' fingerprint "
+            f"{self.library_fingerprint['short']} "
+            f"({self.library_fingerprint['num_trajectories']} trajectories: "
+            f"{self.library_fingerprint['skill_counts']})"
+        )
 
-        for skill_name, folder_path in skill_folders.items():
-            yaml_paths = self._find_yaml_files(str(folder_path))
-            for yp in yaml_paths:
-                mgr = TrajectoryManager(str(yp), None, device)
-                managers.append(mgr)
-                skill_labels.append(skill_name)
-                conditioner_datas.append(
-                    self._parse_conditioner(mgr.traj_data.conditioner, skill_name)
-                )
-
-        if len(managers) == 0:
-            raise ValueError("No trajectory YAML files found in any skill folder.")
-
-        # --- Sort trajectories by conditioner within each skill ------------
-        # This matches LibraryManager's sorting convention and ensures
-        # consistent indexing.
-        combined = list(zip(managers, skill_labels, conditioner_datas))
-        combined.sort(key=lambda x: (x[1], x[2].vel_x))
-        managers = [c[0] for c in combined]
-        skill_labels = [c[1] for c in combined]
-        conditioner_datas = [c[2] for c in combined]
-
-        # --- Capture per-trajectory names (for stats reporting) ------------
-        # Stored in the same global order as ``self._global_conditioning``.
-        self.trajectory_names: list[str] = [m.traj_data.name for m in managers]
-        self.skill_labels: list[str] = list(skill_labels)
-
-        # --- Verify compatibility across all trajectories ------------------
-        ref = managers[0]
-        self.pos_output_names = list(ref.traj_data.pos_output_names)
-        self.vel_output_names = list(ref.traj_data.vel_output_names)
-        self.num_pos_outputs = ref.traj_data.num_pos_outputs
-        self.num_vel_outputs = ref.traj_data.num_vel_outputs
-        self.spline_order = ref.traj_data.spline_order
-        self.ref_frames = list(ref.traj_data.reference_frames)
-
-        for i, mgr in enumerate(managers):
-            td = mgr.traj_data
-            if td.num_pos_outputs != self.num_pos_outputs:
-                raise ValueError(
-                    f"Trajectory {td.name} has {td.num_pos_outputs} pos outputs, "
-                    f"expected {self.num_pos_outputs}."
-                )
-            if td.num_vel_outputs != self.num_vel_outputs:
-                raise ValueError(
-                    f"Trajectory {td.name} has {td.num_vel_outputs} vel outputs, "
-                    f"expected {self.num_vel_outputs}."
-                )
-            if td.pos_output_names != self.pos_output_names:
-                raise ValueError(
-                    f"Trajectory {td.name} pos output names mismatch.\n"
-                    f"Expected: {self.pos_output_names}\nGot: {td.pos_output_names}"
-                )
-            if td.vel_output_names != self.vel_output_names:
-                raise ValueError(
-                    f"Trajectory {td.name} vel output names mismatch.\n"
-                    f"Expected: {self.vel_output_names}\nGot: {td.vel_output_names}"
-                )
-
-        # --- Build global flat tensors from managers -----------------------
-        self.num_trajectories = len(managers)
-        self._build_global_tensors(managers, skill_labels, conditioner_datas)
+        # --- Load cached merged tensors, or build them from the YAMLs ------
+        # Parsing ~1.5k trajectory YAMLs into the merged global tensors costs
+        # tens of seconds on every launch.  Cache the built result keyed by a
+        # content hash of the library's YAML files so an unchanged library
+        # loads near-instantly; any added / removed / edited YAML changes the
+        # key and forces a rebuild.  Sets ``self.data`` and the metadata that
+        # :meth:`_build_global_tensors` would, and returns the post-sort
+        # ``(skill_labels, conditioner_datas)`` for the per-skill build below.
+        skill_labels, conditioner_datas = self._load_or_build_library(
+            skill_folders, device, use_cache,
+        )
 
         # --- Build per-skill metadata --------------------------------------
         self._build_skill_data(skill_labels, conditioner_datas)
@@ -235,6 +216,16 @@ class MultiSkillManager(ManagerBase):
         # owning command via :meth:`set_forced_traj_latch`; ``None`` means no
         # override is ever applied.
         self._forced_traj_latch: Any = None
+        # Optional terrain lookup ``fn(xy_w) -> (dims[N, 3], valid[N])``
+        # returning the (width, height, length) of the terrain feature at
+        # each world xy (NaN = dimension unconstrained).  Registered via
+        # :meth:`set_terrain_dim_lookup`; ``None`` (default) disables the
+        # terrain-dim selection filter (offline / flat-only / test usage).
+        self._terrain_dims_at: Any = None
+        self._terrain_dim_tols = torch.tensor(
+            _TERRAIN_DIM_TOLS, dtype=torch.float32, device=self.device,
+        )
+        self._warned_dim_fallback: bool = False
 
         # --- Pre-compute binomial coefficients for Bezier evaluation -------
         self._binomial_coeffs: dict[int, Tensor] = {}
@@ -426,6 +417,284 @@ class MultiSkillManager(ManagerBase):
                 f"{type(raw_conditioner)}"
             )
 
+    # ------------------------------------------------------------------
+    # Library load / merged-tensor cache
+    # ------------------------------------------------------------------
+
+    def _load_or_build_library(
+        self,
+        skill_folders: dict[str, Path],
+        device: str | torch.device,
+        use_cache: bool,
+    ) -> tuple[list[str], list[ConditionerData]]:
+        """Populate the merged global tensors, from cache when possible.
+
+        Returns ``(skill_labels, conditioner_datas)`` in post-sort global
+        order for the downstream :meth:`_build_skill_data` call.  On a cache
+        hit the YAML parse + :meth:`_build_global_tensors` are skipped
+        entirely; on a miss (or with caching disabled) the full build runs and
+        its result is written back to the cache.  All cache I/O is
+        best-effort — any failure falls back to building from YAML.
+        """
+        cache_path: Path | None = None
+        cache_key: str | None = None
+        if use_cache:
+            try:
+                yaml_paths = self._gather_library_yaml_paths(skill_folders)
+                cache_key = self._library_cache_key(yaml_paths)
+                cache_path = self._library_cache_path(cache_key)
+            except Exception as e:  # noqa: BLE001 - cache is best-effort
+                print(
+                    "[WARN] MultiSkillManager: could not compute library cache "
+                    f"key ({e}); loading from YAML without caching."
+                )
+                cache_path = None
+            if cache_path is not None:
+                restored = self._try_load_library_cache(cache_path, cache_key)
+                if restored is not None:
+                    return restored
+
+        skill_labels, conditioner_datas = self._build_from_yaml(skill_folders, device)
+        if cache_path is not None:
+            self._save_library_cache(
+                cache_path, cache_key, skill_labels, conditioner_datas
+            )
+        return skill_labels, conditioner_datas
+
+    def _build_from_yaml(
+        self,
+        skill_folders: dict[str, Path],
+        device: str | torch.device,
+    ) -> tuple[list[str], list[ConditionerData]]:
+        """Parse every trajectory YAML and build the merged global tensors.
+
+        Sets the same instance attributes the cache path restores
+        (``trajectory_names`` / ``skill_labels``, the output-name & count
+        metadata, ``num_trajectories``, and — via
+        :meth:`_build_global_tensors` — ``self.data`` plus the per-domain and
+        tau helpers).  Returns ``(skill_labels, conditioner_datas)`` in
+        post-sort global order.
+        """
+        # --- Load all trajectories via TrajectoryManager (then discard) ----
+        managers: list[TrajectoryManager] = []
+        skill_labels: list[str] = []
+        conditioner_datas: list[ConditionerData] = []
+
+        for skill_name, folder_path in skill_folders.items():
+            yaml_paths = self._find_yaml_files(str(folder_path))
+            for yp in yaml_paths:
+                mgr = TrajectoryManager(str(yp), None, device)
+                managers.append(mgr)
+                skill_labels.append(skill_name)
+                conditioner_datas.append(
+                    self._parse_conditioner(mgr.traj_data.conditioner, skill_name)
+                )
+
+        if len(managers) == 0:
+            raise ValueError("No trajectory YAML files found in any skill folder.")
+
+        # --- Sort trajectories by conditioner within each skill ------------
+        # This matches LibraryManager's sorting convention and ensures
+        # consistent indexing.
+        combined = list(zip(managers, skill_labels, conditioner_datas))
+        combined.sort(key=lambda x: (x[1], x[2].vel_x))
+        managers = [c[0] for c in combined]
+        skill_labels = [c[1] for c in combined]
+        conditioner_datas = [c[2] for c in combined]
+
+        # --- Capture per-trajectory names (for stats reporting) ------------
+        # Stored in the same global order as ``self._global_conditioning``.
+        self.trajectory_names: list[str] = [m.traj_data.name for m in managers]
+        self.skill_labels: list[str] = list(skill_labels)
+
+        # --- Verify compatibility across all trajectories ------------------
+        ref = managers[0]
+        self.pos_output_names = list(ref.traj_data.pos_output_names)
+        self.vel_output_names = list(ref.traj_data.vel_output_names)
+        self.num_pos_outputs = ref.traj_data.num_pos_outputs
+        self.num_vel_outputs = ref.traj_data.num_vel_outputs
+        self.spline_order = ref.traj_data.spline_order
+        self.ref_frames = list(ref.traj_data.reference_frames)
+
+        for i, mgr in enumerate(managers):
+            td = mgr.traj_data
+            if td.num_pos_outputs != self.num_pos_outputs:
+                raise ValueError(
+                    f"Trajectory {td.name} has {td.num_pos_outputs} pos outputs, "
+                    f"expected {self.num_pos_outputs}."
+                )
+            if td.num_vel_outputs != self.num_vel_outputs:
+                raise ValueError(
+                    f"Trajectory {td.name} has {td.num_vel_outputs} vel outputs, "
+                    f"expected {self.num_vel_outputs}."
+                )
+            if td.pos_output_names != self.pos_output_names:
+                raise ValueError(
+                    f"Trajectory {td.name} pos output names mismatch.\n"
+                    f"Expected: {self.pos_output_names}\nGot: {td.pos_output_names}"
+                )
+            if td.vel_output_names != self.vel_output_names:
+                raise ValueError(
+                    f"Trajectory {td.name} vel output names mismatch.\n"
+                    f"Expected: {self.vel_output_names}\nGot: {td.vel_output_names}"
+                )
+
+        # --- Build global flat tensors from managers -----------------------
+        self.num_trajectories = len(managers)
+        self._build_global_tensors(managers, skill_labels, conditioner_datas)
+        return skill_labels, conditioner_datas
+
+    @staticmethod
+    def _gather_library_yaml_paths(skill_folders: dict[str, Path]) -> list[Path]:
+        """All trajectory YAML paths across every skill folder, sorted.
+
+        Mirrors the set the YAML build actually loads (via
+        :meth:`_find_yaml_files`), so the cache key sees exactly the files
+        that would be parsed.
+        """
+        paths: list[Path] = []
+        for folder in skill_folders.values():
+            paths.extend(MultiSkillManager._find_yaml_files(str(folder)))
+        return sorted(paths)
+
+    @staticmethod
+    def _library_cache_key(yaml_paths: list[Path]) -> str:
+        """Content hash of the library: per-file (path, size, mtime) + version.
+
+        Any added / removed / edited / touched YAML changes the digest, so a
+        stale cache can never match a mutated library.
+        """
+        h = hashlib.sha256()
+        h.update(f"version={_LIBRARY_CACHE_VERSION};".encode())
+        for p in yaml_paths:
+            st = p.stat()
+            h.update(str(p).encode())
+            h.update(f":{st.st_size}:{st.st_mtime_ns};".encode())
+        return h.hexdigest()
+
+    @staticmethod
+    def _library_cache_path(cache_key: str) -> Path:
+        """Filesystem location of the content-addressed cache file.
+
+        Defaults to ``~/.cache/robot_rl/msm_tensors/<key>.pt`` (cwd-independent,
+        never inside the library or source tree).  Override the directory with
+        the ``ROBOT_RL_TRAJ_CACHE_DIR`` environment variable (used by tests to
+        avoid touching the user cache).
+        """
+        cache_dir = os.environ.get("ROBOT_RL_TRAJ_CACHE_DIR")
+        base = Path(cache_dir) if cache_dir else Path.home() / ".cache" / "robot_rl" / "msm_tensors"
+        return base / f"{cache_key}.pt"
+
+    def _try_load_library_cache(
+        self, cache_path: Path, cache_key: str | None
+    ) -> tuple[list[str], list[ConditionerData]] | None:
+        """Restore the merged tensors from ``cache_path`` if valid.
+
+        Returns ``(skill_labels, conditioner_datas)`` on success, or ``None``
+        on any miss / mismatch / read error (caller then builds from YAML).
+        """
+        if not cache_path.exists():
+            return None
+        try:
+            payload = torch.load(
+                str(cache_path), map_location="cpu", weights_only=False
+            )
+        except Exception as e:  # noqa: BLE001 - corrupt / unreadable cache
+            print(
+                "[WARN] MultiSkillManager: failed to read tensor cache at "
+                f"{cache_path} ({e}); rebuilding from YAML."
+            )
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != _LIBRARY_CACHE_VERSION
+            or payload.get("key") != cache_key
+        ):
+            return None
+        try:
+            return self._restore_from_cache_payload(payload)
+        except Exception as e:  # noqa: BLE001 - schema drift / partial payload
+            print(
+                "[WARN] MultiSkillManager: tensor cache restore failed "
+                f"({e}); rebuilding from YAML."
+            )
+            return None
+
+    def _restore_from_cache_payload(
+        self, payload: dict
+    ) -> tuple[list[str], list[ConditionerData]]:
+        """Reconstruct the merged-tensor state from a cache payload dict."""
+        self.num_trajectories = int(payload["num_trajectories"])
+        self.max_expanded_domains = int(payload["max_expanded_domains"])
+        self.pos_output_names = list(payload["pos_output_names"])
+        self.vel_output_names = list(payload["vel_output_names"])
+        self.num_pos_outputs = int(payload["num_pos_outputs"])
+        self.num_vel_outputs = int(payload["num_vel_outputs"])
+        self.spline_order = int(payload["spline_order"])
+        self.ref_frames = list(payload["ref_frames"])
+        self.trajectory_names = list(payload["trajectory_names"])
+        self.skill_labels = list(payload["skill_labels"])
+        self._contact_bodies_per_domain = payload["contact_bodies_per_domain"]
+        self._ref_frame_names_per_domain = payload["ref_frame_names_per_domain"]
+        self._original_domain_times = payload["original_domain_times"].to(self.device)
+        self._cumsum_T = payload["cumsum_T"].to(self.device)
+        self._total_original_T = payload["total_original_T"].to(self.device)
+        self.data = TensorDict(
+            {k: v.to(self.device) for k, v in payload["data"].items()},
+            batch_size=[self.num_trajectories],
+            device=self.device,
+        )
+
+        conditioner_datas = list(payload["conditioner_datas"])
+        # Cheap integrity guard — a torn or schema-drifted payload should miss.
+        if (
+            self.data["coeffs_pos"].shape[0] != self.num_trajectories
+            or len(self.skill_labels) != self.num_trajectories
+            or len(conditioner_datas) != self.num_trajectories
+        ):
+            raise ValueError("cache payload shape/length mismatch")
+        return list(self.skill_labels), conditioner_datas
+
+    def _save_library_cache(
+        self,
+        cache_path: Path,
+        cache_key: str | None,
+        skill_labels: list[str],
+        conditioner_datas: list[ConditionerData],
+    ) -> None:
+        """Write the merged-tensor state to ``cache_path`` (best-effort)."""
+        payload = {
+            "version": _LIBRARY_CACHE_VERSION,
+            "key": cache_key,
+            "num_trajectories": self.num_trajectories,
+            "max_expanded_domains": self.max_expanded_domains,
+            "pos_output_names": list(self.pos_output_names),
+            "vel_output_names": list(self.vel_output_names),
+            "num_pos_outputs": self.num_pos_outputs,
+            "num_vel_outputs": self.num_vel_outputs,
+            "spline_order": self.spline_order,
+            "ref_frames": list(self.ref_frames),
+            "trajectory_names": list(self.trajectory_names),
+            "skill_labels": list(skill_labels),
+            "conditioner_datas": list(conditioner_datas),
+            "data": {k: v.detach().cpu() for k, v in self.data.items()},
+            "contact_bodies_per_domain": self._contact_bodies_per_domain,
+            "ref_frame_names_per_domain": self._ref_frame_names_per_domain,
+            "original_domain_times": self._original_domain_times.detach().cpu(),
+            "cumsum_T": self._cumsum_T.detach().cpu(),
+            "total_original_T": self._total_original_T.detach().cpu(),
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+            torch.save(payload, str(tmp_path))
+            tmp_path.replace(cache_path)
+        except Exception as e:  # noqa: BLE001 - cache write is best-effort
+            print(
+                "[WARN] MultiSkillManager: failed to write tensor cache at "
+                f"{cache_path} ({e}); continuing without it."
+            )
+
     def _build_skill_data(
         self,
         skill_labels: list[str],
@@ -442,6 +711,20 @@ class MultiSkillManager(ManagerBase):
             indices = [
                 i for i, label in enumerate(skill_labels) if label == skill_name
             ]
+            # Each skill must occupy a contiguous block of global trajectory
+            # indices: the sort at construction time (by (skill, vel_x)) is
+            # what makes the per-skill segmented selection in
+            # ``_select_within_skills`` return the *same* global index the
+            # legacy full-library masked ``argmin`` did.  Guard the invariant
+            # here so any future change to the sort fails loudly instead of
+            # silently corrupting trajectory assignment.
+            if indices != list(range(indices[0], indices[0] + len(indices))):
+                raise RuntimeError(
+                    f"Skill '{skill_name}' trajectory indices are not "
+                    f"contiguous ({indices[:3]}...{indices[-3:]}). "
+                    "MultiSkillManager requires trajectories grouped by skill "
+                    "(see the (skill, vel_x) sort in __init__)."
+                )
             conds = [conditioner_datas[i] for i in indices]
             has_terrain = any(c.terrain != "flat" for c in conds)
 
@@ -461,6 +744,15 @@ class MultiSkillManager(ManagerBase):
                 )
             )
 
+        # Per-skill contiguous-block bounds, indexed by the manager's (traj)
+        # skill idx.  Used by ``_select_within_skills`` to slice each skill's
+        # rows out of the global conditioning tensor and to map a per-group
+        # local ``argmin`` back to a global trajectory index.  Kept as plain
+        # Python ints (not tensors) so the per-step selection loop slices with
+        # them without a host-device sync.
+        self._skill_traj_offset: list[int] = [s.traj_indices[0] for s in self.skills]
+        self._skill_traj_count: list[int] = [s.num_trajectories for s in self.skills]
+
         # Build global conditioning tensor across all trajectories.
         # Ordered by global trajectory index (0 .. T-1).
         all_conds = [cd.to_continuous_tensor() for cd in conditioner_datas]
@@ -472,6 +764,17 @@ class MultiSkillManager(ManagerBase):
         # Flat trajectories use -1 as a sentinel for terrain dimensions.
         terrain_dims = self._global_conditioning[:, 3:]  # [T, 3]
         self._terrain_mask = (terrain_dims > 0).any(dim=1)  # [T]
+
+        # Per-skill terrain flag, indexed by the manager's (traj) skill idx.
+        # Used to decide which envs need the terrain-dim filter in
+        # ``_terrain_dim_allowed``.
+        self._skill_has_terrain = torch.tensor(
+            [s.has_terrain for s in self.skills], dtype=torch.bool, device=self.device,
+        )  # [num_skills]
+        # Python-list mirror for the per-skill selection loop, so deciding
+        # whether a skill needs the terrain-dim filter costs no host-device
+        # sync per skill.
+        self._skill_has_terrain_list: list[bool] = [s.has_terrain for s in self.skills]
 
     # ------------------------------------------------------------------
     # Output ordering (called by TrajectoryCommand after construction)
@@ -739,6 +1042,209 @@ class MultiSkillManager(ManagerBase):
         """
         self._forced_traj_latch = latch
 
+    def set_terrain_dim_lookup(self, fn: Any) -> None:
+        """Register the terrain's per-point terrain-dimension query.
+
+        ``fn(xy_w) -> (dims, valid)`` where ``dims`` is ``[N, 3]`` holding
+        the terrain feature's ``(width, height, length)`` at each world xy —
+        same ordering as the trajectory conditioner's terrain columns — and
+        ``valid`` is ``[N]`` bool (False where the cell has no terrain
+        feature).  A NaN entry in ``dims`` marks that dimension as
+        unconstrained (it never participates in matching).  Typically
+        ``MetaCompositeTerrainImporter.terrain_dims_at``.  ``None`` (the
+        default) disables the terrain-dim selection filter.
+        """
+        self._terrain_dims_at = fn
+
+    def _terrain_dim_allowed(
+        self, anchor_xy: Tensor, env_traj_skill_ids: Tensor
+    ) -> Tensor | None:
+        """Per-env trajectory mask from the terrain dimensions under the anchor.
+
+        For envs whose skill has terrain trajectories AND whose anchor cell
+        has a terrain feature, only trajectories whose conditioner
+        ``(terrain_width, terrain_height, terrain_length)`` matches the
+        feature's dims pass — per dimension, within ``_TERRAIN_DIM_TOLS``,
+        with NaN terrain dims unconstrained.  All other envs pass every
+        trajectory (the skill mask alone applies).
+
+        The length tolerance absorbs the legacy stair generator's depth
+        rescale (``step_depth = size_x / round(size_x / nominal)``, ≤ ~2 mm
+        off nominal) while staying far below the library's 0.04 m grid step.
+
+        Args:
+            anchor_xy: ``[N, 2]`` world xy used to resolve each env's
+                terrain feature.
+            env_traj_skill_ids: ``[N]`` skill indices in the manager's
+                (trajectory) skill index space.
+
+        Returns:
+            ``[N, T]`` bool mask, or ``None`` when no lookup is registered.
+        """
+        if self._terrain_dims_at is None:
+            return None
+        dims, valid = self._terrain_dims_at(anchor_xy)           # [N, 3], [N]
+        needs_dims = self._skill_has_terrain[env_traj_skill_ids] & valid  # [N]
+        # Conditioning columns (see ConditionerData.to_continuous_tensor):
+        # [vx, vy, vyaw, terrain_width, terrain_height, terrain_length].
+        traj_dims = self._global_conditioning[:, 3:6].unsqueeze(0)   # [1, T, 3]
+        tols = self._terrain_dim_tols                                # [3]
+        # NaN terrain dims compare False against any tolerance, so the
+        # explicit isnan() OR is what marks them unconstrained.
+        per_dim_ok = (
+            ((traj_dims - dims.unsqueeze(1)).abs() <= tols)
+            | dims.isnan().unsqueeze(1)
+        )                                                            # [N, T, 3]
+        dim_ok = per_dim_ok.all(dim=-1)                              # [N, T]
+        return torch.where(needs_dims.unsqueeze(1), dim_ok, torch.ones_like(dim_ok))
+
+    def _apply_terrain_dim_filter(
+        self, allowed: Tensor, anchor_xy: Tensor, env_traj_skill_ids: Tensor
+    ) -> Tensor:
+        """Intersect the skill mask with the terrain-dim mask, with fallback.
+
+        Rows where the intersection is empty (the feature's dimensions
+        aren't represented in the library) fall back to the skill-only mask
+        — an all-masked row would otherwise make ``argmin`` silently return
+        trajectory 0 of the wrong skill.  Warns once when that happens.
+
+        Args:
+            allowed: ``[N, T]`` skill-eligibility mask.
+            anchor_xy: ``[N, 2]`` world xy terrain anchor per env.
+            env_traj_skill_ids: ``[N]`` manager-space skill indices.
+
+        Returns:
+            ``[N, T]`` refined mask.
+        """
+        dim_mask = self._terrain_dim_allowed(anchor_xy, env_traj_skill_ids)
+        if dim_mask is None:
+            return allowed
+        refined = allowed & dim_mask
+        has_candidate = refined.any(dim=1)
+        if not bool(has_candidate.all()) and not self._warned_dim_fallback:
+            print(
+                "[WARN] MultiSkillManager: some envs sit on a terrain feature "
+                "whose (width, height, length) has no matching trajectory in "
+                "the library — falling back to skill-only selection for those "
+                "envs. Check that the terrain's feature dimensions (e.g. stair "
+                "step_dim_options) were derived from this trajectory library."
+            )
+            self._warned_dim_fallback = True
+        return torch.where(has_candidate.unsqueeze(1), refined, allowed)
+
+    def _selection_anchor_xy(self, env_ids: Tensor | None) -> Tensor:
+        """World xy used to resolve each env's terrain feature during selection.
+
+        Uses the owner's ``ref_poses`` (latest in-contact stance reference,
+        snapped to the stair tread for terrain-aware skills) — stable across
+        per-step pelvis jitter and the same anchor the velocity command uses
+        for its cell lookups.
+
+        Args:
+            env_ids: Optional env subset.
+
+        Returns:
+            ``[N, 2]`` world xy.
+        """
+        anchor_xy = self._skill_owner.ref_poses[:, :2]
+        if env_ids is not None:
+            anchor_xy = anchor_xy[env_ids]
+        return anchor_xy
+
+    def _select_within_skills(
+        self,
+        vel_cmd: Tensor,
+        env_traj_skill_ids: Tensor,
+        anchor_xy: Tensor | None,
+    ) -> Tensor:
+        """Nearest trajectory per env, evaluated within each env's skill block.
+
+        Equivalent to a full-library ``cdist`` followed by a skill mask and a
+        global ``argmin``, but the velocity distance is computed only against
+        the env's own skill's contiguous trajectory block — so the per-step
+        cost scales with the per-skill trajectory count, not the whole
+        library.  Because each skill occupies a contiguous, ``vel_x``-sorted
+        global-index range (guarded in :meth:`_build_skill_data`), a per-group
+        local ``argmin`` (first-min) plus the block offset reproduces the
+        global first-min index exactly.
+
+        The optional terrain-dim filter (the legacy
+        :meth:`_terrain_dim_allowed` / :meth:`_apply_terrain_dim_filter` pair)
+        is folded in per group, materializing only ``[N_s, T_s, 3]`` instead
+        of ``[N, T, 3]``.  The forced-traj latch is intentionally *not* applied
+        here — callers that need it overlay it on the returned indices.
+
+        Args:
+            vel_cmd: ``[N, 3]`` per-env velocity conditioner (vx, vy, vyaw).
+            env_traj_skill_ids: ``[N]`` skill indices in the manager's
+                (trajectory) skill index space.
+            anchor_xy: ``[N, 2]`` world xy used to resolve each env's terrain
+                feature for the terrain-dim filter, or ``None`` to disable the
+                filter (no terrain lookup registered / offline usage).
+
+        Returns:
+            ``[N]`` global trajectory indices.
+        """
+        n = vel_cmd.shape[0]
+        selected = torch.empty(n, dtype=torch.long, device=self.device)
+        if n == 0:
+            return selected
+
+        use_terrain = self._terrain_dims_at is not None and anchor_xy is not None
+        tols = self._terrain_dim_tols  # [3]
+
+        for s in range(len(self.skills)):
+            rows = (env_traj_skill_ids == s).nonzero(as_tuple=True)[0]  # [N_s]
+            if rows.numel() == 0:
+                continue
+            off = self._skill_traj_offset[s]
+            cnt = self._skill_traj_count[s]
+
+            vel_block = self._global_conditioning[off:off + cnt, :3]   # [T_s, 3]
+            d = torch.cdist(vel_cmd[rows], vel_block)                  # [N_s, T_s]
+
+            # Terrain-dim filter (only for terrain-bearing skills, mirroring
+            # the legacy ``needs_dims = _skill_has_terrain & valid`` gate).
+            if use_terrain and self._skill_has_terrain_list[s]:
+                dims, valid = self._terrain_dims_at(anchor_xy[rows])   # [N_s,3],[N_s]
+                traj_dims = self._global_conditioning[
+                    off:off + cnt, 3:6
+                ].unsqueeze(0)                                          # [1, T_s, 3]
+                # NaN terrain dims compare False against tolerance, so the
+                # explicit isnan() OR is what marks them unconstrained.
+                per_dim_ok = (
+                    ((traj_dims - dims.unsqueeze(1)).abs() <= tols)
+                    | dims.isnan().unsqueeze(1)
+                )                                                       # [N_s, T_s, 3]
+                dim_ok = per_dim_ok.all(dim=-1)                         # [N_s, T_s]
+                # Envs whose anchor cell has no terrain feature (~valid) match
+                # every trajectory in the skill.
+                dim_ok = torch.where(
+                    valid.unsqueeze(1), dim_ok, torch.ones_like(dim_ok)
+                )
+                # Empty-match fallback: rows where no trajectory in this skill
+                # matches the feature dims fall back to skill-only velocity
+                # selection (mirrors :meth:`_apply_terrain_dim_filter`).
+                has_candidate = dim_ok.any(dim=1)                      # [N_s]
+                if not bool(has_candidate.all()) and not self._warned_dim_fallback:
+                    print(
+                        "[WARN] MultiSkillManager: some envs sit on a terrain "
+                        "feature whose (width, height, length) has no matching "
+                        "trajectory in the library — falling back to skill-only "
+                        "selection for those envs. Check that the terrain's "
+                        "feature dimensions (e.g. stair step_dim_options) were "
+                        "derived from this trajectory library."
+                    )
+                    self._warned_dim_fallback = True
+                dim_ok = torch.where(
+                    has_candidate.unsqueeze(1), dim_ok, torch.ones_like(dim_ok)
+                )
+                d = d.masked_fill(~dim_ok, float("inf"))
+
+            selected[rows] = d.argmin(dim=1) + off
+
+        return selected
+
     def _select_trajectories(
         self,
         conditioner: Tensor,
@@ -754,8 +1260,10 @@ class MultiSkillManager(ManagerBase):
 
         Args:
             conditioner: ``(N, C)`` conditioning vectors. Only the first three
-                dims (vel_x, vel_y, vel_yaw) participate in matching now —
-                skill replaces the legacy terrain-dim filter.
+                dims (vel_x, vel_y, vel_yaw) participate in the distance;
+                the skill mask plus the terrain-dim filter (when a terrain
+                lookup is registered — see :meth:`set_terrain_dim_lookup`)
+                replace the legacy terrain-dim distance.
             env_ids: Optional env subset matching ``conditioner``'s rows. When
                 provided, the owner's ``skill_id`` is sliced the same way so
                 row counts stay aligned (callers like ``reset_on_reference``
@@ -780,14 +1288,17 @@ class MultiSkillManager(ManagerBase):
 
         env_traj_skill_ids = self._vel_skill_to_traj_skill[owner_skill_ids]  # (N,)
 
-        vel_cmd = conditioner[:, :3]                           # (N, 3)
-        vel_global = self._global_conditioning[:, :3]          # (T, 3)
-        vel_dists = torch.cdist(vel_cmd, vel_global)           # (N, T)
-
-        allowed = self._traj_skill_idx.unsqueeze(0) == env_traj_skill_ids.unsqueeze(1)
-        vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
-
-        selected = vel_dists.argmin(dim=1)
+        # Velocity-nearest pick within each env's own skill block.  The skill
+        # restriction and (when registered) the terrain-dim filter are folded
+        # into the per-group computation — see :meth:`_select_within_skills`.
+        anchor_xy = (
+            self._selection_anchor_xy(env_ids)
+            if self._terrain_dims_at is not None
+            else None
+        )
+        selected = self._select_within_skills(
+            conditioner[:, :3], env_traj_skill_ids, anchor_xy,
+        )
 
         # NOTE: the forced-latch overlay below is intentionally applied to
         # the live per-env selection only — :meth:`nearest_traj_in_skill`
@@ -808,8 +1319,57 @@ class MultiSkillManager(ManagerBase):
 
         return selected
 
+    def _select_trajectories_reference(
+        self,
+        conditioner: Tensor,
+        env_ids: Tensor | None = None,
+    ) -> Tensor:
+        """Reference (pre-optimization) full-library selection — TEST ONLY.
+
+        Computes the velocity-nearest, skill-masked, terrain-filtered
+        selection over the *entire* library with a single ``[N, T]`` ``cdist``
+        (and an ``[N, T, 3]`` terrain mask).  Retained as the permanent
+        equivalence oracle for :meth:`_select_within_skills` — the
+        ``TestSelectionEquivalence`` suite asserts the production path
+        (:meth:`_select_trajectories`) returns byte-identical global indices,
+        guarding the load-bearing ``_traj_changed`` contract against future
+        drift.  Never called on the training hot path.
+        """
+        self._lazy_init_skill_filter()
+
+        owner_skill_ids: Tensor = self._skill_owner.skill_id
+        if env_ids is not None:
+            owner_skill_ids = owner_skill_ids[env_ids]
+        if conditioner.shape[0] != owner_skill_ids.shape[0]:
+            raise RuntimeError(
+                f"conditioner ({conditioner.shape[0]}) and owner.skill_id "
+                f"({owner_skill_ids.shape[0]}) must have matching env count."
+            )
+        env_traj_skill_ids = self._vel_skill_to_traj_skill[owner_skill_ids]
+
+        vel_cmd = conditioner[:, :3]
+        vel_global = self._global_conditioning[:, :3]
+        vel_dists = torch.cdist(vel_cmd, vel_global)
+
+        allowed = self._traj_skill_idx.unsqueeze(0) == env_traj_skill_ids.unsqueeze(1)
+        if self._terrain_dims_at is not None:
+            allowed = self._apply_terrain_dim_filter(
+                allowed, self._selection_anchor_xy(env_ids), env_traj_skill_ids,
+            )
+        vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
+        selected = vel_dists.argmin(dim=1)
+
+        latch = self._forced_traj_latch
+        if latch is not None:
+            active = latch.active if env_ids is None else latch.active[env_ids]
+            forced = latch.traj_idx if env_ids is None else latch.traj_idx[env_ids]
+            selected = torch.where(active, forced, selected)
+
+        return selected
+
     def nearest_traj_in_skill(
         self, owner_skill_ids: Tensor, env_ids: Tensor,
+        anchor_xy: Tensor | None = None,
     ) -> Tensor:
         """Nearest trajectory (by velocity) within an *arbitrary* skill.
 
@@ -825,19 +1385,28 @@ class MultiSkillManager(ManagerBase):
                 (terrain ``skill_list``) index space.
             env_ids: ``[K]`` env indices, aligned to ``owner_skill_ids``,
                 used to read each env's velocity conditioner.
+            anchor_xy: Optional ``[K, 2]`` world xy used to resolve the
+                terrain feature for the terrain-dim filter.  Defaults to the
+                owner's stance reference; the approach planner passes the
+                just-landed stance foot instead (``ref_poses`` is stale at
+                gate-fire time).
 
         Returns:
             ``[K]`` global trajectory indices.
         """
         self._lazy_init_skill_filter()
         conditioner = self._get_conditioner_from_env(env_ids)
-        vel_cmd = conditioner[:, :3]                                # (K, 3)
-        vel_global = self._global_conditioning[:, :3]               # (T, 3)
-        vel_dists = torch.cdist(vel_cmd, vel_global)                # (K, T)
         traj_skill_ids = self._vel_skill_to_traj_skill[owner_skill_ids]  # (K,)
-        allowed = self._traj_skill_idx.unsqueeze(0) == traj_skill_ids.unsqueeze(1)
-        vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
-        return vel_dists.argmin(dim=1)
+        if self._terrain_dims_at is not None and anchor_xy is None:
+            anchor_xy = self._selection_anchor_xy(env_ids)
+        # Shares the per-skill segmented selection; differs from
+        # ``_select_trajectories`` only in that it never applies the
+        # forced-traj latch (the caller peeks at the un-latched candidate).
+        return self._select_within_skills(
+            conditioner[:, :3],
+            traj_skill_ids,
+            anchor_xy if self._terrain_dims_at is not None else None,
+        )
 
     # ------------------------------------------------------------------
     # Core batched helpers
@@ -1092,7 +1661,15 @@ class MultiSkillManager(ManagerBase):
         Returns:
             ``[N, num_contacts]`` binary contact states.
         """
-        if not hasattr(self, "_contact_table") or self._contact_table_key != tuple(contact_frames):
+        # Build the lookup once (and rebuild only if the contact-frame list
+        # changes).  The table is derived purely from the static trajectory
+        # contact layout + ``contact_frames``, so it never changes within a
+        # run.  NOTE: the guard keys off ``_contact_table_key`` (set by
+        # ``_precompute_contact_table``); a prior version checked
+        # ``hasattr(self, "_contact_table")`` — an attribute that is never
+        # assigned — so the O(num_trajectories) Python rebuild ran on *every*
+        # call (twice per step), dominating per-step time as the library grew.
+        if getattr(self, "_contact_table_key", None) != tuple(contact_frames):
             self._precompute_contact_table(contact_frames)
 
         traj_idx = self._get_global_indices(env_ids)
@@ -1309,7 +1886,10 @@ class MultiSkillManager(ManagerBase):
 
         - Half-periodic: 2 gates (phi=0.5 entering reflected second half;
           phi=1.0 wrapping back to first half).
-        - Full-periodic: 1 gate at phi=1.0 (cycle wrap).
+        - Full-periodic: 1 gate at phi=1.0 (cycle wrap).  TODO(zolkin): a
+          two-stride full-periodic gait has two contacts per cycle but only
+          gets one gate here — see the big TODO at the full-periodic branch
+          below; revisit before trusting long full-periodic runs.
         - Episodic: 1 gate at phi=1.0 (end of trajectory).
         - Perpetual: 0 gates.
 
@@ -1350,6 +1930,30 @@ class MultiSkillManager(ManagerBase):
                 gate_pre_size[ti, 1] = 0.5
                 num_gates[ti] = 2
             elif tt == _FULL_PERIODIC_INT or tt == _EPISODIC_INT:
+                # =============================================================
+                # TODO(zolkin): REVISIT FULL-PERIODIC CONTACT GATING.
+                # -------------------------------------------------------------
+                # A full-periodic gait is TWO strides, so it has TWO foot-strike
+                # contacts per cycle (one per stride).  But this branch arms only
+                # ONE gate, at phi=1.0 (the cycle wrap).  The mid-cycle foot
+                # strike (start of the second stride) is NEVER gated, so contact-
+                # based phase resync happens once per FULL cycle (every two
+                # strides) instead of once per stride like half-periodic does.
+                #
+                # The entire new gait library (2026-06-13_..._merged:
+                # running / walk_forward / walk_backwards) is full_periodic, so
+                # EVERY locomotion env now resyncs at half the rate it used to.
+                # Worried this lets phase drift too far between corrections and
+                # hurts tracking / contact timing.  THINK ABOUT THIS before
+                # trusting a long full-periodic run.
+                #
+                # Fix sketch: add a second gate at the mid-cycle contact domain
+                # (the domain where the second stride's stance begins) with its
+                # own gate_body_names + gate_pre_size, and bump MAX_GATES if
+                # needed.  The mid-cycle phi is NOT necessarily 0.5 — derive it
+                # from the per-domain contact structure, don't hardcode it.  Keep
+                # episodic (which shares this branch) at a single end gate.
+                # =============================================================
                 gate_phi[ti, 0] = 1.0
                 gate_active[ti, 0] = True
                 gate_body_names[ti][0] = list(first_domain_bodies)

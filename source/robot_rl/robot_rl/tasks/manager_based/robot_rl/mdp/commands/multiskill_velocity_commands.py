@@ -7,6 +7,8 @@ import torch
 import warp as wp
 from typing import Sequence, TYPE_CHECKING
 
+from .guidance import guidance_pd_commands
+from .traj_tracking.skill_bucket import clamp_pd_channels_to_buckets
 from .velocity_commands import VelocityTrackingCommand
 
 if TYPE_CHECKING:
@@ -47,6 +49,16 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
                 )
         self._terrain = terrain
         self._skill_list: list[str] = list(terrain.skill_list)
+
+        # Terrain velocity guidance (per-block PD targets).  Only composite
+        # importers expose the query; ``None`` keeps pure sampled behavior.
+        self._guidance_at = getattr(terrain, "velocity_guidance_at", None)
+        # Skills that never get guided (e.g. standing — steering a
+        # stationary reference laterally is a conflicting command).
+        self._guidance_skill_exempt = torch.tensor(
+            [s in cfg.guidance_exempt_skills for s in self._skill_list],
+            dtype=torch.bool, device=self.device,
+        )
 
         # The trajectory command's ``ref_poses`` is used as the terrain
         # cell-lookup anchor on mid-episode resamples.  The lookup itself
@@ -168,6 +180,72 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
     def skill_ang_vel_z(self) -> torch.Tensor:
         """``[num_skills, 2]`` per-skill ang-z bucket ``[min, max]``."""
         return self._skill_ang_vel_z
+
+    # ------------------------------------------------------------------
+    # Command post-processing
+    # ------------------------------------------------------------------
+
+    def _update_command(self) -> None:
+        """Base ramp + PD post-processing, per-skill clamping, then guidance.
+
+        Three layers, in order:
+
+        1. The base class ramps the sampled target and applies the random-
+           target y-position / heading PDs, clipped by the GLOBAL
+           ``cfg.ranges`` only.
+        2. Per-skill clamp: with wide global ranges (needed for lateral /
+           yaw on the flat skills) the PD would leak nonzero vy / wz onto
+           stair / standing envs whose buckets are ``(0, 0)``.  Clamping
+           per env by ``sampled_skill_id`` keeps those envs pinned while
+           flat skills keep the full ranges.
+        3. Terrain guidance overwrite: envs standing on a block that
+           declares ``velocity_guidance`` get their vy / wz replaced by a
+           PD toward the block's target (e.g. its exit-edge midpoint),
+           clamped to the block's guidance ranges — a terrain-specific
+           velocity command that supersedes the skill bucket.  Standing
+           envs (control-mode) stay exempt, as do envs whose sampled
+           skill is in ``cfg.guidance_exempt_skills`` (a standing-skill
+           env must not be steered against a stationary reference).
+
+        ``vel_command_b`` feeds trajectory selection (post-PD), so these
+        layers directly control which trajectories get matched — e.g. a
+        guided stair env pushed laterally selects the matching lateral
+        stair trajectory.
+
+        The guidance query runs on the live root position every step, so
+        targets hop automatically as an env crosses block boundaries.
+        """
+        super()._update_command()
+        self.vel_command_b[:] = clamp_pd_channels_to_buckets(
+            self.vel_command_b,
+            self.sampled_skill_id,
+            self._skill_lin_vel_y,
+            self._skill_ang_vel_z,
+        )
+
+        if self._guidance_at is None:
+            return
+        root_pos = wp.to_torch(self.robot.data.root_pos_w)
+        query = self._guidance_at(root_pos[:, :2])
+        guided = (
+            query.active
+            & ~self.is_standing_env
+            & ~self._guidance_skill_exempt[self.sampled_skill_id]
+        )
+        if not guided.any():
+            return
+        vy, wz = guidance_pd_commands(
+            target_y=query.target_w[:, 1],
+            yaw_target=query.yaw,
+            root_y=root_pos[:, 1],
+            lat_vel_w=wp.to_torch(self.robot.data.root_vel_w)[:, 1],
+            heading_w=wp.to_torch(self.robot.data.heading_w),
+            gains=query.gains,
+            vy_range=query.lin_vel_y,
+            wz_range=query.ang_vel_z,
+        )
+        self.vel_command_b[guided, 1] = vy[guided]
+        self.vel_command_b[guided, 2] = wz[guided]
 
     # ------------------------------------------------------------------
     # Sampling / commit helpers
@@ -303,7 +381,12 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
         # end-of-last-episode position at reset-event time, so we pass
         # ``env_origins`` through the ``xy_w`` override.
         xy_spawn = self._env.scene.env_origins[env_ids_t, :2]
-        new_skill = self._sample_skill(env_ids_t, xy_w=xy_spawn)
+        # A fresh episode always draws its skill independently from the spawn
+        # cell's distribution — the previous episode's skill is meaningless
+        # across a reset discontinuity (the env may even have respawned on a
+        # different cell). ``skill_transition_prob`` governs only the
+        # mid-episode resample persistence, not the reset draw.
+        new_skill = self._sample_skill(env_ids_t, xy_w=xy_spawn, force_independent=True)
         new_vx, new_vy, new_wz, new_heading = self._sample_velocity_for_skill(new_skill)
 
         # Immediate live commit.
@@ -327,17 +410,22 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
 
     def _sample_skill(
         self, env_ids: Sequence[int], xy_w: torch.Tensor | None = None,
+        force_independent: bool = False,
     ) -> torch.Tensor:
         """Sample one skill index per env from the terrain's per-cell distribution.
 
-        Without ``skill_transition_prob``: each env's skill is drawn
-        independently from its cell's ``skill_probs`` row each resample.
+        Without ``skill_transition_prob`` (or with ``force_independent=True``):
+        each env's skill is drawn independently from its cell's ``skill_probs``
+        row.
 
         With ``skill_transition_prob = p``: each env independently either keeps
         its previous skill (prob ``1 − p``) or samples a new one from its cell's
         ``skill_probs`` renormalised to exclude the current skill (prob ``p``).
         Cells whose distribution puts all mass on the previous skill leave the
-        env on its current skill (warning logged once).
+        env on its current skill (warning logged once).  Setting ``p = 0.0``
+        therefore locks each env's skill to whatever it was sampled at reset for
+        the whole episode (mid-episode resamples only re-draw the velocity
+        within that skill's bucket).
 
         Args:
             env_ids: Env indices to sample for.
@@ -347,6 +435,10 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
                 ``env.scene.env_origins[..., :2]``) on the reset path —
                 otherwise ``root_pos_w`` is stale and resolves to the
                 end-of-last-episode cell.
+            force_independent: If True, ignore ``skill_transition_prob`` and
+                draw each skill independently from the cell distribution. Used
+                by the reset path so a fresh episode always samples from its
+                spawn cell rather than persisting the previous episode's skill.
         """
         # Per-env world XY → per-env skill probability vector. The importer
         # encapsulates the cell (and per-block, for composite importers)
@@ -355,7 +447,7 @@ class MultiskillVelocityTrackingCommand(VelocityTrackingCommand):
             xy_w = wp.to_torch(self.robot.data.root_pos_w)[env_ids, :2]
         per_env_probs = self._terrain.skill_probs_at(xy_w)  # (n, num_skills)
 
-        if self.cfg.skill_transition_prob is None:
+        if self.cfg.skill_transition_prob is None or force_independent:
             return torch.multinomial(per_env_probs, num_samples=1).squeeze(-1)
 
         n = len(env_ids)

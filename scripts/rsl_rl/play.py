@@ -39,6 +39,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # local imports
 import cli_args  # isort: skip
 from data_logger import DataLogger  # isort: skip
+from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 from robot_rl.network.moe_network import MixtureOfExperts  # isort: skip
@@ -48,7 +49,12 @@ with contextlib.suppress(ImportError):
     import isaaclab_tasks_experimental  # noqa: F401
 
 # -- argparse ----------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+# allow_abbrev=False: never accept a prefix of a long option as that option.
+# Otherwise ``--clip <h5>`` would silently bind to ``--clip_device`` (the only
+# ``--clip*`` flag), feeding a clip PATH as a torch device string. With it off,
+# the explicit ``--clip`` flag below is the only thing ``--clip`` can mean, and
+# any other ambiguous prefix falls through to hydra as a loud error.
+parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.", allow_abbrev=False)
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
@@ -117,6 +123,13 @@ parser.add_argument(
     help='Restrict plots to a time window in seconds. Format: "start,end" — '
          'either end may be empty (e.g. "5,", ",10"). Requires logging.',
 )
+parser.add_argument(
+    "--dump_play_data", action="store_true", default=False,
+    help="Also save the raw per-step world-frame reference arrays (y_des/y_act + "
+         "clip/FM references + the FM prediction window) to play_data.npz in the plots "
+         "dir, for offline analysis. "
+         "Pair with --plots fm_predictions to include the full FM prediction window.",
+)
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
     "--train_mode",
@@ -125,6 +138,61 @@ parser.add_argument(
     help="Run the policy as it behaves during training: actor/critic kept in torch .train() "
          "mode (dropout/batchnorm active) AND stochastic action sampling enabled. "
          "Default play is .eval() mode with deterministic actions.",
+)
+parser.add_argument(
+    "--profile", action="store_true", default=False,
+    help="Enable the per-frame profiling harness (phase timers for policy / "
+         "env.step / logging + a manager and debug-vis breakdown). Prints a "
+         "rolling report every --profile_steps frames. Zero cost when off.",
+)
+parser.add_argument(
+    "--profile_steps", type=int, default=100,
+    help="Frames per rolling profiling report window (with --profile).",
+)
+parser.add_argument(
+    "--profile_sync", action="store_true", default=False,
+    help="Profile in synchronous mode: drain the whole device at each phase "
+         "boundary for true, correctly-nested per-phase costs (incl. Warp "
+         "physics/render on its own stream). Slower; use to resolve "
+         "cross-stream mis-attribution.",
+)
+parser.add_argument(
+    "--no-debug-vis", dest="no_debug_vis", action="store_true", default=False,
+    help="Force the trajectory command's debug visualization off "
+         "(env_cfg.commands.traj_ref.debug_vis = False) to A/B test its cost.",
+)
+parser.add_argument(
+    "--clip", type=str, default=None,
+    help="Path to the clip / trajectory library (.h5) to track, overriding the "
+         "cfg default. Applied to any command term exposing a `path` field "
+         "(traj_ref). Equivalent to the hydra override "
+         "env.commands.traj_ref.path=<h5>, but without the hydra syntax.",
+)
+parser.add_argument(
+    "--clip_device", type=str, default=None,
+    help="Device to hold a trajectory/clip library on (e.g. 'cpu' to keep a multi-GB "
+         "library off a small GPU). Applied to any command term exposing a clip_device "
+         "field. Set here (not via hydra) because the cfg default is None.",
+)
+parser.add_argument(
+    "--fm_checkpoint", type=str, default=None,
+    help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
+         "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
+         "overriding the cfg default.",
+)
+parser.add_argument(
+    "--no-logging", dest="no_logging", action="store_true", default=False,
+    help="Disable per-step DataLogger collection (overrides --plots) to A/B "
+         "test logging cost.",
+)
+parser.add_argument(
+    "--episode_stats", action="store_true", default=False,
+    help="Accumulate the env's extras['log'] (Episode_Termination/*, "
+         "Episode_Reward/*, Metrics/*, Curriculum/*) over the run and write a "
+         "training-comparable summary to <log_dir>/episode_stats.txt. These are "
+         "the same step-mean aggregates the training logger reports, so e.g. "
+         "frame_drift_post_grace can be compared against the wandb curve. "
+         "Independent of --plots / DataLogger.",
 )
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
@@ -187,6 +255,65 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
+
+        # Trajectory-library version check: the saved env.yaml records the
+        # portable content fingerprint of the library this policy trained
+        # against.  The cfg built from the gym registry has it unset, so inject
+        # the trained-against value here (before env construction); the
+        # trajectory command then warns loudly if the locally loaded library
+        # has since diverged.  Best-effort — never blocks play.
+        if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
+            trained_env_yaml = os.path.join(log_dir, "params", "env.yaml")
+            if os.path.isfile(trained_env_yaml):
+                try:
+                    from isaaclab.utils.io import load_yaml
+
+                    saved_traj = (load_yaml(trained_env_yaml).get("commands") or {}).get("traj_ref") or {}
+                    trained_fp = saved_traj.get("library_fingerprint")
+                    if trained_fp is not None:
+                        env_cfg.commands.traj_ref.library_fingerprint = trained_fp
+                        env_cfg.commands.traj_ref.library_manifest = saved_traj.get("library_manifest")
+                        print(f"[INFO] Trained-against trajectory library fingerprint: {trained_fp}")
+                    else:
+                        print(
+                            "[INFO] Saved env.yaml has no trajectory library fingerprint "
+                            "(run predates fingerprinting); skipping library-version check."
+                        )
+                except Exception as exc:  # noqa: BLE001 - never block play
+                    print(f"[WARN] Could not read trained trajectory library fingerprint: {exc}")
+
+        # profiling A/B: optionally force the trajectory debug visualization off
+        if args_cli.no_debug_vis and hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "traj_ref"):
+            env_cfg.commands.traj_ref.debug_vis = False
+            print("[profiling] traj_ref.debug_vis forced OFF for this run.")
+
+        # Optionally override the clip/trajectory library path (the file each
+        # command term tracks).  Applied to any command term exposing a `path`
+        # field; equivalent to env.commands.traj_ref.path=<h5> but without hydra.
+        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "path"):
+                    term.path = args_cli.clip
+                    print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
+
+        # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
+        # hydra: the cfg field default is None so hydra rejects a str override).
+        # Needed to play a policy whose multi-GB clip library would otherwise OOM a
+        # small GPU -- mirrors the same flag in train.py / record_data.py.
+        if args_cli.clip_device is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "clip_device"):
+                    term.clip_device = args_cli.clip_device
+                    print(f"[INFO] clip_device='{args_cli.clip_device}' for commands.{name}.")
+
+        # Optionally override the flow-matching generator checkpoint to track
+        # (mirrors --clip_device / the same flag in train.py); convenient for
+        # playing against a freshly-trained FM without editing the cfg default.
+        if args_cli.fm_checkpoint is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            for name, term in vars(env_cfg.commands).items():
+                if hasattr(term, "fm_checkpoint"):
+                    term.fm_checkpoint = args_cli.fm_checkpoint
+                    print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the
@@ -352,10 +479,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # Set up data logging
         plot_names = [s.strip() for s in args_cli.plots.split(",")]
-        logging_enabled = plot_names != ["none"]
+        logging_enabled = plot_names != ["none"] and not args_cli.no_logging
+        # The FM peel-off plot needs the full F-step predicted window logged each
+        # step (heavier: [T, N, F, P]); enable it only when that plot is requested.
+        log_fm_window = any(p in ("fm_predictions", "all") for p in plot_names)
         if logging_enabled:
-            logger = DataLogger(env)
+            logger = DataLogger(env, log_fm_window=log_fm_window)
         env_ids = list(range(min(args_cli.plot_envs, env_cfg.scene.num_envs)))
+
+        # Optional training-comparable episode-metric accumulator. Folds the
+        # env's extras["log"] (which play normally discards) into running
+        # step-means; written to <log_dir>/episode_stats.txt at the end.
+        ep_stats = EpisodeStatsAccumulator() if args_cli.episode_stats else None
+
+        # optional per-frame profiling harness (see scripts/rsl_rl/profiling.py)
+        phase_timer = None
+        profile_report_path = None
+        if args_cli.profile:
+            from profiling import PhaseTimer, instrument_env_managers
+
+            profile_report_path = os.path.join(log_dir, "profile_report.txt")
+            phase_timer = PhaseTimer(env.unwrapped.device, sync=args_cli.profile_sync)
+            # debug-vis + managers run inside env.step → recorded as nested detail.
+            instrument_env_managers(env, phase_timer, include_debug_vis=True)
+            print(
+                f"[profiling] enabled  |  sync mode: "
+                f"{'ON (slower, exact nesting)' if phase_timer.sync else 'OFF (async CUDA-event timers)'}"
+                f"  |  requested --profile_sync={args_cli.profile_sync}; "
+                f"rolling report every {args_cli.profile_steps} frames. "
+                f"num_envs={env_cfg.scene.num_envs}, "
+                f"logging={logging_enabled}.",
+                flush=True,
+            )
 
         # reset environment
         obs = env.get_observations()
@@ -365,66 +520,94 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
         export_policy_parameters(env, obs, actions, log_dir)
 
+        def _ph(name):
+            """Phase context (no-op when profiling is off)."""
+            return phase_timer.phase(name) if phase_timer is not None else contextlib.nullcontext()
+
         timestep = 0
+        prof_window = 0  # frames since the last rolling profile report
         # simulate environment
         try:
             while True:
                 start_time = time.time()
-                # Drive the dedicated recording camera before the step so
-                # the next render (triggered inside env.step via
-                # RecordVideo) reads a fresh transform.  Writes directly to
-                # the USD prim via Isaac Sim's viewport util — render
-                # products read the prim transform, no viewport_api needed.
-                if record_cam_state is not None and record_cam_state["follow_robot"]:
-                    robot = env.unwrapped.scene.articulations["robot"]
-                    import warp as wp
-                    env_idx = record_cam_state["env_index"]
-                    root_pos_w = wp.to_torch(robot.data.root_pos_w)[
-                        env_idx, :3
-                    ].detach().cpu().numpy()
-                    eye_off = record_cam_state["eye_offset"]
-                    lookat_off = record_cam_state["lookat_offset"]
-                    if record_cam_state["track_yaw"]:
-                        # Rotate the offsets by the robot's yaw so e.g. a
-                        # side-view (+y) stays on the robot's left even as
-                        # the robot turns.
-                        yaw = float(wp.to_torch(robot.data.heading_w)[env_idx].item())
-                        c, s = np.cos(yaw), np.sin(yaw)
-                        rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
-                        eye_off = rot @ eye_off
-                        lookat_off = rot @ lookat_off
-                    eye_w = (root_pos_w + eye_off).tolist()
-                    target_w = (root_pos_w + lookat_off).tolist()
-                    import isaacsim.core.utils.viewports as _isaacsim_viewports
-                    _isaacsim_viewports.set_camera_view(
-                        eye=eye_w, target=target_w,
-                        camera_prim_path=record_cam_state["prim_path"],
-                    )
+                with _ph("frame_total"):
+                    # Drive the dedicated recording camera before the step so
+                    # the next render (triggered inside env.step via
+                    # RecordVideo) reads a fresh transform.  Writes directly to
+                    # the USD prim via Isaac Sim's viewport util — render
+                    # products read the prim transform, no viewport_api needed.
+                    if record_cam_state is not None and record_cam_state["follow_robot"]:
+                        with _ph("camera"):
+                            robot = env.unwrapped.scene.articulations["robot"]
+                            import warp as wp
+                            env_idx = record_cam_state["env_index"]
+                            root_pos_w = wp.to_torch(robot.data.root_pos_w)[
+                                env_idx, :3
+                            ].detach().cpu().numpy()
+                            eye_off = record_cam_state["eye_offset"]
+                            lookat_off = record_cam_state["lookat_offset"]
+                            if record_cam_state["track_yaw"]:
+                                # Rotate the offsets by the robot's yaw so e.g. a
+                                # side-view (+y) stays on the robot's left even as
+                                # the robot turns.
+                                yaw = float(wp.to_torch(robot.data.heading_w)[env_idx].item())
+                                c, s = np.cos(yaw), np.sin(yaw)
+                                rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+                                eye_off = rot @ eye_off
+                                lookat_off = rot @ lookat_off
+                            eye_w = (root_pos_w + eye_off).tolist()
+                            target_w = (root_pos_w + lookat_off).tolist()
+                            import isaacsim.core.utils.viewports as _isaacsim_viewports
+                            _isaacsim_viewports.set_camera_view(
+                                eye=eye_w, target=target_w,
+                                camera_prim_path=record_cam_state["prim_path"],
+                            )
 
-                # run everything in inference mode
-                with torch.inference_mode():
-                    # agent stepping
-                    actions = policy(obs, stochastic_output=args_cli.train_mode)
-                    teacher_actions = (
-                        teacher_model(obs, stochastic_output=args_cli.train_mode)
-                        if teacher_model is not None else None
-                    )
-                    # env stepping
-                    obs, _, dones, _ = env.step(actions)
-                    # reset recurrent states for episodes that have terminated
-                    if version.parse(installed_version) >= version.parse("4.0.0"):
-                        policy.reset(dones)
-                    else:
-                        policy_nn.reset(dones)
+                    # run everything in inference mode
+                    with torch.inference_mode():
+                        # agent stepping
+                        with _ph("policy"):
+                            actions = policy(obs, stochastic_output=args_cli.train_mode)
+                            teacher_actions = (
+                                teacher_model(obs, stochastic_output=args_cli.train_mode)
+                                if teacher_model is not None else None
+                            )
+                        # env stepping (physics + GUI render + managers)
+                        with _ph("env_step"):
+                            obs, _, dones, infos = env.step(actions)
+                        # reset recurrent states for episodes that have terminated
+                        if version.parse(installed_version) >= version.parse("4.0.0"):
+                            policy.reset(dones)
+                        else:
+                            policy_nn.reset(dones)
 
-                if logging_enabled:
-                    logger.collect_step(env)
-                    if teacher_model is not None:
-                        logger.collect_distillation_actions(
-                            student_actions=actions, teacher_actions=teacher_actions
+                    if logging_enabled:
+                        with _ph("logger"):
+                            logger.collect_step(env)
+                            if teacher_model is not None:
+                                logger.collect_distillation_actions(
+                                    student_actions=actions, teacher_actions=teacher_actions
+                                )
+                    if is_moe and "val" in _last_gate_w:
+                        gate_weights_log.append(_last_gate_w["val"])
+                    if ep_stats is not None:
+                        tm = env.unwrapped.termination_manager
+                        term_fired = {n: tm.get_term(n) for n in tm.active_terms}
+                        ep_stats.collect_step(infos, dones, term_fired=term_fired)
+
+                # rolling profiling report
+                if phase_timer is not None:
+                    phase_timer.tick()
+                    prof_window += 1
+                    if prof_window >= args_cli.profile_steps:
+                        phase_timer.report(
+                            total_key="frame_total",
+                            top_level=["camera", "policy", "env_step", "logger"],
+                            reset=True,
+                            title="PLAY per-frame breakdown",
+                            out_path=profile_report_path,
                         )
-                if is_moe and "val" in _last_gate_w:
-                    gate_weights_log.append(_last_gate_w["val"])
+                        prof_window = 0
 
                 timestep += 1
                 if args_cli.video and timestep >= args_cli.video_length:
@@ -438,6 +621,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except KeyboardInterrupt:
             pass
         finally:
+            # Flush any partial profiling window (e.g. on Ctrl-C).
+            if phase_timer is not None:
+                phase_timer.report(
+                    total_key="frame_total",
+                    top_level=["camera", "policy", "env_step", "logger"],
+                    title="PLAY per-frame breakdown (final)",
+                    out_path=profile_report_path,
+                )
+            # Write/print the training-comparable episode-metric summary.
+            if ep_stats is not None and ep_stats.num_steps > 0:
+                num_envs = env.unwrapped.num_envs
+                print("\n" + ep_stats.format_report(num_envs=num_envs))
+                ep_stats_path = os.path.join(log_dir, "episode_stats.txt")
+                ep_stats.write_report(ep_stats_path, num_envs=num_envs)
+                print(f"[INFO] Episode stats written to: {ep_stats_path}")
             # Generate plots from collected data
             if logging_enabled and logger.num_steps > 0:
                 data, metadata = logger.finalize()
@@ -445,7 +643,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if is_moe and gate_weights_log:
                     data["gate_weights"] = torch.stack(gate_weights_log).cpu().numpy()
                     metadata["num_experts"] = _moe_net.num_experts
-                plots_dir = os.path.join(log_dir, "plots")
+                # Task-specific subfolder so different tasks loading the SAME run
+                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-fm-play) keep
+                # their plots side by side instead of overwriting each other.
+                plots_dir = os.path.join(log_dir, "plots", task_name)
+                if args_cli.dump_play_data:
+                    os.makedirs(plots_dir, exist_ok=True)
+                    # Raw world-frame references + FM prediction window for offline
+                    # height-drift analysis. Save the world arrays that exist (the
+                    # FM-window ones need --plots fm_predictions) plus the channel-name
+                    # metadata the post-processor needs to locate pelvis/feet z.
+                    dump_keys = (
+                        "y_des", "y_act", "dy_des", "dy_act",
+                        "y_des_clip", "dy_des_clip", "y_des_fm", "dy_des_fm",
+                        "fm_pred_y", "fm_pred_dy", "fm_active", "fm_pred_idx",
+                    )
+                    bundle = {k: data[k] for k in dump_keys if k in data}
+                    for mk in ("pos_names", "vel_names", "dt", "t_offset",
+                               "fm_window_len", "fm_novel_start", "ee_frames"):
+                        if mk in metadata:
+                            bundle[mk] = np.asarray(metadata[mk], dtype=object)
+                    dump_path = os.path.join(plots_dir, "play_data.npz")
+                    np.savez(dump_path, **bundle)
+                    print(f"[INFO] Dumped raw play data ({len(bundle)} arrays) to {dump_path}")
                 time_range = None
                 if args_cli.plot_time_range:
                     parts = args_cli.plot_time_range.split(",")

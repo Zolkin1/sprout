@@ -7,10 +7,81 @@ import warp as wp
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import euler_xyz_from_quat, quat_conjugate, quat_mul, wrap_to_pi
+from isaaclab.utils.math import (
+    euler_xyz_from_quat,
+    quat_box_minus,
+    quat_conjugate,
+    quat_mul,
+    wrap_to_pi,
+)
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
+
+
+def base_pose_error_termination(
+    env,
+    command_name: str = "traj_ref",
+    max_pos_dist: float = 0.25,
+    max_ori_rad: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base pose drifts too far from the tracking reference.
+
+    The single failure termination for open-loop motion-sequence tracking
+    (replaces the pelvis-upright / base-height / frame-drift terminations).
+    Compares the robot's world base pose against the reference base pose served
+    by :meth:`MotionSequenceCommand.termination_reference_world_state` -- the
+    tracked reference for clip- and open-loop-FM envs, but the **clip** reference
+    for closed-loop-FM envs (so a robot that stalls while the clip marches on
+    terminates instead of riding a stationary FM prediction):
+
+      * position: terminate if ``||ref_pos - root_pos|| > max_pos_dist`` (m).
+      * orientation: terminate if the geodesic angle between the reference
+        and actual base quaternions exceeds ``max_ori_rad`` (rad).
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+        max_pos_dist: Max base position error before terminating (m).
+        max_ori_rad: Max base orientation error before terminating (rad).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(command_name)
+    state = cmd.termination_reference_world_state()
+    ref_pos_w = state[:, 0:3]
+    ref_quat_w = state[:, 3:7]                      # wxyz
+    root_pos_w = wp.to_torch(asset.data.root_pos_w)
+    root_quat_w = wp.to_torch(asset.data.root_quat_w)  # wxyz
+
+    pos_err = torch.norm(ref_pos_w - root_pos_w, dim=-1)
+    # ||quat_box_minus|| is the geodesic rotation angle (rad).
+    ori_err = torch.norm(quat_box_minus(root_quat_w, ref_quat_w), dim=-1)
+    return (pos_err > max_pos_dist) | (ori_err > max_ori_rad)
+
+
+def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
+    """Truncate (good termination) when the clip's last step is reached.
+
+    Wire this as ``DoneTerm(..., time_out=True)`` so RSL-RL bootstraps the
+    value from the final state rather than treating clip-end as a failure.
+    Keyed on the clip step counter so it is correct even when episodes start
+    mid-clip (``random_start_phase``).
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs at/after the clip's last step.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    last_step = cmd.manager.num_steps - 1
+    return (cmd.start_step + env.episode_length_buf) >= last_step
 
 def no_progress(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """
@@ -103,6 +174,42 @@ def base_orientation_from_upright(
     return (roll.abs() > roll_limit) | (pitch.abs() > pitch_limit)
 
 
+def base_fallen(
+    env,
+    min_height: float = 0.5,
+    roll_limit_deg: float = 70.0,
+    pitch_limit_deg: float = 70.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base has fallen: too low, or tilted too far from upright.
+
+    A trajectory-independent fall detector: fires when the base world height
+    drops below ``min_height`` (m) **or** the base roll/pitch deviates from
+    world upright (world z) by more than ``roll_limit_deg`` / ``pitch_limit_deg``
+    (yaw ignored).  The orientation half reuses
+    :func:`base_orientation_from_upright`, so the two share one definition.
+
+    Independent of the tracking reference (unlike
+    :func:`base_pose_error_termination`), so it catches a collapsed / face-
+    planted robot regardless of where the reference is.  On flat ground the
+    base world ``z`` is the height above the ground plane.
+
+    Args:
+        env: IsaacLab environment.
+        min_height: Minimum base world height before terminating (m).
+        roll_limit_deg: Maximum allowed |roll| from upright (deg).
+        pitch_limit_deg: Maximum allowed |pitch| from upright (deg).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    too_low = wp.to_torch(asset.data.root_pos_w)[:, 2] < min_height
+    tilted = base_orientation_from_upright(env, roll_limit_deg, pitch_limit_deg, asset_cfg)
+    return too_low | tilted
+
+
 def frame_deviation_from_reference(
     env,
     cmd_name: str,
@@ -135,9 +242,11 @@ def frame_deviation_from_reference(
         min_dist: Absolute minimum threshold in metres.  Default ``0.0``
             disables the floor — set this above the noise floor / typical
             stance-foot drift to avoid spurious termination.
-        grace_period_s: Seconds after a trajectory swap (within-skill bucket
-            swap or full skill change) and after a fresh episode reset
-            during which this termination is suppressed.  Reads
+        grace_period_s: Seconds after an in-episode trajectory swap
+            (within-skill bucket swap or full skill change) during which this
+            termination is suppressed.  Fresh episode resets are NOT granted
+            grace — the reset spawns the robot on the reference, so there is no
+            transition transient and the termination arms immediately.  Reads
             ``cmd.time_since_traj_change_s`` (populated by
             ``BatchedMultiSkillCommand._pre_update_phase``).  Default 0
             disables the grace.  Silently no-ops if the command term does
@@ -271,6 +380,69 @@ def frame_drift_in_skill(
     cmd = env.command_manager.get_term(cmd_name)
     skill_idx = cmd._skill_list.index(skill_name)
     return drift & (cmd.skill_id == skill_idx)
+
+
+def frame_drift_post_grace(
+    env,
+    cmd_name: str = "traj_ref",
+    window_s: float = 0.25,
+    base_term: str = "frame_drift",
+    grace_period_s: float | None = None,
+) -> torch.Tensor:
+    """Subset of ``base_term``'s frame-drift done, masked to envs that
+    terminated within ``window_s`` seconds *after* the grace period ended.
+
+    A frame-drift termination this soon after a trajectory swap's grace window
+    expires is strong evidence the transition itself failed (it just took
+    slightly longer than the grace period to blow up), rather than steady-state
+    tracking drift. Logged by the ``TerminationManager`` as
+    ``Episode_Termination/frame_drift_post_grace``; compare against
+    ``Episode_Termination/frame_drift`` for the suspected-transition-failure
+    fraction.
+
+    Like :func:`frame_drift_in_skill` this is an exact subset of ``base_term``
+    (an already-active term) read via ``get_term``, so the union of all done
+    signals — and therefore training dynamics — is unchanged, and the grace
+    logic is not recomputed. This requires ``base_term`` to be computed earlier
+    in the step than this term, which holds as long as it is registered before
+    it in the terminations cfg.
+
+    The window is ``[grace_period_s, grace_period_s + window_s)`` in seconds,
+    measured by ``cmd.time_since_traj_change_s`` (reset to 0 on an in-episode
+    trajectory swap, 1e6 on a fresh reset — so envs that never transitioned are
+    naturally excluded). The lower bound is redundant while ``frame_drift`` can
+    only fire after grace, but is kept explicit so the metric stays correct if
+    the parent gate ever changes.
+
+    Args:
+        env: The IsaacLab environment.
+        cmd_name: Trajectory command term exposing ``time_since_traj_change_s``
+            (the multiskill command).
+        window_s: Width (seconds) of the post-grace window to flag.
+        base_term: Name of the parent frame-drift termination term.
+        grace_period_s: Grace window (seconds). Defaults to ``None``, in which
+            case it is read from ``base_term``'s own ``grace_period_s`` param via
+            ``get_term_cfg`` so it tracks the parent automatically.
+
+    Returns:
+        Boolean tensor of shape ``[num_envs]`` — ``True`` for envs that
+        terminated via ``base_term`` this step within the post-grace window.
+    """
+    # Safe no-op if the parent term is not active (e.g. disabled in a subclass).
+    if base_term not in env.termination_manager.active_terms:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    drift = env.termination_manager.get_term(base_term)                       # (N,) bool
+    cmd = env.command_manager.get_term(cmd_name)
+    # Silent no-op for command terms without a transition clock (single-skill).
+    time_since = getattr(cmd, "time_since_traj_change_s", None)
+    if time_since is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    if grace_period_s is None:
+        grace_period_s = env.termination_manager.get_term_cfg(base_term).params.get(
+            "grace_period_s", 0.0
+        )
+    in_window = (time_since >= grace_period_s) & (time_since < grace_period_s + window_s)
+    return drift & in_window
 
 
 def illegal_terrain_contact(

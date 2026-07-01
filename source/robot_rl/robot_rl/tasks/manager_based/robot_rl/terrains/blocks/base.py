@@ -13,6 +13,10 @@ import trimesh
 
 from isaaclab.utils import configclass
 
+from robot_rl.tasks.manager_based.robot_rl.terrains.velocity_guidance_cfg import (
+    BlockVelocityGuidanceCfg,
+)
+
 
 @configclass
 class TerrainBlockCfg:
@@ -35,6 +39,12 @@ class TerrainBlockCfg:
 
     difficulty_scale: float = 1.0
     """Reserved hook for future per-block difficulty scaling — unused for v1."""
+
+    velocity_guidance: BlockVelocityGuidanceCfg | None = None
+    """Optional terrain-specific velocity guidance for envs on this block.
+    ``None`` (default) keeps the normal randomly-sampled lateral / yaw
+    commands; a cfg makes the velocity command PD-steer guided envs toward
+    the block's target (see :mod:`..velocity_guidance_cfg`)."""
 
 
 @dataclass

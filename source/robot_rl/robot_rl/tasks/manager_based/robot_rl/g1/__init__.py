@@ -437,6 +437,15 @@ if not _registered:
     )
 
     # Multiskill terrain
+    # TODO(zolkin): rename the runner these two point at. "HalfPeriodic" only
+    # describes phase-clock handling (negate sin/cos_phase under reflection),
+    # but this env disables the phase clock (sin_phase/cos_phase = None) and
+    # feeds explicit trajectory-reference obs, so the half-periodic-vs-episodic
+    # distinction is inert here and the label is misleading. Add a phase-
+    # agnostic SagittalSymmetricPPORunnerCfg (same as SymmetricEpisodic, using
+    # symmetric_data_augmentation_episodic) and point both registrations at it.
+    # Don't rename SymmetricHalfPeriodicPPORunnerCfg itself — it's accurate for
+    # the phase-obs envs (running / stairs / walk_run) that still use it.
     gym.register(
         id="G1-multiskill-terrain-clf",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -454,6 +463,81 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_terrain_multiskill_env_cfg:G1TerrainMultiskillCLFEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        },
+    )
+
+    ## =========================================
+    # Teacher: open-loop motion-clip tracking (pre-generated clips, flat ground)
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips
+    # are full episodic motions with no gait-phase obs, so the Episodic runner
+    # is the correct choice (phase negation is a no-op here).
+    gym.register(
+        id="G1-teacher-clf-sym",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-sym-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        },
+    )
+
+    # Deterministic single-clip playback of the trained teacher on the parity clip
+    # (stand -> walk -> run -> stand); ego re-anchoring off by default (override
+    # env.commands.traj_ref.ego_anchor_fraction=1.0 to watch the re-anchoring).
+    gym.register(
+        id="G1-teacher-clf-parity-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherParityPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    ## =========================================
+    # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
+    ## =========================================
+    # Closed-loop deploy of the ROBOT-STATE-conditioned FM: the teacher (--load_run)
+    # tracks the FM predicted from the LIVE robot-state history each step (the new
+    # paradigm). Pass the robot-state FM via --fm_checkpoint and --clip_device cpu.
+    gym.register(
+        id="G1-tracker-clf-fm-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
     _registered = True

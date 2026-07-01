@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
+    lift_position,
+)
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedEnv
@@ -240,6 +244,99 @@ def reset_on_reference(
         nonref_phase = torch.zeros(num_nonref_envs, device=env.device)
         cmd.manager.set_phase(nonref_phase, nonref_ids)
 
+
+
+def reset_on_motion_sequence(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    base_frame_name: str = "pelvis_link",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset each env onto a randomly chosen pre-generated motion clip.
+
+    Picks a clip (and, if ``cfg.random_start_phase``, a random start step),
+    places the clip in the world so its start-step stance anchor sits at the
+    env origin (re-zeroed so a mid-clip start still spawns at the origin, not
+    metres downrange), and writes the clip's reference base pose / velocity /
+    joint state into the sim.  Sets the command's per-env clip tracking state
+    so the first ``compute`` reproduces the spawn pose (zero initial error).
+
+    Unlike :func:`reset_on_reference`, there is no velocity conditioner, no
+    skill bucket, no contact-gate state, and every env starts on a clip.
+
+    Args:
+        env: The environment.
+        env_ids: Env indices to reset.
+        command_name: The :class:`MotionSequenceCommand` term name.
+        base_frame_name: Trajectory base frame (must match the command cfg).
+        asset_cfg: Robot asset config.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(command_name)
+    if env_ids.numel() == 0:
+        return
+    k = env_ids.shape[0]
+    device = env.device
+    num_clips = cmd.manager.num_clips
+    num_steps = cmd.manager.num_steps
+
+    # 1. Sample a clip and a start step per env.
+    clip_id = torch.randint(0, num_clips, (k,), device=device)
+    if cmd.cfg.random_start_phase:
+        # Leave at least random_start_min_remaining_s of clip after the start.
+        margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
+        hi = max(1, num_steps - margin)
+        start_step = torch.randint(0, hi, (k,), device=device)
+    else:
+        start_step = torch.zeros(k, dtype=torch.long, device=device)
+
+    # 2. World placement of the clip frame (optional random yaw): re-zero only the
+    #    downrange (x, y) placement so a mid-clip start spawns the base at the env
+    #    origin, but KEEP the clip's base height (z).
+    world_quat = torch.zeros(k, 4, device=device)
+    world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
+    if getattr(cmd.cfg, "randomize_heading", False):
+        yaw = torch.empty(k, device=device).uniform_(-torch.pi, torch.pi)
+        zeros = torch.zeros_like(yaw)
+        world_quat = quat_from_euler_xyz(zeros, zeros, yaw)
+    # Clip-world base position at the start step (clips are stored clip-world, so
+    # there is no per-step anchor schedule). Rotate it by the placement heading;
+    # re-zero only x/y (keep z) so the base spawns at the env origin at its
+    # natural clip height, with the feet resting on the ground.
+    y0, _ = cmd.manager.gather_desired(clip_id, start_step)
+    base_pos_cf = y0[:, cmd._base_idx["pos"]]  # [k, 3]
+    rotated = lift_position(torch.zeros(k, 3, device=device), world_quat, base_pos_cf)
+    rotated[:, 2] = 0.0
+    world_pos = env.scene.env_origins[env_ids] - rotated
+
+    # 3. World reference state at (clip, start_step, placement).
+    state = cmd.reference_world_state_at(clip_id, start_step, world_pos, world_quat)
+    nj = len(asset.joint_names)
+    base_pose = state[:, 0:7]          # [pos(3), quat wxyz(4)]
+    base_vel = state[:, 7:13]          # [lin(3), ang(3)]
+    joint_pos = state[:, 13:13 + nj]
+    joint_vel = state[:, 13 + nj:13 + 2 * nj]
+
+    # 4. Commit the command's per-env clip tracking state (so the first
+    #    compute, at episode_length_buf == 0, reproduces this spawn pose).
+    cmd.clip_id[env_ids] = clip_id
+    cmd.start_step[env_ids] = start_step
+    cmd.clip_world_pos[env_ids] = world_pos
+    cmd.clip_world_quat[env_ids] = world_quat
+
+    # Ego re-anchor: clip envs are ego-anchored with probability ``ego_anchor_fraction``,
+    # else world-anchored. Ego-anchored envs get their clip placement periodically snapped
+    # onto the robot root during the episode (see MotionSequenceCommand._reanchor_ego_envs);
+    # the closed-loop FM tracker (FmTrackingCommand) sets ego_anchor_fraction=1.0.
+    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
+    cmd._ego_mask[env_ids] = torch.rand(k, device=device) < ego_frac
+
+    # 5. Write to sim.
+    asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
+    asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
+    asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
+    asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
 
 def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:
