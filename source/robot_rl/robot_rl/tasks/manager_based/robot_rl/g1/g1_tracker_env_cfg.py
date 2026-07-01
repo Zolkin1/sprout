@@ -245,6 +245,10 @@ class G1FmTrackerCommandsCfg:
         # Warmup clip is robot-anchored on the FM re-plan cadence (matches the deploy regime).
         ego_anchor_fraction=1.0,
         ego_anchor_every=10,
+        # The clip library only supplies the reset spawn pose + velocity command here, so
+        # keep it on CPU by default -- loading the multi-GB library onto a 12GB GPU next to
+        # the sim + FM + teacher OOMs (override with --clip_device).
+        clip_device="cpu",
     )
 
 
