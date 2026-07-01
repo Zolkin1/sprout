@@ -151,6 +151,22 @@ def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> 
     if policy.ctx.num_extra_frames > 0:
         fr = robot.get_body_world_states(policy.ctx.frame_names)  # [K, 13]
         state.update(frame_pos=fr[:, 0:3], frame_quat=fr[:, 3:7], frame_lin=fr[:, 7:10], frame_ang=fr[:, 10:13])
+    # Height scan (per-ray ground clearance): raycast a yaw-aligned grid under the pelvis
+    # against the MuJoCo terrain, replicating IsaacLab mdp.height_scan. Computed when the
+    # tracker uses a height_scan obs (spec present) or the FM conditions on a scan
+    # (height_dim>1). Feeds the tracker obs + FM height token; also drawn in the viewer.
+    spec = policy._trk.get_height_scan_spec() if hasattr(policy._trk, "get_height_scan_spec") else None
+    if spec is not None or getattr(policy.ctx, "height_dim", 1) > 1:
+        s = spec or {}
+        off = s.get("offset_pos", [0.75, 0.0, 20.0])
+        clr, hits = robot.compute_height_scan(
+            state["root_pos"], state["root_quat"],
+            resolution=float(s.get("resolution", 0.1)), size=tuple(s.get("size", (1.5, 1.0))),
+            offset_fwd=float(off[0]), ray_start_h=float(off[2]),
+            sensor_offset=float(s.get("sensor_offset", 0.5)),
+        )
+        state["height_scan"] = np.nan_to_num(clr, nan=0.0)  # misses -> 0 (flat never misses)
+        state["height_scan_hits"] = hits
     return state
 
 
@@ -426,12 +442,18 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                          *torques, *jp_vals, *ee_vals])
 
     def draw_viz(viewer, state: dict) -> None:
-        """Populate ``user_scn`` with FM root/feet spheres + desired/actual velocity arrows."""
+        """Populate ``user_scn`` with the height-scan hits + FM root/feet spheres + velocity arrows."""
         if viewer is None or not viz:
             return
         scn = viewer.user_scn
         scn.ngeom = 0
         base_pos = np.asarray(state["root_pos"], dtype=np.float64)
+        # Height-scan ray hits (magenta dots on the terrain under/ahead of the robot).
+        hits = state.get("height_scan_hits")
+        if hits is not None:
+            for p in np.asarray(hits, dtype=np.float64):
+                if np.isfinite(p).all():
+                    _add_sphere(scn, p, (1.0, 0.0, 1.0, 0.9), 0.015)
         # FM prediction spheres (only once the generator has a valid prediction).
         if policy._pred_valid:
             if fm_traj_points <= 0:
