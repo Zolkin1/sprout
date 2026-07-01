@@ -262,7 +262,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             command to match training. Overridden by ``max_acc`` in the tracker metadata
             when present; ``<= 0`` disables ramping.
         fm_traj_points: Number of evenly-spaced spheres drawn along the FM predicted root
-            trajectory in the viewer.
+            (and feet) trajectory in the viewer; ``<= 0`` draws every predicted node (a
+            dense ribbon, matching the IsaacLab debug viz).
         clip: Optional baked-clip reference source. When given, the robot spawns on the
             clip's step-0 pose and the tracker is driven by the clip reference (no FM)
             instead of the standing warmup + FM path.
@@ -433,8 +434,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         base_pos = np.asarray(state["root_pos"], dtype=np.float64)
         # FM prediction spheres (only once the generator has a valid prediction).
         if policy._pred_valid:
-            n_pts = max(1, min(fm_traj_points, policy.ctx.F))
-            idxs = np.unique(np.linspace(0, policy.ctx.F - 1, n_pts).astype(int))
+            if fm_traj_points <= 0:
+                idxs = np.arange(policy.ctx.F)  # every predicted node -- dense ribbon (like IsaacLab)
+            else:
+                n_pts = max(1, min(fm_traj_points, policy.ctx.F))
+                idxs = np.unique(np.linspace(0, policy.ctx.F - 1, n_pts).astype(int))
             rp = policy._pred["root_pos"][0]  # (F, 3) predicted root path
             for i in idxs:
                 _add_sphere(scn, rp[int(i)], (1.0, 0.55, 0.0, 0.85), 0.02)
@@ -628,8 +632,9 @@ def main() -> None:
                         help="Velocity-command rate limit (m/s^2, rad/s^2) to match training; "
                              "the clip library ramps at 2.0. Overridden by tracker metadata "
                              "'max_acc' if present; <=0 disables.")
-    parser.add_argument("--fm_traj_points", type=int, default=10,
-                        help="Number of spheres drawn along the FM predicted root trajectory.")
+    parser.add_argument("--fm_traj_points", type=int, default=0,
+                        help="Number of spheres drawn along the FM predicted root/feet trajectory; "
+                             "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--max_vx", type=float, default=1.0)
     parser.add_argument("--max_vy", type=float, default=0.5)
