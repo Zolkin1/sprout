@@ -137,9 +137,9 @@ class FmTrackingCommand(MotionSequenceCommand):
                 self._fm_pred_specs.append((name, color, "base", -1))
             elif name in self.ctx.frame_names:
                 self._fm_pred_specs.append((name, color, "frame", self.ctx.frame_names.index(name)))
-        self._fm_debug_offsets = torch.arange(
-            0, self.ctx.F, max(1, int(self.cfg.debug_vis_stride)), dtype=torch.long, device=dev
-        )
+        # Show EVERY predicted node in the FM ribbon (dense), independent of the
+        # clip ribbon's debug_vis_stride subsampling.
+        self._fm_debug_offsets = torch.arange(0, self.ctx.F, dtype=torch.long, device=dev)
 
     def reset(self, env_ids=None):
         """Latch the per-env episode reset (consumed in :meth:`_snapshot_and_infer`)."""
