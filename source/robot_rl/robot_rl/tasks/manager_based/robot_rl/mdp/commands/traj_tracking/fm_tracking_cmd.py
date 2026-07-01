@@ -24,6 +24,9 @@ import os
 import torch
 import warp as wp
 
+from isaaclab.envs.mdp import height_scan as mdp_height_scan
+from isaaclab.managers import SceneEntityCfg
+
 from robot_rl.flow_matching.online import (
     BatchedHistory,
     build_cmd_tokens,
@@ -248,7 +251,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         frames = self._history.stack("frames")[ids] if self.ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
-        height = build_height_token(self.ctx, rp[:, -1, 2])          # robot root z above ground (now)
+        # Height token = the live height scan at "now" (per-ray ground clearance from the
+        # pelvis scanner), matching training; the same mdp.height_scan the teacher obs uses.
+        scan = mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))[ids]  # [V,K]
+        height = build_height_token(self.ctx, scan)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
         # Anchor = the robot NOW (the most-recent history step IS the live robot); the FM
