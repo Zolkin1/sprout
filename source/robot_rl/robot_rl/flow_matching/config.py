@@ -19,8 +19,9 @@ class FlowMatchingConfig:
 
     Architecture (single transformer, robot-state conditioned): tokens are assembled
     as ``[history(N) | height(1) | cmd(Ncmd) | future(F)]``. The ``num_history_states``
-    real-robot-state history tokens (whose job is to supply *phase*), the root-height
-    token, and the strided future-command tokens are SEPARATE conditioning tokens
+    real-robot-state history tokens (whose job is to supply *phase*), the height-scan
+    token (a ``height_dim``-ray ground-clearance vector embedded into ONE token), and
+    the strided future-command tokens are SEPARATE conditioning tokens
     (never noised, not part of the denoised window). The model denoises the ``F``
     future state tokens -- ALL future, no past echo, no inpainting / known-mask. During
     training the history is replaced by a learned null embedding with probability
@@ -72,11 +73,19 @@ class FlowMatchingConfig:
     state_dim: int = 57
     # Per-step history-token width (= state_dim; resolved at build time).
     history_dim: int = 57
-    # Width of the height conditioning token (root z above ground; a heightmap stand-in).
-    height_dim: int = 1
-    # World floor height under the anchor for the height token (flat ground -> 0.0).
-    # Reuse the terrain-calibrated floor when the terrain loss is on.
+    # Width of the height conditioning token: the number of ray-cast ground-clearance
+    # values in the height scan (embedded through one MLP into a single token). Resolved
+    # from the recorded ``height_scan`` at dataset build time.
+    height_dim: int = 176
+    # World floor height for the TERRAIN-PENETRATION LOSS only (flat ground -> 0.0). It no
+    # longer feeds any FM conditioning token (the height scan replaced the root-z scalar).
+    # TODO: the terrain loss's flat-``ground_z`` floor is wrong on non-flat terrain; move it
+    # to an SDF (or a height-scan-derived local floor) before training on complex terrain.
     ground_z: float = 0.0
+    # Std floor for the height-scan normalizer. On flat ground the per-ray scan is nearly
+    # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
+    # normalization; a larger floor (~1e-2 m) keeps a near-flat scan well-scaled.
+    height_norm_eps: float = 1e-2
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 

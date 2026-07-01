@@ -469,6 +469,10 @@ def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherS
     steps = data["step_in_episode"][rows]
     snap = data["reanchor_active"][rows].astype(bool)
     state, ref_future, cmd_future = data["state"], data["ref_future"], data["cmd_future"]
+    height_scan = data.get("height_scan")
+    if height_scan is None:
+        raise SystemExit("[bench] this recording has no 'height_scan' array; re-record with a "
+                         "height_scanner sensor active (--task G1-teacher-clf-record-play).")
     foot_idxs = [i for i, f in enumerate(meta.state_frame_names) if "ankle" in f.lower() or "foot" in f.lower()]
 
     def _t(a):
@@ -489,7 +493,7 @@ def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherS
             _t(h["root_lin_vel"])[None], _t(h["root_ang_vel"])[None],
             _t(h["joint_pos"])[None], _t(h["joint_vel"])[None], frames=frames,
         )
-        height = build_height_token(ctx, _t(h["root_pos"][-1, 2]))
+        height = build_height_token(ctx, _t(height_scan[snap_row])[None])  # (1, K) recorded scan
         cmd = build_cmd_tokens(ctx, _t(cmd_future[snap_row])[None]) if ctx.cmd_dim > 0 else None
         p_ref, q_ref = _t(h["root_pos"][-1])[None], _t(h["root_quat"][-1])[None]
         world = sample_world(ctx, hist, height, cmd, p_ref, q_ref)

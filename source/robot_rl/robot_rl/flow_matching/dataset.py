@@ -188,6 +188,11 @@ class FutureStateDataset(Dataset):
                 "target_source='ego_anchored_clip_future' requires a 'ref_future' array; "
                 "re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
             )
+        if data.get("height_scan") is None:
+            raise ValueError(
+                "the height-scan FM requires a 'height_scan' array; re-record with a "
+                "height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)."
+            )
         if len(windows) == 0:
             raise ValueError("No valid snap windows; check reanchor_active vs num_history_states.")
 
@@ -277,8 +282,12 @@ class FutureStateDataset(Dataset):
             print(f"[fm-data][WARN] target node-0 root offset mean={node0_off:.3f} m (> 0.15); "
                   "the recorded ref_future may not be ego-anchored onto the robot at the snap.")
 
-        # Height token = robot root z above ground at the snap.
-        self.height = (p_anchor[:, 2:3] - float(cfg.ground_z)).contiguous()  # (Nw, 1)
+        # Height token = the recorded height scan at the snap row (per-ray ground
+        # clearance, body-relative). Replaces the old root-z scalar. K resolved here.
+        hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P, K)
+        self.height = hs[snap_rows].contiguous()  # (Nw, K)
+        self.height_dim = self.height.shape[1]
+        cfg.height_dim = self.height_dim
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
@@ -300,7 +309,10 @@ class FutureStateDataset(Dataset):
         self.state_normalizer = state_normalizer
 
         if height_normalizer is None:
-            height_normalizer = Normalizer.fit(self.height, torch.ones(1, dtype=torch.bool))
+            height_normalizer = Normalizer.fit(
+                self.height, torch.ones(self.height_dim, dtype=torch.bool),
+                eps=float(cfg.height_norm_eps),
+            )
         self.height_normalizer = height_normalizer
 
         if cmd_dim > 0:

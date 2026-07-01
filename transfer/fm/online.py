@@ -8,12 +8,12 @@ sim2sim / hardware tracker runner: it carries **no** isaaclab or robot_rl import
 
 It maintains a rolling per-env history of the robot state, builds the ``N`` history
 (phase) conditioning tokens (in the xyz+yaw relative-frame representation), the
-root-height token, and the strided future command tokens, samples the ``F``-step
+height-scan token, and the strided future command tokens, samples the ``F``-step
 future window, and lifts it back to the world frame.
 
 The conditioning matches ``robot_rl.flow_matching.dataset.FutureStateDataset``:
 ``N`` real-robot-state history tokens anchored at the most recent step (index N-1,
-the xyz+yaw ground frame), a single root-height token, the strided command tokens,
+the xyz+yaw ground frame), a single height-scan token, the strided command tokens,
 and the ``F`` predicted FUTURE states (node 0 = current step, offset ≈ 0). There is
 no inpainting / known-mask: conditioning is separate tokens. Keep in lock-step with
 ``source/robot_rl/robot_rl/flow_matching/online.py``.
@@ -95,8 +95,8 @@ class FmOnlineContext:
         model: The loaded :class:`FlowMatchingTransformer` (eval mode).
         state_norm: Normalizer for the state tokens (history conditioning + future).
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
-        height_norm: Normalizer for the scalar root-height token.
-        ground_z: World floor height under the anchor for the height token.
+        height_norm: Normalizer for the height-scan token.
+        ground_z: World floor height for the terrain-penetration loss only (no longer feeds any FM token).
         N: Number of history (phase) conditioning tokens.
         F: Future window length (all F are predicted; node 0 = current step).
         D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``); also history_dim.
@@ -270,20 +270,22 @@ def build_history_tokens(
     return ctx.state_norm.normalize(rel)
 
 
-def build_height_token(ctx: FmOnlineContext, anchor_root_z: torch.Tensor) -> torch.Tensor:
-    """Build the normalized root-height token ``(V, 1)`` from the anchor root z.
+def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch.Tensor:
+    """Build the normalized height-scan token ``(V, height_dim)`` from a raw scan.
+
+    The height scan is a vector of ray-cast ground-clearance values (body-relative,
+    yaw-aligned -- already in the FM's xyz+yaw ego frame, so no re-anchoring), embedded
+    downstream through one MLP into a single token. It replaces the old root-z scalar.
 
     Args:
         ctx: The loaded context.
-        anchor_root_z: World z of the robot root at the anchor step, shape ``(V,)`` or
-            ``(V, 1)``. At deployment this is the live robot root z (the ground-clearance
-            stand-in for a heightmap).
+        height_scan: Raw height scan at the anchor step, shape ``(V, height_dim)``. At
+            deployment this is the live per-ray ground clearance for each env.
 
     Returns:
-        Normalized height token ``(V, 1)``.
+        Normalized height-scan token ``(V, height_dim)``.
     """
-    raw = anchor_root_z.reshape(-1, 1) - ctx.ground_z
-    return ctx.height_norm.normalize(raw)
+    return ctx.height_norm.normalize(height_scan)
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:
@@ -323,7 +325,7 @@ def sample_world(
     Args:
         ctx: The loaded context.
         history: History (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        height: Normalized root-height token ``(V, 1)`` (from :func:`build_height_token`).
+        height: Normalized height-scan token ``(V, height_dim)`` (from :func:`build_height_token`).
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
         p_ref: World reference position ``(V, 3)`` (the current robot base position).
         q_ref: World reference quaternion ``(V, 4, xyzw)``.

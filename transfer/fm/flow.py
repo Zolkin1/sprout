@@ -198,6 +198,11 @@ def terrain_penetration_term(
     frame are placed with the predicted foot orientation (contact mode). Operates on the
     pure F-step prediction.
 
+    TODO: ``terrain`` here is a flat floor (a single ``ground_z`` height) -- the last use of
+    the height scalar in the FM. This is wrong on non-flat terrain. Replace it with an SDF
+    (or a local floor derived from the recorded height scan) before training on complex
+    terrain, so the penetration query uses the true local ground height per foot.
+
     Args:
         pred_phys: Predicted endpoint / sample (denormalized), ``(B, F, D)``.
         p_ref: World anchor position ``(B, 3)``; q_ref: anchor quat ``(B, 4 xyzw)``.

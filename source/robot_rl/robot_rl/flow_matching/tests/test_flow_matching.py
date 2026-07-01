@@ -214,9 +214,13 @@ def test_flow_batch_no_mask():
 # ---------------------------------------------------------------------------
 # 5. Model: token layout, conditioning, learned null-history
 # ---------------------------------------------------------------------------
-def _model(d=57, f=8, n=2, cmd_dim=3, stride=5, **kw):
+# Height token is now a scan vector (K rays) embedded into ONE token; use a small K in tests.
+_HK = 8
+
+
+def _model(d=57, f=8, n=2, cmd_dim=3, stride=5, height_dim=_HK, **kw):
     return FlowMatchingTransformer(
-        state_dim=d, future_len=f, num_history_states=n, history_dim=d, height_dim=1,
+        state_dim=d, future_len=f, num_history_states=n, history_dim=d, height_dim=height_dim,
         cmd_dim=cmd_dim, cmd_stride=stride, d_model=32, nhead=4, num_layers=2, dim_feedforward=64, **kw
     ).eval()
 
@@ -226,7 +230,7 @@ def test_model_shapes_and_conditioning():
     b, f, d, n, cmd_dim, stride = 3, 8, 57, 2, 3, 5
     model = _model(d, f, n, cmd_dim, stride)
     x, tau = torch.randn(b, f, d), torch.rand(b)
-    hist, height = torch.randn(b, n, d), torch.randn(b, 1)
+    hist, height = torch.randn(b, n, d), torch.randn(b, _HK)
     cmd = torch.randn(b, len(range(0, f, stride)), cmd_dim)
     with torch.no_grad():
         v0 = model(x, tau, hist, height, cmd)
@@ -240,7 +244,7 @@ def test_model_null_history():
     torch.manual_seed(8)
     b, f, d, n = 4, 8, 57, 2
     model = _model(d, f, n, cmd_dim=0)
-    x, tau, height = torch.randn(b, f, d), torch.rand(b), torch.randn(b, 1)
+    x, tau, height = torch.randn(b, f, d), torch.rand(b), torch.randn(b, _HK)
     hist = torch.randn(b, n, d)
     mask = torch.ones(b, dtype=torch.bool)
     with torch.no_grad():
@@ -254,7 +258,7 @@ def test_model_null_history():
 def test_model_no_command():
     model = _model(d=8, f=6, n=2, cmd_dim=0)
     with torch.no_grad():
-        out = model(torch.randn(2, 6, 8), torch.rand(2), torch.randn(2, 2, 8), torch.randn(2, 1), None)
+        out = model(torch.randn(2, 6, 8), torch.rand(2), torch.randn(2, 2, 8), torch.randn(2, _HK), None)
     assert out.shape == (2, 6, 8)
 
 
@@ -265,7 +269,7 @@ def test_flow_loss_and_samplers():
     torch.manual_seed(9)
     b, f, d, n, cmd_dim, stride = 8, 8, 57, 2, 3, 5
     model = _model(d, f, n, cmd_dim, stride)
-    x1, hist, height = torch.randn(b, f, d), torch.randn(b, n, d), torch.randn(b, 1)
+    x1, hist, height = torch.randn(b, f, d), torch.randn(b, n, d), torch.randn(b, _HK)
     cmd = torch.randn(b, len(range(0, f, stride)), cmd_dim)
     null = torch.rand(b) < 0.25
     out = flow_matching_loss(model, x1, hist, height, cmd, history_null_mask=null)
@@ -432,7 +436,7 @@ def test_flow_loss_fk_terms_and_tau_gate():
     nj, k = len(_FK_JOINTS), len(_FK_FRAMES)
     d, f, n = target_state_dim(nj, k), 8, 2
     model = _model(d, f, n, cmd_dim=0)
-    x1, hist, height = torch.randn(16, f, d), torch.randn(16, n, d), torch.randn(16, 1)
+    x1, hist, height = torch.randn(16, f, d), torch.randn(16, n, d), torch.randn(16, _HK)
     norm = _norm(x1)
     ckw = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k,
                vel_weight=0.1, accel_weight=0.01, joint_vel_weight=0.1,
@@ -525,7 +529,7 @@ def test_snap_windows():
     assert wins[0].tolist() == [3, 4]
 
 
-def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, seed=0):
+def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, Ksc=6, seed=0):
     rng = np.random.default_rng(seed)
     node = target_state_dim(nj, K)
     parts = []
@@ -537,10 +541,12 @@ def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, seed=0):
         rfu = rng.standard_normal((L, F, node)).astype(np.float32)
         rfu[:, 0, 0:3] = s[:, 0:3]; rfu[:, 0, 3:7] = s[:, 3:7]  # node-0 ego-anchored on the robot
         cf = rng.standard_normal((L, F, 3)).astype(np.float32)
+        hs = rng.standard_normal((L, Ksc)).astype(np.float32)  # per-step height scan (Ksc rays)
         ra = (np.arange(L) % Kstep == 0).astype(np.uint8)
         done = np.zeros(L, np.uint8); done[-1] = 1
-        parts.append((s, rfu, cf, ra, np.full(L, e, np.int64), np.arange(L, dtype=np.int64), done))
-    keys = ["state", "ref_future", "cmd_future", "reanchor_active", "episode_id", "step_in_episode", "done"]
+        parts.append((s, rfu, cf, hs, ra, np.full(L, e, np.int64), np.arange(L, dtype=np.int64), done))
+    keys = ["state", "ref_future", "cmd_future", "height_scan", "reanchor_active",
+            "episode_id", "step_in_episode", "done"]
     data = {k: np.concatenate([p[i] for p in parts]) for i, k in enumerate(keys)}
     stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel"]
     std = [3, 4, 3, 3, nj, nj]
@@ -560,11 +566,13 @@ def test_dataset_snap_windows_build():
                              target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
     train, val = build_train_val(data, meta, cfg)
     it = train[0]
+    ksc = data["height_scan"].shape[1]
     assert it["history"].shape == (2, node)
     assert it["state"].shape == (F, node)
-    assert it["height"].shape == (1,)
+    assert it["height"].shape == (ksc,)
     assert it["cmd_tokens"].shape == (cfg.num_cmd_tokens, 3)
     assert cfg.state_dim == node and cfg.history_dim == node and cfg.cmd_dim == 3
+    assert cfg.height_dim == ksc
     assert val is not None and len(val) > 0
     assert isinstance(train.val_episode_ids, list)
     # node-0 target offset ~ 0 in the robot frame (ego-anchored), so the raw target root pos is small.
@@ -584,7 +592,7 @@ def test_online_roundtrip():
     # Model must match the ctor load_fm_context will rebuild from cfg.
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
-        height_dim=1, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
+        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
     ).eval()
     ckpt = {
@@ -603,9 +611,10 @@ def test_online_roundtrip():
     rq = torch.nn.functional.normalize(torch.randn(V, N, 4), dim=-1)
     hist = build_history_tokens(ctx, rp, rq, torch.randn(V, N, 3), torch.randn(V, N, 3),
                                 torch.randn(V, N, nj), torch.randn(V, N, nj), frames=torch.randn(V, N, K, 13))
-    height = build_height_token(ctx, rp[:, -1, 2])
+    height = build_height_token(ctx, torch.randn(V, cfg.height_dim))
     cmd = build_cmd_tokens(ctx, torch.randn(V, F, 3))
-    assert hist.shape == (V, N, node) and height.shape == (V, 1) and cmd.shape == (V, ctx.num_cmd_tokens, 3)
+    assert (hist.shape == (V, N, node) and height.shape == (V, cfg.height_dim)
+            and cmd.shape == (V, ctx.num_cmd_tokens, 3))
     world = sample_world(ctx, hist, height, cmd, p_ref=torch.randn(V, 3),
                          q_ref=torch.nn.functional.normalize(torch.randn(V, 4), dim=-1))
     assert world["root_pos_w"].shape == (V, F, 3)
