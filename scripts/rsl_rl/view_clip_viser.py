@@ -133,6 +133,56 @@ def _tube_mesh(path: np.ndarray, radius: float, n_seg: int = 14) -> tuple[np.nda
     return verts.astype(np.float32), np.concatenate([f1, f2], axis=0).astype(np.uint32)
 
 
+def _box(xmin, xmax, ymin, ymax, zmin, zmax) -> tuple[np.ndarray, np.ndarray]:
+    """Axis-aligned box as (8 vertices, 12 triangle faces)."""
+    v = np.array([
+        [xmin, ymin, zmin], [xmax, ymin, zmin], [xmax, ymax, zmin], [xmin, ymax, zmin],
+        [xmin, ymin, zmax], [xmax, ymin, zmax], [xmax, ymax, zmax], [xmin, ymax, zmax],
+    ], dtype=np.float32)
+    f = np.array([
+        [0, 2, 1], [0, 3, 2],  # bottom
+        [4, 5, 6], [4, 6, 7],  # top
+        [0, 1, 5], [0, 5, 4],  # -y
+        [2, 3, 7], [2, 7, 6],  # +y
+        [1, 2, 6], [1, 6, 5],  # +x
+        [3, 0, 4], [3, 4, 7],  # -x
+    ], dtype=np.uint32)
+    return v, f
+
+
+def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Build a solid multi-band terrain mesh (verts, faces) from a manifest entry.
+
+    Flat bands render as a full-corridor-width slab at their level; stair bands
+    render as solid tread pillars spanning the (narrower, centered) stair width.
+    All in the clip-world (local-corner) frame the clip is stored in.  Falls back
+    to the legacy single-stair keys for pre-multi-band manifests.
+    """
+    size_y = float(m.get("size_y", 1.2))
+    w = float(m["dims"]["w"]); d = float(m["dims"]["d"])
+    cy = size_y / 2.0
+    symin, symax = cy - w / 2.0, cy + w / 2.0
+    base_z = -0.08
+    boxes = []
+    bands = m.get("bands")
+    if bands is None:  # legacy single-stair manifest
+        bands = [{"block_type": "StairBlock", "aabb": [m["span_xmin"], m["span_xmax"], 0.0, size_y],
+                  "exit_z": m["exit_z"], "stair_top_centers": m["stair_top_centers"]}]
+    for b in bands:
+        x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
+        if b["block_type"] == "StairBlock":
+            for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # tread pillars
+                boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, base_z, float(cz)))
+        else:  # flat slab, full corridor width, at the band's level
+            boxes.append((x0, x1, 0.0, size_y, base_z, float(b["exit_z"])))
+
+    verts, faces, off = [], [], 0
+    for b in boxes:
+        v, f = _box(*b)
+        verts.append(v); faces.append(f + off); off += 8
+    return np.concatenate(verts), np.concatenate(faces)
+
+
 class ClipScene:
     """Builds and updates all viser nodes for one clip at a time."""
 
@@ -143,6 +193,15 @@ class ClipScene:
         self.max_ghosts = max_ghosts
         self.term_dist = term_dist
         self.num_steps = lib.num_steps
+
+        # Per-clip terrain manifest (empty for flat-only / pre-terrain libraries).
+        self.terrain_manifest = {
+            int(m["terrain_id"]): m for m in lib.attrs.get("terrain_manifest", [])
+        }
+        self.clip_terrain_id = lib.terrain_id
+        self._terrain_handle: viser.SceneNodeHandle | None = None
+        self._grid_handle: viser.SceneNodeHandle | None = None
+        self._spawngoal_handle: viser.SceneNodeHandle | None = None
 
         self.pos_names = list(lib.meta["pos_output_names"])
         self.contact_frames = list(lib.meta["contact_frames"])
@@ -214,6 +273,48 @@ class ClipScene:
         # Sampled (target) velocity per step, if the library stored it.
         tv = self.lib.target_vel
         self._target_vel = tv[clip_idx].cpu().numpy() if tv.numel() > 0 else None
+
+        # Terrain mesh for this clip (flat clips keep the bare grid).
+        for h in (self._terrain_handle, self._grid_handle, self._spawngoal_handle):
+            if h is not None:
+                h.remove()
+        self._terrain_handle = self._grid_handle = self._spawngoal_handle = None
+        tid = int(self.clip_terrain_id[clip_idx]) if self.clip_terrain_id.numel() else -1
+        if tid in self.terrain_manifest:
+            mm = self.terrain_manifest[tid]
+            tv_v, tv_f = _stair_terrain_mesh(mm)
+            self._terrain_handle = self.server.scene.add_mesh_simple(
+                "/terrain", vertices=tv_v, faces=tv_f,
+                color=(0.62, 0.62, 0.66), opacity=1.0, side="double", flat_shading=True,
+            )
+            # Ground grid sized to the terrain chunk, centered on it.
+            sx, sy = float(mm["size_x"]), float(mm["size_y"])
+            self._grid_handle = self.server.scene.add_grid(
+                "/grid", width=sx, height=sy, cell_size=1.0, position=(sx / 2.0, sy / 2.0, 0.0),
+            )
+            # Spawn (green) + nav goal (red) markers.
+            pts, cols = [], []
+            sp = mm.get("spawn_anchor")
+            if sp is not None:
+                pts.append([sp[0], sp[1], 0.05]); cols.append((0.1, 0.9, 0.1))
+            goal = mm.get("nav_goal")
+            if goal is not None:
+                pts.append([goal[0], goal[1], 0.05]); cols.append((0.9, 0.1, 0.1))
+            if pts:
+                self._spawngoal_handle = self.server.scene.add_point_cloud(
+                    "/spawn_goal", points=np.array(pts, np.float32),
+                    colors=np.array(cols, np.float32), point_size=0.15, point_shape="circle",
+                )
+        else:
+            # Flat clip: grid sized to the base-path bounding box + margin.
+            bp = self._world_base_pos
+            lo = bp[:, :2].min(axis=0) - 3.0
+            hi = bp[:, :2].max(axis=0) + 3.0
+            wx, wy = float(hi[0] - lo[0]), float(hi[1] - lo[1])
+            self._grid_handle = self.server.scene.add_grid(
+                "/grid", width=wx, height=wy, cell_size=1.0,
+                position=(float((lo[0] + hi[0]) / 2.0), float((lo[1] + hi[1]) / 2.0), 0.0),
+            )
 
         # Termination-distance corridor: tube of radius max_pos_dist around the base path.
         if self._tube_handle is not None:
@@ -331,8 +432,7 @@ def main() -> int:
     print(f"[view_clip_viser] {lib.num_clips} clips x {lib.num_steps} steps, dt={lib.meta['dt']}s")
 
     server = viser.ViserServer(port=args.port)
-    server.scene.add_grid("/grid", width=20.0, height=20.0, cell_size=1.0)
-    server.scene.set_up_direction("+z")
+    server.scene.set_up_direction("+z")  # grid is (re)created per clip in load_clip, sized to the chunk
 
     scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist)
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
@@ -354,8 +454,14 @@ def main() -> int:
         cur_skill = lib.meta["skill_list"][int(sk[min(step, len(sk) - 1)])]
         present = sorted(set(sk.tolist()))
         skills = [lib.meta["skill_list"][s] for s in present]
+        # Terrain type / id of this clip (flat clips have terrain_id -1).
+        type_names = lib.attrs.get("terrain_type_names", ["flat"])
+        ttype = type_names[int(lib.terrain_type_code[ci])] if lib.terrain_type_code.numel() else "?"
+        tid = int(lib.terrain_id[ci]) if lib.terrain_id.numel() else -1
+        tinfo = f"{ttype}" + (f" (terrain {tid})" if tid >= 0 else "")
         gui_info.value = (
-            f"clip {ci} | step {step}/{lib.num_steps - 1} | now: {cur_skill} | clip skills: {', '.join(skills)}"
+            f"clip {ci} [{tinfo}] | step {step}/{lib.num_steps - 1} | now: {cur_skill} | "
+            f"clip skills: {', '.join(skills)}"
         )
         tv = scene.target_vel_at(step)
         gui_vel.value = (

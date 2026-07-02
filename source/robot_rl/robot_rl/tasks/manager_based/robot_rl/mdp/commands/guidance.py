@@ -60,3 +60,50 @@ def guidance_pd_commands(
     vy = torch.clamp(vy, min=vy_range[:, 0], max=vy_range[:, 1])
     wz = torch.clamp(wz, min=wz_range[:, 0], max=wz_range[:, 1])
     return vy, wz
+
+
+def goal_pd_commands(
+    anchor_xy: torch.Tensor,
+    heading: torch.Tensor,
+    goal_xy: torch.Tensor,
+    gains: torch.Tensor,
+    vy_range: torch.Tensor,
+    wz_range: torch.Tensor,
+    lat_vel_b: torch.Tensor | float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """2D goal-directed lateral + heading PD (offline clip nav).
+
+    Steers the (vy, wz) velocity command so the robot turns toward and closes
+    on a fixed 2D goal point, while forward velocity (vx) is sampled elsewhere.
+    Generalizes :func:`guidance_pd_commands` from a world-y + heading target to
+    an arbitrary 2D goal: the heading target is the bearing to the goal and the
+    lateral error is the goal offset expressed in the robot's body frame.  For
+    a robot at ``heading=0`` chasing a goal straight ahead (+x) it reduces to
+    the 1-D guidance law.
+
+    Args:
+        anchor_xy: ``[K, 2]`` robot world xy (the stance-foot anchor offline).
+        heading: ``[K]`` robot world heading (yaw, rad).
+        goal_xy: ``[K, 2]`` world xy of the goal.
+        gains: ``[K, 3]`` PD gains ``(y_kp, y_kd, heading_kp)``.
+        vy_range: ``[K, 2]`` (min, max) clamp on the lateral output.
+        wz_range: ``[K, 2]`` (min, max) clamp on the yaw output.
+        lat_vel_b: ``[K]`` (or scalar) body-frame lateral velocity for the
+            damping term; ``0`` (default) gives a pure-P lateral loop, which is
+            appropriate offline where no measured velocity is available.
+
+    Returns:
+        Tuple ``(vy, wz)`` of ``[K]`` clamped command channels.
+    """
+    dx = goal_xy[:, 0] - anchor_xy[:, 0]
+    dy = goal_xy[:, 1] - anchor_xy[:, 1]
+    yaw_target = torch.atan2(dy, dx)
+    # Goal offset rotated into the robot body frame; the y (lateral) component
+    # is the cross-track error the lateral loop nulls.
+    cos_h, sin_h = torch.cos(heading), torch.sin(heading)
+    e_lat = -sin_h * dx + cos_h * dy
+    vy = gains[:, 0] * e_lat - gains[:, 1] * lat_vel_b
+    wz = gains[:, 2] * _wrap_to_pi(yaw_target - heading)
+    vy = torch.clamp(vy, min=vy_range[:, 0], max=vy_range[:, 1])
+    wz = torch.clamp(wz, min=wz_range[:, 0], max=wz_range[:, 1])
+    return vy, wz

@@ -12,6 +12,7 @@ import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, yaw_quat
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
+from .clips.step_length_table import traj_step_length_table
 from .manager_base import ManagerBase
 from .multiskill_manager import MultiSkillManager
 from .terrain_aware_ref import _TERRAIN_AWARE_SKILLS
@@ -1133,48 +1134,16 @@ class BatchedMultiSkillCommand(BaseTrajectoryCommand):
     def _build_step_length_table(self) -> None:
         """Populate ``self._traj_step_length`` ``[T]`` (forward swing reach).
 
-        For each trajectory with contact gates, evaluate its position
-        output just before the *first* gate (``gate_phi - EPS``) and read
-        the swing foot's local-frame x — the forward distance the swing
-        foot lands ahead of the stance-foot anchor over one stride.  This
-        is the same quantity :meth:`_ref_xy_at_next_gate` extracts at
-        runtime (before the world transform), so the table and the live
-        prediction stay consistent.  Trajectories without gates (perpetual,
-        e.g. standing) get ``inf`` so they are never chosen as a slow-down
-        step.
+        Delegates to the shared :func:`traj_step_length_table` so the online
+        command and the offline clip generator compute the identical quantity
+        (the forward swing-foot reach at the end of the first stride, per
+        trajectory; ``inf`` for gate-less trajectories).  This is the same
+        quantity :meth:`_ref_xy_at_next_gate` extracts at runtime (before the
+        world transform), so the table and the live prediction stay consistent.
         """
-        mgr = self.manager
-        eps = mgr._EPS_PHI
-        T = mgr.num_trajectories
-        step_len = torch.full((T,), float("inf"), device=self.device)
-
-        t_ids = torch.where(mgr._num_gates_per_traj > 0)[0]
-        if t_ids.numel() == 0:
-            self._traj_step_length = step_len
-            return
-
-        # First gate (index 0) = end of the first stride.  ``_gate_phi_table``
-        # stores gate phis (0.5 / 1.0) in order.
-        gate_phi = mgr._gate_phi_table[t_ids, 0]                # [G]
-        pre_phi = gate_phi - eps
-        # Post-gate ref frame = the foot that lands at the gate (wrap so a
-        # phi=1.0 gate reads from the next period's start, matching
-        # ``_ref_xy_at_next_gate``).
-        post_phi = torch.remainder(gate_phi + eps, 1.0)
-        post_dom = mgr._get_domain_indices(post_phi, t_ids)
-        swing_ref = mgr._ref_frame_map[t_ids, post_dom]         # [G] -> ref_frames idx
-
-        # Evaluate the position output at ``pre_phi`` per trajectory.
-        pre_dom = mgr._get_domain_indices(pre_phi, t_ids)
-        tau = mgr._compute_normalized_tau(pre_phi, t_ids, pre_dom)
-        coeffs = mgr.data["coeffs_pos"][t_ids, pre_dom]         # [G, P, K+1]
-        T_dom = mgr.data["domain_times"][t_ids, pre_dom]
-        pos = mgr._compute_bezier_batched(tau, coeffs, T_dom, derivative=False)  # [G, P]
-
-        x_cols = self._ref_frame_to_pos_xy_idx[swing_ref, 0]    # [G] swing pos_x col
-        local_x = pos.gather(1, x_cols.unsqueeze(1)).squeeze(1)  # [G]
-        step_len[t_ids] = local_x
-        self._traj_step_length = step_len
+        self._traj_step_length = traj_step_length_table(
+            self.manager, self._ref_frame_to_pos_xy_idx, self.device,
+        )
 
     def _resolve_vel_cmd(self) -> None:
         """Lazy-resolve the velocity command term on first compute."""

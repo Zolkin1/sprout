@@ -34,6 +34,20 @@ _DENSE_DTYPES: dict[str, str] = {
     "target_vel": "float32",
 }
 
+# Per-clip (1-D, shape [N]) terrain tags.  ``terrain_id`` indexes the embedded
+# ``terrain_manifest`` root attr (-1 for flat clips, which have no manifest
+# entry); ``terrain_type_code`` indexes ``_TERRAIN_TYPE_NAMES``.
+_PERCLIP_DTYPES: dict[str, str] = {
+    "terrain_id": "int32",
+    "terrain_type_code": "uint8",
+}
+
+# Canonical terrain-type ordering (code = index).  ``flat`` is the original
+# no-terrain clip; ``terrain`` is terrain-only (e.g. a staircase); ``transition``
+# is a flat lead-in that approaches and climbs the terrain.
+_TERRAIN_TYPE_NAMES: list[str] = ["flat", "terrain", "transition"]
+_TERRAIN_TYPE_CODE: dict[str, int] = {n: i for i, n in enumerate(_TERRAIN_TYPE_NAMES)}
+
 
 class ClipLibraryWriter:
     """Streaming HDF5 writer for a dense motion-clip library.
@@ -72,6 +86,11 @@ class ClipLibraryWriter:
                 key, shape=shape, dtype=_DENSE_DTYPES[key],
                 chunks=chunk, compression=compression,
             )
+        # Per-clip terrain tags (1-D).  Default flat: id -1, code 0.
+        self._f.create_dataset("terrain_id", shape=(num_clips,), dtype="int32")
+        self._f["terrain_id"][...] = -1
+        self._f.create_dataset("terrain_type_code", shape=(num_clips,), dtype="uint8")
+        self._f.attrs["terrain_type_names"] = json.dumps(_TERRAIN_TYPE_NAMES)
         # Store layout metadata as JSON attrs.
         for k, v in self.meta.items():
             self._f.attrs[k] = json.dumps(v)
@@ -89,6 +108,15 @@ class ClipLibraryWriter:
                 continue  # optional dataset (e.g. older generator without it)
             arr = batch[key].detach().to("cpu").numpy()
             self._f[key][start_idx:end] = arr.astype(_DENSE_DTYPES[key], copy=False)
+        # Per-clip terrain tags: ``terrain_id`` is a per-clip tensor; the batch
+        # carries a single ``terrain_type`` string (all clips share a terrain).
+        if "terrain_id" in batch:
+            tid = batch["terrain_id"].detach().to("cpu").numpy()
+            self._f["terrain_id"][start_idx:end] = tid.astype("int32", copy=False)
+        ttype = batch.get("terrain_type", "flat")
+        if ttype not in _TERRAIN_TYPE_CODE:
+            raise ValueError(f"unknown terrain_type '{ttype}'; expected one of {_TERRAIN_TYPE_NAMES}")
+        self._f["terrain_type_code"][start_idx:end] = _TERRAIN_TYPE_CODE[ttype]
         self._written = max(self._written, end)
 
     def set_attr(self, name: str, value) -> None:
@@ -116,6 +144,8 @@ class ClipLibraryData:
     skill_id: torch.Tensor       # [N, T] uint8
     stride_idx: torch.Tensor     # [N, T] int32
     target_vel: torch.Tensor     # [N, T, 3] ramped (vx, vy, wz) command; empty if absent
+    terrain_id: torch.Tensor     # [N] int32 manifest id (-1 flat); empty if absent
+    terrain_type_code: torch.Tensor  # [N] uint8 index into terrain_type_names; empty if absent
     meta: dict
     attrs: dict
 
@@ -150,6 +180,12 @@ def load_clip_library(
             # Guard `key in f` so libraries written before a field was added
             # (e.g. target_vel) still load, with an empty placeholder.
             if key in load and key in f:
+                tensors[key] = torch.from_numpy(f[key][...]).to(device)
+            else:
+                tensors[key] = torch.empty(0, device=device)
+        # Per-clip terrain tags (always loaded; empty for pre-terrain libraries).
+        for key in _PERCLIP_DTYPES:
+            if key in f:
                 tensors[key] = torch.from_numpy(f[key][...]).to(device)
             else:
                 tensors[key] = torch.empty(0, device=device)
