@@ -135,7 +135,10 @@ def main() -> int:
     p.add_argument("--nav-heading-kp", type=float, default=0.5, help="[transition] heading gain toward the goal bearing.")
     p.add_argument("--nav-vy-clamp", type=float, default=0.4, help="[transition] |vy| clamp on the nav lateral command (m/s).")
     p.add_argument("--nav-wz-clamp", type=float, default=0.5, help="[transition] |wz| clamp on the nav yaw command (rad/s).")
-    p.add_argument("--seam-blend-steps", type=int, default=8, help="Flat-clip seam cross-fade width (terrain clips force 0).")
+    p.add_argument("--transition", choices=("raw", "linear"), default="linear",
+                   help="Skill-transition (seam) strategy for FLAT clips: 'linear' cross-fade (default, online parity) or 'raw' hard cut. Terrain/transition-clip seams are always a hard cut.")
+    p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
+                   help="Phi window for the 'linear' transition cross-fade (matches the online transition_blend_end_phi).")
     p.add_argument("--approach-threshold", type=float, default=0.15, help="Stance-to-stair distance (m) to commit the climb.")
     p.add_argument("--device", default="cpu")
     p.add_argument("--hf-repo", default=None, help="Optional HuggingFace repo id for the source library.")
@@ -240,7 +243,8 @@ def main() -> int:
     generator = OfflineClipGenerator(
         manager, samplers["flat"], dt=args.dt, clip_length_s=args.clip_length,
         exclude_skills=[stair_skill] if has_terrain_lib else [],
-        seam_blend_steps=args.seam_blend_steps,
+        transition=args.transition,
+        transition_blend_end_phi=args.transition_blend_end_phi,
         approach_threshold=args.approach_threshold,
         nav_gains=(args.nav_y_kp, args.nav_y_kd, args.nav_heading_kp),
         nav_vy_clamp=(-args.nav_vy_clamp, args.nav_vy_clamp),
@@ -273,7 +277,8 @@ def main() -> int:
         "nav_gains": [args.nav_y_kp, args.nav_y_kd, args.nav_heading_kp],
         "nav_vy_clamp": args.nav_vy_clamp,
         "nav_wz_clamp": args.nav_wz_clamp,
-        "seam_blend_steps": args.seam_blend_steps,
+        "transition": args.transition,
+        "transition_blend_end_phi": args.transition_blend_end_phi,
         "approach_threshold": args.approach_threshold,
         "skill_list": skill_list,
         "hd_grid": [list(hd) for hd in hd_grid],

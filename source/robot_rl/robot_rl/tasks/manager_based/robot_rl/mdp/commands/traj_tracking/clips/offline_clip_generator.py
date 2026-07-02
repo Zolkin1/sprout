@@ -46,11 +46,11 @@ from isaaclab.utils.math import quat_apply, yaw_quat
 from ...guidance import goal_pd_commands
 from ..multiskill_manager import _HALF_PERIODIC_INT, MultiSkillManager
 from ..skill_bucket import bucket_for_velocity
-from ..skill_transition import blend_outputs
 from ..terrain_aware_ref import stair_stance_ref
 from ..terrain_transition import plan_slowdown_step
 from ..world_lift import bake_outputs_to_world, lift_orientation, lift_position
 from .offline_velocity_sampler import OfflineVelocitySampler
+from .transition_strategy import TransitionStrategy, make_transition_strategy
 from .step_length_table import (
     build_ref_frame_to_pos_xy_idx,
     expand_ref_frames,
@@ -76,8 +76,15 @@ class OfflineClipGenerator:
         exclude_skills: Skills never picked during velocity-bucketed selection.
         project_to_ground: Pin each flat re-anchor to the ground plane.
         ground_height: Flat ground-plane height (m).
-        seam_blend_steps: Cross-fade width at flat stride seams (0 disables;
-            forced to 0 while a terrain context is bound).
+        transition: Skill-transition (seam) strategy for the flat rollout --
+            ``"linear"`` (default; cross-fade old->new over ``transition_blend_end_phi``
+            of phase, mirroring the online blend), ``"raw"`` (hard cut, no blend),
+            or a custom :class:`TransitionStrategy` instance (extension hook, e.g.
+            motion matching).  Terrain/transition-clip seams are handled by the
+            stair state machine and are always a hard cut (a stair commit jumps the
+            anchor up a tread, so a continued old stride would float mid-air).
+        transition_blend_end_phi: Phi window for the ``"linear"`` cross-fade
+            (ignored by ``"raw"``); matches the online ``transition_blend_end_phi``.
         approach_threshold: Distance (m) below which the stance foot is treated
             as "at" the stair stance reference (commit the stair skill).
         device: Torch device.
@@ -94,7 +101,8 @@ class OfflineClipGenerator:
         exclude_skills: Sequence[str] | None = None,
         project_to_ground: bool = True,
         ground_height: float = 0.0,
-        seam_blend_steps: int = 0,
+        transition: str | TransitionStrategy = "linear",
+        transition_blend_end_phi: float = 0.3,
         approach_threshold: float = 0.15,
         nav_gains: tuple[float, float, float] = (1.5, 0.3, 0.5),
         nav_vy_clamp: tuple[float, float] = (-0.4, 0.4),
@@ -246,12 +254,16 @@ class OfflineClipGenerator:
         self._diag_yaw_signed: torch.Tensor | None = None
         self._diag_yaw_stride: torch.Tensor | None = None
 
-        # Seam cross-fade: blend the new stride's first K steps with the old
-        # stride continued (re-expressed in the new anchor) to smooth the
-        # otherwise-hard hand-off.  0 disables.
-        self.seam_blend_steps = int(seam_blend_steps)
-        if self.seam_blend_steps > 0:
-            self._build_blend_groups()
+        # Skill-transition (seam) handling is pluggable: raw hard-cut, linear
+        # cross-fade (online parity, default), or a custom TransitionStrategy.
+        # The blend needs the per-frame ori column groups (SLERP), so build them
+        # unconditionally.
+        self._build_blend_groups()
+        self.transition = make_transition_strategy(
+            transition, manager=self.manager, total_time=self._total_time,
+            ori_groups=self._blend_ori_groups, dt=self.dt,
+            blend_end_phi=transition_blend_end_phi, device=self.device,
+        )
 
     # ------------------------------------------------------------------
     # Terrain context
@@ -844,13 +856,12 @@ class OfflineClipGenerator:
             on_stairs = ground_z = terrain_done = band_idx = None
         phase = torch.zeros(n, device=dev)
 
-        # Seam cross-fade is disabled while on terrain (a stair commit jumps the
-        # anchor up a tread, so a continued old stride would float mid-air).
-        K = 0 if terrain else self.seam_blend_steps
-        if K > 0:
-            blend_remaining = torch.zeros(n, dtype=torch.long, device=dev)
-            blend_old_stride = stride_idx.clone()
-            blend_old_phase = torch.zeros(n, device=dev)
+        # Reset the skill-transition strategy for this batch.  Seams are armed
+        # only on the flat path below; terrain-clip seams are handled by the stair
+        # state machine (a hard cut -- a stair commit jumps the anchor up a tread,
+        # so a continued old stride would float mid-air), so the strategy's
+        # ``apply`` no-ops on terrain (nothing armed).
+        self.transition.reset(n)
 
         all_ids = torch.arange(n, device=dev)
         for t in range(T):
@@ -859,27 +870,13 @@ class OfflineClipGenerator:
             ypos, yvel = m.get_output(phase)
             contact = m.get_contact_state(phase, self.contact_frames)
 
-            # 1a. Seam cross-fade: for clips within K steps of a stride change,
-            # blend the new stride with the old stride continued (re-expressed
-            # in the new anchor).  (Done after contact -- it mutates the
-            # manager's cached indices, which the top of the next iter resets.)
-            if K > 0:
-                bmask = blend_remaining > 0
-                if bool(bmask.any()):
-                    bids = all_ids[bmask]
-                    # The old stride continued re-anchors to the same landing as
-                    # the new stride, so it is anchor-relative in the *same*
-                    # frame -- evaluate and blend directly (no re-expression).
-                    m.set_trajectory_indices(blend_old_stride[bids])
-                    oy, ody = m.get_output(blend_old_phase[bids] % 1.0)
-                    # alpha ramps from ~0 (just past the seam, mostly old) to ~1.
-                    alpha = (K - blend_remaining[bids] + 1).float() / (K + 1)
-                    ypos[bids] = blend_outputs(oy, ypos[bids], alpha, self._blend_ori_groups)
-                    yvel[bids] = blend_outputs(ody, yvel[bids], alpha, None)
-                    blend_old_phase[bids] = (
-                        blend_old_phase[bids] + self.dt / self._total_time[blend_old_stride[bids]]
-                    )
-                    blend_remaining[bids] = blend_remaining[bids] - 1
+            # 1a. Skill-transition blend for clips mid-transition (raw = no-op;
+            # linear = cross-fade the old stride continued into the new).  The old
+            # stride re-anchors to the same landing as the new, so both are
+            # anchor-relative in the same frame and blend directly.  (Done after
+            # contact -- it mutates the manager's cached indices, which the top of
+            # the next iter resets.)
+            ypos, yvel = self.transition.apply(ypos, yvel)
 
             y_des[:, t] = ypos
             dy_des[:, t] = yvel
@@ -915,14 +912,12 @@ class OfflineClipGenerator:
                         stride_idx, skill_id, on_stairs, ground_z, terrain_done, band_idx,
                     )
                     continue
-                # --- Flat path (unchanged) ---
-                # Arm the seam cross-fade: the old stride keeps going into its
-                # next cycle (re-anchored to the new landing == the new anchor),
-                # so its continuation phase is the overshoot past 1.0.
-                if K > 0:
-                    blend_old_stride[ids] = stride_idx[ids]
-                    blend_old_phase[ids] = phase[ids] - 1.0
-                    blend_remaining[ids] = K
+                # --- Flat path ---
+                # Arm the transition: the old stride keeps going into its next
+                # cycle (re-anchored to the new landing == the new anchor), so its
+                # continuation phase is the overshoot past 1.0.  ``raw`` skips this.
+                if self.transition.arms:
+                    self.transition.arm(ids, stride_idx[ids], phase[ids] - 1.0)
                 # New anchor = reference stance landing of the old stride.
                 new_pos, new_quat = self._stance_landing_world(
                     stride_idx[ids], anchor_pos[ids], anchor_quat[ids],

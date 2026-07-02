@@ -134,9 +134,12 @@ def main() -> int:
     p.add_argument("--no-ground-projection", action="store_true",
                    help="Disable pinning stance landings to the ground plane (allows z drift).")
     p.add_argument("--ground-height", type=float, default=0.0, help="Ground plane height for projection (m).")
-    p.add_argument("--seam-blend-steps", type=int, default=8,
-                   help="Cross-fade the new stride's first N steps with the old stride at each "
-                        "seam to smooth transitions (0 disables).")
+    p.add_argument("--transition", choices=("raw", "linear"), default="linear",
+                   help="Skill-transition (seam) strategy: 'linear' cross-fade old->new (default, "
+                        "online parity) or 'raw' hard cut.")
+    p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
+                   help="Phi window for the 'linear' transition cross-fade "
+                        "(matches the online transition_blend_end_phi).")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -214,7 +217,8 @@ def main() -> int:
     gen = OfflineClipGenerator(
         manager, sampler, dt=args.dt, clip_length_s=args.clip_length,
         exclude_skills=exclude_skills, project_to_ground=not args.no_ground_projection,
-        ground_height=args.ground_height, seam_blend_steps=args.seam_blend_steps, device=device,
+        ground_height=args.ground_height, transition=args.transition,
+        transition_blend_end_phi=args.transition_blend_end_phi, device=device,
     )
 
     # Generator config that fully determines the clips (for the fingerprint).
@@ -236,7 +240,8 @@ def main() -> int:
         "exclude_skills": exclude_skills,
         "project_to_ground": not args.no_ground_projection,
         "ground_height": args.ground_height,
-        "seam_blend_steps": args.seam_blend_steps,
+        "transition": args.transition,
+        "transition_blend_end_phi": args.transition_blend_end_phi,
         "velocity_buckets": {
             name: {"lin_vel_x": list(b.lin_vel_x), "lin_vel_y": list(b.lin_vel_y),
                    "ang_vel_z": list(b.ang_vel_z), "heading": b.heading}
