@@ -76,13 +76,14 @@ class OfflineClipGenerator:
         exclude_skills: Skills never picked during velocity-bucketed selection.
         project_to_ground: Pin each flat re-anchor to the ground plane.
         ground_height: Flat ground-plane height (m).
-        transition: Skill-transition (seam) strategy for the flat rollout --
-            ``"linear"`` (default; cross-fade old->new over ``transition_blend_end_phi``
-            of phase, mirroring the online blend), ``"raw"`` (hard cut, no blend),
-            or a custom :class:`TransitionStrategy` instance (extension hook, e.g.
-            motion matching).  Terrain/transition-clip seams are handled by the
-            stair state machine and are always a hard cut (a stair commit jumps the
-            anchor up a tread, so a continued old stride would float mid-air).
+        transition: Skill-transition (seam) strategy -- ``"linear"`` (default;
+            cross-fade old->new over ``transition_blend_end_phi`` of phase,
+            mirroring the online blend), ``"raw"`` (hard cut, no blend), or a custom
+            :class:`TransitionStrategy` instance (extension hook, e.g. motion
+            matching).  Applies to BOTH the flat rollout and terrain /
+            transition-clip seams, including the flat->stair commit: the leaving
+            stride re-anchors to the new stance ref, which a correctly designed
+            approach places right on the old landing, so the blend stays continuous.
         transition_blend_end_phi: Phi window for the ``"linear"`` cross-fade
             (ignored by ``"raw"``); matches the online ``transition_blend_end_phi``.
         approach_threshold: Distance (m) below which the stance foot is treated
@@ -856,11 +857,11 @@ class OfflineClipGenerator:
             on_stairs = ground_z = terrain_done = band_idx = None
         phase = torch.zeros(n, device=dev)
 
-        # Reset the skill-transition strategy for this batch.  Seams are armed
-        # only on the flat path below; terrain-clip seams are handled by the stair
-        # state machine (a hard cut -- a stair commit jumps the anchor up a tread,
-        # so a continued old stride would float mid-air), so the strategy's
-        # ``apply`` no-ops on terrain (nothing armed).
+        # Reset the skill-transition strategy for this batch.  Seams are armed on
+        # BOTH the flat and terrain paths; the leaving stride re-anchors to the new
+        # stance ref, which (with a correctly designed approach) sits right on the
+        # old landing -- so the flat->stair commit blends continuously rather than
+        # floating a tread up.
         self.transition.reset(n)
 
         all_ids = torch.arange(n, device=dev)
@@ -906,6 +907,15 @@ class OfflineClipGenerator:
                 # Time overshoot past the old stride end (seconds) -- carried
                 # into the new stride so the global timeline stays uniform dt.
                 overshoot_s = (phase[ids] - 1.0) * old_tt[ids]
+                # Arm the skill-transition blend (flat AND terrain seams) BEFORE
+                # the boundary overwrites stride_idx / phase: the old (leaving)
+                # stride keeps going into its next cycle, re-anchored to the new
+                # stance ref.  On terrain the new ref is the stair stance snap,
+                # which a correctly designed approach places very close to the old
+                # landing -- so the blend stays continuous (it does NOT float a
+                # tread up).  ``raw`` skips this.
+                if self.transition.arms:
+                    self.transition.arm(ids, stride_idx[ids], phase[ids] - 1.0)
                 if terrain:
                     self._terrain_boundary(
                         ids, vel, phase, overshoot_s, anchor_pos, anchor_quat,
@@ -913,11 +923,6 @@ class OfflineClipGenerator:
                     )
                     continue
                 # --- Flat path ---
-                # Arm the transition: the old stride keeps going into its next
-                # cycle (re-anchored to the new landing == the new anchor), so its
-                # continuation phase is the overshoot past 1.0.  ``raw`` skips this.
-                if self.transition.arms:
-                    self.transition.arm(ids, stride_idx[ids], phase[ids] - 1.0)
                 # New anchor = reference stance landing of the old stride.
                 new_pos, new_quat = self._stance_landing_world(
                     stride_idx[ids], anchor_pos[ids], anchor_quat[ids],

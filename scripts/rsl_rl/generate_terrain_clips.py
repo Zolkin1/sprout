@@ -136,7 +136,7 @@ def main() -> int:
     p.add_argument("--nav-vy-clamp", type=float, default=0.4, help="[transition] |vy| clamp on the nav lateral command (m/s).")
     p.add_argument("--nav-wz-clamp", type=float, default=0.5, help="[transition] |wz| clamp on the nav yaw command (rad/s).")
     p.add_argument("--transition", choices=("raw", "linear"), default="linear",
-                   help="Skill-transition (seam) strategy for FLAT clips: 'linear' cross-fade (default, online parity) or 'raw' hard cut. Terrain/transition-clip seams are always a hard cut.")
+                   help="Skill-transition (seam) strategy for ALL clips incl. the flat->stair commit: 'linear' cross-fade (default, online parity) or 'raw' hard cut.")
     p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
                    help="Phi window for the 'linear' transition cross-fade (matches the online transition_blend_end_phi).")
     p.add_argument("--approach-threshold", type=float, default=0.15, help="Stance-to-stair distance (m) to commit the climb.")
