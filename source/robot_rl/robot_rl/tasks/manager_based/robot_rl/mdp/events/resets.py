@@ -245,6 +245,119 @@ def reset_on_reference(
         cmd.manager.set_phase(nonref_phase, nonref_ids)
 
 
+def reset_bend_cycle(
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        command_name: str,
+        base_frame_name: str = "pelvis_link",
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset each env into a bend-cycle reference pose (free start, or a static hold).
+
+    For the combined bend-over / bend-up *periodic* env.  With probability
+    ``cmd.cfg.percent_hold_phi`` an env is a **static-hold** env, pinned to a
+    phase drawn uniformly from ``cmd.cfg.hold_phi_values`` (e.g. standing at
+    ``0.0``/``1.0``, bent-over at ``0.5``); the remaining envs start **free** at
+    phase 0 (standing) and cycle through the motion.
+
+    Every env is reset INTO its phase's reference pose (so the initial tracking
+    error is ~zero), the command's per-env hold state is recorded (so the phase
+    stays pinned and the reference velocity is zeroed while held), and the
+    manager clock is anchored at the chosen phase.
+
+    Unlike :func:`reset_on_reference`, there is no velocity conditioner and no
+    skill bucket — the bend-cycle is a single stationary periodic clip.  Pose
+    extraction mirrors :func:`reset_on_reference` (including its ref-frame
+    offset handling and quaternion ordering).
+
+    Args:
+        env: The environment.
+        env_ids: Env indices to reset.
+        command_name: The single-skill trajectory command term name.
+        base_frame_name: Trajectory output frame used as the robot root.
+        asset_cfg: Robot asset config.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(command_name)
+    if env_ids.numel() == 0:
+        return
+    num_env = len(env_ids)
+    device = env.device
+
+    # --- Decide held vs free and the target phase per env ------------------
+    hold_values = getattr(cmd.cfg, "hold_phi_values", None)
+    p_hold = float(getattr(cmd.cfg, "percent_hold_phi", -1.0))
+    if hold_values is not None and p_hold > 0.0:
+        held = torch.rand(num_env, device=device) < p_hold
+        hv = torch.tensor(hold_values, device=device, dtype=torch.float32)
+        pick = torch.randint(0, len(hold_values), (num_env,), device=device)
+        hold_phi = hv[pick]
+    else:
+        held = torch.zeros(num_env, dtype=torch.bool, device=device)
+        hold_phi = torch.zeros(num_env, device=device)
+    # Free envs start at phase 0 (standing); held envs sit at their hold phase.
+    target_phase = torch.where(held, hold_phi, torch.zeros(num_env, device=device))
+
+    # Record the hold state BEFORE evaluating desired outputs so held envs get
+    # their reference velocity zeroed inside ``get_desired_outputs``.
+    cmd.reset_hold_state(env_ids, held, hold_phi)
+
+    # --- Validate base frame outputs exist ---------------------------------
+    pos_indices = _find_output_indices(cmd.ordered_pos_output_names, base_frame_name, "pos_")
+    ori_indices = _find_output_indices(cmd.ordered_pos_output_names, base_frame_name, "ori_")
+    if len(pos_indices) != 3 or len(ori_indices) != 4:
+        raise ValueError(
+            f"Base frame '{base_frame_name}' must expose pos_x/y/z and ori_x/y/z/w in the "
+            f"trajectory outputs (found {len(pos_indices)} pos, {len(ori_indices)} ori)."
+        )
+
+    # --- Per-env spawn offset (ref-frame + stair; ~zero for a flat clip) ---
+    cmd.manager.invalidate_cache()
+    traj_idx = cmd.manager.get_current_trajectory_indices()[env_ids]
+    domain_idx = cmd.manager.get_current_domains(target_phase, env_ids=env_ids)
+    ref_offset = cmd.manager.data["ref_frame_offset"][traj_idx, domain_idx]
+    stair_offset = cmd.manager.data["origin_relative_to_stair_center"][traj_idx]
+    spawn_offset = ref_offset + stair_offset
+
+    # Set the reference frame at env_origin + spawn_offset (identity quaternion).
+    cmd.ref_poses[env_ids, :3] = env.scene.env_origins[env_ids] + spawn_offset
+    cmd.ref_poses[env_ids, 3:6] = 0.0
+    cmd.ref_poses[env_ids, 6] = 1.0
+
+    # Desired outputs at the target phase (fills y_des / dy_des; zeros dy_des
+    # for held envs via the command's ``get_desired_outputs`` override).
+    cmd.get_desired_outputs(target_phase, env_ids=env_ids)
+    y_sampled = cmd.y_des[env_ids]
+    dy_sampled = cmd.dy_des[env_ids]
+
+    # World-frame base pose (spline outputs are ref-frame-relative).
+    base_pos_rel = y_sampled[:, pos_indices]
+    base_ori_quat_w = y_sampled[:, ori_indices]  # (x, y, z, w), as in reset_on_reference
+    base_pos_w = base_pos_rel + env.scene.env_origins[env_ids] + spawn_offset
+    base_pose = torch.cat([base_pos_w, base_ori_quat_w], dim=-1)
+
+    # Base velocity.
+    lin_vel_indices = _find_output_indices(cmd.ordered_vel_output_names, base_frame_name, "pos_")
+    ang_vel_indices = _find_output_indices(cmd.ordered_vel_output_names, base_frame_name, "ori_")
+    base_vel = torch.cat([dy_sampled[:, lin_vel_indices], dy_sampled[:, ang_vel_indices]], dim=-1)
+
+    # Joint positions / velocities, reordered to the robot joint axis.
+    joint_pos = torch.zeros(num_env, len(asset.joint_names), device=device)
+    joint_vel = torch.zeros_like(joint_pos)
+    for i, joint_name in enumerate(asset.joint_names):
+        traj_output_name = f"joint:{joint_name}"
+        pos_traj_idx = cmd.ordered_pos_output_names.index(traj_output_name)
+        vel_traj_idx = cmd.ordered_vel_output_names.index(traj_output_name)
+        joint_pos[:, i] = y_sampled[:, pos_traj_idx]
+        joint_vel[:, i] = dy_sampled[:, vel_traj_idx]
+
+    # Anchor the trajectory clock and write the state to sim.
+    cmd.manager.set_phase(target_phase, env_ids)
+    asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
+    asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
+    asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
+    asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
+
 
 def reset_on_motion_sequence(
     env: ManagerBasedEnv,

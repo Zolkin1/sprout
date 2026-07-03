@@ -1,18 +1,22 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Trajectory command that exposes a phasing variable and hold-phi logic.
+"""Single-skill trajectory command that exposes a phasing variable.
 
-TODO: Delete this file. Single-skill phase-as-observation path was
-superseded by :class:`BatchedMultiSkillCommand` (multi-skill manager
-holds phase directly). The remaining consumers are the single-skill
-g1 configs (walking/running/bow/bend) and ``observations._phased_cmd``;
-migrate those to the multi-skill path before removing this module.
+Single-skill trajectory commands feed the phasing variable ``phi in [0, 1]``
+into the observation (via ``ref_sin_phase`` / ``ref_cos_phase``) and drive the
+trajectory purely from the episode clock.  They should extend this class;
+multi-skill commands that manage phase on the manager should extend
+:class:`BaseTrajectoryCommand` directly.
 
-Single-skill trajectory commands (those that feed the phase into the
-observation and tie trajectory advancement to the base-velocity command)
-should extend this class.  Multi-skill commands that advance time
-without a phase variable should extend :class:`BaseTrajectoryCommand`
-directly.
+This class OWNS phase advance for the single-skill path.  The live
+:class:`BaseTrajectoryCommand._update_command` reads ``self.manager.phase`` each
+step, so :meth:`_pre_update_phase` (called at the top of ``_update_command``)
+computes the per-env phase from the episode clock and writes it onto the
+manager.  It also implements the *fixed-phase static hold* used by the
+bend-cycle env: with ``cfg.hold_phi_values`` set, a per-episode subset of
+environments (chosen at reset, see :func:`mdp.events.resets.reset_bend_cycle`)
+is pinned to a fixed phase and has its reference velocity zeroed, so the policy
+learns to hold that pose statically.
 """
 
 from __future__ import annotations
@@ -26,15 +30,16 @@ from .manager_base import ManagerBase
 
 
 class PhasedTrajectoryCommand(BaseTrajectoryCommand):
-    """Base class for trajectory commands that expose a phasing variable.
+    """Base class for single-skill trajectory commands with a phasing variable.
 
     Adds:
 
-    - ``self.phasing_var`` / ``self.unmasked_phasing_var`` state for use as
-      observation inputs and for phase-binned CLF logging.
-    - Hold-phi logic that pauses phase at a domain boundary when the
-      commanded base velocity drops below ``cfg.hold_phi_threshold``.
-    - Per-episode random phase-hold enabled by ``cfg.percent_hold_phi``.
+    - ``self.phasing_var`` state (the phase in ``[0, 1]``) exposed as an
+      observation input and used for phase-binned CLF logging.
+    - Episode-clock phase advance in :meth:`_pre_update_phase`.
+    - Fixed-phase static hold controlled by ``cfg.hold_phi_values`` /
+      ``cfg.percent_hold_phi`` and the per-env ``held_mask`` /
+      ``hold_phi_value`` state written by the reset event.
     """
 
     @abstractmethod
@@ -48,88 +53,70 @@ class PhasedTrajectoryCommand(BaseTrajectoryCommand):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
 
+        # Phasing variable in [0, 1]; the sin/cos phase observations read this.
         self.phasing_var = torch.zeros(self.num_envs, device=self.device)
-        self.unmasked_phasing_var = torch.zeros(self.num_envs, device=self.device)
-        self.prev_unmasked_phasing_var = torch.zeros(self.num_envs, device=self.device)
-        self.hold_envs = torch.ones(self.num_envs, device=self.device)
 
-        self.should_hold = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.boundaries_crossed = torch.zeros(self.num_envs, dtype=torch.int, device=self.device)
-        self.hold_phi_value = -1.0 * torch.ones(self.num_envs, device=self.device)
+        # Fixed-phase static-hold state (populated at reset by
+        # ``reset_bend_cycle`` when ``cfg.hold_phi_values`` is set):
+        #   ``held_mask[e]``      -> this env holds a fixed phase this episode.
+        #   ``hold_phi_value[e]`` -> the phase it is pinned to.
+        self.held_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.hold_phi_value = torch.zeros(self.num_envs, device=self.device)
 
-    def update_phasing_var(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
-        """Update the phasing variable, with hold logic on full updates.
+    def _pre_update_phase(self) -> None:
+        """Advance the phasing variable from the episode clock, then apply holds.
 
-        Holds phi at the second boundary crossing (0.0 or 0.5) rather than
-        the first, allowing a full phase to complete before stopping when
-        velocity is low.
-
-        Args:
-            t: Time tensor of shape ``[N]``.
-            env_ids: Optional environment indices. If provided, only those
-                environments are updated (hold logic is skipped).
-
-        Returns:
-            Phasing variable tensor of shape ``[N]``.
+        Called at the top of ``BaseTrajectoryCommand._update_command`` (which
+        then reads ``self.manager.phase``).  Phase is recomputed from absolute
+        episode time each step (``get_phasing_var`` wraps for periodic
+        trajectories), so there is no incremental drift.  Held envs are pinned
+        to their fixed phase.
         """
-        if env_ids is not None:
-            new_phi = self.manager.get_phasing_var(t, env_ids)
-            self.phasing_var[env_ids] = new_phi
-            self.unmasked_phasing_var[env_ids] = new_phi
-            return new_phi
+        t = self.env.episode_length_buf * self.env.step_dt
+        phase = self.manager.get_phasing_var(t)
 
-        prev_phi = self.phasing_var
-        self.prev_unmasked_phasing_var = self.unmasked_phasing_var
-        self.phasing_var = self.manager.get_phasing_var(t)
-        self.unmasked_phasing_var = self.phasing_var
+        if self.cfg.hold_phi_values is not None:
+            phase = torch.where(self.held_mask, self.hold_phi_value, phase)
 
-        cmd_vel = self.env.command_manager.get_command("base_velocity")
-        prev_should_hold = self.should_hold.clone()
-        self.should_hold = torch.abs(cmd_vel[:, 0]) < self.cfg.hold_phi_threshold
-
-        newly_holding = self.should_hold & ~prev_should_hold
-        reset_mask = newly_holding | (self.env.episode_length_buf == 0)
-        self.boundaries_crossed[reset_mask] = 0
-        self.hold_phi_value[reset_mask] = -1.0
-
-        released = ~self.should_hold
-        self.hold_phi_value[released] = -1.0
-        self.boundaries_crossed[released] = 0
-
-        active = self.should_hold & (self.hold_phi_value < 0)
-
-        crosses_zero = active & (self.phasing_var < prev_phi) & (prev_phi > 0)
-        crosses_half = active & (prev_phi < 0.5) & (self.phasing_var >= 0.5)
-
-        crosses_any = crosses_zero | crosses_half
-        self.boundaries_crossed[crosses_any] += 1
-
-        lock_at_zero = crosses_zero & (self.boundaries_crossed >= self.cfg.phasing_boundaries)
-        lock_at_half = crosses_half & (self.boundaries_crossed >= self.cfg.phasing_boundaries)
-        self.hold_phi_value[lock_at_zero] = 0.0
-        self.hold_phi_value[lock_at_half] = 0.5
-
-        holding = self.hold_phi_value >= 0
-        self.phasing_var[holding] = self.hold_phi_value[holding]
-
-        return self.phasing_var
+        self.manager.phase = phase
+        self.phasing_var = phase
+        self.manager.invalidate_cache()
 
     def get_phasing_var(self) -> torch.Tensor:
         """Return the current phasing variable of shape ``[N]``."""
         return self.phasing_var
 
-    def _compute_time(self) -> torch.Tensor:
-        """Apply ``percent_hold_phi`` on top of the base time computation."""
-        t = super()._compute_time()
-        if self.cfg.percent_hold_phi > 0:
-            mask = torch.where(self.env.episode_length_buf == 0)[0]
-            self.hold_envs[mask] = (
-                torch.rand(len(mask), device=self.device) > self.cfg.percent_hold_phi
-            ).float()
-            t = t * self.hold_envs
-        return t
+    def get_desired_outputs(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> None:
+        """Populate desired outputs, zeroing the reference velocity for held envs.
 
-    def get_desired_outputs(self, t: torch.Tensor, env_ids: torch.Tensor = None) -> None:
-        """Populate the phasing variable, then delegate to the base."""
-        self.update_phasing_var(t, env_ids)
-        super().get_desired_outputs(t, env_ids)
+        Held (static-hold) envs must track a *stationary* pose, so their
+        reference velocity is zeroed regardless of the clip's velocity at that
+        phase.
+
+        Args:
+            phase: phase in [0, 1] tensor of shape ``[N]``.
+            env_ids: Optional environment indices.
+        """
+        super().get_desired_outputs(phase, env_ids)
+
+        if self.cfg.hold_phi_values is None:
+            return
+        if env_ids is None:
+            self.dy_des[self.held_mask] = 0.0
+        else:
+            held_sub = self.held_mask[env_ids]
+            self.dy_des[env_ids[held_sub]] = 0.0
+
+    def reset_hold_state(
+        self, env_ids: torch.Tensor, held: torch.Tensor, hold_phi: torch.Tensor
+    ) -> None:
+        """Set which of ``env_ids`` hold a fixed phase this episode (reset hook).
+
+        Args:
+            env_ids: Environment indices being reset.
+            held: Bool tensor ``[len(env_ids)]`` — whether each env holds.
+            hold_phi: Float tensor ``[len(env_ids)]`` — the fixed phase per env
+                (ignored where ``held`` is False).
+        """
+        self.held_mask[env_ids] = held
+        self.hold_phi_value[env_ids] = hold_phi

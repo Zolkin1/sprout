@@ -1169,6 +1169,160 @@ class TrajectoryManager(ManagerBase):
     def get_v_log(self):
         return self.v_log, self.phi_keys
 
+
+class PhaseTrajectoryManager(ManagerBase):
+    """Phase-in-[0,1] adapter over a single time-based :class:`TrajectoryManager`.
+
+    The live :class:`~.base_trajectory_cmd.BaseTrajectoryCommand` (and the
+    :func:`mdp.events.resets.reset_on_reference`-family reset events) drive
+    trajectories by a *phasing variable* ``phi`` in ``[0, 1]`` -- the same
+    contract :class:`~.multiskill_manager.MultiSkillManager` implements
+    (``manager.phase`` holds phi; ``get_output(phi, env_ids)`` etc.).
+
+    :class:`TrajectoryManager`, by contrast, works in absolute *time* (seconds)
+    and is shared by :class:`~.library_manager.LibraryManager`,
+    :class:`~.multiskill_manager.MultiSkillManager` clip-loading, and an
+    extensive test suite that asserts time semantics -- so its API must not
+    change.  This adapter bridges the two: it wraps a ``TrajectoryManager`` and
+    converts ``phi -> time`` at every entry point, and holds the per-env phase
+    state the command reads (``phase``) and the reset writes (``set_phase``).
+
+    Only the single-trajectory case is supported (``manager_type="trajectory"``);
+    trajectory-selection ``env_ids`` arguments are accepted for interface parity
+    but ignored (there is exactly one trajectory, so every env shares it).
+    """
+
+    def __init__(self, traj_path: str, hf_repo: str, device, num_envs: int):
+        """Build the adapter around a single :class:`TrajectoryManager`.
+
+        Args:
+            traj_path: Path to the trajectory YAML (or HF-relative path).
+            hf_repo: Hugging Face repo id, or ``None`` for a local path.
+            device: Torch device for all state tensors.
+            num_envs: Number of environments (sizes the per-env phase buffer).
+        """
+        self.device = device
+        self._inner = TrajectoryManager(traj_path, hf_repo, device)
+        # Per-env phasing variable in [0, 1]; owned/advanced by the command.
+        self.phase = torch.zeros(num_envs, device=device)
+
+    def _phase_to_time(self, phase: torch.Tensor) -> torch.Tensor:
+        """Convert a phasing variable in [0, 1] to absolute trajectory time.
+
+        Exact inverse of :meth:`TrajectoryManager.get_phasing_var`: full/episodic
+        trajectories span ``total_time`` over ``phi in [0, 1]``; half-periodic
+        trajectories span ``2 * total_time``.
+
+        Args:
+            phase: Phasing variable of shape ``[N]`` in ``[0, 1]``.
+
+        Returns:
+            Time tensor of shape ``[N]`` in seconds.
+        """
+        total = self._inner.traj_data.total_time
+        if self._inner.traj_data.trajectory_type == TrajectoryType.HALF_PERIODIC:
+            total = total * 2.0
+        return phase * total
+
+    # --- Phase-based reads (converted to time, then delegated) ------------
+
+    def get_output(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Bezier position/velocity outputs at the given phase. See :meth:`TrajectoryManager.get_output`."""
+        return self._inner.get_output(self._phase_to_time(phase))
+
+    def get_acceleration(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Bezier acceleration outputs at the given phase. See :meth:`TrajectoryManager.get_acceleration`."""
+        return self._inner.get_acceleration(self._phase_to_time(phase))
+
+    def get_current_domains(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Active domain index per env at the given phase."""
+        return self._inner.get_current_domains(self._phase_to_time(phase))
+
+    def get_domain_times(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Duration of the active domain per env at the given phase."""
+        return self._inner.get_domain_times(self._phase_to_time(phase))
+
+    def get_contact_state(self, phase: torch.Tensor, contact_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Desired contact state per env at the given phase."""
+        return self._inner.get_contact_state(self._phase_to_time(phase), contact_frames)
+
+    def get_ref_frames_in_use(self, phase: torch.Tensor, ref_frames: list[str], env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Active reference-frame index per env at the given phase."""
+        return self._inner.get_ref_frames_in_use(self._phase_to_time(phase), ref_frames)
+
+    # --- Phase state (read by the command, written by reset events) -------
+
+    def set_phase(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> None:
+        """Anchor the phasing variable for the given envs (used by reset events)."""
+        if env_ids is None:
+            self.phase = phase.to(self.device)
+        else:
+            self.phase[env_ids] = phase.to(self.device)
+
+    def invalidate_cache(self) -> None:
+        """No-op: a single-trajectory manager caches no per-env trajectory assignment."""
+        return None
+
+    def get_current_trajectory_indices(self, env_ids: torch.Tensor = None) -> torch.Tensor:
+        """Return all-zero trajectory indices (single trajectory)."""
+        n = self.phase.shape[0] if env_ids is None else int(len(env_ids))
+        return torch.zeros(n, dtype=torch.long, device=self.device)
+
+    @property
+    def data(self) -> dict:
+        """Batched offset tables keyed as ``[traj_idx, ...]`` for reset events.
+
+        Single trajectory, so the leading (trajectory) dimension is 1.
+        """
+        return {
+            "ref_frame_offset": self._inner.ref_frame_offset_per_domain.unsqueeze(0),
+            "origin_relative_to_stair_center": self._inner.origin_relative_to_stair_center.unsqueeze(0),
+        }
+
+    # --- Time->phase (used by the command's phase advance) ----------------
+
+    def get_phasing_var(self, t: torch.Tensor) -> torch.Tensor:
+        """Map absolute episode time to a phasing variable in [0, 1] (delegated)."""
+        return self._inner.get_phasing_var(t)
+
+    # --- Pure delegation (time-independent) -------------------------------
+
+    def get_trajectory_type(self) -> TrajectoryType:
+        """Trajectory type (episodic / full_periodic / half_periodic / perpetual)."""
+        return self._inner.get_trajectory_type()
+
+    def get_reference_frames(self) -> list[str]:
+        """List of bezier reference frames."""
+        return self._inner.get_reference_frames()
+
+    def get_num_domains(self) -> int:
+        """Number of (expanded) domains."""
+        return self._inner.get_num_domains()
+
+    def get_total_time(self) -> torch.Tensor:
+        """Total trajectory duration (doubled for half-periodic)."""
+        return self._inner.get_total_time()
+
+    def order_outputs(self, ordered_pos_output_names: list[str], ordered_vel_output_names: list[str]) -> None:
+        """Reorder the inner manager's outputs/coefficients to the given order."""
+        return self._inner.order_outputs(ordered_pos_output_names, ordered_vel_output_names)
+
+    @property
+    def get_pos_output_names(self) -> list[str]:
+        """Position output names (includes ori_w)."""
+        return self._inner.get_pos_output_names
+
+    @property
+    def get_vel_output_names(self) -> list[str]:
+        """Velocity output names (excludes ori_w)."""
+        return self._inner.get_vel_output_names
+
+    @property
+    def traj_data(self) -> TrajectoryData:
+        """The inner manager's loaded trajectory data."""
+        return self._inner.traj_data
+
+
 def _ncr(n, r):
     return math.comb(n, r)
 

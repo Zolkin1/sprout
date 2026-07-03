@@ -414,6 +414,40 @@ if not _registered:
     )
 
     ## =========================================
+    # Bend Cycle (combined bend-over + bend-up as one periodic policy)
+    ## =========================================
+    gym.register(
+        id="G1-bend_cycle-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bend_cycle_clf_env_cfg:G1BendCycleCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    gym.register(
+        id="G1-bend_cycle-clf-symmetric",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bend_cycle_clf_env_cfg:G1BendCycleCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        }
+    )
+
+    # Play
+    gym.register(
+        id="G1-bend_cycle-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bend_cycle_clf_env_cfg:G1BendCycleCLFEnvCfg_PLAY",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    ## =========================================
     # Stairs Terrain
     ## =========================================
     gym.register(

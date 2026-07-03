@@ -237,6 +237,7 @@ RL Task list:
 | `waving_clf`          | G1 |             No             | Robot stands still and waves. Uses trajectories and CLFs.                            |
 | `bow_forward_clf_sym` | G1 |     :white_check_mark:     | Robot bows forward then holds its position. Uses symmetry.                           |
 | `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
+| `bend_cycle_clf_sym`  | G1 |             No             | One policy for the full bend-over + bend-up cycle as a single periodic trajectory (phi 0->0.5 bend over, 0.5->1.0 bend up); randomly holds standing / bent-over. Task id `G1-bend_cycle-clf-symmetric`. |
 
 You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
 

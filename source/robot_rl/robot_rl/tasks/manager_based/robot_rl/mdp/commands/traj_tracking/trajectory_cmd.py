@@ -14,7 +14,7 @@ import torch
 from .library_manager import LibraryManager
 from .manager_base import ManagerBase
 from .phased_trajectory_cmd import PhasedTrajectoryCommand
-from .trajectory_manager import TrajectoryManager
+from .trajectory_manager import PhaseTrajectoryManager
 
 
 class TrajectoryCommand(PhasedTrajectoryCommand):
@@ -30,7 +30,9 @@ class TrajectoryCommand(PhasedTrajectoryCommand):
         """Create the underlying manager based on ``cfg.manager_type``."""
         self.manager_type = cfg.manager_type
         if cfg.manager_type == "trajectory":
-            return TrajectoryManager(cfg.path, cfg.hf_repo, env.device)
+            # PhaseTrajectoryManager adapts the time-based single-trajectory
+            # core to the phase-in-[0,1] contract the live base command drives.
+            return PhaseTrajectoryManager(cfg.path, cfg.hf_repo, env.device, self.num_envs)
         if cfg.manager_type == "library":
             return LibraryManager(
                 cfg.path,
