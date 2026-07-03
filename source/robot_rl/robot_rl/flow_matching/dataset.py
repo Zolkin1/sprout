@@ -39,6 +39,7 @@ from .transforms import (
     frame_block_start,
     orientation_slices,
     relative_state,
+    sanitize_height_scan,
     target_state_dim,
 )
 
@@ -188,6 +189,11 @@ class FutureStateDataset(Dataset):
                 "target_source='ego_anchored_clip_future' requires a 'ref_future' array; "
                 "re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
             )
+        if data.get("height_scan") is None:
+            raise ValueError(
+                "the height-scan FM requires a 'height_scan' array; re-record with a "
+                "height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)."
+            )
         if len(windows) == 0:
             raise ValueError("No valid snap windows; check reanchor_active vs num_history_states.")
 
@@ -277,8 +283,15 @@ class FutureStateDataset(Dataset):
             print(f"[fm-data][WARN] target node-0 root offset mean={node0_off:.3f} m (> 0.15); "
                   "the recorded ref_future may not be ego-anchored onto the robot at the snap.")
 
-        # Height token = robot root z above ground at the snap.
-        self.height = (p_anchor[:, 2:3] - float(cfg.ground_z)).contiguous()  # (Nw, 1)
+        # Height token = the recorded height scan at the snap row (per-ray ground
+        # clearance, body-relative). Replaces the old root-z scalar. K resolved here.
+        hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P, K)
+        # Missed ray-cast rays are recorded as -inf; sanitize before the normalizer
+        # fit so they don't produce a NaN loss (matches the deploy token builder).
+        hs = sanitize_height_scan(hs)
+        self.height = hs[snap_rows].contiguous()  # (Nw, K)
+        self.height_dim = self.height.shape[1]
+        cfg.height_dim = self.height_dim
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
@@ -300,7 +313,10 @@ class FutureStateDataset(Dataset):
         self.state_normalizer = state_normalizer
 
         if height_normalizer is None:
-            height_normalizer = Normalizer.fit(self.height, torch.ones(1, dtype=torch.bool))
+            height_normalizer = Normalizer.fit(
+                self.height, torch.ones(self.height_dim, dtype=torch.bool),
+                eps=float(cfg.height_norm_eps),
+            )
         self.height_normalizer = height_normalizer
 
         if cmd_dim > 0:
@@ -319,10 +335,16 @@ class FutureStateDataset(Dataset):
         self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
         self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, 1)
 
-        # -- observation noise (train-time augmentation; history tokens only) --
+        # -- observation noise (train-time augmentation; conditioning tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
         self.state_noise = (
             self._state_noise_std(state_normalizer) if self.add_noise else None
+        )
+        # Height-scan noise (normalized space = raw m / std), per ray. The height token is a
+        # real (noisy) sensor at deploy, so it is noised in training like the history tokens.
+        self.height_noise = (
+            (float(cfg.noise_height_scan) * float(cfg.noise_scale)) / height_normalizer.std
+            if self.add_noise else None
         )
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
@@ -351,13 +373,14 @@ class FutureStateDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         history = self.history[i]
+        height = self.height_norm_tokens[i]
         if self.add_noise:
-            noise = (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            history = history + noise
+            history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
+            height = height + (torch.rand(self.height_dim) * 2.0 - 1.0) * self.height_noise
         item = {
             "state": self.state[i],          # (F, D) ego-anchored clip future target
             "history": history,              # (N, D) real-robot phase conditioning
-            "height": self.height_norm_tokens[i],  # (1,)
+            "height": height,                # (K,) height-scan token (noised in train)
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }

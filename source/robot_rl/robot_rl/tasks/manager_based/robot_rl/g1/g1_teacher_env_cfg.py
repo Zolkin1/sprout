@@ -22,6 +22,10 @@ from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.terrains import TerrainGeneratorCfg
+from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
@@ -30,6 +34,7 @@ from .g1_clf_tracking_base import (
     G1ClfTrackingEnvCfg,
     G1ClfTrackingEventsCfg,
     G1ClfTrackingRewardCfg,
+    G1ClfTrackingSceneCfg,
 )
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
@@ -43,6 +48,37 @@ DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
 # task; the teacher parity-play variant tracks it open-loop for a quick, clean
 # look at how the teacher follows a known profile (and IsaacLab <-> MuJoCo checks).
 DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
+
+# Flat TRIANGLE-MESH terrain for FM-data recording. The height-scan RayCaster cannot hit
+# the infinite "plane" primitive the teacher trains on, so recording uses a flat mesh at
+# z=0 -- keeps the robot's flat-ground distribution while giving the scanner a surface.
+FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0), border_width=20.0, num_rows=10, num_cols=20,
+    horizontal_scale=0.1, vertical_scale=0.005, slope_threshold=0.75, use_cache=False,
+    sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
+)
+
+
+##
+# Scene
+##
+@configclass
+class G1TeacherSceneCfg(G1ClfTrackingSceneCfg):
+    """Teacher scene + a downward height-scan ray-caster on the pelvis (176 rays).
+
+    The scan is the FM's height-conditioning token AND (Phase D) a teacher observation;
+    it needs a raycast-able MESH terrain (see ``G1TeacherEnvCfg``'s flat-mesh override --
+    the RayCaster cannot hit the infinite "plane" primitive).
+    """
+
+    height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.75, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.5, 1.0]),
+        mesh_prim_paths=["/World/ground"],
+        debug_vis=False,
+    )
 
 
 ##
@@ -137,6 +173,13 @@ class G1TeacherObservationsCfg:
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
             noise=Unoise(n_min=-0.1, n_max=0.1),
         )
+        # Terrain awareness: per-ray ground clearance from the pelvis height scanner
+        # (the same scan the FM conditions on). Flat ground -> ~constant; carries terrain
+        # shape on rough ground. Noised like the other deployable sensor terms.
+        height_scan = ObsTerm(
+            func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            noise=Unoise(n_min=-0.1, n_max=0.1), clip=(-1.0, 1.0),
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -181,6 +224,12 @@ class G1TeacherObservationsCfg:
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
         act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+
+        # Terrain height scan (clean; critic corruption is off).
+        height_scan = ObsTerm(
+            func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+            clip=(-1.0, 1.0),
+        )
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -255,8 +304,15 @@ class G1TeacherTerminationCfg:
 ##
 @configclass
 class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
-    """Flat-ground open-loop motion-sequence tracking env."""
+    """Flat-ground open-loop motion-sequence tracking env (with a height scan).
 
+    The scene carries a height-scan ray-caster (a teacher observation + the FM's
+    height token), so the ground is a flat raycast-able TRIANGLE MESH rather than the
+    infinite "plane" primitive (which the RayCaster cannot hit); the robot still runs
+    on flat ground.
+    """
+
+    scene: G1TeacherSceneCfg = G1TeacherSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
     commands: G1TeacherCommandsCfg = G1TeacherCommandsCfg()
     rewards: G1TeacherRewardCfg = G1TeacherRewardCfg()
@@ -265,9 +321,10 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Flat ground for v1 (override the rough-terrain generator).
-        self.scene.terrain.terrain_type = "plane"
-        self.scene.terrain.terrain_generator = None
+        # Flat ground for v1, but a raycast-able MESH (not the "plane" primitive) so the
+        # height_scanner returns valid hits; the robot's flat-ground distribution is unchanged.
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = FLAT_MESH_TERRAIN_CFG
         # Episode length matches a 20 s clip at the 0.02 s control dt
         # (decimation 4 * sim.dt 0.005); regenerate clips at this dt.
         self.episode_length_s = 20.0
@@ -295,6 +352,8 @@ class G1TeacherEnvCfgPlay(G1TeacherEnvCfg):
         self.events.randomize_ground_contact_friction = None
         # Draw the reference-trajectory markers in the viewer.
         self.commands.traj_ref.debug_vis = True
+        # Draw the height-scan ray hits in the viewer.
+        self.scene.height_scanner.debug_vis = True
 
 
 @configclass

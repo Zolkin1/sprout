@@ -92,7 +92,7 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
-        "ground_z": float(ctx.ground_z),
+        "ground_z": float(ctx.ground_z), "height_dim": int(ctx.model.height_dim),
     }
 
 
@@ -104,7 +104,8 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     wrapper = _FmSamplerOnnx(ctx).eval()
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
-    dummy = (torch.randn(v, n, d), torch.randn(v, 1), torch.randn(v, n_cmd, cmd), torch.randn(v, f, d))
+    hdim = int(ctx.model.height_dim)  # height-scan width (176), not 1
+    dummy = (torch.randn(v, n, d), torch.randn(v, hdim), torch.randn(v, n_cmd, cmd), torch.randn(v, f, d))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
     # dim on TransformerEncoder, whereas the newer dynamo path baked a static batch

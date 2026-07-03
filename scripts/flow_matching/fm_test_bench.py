@@ -200,7 +200,7 @@ class DuckMeta:
 _NEEDED_ARRAYS = ("state", "target_vel", "episode_id", "step_in_episode", "done")
 # Robot-state-conditioned (ego_anchored_clip_future) recordings carry these too; loaded
 # when present so the teacher-data forecast_step can overlay the real clip future.
-_OPTIONAL_ARRAYS = ("ref_future", "cmd_future", "reanchor_active")
+_OPTIONAL_ARRAYS = ("ref_future", "cmd_future", "reanchor_active", "height_scan")
 _NEEDED_META = (
     "state_term_names", "state_term_dims", "state_frame_names",
     "state_joint_names", "num_envs", "dt", "ref_source", "ref_future_len",
@@ -469,6 +469,10 @@ def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherS
     steps = data["step_in_episode"][rows]
     snap = data["reanchor_active"][rows].astype(bool)
     state, ref_future, cmd_future = data["state"], data["ref_future"], data["cmd_future"]
+    height_scan = data.get("height_scan")
+    if height_scan is None:
+        raise SystemExit("[bench] this recording has no 'height_scan' array; re-record with a "
+                         "height_scanner sensor active (--task G1-teacher-clf-record-play).")
     foot_idxs = [i for i, f in enumerate(meta.state_frame_names) if "ankle" in f.lower() or "foot" in f.lower()]
 
     def _t(a):
@@ -489,7 +493,7 @@ def run_forecast_step_teacher(ctx, data, meta, layout, args, device) -> TeacherS
             _t(h["root_lin_vel"])[None], _t(h["root_ang_vel"])[None],
             _t(h["joint_pos"])[None], _t(h["joint_vel"])[None], frames=frames,
         )
-        height = build_height_token(ctx, _t(h["root_pos"][-1, 2]))
+        height = build_height_token(ctx, _t(height_scan[snap_row])[None])  # (1, K) recorded scan
         cmd = build_cmd_tokens(ctx, _t(cmd_future[snap_row])[None]) if ctx.cmd_dim > 0 else None
         p_ref, q_ref = _t(h["root_pos"][-1])[None], _t(h["root_quat"][-1])[None]
         world = sample_world(ctx, hist, height, cmd, p_ref, q_ref)

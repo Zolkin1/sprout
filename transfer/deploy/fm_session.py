@@ -41,6 +41,7 @@ class FmContext:
     joint_names: list[str]
     target_frame_names: list[str]
     ground_z: float
+    height_dim: int
 
     @property
     def frame_names(self) -> list[str]:
@@ -66,7 +67,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
-        ground_z=float(m.get("ground_z", 0.0)),
+        ground_z=float(m.get("ground_z", 0.0)), height_dim=int(m.get("height_dim", 1)),
     )
 
 
@@ -102,14 +103,24 @@ def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, j
     ).reshape(v, n, ctx.D)
 
 
-def build_height_token(ctx: FmContext, anchor_root_z: np.ndarray) -> np.ndarray:
-    """Build the **raw** root-height token ``(V, 1)`` = root z - ground_z.
+def build_height_token(ctx: FmContext, height_scan: np.ndarray) -> np.ndarray:
+    """Build the **raw** height-scan token ``(V, height_dim)`` from per-ray ground clearance.
 
-    The ``fm.onnx`` graph folds in the height normalization. ``anchor_root_z`` is the
-    world z of the robot root at the anchor step, shape ``(V,)`` or ``(V, 1)`` -- the
-    live ground-clearance stand-in for a heightmap.
+    The ``fm.onnx`` graph folds in the height normalization, so this just shapes the raw
+    scan. ``height_scan`` is the live per-ray clearance from the height_scanner sensor
+    (body-relative / yaw-aligned), shape ``(V, height_dim)`` or ``(height_dim,)``.
     """
-    return np.asarray(anchor_root_z, dtype=np.float64).reshape(-1, 1) - ctx.ground_z
+    scan = np.asarray(height_scan, dtype=np.float64)
+    if scan.ndim == 1:
+        scan = scan[None, :]
+    if scan.shape[-1] != ctx.height_dim:
+        raise ValueError(f"height_scan width {scan.shape[-1]} != fm height_dim {ctx.height_dim}.")
+    # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds
+    # in the height normalization, so a non-finite value here would poison it. Clamp to
+    # the +/-1 m band the token is trained on (mirrors
+    # flow_matching.transforms.sanitize_height_scan, HEIGHT_SCAN_CLIP=1.0).
+    scan = np.clip(np.nan_to_num(scan, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
+    return scan
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
