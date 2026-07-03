@@ -48,7 +48,7 @@ from fm.quat_math import quat_apply, quat_box_minus, quat_inv  # noqa: E402
 
 # Observation clip bounds that are set on the obs terms in the env cfg
 # (G1TeacherObservationsCfg) but not carried in policy_parameters.yaml.
-_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0}
+_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0, "height_scan": 1.0}
 
 
 def _wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -281,7 +281,13 @@ class GeneratorTrackerPolicy:
         frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
-        height = build_height_token(ctx, rp[:, -1, 2])
+        # Height token: the live per-ray height scan at "now" (state["height_scan"]);
+        # legacy scalar-height FMs (height_dim==1) fall back to the root z.
+        if ctx.model.height_dim > 1:
+            height = build_height_token(ctx, torch.as_tensor(
+                state["height_scan"], dtype=torch.float32, device=self.fm_device)[None])
+        else:
+            height = build_height_token(ctx, rp[:, -1, 2])
         # Held command over the future horizon (no clip to read ahead from).
         fut_cmd = cmd[:, -1:].expand(1, ctx.F, ctx.cmd_dim).clone()
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
@@ -434,6 +440,9 @@ class GeneratorTrackerPolicy:
         }
         if base_vel_ref is not None:
             values["base_vel_ref"] = base_vel_ref
+        # Height-scan obs term (only if the tracker was trained with it); _assemble clips it.
+        if "height_scan" in state:
+            values["height_scan"] = t(state["height_scan"])
         return self._assemble(values)
 
     def _projected_gravity(self, root_quat_xyzw: torch.Tensor) -> torch.Tensor:

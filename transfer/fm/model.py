@@ -127,7 +127,8 @@ class FlowMatchingTransformer(nn.Module):
         self.history_in = _token_mlp(self.history_dim, d_model)
         self.hist_type = nn.Parameter(torch.zeros(1, 1, d_model))
         self.null_history = nn.Parameter(torch.zeros(1, 1, d_model))
-        # Height conditioning token (ground clearance / heightmap stand-in).
+        # Height-scan conditioning token: a ``height_dim``-ray ground-clearance vector
+        # embedded into one token (replaces the old root-z scalar heightmap stand-in).
         self.height_in = _token_mlp(height_dim, d_model)
         self.height_type = nn.Parameter(torch.zeros(1, 1, d_model))
 
@@ -173,8 +174,8 @@ class FlowMatchingTransformer(nn.Module):
                 shape ``(B, F, state_dim)``.
             tau: Flow time in ``[0, 1]``, shape ``(B,)``.
             history: Clean history (phase) conditioning, shape ``(B, N, history_dim)``.
-            height: Height conditioning (root z above ground), shape ``(B, height_dim)``
-                or ``(B,)``.
+            height: Height-scan conditioning (``height_dim`` ray-cast ground-clearance
+                values), shape ``(B, height_dim)`` or ``(B,)``.
             cmd_tokens: Strided future command tokens (normalized), shape
                 ``(B, num_cmd_tokens, cmd_dim)``. Required when built with
                 ``cmd_dim > 0``; ignored otherwise.

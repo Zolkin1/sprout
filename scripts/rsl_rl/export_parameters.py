@@ -259,6 +259,33 @@ def export_policy_parameters(env, obs, actions, save_dir):
 
     params["observation_terms"] = obs_info
 
+    # Height-scan sensor geometry so the MuJoCo / hardware deploy can REPLICATE the scan
+    # that both the `height_scan` obs term and the FM height token consume. Read from the
+    # scene's RayCasterCfg (resolution/size/offset) + the height_scan obs term's
+    # mdp.height_scan `offset` and clip. None when the task has no height scanner.
+    hs_spec = None
+    scene = unwrapped_env.scene
+    scanner = scene.sensors.get("height_scanner") if hasattr(scene, "sensors") else None
+    if scanner is not None:
+        rc = scanner.cfg  # RayCasterCfg
+        pat = rc.pattern_cfg
+        term_cfgs = obs_manager._group_obs_term_cfgs.get(obs_group_name, [])
+        term_names = obs_manager.active_terms.get(obs_group_name, [])
+        hs_cfg = next((c for n, c in zip(term_names, term_cfgs) if n == "height_scan"), None)
+        mdp_offset, clip = 0.5, None
+        if hs_cfg is not None:
+            mdp_offset = float((hs_cfg.params or {}).get("offset", 0.5))
+            clip = list(hs_cfg.clip) if getattr(hs_cfg, "clip", None) is not None else None
+        hs_spec = {
+            "resolution": float(pat.resolution),
+            "size": [float(pat.size[0]), float(pat.size[1])],
+            "offset_pos": [float(rc.offset.pos[0]), float(rc.offset.pos[1]), float(rc.offset.pos[2])],
+            "ray_alignment": str(getattr(rc, "ray_alignment", "yaw")),
+            "sensor_offset": mdp_offset,   # mdp.height_scan subtracts this
+            "clip": clip,                  # obs-term clip (apply in deploy to match training)
+        }
+    params["height_scan_spec"] = hs_spec
+
     # Convert to serializable format
     params = convert_to_serializable(params)
 

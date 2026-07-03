@@ -5,12 +5,12 @@
 Used by the online RL tracking command (``FmTrackingCommand``): maintains a
 rolling per-env history of the
 robot state, build the ``N`` history (phase) conditioning tokens (in the xyz+yaw
-relative-frame representation), the root-height token, and the strided future
+relative-frame representation), the height-scan token, and the strided future
 command tokens, sample the ``F``-step future window, and lift it back to the world.
 
 The conditioning must match ``robot_rl.flow_matching.dataset.FutureStateDataset``
 exactly: ``N`` real-robot-state history tokens anchored at the most recent step
-(index N-1, the xyz+yaw ground frame), a single root-height token, the strided
+(index N-1, the xyz+yaw ground frame), a single height-scan token, the strided
 command tokens, and the ``F`` predicted FUTURE states (node 0 = current step,
 offset ≈ 0). There is no inpainting / known-mask: conditioning is separate tokens.
 This file is kept in lock-step with the deployment-side ``transfer/fm/online.py``.
@@ -27,7 +27,12 @@ from .config import FlowMatchingConfig
 from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
-from .transforms import relative_state as _relative_state, state_to_absolute, target_state_dim
+from .transforms import (
+    relative_state as _relative_state,
+    sanitize_height_scan,
+    state_to_absolute,
+    target_state_dim,
+)
 
 
 # ----------------------------------------------------------------------
@@ -92,8 +97,8 @@ class FmOnlineContext:
         model: The loaded :class:`FlowMatchingTransformer` (eval mode).
         state_norm: Normalizer for the state tokens (history conditioning + future).
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
-        height_norm: Normalizer for the scalar root-height token.
-        ground_z: World floor height under the anchor for the height token.
+        height_norm: Normalizer for the height-scan token.
+        ground_z: World floor height for the terrain-penetration loss only (no longer feeds any FM token).
         N: Number of history (phase) conditioning tokens.
         F: Future window length (all F are predicted; node 0 = current step).
         D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``); also history_dim.
@@ -267,20 +272,23 @@ def build_history_tokens(
     return ctx.state_norm.normalize(rel)
 
 
-def build_height_token(ctx: FmOnlineContext, anchor_root_z: torch.Tensor) -> torch.Tensor:
-    """Build the normalized root-height token ``(V, 1)`` from the anchor root z.
+def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch.Tensor:
+    """Build the normalized height-scan token ``(V, height_dim)`` from a raw scan.
+
+    The height scan is a vector of ray-cast ground-clearance values (body-relative,
+    yaw-aligned -- already in the FM's xyz+yaw ego frame, so no re-anchoring), embedded
+    downstream through one MLP into a single token. It replaces the old root-z scalar.
 
     Args:
         ctx: The loaded context.
-        anchor_root_z: World z of the robot root at the anchor step, shape ``(V,)`` or
-            ``(V, 1)``. At deployment this is the live robot root z (the ground-clearance
-            stand-in for a heightmap).
+        height_scan: Raw height scan at the anchor step, shape ``(V, height_dim)``. At
+            deployment this is the live ``mdp.height_scan`` reading; in the test bench it
+            is the recorded scan at the snap row.
 
     Returns:
-        Normalized height token ``(V, 1)``.
+        Normalized height-scan token ``(V, height_dim)``.
     """
-    raw = anchor_root_z.reshape(-1, 1) - ctx.ground_z
-    return ctx.height_norm.normalize(raw)
+    return ctx.height_norm.normalize(sanitize_height_scan(height_scan))
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:
@@ -320,7 +328,7 @@ def sample_world(
     Args:
         ctx: The loaded context.
         history: History (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        height: Normalized root-height token ``(V, 1)`` (from :func:`build_height_token`).
+        height: Normalized height-scan token ``(V, height_dim)`` (from :func:`build_height_token`).
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
         p_ref: World reference position ``(V, 3)`` (the current robot base position).
         q_ref: World reference quaternion ``(V, 4, xyzw)``.

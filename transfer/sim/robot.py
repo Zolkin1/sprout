@@ -283,6 +283,60 @@ class Robot:
             out[i, 10:13] = jacr @ self.mj_data.qvel  # angular (world)
         return out
 
+    def compute_height_scan(
+        self, base_pos: np.ndarray, base_quat_xyzw: np.ndarray,
+        resolution: float = 0.1, size=(1.5, 1.0), offset_fwd: float = 0.75,
+        sensor_offset: float = 0.5, ray_start_h: float = 20.0, terrain_group: int = 2,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Replicate IsaacLab ``mdp.height_scan`` via a MuJoCo grid raycast.
+
+        Casts a yaw-aligned grid of straight-down rays under the pelvis against the
+        terrain (geom group ``terrain_group``) and returns per-ray ground clearance
+        matching IsaacLab: ``clearance = base_z - hit_z - sensor_offset`` (verified
+        empirically: recorded ``root_z - scan == 0.5`` exactly). Ray order is y-outer,
+        x-inner (IsaacLab ``GridPatternCfg`` "xy" ordering); grid is centred
+        ``offset_fwd`` m ahead of the pelvis. Defaults match ``G1TeacherSceneCfg``'s
+        ``height_scanner`` (0.1 m over 1.5x1.0 -> 16x11 = 176 rays).
+
+        Args:
+            base_pos: Pelvis world position ``(3,)``.
+            base_quat_xyzw: Pelvis world quaternion ``(x, y, z, w)`` (yaw is used).
+            resolution/size/offset_fwd/sensor_offset: match the trained height_scanner.
+            ray_start_h: Height above the pelvis to start each (downward) ray.
+            terrain_group: MuJoCo geom group of the raycast-able terrain. The robot must
+                NOT be in this group, so rays hit the ground and skip the robot's own body.
+
+        Returns:
+            ``(clearance (K,), hit_points_world (K, 3))``; no-hit rays -> ``nan``.
+        """
+        hx, hy = float(size[0]) / 2.0, float(size[1]) / 2.0
+        xs = np.arange(-hx, hx + 1e-9, resolution)   # 16 for size 1.5 @ 0.1
+        ys = np.arange(-hy, hy + 1e-9, resolution)   # 11 for size 1.0 @ 0.1
+        qx, qy, qz, qw = (float(v) for v in base_quat_xyzw)
+        yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        c, s = np.cos(yaw), np.sin(yaw)
+        bx, by, bz = float(base_pos[0]), float(base_pos[1]), float(base_pos[2])
+        geomgroup = np.zeros(6, dtype=np.uint8)
+        geomgroup[int(terrain_group)] = 1           # hit ONLY the terrain group (skip the robot)
+        geomid = np.array([-1], dtype=np.int32)
+        vec = np.array([0.0, 0.0, -1.0])            # straight down (IsaacLab ray direction)
+        clearance = np.full(xs.size * ys.size, np.nan)
+        hits = np.full((xs.size * ys.size, 3), np.nan)
+        k = 0
+        for gy in ys:                               # y outer
+            for gx in xs:                           # x inner (x varies fastest)
+                lx, ly = offset_fwd + gx, gy        # forward-offset grid, pelvis frame
+                wx = bx + c * lx - s * ly           # yaw-rotate into world
+                wy = by + s * lx + c * ly
+                pnt = np.array([wx, wy, bz + ray_start_h])
+                dist = mujoco.mj_ray(self.mj_model, self.mj_data, pnt, vec, geomgroup, 1, -1, geomid)
+                if dist >= 0.0:
+                    hit_z = pnt[2] - dist
+                    clearance[k] = bz - hit_z - sensor_offset
+                    hits[k] = (wx, wy, hit_z)
+                k += 1
+        return clearance, hits
+
     def pd_control(self, qpos: np.ndarray, qvel: np.ndarray):
         """Compute the PD control actions to keep the robot moving straight."""
         kp_y = self.gains["kp_y"]

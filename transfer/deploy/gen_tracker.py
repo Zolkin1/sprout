@@ -35,7 +35,7 @@ from .quat_math_np import quat_apply, quat_box_minus, quat_inv
 from .tracker_session import TrackerSession
 
 # Obs-term clip bounds set in the env cfg but not carried in the metadata.
-_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0}
+_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0, "height_scan": 1.0}
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -291,7 +291,13 @@ class GenTrackerPolicy:
         frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
-        height = build_height_token(ctx, rp[:, -1, 2])
+        # Height token: the live per-ray height scan at "now" (the runner computes it and
+        # puts it in state["height_scan"]); legacy scalar-height FMs (height_dim==1) fall
+        # back to the root z. Matches how the scan is recorded + used in the RL obs.
+        if ctx.height_dim > 1:
+            height = build_height_token(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
+        else:
+            height = build_height_token(ctx, rp[:, -1, 2])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip→FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -427,6 +433,10 @@ class GenTrackerPolicy:
         }
         if base_vel_ref is not None:
             values["base_vel_ref"] = base_vel_ref
+        # Height-scan obs term (only if the tracker was trained with it). The runner puts
+        # the per-ray clearance in state["height_scan"]; _assemble clips it via _TERM_CLIP.
+        if "height_scan" in state:
+            values["height_scan"] = f64(state["height_scan"])
         return self._assemble(values)
 
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:

@@ -450,6 +450,7 @@ def main() -> None:
     num_joints = train_ds.num_joints
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
+          f"height_dim={cfg.height_dim} (height-scan rays), "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")

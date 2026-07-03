@@ -91,6 +91,15 @@ class TrackerSession:
             for n, t in terms.items()
         ]
 
+    def get_height_scan_spec(self) -> dict | None:
+        """Height-scanner geometry (resolution, size, offset_pos, ray_alignment,
+        sensor_offset, clip) embedded at export time, or None if the task has no scanner.
+
+        Lets the MuJoCo / hardware deploy replicate the exact grid the policy + FM were
+        trained on. See ``scripts/rsl_rl/export_parameters.py``.
+        """
+        return self.params.get("height_scan_spec")
+
     def get_valid_ic_pos(self) -> np.ndarray | None:
         """Valid initial pose [base_pos(3), base_quat(4), joint_pos(N)] or None."""
         ic = self.params.get("valid_ic_pos")

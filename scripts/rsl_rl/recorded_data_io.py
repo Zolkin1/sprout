@@ -56,6 +56,10 @@ class RecordingMeta:
         ref_future_len: Number of future nodes ``F`` stored per step in ``ref_future`` (0 if absent).
         ref_future_term_names: Per-node layout names of ``ref_future`` (== ``state_term_names``).
         ref_future_term_dims: Per-node layout dims of ``ref_future`` (== ``state_term_dims``).
+        height_scan_dim: Number of rays ``K`` in the per-step ``height_scan`` array (0 if
+            absent). The height scan is the FM's height-conditioning token (per-ray ground
+            clearance from the ``height_scanner`` sensor), captured when the recording task
+            has one active (e.g. ``G1-teacher-clf-record``).
         content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
             set after collection. Compression-robust dataset identity; empty for older files.
     """
@@ -85,6 +89,7 @@ class RecordingMeta:
     ref_future_len: int = 0
     ref_future_term_names: list[str] = field(default_factory=list)
     ref_future_term_dims: list[int] = field(default_factory=list)
+    height_scan_dim: int = 0
     content_sha256: str = ""
 
 
@@ -197,6 +202,10 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         optional_arrays["cmd_future"] = data["cmd_future"].astype(np.float32)
     if data.get("reanchor_active") is not None:
         optional_arrays["reanchor_active"] = data["reanchor_active"].astype(np.uint8)
+    # Per-step height scan ``[num_pairs, K]`` (per-ray ground clearance) -- the FM's
+    # height-conditioning token. Written only when a height_scanner sensor was active.
+    if data.get("height_scan") is not None:
+        optional_arrays["height_scan"] = data["height_scan"].astype(np.float32)
     np.savez_compressed(
         path,
         # per-pair arrays
@@ -237,6 +246,7 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         ref_future_len=np.int64(meta.ref_future_len),
         ref_future_term_names=np.array(meta.ref_future_term_names),
         ref_future_term_dims=np.array(meta.ref_future_term_dims, dtype=np.int64),
+        height_scan_dim=np.int64(meta.height_scan_dim),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -269,6 +279,8 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         "ref_future": z["ref_future"] if "ref_future" in z.files else None,
         "cmd_future": z["cmd_future"] if "cmd_future" in z.files else None,
         "reanchor_active": z["reanchor_active"] if "reanchor_active" in z.files else None,
+        # Present only when a height_scanner sensor was active during recording.
+        "height_scan": z["height_scan"] if "height_scan" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],
@@ -307,6 +319,7 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         ref_future_term_dims=(
             [int(x) for x in z["ref_future_term_dims"]] if "ref_future_term_dims" in z.files else []
         ),
+        height_scan_dim=int(z["height_scan_dim"]) if "height_scan_dim" in z.files else 0,
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
     return data, meta
