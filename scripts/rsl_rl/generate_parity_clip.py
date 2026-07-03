@@ -128,10 +128,10 @@ def main() -> int:
     p.add_argument("--no-ground-projection", action="store_true",
                    help="Disable pinning stance landings to the ground plane (allows z drift).")
     p.add_argument("--ground-height", type=float, default=0.0, help="Ground plane height for projection (m).")
-    p.add_argument("--transition", choices=("raw", "linear"), default="linear",
-                   help="Skill-transition (seam) strategy: 'linear' cross-fade (default) or 'raw' hard cut.")
+    p.add_argument("--transition", choices=("raw", "linear", "quadratic"), default="linear",
+                   help="Skill-transition (seam) strategy: 'linear' cross-fade (default), 'quadratic' ease-in cross-fade (holds the old stride longer), or 'raw' hard cut.")
     p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
-                   help="Phi window for the 'linear' transition cross-fade.")
+                   help="Cross-fade completion length as a fraction of a STEP (half-cycle), in (0, 1]. Applies to 'linear'/'quadratic'.")
     args = p.parse_args()
 
     device = torch.device(args.device)

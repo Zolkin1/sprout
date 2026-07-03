@@ -27,7 +27,7 @@ def test_transition_lead_in_clamped_with_redistribution():
     for seed in range(60):
         rng = np.random.default_rng(seed)
         specs = sample_terrain_specs(
-            rng, n_terrain=0, n_transition=1, hd_grid=hd, width=0.777,
+            rng, n_terrain=0, n_transition=1, hd_grid=hd, width_range=(0.777, 0.777),
             num_steps_range=(3, 3),     # tiny stairs -> the lead-in wants the slack
             lead_in_range=(min_lead, max_lead), end_platform=min_end,
             num_transitions_range=(2, 2), inter_flat_range=(min_inter, 5.0),

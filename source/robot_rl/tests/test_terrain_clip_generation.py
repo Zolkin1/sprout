@@ -120,7 +120,7 @@ def test_terrain_only_clip_climbs(built):
     m, gen, sampler, stair = built
     rng = np.random.default_rng(0)
     specs = sample_terrain_specs(
-        rng, n_terrain=1, n_transition=0, hd_grid=_hd_grid(m), width=0.777,
+        rng, n_terrain=1, n_transition=0, hd_grid=_hd_grid(m), width_range=(0.777, 0.777),
         num_steps_range=(5, 5), lead_in_range=(0.0, 0.0), end_platform=1.0,
         num_transitions_range=(1, 1), inter_flat_range=(3.0, 3.0),
         nav_width_range=(0.777, 0.777), flat_width_margin=0.3, transition_length=14.0,
@@ -181,7 +181,7 @@ def test_approach_masked_by_skill_is_forward(built):
     m, gen, sampler, stair = built
     rng = np.random.default_rng(1)
     specs = sample_terrain_specs(
-        rng, n_terrain=1, n_transition=0, hd_grid=_hd_grid(m), width=0.777,
+        rng, n_terrain=1, n_transition=0, hd_grid=_hd_grid(m), width_range=(0.777, 0.777),
         num_steps_range=(5, 5), lead_in_range=(1.5, 4.0), end_platform=1.0,
         num_transitions_range=(1, 1), inter_flat_range=(3.0, 3.0),
         nav_width_range=(0.777, 0.777), flat_width_margin=0.3, transition_length=14.0,
@@ -232,7 +232,7 @@ def test_transition_multi_band_straight_climb(built):
     m, gen, sampler, stair = built
     rng = np.random.default_rng(3)
     specs = sample_terrain_specs(
-        rng, n_terrain=0, n_transition=1, hd_grid=_hd_grid(m), width=0.777,
+        rng, n_terrain=0, n_transition=1, hd_grid=_hd_grid(m), width_range=(0.777, 0.777),
         num_steps_range=(3, 3), lead_in_range=(3.0, 3.0), end_platform=1.0,
         num_transitions_range=(2, 2), inter_flat_range=(3.0, 3.0),
         nav_width_range=(2.5, 2.5), flat_width_margin=0.4, transition_length=14.0,
@@ -245,12 +245,17 @@ def test_transition_multi_band_straight_climb(built):
     assert abs(float(bt.spawn_anchor_pos[1]) - cy) < 1e-5, "transition should spawn centered"
     gen.clear_terrain_context()
     gen.sampler = sampler   # forward-only stair-range vx; vy/wz = 0
+    sampler._gen.manual_seed(1)   # deterministic regardless of test order (shared module sampler)
     gen.set_terrain_context(
         projector=bt.projector, terrain_dim_lookup=bt.dim_lookup,
         spawn_anchor_pos=bt.spawn_anchor_pos, spawn_anchor_quat=torch.tensor([0.0, 0.0, 0.0, 1.0]),
         spawn_on_stairs=bt.spawn_on_stairs, spawn_ground_z=bt.spawn_ground_z,
         band_exit_z=bt.band_exit_z, terrain_id=0, terrain_type="transition",
         steer_to_goal=bt.steer_to_goal, nav_goal_xy=bt.nav_goal_xy,
+        # Non-steered terrains walk straight up the corridor (matches ``orchestrate``,
+        # which sets ``straight_only = not steer_to_goal``); the per-step re-anchor
+        # freezes the lateral anchor so the corridor walk stays on the centerline.
+        straight_only=True,
         flat_exclude_skills=("running",), approach_skills=("walk_forward",),
     )
     out = gen.generate_batch(4)
@@ -271,13 +276,20 @@ def test_transition_multi_band_straight_climb(built):
     back = [i for i, s in enumerate(m.skills) if s.name == "walk_backwards"]
     if back:
         assert int((out["skill_id"] == back[0]).sum()) == 0, "walk_backwards leaked into a transition clip"
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.terrain_clip_orchestrator import (
+        report_off_terrain,
+    )
+    # Real requirement: no reference FOOT leaves the corridor / treads (the
+    # per-step re-anchor keeps the lateral drift bounded).
+    _off, _exc = report_off_terrain(out, bt.manifest)
+    assert float(_exc.max()) < 0.10, f"foot {float(_exc.max()):.3f} m off the corridor"
     for ci in range(y.shape[0]):
         assert float(y[ci, -1, px]) > float(y[ci, 0, px]) + 1.0, "no forward progress"
         # Climbs at least the first staircase.
         assert float(y[ci, :, pz].max()) - float(y[ci, 0, pz]) > 0.4 * bt.band_exit_z[0], "did not climb"
-        # Stays near the centerline: the approach only uses STRAIGHT strides, so
-        # no strafing/turning stride side-steps the robot off-center.
-        assert float((y[ci, :, py] - cy).abs().max()) < 0.4, "drifted off the centerline"
+        # Pelvis stays roughly on the centerline (loose -- includes the reference
+        # gait's natural lateral sway, which the per-step re-anchor shows in full).
+        assert float((y[ci, :, py] - cy).abs().max()) < 0.45, "pelvis drifted off the centerline"
 
 
 def _frame_yaw(y: torch.Tensor, names: list[str], frame: str) -> torch.Tensor:
@@ -305,7 +317,7 @@ def test_straight_only_zeros_anchor_yaw_and_records_diag(built):
     m, gen, sampler, stair = built
     rng = np.random.default_rng(3)
     specs = sample_terrain_specs(
-        rng, n_terrain=0, n_transition=1, hd_grid=_hd_grid(m), width=0.777,
+        rng, n_terrain=0, n_transition=1, hd_grid=_hd_grid(m), width_range=(0.777, 0.777),
         num_steps_range=(3, 3), lead_in_range=(3.0, 3.0), end_platform=1.0,
         num_transitions_range=(2, 2), inter_flat_range=(3.0, 3.0),
         nav_width_range=(2.5, 2.5), flat_width_margin=0.4, transition_length=14.0,
@@ -313,6 +325,7 @@ def test_straight_only_zeros_anchor_yaw_and_records_diag(built):
     bt = build_terrain(specs[0], geom_seed=2, device=DEVICE, size_y_floor=1.2)
     gen.clear_terrain_context()
     gen.sampler = sampler   # forward-only vx; vy/wz = 0
+    sampler._gen.manual_seed(1)   # deterministic regardless of test order (shared module sampler)
 
     # steer_to_goal + straight_only is contradictory -> rejected.
     with pytest.raises(ValueError):
@@ -350,10 +363,19 @@ def test_straight_only_zeros_anchor_yaw_and_records_diag(built):
     net = (rank_yaw[:, -1] - rank_yaw[:, 0]).abs()
     assert float(net.max()) < np.radians(12.0), "anchor heading accumulated (yaw not zeroed)"
 
-    # And the clip stays on the corridor (no lateral drift off the centerline).
+    # The clip stays on the corridor.  Real requirement: no reference FOOT leaves
+    # the corridor / treads (the per-step re-anchor freezes the straight-only
+    # lateral anchor, so drift stays bounded).
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.terrain_clip_orchestrator import (
+        report_off_terrain,
+    )
+    _off, _exc = report_off_terrain(out, bt.manifest)
+    assert float(_exc.max()) < 0.10, f"foot {float(_exc.max()):.3f} m off the corridor"
+    # Pelvis stays roughly centered (loose -- includes the natural lateral sway
+    # of the reference gait, shown in full by the per-step re-anchor).
     py = names.index("pelvis_link:pos_y")
     cy = bt.manifest["size_y"] / 2.0
-    assert float((y[:, :, py] - cy).abs().max()) < 0.3, "drifted off the centerline"
+    assert float((y[:, :, py] - cy).abs().max()) < 0.45, "pelvis drifted off the centerline"
 
     gen.clear_terrain_context()
     assert gen._straight_only is False and gen._diag_yaw_stride is None

@@ -112,7 +112,7 @@ def sample_terrain_specs(
     n_terrain: int,
     n_transition: int,
     hd_grid: list[tuple[float, float]],
-    width: float,
+    width_range: tuple[float, float],
     num_steps_range: tuple[int, int],
     lead_in_range: tuple[float, float],
     end_platform: float,
@@ -141,19 +141,35 @@ def sample_terrain_specs(
     excess is redistributed onto the other flat bands (inter-stair flats + top
     platform) so the total stays ``transition_length``.  ``inter_flat_range[1]``
     is still unused (inter-stair flats have no max).
+
+    ``width_range`` is the stair tread width ``(lo, hi)``: a fixed-width library
+    has ``lo == hi`` (every terrain uses that width), a range library (a stair
+    trajectory declaring ``terrain_width`` as a ``{min, max}`` range) is sampled
+    per terrain so terrains vary in stair width.  For a ``transition`` the tread
+    width is additionally capped at that terrain's corridor width ``nav_width``
+    so the stairs never grow wider than the flat corridor leading to them.
     """
     specs: list[TerrainSpec] = []
     tid = 0
+    w_lo, w_hi = float(width_range[0]), float(width_range[1])
+
+    def _sample_width(cap: float | None = None) -> float:
+        """Uniform tread width in the range (fixed when lo == hi), capped."""
+        hi = w_hi if cap is None else min(w_hi, cap)
+        hi = max(hi, w_lo)
+        return float(rng.uniform(w_lo, hi)) if hi > w_lo else w_lo
+
     for _ in range(n_terrain):
         h, d = hd_grid[int(rng.integers(len(hd_grid)))]
+        w = _sample_width()
         # One big staircase spanning ~transition_length (so terrain-only terrains
         # are the same length as transitions and the robot climbs for the whole
         # clip); just the staircase, no flat base / top.
         ns = max(2, int(round(transition_length / d)))
         specs.append(TerrainSpec(
             terrain_id=tid, ttype="terrain", step_height=float(h), step_depth=float(d),
-            width=float(width), lead_in=0.0, stair_steps=[ns], flat_after=[0.0],
-            nav_width=float(width), spawn_y_offset=0.0,
+            width=w, lead_in=0.0, stair_steps=[ns], flat_after=[0.0],
+            nav_width=w, spawn_y_offset=0.0,
         ))
         tid += 1
 
@@ -200,9 +216,12 @@ def sample_terrain_specs(
 
         nav_width = float(rng.uniform(*nav_width_range))
         off_max = max(0.0, nav_width / 2.0 - flat_width_margin)
+        # Tread width sampled in the range, capped at this corridor so the
+        # stairs stay within the flat corridor leading up to them.
+        tread_w = _sample_width(cap=nav_width)
         specs.append(TerrainSpec(
             terrain_id=tid, ttype="transition", step_height=float(h), step_depth=float(d),
-            width=float(width), lead_in=lead_in, stair_steps=steps, flat_after=flat_after,
+            width=tread_w, lead_in=lead_in, stair_steps=steps, flat_after=flat_after,
             nav_width=nav_width, spawn_y_offset=float(rng.uniform(-off_max, off_max)),
         ))
         tid += 1

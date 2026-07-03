@@ -125,6 +125,12 @@ def composite_terrain(
         "is_border": False,
         "blocks": block_metadata,
     }
+    # Pass through an optional per-cell terrain id (used by the clip-terrain
+    # importer to map each grid cell -> the offline clip terrain it rebuilds, so
+    # envs can be assigned a clip from their own terrain).  ``-1`` marks the flat
+    # (no-terrain) cell, matching the flat clips' ``terrain_id``.
+    if cfg.terrain_id is not None:
+        meta_data["terrain_id"] = int(cfg.terrain_id)
     return all_meshes, origin, meta_data
 
 
@@ -151,3 +157,10 @@ class CompositeSubTerrainCfg(SubTerrainBaseCfg):
     """Walkable-surface z at the first block's left edge. Successive blocks
     chain off the previous block's ``exit_z``, so this is the elevation of
     the whole sub-terrain's entry point."""
+
+    terrain_id: int | None = None
+    """Optional id tying this cell to an offline clip-library terrain. Passed
+    through into ``composite_terrain``'s ``meta_data`` so the clip-terrain
+    importer can expose a per-env terrain id and sample clips matching the cell.
+    ``None`` (default) omits it; the clip loader sets it per terrain (``-1`` for
+    the flat cell)."""

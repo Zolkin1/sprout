@@ -45,14 +45,14 @@ from isaaclab.utils.math import quat_apply, yaw_quat
 
 from ...guidance import goal_pd_commands
 from ..multiskill_manager import _HALF_PERIODIC_INT, MultiSkillManager
+from ..sagittal_reflector import swap_left_right
 from ..skill_bucket import bucket_for_velocity
 from ..terrain_aware_ref import stair_stance_ref
 from ..terrain_transition import plan_slowdown_step
-from ..world_lift import bake_outputs_to_world, lift_orientation, lift_position
+from ..world_lift import anchor_inv_yaw, bake_outputs_to_world, lift_orientation, lift_position
 from .offline_velocity_sampler import OfflineVelocitySampler
 from .transition_strategy import TransitionStrategy, make_transition_strategy
 from .step_length_table import (
-    build_ref_frame_to_pos_xy_idx,
     expand_ref_frames,
     traj_step_length_table,
 )
@@ -60,6 +60,9 @@ from .step_length_table import (
 # Phase used to read the "end of stride" stance-foot landing pose.  Just shy
 # of 1.0 so the lookup stays inside the stride's last domain.
 _END_PHASE = 1.0 - 1e-4
+# Back-off used to read the mid-cycle (LEFT) foot landing just before ``phi_mid``,
+# so the lookup stays inside the first half's last domain.
+_MID_READ_EPS = 1e-4
 
 
 class OfflineClipGenerator:
@@ -78,14 +81,24 @@ class OfflineClipGenerator:
         ground_height: Flat ground-plane height (m).
         transition: Skill-transition (seam) strategy -- ``"linear"`` (default;
             cross-fade old->new over ``transition_blend_end_phi`` of phase,
-            mirroring the online blend), ``"raw"`` (hard cut, no blend), or a custom
-            :class:`TransitionStrategy` instance (extension hook, e.g. motion
-            matching).  Applies to BOTH the flat rollout and terrain /
+            mirroring the online blend), ``"quadratic"`` (same cross-fade with a
+            quadratic ease-in, holding the old stride longer), ``"raw"`` (hard
+            cut, no blend), or a custom :class:`TransitionStrategy` instance
+            (extension hook, e.g. motion matching).  Applies to BOTH the flat rollout and terrain /
             transition-clip seams, including the flat->stair commit: the leaving
             stride re-anchors to the new stance ref, which a correctly designed
             approach places right on the old landing, so the blend stays continuous.
-        transition_blend_end_phi: Phi window for the ``"linear"`` cross-fade
-            (ignored by ``"raw"``); matches the online ``transition_blend_end_phi``.
+        transition_blend_end_phi: Cross-fade completion length as a fraction of a
+            STEP (half-cycle) in ``(0, 1]`` -- e.g. ``0.3`` settles 30% of the way
+            into the step (ignored by ``"raw"``).  Normalized per seam by the
+            step's phase span, so it is step-relative, not full-period-relative.
+        blend_pace: Which stride's step DURATION the cross-fade window is a
+            fraction of at a cross-gait seam: ``"old"`` (the leaving stride, the
+            default), ``"new"`` (the incoming stride), or ``"longer"`` (the longer
+            of the two).  Only matters when the two strides differ in period
+            (e.g. walk<->stair / walk<->run); for same-period seams all three are
+            identical.  The blend clock always runs on the old stride's phase, so
+            this only rescales the completion window.
         approach_threshold: Distance (m) below which the stance foot is treated
             as "at" the stair stance reference (commit the stair skill).
         device: Torch device.
@@ -104,13 +117,19 @@ class OfflineClipGenerator:
         ground_height: float = 0.0,
         transition: str | TransitionStrategy = "linear",
         transition_blend_end_phi: float = 0.3,
+        blend_pace: str = "old",
         approach_threshold: float = 0.15,
         nav_gains: tuple[float, float, float] = (1.5, 0.3, 0.5),
         nav_vy_clamp: tuple[float, float] = (-0.4, 0.4),
         nav_wz_clamp: tuple[float, float] = (-0.5, 0.5),
+        debug_interp: bool = False,
         device: str | torch.device = "cpu",
     ) -> None:
         self.manager = manager
+        # When set, generate_batch also returns per-step ``blend_active`` /
+        # ``blend_alpha`` (the skill-transition cross-fade state) for the
+        # ``plot_clip_frames`` debug util.
+        self.debug_interp = bool(debug_interp)
         self.sampler = sampler
         self.device = torch.device(device)
         # Half-periodic strides are unsupported offline (see _reject_half_periodic).
@@ -175,6 +194,18 @@ class OfflineClipGenerator:
         )
         self.ref_frame = ref_frame
 
+        # Left ankle (the other foot) -- the stance / landing foot for the
+        # second half of a stride, needed for the mid-cycle per-step re-anchor.
+        left_frame = swap_left_right(ref_frame)
+        self._la_pos_idx = torch.tensor(
+            [self.pos_output_names.index(f"{left_frame}:{a}") for a in ("pos_x", "pos_y", "pos_z")],
+            dtype=torch.long, device=self.device,
+        )
+        self._la_ori_idx = torch.tensor(
+            [self.pos_output_names.index(f"{left_frame}:{a}") for a in ("ori_x", "ori_y", "ori_z", "ori_w")],
+            dtype=torch.long, device=self.device,
+        )
+
         # Per-trajectory total time, on device.
         self._total_time = manager.data["total_time"].to(self.device)
         # Per-trajectory natural stance-ankle height (the ref-frame z offset
@@ -196,14 +227,54 @@ class OfflineClipGenerator:
         self._stair_skill_id = int(terrain_skill_ids[0]) if terrain_skill_ids.numel() else -1
         # Per-trajectory forward swing reach for the slow-down approach step.
         # The ref-frame map needs BOTH feet present so half-periodic reflected
-        # domains resolve (manager.ref_frames may list only the right foot); the
-        # pos-xy index must key on the same expanded list.
+        # domains resolve (manager.ref_frames may list only the right foot).
         ref_frames = expand_ref_frames(list(manager.ref_frames))
         manager.build_ref_frame_map(ref_frames)
-        self._ref_frame_to_pos_xy_idx = build_ref_frame_to_pos_xy_idx(manager, ref_frames, self.device)
-        self._traj_step_length = traj_step_length_table(
-            manager, self._ref_frame_to_pos_xy_idx, self.device,
+        # Landing-foot reach per trajectory (resolves the swing foot from the
+        # contact schedule, so it is the correct first-stride reach after the
+        # two-gate full-periodic change; see ``traj_step_length_table``).
+        self._traj_step_length = traj_step_length_table(manager, self.device)     # [T]
+
+        # --- Mid-cycle (per-step) stitching support --------------------------
+        # Full-periodic gaits now carry two contact gates (gate 0 = the mid-cycle
+        # LEFT strike, gate 1 = the cycle-wrap RIGHT strike); the flat rollout
+        # re-anchors per STEP (half cycle), alternating the stance/landing foot.
+        # ``_has_mid`` marks trajectories with a mid-cycle strike; ``_phi_mid`` is
+        # that strike's phase (1.0 for no-mid strides -- standing -- so the state
+        # machine degenerates to the whole-cycle path for them).
+        T = manager.num_trajectories
+        all_t = torch.arange(T, device=self.device)
+        gp0 = manager._gate_phi_table[:, 0].to(self.device)                       # [T]
+        self._has_mid = (manager._num_gates_per_traj.to(self.device) >= 2)        # [T]
+        self._phi_mid = torch.where(self._has_mid, gp0, torch.ones_like(gp0))     # [T]
+        # Stance (left) domain of the second half, for its ground-height pin;
+        # domain 0 where there is no mid strike (unused there).
+        mid_dom = manager._get_domain_indices(
+            torch.remainder(self._phi_mid + manager._EPS_PHI, 1.0), all_t,
         )                                                                        # [T]
+        self._mid_domain = torch.where(self._has_mid, mid_dom, torch.zeros_like(mid_dom))
+        ref_off = manager.data["ref_frame_offset"].to(self.device)               # [T, D, 3]
+        self._ref_offset_z_mid = ref_off[all_t, self._mid_domain, 2]             # [T]
+        # A skill "has a mid strike" iff any of its trajectories do (walking /
+        # running yes, standing no).  The even->odd (second-half) selection
+        # excludes no-mid skills so a "second half" is always a real gait stride.
+        self._skill_has_mid = torch.zeros(self.num_skills, dtype=torch.bool, device=self.device)
+        for s in range(self.num_skills):
+            sel = self._traj_skill_idx == s
+            if bool(sel.any()):
+                self._skill_has_mid[s] = bool(self._has_mid[sel].any())
+        # Per-step boundary detection assumes a control step never skips a whole
+        # half cycle (so a crossing is unambiguous).  dphi = dt / total_time.
+        if bool(self._has_mid.any()):
+            hm = self._has_mid
+            min_half = torch.minimum(self._phi_mid[hm], 1.0 - self._phi_mid[hm]).min()
+            max_dphi = (self.dt / self._total_time[hm]).max()
+            if float(max_dphi) >= float(min_half):
+                raise ValueError(
+                    f"control dt {self.dt}s yields a phase step up to {float(max_dphi):.3f} "
+                    f">= the smallest half-cycle {float(min_half):.3f}; per-step boundary "
+                    "detection would skip a mid-cycle gate. Reduce dt."
+                )
         # Base approach slow-down candidate set: allowed, flat, gated (perpetual
         # standing has inf reach, never chosen), and STRAIGHT (vy = vyaw = 0 -- the
         # approach must be head-on).  This base is further restricted PER TERRAIN
@@ -259,12 +330,23 @@ class OfflineClipGenerator:
         # cross-fade (online parity, default), or a custom TransitionStrategy.
         # The blend needs the per-frame ori column groups (SLERP), so build them
         # unconditionally.
+        if blend_pace not in ("old", "new", "longer"):
+            raise ValueError(f"blend_pace must be 'old' | 'new' | 'longer'; got {blend_pace!r}")
+        self._blend_pace = blend_pace
         self._build_blend_groups()
+        # ``transition_blend_end_phi`` is a fraction of a STEP (half-cycle); the
+        # cross-fade normalizes by the per-seam step length (passed to ``arm``),
+        # so it always finishes within one step.  The (0, 1] range is validated in
+        # the transition constructor.
         self.transition = make_transition_strategy(
             transition, manager=self.manager, total_time=self._total_time,
-            ori_groups=self._blend_ori_groups, dt=self.dt,
+            ori_groups=self._blend_ori_groups, pos_groups=self._blend_pos_groups, dt=self.dt,
             blend_end_phi=transition_blend_end_phi, device=self.device,
         )
+        if self.debug_interp:
+            # Also snapshot the pre-blend nominals (old continuation + new segment)
+            # so the plot can show the blended value against them.
+            self.transition._log_nominals = True
 
     # ------------------------------------------------------------------
     # Terrain context
@@ -503,50 +585,152 @@ class OfflineClipGenerator:
         stride = self.manager._select_within_skills(vel_cmd, skill, anchor_xy=anchor_xy)
         return skill, stride
 
+    def _foot_landing_world(
+        self,
+        stride: torch.Tensor,
+        anchor_pos: torch.Tensor,
+        anchor_quat: torch.Tensor,
+        read_phase: torch.Tensor,
+        pos_idx: torch.Tensor,
+        ori_idx: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """World pose of a foot at ``read_phase`` of ``stride``, lifted by the anchor.
+
+        Generalizes the stance-foot landing read to an arbitrary foot
+        (``pos_idx`` / ``ori_idx`` select the right or left ankle output columns)
+        and phase (``read_phase`` ``[k]``, e.g. ``phi_mid - eps`` for the
+        mid-cycle LEFT strike or ``_END_PHASE`` for the cycle-wrap RIGHT strike).
+        Orientation is reduced to yaw so the anchor stays a flat ground frame.
+
+        Returns ``(world_pos[k,3], world_quat[k,4], foot_local[k,3])`` -- the
+        anchor-relative foot position is also returned (the mid-cycle blend needs
+        it to align the old stride's continuation with the new landing).
+        """
+        self.manager.set_trajectory_indices(stride)
+        end_pos, _ = self.manager.get_output(read_phase)
+        pos_rel = end_pos[:, pos_idx]    # [k, 3]
+        quat_rel = end_pos[:, ori_idx]   # [k, 4] xyzw
+        world_pos = lift_position(anchor_pos, anchor_quat, pos_rel)
+        world_quat = yaw_quat(lift_orientation(anchor_quat, quat_rel))
+        return world_pos, world_quat, pos_rel
+
     def _stance_landing_world(
         self, stride: torch.Tensor, anchor_pos: torch.Tensor, anchor_quat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """World pose of the stance (right-ankle) frame at the end of a stride.
 
-        This becomes the next stride's anchor: the reference foot landing
-        pose, lifted to world via the current anchor.  Orientation is
-        reduced to yaw so the anchor stays a flat ground frame.
+        This becomes the next stride's anchor at a cycle-wrap (RIGHT-foot) seam:
+        the reference foot landing pose, lifted to world via the current anchor.
+        Thin wrapper over :meth:`_foot_landing_world` for the right ankle at
+        ``_END_PHASE`` (used by the terrain climb and the odd->even flat seam).
         """
-        self.manager.set_trajectory_indices(stride)
-        end_pos, _ = self.manager.get_output(
-            torch.full((stride.shape[0],), _END_PHASE, device=self.device)
+        read = torch.full((stride.shape[0],), _END_PHASE, device=self.device)
+        world_pos, world_quat, _ = self._foot_landing_world(
+            stride, anchor_pos, anchor_quat, read, self._ra_pos_idx, self._ra_ori_idx,
         )
-        ra_pos_rel = end_pos[:, self._ra_pos_idx]   # [k, 3]
-        ra_quat_rel = end_pos[:, self._ra_ori_idx]  # [k, 4] wxyz
-        # x/y come from the lifted landing; z is pinned by the caller to the
-        # new stride's natural ankle height (avoids cumulative z drift).
-        new_pos = lift_position(anchor_pos, anchor_quat, ra_pos_rel)
-        # Keep the anchor a yaw-only ground frame (the lift only uses yaw).
-        new_quat = yaw_quat(lift_orientation(anchor_quat, ra_quat_rel))
-        return new_pos, new_quat
+        return world_pos, world_quat
+
+    def _solve_anchor_for_foot(
+        self,
+        land_pos: torch.Tensor,
+        land_quat: torch.Tensor,
+        new_stride: torch.Tensor,
+        g_start: torch.Tensor,
+        pos_idx: torch.Tensor,
+        straight_only: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Anchor placing ``new_stride`` so its foot at ``g_start`` sits at ``land_pos``.
+
+        Solves the yaw-only anchor so that lifting the new stride's foot-local
+        position at phase ``g_start`` reproduces the world landing ``land_pos`` in
+        xy (``anchor_pos = land_pos - R_yaw(anchor) @ foot_local(g_start)``).  The
+        z here is the raw lift; the caller pins it to the ground plane to avoid
+        cumulative z drift (mirrors the whole-cycle path).  For an even->odd seam
+        ``foot`` is the LEFT ankle and ``g_start = phi_mid[new]``; for the
+        odd->even seam it reduces to the right ankle at phase 0 (``foot_local``
+        ≈ origin), i.e. the whole-cycle re-anchor.  ``straight_only`` snaps the
+        anchor to world-aligned yaw (corridor terrains); else it carries the
+        landing foot's heading.
+
+        Returns ``(anchor_pos[k,3], anchor_quat[k,4], foot_local[k,3])`` -- the
+        new stride's anchor-relative foot position at ``g_start`` is returned so
+        the caller can align the old stride's continuation for the blend.
+        """
+        k = new_stride.shape[0]
+        self.manager.set_trajectory_indices(new_stride)
+        seg_pos, _ = self.manager.get_output(g_start)
+        foot_local = seg_pos[:, pos_idx]                       # [k, 3]
+        if straight_only:
+            new_quat = torch.zeros(k, 4, device=self.device)
+            new_quat[:, 3] = 1.0
+        else:
+            new_quat = yaw_quat(land_quat)
+        off = quat_apply(anchor_inv_yaw(new_quat), foot_local)  # [k, 3]
+        new_pos = land_pos - off
+        return new_pos, new_quat, foot_local
 
     def _anchor_ground_z(self, stride: torch.Tensor) -> torch.Tensor:
         """Pinned anchor z for a stride: ground height + its stance-ankle offset."""
         return self.ground_height + self._ref_offset_z[stride]
+
+    def _second_half_eligible(self, k: int, base: torch.Tensor) -> torch.Tensor:
+        """``[num_skills, k]`` eligibility for an even->odd (second-half) selection.
+
+        ``base`` skills that carry a mid-cycle strike; excludes no-mid skills
+        (standing) so a "second half" is always a real walking / running stride.
+        """
+        mask = base & self._skill_has_mid
+        return mask.view(self.num_skills, 1).expand(self.num_skills, k)
+
+    def _blend_seg_len(
+        self, old_stride: torch.Tensor, new_stride: torch.Tensor, even: torch.Tensor,
+    ) -> torch.Tensor:
+        """Blend-window scale (in OLD-period phi) for the ``arm`` ``seg_len``.
+
+        ``blend_end_phi`` is a fraction of a STEP; the step DURATION is paced by
+        the old (leaving) stride, the new (incoming) stride, or the ``longer`` of
+        the two half-cycles (``self._blend_pace``).  The half being played during
+        the blend is the 2nd half at a mid-cycle seam (``even``) else the 1st.
+        Returned in OLD-period phi units because the blend clock ``_phi`` accrues
+        at ``dt / total_time[old_stride]`` (only rescales the window; the clock
+        stays on the old stride).
+        """
+        old_half = torch.where(even, 1.0 - self._phi_mid[old_stride], self._phi_mid[old_stride])
+        old_dur = old_half * self._total_time[old_stride]                 # seconds
+        if self._blend_pace == "old":
+            dur = old_dur
+        else:
+            new_half = torch.where(even, 1.0 - self._phi_mid[new_stride], self._phi_mid[new_stride])
+            new_dur = new_half * self._total_time[new_stride]
+            dur = new_dur if self._blend_pace == "new" else torch.maximum(old_dur, new_dur)
+        return dur / self._total_time[old_stride]
 
     # ------------------------------------------------------------------
     # Seam cross-fade
     # ------------------------------------------------------------------
 
     def _build_blend_groups(self) -> None:
-        """Per-frame orientation column groups (xyzw) for SLERP in blend_outputs.
+        """Per-frame orientation (xyzw) and position (xyz) column groups for blends.
 
         The old stride's continuation re-anchors to the *same* landing pose as
         the new stride (that is how the seam anchor is computed), so both are
         anchor-relative in the same frame and blend directly -- only the quat
-        columns need SLERP rather than a linear blend.
+        columns need SLERP rather than a linear blend.  ``_blend_pos_groups``
+        lists every frame's ``(pos_x, pos_y, pos_z)`` columns; the mid-cycle
+        blend translates the old continuation by a constant per-clip shift over
+        these columns so its (left) stance foot aligns with the new landing.
         """
-        frames = [n[: -len(":pos_x")] for n in self.pos_output_names if n.endswith(":pos_x")]
-        frames = [f for f in frames if f"{f}:ori_w" in self.pos_output_names]
+        ori_frames = [n[: -len(":pos_x")] for n in self.pos_output_names if n.endswith(":pos_x")]
+        ori_frames = [f for f in ori_frames if f"{f}:ori_w" in self.pos_output_names]
         self._blend_ori_groups = torch.tensor(
-            [[self.pos_output_names.index(f"{f}:ori_{a}") for a in ("x", "y", "z", "w")] for f in frames],
+            [[self.pos_output_names.index(f"{f}:ori_{a}") for a in ("x", "y", "z", "w")] for f in ori_frames],
             dtype=torch.long, device=self.device,
         )  # [F, 4]
+        pos_frames = [n[: -len(":pos_x")] for n in self.pos_output_names if n.endswith(":pos_x")]
+        self._blend_pos_groups = torch.tensor(
+            [[self.pos_output_names.index(f"{f}:pos_{a}") for a in ("x", "y", "z")] for f in pos_frames],
+            dtype=torch.long, device=self.device,
+        )  # [F, 3]
 
     # ------------------------------------------------------------------
     # Terrain rollout helpers
@@ -626,7 +810,7 @@ class OfflineClipGenerator:
         ids: torch.Tensor,
         vel: torch.Tensor,
         phase: torch.Tensor,
-        overshoot_s: torch.Tensor,
+        old_tt: torch.Tensor,
         anchor_pos: torch.Tensor,
         anchor_quat: torch.Tensor,
         stride_idx: torch.Tensor,
@@ -635,22 +819,32 @@ class OfflineClipGenerator:
         ground_z: torch.Tensor,
         terrain_done: torch.Tensor,
         band_idx: torch.Tensor,
+        parity: torch.Tensor,
     ) -> None:
-        """Commit the next stride for crossing terrain clips (in place).
+        """Commit the next STEP (half cycle) for crossing terrain clips (in place).
 
-        State machine per clip, per stair band (flat -> approach -> climb -> top):
+        The terrain rollout is per-step (uniform with the flat rollout): each
+        boundary re-anchors on the foot that just landed -- LEFT at the mid-cycle
+        strike (parity 0 -> 1) or RIGHT at the cycle wrap (parity 1 -> 0) --
+        alternating both on the flat approach AND on the climb (each foot steps
+        up one tread).  State machine per clip, per stair band (flat -> approach
+        -> climb -> top):
 
-        * on the flat before band ``band_idx`` (not on stairs): the nominal
-          sampled gait continues until the next nominal step would overshoot the
-          stair stance reference; then a shortened straight walk step
+        * flat before band ``band_idx`` (not on stairs): the nominal per-step
+          gait continues until the next step would overshoot the stair stance
+          reference; then a shortened straight walk step
           (:func:`plan_slowdown_step`) lands closest to the entry without
           stepping in, or the stair skill is committed (within
-          ``approach_threshold``, or when no shorter step fits);
-        * climbing band k: each stride re-anchors onto the tread the reference
-          foot rests on (z climbs) until it reaches ``band_exit_z[k]``; then flat
-          walking resumes at that height and ``band_idx`` advances to k+1 (the
-          multi-span projector auto-targets the next staircase).  Topping the
-          LAST band latches ``terrain_done`` so the clip never re-enters.
+          ``approach_threshold``, or when no shorter step fits).  Either foot may
+          land on the entry (the climb re-anchors on whichever it is).
+        * climbing band k: each STEP re-anchors the landing foot onto its tread
+          (z climbs) until the landed z reaches ``band_exit_z[k]``; then flat
+          walking resumes at that height and ``band_idx`` advances to k+1.
+          Topping the LAST band latches ``terrain_done``.
+
+        The right-step reach is approximated by the left-step reach
+        (``_traj_step_length``); good for the near-symmetric forward gaits the
+        approach is restricted to.
         """
         dev = self.device
         K = ids.shape[0]
@@ -659,25 +853,41 @@ class OfflineClipGenerator:
         cur_ground = ground_z[ids]                                       # [K]
         cur_done = terrain_done[ids]                                     # [K] bool (climbed out)
         cur_band = band_idx[ids]                                         # [K] long
+        cur_stride = stride_idx[ids]                                     # [K]
 
-        # Old stride's stance-foot landing (world); z carries the climb.
-        land_pos, land_quat = self._stance_landing_world(
-            stride_idx[ids], anchor_pos[ids], anchor_quat[ids],
-        )
+        # Landing foot per parity: LEFT at the mid-cycle strike (even -> odd),
+        # RIGHT at the cycle wrap (odd -> even / no-mid).  Per-row output columns
+        # let a mixed-parity batch read the correct foot in one gather.
+        even = (parity[ids] == 0) & self._has_mid[cur_stride]            # LEFT lands
+        pos_idx = torch.where(
+            even.unsqueeze(1), self._la_pos_idx.unsqueeze(0), self._ra_pos_idx.unsqueeze(0),
+        )                                                                # [K, 3]
+        ori_idx = torch.where(
+            even.unsqueeze(1), self._la_ori_idx.unsqueeze(0), self._ra_ori_idx.unsqueeze(0),
+        )                                                                # [K, 4]
+        read_phase = torch.where(
+            even, self._phi_mid[cur_stride] - _MID_READ_EPS,
+            torch.full((K,), _END_PHASE, device=dev),
+        )                                                                # [K]
+
+        # Old stride's landing-foot pose (world); z carries the climb.
+        self.manager.set_trajectory_indices(cur_stride)
+        end_pos, _ = self.manager.get_output(read_phase)
+        old_foot_local = end_pos.gather(1, pos_idx)                      # [K, 3]
+        old_foot_quat = end_pos.gather(1, ori_idx)                       # [K, 4]
+        land_pos = lift_position(anchor_pos[ids], anchor_quat[ids], old_foot_local)
+        land_quat = yaw_quat(lift_orientation(anchor_quat[ids], old_foot_quat))
 
         # Straight-only diagnostic: ``land_quat`` is the heading the leaving stride
-        # (traj A) imparts relative to its (identity) start anchor -- exactly the
-        # yaw we discard below when snapping to global 0.  Record, per clip, the
-        # largest such correction and the stride that produced it, so a crooked
-        # source stride (one that ends several degrees off straight) is findable.
+        # imparts -- exactly the yaw discarded when snapping to global 0.  Record
+        # the largest such correction + its source stride per clip.
         if self._straight_only and self._diag_yaw_abs is not None:
-            leaving = stride_idx[ids]                                     # traj A (being left)
-            corr = 2.0 * torch.atan2(land_quat[:, 2], land_quat[:, 3])    # [K] yaw of yaw-only quat
+            corr = 2.0 * torch.atan2(land_quat[:, 2], land_quat[:, 3])    # [K]
             cur = self._diag_yaw_abs[ids]
             better = corr.abs() > cur
             self._diag_yaw_abs[ids] = torch.where(better, corr.abs(), cur)
             self._diag_yaw_signed[ids] = torch.where(better, corr, self._diag_yaw_signed[ids])
-            self._diag_yaw_stride[ids] = torch.where(better, leaving, self._diag_yaw_stride[ids])
+            self._diag_yaw_stride[ids] = torch.where(better, cur_stride, self._diag_yaw_stride[ids])
 
         # Flat candidate (velocity-bucketed among allowed flat skills).
         _, flat_stride = self._select_strides(v, anchor_xy=None, eligible=self._flat_eligible(K))
@@ -687,9 +897,9 @@ class OfflineClipGenerator:
         stair_vec = torch.full((K,), self._stair_skill_id, dtype=torch.long, device=dev)
         stair_stride = self.manager._select_within_skills(v, stair_vec, anchor_xy=land_pos[:, :2])
         dom = self.manager._get_domain_indices(torch.zeros(K, device=dev), stair_stride)
-        # Project the foot with THIS clip's band (band_idx) -- not the multi-band
-        # "next stair ahead" -- so a foot that overshot the top of band cur_band
-        # snaps to that band's exit level rather than teleporting onto band+1.
+        # Project the foot with THIS clip's band (band_idx) so a foot that
+        # overshot the top of band cur_band snaps to that band's exit level
+        # rather than teleporting onto band+1.
         band_project = lambda pts: self._band_project(pts, cur_band)
         stair_ref = stair_stance_ref(self.manager, band_project, stair_stride, land_pos, dom)  # [K, 3]
 
@@ -697,9 +907,7 @@ class OfflineClipGenerator:
         fwd = quat_apply(yaw_quat(land_quat), self._fwd_local.expand(K, 3))   # [K, 3]
         tgt = ((stair_ref[:, :2] - land_pos[:, :2]) * fwd[:, :2]).sum(dim=1)  # [K]
 
-        # Approach slow-down decision (only meaningful for flat clips).  Uses the
-        # per-terrain approach mask when set (e.g. excludes running so the
-        # slow-down never picks a big running step for a large gap).
+        # Approach slow-down decision (only meaningful for flat clips).
         appr_elig = self._ctx_approach_eligible if self._ctx_approach_eligible is not None else self._approach_eligible
         elig = appr_elig.unsqueeze(0).expand(K, -1)                          # [K, T]
         do_appr, forced = plan_slowdown_step(
@@ -707,10 +915,7 @@ class OfflineClipGenerator:
         )
 
         # The nominal (sampled) gait's forward reach; the approach only triggers
-        # when this nominal step would overshoot the stair stance reference (i.e.
-        # the desired footstep would land into the stair) -- otherwise keep the
-        # nominal gait.  Standing / gate-less strides (inf reach) don't advance,
-        # so they never "overshoot".  Mirrors the online next-gate approach gate.
+        # when the next step would overshoot the stair stance reference.
         nominal_step = self._traj_step_length[flat_stride]                   # [K]
         would_overshoot = torch.isfinite(nominal_step) & (nominal_step > tgt)
 
@@ -718,15 +923,7 @@ class OfflineClipGenerator:
         band_exit = self._band_exit_z[cur_band]                              # [K]
         last_band = self._band_exit_z.numel() - 1
         topped = land_pos[:, 2] >= (band_exit - 1e-3)                        # reached this band's top
-        # ``cur_done`` clips have already climbed out the LAST band -- they never
-        # re-enter (the exit-level projection would otherwise re-commit them).
-        # Commit the climb when already at the entry, or when the nominal step
-        # would overshoot but no shorter straight step fits (can't land cleaner).
         commit_stair = (~cur_stairs) & (~cur_done) & ((tgt <= self.approach_threshold) | (would_overshoot & ~do_appr))
-        # Adjust (slow-down) only when the nominal step would overshoot AND a
-        # shorter straight step fits: pick the longest straight step not past the
-        # entry (``plan_slowdown_step`` / ``forced``) so the foot lands closest to
-        # the nominal stair start without stepping into the stair.
         approach = (~cur_stairs) & (~cur_done) & (~commit_stair) & would_overshoot & do_appr
         stay_stairs = cur_stairs & (~topped)
         use_stair = commit_stair | stay_stairs
@@ -737,27 +934,70 @@ class OfflineClipGenerator:
         new_stride = torch.where(approach, forced, new_stride)
         new_skill = self._traj_skill_idx[new_stride]
 
-        # Anchor: stair strides snap onto the tread (z climbs); flat strides pin
-        # to the current ground (this band's connecting level once topped).
-        new_ground = torch.where(just_topped, band_exit, cur_ground)
-        flat_pos = land_pos.clone()
-        flat_pos[:, 2] = new_ground + self._ref_offset_z[new_stride]
-        new_pos = torch.where(use_stair.unsqueeze(-1), stair_ref, flat_pos)
+        # Next segment: play the OTHER half -- even -> odd continues the second
+        # half (from phi_mid, next parity 1); odd -> even starts a first half
+        # (from 0, next parity 0).  The re-anchored foot is the one that landed.
+        g_start = torch.where(even, self._phi_mid[new_stride], torch.zeros(K, device=dev))
+        new_parity = torch.where(even, torch.ones(K, dtype=torch.long, device=dev),
+                                 torch.zeros(K, dtype=torch.long, device=dev))
+        self.manager.set_trajectory_indices(new_stride)
+        seg_pos, _ = self.manager.get_output(g_start)
+        new_foot_local = seg_pos.gather(1, pos_idx)                          # [K, 3]
 
-        # Straight-only terrain (transition / terrain): lay EVERY stride in the
-        # global (world-aligned, yaw = 0) frame -- do NOT carry the leaving
-        # stride's landing heading forward -- so per-stride yaw residuals never
-        # accumulate into a drift.  Otherwise: stair anchors use an identity
-        # (world-aligned) quat -- matching the online ``apply_terrain_aware_ref``
-        # -- so the climb stays axis-aligned and doesn't inherit any approach-walk
-        # yaw drift, while flat strides keep the yaw-only landing quat for heading
-        # continuity.
+        # Anchor quat: stair strides (and straight-only terrains) stay world-
+        # aligned (identity); flat strides carry the landing heading.
         if self._straight_only:
-            new_quat = torch.zeros_like(land_quat)
+            new_quat = torch.zeros(K, 4, device=dev)
             new_quat[:, 3] = 1.0
         else:
             new_quat = land_quat.clone()
             new_quat[use_stair] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=dev)
+
+        # Solve the anchor so the landing foot at g_start sits on its target:
+        # the snapped stair tread (use_stair) or the flat continuation xy with the
+        # anchor z pinned to the current ground (no cumulative z drift).
+        off = quat_apply(anchor_inv_yaw(new_quat), new_foot_local)          # [K, 3]
+        new_ground = torch.where(just_topped, band_exit, cur_ground)
+        ref_off_land = torch.where(even, self._ref_offset_z_mid[new_stride], self._ref_offset_z[new_stride])
+        target_xy = torch.where(use_stair.unsqueeze(1), stair_ref[:, :2], land_pos[:, :2])
+        new_pos = torch.empty(K, 3, device=dev)
+        new_pos[:, :2] = target_xy - off[:, :2]
+        new_pos[:, 2] = torch.where(
+            use_stair, stair_ref[:, 2] - off[:, 2], new_ground + ref_off_land,
+        )
+        # Straight-only corridor: no lateral drift.  Re-anchoring the landing
+        # foot each STEP would accumulate a sideways drift off the centerline at
+        # every stride change (a changed stride lands at a slightly different
+        # lateral offset).  So FREEZE the lateral anchor -- the lateral analog of
+        # zeroing yaw -- for the STEADY segments (flat walking + climbing), which
+        # keeps the walk on the spawn centerline and the climb centered on the
+        # (corridor-centered) treads.  But do NOT freeze the two walk<->stair
+        # TRANSITIONS (`commit_stair`, `just_topped`): there the stance geometry
+        # changes a lot between the walk and stair strides, so freezing would drag
+        # BOTH feet ~0.15 m sideways (a visible teleport) instead of letting the
+        # just-landed foot stay put.  Leaving those transitions on the free-y
+        # (landing-continuous) path keeps the planted foot fixed across the seam.
+        if self._straight_only:
+            freeze = ~(commit_stair | just_topped)
+            new_pos[freeze, 1] = anchor_pos[ids][freeze, 1]
+
+        # Arm the skill-transition blend from the phase just crossed: even -> odd
+        # continues the old stride's own second half (re-aligned so its landing
+        # foot matches the new one); odd -> even wraps into the next cycle.  Only
+        # arm on a real stride SWAP (a same-stride boundary is an exact no-op).
+        if self.transition.arms:
+            ch = new_stride != cur_stride
+            if bool(ch.any()):
+                old_phase_arm = torch.where(even, phase[ids], phase[ids] - 1.0)
+                pos_shift = torch.zeros(K, 3, device=dev)
+                pos_shift[even] = (new_foot_local - old_foot_local)[even]
+                # Window scale (fraction of a STEP paced by blend_pace); the half
+                # being entered is the 2nd (even) else the 1st.
+                seg_len = self._blend_seg_len(cur_stride[ch], new_stride[ch], even[ch])
+                self.transition.arm(
+                    ids[ch], cur_stride[ch], old_phase_arm[ch],
+                    pos_shift=pos_shift[ch], seg_len=seg_len,
+                )
 
         anchor_pos[ids] = new_pos
         anchor_quat[ids] = new_quat
@@ -769,7 +1009,114 @@ class OfflineClipGenerator:
         is_last = cur_band >= last_band
         terrain_done[ids] = cur_done | (just_topped & is_last)
         band_idx[ids] = torch.where(just_topped & ~is_last, cur_band + 1, cur_band)
-        phase[ids] = (overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
+        parity[ids] = new_parity
+        target_cross = torch.where(even, self._phi_mid[cur_stride], torch.ones(K, device=dev))
+        overshoot_s = (phase[ids] - target_cross) * old_tt[ids]
+        phase[ids] = (g_start + overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
+
+    def _flat_boundary_per_step(
+        self,
+        ids: torch.Tensor,
+        vel: torch.Tensor,
+        phase: torch.Tensor,
+        old_tt: torch.Tensor,
+        anchor_pos: torch.Tensor,
+        anchor_quat: torch.Tensor,
+        stride_idx: torch.Tensor,
+        skill_id: torch.Tensor,
+        parity: torch.Tensor,
+    ) -> None:
+        """Commit the next STEP (half cycle) for crossed flat clips (in place).
+
+        Splits the crossed clips by what just landed:
+
+        * **even -> odd** (parity 0, mid-cycle strike of a mid-carrying stride):
+          the LEFT foot landed at ``phi_mid``.  Re-anchor on the left foot and
+          play the next selected stride's SECOND half (from ``phi_mid``).  The
+          second-half selection excludes no-mid skills (standing) so it is always
+          a real gait stride.
+        * **odd -> even / whole** (parity 1, OR a no-mid stride at ``phi=1.0``):
+          the RIGHT foot landed at the cycle wrap.  Re-anchor on the right foot
+          (the whole-cycle path) and play the next selected stride's FIRST half
+          (from phase 0).
+
+        The old stride is armed into the skill-transition blend continuing from
+        the phase just crossed (its own second half for a mid seam; the wrapped
+        next cycle for a whole seam).
+        """
+        cur_stride = stride_idx[ids]
+        p = parity[ids]
+        even_to_odd = (p == 0) & self._has_mid[cur_stride]     # LEFT foot lands
+        first_half = ~even_to_odd                              # RIGHT foot lands
+
+        # --- even -> odd: LEFT foot landed at phi_mid; play a SECOND half next ---
+        if bool(even_to_odd.any()):
+            eo = ids[even_to_odd]
+            cs = stride_idx[eo]
+            phi_mid = self._phi_mid[cs]                                    # [k]
+            overshoot_s = (phase[eo] - phi_mid) * old_tt[eo]
+            read = phi_mid - _MID_READ_EPS
+            land_pos, land_quat, old_foot_local = self._foot_landing_world(
+                cs, anchor_pos[eo], anchor_quat[eo], read,
+                self._la_pos_idx, self._la_ori_idx,
+            )
+            new_skill, new_stride = self._select_strides(
+                vel[eo], eligible=self._second_half_eligible(eo.numel(), self._allowed),
+            )
+            g_start = self._phi_mid[new_stride]                            # [k]
+            new_pos, new_quat, new_foot_local = self._solve_anchor_for_foot(
+                land_pos, land_quat, new_stride, g_start, self._la_pos_idx, self._straight_only,
+            )
+            # Blend the old stride's OWN second half into the new one, re-aligned
+            # so its left (stance) foot sits at the same landing as the new
+            # stride's (see Step 4).  Only arm on a real stride SWAP -- when the
+            # velocity holds the same stride the old continuation == the new
+            # segment, so the blend is an exact no-op; skipping it keeps the
+            # output identical while making ``blend_active`` mean "a real seam".
+            if self.transition.arms:
+                ch = new_stride != cs
+                if bool(ch.any()):
+                    even_ch = torch.ones_like(cs[ch], dtype=torch.bool)   # even->odd (2nd half)
+                    self.transition.arm(
+                        eo[ch], cs[ch], phase[eo][ch],
+                        pos_shift=(new_foot_local - old_foot_local)[ch],
+                        seg_len=self._blend_seg_len(cs[ch], new_stride[ch], even_ch),
+                    )
+            if self.project_to_ground:
+                new_pos[:, 2] = self.ground_height + self._ref_offset_z_mid[new_stride]
+            anchor_pos[eo] = new_pos
+            anchor_quat[eo] = new_quat
+            stride_idx[eo] = new_stride
+            skill_id[eo] = new_skill
+            parity[eo] = 1
+            phase[eo] = (g_start + overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
+
+        # --- odd -> even / whole: RIGHT foot landed at 1.0; play a FIRST half ---
+        if bool(first_half.any()):
+            fi = ids[first_half]
+            cs = stride_idx[fi]
+            overshoot_s = (phase[fi] - 1.0) * old_tt[fi]
+            new_pos, new_quat = self._stance_landing_world(cs, anchor_pos[fi], anchor_quat[fi])
+            new_skill, new_stride = self._select_strides(vel[fi])
+            # Old stride wraps into its next cycle; blend only on a real stride SWAP
+            # (a same-stride wrap is an exact no-op).  STEP entered = its next 1st
+            # half (phi_mid).
+            if self.transition.arms:
+                ch = new_stride != cs
+                if bool(ch.any()):
+                    odd_ch = torch.zeros_like(cs[ch], dtype=torch.bool)   # odd->even (1st half)
+                    self.transition.arm(
+                        fi[ch], cs[ch], (phase[fi] - 1.0)[ch],
+                        seg_len=self._blend_seg_len(cs[ch], new_stride[ch], odd_ch),
+                    )
+            if self.project_to_ground:
+                new_pos[:, 2] = self._anchor_ground_z(new_stride)
+            anchor_pos[fi] = new_pos
+            anchor_quat[fi] = new_quat
+            stride_idx[fi] = new_stride
+            skill_id[fi] = new_skill
+            parity[fi] = 0
+            phase[fi] = (overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
 
     def _print_yaw_diag(self, n: int) -> None:
         """Print, per straight-only clip, the max discarded yaw + its source stride.
@@ -833,6 +1180,14 @@ class OfflineClipGenerator:
         skill_buf = torch.empty(n, T, dtype=torch.uint8, device=dev)
         stride_buf = torch.empty(n, T, dtype=torch.int32, device=dev)
         target_vel_buf = torch.empty(n, T, 3, device=dev)  # ramped (vx, vy, wz) command
+        # Optional per-step skill-transition (cross-fade) debug logging.
+        if self.debug_interp:
+            blend_active_buf = torch.zeros(n, T, dtype=torch.uint8, device=dev)
+            blend_alpha_buf = torch.zeros(n, T, device=dev)
+            # PRE-blend nominals (old continuation + pure new segment), NaN where
+            # not mid-blend; baked to clip-world after the rollout like y_des.
+            blend_old_buf = torch.full((n, T, P), float("nan"), device=dev)
+            blend_new_buf = torch.full((n, T, P), float("nan"), device=dev)
 
         # --- Initial state ---
         vel = self.sampler.reset(n)                          # [n, 3]
@@ -847,6 +1202,9 @@ class OfflineClipGenerator:
                 self._diag_yaw_stride = torch.full((n,), -1, dtype=torch.long, device=dev)
             else:
                 self._diag_yaw_abs = self._diag_yaw_signed = self._diag_yaw_stride = None
+            # Half-cycle parity for the per-step terrain rollout too; terrain-only
+            # clips spawn on tread 0 with the right ankle as stance (parity 0).
+            parity = torch.zeros(n, dtype=torch.long, device=dev)
         else:
             skill_id, stride_idx = self._select_strides(vel)  # [n], [n]
             anchor_pos = torch.zeros(n, 3, device=dev)
@@ -855,6 +1213,10 @@ class OfflineClipGenerator:
             anchor_quat = torch.zeros(n, 4, device=dev)
             anchor_quat[:, 3] = 1.0                          # identity (xyzw, w last)
             on_stairs = ground_z = terrain_done = band_idx = None
+            # Half-cycle parity: 0 = playing a stride's FIRST half (right stance,
+            # left swinging), 1 = SECOND half (left stance, right swinging).  The
+            # flat rollout re-anchors per STEP, alternating the landing foot.
+            parity = torch.zeros(n, dtype=torch.long, device=dev)
         phase = torch.zeros(n, device=dev)
 
         # Reset the skill-transition strategy for this batch.  Seams are armed on
@@ -878,6 +1240,15 @@ class OfflineClipGenerator:
             # contact -- it mutates the manager's cached indices, which the top of
             # the next iter resets.)
             ypos, yvel = self.transition.apply(ypos, yvel)
+            if self.debug_interp:
+                act, alp = self.transition.debug_blend_state()
+                if act is not None:
+                    blend_active_buf[:, t] = act.to(torch.uint8)
+                    blend_alpha_buf[:, t] = alp
+                oo, nn = self.transition.debug_blend_outputs()
+                if oo is not None:
+                    blend_old_buf[:, t] = oo
+                    blend_new_buf[:, t] = nn
 
             y_des[:, t] = ypos
             dy_des[:, t] = yvel
@@ -898,47 +1269,30 @@ class OfflineClipGenerator:
             vel = self.sampler.step()
             vel = self._apply_goal_steer(vel, anchor_pos, anchor_quat, on_stairs)
 
-            # 3. Advance phase; handle stride-boundary crossings.
+            # 3. Advance phase; handle stride-boundary crossings.  BOTH rollouts
+            # commit per STEP (half cycle): an even-parity clip crosses at its
+            # stride's mid-cycle strike ``phi_mid`` (LEFT foot lands), an
+            # odd-parity clip at the cycle wrap ``phi=1.0`` (RIGHT foot lands).
             old_tt = self._total_time[stride_idx]            # [n]
             phase = phase + self.dt / old_tt
-            crossed = phase >= 1.0
+            target = torch.where(
+                (parity == 0) & self._has_mid[stride_idx],
+                self._phi_mid[stride_idx], torch.ones_like(phase),
+            )
+            crossed = phase >= target
             if crossed.any():
                 ids = all_ids[crossed]
-                # Time overshoot past the old stride end (seconds) -- carried
-                # into the new stride so the global timeline stays uniform dt.
-                overshoot_s = (phase[ids] - 1.0) * old_tt[ids]
-                # Arm the skill-transition blend (flat AND terrain seams) BEFORE
-                # the boundary overwrites stride_idx / phase: the old (leaving)
-                # stride keeps going into its next cycle, re-anchored to the new
-                # stance ref.  On terrain the new ref is the stair stance snap,
-                # which a correctly designed approach places very close to the old
-                # landing -- so the blend stays continuous (it does NOT float a
-                # tread up).  ``raw`` skips this.
-                if self.transition.arms:
-                    self.transition.arm(ids, stride_idx[ids], phase[ids] - 1.0)
                 if terrain:
                     self._terrain_boundary(
-                        ids, vel, phase, overshoot_s, anchor_pos, anchor_quat,
-                        stride_idx, skill_id, on_stairs, ground_z, terrain_done, band_idx,
+                        ids, vel, phase, old_tt, anchor_pos, anchor_quat,
+                        stride_idx, skill_id, on_stairs, ground_z, terrain_done,
+                        band_idx, parity,
                     )
-                    continue
-                # --- Flat path ---
-                # New anchor = reference stance landing of the old stride.
-                new_pos, new_quat = self._stance_landing_world(
-                    stride_idx[ids], anchor_pos[ids], anchor_quat[ids],
-                )
-                # New stride from the current (ramped) velocity.
-                new_skill, new_stride = self._select_strides(vel[ids])
-                # Pin the new anchor z to the new stride's natural ankle height
-                # (foot on the ground, no cumulative z drift).
-                if self.project_to_ground:
-                    new_pos[:, 2] = self._anchor_ground_z(new_stride)
-                # Commit.
-                anchor_pos[ids] = new_pos
-                anchor_quat[ids] = new_quat
-                stride_idx[ids] = new_stride
-                skill_id[ids] = new_skill
-                phase[ids] = (overshoot_s / self._total_time[new_stride]).clamp_(min=0.0)
+                else:
+                    self._flat_boundary_per_step(
+                        ids, vel, phase, old_tt, anchor_pos, anchor_quat,
+                        stride_idx, skill_id, parity,
+                    )
 
         # Terrain-only clips must climb for the WHOLE clip -- they should never
         # top out and fall back to a flat gait.  If any did, the staircase is too
@@ -969,6 +1323,18 @@ class OfflineClipGenerator:
             y_des, dy_des, anchor_pos_buf, anchor_quat_buf,
             self.pos_output_names, self.vel_output_names,
         )
+        # Bake the debug nominals through the SAME anchor schedule so they are in
+        # the clip-world frame too (NaN frames stay NaN; velocity is unused).
+        if self.debug_interp:
+            _dy = torch.zeros(n, T, V, device=dev)
+            bake_outputs_to_world(
+                blend_old_buf, _dy, anchor_pos_buf, anchor_quat_buf,
+                self.pos_output_names, self.vel_output_names,
+            )
+            bake_outputs_to_world(
+                blend_new_buf, _dy, anchor_pos_buf, anchor_quat_buf,
+                self.pos_output_names, self.vel_output_names,
+            )
 
         meta = {
             "dt": self.dt,
@@ -980,7 +1346,7 @@ class OfflineClipGenerator:
             "ref_frame": self.ref_frame,
             "skill_list": list(self.sampler.skill_list),
         }
-        return {
+        out = {
             "y_des": y_des,
             "dy_des": dy_des,
             "contact": contact_buf,
@@ -991,3 +1357,9 @@ class OfflineClipGenerator:
             "terrain_type": self._terrain_type,
             "meta": meta,
         }
+        if self.debug_interp:
+            out["blend_active"] = blend_active_buf   # [n, T] uint8: mid-cross-fade
+            out["blend_alpha"] = blend_alpha_buf     # [n, T] float: blend weight 0->1
+            out["blend_old"] = blend_old_buf         # [n, T, P] pre-blend OLD nominal (NaN off-blend)
+            out["blend_new"] = blend_new_buf         # [n, T, P] pre-blend NEW nominal (NaN off-blend)
+        return out

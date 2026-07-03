@@ -29,7 +29,8 @@ from .trajectory_manager import TrajectoryManager, TrajectoryType
 # (the ``self.data`` keys, the per-domain metadata lists, or the tau helpers
 # produced by ``_build_global_tensors``) changes shape or meaning.  A bump
 # invalidates every existing cache file so stale layouts are never restored.
-_LIBRARY_CACHE_VERSION = 1
+# v2: ConditionerData gained per-terrain-dim (lo, hi) bounds (range support).
+_LIBRARY_CACHE_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,20 @@ _LIBRARY_CACHE_VERSION = 1
 
 @dataclass
 class ConditionerData:
-    """Structured conditioning information parsed from a trajectory YAML."""
+    """Structured conditioning information parsed from a trajectory YAML.
+
+    A terrain dimension (``terrain_width`` / ``terrain_height`` /
+    ``terrain_length``) may be declared either as a single number or as a
+    ``{min, max}`` *range* (with either bound optional).  A range marks the
+    dimension a *don't-care* for this trajectory: it was optimized to work for
+    any terrain value inside the range.  The ``terrain_*`` fields hold a
+    representative scalar (the fixed value, or a finite bound / the midpoint of
+    a range) used for the conditioning tensor and the terrain mask; the paired
+    ``terrain_*_bounds`` ``(lo, hi)`` carry the full extent (``lo == hi`` for a
+    fixed value; ``hi == +inf`` / ``lo == 0`` for an open range).  The bounds
+    drive the range-aware terrain-dim selection filter and the offline
+    generator's per-terrain dimension sampling.
+    """
 
     vel_x: float = 0.0
     vel_y: float = 0.0
@@ -47,12 +61,31 @@ class ConditionerData:
     terrain_width: float = 0.0
     terrain_height: float = 0.0
     terrain_length: float = 0.0
+    terrain_width_bounds: tuple[float, float] = (0.0, 0.0)
+    terrain_height_bounds: tuple[float, float] = (0.0, 0.0)
+    terrain_length_bounds: tuple[float, float] = (0.0, 0.0)
 
     def to_continuous_tensor(self) -> list[float]:
         """Return the continuous conditioning dimensions as a flat list."""
         return [
             self.vel_x, self.vel_y, self.vel_yaw,
             self.terrain_width, self.terrain_height, self.terrain_length,
+        ]
+
+    def terrain_bounds_lo(self) -> list[float]:
+        """Lower bounds ``[width, height, length]`` of the terrain dims."""
+        return [
+            self.terrain_width_bounds[0],
+            self.terrain_height_bounds[0],
+            self.terrain_length_bounds[0],
+        ]
+
+    def terrain_bounds_hi(self) -> list[float]:
+        """Upper bounds ``[width, height, length]`` (``+inf`` for open ranges)."""
+        return [
+            self.terrain_width_bounds[1],
+            self.terrain_height_bounds[1],
+            self.terrain_length_bounds[1],
         ]
 
 
@@ -392,24 +425,64 @@ class MultiSkillManager(ManagerBase):
         return yamls
 
     @staticmethod
+    def _parse_terrain_dim(raw: Any) -> tuple[float, tuple[float, float]]:
+        """Parse one terrain dimension into ``(representative, (lo, hi))``.
+
+        A plain number is a fixed value (``lo == hi == value``).  A
+        ``{min, max}`` dict is a range (a *don't-care* dimension); an omitted
+        ``min`` defaults to ``0.0`` and an omitted ``max`` to ``+inf``.  The
+        representative scalar (for the conditioning tensor / terrain mask) is
+        the midpoint of a finite range, the single finite bound of a half-open
+        range, or the fixed value.
+        """
+        if isinstance(raw, dict):
+            lo = float(raw.get("min", 0.0))
+            hi = float(raw.get("max", float("inf")))
+            if math.isfinite(lo) and math.isfinite(hi):
+                rep = 0.5 * (lo + hi)
+            elif math.isfinite(lo):
+                rep = lo
+            elif math.isfinite(hi):
+                rep = hi
+            else:
+                rep = 0.0
+            return rep, (lo, hi)
+        v = float(raw)
+        return v, (v, v)
+
+    @staticmethod
     def _parse_conditioner(raw_conditioner: Any, skill_name: str) -> ConditionerData:
         """Parse a conditioner field from YAML into ConditionerData.
 
-        Supports both old format (list of floats) and new format (dict).
+        Supports both old format (list of floats) and new format (dict).  Each
+        terrain dimension in the dict form may itself be a single number or a
+        ``{min, max}`` range (see :meth:`_parse_terrain_dim`).
         """
         if isinstance(raw_conditioner, list):
             # Old format: [min, max] — use midpoint as vel_x, zeros elsewhere
             mid = sum(raw_conditioner) / len(raw_conditioner)
             return ConditionerData(vel_x=mid)
         elif isinstance(raw_conditioner, dict):
+            w_rep, w_bounds = MultiSkillManager._parse_terrain_dim(
+                raw_conditioner.get("terrain_width", 0.0)
+            )
+            h_rep, h_bounds = MultiSkillManager._parse_terrain_dim(
+                raw_conditioner.get("terrain_height", 0.0)
+            )
+            l_rep, l_bounds = MultiSkillManager._parse_terrain_dim(
+                raw_conditioner.get("terrain_length", 0.0)
+            )
             return ConditionerData(
                 vel_x=raw_conditioner.get("vel_x", 0.0),
                 vel_y=raw_conditioner.get("vel_y", 0.0),
                 vel_yaw=raw_conditioner.get("vel_yaw", 0.0),
                 terrain=raw_conditioner.get("terrain", "flat"),
-                terrain_width=raw_conditioner.get("terrain_width", 0.0),
-                terrain_height=raw_conditioner.get("terrain_height", 0.0),
-                terrain_length=raw_conditioner.get("terrain_length", 0.0),
+                terrain_width=w_rep,
+                terrain_height=h_rep,
+                terrain_length=l_rep,
+                terrain_width_bounds=w_bounds,
+                terrain_height_bounds=h_bounds,
+                terrain_length_bounds=l_bounds,
             )
         else:
             raise ValueError(
@@ -760,6 +833,21 @@ class MultiSkillManager(ManagerBase):
             all_conds, dtype=torch.float32, device=self.device,
         )  # [T, C]
 
+        # Per-trajectory terrain-dim bounds (width, height, length): a fixed
+        # value has lo == hi; a range (a ``{min, max}`` conditioner) has
+        # lo < hi (hi may be +inf for an open range).  Kept alongside
+        # ``_global_conditioning`` (which stores only the representative scalar)
+        # so the terrain-dim filter can do range containment and the offline
+        # generator can sample a range dim's built value.
+        self._terrain_dim_lo = torch.tensor(
+            [cd.terrain_bounds_lo() for cd in conditioner_datas],
+            dtype=torch.float32, device=self.device,
+        )  # [T, 3]
+        self._terrain_dim_hi = torch.tensor(
+            [cd.terrain_bounds_hi() for cd in conditioner_datas],
+            dtype=torch.float32, device=self.device,
+        )  # [T, 3]
+
         # Terrain mask: True if trajectory has real terrain (positive dims).
         # Flat trajectories use -1 as a sentinel for terrain dimensions.
         terrain_dims = self._global_conditioning[:, 3:]  # [T, 3]
@@ -1085,14 +1173,17 @@ class MultiSkillManager(ManagerBase):
             return None
         dims, valid = self._terrain_dims_at(anchor_xy)           # [N, 3], [N]
         needs_dims = self._skill_has_terrain[env_traj_skill_ids] & valid  # [N]
-        # Conditioning columns (see ConditionerData.to_continuous_tensor):
-        # [vx, vy, vyaw, terrain_width, terrain_height, terrain_length].
-        traj_dims = self._global_conditioning[:, 3:6].unsqueeze(0)   # [1, T, 3]
+        # Range containment against each trajectory's terrain-dim bounds
+        # (see ConditionerData): a fixed dim (lo == hi) reduces to
+        # |feature - value| <= tol; a range dim matches any in-range feature.
+        lo = self._terrain_dim_lo.unsqueeze(0)                       # [1, T, 3]
+        hi = self._terrain_dim_hi.unsqueeze(0)                       # [1, T, 3]
+        feat = dims.unsqueeze(1)                                     # [N, 1, 3]
         tols = self._terrain_dim_tols                                # [3]
-        # NaN terrain dims compare False against any tolerance, so the
-        # explicit isnan() OR is what marks them unconstrained.
+        # NaN terrain dims compare False against any bound, so the explicit
+        # isnan() OR is what marks them unconstrained.
         per_dim_ok = (
-            ((traj_dims - dims.unsqueeze(1)).abs() <= tols)
+            ((feat >= lo - tols) & (feat <= hi + tols))
             | dims.isnan().unsqueeze(1)
         )                                                            # [N, T, 3]
         dim_ok = per_dim_ok.all(dim=-1)                              # [N, T]
@@ -1207,13 +1298,17 @@ class MultiSkillManager(ManagerBase):
             # the legacy ``needs_dims = _skill_has_terrain & valid`` gate).
             if use_terrain and self._skill_has_terrain_list[s]:
                 dims, valid = self._terrain_dims_at(anchor_xy[rows])   # [N_s,3],[N_s]
-                traj_dims = self._global_conditioning[
-                    off:off + cnt, 3:6
-                ].unsqueeze(0)                                          # [1, T_s, 3]
-                # NaN terrain dims compare False against tolerance, so the
+                # Range containment against each trajectory's terrain-dim
+                # bounds (fixed dims have lo == hi, reducing to the old
+                # |feature - value| <= tol; range dims accept any in-range
+                # feature).
+                lo = self._terrain_dim_lo[off:off + cnt].unsqueeze(0)  # [1, T_s, 3]
+                hi = self._terrain_dim_hi[off:off + cnt].unsqueeze(0)  # [1, T_s, 3]
+                feat = dims.unsqueeze(1)                                # [N_s, 1, 3]
+                # NaN terrain dims compare False against any bound, so the
                 # explicit isnan() OR is what marks them unconstrained.
                 per_dim_ok = (
-                    ((traj_dims - dims.unsqueeze(1)).abs() <= tols)
+                    ((feat >= lo - tols) & (feat <= hi + tols))
                     | dims.isnan().unsqueeze(1)
                 )                                                       # [N_s, T_s, 3]
                 dim_ok = per_dim_ok.all(dim=-1)                         # [N_s, T_s]
@@ -1886,10 +1981,12 @@ class MultiSkillManager(ManagerBase):
 
         - Half-periodic: 2 gates (phi=0.5 entering reflected second half;
           phi=1.0 wrapping back to first half).
-        - Full-periodic: 1 gate at phi=1.0 (cycle wrap).  TODO(zolkin): a
-          two-stride full-periodic gait has two contacts per cycle but only
-          gets one gate here — see the big TODO at the full-periodic branch
-          below; revisit before trusting long full-periodic runs.
+        - Full-periodic: 2 gates — the mid-cycle strike (gate 0: the swing
+          foot's touchdown that begins the second stride, at a phi *derived
+          from the contact schedule*, not hardcoded) and the cycle wrap
+          (gate 1: phi=1.0, the domain-0 stance foot re-striking).  A
+          full-periodic gait with no distinct mid-cycle strike (one stance
+          set for the whole cycle) falls back to a single gate at phi=1.0.
         - Episodic: 1 gate at phi=1.0 (end of trajectory).
         - Perpetual: 0 gates.
 
@@ -1929,31 +2026,48 @@ class MultiSkillManager(ManagerBase):
                 gate_body_names[ti][1] = list(first_domain_bodies)
                 gate_pre_size[ti, 1] = 0.5
                 num_gates[ti] = 2
-            elif tt == _FULL_PERIODIC_INT or tt == _EPISODIC_INT:
-                # =============================================================
-                # TODO(zolkin): REVISIT FULL-PERIODIC CONTACT GATING.
-                # -------------------------------------------------------------
-                # A full-periodic gait is TWO strides, so it has TWO foot-strike
-                # contacts per cycle (one per stride).  But this branch arms only
-                # ONE gate, at phi=1.0 (the cycle wrap).  The mid-cycle foot
-                # strike (start of the second stride) is NEVER gated, so contact-
-                # based phase resync happens once per FULL cycle (every two
-                # strides) instead of once per stride like half-periodic does.
-                #
-                # The entire new gait library (2026-06-13_..._merged:
-                # running / walk_forward / walk_backwards) is full_periodic, so
-                # EVERY locomotion env now resyncs at half the rate it used to.
-                # Worried this lets phase drift too far between corrections and
-                # hurts tracking / contact timing.  THINK ABOUT THIS before
-                # trusting a long full-periodic run.
-                #
-                # Fix sketch: add a second gate at the mid-cycle contact domain
-                # (the domain where the second stride's stance begins) with its
-                # own gate_body_names + gate_pre_size, and bump MAX_GATES if
-                # needed.  The mid-cycle phi is NOT necessarily 0.5 — derive it
-                # from the per-domain contact structure, don't hardcode it.  Keep
-                # episodic (which shares this branch) at a single end gate.
-                # =============================================================
+            elif tt == _FULL_PERIODIC_INT:
+                # A full-periodic gait is TWO strides with TWO foot-strike
+                # contacts per cycle.  Gate 0 is the mid-cycle strike (the swing
+                # foot's touchdown that starts the second stride); gate 1 is the
+                # cycle-wrap strike (phi=1.0).  Gating both restores per-stride
+                # contact resync (parity with half-periodic).  The mid-cycle phi
+                # is DERIVED from the contact schedule -- the first domain after
+                # domain 0 whose contact set is non-empty and differs from the
+                # domain-0 stance (the opposite foot coming into contact; robust
+                # to intervening flight phases) -- not hardcoded to 0.5.
+                nd = int(self.data["num_original_domains"][ti].item())
+                stance0 = set(first_domain_bodies)
+                mid_dom = next(
+                    (
+                        di for di in range(1, nd)
+                        if self._contact_bodies_per_domain[ti][di]
+                        and set(self._contact_bodies_per_domain[ti][di]) != stance0
+                    ),
+                    None,
+                )
+                if mid_dom is not None:
+                    total_t = float(self.data["total_time"][ti].item())
+                    phi_mid = float(self.data["domain_boundaries"][ti, mid_dom].item()) / total_t
+                    gate_phi[ti, 0] = phi_mid
+                    gate_active[ti, 0] = True
+                    gate_body_names[ti][0] = list(self._contact_bodies_per_domain[ti][mid_dom])
+                    gate_pre_size[ti, 0] = phi_mid
+
+                    gate_phi[ti, 1] = 1.0
+                    gate_active[ti, 1] = True
+                    gate_body_names[ti][1] = list(first_domain_bodies)
+                    gate_pre_size[ti, 1] = 1.0 - phi_mid
+                    num_gates[ti] = 2
+                else:
+                    # No distinct mid-cycle strike (single stance set): fall back
+                    # to the single cycle-wrap gate.
+                    gate_phi[ti, 0] = 1.0
+                    gate_active[ti, 0] = True
+                    gate_body_names[ti][0] = list(first_domain_bodies)
+                    gate_pre_size[ti, 0] = 1.0
+                    num_gates[ti] = 1
+            elif tt == _EPISODIC_INT:
                 gate_phi[ti, 0] = 1.0
                 gate_active[ti, 0] = True
                 gate_body_names[ti][0] = list(first_domain_bodies)

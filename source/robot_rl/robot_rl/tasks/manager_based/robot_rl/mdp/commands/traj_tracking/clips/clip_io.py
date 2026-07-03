@@ -34,6 +34,16 @@ _DENSE_DTYPES: dict[str, str] = {
     "target_vel": "float32",
 }
 
+# Optional per-step DEBUG datasets (only present when the generator ran with
+# ``debug_interp=True``): the skill-transition cross-fade state per step, for the
+# ``plot_clip_frames`` util.  Created lazily on the first batch that carries them.
+_DEBUG_DTYPES: dict[str, str] = {
+    "blend_active": "uint8",    # [N, T] 1 while mid-cross-fade
+    "blend_alpha": "float32",   # [N, T] blend weight 0 (pure old) -> 1 (pure new)
+    "blend_old": "float32",     # [N, T, P] pre-blend OLD nominal (NaN off-blend)
+    "blend_new": "float32",     # [N, T, P] pre-blend NEW nominal (NaN off-blend)
+}
+
 # Per-clip (1-D, shape [N]) terrain tags.  ``terrain_id`` indexes the embedded
 # ``terrain_manifest`` root attr (-1 for flat clips, which have no manifest
 # entry); ``terrain_type_code`` indexes ``_TERRAIN_TYPE_NAMES``.
@@ -78,6 +88,7 @@ class ClipLibraryWriter:
             "stride_idx": (num_clips, T),
             "target_vel": (num_clips, T, 3),
         }
+        self._compression = compression
         self._f = h5py.File(self.path, "w")
         for key, shape in shapes.items():
             # Chunk per-clip so reads of a single clip touch one chunk.
@@ -117,6 +128,19 @@ class ClipLibraryWriter:
         if ttype not in _TERRAIN_TYPE_CODE:
             raise ValueError(f"unknown terrain_type '{ttype}'; expected one of {_TERRAIN_TYPE_NAMES}")
         self._f["terrain_type_code"][start_idx:end] = _TERRAIN_TYPE_CODE[ttype]
+        # Optional debug datasets (only when the generator logged them); create
+        # lazily on the first batch that carries them.
+        for key, dt in _DEBUG_DTYPES.items():
+            if key not in batch:
+                continue
+            arr = batch[key].detach().to("cpu").numpy()
+            if key not in self._f:
+                shape = (self.num_clips,) + arr.shape[1:]   # per-step [.,T] or [.,T,P]
+                self._f.create_dataset(
+                    key, shape=shape, dtype=dt,
+                    chunks=(1,) + arr.shape[1:], compression=self._compression,
+                )
+            self._f[key][start_idx:end] = arr.astype(dt, copy=False)
         self._written = max(self._written, end)
 
     def set_attr(self, name: str, value) -> None:
@@ -205,3 +229,32 @@ def load_clip_library(
                 decoded = v.item() if isinstance(v, np.generic) else v
             (meta if k in meta_keys else attrs)[k] = decoded
     return ClipLibraryData(meta=meta, attrs=attrs, **tensors)
+
+
+def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
+    """Group clip indices by their ``terrain_id`` (``-1`` = flat / no terrain).
+
+    Used to assign each env a clip from the terrain that env stands on: a reset
+    (or the standalone verify script) looks up the env's terrain id and samples
+    uniformly from that terrain's clip list.
+
+    Args:
+        lib: A loaded clip library (must carry per-clip ``terrain_id``).
+
+    Returns:
+        ``{terrain_id: clip_indices}`` where each value is a 1-D long tensor of
+        clip indices (on ``lib.terrain_id``'s device), for every distinct
+        ``terrain_id`` present (including ``-1``).
+
+    Raises:
+        ValueError: If the library carries no per-clip ``terrain_id`` (a
+            pre-terrain library); such libraries cannot be terrain-assigned.
+    """
+    if lib.terrain_id.numel() == 0:
+        raise ValueError(
+            "clip library has no per-clip terrain_id (pre-terrain library); "
+            "cannot group clips by terrain. Regenerate with the terrain-aware "
+            "generator (scripts/rsl_rl/generate_terrain_clips.py)."
+        )
+    tid = lib.terrain_id.to(torch.long)
+    return {int(t): (tid == int(t)).nonzero(as_tuple=False).flatten() for t in torch.unique(tid)}

@@ -1136,14 +1136,20 @@ class BatchedMultiSkillCommand(BaseTrajectoryCommand):
 
         Delegates to the shared :func:`traj_step_length_table` so the online
         command and the offline clip generator compute the identical quantity
-        (the forward swing-foot reach at the end of the first stride, per
-        trajectory; ``inf`` for gate-less trajectories).  This is the same
-        quantity :meth:`_ref_xy_at_next_gate` extracts at runtime (before the
-        world transform), so the table and the live prediction stay consistent.
+        (the forward reach of the foot that LANDS at the first gate, per
+        trajectory; ``inf`` for gate-less trajectories).
+
+        TODO(zolkin): :meth:`_ref_xy_at_next_gate` still resolves the swing foot
+        via the bezier reference frame (``_ref_frame_map``), which is the right
+        ankle for every domain in the current library.  Before the two-gate
+        full-periodic change that matched (the sole gate was the right-foot cycle
+        wrap), but the new mid-cycle gate lands the LEFT foot, so the live
+        touchdown prediction now reads the wrong foot at that gate.  Route
+        ``_ref_xy_at_next_gate`` through the same contact-schedule landing-foot
+        resolution (``_landing_foot_pos_x_cols``) so the table and the live
+        prediction agree again.
         """
-        self._traj_step_length = traj_step_length_table(
-            self.manager, self._ref_frame_to_pos_xy_idx, self.device,
-        )
+        self._traj_step_length = traj_step_length_table(self.manager, self.device)
 
     def _resolve_vel_cmd(self) -> None:
         """Lazy-resolve the velocity command term on first compute."""

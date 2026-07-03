@@ -114,7 +114,8 @@ def main() -> int:
     p.add_argument("--clip-length", type=float, default=12.0, help="Clip length (s).")
     p.add_argument("--dt", type=float, default=0.02, help="Control-step dt (s).")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--stair-skill", default="stair_up", help="Stair skill subfolder name (for the step-dim scan).")
+    p.add_argument("--stair-skill", default=None, help="Stair skill subfolder name for the step-dim scan (default: the auto-detected terrain-aware skill).")
+    p.add_argument("--stair-width-max", type=float, default=3.0, help="Upper bound (m) when the stair library declares terrain_width as an open range (e.g. {min: 1.0}); tread widths are sampled per terrain in [range_min, this].")
     p.add_argument("--num-steps-min", type=int, default=4)
     p.add_argument("--num-steps-max", type=int, default=8)
     p.add_argument("--lead-in-min", type=float, default=1.5, help="[transition] flat lead-in (start platform) FLOOR (m).")
@@ -135,11 +136,15 @@ def main() -> int:
     p.add_argument("--nav-heading-kp", type=float, default=0.5, help="[transition] heading gain toward the goal bearing.")
     p.add_argument("--nav-vy-clamp", type=float, default=0.4, help="[transition] |vy| clamp on the nav lateral command (m/s).")
     p.add_argument("--nav-wz-clamp", type=float, default=0.5, help="[transition] |wz| clamp on the nav yaw command (rad/s).")
-    p.add_argument("--transition", choices=("raw", "linear"), default="linear",
-                   help="Skill-transition (seam) strategy for ALL clips incl. the flat->stair commit: 'linear' cross-fade (default, online parity) or 'raw' hard cut.")
+    p.add_argument("--transition", choices=("raw", "linear", "quadratic"), default="linear",
+                   help="Skill-transition (seam) strategy for ALL clips incl. the flat->stair commit: 'linear' cross-fade (default, online parity), 'quadratic' ease-in cross-fade (holds the old stride longer), or 'raw' hard cut.")
     p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
-                   help="Phi window for the 'linear' transition cross-fade (matches the online transition_blend_end_phi).")
+                   help="Cross-fade completion length as a fraction of a STEP (half-cycle), in (0, 1]; e.g. 0.3 settles 30%% of the way into the step. Applies to 'linear'/'quadratic'.")
+    p.add_argument("--blend-pace", choices=("old", "new", "longer"), default="old",
+                   help="Which stride's step DURATION the cross-fade window is a fraction of at a cross-gait (walk<->stair) seam: 'old' leaving stride (default), 'new' incoming, or 'longer' of the two.")
     p.add_argument("--approach-threshold", type=float, default=0.15, help="Stance-to-stair distance (m) to commit the climb.")
+    p.add_argument("--debug-interp", action="store_true",
+                   help="Log per-step skill-transition state (blend_active/blend_alpha) into the .h5 for scripts/rsl_rl/plot_clip_frames.py.")
     p.add_argument("--device", default="cpu")
     p.add_argument("--hf-repo", default=None, help="Optional HuggingFace repo id for the source library.")
     args = p.parse_args()
@@ -180,15 +185,27 @@ def main() -> int:
     flat_probs = _probs(skill_list, {k: v for k, v in default_probs.items() if k != stair_skill})
     samplers = {"flat": _make_sampler(buckets, skill_list, flat_probs, args.dt, args.seed + 1)}
 
-    hd_grid, width, specs, walk_names = [], 0.0, [], []
+    hd_grid, width_range, specs, walk_names = [], (0.0, 0.0), [], []
     if has_terrain_lib:
-        # Discrete (step_height, step_depth) grid + tread width from the library.
-        hd_grid = scan_stair_step_dims(args.source, hf_repo=args.hf_repo, skill_folder=args.stair_skill)
+        # Discrete (step_height, step_depth) grid from the library.  The scan
+        # folder defaults to the auto-detected terrain skill (its name is the
+        # subfolder name), overridable with --stair-skill.
+        scan_folder = args.stair_skill or stair_skill
+        hd_grid = scan_stair_step_dims(args.source, hf_repo=args.hf_repo, skill_folder=scan_folder)
         stair_idx = manager.skill_name_to_idx[stair_skill]
         off = manager._skill_traj_offset[stair_idx]
         cnt = manager.skills[stair_idx].num_trajectories
-        width = float(manager._global_conditioning[off:off + cnt, 3].median())
-        print(f"[generate_terrain_clips] stair skill '{stair_skill}': {len(hd_grid)} (h,d) pairs, width={width:.3f}")
+        # Tread-width range declared by the stair trajectories (terrain_width).
+        # A fixed width has lo == hi (built at that width on every terrain); an
+        # open range (e.g. {min: 1.0}) has hi == +inf, capped by --stair-width-max
+        # and sampled per terrain by sample_terrain_specs.
+        w_lo = float(manager._terrain_dim_lo[off:off + cnt, 0].min())
+        w_hi = float(manager._terrain_dim_hi[off:off + cnt, 0].max())
+        w_hi = min(w_hi, args.stair_width_max)
+        w_lo = min(w_lo, w_hi)
+        width_range = (w_lo, w_hi)
+        span = f"[{w_lo:.3f}, {w_hi:.3f}]" if w_hi > w_lo else f"{w_lo:.3f} (fixed)"
+        print(f"[generate_terrain_clips] stair skill '{stair_skill}': {len(hd_grid)} (h,d) pairs, tread width {span}")
 
         fwd_buckets = {
             name: _Bucket(lin_vel_x=b.lin_vel_x, lin_vel_y=(0.0, 0.0), ang_vel_z=(0.0, 0.0))
@@ -225,7 +242,7 @@ def main() -> int:
 
         rng = np.random.default_rng(args.seed)
         specs = sample_terrain_specs(
-            rng, counts["terrain"], counts["transition"], hd_grid, width,
+            rng, counts["terrain"], counts["transition"], hd_grid, width_range,
             num_steps_range=(args.num_steps_min, args.num_steps_max),
             lead_in_range=(args.lead_in_min, args.lead_in_max),
             end_platform=args.end_platform,
@@ -245,10 +262,12 @@ def main() -> int:
         exclude_skills=[stair_skill] if has_terrain_lib else [],
         transition=args.transition,
         transition_blend_end_phi=args.transition_blend_end_phi,
+        blend_pace=args.blend_pace,
         approach_threshold=args.approach_threshold,
         nav_gains=(args.nav_y_kp, args.nav_y_kd, args.nav_heading_kp),
         nav_vy_clamp=(-args.nav_vy_clamp, args.nav_vy_clamp),
         nav_wz_clamp=(-args.nav_wz_clamp, args.nav_wz_clamp),
+        debug_interp=args.debug_interp,
         device=device,
     )
 
@@ -279,10 +298,12 @@ def main() -> int:
         "nav_wz_clamp": args.nav_wz_clamp,
         "transition": args.transition,
         "transition_blend_end_phi": args.transition_blend_end_phi,
+        "blend_pace": args.blend_pace,
         "approach_threshold": args.approach_threshold,
         "skill_list": skill_list,
         "hd_grid": [list(hd) for hd in hd_grid],
-        "width": width,
+        "width_range": list(width_range),
+        "stair_width_max": args.stair_width_max,
     }
     clip_fp = fingerprint_clip_config(manager.library_fingerprint, gen_config, args.seed)
 

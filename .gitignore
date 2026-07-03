@@ -103,7 +103,8 @@ transfer/sim/experiments/comparison_logs
 /amy_remote_mount/
 talos_remote_mount/
 transfer/sim/experiments/temp_holder/
-hf/
+# hf/ is a symlink in worktrees; anchor it so trailing-slash matching still ignores it
+/hf
 /uv.lock
 
 todo-report-*
@@ -111,5 +112,9 @@ todo-report-*
 claude_plans/
 .claude/
 # Generated motion-clip libraries (large HDF5) — repo-root only,
-# NOT the source subpackage .../traj_tracking/clips/
-/clips/
+# NOT the source subpackage .../traj_tracking/clips/.  No trailing slash so it also
+# ignores the `clips` SYMLINK used in git worktrees (a dir-only rule would miss it).
+/clips
+
+# Diagnostic plot outputs (regenerable)
+/plots/

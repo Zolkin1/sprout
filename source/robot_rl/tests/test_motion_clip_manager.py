@@ -45,6 +45,8 @@ def _synthetic_lib(num_clips=4, T=10) -> ClipLibraryData:
         skill_id=torch.zeros(num_clips, T, dtype=torch.uint8),
         stride_idx=torch.zeros(num_clips, T, dtype=torch.int32),
         target_vel=torch.zeros(num_clips, T, 3),
+        terrain_id=torch.full((num_clips,), -1, dtype=torch.int32),
+        terrain_type_code=torch.zeros(num_clips, dtype=torch.uint8),
         meta=meta, attrs={},
     )
 
