@@ -39,6 +39,7 @@ from .transforms import (
     frame_block_start,
     orientation_slices,
     relative_state,
+    sanitize_height_scan,
     target_state_dim,
 )
 
@@ -285,6 +286,9 @@ class FutureStateDataset(Dataset):
         # Height token = the recorded height scan at the snap row (per-ray ground
         # clearance, body-relative). Replaces the old root-z scalar. K resolved here.
         hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P, K)
+        # Missed ray-cast rays are recorded as -inf; sanitize before the normalizer
+        # fit so they don't produce a NaN loss (matches the deploy token builder).
+        hs = sanitize_height_scan(hs)
         self.height = hs[snap_rows].contiguous()  # (Nw, K)
         self.height_dim = self.height.shape[1]
         cfg.height_dim = self.height_dim

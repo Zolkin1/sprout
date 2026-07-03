@@ -371,3 +371,31 @@ def ori6d_orthonormality_penalty(d6: torch.Tensor) -> torch.Tensor:
     n1 = a1.norm(dim=-1)
     n2 = a2.norm(dim=-1)
     return dot.pow(2).mean() + (n1 - 1.0).pow(2).mean() + (n2 - 1.0).pow(2).mean()
+
+
+HEIGHT_SCAN_CLIP = 1.0
+"""Symmetric clip band (metres) for the height-scan conditioning signal.
+
+Matches the ``height_scan`` RL observation term's ``clip=(-1, 1)`` so the FM's
+height token, the recorded training data, and the deployed policy all condition
+on an identically-bounded signal.
+"""
+
+
+def sanitize_height_scan(height_scan: torch.Tensor, clip: float = HEIGHT_SCAN_CLIP) -> torch.Tensor:
+    """Make a raw height scan finite and clamp it to ``[-clip, clip]``.
+
+    Ray-cast rays that miss the (finite) mesh come back as ``-inf`` in Isaac Lab
+    (``pos_z - inf - offset``). Left raw, a single such value makes the height
+    normalizer's per-dimension mean non-finite and yields a NaN training loss.
+    This maps non-finite entries to the clip band (a miss -> the band edge) and
+    bounds the signal to the range the teacher's ``height_scan`` obs term uses.
+
+    Args:
+        height_scan: Raw per-ray ground clearance, shape ``(..., K)``.
+        clip: Symmetric clip magnitude in metres.
+
+    Returns:
+        Finite, clamped height scan with the same shape as the input.
+    """
+    return torch.nan_to_num(height_scan, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)

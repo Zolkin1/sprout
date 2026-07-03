@@ -30,7 +30,12 @@ from .config import FlowMatchingConfig
 from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
-from .transforms import relative_state as _relative_state, state_to_absolute, target_state_dim
+from .transforms import (
+    relative_state as _relative_state,
+    sanitize_height_scan,
+    state_to_absolute,
+    target_state_dim,
+)
 
 
 # ----------------------------------------------------------------------
@@ -285,7 +290,7 @@ def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch
     Returns:
         Normalized height-scan token ``(V, height_dim)``.
     """
-    return ctx.height_norm.normalize(height_scan)
+    return ctx.height_norm.normalize(sanitize_height_scan(height_scan))
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:

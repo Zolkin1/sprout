@@ -115,6 +115,11 @@ def build_height_token(ctx: FmContext, height_scan: np.ndarray) -> np.ndarray:
         scan = scan[None, :]
     if scan.shape[-1] != ctx.height_dim:
         raise ValueError(f"height_scan width {scan.shape[-1]} != fm height_dim {ctx.height_dim}.")
+    # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds
+    # in the height normalization, so a non-finite value here would poison it. Clamp to
+    # the +/-1 m band the token is trained on (mirrors
+    # flow_matching.transforms.sanitize_height_scan, HEIGHT_SCAN_CLIP=1.0).
+    scan = np.clip(np.nan_to_num(scan, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
     return scan
 
 
