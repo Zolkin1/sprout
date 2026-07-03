@@ -352,6 +352,8 @@ class G1TeacherEnvCfgPlay(G1TeacherEnvCfg):
         self.events.randomize_ground_contact_friction = None
         # Draw the reference-trajectory markers in the viewer.
         self.commands.traj_ref.debug_vis = True
+        # Draw the height-scan ray hits in the viewer.
+        self.scene.height_scanner.debug_vis = True
 
 
 @configclass
