@@ -310,7 +310,46 @@ def reset_on_motion_sequence(
     rotated[:, 2] = 0.0
     world_pos = env.scene.env_origins[env_ids] - rotated
 
-    # 3. World reference state at (clip, start_step, placement).
+    # 3-5. Ego re-anchor mask (clip envs are ego-anchored with probability
+    #      ``ego_anchor_fraction``, else world-anchored; ego-anchored envs get their
+    #      clip placement periodically snapped onto the robot root during the episode,
+    #      see MotionSequenceCommand._reanchor_ego_envs -- the closed-loop FM tracker
+    #      sets ego_anchor_fraction=1.0), then compute + write the reference spawn
+    #      state and commit the command's per-env clip state via the shared tail.
+    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
+    ego_mask = torch.rand(k, device=device) < ego_frac
+    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
+
+
+def _commit_clip_reset(
+    cmd,
+    asset: "Articulation",
+    env_ids: torch.Tensor,
+    clip_id: torch.Tensor,
+    start_step: torch.Tensor,
+    world_pos: torch.Tensor,
+    world_quat: torch.Tensor,
+    ego_mask: torch.Tensor,
+) -> None:
+    """Shared tail of the clip resets: reference world state -> sim + command state.
+
+    Given a per-env clip assignment (``clip_id`` / ``start_step``) and world placement
+    (``world_pos`` / ``world_quat``), computes the reference base pose / velocity /
+    joint state at that placement, writes it to the sim, and commits the
+    :class:`MotionSequenceCommand`'s per-env clip tracking state so the first
+    ``compute`` (at ``episode_length_buf == 0``) reproduces the spawn pose with zero
+    initial error.
+
+    Args:
+        cmd: The :class:`MotionSequenceCommand` term.
+        asset: The robot articulation.
+        env_ids: Env indices being reset.
+        clip_id: ``[k]`` clip index per resetting env.
+        start_step: ``[k]`` start step within the clip per resetting env.
+        world_pos: ``[k, 3]`` world placement of each clip's frame.
+        world_quat: ``[k, 4]`` world placement heading (xyzw, w last) per env.
+        ego_mask: ``[k]`` bool, which envs are ego-anchored this episode.
+    """
     state = cmd.reference_world_state_at(clip_id, start_step, world_pos, world_quat)
     nj = len(asset.joint_names)
     base_pose = state[:, 0:7]          # [pos(3), quat wxyz(4)]
@@ -318,25 +357,164 @@ def reset_on_motion_sequence(
     joint_pos = state[:, 13:13 + nj]
     joint_vel = state[:, 13 + nj:13 + 2 * nj]
 
-    # 4. Commit the command's per-env clip tracking state (so the first
-    #    compute, at episode_length_buf == 0, reproduces this spawn pose).
     cmd.clip_id[env_ids] = clip_id
     cmd.start_step[env_ids] = start_step
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
+    cmd._ego_mask[env_ids] = ego_mask
 
-    # Ego re-anchor: clip envs are ego-anchored with probability ``ego_anchor_fraction``,
-    # else world-anchored. Ego-anchored envs get their clip placement periodically snapped
-    # onto the robot root during the episode (see MotionSequenceCommand._reanchor_ego_envs);
-    # the closed-loop FM tracker (FmTrackingCommand) sets ego_anchor_fraction=1.0.
-    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
-    cmd._ego_mask[env_ids] = torch.rand(k, device=device) < ego_frac
-
-    # 5. Write to sim.
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
     asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
     asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
+
+
+def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor]) -> torch.Tensor:
+    """Sample, per env, a random clip whose ``terrain_id`` matches the env's tile.
+
+    Pure-tensor helper (no sim), shared by :func:`reset_on_terrain_motion_sequence`
+    and its unit test.
+
+    Args:
+        env_tid: ``[k]`` long, the terrain id of each env's tile (``-1`` = flat).
+        groups: ``{terrain_id: clip_indices}`` (from
+            :func:`...clips.clip_io.group_clips_by_terrain`); each value is a 1-D long
+            tensor of clip indices for that terrain.
+
+    Returns:
+        ``[k]`` long clip index per env, on ``env_tid``'s device.
+
+    Raises:
+        ValueError: if any env's terrain id has no clips -- that tile can never be
+            assigned a matching clip (a fatal library / terrain mismatch).
+    """
+    device = env_tid.device
+    missing = sorted(
+        {int(t) for t in env_tid.tolist() if int(t) not in groups or groups[int(t)].numel() == 0}
+    )
+    if missing:
+        raise ValueError(
+            f"terrain id(s) {missing} have an env tile but NO clips in the library -- "
+            "envs on those tiles cannot be assigned a matching clip. Regenerate the "
+            "terrain clip library so every terrain has clips."
+        )
+    clip_id = torch.empty(env_tid.shape[0], dtype=torch.long, device=device)
+    for t in torch.unique(env_tid).tolist():
+        mask = env_tid == t
+        g = groups[int(t)].to(device)
+        pick = torch.randint(0, int(g.numel()), (int(mask.sum()),), device=device)
+        clip_id[mask] = g[pick]
+    return clip_id
+
+
+def reset_on_terrain_motion_sequence(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    base_frame_name: str = "pelvis_link",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset each env onto a clip whose terrain matches the env's terrain tile.
+
+    Terrain-aware counterpart to :func:`reset_on_motion_sequence`.  The scene terrain
+    is a :class:`ClipTerrainImporter` built from the same clip library the command
+    tracks, so each env is pinned to a tile with a known ``terrain_id`` and tile
+    geometry.  For each resetting env this:
+
+    * samples a clip uniformly from the clips whose per-clip ``terrain_id`` matches
+      the env's tile (flat tiles -> flat clips, ``terrain_id == -1``);
+    * places the clip on the tile with
+      :func:`...terrains.clip_terrain_loader.clip_frame_origin` (identity heading --
+      clips are baked axis-aligned with the staircase), so the reference feet ride the
+      treads.  Wandering flat clips are re-centered on their flat tile (their bbox is
+      not centered on the clip origin);
+    * restricts ego re-anchoring to flat clips: re-anchoring snaps the clip onto the
+      robot root, which would decouple a terrain clip from the physical staircase, so
+      terrain / transition clips are always world-anchored.
+
+    Args:
+        env: The environment (``env.scene.terrain`` must be a ClipTerrainImporter).
+        env_ids: Env indices to reset.
+        command_name: The :class:`MotionSequenceCommand` term name.
+        base_frame_name: Trajectory base frame (must match the command cfg).
+        asset_cfg: Robot asset config.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+        group_clips_by_terrain,
+    )
+    from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
+        clip_frame_origin,
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_term(command_name)
+    if env_ids.numel() == 0:
+        return
+    k = env_ids.shape[0]
+    device = env.device
+    importer = env.scene.terrain
+    if not hasattr(importer, "env_terrain_id"):
+        raise TypeError(
+            "reset_on_terrain_motion_sequence requires the scene terrain to be a "
+            "ClipTerrainImporter (exposing env_terrain_id / env_cell_*). Use "
+            "reset_on_motion_sequence for the flat-ground teacher."
+        )
+    num_steps = cmd.manager.num_steps
+
+    # Cache the terrain -> clip-indices grouping on the command (built once, on device).
+    groups = getattr(cmd, "_terrain_groups", None)
+    if groups is None:
+        groups = {t: idx.to(device) for t, idx in group_clips_by_terrain(cmd.manager.lib).items()}
+        cmd._terrain_groups = groups
+
+    # 1. Per-env terrain id -> sample a matching clip + a start step.
+    env_tid = importer.env_terrain_id[env_ids].to(torch.long)
+    clip_id = sample_terrain_clips(env_tid, groups)
+    if cmd.cfg.random_start_phase:
+        margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
+        hi = max(1, num_steps - margin)
+        start_step = torch.randint(0, hi, (k,), device=device)
+    else:
+        start_step = torch.zeros(k, dtype=torch.long, device=device)
+
+    # 2. Place each clip on its tile (identity heading -- clips are baked axis-aligned
+    #    with the staircase, so alignment is a pure translation). Terrain / transition
+    #    clips sit on the tile centerline (clip_y_center = size_y/2); flat clips at the
+    #    corner (0), then re-centered below.
+    world_quat = torch.zeros(k, 4, device=device)
+    world_quat[:, 3] = 1.0  # identity (xyzw, w last)
+    is_flat = env_tid == -1
+    csize_y = torch.tensor(
+        [float(importer.clip_size_y.get(int(t), 0.0)) for t in env_tid.tolist()], device=device
+    )
+    clip_y_center = torch.where(is_flat, torch.zeros_like(csize_y), 0.5 * csize_y)
+    world_pos = clip_frame_origin(
+        importer.env_cell_corner[env_ids],
+        importer.env_cell_center[env_ids],
+        clip_y_center,
+        importer.env_clip_x_offset[env_ids],
+    )
+
+    # Flat clips WANDER (turning walks up to tens of metres) and their bbox is not
+    # centered on the clip origin, so anchoring that origin at the tile corner would
+    # overhang the flat patch (sized to the max flat bbox). Center each flat clip's
+    # base-frame bbox on its tile instead so the whole path stays on the tile.
+    if bool(is_flat.any()):
+        bidx = cmd._base_idx["pos"]
+        bx, by = int(bidx[0]), int(bidx[1])
+        y_des = cmd.manager.lib.y_des
+        flat_ids = clip_id[is_flat].to(y_des.device)
+        pel_xy = y_des[flat_ids][:, :, [bx, by]].to(device)             # [m, T, 2]
+        bbox_center = 0.5 * (pel_xy.amax(dim=1) + pel_xy.amin(dim=1))    # [m, 2]
+        cell_center_flat = importer.env_cell_center[env_ids][is_flat]
+        world_pos[is_flat, 0] = cell_center_flat[:, 0] - bbox_center[:, 0]
+        world_pos[is_flat, 1] = cell_center_flat[:, 1] - bbox_center[:, 1]
+
+    # 3-5. Ego re-anchor is flat-only (a terrain clip re-anchored onto the robot root
+    #      would decouple from the physical staircase), then compute + write the spawn.
+    ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
+    ego_mask = is_flat & (torch.rand(k, device=device) < ego_frac)
+    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
 
 
 def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:
