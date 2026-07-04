@@ -82,6 +82,14 @@ def export_policy_parameters(env, obs, actions, save_dir):
         raise ValueError("Could not get skill_type and/or total_time while exporting parameters!")
         # pass
 
+    # Bent-hold phase (bend-cycle command only): the phase the policy holds "bent"
+    # at (the bend_down->bend_up domain boundary, e.g. ~0.474), so the sim2sim /
+    # hardware runner sweeps the "bend over" button to the SAME phase the policy
+    # trained its static hold at. Absent for other commands (runner falls back).
+    bent_phi = getattr(unwrapped_env.command_manager.get_term("traj_ref"), "_bent_phi", None)
+    if bent_phi is not None:
+        params["bent_hold_phi"] = float(bent_phi)
+
     # Add velocity command ranges
     try:
         base_vel_cfg = unwrapped_env.command_manager.get_term("base_velocity").cfg
