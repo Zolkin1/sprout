@@ -11,12 +11,14 @@ are treated as ONE ``full_periodic`` trajectory over the phasing variable
 - ``phi = 0`` and ``phi = 1.0`` are the standing pose (the cycle
   stand -> bend -> stand is genuinely periodic); ``phi = 0.5`` is bent over.
 
-A configurable fraction of episodes (``percent_hold_phi``) is a *static hold*
-pinned to a phase drawn from ``hold_phi_values`` (standing at 0.0/1.0, bent-over
-at 0.5), so the policy also learns to hold those poses.  Holds are realised by
-:func:`mdp.reset_bend_cycle` (resets the robot into the held pose) plus the
-:class:`PhasedTrajectoryCommand` fixed-phase-hold logic (pins the phase and
-zeroes the reference velocity).
+Every env runs the cycle with per-episode-random dwells at standing and at the
+bent pose: stand -> hold standing (``stand_dwell_s``) -> bend -> hold bent
+(``bent_dwell_s``) -> bend up -> stand -> repeat.  So every env trains both
+(fragile) holds before/after the motion.  The bent pose is the clip's
+``bend_down -> bend_up`` domain boundary (the deepest bend, ~0.474), auto-derived.
+The dwells are realised by :func:`mdp.reset_bend_cycle` (draws the per-env dwells
++ spawns standing) plus :meth:`PhasedTrajectoryCommand._dwell_cycle_phase` (pauses
+the phase at standing / bent and zeroes the reference velocity during each pause).
 
 Built on the live :class:`G1ClfTrackingEnvCfg` (single-skill
 ``TrajectoryCommandCfg`` path), not the deprecated ``g1_trajopt_*`` bow/bend
@@ -62,10 +64,12 @@ class G1BendCycleCommandsCfg(G1ClfTrackingCommandCfg):
         conditioner_generator_name="base_velocity",
         Q_weights=BOWING_Q_weights,
         R_weights=BOWING_R_weights,
-        # Fixed-phase static holds: with prob ``percent_hold_phi`` an episode is
-        # pinned to standing (0.0/1.0) or bent-over (0.5).
-        percent_hold_phi=0.3,
-        hold_phi_values=[0.0, 0.5, 1.0],
+        # Every cycle holds standing (phase 0) for 1-4 s and the bent pose for
+        # 2-5 s (per-episode-random), so every env trains both holds. The bent
+        # phase auto-derives from the bend_down->bend_up domain boundary
+        # (bent_hold_phi=None -> ~0.474, the deepest bend).
+        stand_dwell_s=(1.0, 4.0),
+        bent_dwell_s=(2.0, 5.0),
     )
 
 
@@ -82,9 +86,10 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
         # Post init of parent
         super().__post_init__()
 
-        # A few full stand->bend->stand cycles per episode (plus static holds).
-        # NOTE: tune to the clip's total period once the final clip is uploaded.
-        self.episode_length_s = 10.0
+        # Long enough for one full cycle even at the max dwells: up to 4s stand
+        # hold + ~1.9s bend + up to 5s bent hold + ~1.9s bend up = ~12.8s, so
+        # bending back up keeps getting trained.
+        self.episode_length_s = 15.0
 
         ##
         # Commands — stationary motion, so zero the base-velocity command.
@@ -95,10 +100,10 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
 
         ##
-        # Events — reset each env into a bend-cycle pose (free -> phase 0,
-        # held -> a phase drawn from ``hold_phi_values``).  Replaces the base
-        # ``reset_on_ref`` (which is coupled to the multi-skill velocity
-        # conditioner the bend-cycle env does not use).
+        # Events — reset every env into the phase-0 standing pose + draw its
+        # per-episode bent-dwell duration.  Replaces the base ``reset_on_ref``
+        # (which is coupled to the multi-skill velocity conditioner the
+        # bend-cycle env does not use).
         ##
         self.events.reset_on_ref = EventTerm(
             func=mdp.reset_bend_cycle,
@@ -106,6 +111,37 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
             params={
                 "command_name": "traj_ref",
                 "base_frame_name": "pelvis_link",
+            },
+        )
+
+        ##
+        # Domain randomization — the bend policy must be robust to carrying a load on
+        # its back while bent over.
+        ##
+        # Widen the torso (waist) mass scale from ±15% to 0.7–1.3.
+        self.events.add_base_mass.params["mass_distribution_params"] = (0.7, 1.3)
+        # Widen the vertical (z) torso-COM jitter from ±1 cm to ±5 cm (x/y unchanged).
+        self.events.base_com.params["com_range"] = {
+            "x": (-0.05, 0.05),
+            "y": (-0.05, 0.05),
+            "z": (-0.05, 0.05),
+        }
+        # Half the envs carry a 5–7 kg back payload: a point mass at a random position
+        # within a 5 cm cube centered ~10 cm behind and ~15 cm above the torso frame
+        # (a backpack-like load that pulls the robot backward/up when it bends).
+        self.events.add_back_payload = EventTerm(
+            func=mdp.add_payload_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "mass_range": (5.0, 7.0),
+                "position_range": {
+                    "x": (-0.125, -0.075),
+                    "y": (-0.025, 0.025),
+                    "z": (0.125, 0.175),
+                },
+                "fraction": 0.5,
+                "debug_vis": False,
             },
         )
 
@@ -162,3 +198,8 @@ class G1BendCycleCLFEnvCfg_PLAY(G1BendCycleCLFEnvCfg):
         self.events.base_com = None
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        # Keep the back payload ON so its placement is visible: every env carries one
+        # (fraction=1) and the debug sphere is drawn at the payload's live position.
+        self.events.add_back_payload.params["fraction"] = 1.0
+        self.events.add_back_payload.params["debug_vis"] = True

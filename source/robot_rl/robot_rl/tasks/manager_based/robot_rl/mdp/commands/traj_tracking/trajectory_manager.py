@@ -1303,6 +1303,17 @@ class PhaseTrajectoryManager(ManagerBase):
         """Total trajectory duration (doubled for half-periodic)."""
         return self._inner.get_total_time()
 
+    def get_domain_boundary_phases(self) -> list[float]:
+        """Internal domain-boundary phases in ``(0, 1)``.
+
+        For the bend cycle (``domain_sequence`` ``[bend_down, bend_up]``) this is the
+        single ``bend_down -> bend_up`` switch -- the deepest-bend pose --
+        i.e. ``T[bend_down] / total_time``. Empty for a single-domain clip.
+        """
+        tb = self._inner.domain_boundaries  # cumulative domain times [0 .. total]
+        total = float(self._inner.traj_data.total_time)
+        return [float(tb[i]) / total for i in range(1, len(tb) - 1)]
+
     def order_outputs(self, ordered_pos_output_names: list[str], ordered_vel_output_names: list[str]) -> None:
         """Reorder the inner manager's outputs/coefficients to the given order."""
         return self._inner.order_outputs(ordered_pos_output_names, ordered_vel_output_names)

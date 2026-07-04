@@ -252,18 +252,15 @@ def reset_bend_cycle(
         base_frame_name: str = "pelvis_link",
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ):
-    """Reset each env into a bend-cycle reference pose (free start, or a static hold).
+    """Reset each env into the phase-0 (standing) pose and draw its bent-dwell duration.
 
-    For the combined bend-over / bend-up *periodic* env.  With probability
-    ``cmd.cfg.percent_hold_phi`` an env is a **static-hold** env, pinned to a
-    phase drawn uniformly from ``cmd.cfg.hold_phi_values`` (e.g. standing at
-    ``0.0``/``1.0``, bent-over at ``0.5``); the remaining envs start **free** at
-    phase 0 (standing) and cycle through the motion.
-
-    Every env is reset INTO its phase's reference pose (so the initial tracking
-    error is ~zero), the command's per-env hold state is recorded (so the phase
-    stays pinned and the reference velocity is zeroed while held), and the
-    manager clock is anchored at the chosen phase.
+    For the combined bend-over / bend-up *periodic* env.  EVERY env resets into
+    the phase-0 standing pose (zero initial tracking error) and then plays the
+    cycle -- stand -> hold stand -> bend -> hold bent -> bend up -> stand ->
+    repeat -- driven by :meth:`PhasedTrajectoryCommand._pre_update_phase`.  This
+    event draws each env's per-episode standing / bent dwell durations from
+    ``cmd.cfg.stand_dwell_s`` / ``cmd.cfg.bent_dwell_s`` (seconds), so every env
+    holds standing and the bent pose that long each cycle.
 
     Unlike :func:`reset_on_reference`, there is no velocity conditioner and no
     skill bucket — the bend-cycle is a single stationary periodic clip.  Pose
@@ -284,23 +281,21 @@ def reset_bend_cycle(
     num_env = len(env_ids)
     device = env.device
 
-    # --- Decide held vs free and the target phase per env ------------------
-    hold_values = getattr(cmd.cfg, "hold_phi_values", None)
-    p_hold = float(getattr(cmd.cfg, "percent_hold_phi", -1.0))
-    if hold_values is not None and p_hold > 0.0:
-        held = torch.rand(num_env, device=device) < p_hold
-        hv = torch.tensor(hold_values, device=device, dtype=torch.float32)
-        pick = torch.randint(0, len(hold_values), (num_env,), device=device)
-        hold_phi = hv[pick]
-    else:
-        held = torch.zeros(num_env, dtype=torch.bool, device=device)
-        hold_phi = torch.zeros(num_env, device=device)
-    # Free envs start at phase 0 (standing); held envs sit at their hold phase.
-    target_phase = torch.where(held, hold_phi, torch.zeros(num_env, device=device))
+    # --- Per-env dwell durations for this episode --------------------------
+    # The phase pauses at standing / at the bent pose this long each cycle; see
+    # PhasedTrajectoryCommand._dwell_cycle_phase.
+    def _draw(rng: tuple | None) -> torch.Tensor:
+        if rng is None:
+            return torch.zeros(num_env, device=device)
+        return torch.empty(num_env, device=device).uniform_(float(rng[0]), float(rng[1]))
 
-    # Record the hold state BEFORE evaluating desired outputs so held envs get
-    # their reference velocity zeroed inside ``get_desired_outputs``.
-    cmd.reset_hold_state(env_ids, held, hold_phi)
+    cmd.reset_dwells(env_ids,
+                     _draw(getattr(cmd.cfg, "stand_dwell_s", None)),
+                     _draw(getattr(cmd.cfg, "bent_dwell_s", None)))
+
+    # ALL envs reset into the phase-0 (standing) pose; the cycle then plays from
+    # standing (hold stand -> bend -> hold bent -> bend up -> ...).
+    pose_phase = torch.zeros(num_env, device=device)
 
     # --- Validate base frame outputs exist ---------------------------------
     pos_indices = _find_output_indices(cmd.ordered_pos_output_names, base_frame_name, "pos_")
@@ -314,7 +309,7 @@ def reset_bend_cycle(
     # --- Per-env spawn offset (ref-frame + stair; ~zero for a flat clip) ---
     cmd.manager.invalidate_cache()
     traj_idx = cmd.manager.get_current_trajectory_indices()[env_ids]
-    domain_idx = cmd.manager.get_current_domains(target_phase, env_ids=env_ids)
+    domain_idx = cmd.manager.get_current_domains(pose_phase, env_ids=env_ids)
     ref_offset = cmd.manager.data["ref_frame_offset"][traj_idx, domain_idx]
     stair_offset = cmd.manager.data["origin_relative_to_stair_center"][traj_idx]
     spawn_offset = ref_offset + stair_offset
@@ -324,9 +319,8 @@ def reset_bend_cycle(
     cmd.ref_poses[env_ids, 3:6] = 0.0
     cmd.ref_poses[env_ids, 6] = 1.0
 
-    # Desired outputs at the target phase (fills y_des / dy_des; zeros dy_des
-    # for held envs via the command's ``get_desired_outputs`` override).
-    cmd.get_desired_outputs(target_phase, env_ids=env_ids)
+    # Desired outputs at phase 0, the standing spawn pose (fills y_des / dy_des).
+    cmd.get_desired_outputs(pose_phase, env_ids=env_ids)
     y_sampled = cmd.y_des[env_ids]
     dy_sampled = cmd.dy_des[env_ids]
 
@@ -352,7 +346,7 @@ def reset_bend_cycle(
         joint_vel[:, i] = dy_sampled[:, vel_traj_idx]
 
     # Anchor the trajectory clock and write the state to sim.
-    cmd.manager.set_phase(target_phase, env_ids)
+    cmd.manager.set_phase(pose_phase, env_ids)
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
     asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)

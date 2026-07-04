@@ -12,11 +12,11 @@ This class OWNS phase advance for the single-skill path.  The live
 :class:`BaseTrajectoryCommand._update_command` reads ``self.manager.phase`` each
 step, so :meth:`_pre_update_phase` (called at the top of ``_update_command``)
 computes the per-env phase from the episode clock and writes it onto the
-manager.  It also implements the *fixed-phase static hold* used by the
-bend-cycle env: with ``cfg.hold_phi_values`` set, a per-episode subset of
-environments (chosen at reset, see :func:`mdp.events.resets.reset_bend_cycle`)
-is pinned to a fixed phase and has its reference velocity zeroed, so the policy
-learns to hold that pose statically.
+manager.  It also implements the *dwell cycle* used by the bend-cycle env: with
+``cfg.stand_dwell_s`` / ``cfg.bent_dwell_s`` set, the phase pauses at standing
+(phase 0) and at the bent pose (``self._bent_phi``) for per-episode-random
+dwells each cycle, so every env plays stand -> hold-stand -> bend -> hold-bent
+-> bend-up -> stand and trains both (fragile) holds.
 """
 
 from __future__ import annotations
@@ -37,9 +37,10 @@ class PhasedTrajectoryCommand(BaseTrajectoryCommand):
     - ``self.phasing_var`` state (the phase in ``[0, 1]``) exposed as an
       observation input and used for phase-binned CLF logging.
     - Episode-clock phase advance in :meth:`_pre_update_phase`.
-    - Fixed-phase static hold controlled by ``cfg.hold_phi_values`` /
-      ``cfg.percent_hold_phi`` and the per-env ``held_mask`` /
-      ``hold_phi_value`` state written by the reset event.
+    - An optional per-env dwell at standing (phase 0) and at the bent pose
+      (``self._bent_phi``), enabled by ``cfg.stand_dwell_s`` / ``cfg.bent_dwell_s``:
+      the cycle pauses there each period so the policy trains holding those poses,
+      with the reference velocity zeroed during each dwell.
     """
 
     @abstractmethod
@@ -56,67 +57,115 @@ class PhasedTrajectoryCommand(BaseTrajectoryCommand):
         # Phasing variable in [0, 1]; the sin/cos phase observations read this.
         self.phasing_var = torch.zeros(self.num_envs, device=self.device)
 
-        # Fixed-phase static-hold state (populated at reset by
-        # ``reset_bend_cycle`` when ``cfg.hold_phi_values`` is set):
-        #   ``held_mask[e]``      -> this env holds a fixed phase this episode.
-        #   ``hold_phi_value[e]`` -> the phase it is pinned to.
-        self.held_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.hold_phi_value = torch.zeros(self.num_envs, device=self.device)
+        # Per-env dwell durations (s), drawn each reset by ``reset_bend_cycle``.
+        # The cycle pauses at standing (phase 0) for ``_stand_dwell_s`` and at the
+        # bent pose (``_bent_phi``) for ``_bent_dwell_s`` before continuing.
+        self._stand_dwell_s = torch.zeros(self.num_envs, device=self.device)
+        self._bent_dwell_s = torch.zeros(self.num_envs, device=self.device)
+        self._uses_dwell = (cfg.bent_dwell_s is not None) or (cfg.stand_dwell_s is not None)
+
+        # Clip period (s): the divisor that maps episode time -> phase (matches
+        # what ``get_phasing_var`` divides by), used to place the dwells.
+        self._period = float(self.manager.get_total_time())
+
+        # Bent-pose phase: explicit override, else the clip's bend_down->bend_up
+        # domain boundary (the deepest bend, e.g. ~0.474), else 0.5.
+        if cfg.bent_hold_phi is not None:
+            self._bent_phi = float(cfg.bent_hold_phi)
+        elif hasattr(self.manager, "get_domain_boundary_phases"):
+            boundaries = self.manager.get_domain_boundary_phases()
+            self._bent_phi = float(boundaries[0]) if boundaries else 0.5
+        else:
+            self._bent_phi = 0.5
 
     def _pre_update_phase(self) -> None:
-        """Advance the phasing variable from the episode clock, then apply holds.
+        """Advance the phasing variable from the episode clock (with the dwells).
 
-        Called at the top of ``BaseTrajectoryCommand._update_command`` (which
-        then reads ``self.manager.phase``).  Phase is recomputed from absolute
-        episode time each step (``get_phasing_var`` wraps for periodic
-        trajectories), so there is no incremental drift.  Held envs are pinned
-        to their fixed phase.
+        Called at the top of ``BaseTrajectoryCommand._update_command`` (which then
+        reads ``self.manager.phase``).  Without dwells the phase is recomputed from
+        absolute episode time each step (``get_phasing_var`` wraps for periodic
+        clips, so there is no drift).  With a dwell configured the clock pauses at
+        standing and/or the bent pose each cycle (see :meth:`_dwell_cycle_phase`).
         """
         t = self.env.episode_length_buf * self.env.step_dt
-        phase = self.manager.get_phasing_var(t)
-
-        if self.cfg.hold_phi_values is not None:
-            phase = torch.where(self.held_mask, self.hold_phi_value, phase)
+        if self._uses_dwell:
+            phase = self._dwell_cycle_phase(t)
+        else:
+            phase = self.manager.get_phasing_var(t)
 
         self.manager.phase = phase
         self.phasing_var = phase
         self.manager.invalidate_cache()
+
+    def _dwell_cycle_phase(self, t: torch.Tensor) -> torch.Tensor:
+        """Phase for the periodic cycle with per-env dwells at standing and bent.
+
+        Each period is: hold standing (phase 0) for ``_stand_dwell_s``, sweep
+        ``0 -> bent`` at the clip's natural rate, hold bent for ``_bent_dwell_s``,
+        sweep ``bent -> 1.0``, then wrap.  Inserting the dwells into the clock keeps
+        the phase (and thus the sin/cos observation) continuous across each pause.
+
+        Args:
+            t: Elapsed episode time per env, shape ``[N]``.
+
+        Returns:
+            Phasing variable in ``[0, 1]``, shape ``[N]``.
+        """
+        bent = self._bent_phi
+        period = self._period
+        t_reach = bent * period                       # time to sweep 0 -> bent
+        d_s = self._stand_dwell_s                      # [N] standing dwell (s)
+        d_b = self._bent_dwell_s                       # [N] bent dwell (s)
+        tau = torch.remainder(t, period + d_s + d_b)   # time within the current period
+
+        r_stand = tau < d_s
+        r_bend = (tau >= d_s) & (tau < d_s + t_reach)
+        r_bent = (tau >= d_s + t_reach) & (tau < d_s + t_reach + d_b)
+        # else r_up: bending up, phase = (tau - d_s - d_b) / period
+        return torch.where(
+            r_stand,
+            torch.zeros_like(tau),
+            torch.where(
+                r_bend,
+                (tau - d_s) / period,
+                torch.where(r_bent, torch.full_like(tau, bent), (tau - d_s - d_b) / period),
+            ),
+        )
 
     def get_phasing_var(self) -> torch.Tensor:
         """Return the current phasing variable of shape ``[N]``."""
         return self.phasing_var
 
     def get_desired_outputs(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> None:
-        """Populate desired outputs, zeroing the reference velocity for held envs.
+        """Populate desired outputs, zeroing the reference velocity during a dwell.
 
-        Held (static-hold) envs must track a *stationary* pose, so their
-        reference velocity is zeroed regardless of the clip's velocity at that
-        phase.
+        While the phase is paused at standing (phase 0) or the bent pose
+        (``self._bent_phi``) the robot holds a *stationary* pose, so its reference
+        velocity is zeroed (the clip's velocity there is otherwise nonzero).
+        Outside the dwells (sweeping in / out) it tracks the real motion velocity.
 
         Args:
-            phase: phase in [0, 1] tensor of shape ``[N]``.
+            phase: phase tensor (shape ``[N]`` when ``env_ids`` is None, else
+                ``[len(env_ids)]``) -- the phase these outputs are evaluated at.
             env_ids: Optional environment indices.
         """
         super().get_desired_outputs(phase, env_ids)
 
-        if self.cfg.hold_phi_values is None:
+        if not self._uses_dwell:
             return
+        dwelling = (phase == self._bent_phi) | (phase == 0.0)
         if env_ids is None:
-            self.dy_des[self.held_mask] = 0.0
+            self.dy_des[dwelling] = 0.0
         else:
-            held_sub = self.held_mask[env_ids]
-            self.dy_des[env_ids[held_sub]] = 0.0
+            self.dy_des[env_ids[dwelling]] = 0.0
 
-    def reset_hold_state(
-        self, env_ids: torch.Tensor, held: torch.Tensor, hold_phi: torch.Tensor
-    ) -> None:
-        """Set which of ``env_ids`` hold a fixed phase this episode (reset hook).
+    def reset_dwells(self, env_ids: torch.Tensor, stand_s: torch.Tensor, bent_s: torch.Tensor) -> None:
+        """Set the per-env standing / bent dwell durations (s) for the resetting envs.
 
         Args:
             env_ids: Environment indices being reset.
-            held: Bool tensor ``[len(env_ids)]`` — whether each env holds.
-            hold_phi: Float tensor ``[len(env_ids)]`` — the fixed phase per env
-                (ignored where ``held`` is False).
+            stand_s: Standing-dwell duration per env, shape ``[len(env_ids)]``.
+            bent_s: Bent-dwell duration per env, shape ``[len(env_ids)]``.
         """
-        self.held_mask[env_ids] = held
-        self.hold_phi_value[env_ids] = hold_phi
+        self._stand_dwell_s[env_ids] = stand_s
+        self._bent_dwell_s[env_ids] = bent_s
