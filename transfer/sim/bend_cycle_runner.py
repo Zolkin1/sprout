@@ -24,6 +24,7 @@ Run from ``transfer/sim/`` (MuJoCo assets resolve relative to cwd):
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import math
 import os
@@ -158,8 +159,114 @@ class RealtimePacer:
             time.sleep(slack)
 
 
+def plot_bend_cycle_logs(csv_path: str) -> None:
+    """Read a bend-cycle sim log CSV and write diagnostic + joint-tracking PNGs alongside it.
+
+    Diagnostics figure: base height + pitch, whole-body CoM_x vs the foot support
+    (left/right ankle x), foot heights, and ankle-pitch torques -- the quantities
+    that reveal a bent-pose tip. Joint figure: per-joint commanded (policy target)
+    vs achieved position, mirroring the IsaacLab reference-vs-actual grid.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    d = np.genfromtxt(csv_path, delimiter=",", names=True)
+    t = d["time"]
+    joints = [c[4:] for c in d.dtype.names if c.startswith("cmd_")]
+    out_dir = os.path.dirname(csv_path)
+
+    def overlay_phi(ax, label: bool = True):
+        """Add the phase variable phi as a light gray twin-axis trace (0..1) for correlation."""
+        ap = ax.twinx()
+        ap.plot(t, d["phi"], color="0.55", lw=1.0, alpha=0.75, label="phi")
+        ap.set_ylim(-0.05, 1.05)
+        if label:
+            ap.set_ylabel("phi (phase)", color="0.45", fontsize=8)
+        else:
+            ap.set_yticks([])
+        return ap
+
+    # --- diagnostics ---
+    fig, ax = plt.subplots(2, 2, figsize=(14, 9))
+    a = ax[0, 0]; a.plot(t, d["base_z"], "b-", label="base z (m)")
+    a.set_ylabel("base z (m)", color="b"); a2 = a.twinx()
+    a2.plot(t, np.degrees(d["pitch"]), "r-", label="pitch"); a2.set_ylabel("base pitch (deg)", color="r")
+    a.set_title("base height + pitch"); a.set_xlabel("t (s)"); a.grid(alpha=0.3)
+
+    a = ax[0, 1]
+    a.plot(t, d["com_x"], "k-", lw=2, label="CoM x")
+    a.plot(t, d["lfoot_x"], "g--", label="left foot x"); a.plot(t, d["rfoot_x"], "m--", label="right foot x")
+    a.fill_between(t, np.minimum(d["lfoot_x"], d["rfoot_x"]), np.maximum(d["lfoot_x"], d["rfoot_x"]),
+                   color="gray", alpha=0.2, label="foot support (x)")
+    a.set_title("whole-body CoM_x vs foot support (tips if CoM leaves the band)")
+    a.set_xlabel("t (s)"); a.set_ylabel("world x (m)"); a.legend(fontsize=7, loc="upper left"); a.grid(alpha=0.3)
+    overlay_phi(a)
+
+    a = ax[1, 0]
+    a.plot(t, d["lfoot_z"], "g-", label="left foot z"); a.plot(t, d["rfoot_z"], "m-", label="right foot z")
+    a.set_title("foot heights (lift-off)"); a.set_xlabel("t (s)"); a.set_ylabel("z (m)")
+    a.legend(fontsize=7); a.grid(alpha=0.3)
+
+    a = ax[1, 1]
+    for j, c in [("left_ankle_pitch_joint", "g"), ("right_ankle_pitch_joint", "m")]:
+        if f"tau_{j}" in d.dtype.names:
+            a.plot(t, d[f"tau_{j}"], c + "-", label=f"{j} tau")
+    a.set_title("ankle-pitch torque (saturation?)"); a.set_xlabel("t (s)"); a.set_ylabel("torque (Nm)")
+    a.legend(fontsize=7); a.grid(alpha=0.3)
+    fig.tight_layout(); p1 = os.path.join(out_dir, "diagnostics.png"); fig.savefig(p1, dpi=110); plt.close(fig)
+
+    # --- per-joint commanded vs achieved ---
+    ncol = 4; nrow = int(np.ceil(len(joints) / ncol))
+    fig, axg = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.4 * nrow), squeeze=False)
+    for k, j in enumerate(joints):
+        a = axg[k // ncol][k % ncol]
+        a.plot(t, d[f"cmd_{j}"], "b-", label="commanded")
+        a.plot(t, d[f"pos_{j}"], "r--", label="achieved")
+        a.set_title(j, fontsize=8); a.tick_params(labelsize=6); a.grid(alpha=0.3)
+    axg[0][0].legend(fontsize=7)
+    for k in range(len(joints), nrow * ncol):
+        axg[k // ncol][k % ncol].axis("off")
+    fig.suptitle("Commanded (policy target) vs achieved joint position", fontsize=12)
+    fig.tight_layout(); p2 = os.path.join(out_dir, "joint_tracking.png"); fig.savefig(p2, dpi=110); plt.close(fig)
+
+    # --- all leg-joint torques (left vs right overlaid per joint type) ---
+    leg_types = ["hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll"]
+    fig, axl = plt.subplots(2, 3, figsize=(16, 8), squeeze=False)
+    for k, jt in enumerate(leg_types):
+        a = axl[k // 3][k % 3]
+        for side, c in (("left", "g"), ("right", "m")):
+            col = f"tau_{side}_{jt}_joint"
+            if col in d.dtype.names:
+                a.plot(t, d[col], c + "-", label=side)
+        a.set_title(f"{jt} torque", fontsize=10); a.set_xlabel("t (s)")
+        a.set_ylabel("torque (Nm)"); a.legend(fontsize=8, loc="upper left"); a.grid(alpha=0.3)
+        overlay_phi(a, label=(k % 3 == 2))  # phi label only on the rightmost column
+    fig.suptitle("Leg-joint torques (left vs right, phi overlaid)", fontsize=12)
+    fig.tight_layout(); p3 = os.path.join(out_dir, "leg_torques.png"); fig.savefig(p3, dpi=110); plt.close(fig)
+
+    # --- sin/cos phase observations: prefer the RECORDED values (exactly what the
+    # actor consumed); fall back to reconstruction for logs written before they existed.
+    if "sin_phase_obs" in d.dtype.names and "cos_phase_obs" in d.dtype.names:
+        sin_p, cos_p = d["sin_phase_obs"], d["cos_phase_obs"]
+        src = "recorded from obs"
+    else:
+        two_pi_phi = 2.0 * np.pi * d["phi"]
+        sin_p, cos_p = np.sin(two_pi_phi), np.cos(two_pi_phi)
+        src = "reconstructed from phi"
+    fig, ax = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    ax[0].plot(t, sin_p, "b-", label="sin_phase"); ax[0].plot(t, cos_p, "r-", label="cos_phase")
+    ax[0].set_ylabel("phase obs"); ax[0].set_title(f"sin / cos phase observations vs time ({src})")
+    ax[0].legend(fontsize=9); ax[0].grid(alpha=0.3); ax[0].set_ylim(-1.1, 1.1)
+    ax[1].plot(t, d["phi"], "k-", label="phi"); ax[1].set_ylabel("phi (phase)")
+    ax[1].set_xlabel("t (s)"); ax[1].set_ylim(-0.05, 1.05); ax[1].grid(alpha=0.3); ax[1].legend(fontsize=9)
+    fig.tight_layout(); p4 = os.path.join(out_dir, "phase_obs.png"); fig.savefig(p4, dpi=110); plt.close(fig)
+    print(f"[INFO] Wrote plots:\n  {p1}\n  {p2}\n  {p3}\n  {p4}")
+
+
 def run(policy: BendCyclePolicy, robot: Robot, buttons: Buttons, phase: PhaseButtonController,
-        sim_duration: float, headless: bool, rt_factor: float, warmup_time: float) -> bool:
+        sim_duration: float, headless: bool, rt_factor: float, warmup_time: float,
+        log_path: str | None = None) -> bool:
     """Run the (optional) settle hold + live button-driven control loop.
 
     Args:
@@ -190,6 +297,45 @@ def run(policy: BendCyclePolicy, robot: Robot, buttons: Buttons, phase: PhaseBut
     if headless and sim_duration <= 0:
         raise ValueError("Headless mode requires --total_time > 0.")
 
+    # --- optional per-step logging ---
+    joints_mj = list(robot.joint_names)
+    log_rows: list[list[float]] = []
+    if log_path:
+        mm = robot.mj_model
+        pelvis_id = mujoco.mj_name2id(mm, mujoco.mjtObj.mjOBJ_BODY, "pelvis_link")
+        lfoot_id = mujoco.mj_name2id(mm, mujoco.mjtObj.mjOBJ_BODY, "left_ankle_roll_link")
+        rfoot_id = mujoco.mj_name2id(mm, mujoco.mjtObj.mjOBJ_BODY, "right_ankle_roll_link")
+        act_ids = [mujoco.mj_name2id(mm, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{j}_pos") for j in joints_mj]
+        # Slices of the sin/cos phase terms in the assembled obs, so we log the EXACT
+        # (scaled) values fed to the actor -- not a reconstruction from phi.
+        sin_i, _ = policy.obs_term_slice("sin_phase")
+        cos_i, _ = policy.obs_term_slice("cos_phase")
+
+    def record(phi: float, action: np.ndarray, obs: np.ndarray) -> None:
+        """Append one row of state + commanded targets + physical diagnostics.
+
+        ``sin_phase_obs`` / ``cos_phase_obs`` are read straight out of the assembled
+        observation ``obs`` (the exact values the actor consumed this step).
+        """
+        dta = robot.mj_data
+        q, qd = dta.qpos, dta.qvel
+        w, x, y, z = q[3], q[4], q[5], q[6]
+        roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        com = dta.subtree_com[pelvis_id]      # whole-robot CoM (world)
+        lf, rf = dta.xpos[lfoot_id], dta.xpos[rfoot_id]
+        tau = [float(dta.actuator_force[a]) for a in act_ids]
+        obs_flat = np.asarray(obs).reshape(-1)
+        sin_obs, cos_obs = float(obs_flat[sin_i]), float(obs_flat[cos_i])
+        log_rows.append([float(dta.time), float(phi), sin_obs, cos_obs,
+                         float(q[0]), float(q[1]), float(q[2]),
+                         roll, pitch, yaw, float(qd[3]), float(qd[4]), float(qd[5]),
+                         float(com[0]), float(com[1]), float(com[2]),
+                         float(lf[0]), float(lf[2]), float(rf[0]), float(rf[2]),
+                         *[float(v) for v in action], *[float(v) for v in q[7:]],
+                         *[float(v) for v in qd[6:]], *tau])
+
     def advance(viewer) -> None:
         """Step ``decim`` physics sub-steps (viewer sync), then pace to real time."""
         for i in range(decim):
@@ -214,6 +360,8 @@ def run(policy: BendCyclePolicy, robot: Robot, buttons: Buttons, phase: PhaseBut
             np.asarray(qpos[7:]), np.asarray(qvel[6:]), robot.joint_names, phi)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
+        if log_path:
+            record(phi, action, obs)
 
     def loop(viewer) -> bool:
         """Settle hold then live control; return False if the robot fell."""
@@ -241,12 +389,27 @@ def run(policy: BendCyclePolicy, robot: Robot, buttons: Buttons, phase: PhaseBut
 
     pacer.reset(robot.mj_data.time)
     if headless:
-        return loop(None)
-    with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
-        tid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-        viewer.cam.trackbodyid = tid
-        viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-        return loop(viewer)
+        success = loop(None)
+    else:
+        with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
+            tid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+            viewer.cam.trackbodyid = tid
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            success = loop(viewer)
+
+    if log_path and log_rows:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        header = (["time", "phi", "sin_phase_obs", "cos_phase_obs",
+                   "base_x", "base_y", "base_z", "roll", "pitch", "yaw",
+                   "avx", "avy", "avz", "com_x", "com_y", "com_z",
+                   "lfoot_x", "lfoot_z", "rfoot_x", "rfoot_z"]
+                  + [f"cmd_{j}" for j in joints_mj] + [f"pos_{j}" for j in joints_mj]
+                  + [f"vel_{j}" for j in joints_mj] + [f"tau_{j}" for j in joints_mj])
+        with open(log_path, "w", newline="") as f:
+            w = csv.writer(f); w.writerow(header); w.writerows(log_rows)
+        print(f"[INFO] Wrote {len(log_rows)} log rows to {log_path}")
+        plot_bend_cycle_logs(log_path)
+    return success
 
 
 def main() -> None:
@@ -272,6 +435,10 @@ def main() -> None:
     parser.add_argument("--bent_phi", type=float, default=None,
                         help="Phase 'bend over' (A) holds at. Default: read from the policy metadata "
                              "(the bend_down->bend_up domain boundary, ~0.474), else 0.5.")
+    parser.add_argument("--log", action="store_true", default=False,
+                        help="Log per-step state + commanded targets to CSV and write diagnostic plots.")
+    parser.add_argument("--log_path", type=str, default=None,
+                        help="CSV path for --log (default: <run_dir>/mujoco_bend_cycle_logs/sim_log.csv).")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -309,8 +476,17 @@ def main() -> None:
     buttons = Buttons(args.a_button, args.b_button)
     phase = PhaseButtonController(bent_phi=bent_phi)
 
+    log_path = None
+    if args.log or args.log_path:
+        if args.log_path:
+            log_path = args.log_path
+        else:
+            run_dir = os.path.dirname(os.path.dirname(tracker_onnx))  # <run>/exported/tracker.onnx -> <run>
+            log_path = os.path.join(run_dir, "mujoco_bend_cycle_logs", "sim_log.csv")
+        print(f"[INFO] Logging to {log_path} (+ diagnostics.png, joint_tracking.png alongside).")
+
     success = run(policy, robot, buttons, phase, args.total_time, args.headless,
-                  args.rt_factor, args.warmup_time)
+                  args.rt_factor, args.warmup_time, log_path=log_path)
     print(f"[INFO] Run finished. Survived: {success}")
 
 

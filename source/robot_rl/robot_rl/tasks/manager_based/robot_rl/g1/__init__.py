@@ -447,6 +447,18 @@ if not _registered:
         }
     )
 
+    # Play with the mass/CoM domain randomization left ON (to see the current
+    # policy tip under the randomized upper-body distribution before retraining).
+    gym.register(
+        id="G1-bend_cycle-clf-play-dr",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_bend_cycle_clf_env_cfg:G1BendCycleCLFEnvCfg_PLAY_DR",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
     ## =========================================
     # Stairs Terrain
     ## =========================================

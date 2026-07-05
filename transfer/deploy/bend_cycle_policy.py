@@ -103,6 +103,26 @@ class BendCyclePolicy:
         }
         return self._assemble(values)
 
+    def obs_term_slice(self, name: str) -> tuple[int, int]:
+        """Return the ``(start, length)`` slice of obs term ``name`` in the assembled obs.
+
+        Lets a caller read the exact (scaled) values fed to the actor for a term --
+        e.g. ``sin_phase`` / ``cos_phase`` -- straight from the observation vector,
+        instead of reconstructing them from ``phi``.
+
+        Args:
+            name: Observation term name (as in the embedded ``observation_terms.policy``).
+
+        Returns:
+            ``(start_index, length)`` into the flat ``[num_obs]`` observation.
+        """
+        idx = 0
+        for term in self._obs_terms:
+            if term["name"] == name:
+                return idx, term["shape"]
+            idx += term["shape"]
+        raise KeyError(f"Obs term '{name}' not found in the policy observation.")
+
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:
         """Order, clip, and scale terms per the embedded ``observation_terms.policy``."""
         out = np.zeros(self._num_obs, dtype=np.float32)

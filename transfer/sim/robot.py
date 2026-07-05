@@ -17,8 +17,8 @@ class Robot:
     def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
                  input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
-            raise ValueError("Invalid robot name! Only support g1_21j for now.")
+        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_21j_usdmass"):
+            raise ValueError(f"Invalid robot name '{robot_name}'! Only support g1_21j variants for now.")
 
         self.robot_name = robot_name
         self.scene_name = scene_name

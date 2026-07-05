@@ -126,6 +126,23 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
             "y": (-0.05, 0.05),
             "z": (-0.05, 0.05),
         }
+        # Randomize the UPPER-BODY (waist lump) CoM position — the training USD
+        # uses a ``box_merged`` model that lumps torso+head+arms into a single
+        # ``waist_yaw_link`` CoM, whereas the real robot (≈ the distributed stock
+        # MuJoCo model) carries that mass ~+1.7 cm higher and ~+0.6 cm more forward.
+        # ``base_com`` only jitters the *pelvis*, and ``add_base_mass`` scales the
+        # waist mass but keeps its CoM fixed, so the policy otherwise never trains
+        # against the higher/forward upper CoM that tips it in sim2sim. Use a broad
+        # symmetric ±5 cm jitter (well past the measured stock−training delta) so
+        # the policy is robust wherever the real upper CoM actually lands.
+        self.events.waist_com = EventTerm(
+            func=mdp.randomize_rigid_body_com,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
+                "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+            },
+        )
         # Half the envs carry a 5–7 kg back payload: a point mass at a random position
         # within a 5 cm cube centered ~10 cm behind and ~15 cm above the torso frame
         # (a backpack-like load that pulls the robot backward/up when it bends).
@@ -148,10 +165,14 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
         ##
         # Rewards — retune the CLF terms to the bend (BOWING-weight) scale.
         # The base defaults (max_eta_err=6, decreasing weight -5) are tuned for
-        # the looser walking CLF; the bend uses the tight bow settings.
+        # the looser walking CLF; the bend uses the tighter ``max_eta_err``.
+        # Keep the CLF *decreasing* (stability) term ON: it penalizes the
+        # Lyapunov function failing to decrease (tracking error growing / ``η̇``
+        # not going negative), which directly damps the oscillation around the
+        # bent hold rather than just the mean tracking error.
         ##
         self.rewards.clf_reward.params["max_eta_err"] = 0.25
-        self.rewards.clf_decreasing_condition.weight = 0.0
+        self.rewards.clf_decreasing_condition.weight = -5.0
 
         ##
         # Terrain — flat ground, no generator / height scan / curriculum.
@@ -196,10 +217,41 @@ class G1BendCycleCLFEnvCfg_PLAY(G1BendCycleCLFEnvCfg):
         self.events.randomize_ground_contact_friction = None
         self.events.add_base_mass = None
         self.events.base_com = None
+        self.events.waist_com = None
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
         # Keep the back payload ON so its placement is visible: every env carries one
         # (fraction=1) and the debug sphere is drawn at the payload's live position.
-        self.events.add_back_payload.params["fraction"] = 1.0
+        self.events.add_back_payload.params["fraction"] = 0.0 #1.0
         self.events.add_back_payload.params["debug_vis"] = True
+
+
+@configclass
+class G1BendCycleCLFEnvCfg_PLAY_DR(G1BendCycleCLFEnvCfg):
+    """Playback with the mass / CoM domain randomization left ON.
+
+    Same few-env, corruption-free viewing as ``_PLAY`` but keeps the persistent
+    physical DR — torso mass scale, pelvis + waist-lump CoM jitter (±5 cm), the
+    back payload, friction/gains — so you can watch the *current* policy meet the
+    randomized upper-body distribution: confirm it tips under a forward/high waist
+    CoM *before* retraining, and confirm it no longer does after. Transient
+    disturbances (pushes / external force) are switched OFF so any tip is
+    attributable to the mass distribution and not a random kick. Uses more envs
+    than ``_PLAY`` so the randomized range is well sampled (some envs land in the
+    tipping regime).
+    """
+
+    def __post_init__(self):
+        # Post init of parent (the TRAIN cfg -> all DR present)
+        super().__post_init__()
+
+        self.scene.num_envs = 16
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+
+        # Drop only the transient disturbances so a tip is a pure mass/CoM result;
+        # the mass-distribution DR (add_base_mass, base_com, waist_com,
+        # add_back_payload) stays exactly as configured for training.
+        self.events.push_robot = None
+        self.events.base_external_force_torque = None
