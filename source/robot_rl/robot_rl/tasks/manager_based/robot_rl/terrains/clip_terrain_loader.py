@@ -123,6 +123,29 @@ def _tile_mesh(footprint: tuple[float, float], blocks: list[TerrainBlockCfg]) ->
     return trimesh.util.concatenate(meshes)
 
 
+def default_num_flat_tiles(lib) -> int:
+    """Number of flat tiles to build when the caller doesn't specify one.
+
+    Derives from the generation metadata: the number of FLAT TERRAINS the library was
+    generated with (``generator_config.counts.flat``), so the flat / terrain /
+    transition tile counts match the requested generation split (total tiles ==
+    ``num_terrains``).  Flat tiles are NOT one-per-clip -- each flat tile hosts many
+    flat clips (the reset samples any flat clip onto a flat tile), so a library with
+    thousands of flat clips still builds only ``counts.flat`` flat tiles.
+
+    Falls back to the flat-clip count for pre-``generator_config`` libraries.
+
+    Args:
+        lib: A loaded :class:`ClipLibraryData`.
+
+    Returns:
+        The flat-tile count to build.
+    """
+    n_flat_clips = int((lib.terrain_id.to(torch.long) == _FLAT_TERRAIN_ID).sum())
+    gen_counts = (lib.attrs.get("generator_config") or {}).get("counts") or {}
+    return int(gen_counts.get("flat", n_flat_clips))
+
+
 def assemble_clip_terrain(
     lib,
     *,
@@ -147,7 +170,9 @@ def assemble_clip_terrain(
         lib: A loaded :class:`ClipLibraryData` (``attrs["terrain_manifest"]`` +
             per-clip ``terrain_id`` + ``y_des`` for the flat-travel extent).
         num_rows: Replicas of the tile set (env capacity); each is a strip in y.
-        num_flat_tiles: Number of flat patches (default: number of flat clips).
+        num_flat_tiles: Number of flat patches (default: the library's flat-terrain
+            count from ``generator_config.counts.flat`` via :func:`default_num_flat_tiles`,
+            so flat/terrain/transition tile counts match the generation split).
         col_gap: Void gap (m) between tiles along x.
         row_gap: Void gap (m) between rows / class blocks along y.
         size_margin: Extra flat (m) added to the terrain / transition footprints.
@@ -184,8 +209,7 @@ def assemble_clip_terrain(
     trans_fp = (trans_fp0[0] + transition_back_buffer, trans_fp0[1])
     fx, fy = _flat_clip_travel(lib)
     flat_fp = (fx + 2.0 * flat_buffer, fy + 2.0 * flat_buffer)   # buffer on each side
-    n_flat_clips = int((lib.terrain_id.to(torch.long) == _FLAT_TERRAIN_ID).sum())
-    n_flat = n_flat_clips if num_flat_tiles is None else int(num_flat_tiles)
+    n_flat = default_num_flat_tiles(lib) if num_flat_tiles is None else int(num_flat_tiles)
 
     # Ordered tile specs: (terrain_id, type_code, footprint, blocks, clip_x_offset).
     clip_size_y: dict[int, float] = {}

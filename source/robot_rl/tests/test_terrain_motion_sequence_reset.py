@@ -14,8 +14,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from types import SimpleNamespace
+
 from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import sample_terrain_clips
-from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import clip_frame_origin
+from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
+    clip_frame_origin,
+    default_num_flat_tiles,
+)
 
 
 def _groups() -> dict[int, torch.Tensor]:
@@ -63,6 +68,27 @@ def test_sample_raises_on_empty_group():
     env_tid = torch.tensor([0], dtype=torch.long)
     with pytest.raises(ValueError, match="terrain id"):
         sample_terrain_clips(env_tid, groups)
+
+
+def _fake_lib(flat_clip_count: int, gen_counts: dict | None):
+    """Minimal stand-in for ClipLibraryData for default_num_flat_tiles."""
+    terrain_id = torch.full((flat_clip_count + 3,), -1, dtype=torch.long)
+    terrain_id[:3] = torch.tensor([0, 1, 2])  # a few non-flat clips
+    attrs = {} if gen_counts is None else {"generator_config": {"counts": gen_counts}}
+    return SimpleNamespace(terrain_id=terrain_id, attrs=attrs)
+
+
+def test_default_num_flat_tiles_from_generation():
+    """With generation metadata, flat tiles = the FLAT-TERRAIN count (not flat-clip
+    count), so tile counts match the generation split regardless of clips-per-terrain."""
+    lib = _fake_lib(flat_clip_count=3600, gen_counts={"flat": 9, "terrain": 8, "transition": 8})
+    assert default_num_flat_tiles(lib) == 9
+
+
+def test_default_num_flat_tiles_fallback_without_metadata():
+    """Pre-generator_config libraries fall back to the flat-clip count."""
+    lib = _fake_lib(flat_clip_count=8, gen_counts=None)
+    assert default_num_flat_tiles(lib) == 8
 
 
 def test_clip_frame_origin_terrain_centerline():

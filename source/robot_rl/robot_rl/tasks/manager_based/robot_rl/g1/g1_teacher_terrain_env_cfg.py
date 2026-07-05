@@ -57,6 +57,12 @@ class G1TeacherTerrainSceneCfg(G1TeacherSceneCfg):
     terrain = ClipTerrainImporterCfg(
         prim_path="/World/ground",
         clip_library_path=DEFAULT_TERRAIN_CLIP_PATH,
+        # num_flat_tiles left as None -> derived from the library's generation metadata
+        # (generator_config.counts.flat), so flat/terrain/transition tile counts match
+        # the split you generated with (total tiles == num_terrains) and envs are spread
+        # evenly across terrain types. (Without this the default would be one flat tile
+        # PER flat clip -- thousands -- diluting stair envs to ~0; see
+        # terrains.clip_terrain_loader.default_num_flat_tiles.)
         # Replica rows for env capacity (rows are pure replicas of the tile set).
         num_rows=10,
         # No difficulty ordering -> use ALL replica rows (not just [0, max_init]).
@@ -118,6 +124,10 @@ class G1TeacherTerrainEnvCfgPlay(G1TeacherTerrainEnvCfg):
         # One replica row + one env per tile -> every terrain is shown exactly once.
         self.scene.terrain.num_rows = 1
         self.scene.num_envs = 24
+        # Local play is usually on a small GPU; a large terrain clip library would OOM
+        # if loaded onto the GPU, so keep the clip library on CPU (device-safe gather).
+        # Override with --clip_device on the command line if you have GPU headroom.
+        self.commands.traj_ref.clip_device = "cpu"
         self.observations.policy.enable_corruption = False
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None

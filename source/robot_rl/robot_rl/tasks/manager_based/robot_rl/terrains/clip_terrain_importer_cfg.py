@@ -33,7 +33,10 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     """Replicas of the tile set (each a strip in y) -> more distinct env spawns."""
 
     num_flat_tiles: int | None = None
-    """Number of flat patches (``None`` = one per flat clip)."""
+    """Number of flat patches. ``None`` derives it from the library's generation
+    metadata (``generator_config.counts.flat``) so flat/terrain/transition tile counts
+    match the generation split -- NOT one tile per flat clip. See
+    ``clip_terrain_loader.default_num_flat_tiles``."""
 
     col_gap: float = 1.0
     """Void gap (m) between tiles along x."""

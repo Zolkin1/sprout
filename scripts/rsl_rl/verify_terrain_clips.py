@@ -77,6 +77,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer_cfg im
 )
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (  # noqa: E402
     clip_frame_origin,
+    default_num_flat_tiles,
 )
 
 # Reference-frame colors (pelvis blue, L-ankle teal, R-ankle orange, wrists grey).
@@ -162,11 +163,11 @@ def main() -> None:
     device = sim.device
 
     lib = load_clip_library(args_cli.clip_path, device="cpu")
-    # Tile count = manifest terrains + flat tiles (default one per flat clip); size
-    # num_envs to one env per tile per replica row unless overridden.
+    # Tile count = manifest terrains + flat tiles (default: the library's flat-terrain
+    # count from generator_config, matching the generation split); size num_envs to one
+    # env per tile per replica row unless overridden.
     n_terrain_tiles = len(lib.attrs["terrain_manifest"])
-    n_flat_clips = int((lib.terrain_id.to(torch.long) == -1).sum())
-    num_flat_tiles = args_cli.num_flat_tiles if args_cli.num_flat_tiles is not None else n_flat_clips
+    num_flat_tiles = args_cli.num_flat_tiles if args_cli.num_flat_tiles is not None else default_num_flat_tiles(lib)
     num_tiles = n_terrain_tiles + num_flat_tiles
     num_envs = int(args_cli.num_envs or args_cli.num_rows * num_tiles)
 
