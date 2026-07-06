@@ -565,6 +565,19 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+
+    # Terrain variant: same closed-loop FM deploy, but on the ClipTerrainImporter stairs
+    # (height scan rides the treads). Load the teacher via --load_run + terrain FM via
+    # --fm_checkpoint, --clip_device cpu.
+    gym.register(
+        id="G1-tracker-clf-fm-terrain-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True
 
 
