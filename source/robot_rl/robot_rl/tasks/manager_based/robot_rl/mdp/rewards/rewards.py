@@ -156,6 +156,55 @@ def multiple_undesired_contacts(env: ManagerBasedRLEnv, threshold: float, sensor
         total += torch.sum(is_contact, dim=1)
     return total
 
+def flight_contact_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    base_vel_cmd: str,
+    sensor_cfgs: Sequence[SceneEntityCfg],
+    weight_scalar: float,
+    start_vel: float,
+) -> torch.Tensor:
+    """Penalize ground contact while the reference is in its flight phase.
+
+    Rewards a genuine flight phase at running speed: whenever the *reference*
+    commands every tracked foot into swing (no desired contact) and the
+    commanded forward speed is at least ``start_vel`` m/s, any measured foot
+    contact force is penalized. ``weight_scalar`` starts at 0 and is ramped up
+    by :func:`~robot_rl.tasks.manager_based.robot_rl.mdp.curriculums.curriculums.contact_curriculum`,
+    so the penalty turns on gradually over training.
+
+    Args:
+        env: The RL environment.
+        command_name: Name of the trajectory-tracking command (the reference).
+        base_vel_cmd: Name of the base-velocity command (used for the speed gate).
+        sensor_cfgs: Foot contact sensors whose forces are summed.
+        weight_scalar: Curriculum-ramped scale on the penalty magnitude.
+        start_vel: Minimum commanded forward speed (m/s) for the penalty to apply.
+
+    Returns:
+        Non-negative per-environment penalty of shape ``[N]`` (applied with a
+        negative reward weight).
+    """
+    cmd = env.command_manager.get_term(command_name)
+
+    # Flight = the reference commands every tracked foot into swing (no contact).
+    contact_state = cmd.get_contact_state(cmd.manager.phase)  # [N, num_contacts]
+    flight_mask = (contact_state.sum(dim=-1) == 0).float()    # [N]
+
+    # Only penalize at running speed (commanded forward velocity >= start_vel).
+    command_vel = env.command_manager.get_command(base_vel_cmd)[:, :3]
+    speed_mask = (command_vel[:, 0] >= start_vel).float()     # [N]
+
+    # Measured foot contact-force magnitude, summed across the foot sensors.
+    contact_forces = torch.zeros(env.num_envs, device=env.device)
+    for sensor_cfg in sensor_cfgs:
+        contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+        net_forces = wp.to_torch(contact_sensor.data.net_forces_w_history)  # [N, H, B, 3]
+        contact_forces += torch.linalg.norm(net_forces[:, 0, sensor_cfg.body_ids], dim=-1).sum(dim=-1)
+
+    penalty = weight_scalar * torch.tanh(contact_forces / 0.5)
+    return flight_mask * speed_mask * penalty
+
 def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize applied torques if they cross the limits.
 

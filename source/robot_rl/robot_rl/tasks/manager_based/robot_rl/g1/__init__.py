@@ -168,6 +168,40 @@ if not _registered:
     )
 
     ## =========================================
+    # Running (submission refresh: matched DR + revived flight-contact penalty)
+    ## =========================================
+    gym.register(
+        id="G1-running-refresh-clf",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    gym.register(
+        id="G1-running-refresh-clf-symmetric",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        }
+    )
+
+    # Play
+    gym.register(
+        id="G1-running-refresh-clf-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    ## =========================================
     # Walk + Run Trajectory Optimization
     ## =========================================
     #########

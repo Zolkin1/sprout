@@ -234,6 +234,7 @@ RL Task list:
 | `walking_clf`         |     G1     |             No             | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground.                |
 | `walking_clf_sym`     |     G1     |     :white_check_mark:     | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground, uses symmetry. |
 | `running_clf_sym`     | G1 |     :white_check_mark:     | Running controller using a gait library.                                             |
+| `G1-running-refresh-clf` | G1 |          No (sim)          | Running, submission refresh: trajectory-clip reference, submission-matched DR, revived flight-contact penalty. Gym IDs `G1-running-refresh-clf[-symmetric\|-play]`. |
 | `waving_clf`          | G1 |             No             | Robot stands still and waves. Uses trajectories and CLFs.                            |
 | `bow_forward_clf_sym` | G1 |     :white_check_mark:     | Robot bows forward then holds its position. Uses symmetry.                           |
 | `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
