@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
 
@@ -62,6 +63,11 @@ class RecordingMeta:
             has one active (e.g. ``G1-teacher-clf-record``).
         content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
             set after collection. Compression-robust dataset identity; empty for older files.
+        format: Storage layout. "per_step_npz" (the legacy every-step ``.npz``) or
+            "windowed_h5" (pre-formed FM snap windows in a streaming ``.h5``; see
+            :class:`RecordedWindowWriter`). Defaulted so legacy ``.npz`` files still load.
+        history_len: For "windowed_h5", the number of history-state rows ``H`` stored per
+            window (must be >= the trainable ``num_history_states``). 0 for per-step files.
     """
 
     checkpoint_path: str
@@ -91,6 +97,8 @@ class RecordingMeta:
     ref_future_term_dims: list[int] = field(default_factory=list)
     height_scan_dim: int = 0
     content_sha256: str = ""
+    format: str = "per_step_npz"
+    history_len: int = 0
 
 
 def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
@@ -322,4 +330,165 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         height_scan_dim=int(z["height_scan_dim"]) if "height_scan_dim" in z.files else 0,
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
+    return data, meta
+
+
+# ---------------------------------------------------------------------------
+# Windowed (snap-only) recordings -- streaming HDF5
+# ---------------------------------------------------------------------------
+#
+# The FM dataset only ever trains on "snap" windows (flow_matching/dataset.py
+# snap_windows). Recording every step and storing the F-node ``ref_future`` at EVERY
+# step -- then discarding ~92% of it -- is what makes the per-step ``.npz`` path OOM.
+# The windowed format instead stores ONE pre-formed snap window per row (every stored
+# byte is used) and streams to a chunked, compressed HDF5 with bounded RAM (np.savez
+# cannot append). Layout per window (raw world-frame; the dataset applies relative_state
+# + normalization at build time):
+#   history_state [W, H, node]  the H most-recent state rows (last row == the snap; its
+#                               root pose is the ego-anchor). H >= trainable N.
+#   ref_future    [W, F, node]  the ego-anchored clip future at the snap.
+#   height_scan   [W, K]        the snap-row height scan (optional).
+#   cmd_future    [W, F, cmd]   the snap-row future command (optional; dataset strides it).
+#   episode_id    [W]           the snap-row episode id (leakage-free train/val split).
+
+_WINDOW_DTYPES: dict[str, str] = {
+    "history_state": "float32",
+    "ref_future": "float32",
+    "height_scan": "float32",
+    "cmd_future": "float32",
+    "episode_id": "int64",
+}
+
+
+def is_windowed_recording(path: str) -> bool:
+    """True if ``path`` is a windowed HDF5 recording (by extension ``.h5``/``.hdf5``)."""
+    return os.path.splitext(str(path))[1].lower() in (".h5", ".hdf5")
+
+
+def fingerprint_windows(data: dict[str, np.ndarray]) -> str:
+    """Content hash over the windowed arrays (see :func:`fingerprint_arrays`)."""
+    return fingerprint_arrays(data)
+
+
+def _window_chunk(shape: tuple[int, ...], block: int = 256) -> tuple[int, ...]:
+    """Chunk shape for a windowed dataset: block windows along the first axis.
+
+    Blocking many windows per chunk keeps the chunk count small (millions of
+    single-window chunks bloat the HDF5 B-tree), while a ~1-4 MB chunk stays
+    efficient for the sequential full-load reads the FM dataset does.
+    """
+    return (min(shape[0], block),) + shape[1:]
+
+
+class RecordedWindowWriter:
+    """Streaming HDF5 writer for pre-formed FM snap windows.
+
+    Datasets are pre-sized to ``num_windows`` and each collected batch is written into
+    its slice, so recording millions of windows never holds more than one batch in RAM
+    (unlike ``np.savez_compressed``). ``height_scan``/``cmd_future`` datasets are created
+    only when their dim is > 0. :class:`RecordingMeta` is stored as JSON-encoded root
+    attrs; :meth:`close` records ``num_windows_written`` and :func:`load_recorded_windows`
+    slices to it (so an under-filled file trims cleanly).
+
+    Args:
+        path: Output ``.h5`` path.
+        num_windows: Total windows the file will hold (upper bound).
+        history_len: ``H``, history-state rows per window.
+        node_dim: Per-row raw state width (== ref_future node width).
+        future_len: ``F``, future nodes per window.
+        height_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
+        cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
+        meta: Provenance/layout metadata (stored as JSON attrs).
+        compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
+    """
+
+    def __init__(
+        self, path: str, num_windows: int, history_len: int, node_dim: int,
+        future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
+        compression: str | None = "lzf",
+    ) -> None:
+        import h5py
+
+        self.path = str(path)
+        self.num_windows = int(num_windows)
+        shapes: dict[str, tuple[int, ...]] = {
+            "history_state": (num_windows, history_len, node_dim),
+            "ref_future": (num_windows, future_len, node_dim),
+            "episode_id": (num_windows,),
+        }
+        if height_dim > 0:
+            shapes["height_scan"] = (num_windows, height_dim)
+        if cmd_dim > 0:
+            shapes["cmd_future"] = (num_windows, future_len, cmd_dim)
+        self._keys = list(shapes)
+        self._f = h5py.File(self.path, "w")
+        for key, shape in shapes.items():
+            self._f.create_dataset(
+                key, shape=shape, dtype=_WINDOW_DTYPES[key],
+                chunks=_window_chunk(shape), compression=compression,
+            )
+        # RecordingMeta as JSON attrs (reconstructed by load_recorded_windows).
+        for k, v in asdict(meta).items():
+            self._f.attrs[k] = json.dumps(v)
+        self._f.attrs["num_windows"] = int(num_windows)
+        self._written = 0
+
+    def write_batch(self, batch: dict[str, np.ndarray]) -> int:
+        """Append a batch of windows; returns the number actually written.
+
+        Clamps to the remaining capacity. ``batch`` maps each present dataset key to a
+        ``[n, ...]`` array; all keys must share the leading ``n``.
+        """
+        n = int(batch["history_state"].shape[0])
+        start = self._written
+        take = min(n, self.num_windows - start)
+        if take <= 0:
+            return 0
+        end = start + take
+        for key in self._keys:
+            arr = np.asarray(batch[key])[:take]
+            self._f[key][start:end] = arr.astype(_WINDOW_DTYPES[key], copy=False)
+        self._written = end
+        return take
+
+    def set_attr(self, name: str, value) -> None:
+        """Store an extra JSON-encoded root attribute (e.g. the content fingerprint)."""
+        self._f.attrs[name] = json.dumps(value)
+
+    @property
+    def num_written(self) -> int:
+        """Number of windows written so far."""
+        return self._written
+
+    def close(self) -> None:
+        self._f.attrs["num_windows_written"] = self._written
+        self._f.close()
+
+    def __enter__(self) -> "RecordedWindowWriter":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def load_recorded_windows(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]:
+    """Load a windowed recording written by :class:`RecordedWindowWriter`.
+
+    Returns ``(data, meta)`` where ``data`` holds the pre-formed window arrays
+    (``history_state``, ``ref_future``, and -- when present -- ``height_scan``,
+    ``cmd_future``, plus ``episode_id``), each trimmed to ``num_windows_written``.
+    ``meta`` is reconstructed from the JSON root attrs.
+    """
+    import h5py
+
+    data: dict[str, np.ndarray] = {}
+    with h5py.File(str(path), "r") as f:
+        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        for key in _WINDOW_DTYPES:
+            if key in f:
+                data[key] = f[key][:n]
+        raw_attrs = {k: json.loads(v) for k, v in f.attrs.items()
+                     if k not in ("num_windows", "num_windows_written")}
+    field_names = {fld.name for fld in fields(RecordingMeta)}
+    meta = RecordingMeta(**{k: v for k, v in raw_attrs.items() if k in field_names})
     return data, meta

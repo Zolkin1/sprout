@@ -55,6 +55,7 @@ import cli_args  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 from recorded_data_io import (  # isort: skip
     RecordingMeta,
+    RecordedWindowWriter,
     fingerprint_arrays,
     sha256_file,
     unique_output_path,
@@ -82,8 +83,21 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument("--num_envs", type=int, default=32, help="Number of environments to simulate.")
 parser.add_argument(
-    "--num_pairs", type=int, required=True,
-    help="Total number of (observation, action) pairs to record.",
+    "--num_pairs", type=int, default=None,
+    help="LEGACY per-step .npz mode: total (observation, action) pairs to record "
+         "(buffers all steps in RAM). Pass exactly one of --num_pairs or --num_windows.",
+)
+parser.add_argument(
+    "--num_windows", type=int, default=None,
+    help="WINDOWED mode: total FM snap windows to stream to a chunked .h5 (bounded RAM; "
+         "only the snaps the FM actually trains on are stored). Pass exactly one of "
+         "--num_pairs or --num_windows.",
+)
+parser.add_argument(
+    "--history_len", type=int, default=8,
+    help="[--num_windows] History-state rows H stored per window. Must be >= the largest "
+         "num_history_states you will train the FM with (this is the one irreversible "
+         "record-time choice). Default 8.",
 )
 parser.add_argument(
     "--output_dir", type=str, default=None,
@@ -296,6 +310,45 @@ def _build_recording_meta(
     )
 
 
+def _assemble_state(robot, state_frames, frame_body_idx, n_envs) -> torch.Tensor:
+    """Raw world-frame per-step state row ``[N, node_dim]`` (layout == state_term_names).
+
+    Shared by :func:`collect_pairs` and :func:`collect_windows` so the recorded node
+    layout stays in one place: root pos(3)/quat(4, xyzw)/lin(3)/ang(3), joints, then
+    per extra frame pos(3)/quat(4)/lin(3)/ang(3).
+    """
+    parts = [
+        wp.to_torch(robot.data.root_pos_w),           # [N, 3]
+        wp.to_torch(robot.data.root_quat_w),          # [N, 4] (xyzw)
+        wp.to_torch(robot.data.root_link_lin_vel_w),  # [N, 3]
+        wp.to_torch(robot.data.root_link_ang_vel_w),  # [N, 3]
+        wp.to_torch(robot.data.joint_pos),            # [N, nj]
+        wp.to_torch(robot.data.joint_vel),            # [N, nj]
+    ]
+    if state_frames:
+        fpos = wp.to_torch(robot.data.body_pos_w)[:, frame_body_idx]        # [N, K, 3]
+        fquat = wp.to_torch(robot.data.body_quat_w)[:, frame_body_idx]      # [N, K, 4]
+        flink = wp.to_torch(robot.data.body_link_vel_w)[:, frame_body_idx]  # [N, K, 6]
+        parts.append(
+            torch.cat([fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1).reshape(n_envs, -1)
+        )
+    return torch.cat(parts, dim=-1)
+
+
+def _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs) -> torch.Tensor:
+    """Ego-anchored clip future ``[N, F, node_dim]`` (node layout == state).
+
+    Shared by :func:`collect_pairs` and :func:`collect_windows`.
+    """
+    pos_w, quat_w, lin_w, ang_w = ref_cmd.get_future_world_base(future_offsets)  # [N,F,·]
+    jp, jv = ref_cmd.get_future_joint_state(future_offsets)                       # [N,F,nj]
+    node = torch.cat([pos_w, quat_w, lin_w, ang_w, jp, jv], dim=-1)              # [N,F,13+2nj]
+    if state_frames:
+        ff = ref_cmd.get_future_world_frames(state_frames, future_offsets)       # [N,F,K,13]
+        node = torch.cat([node, ff.reshape(n_envs, ff.shape[1], -1)], dim=-1)
+    return node
+
+
 def collect_pairs(
     env: RslRlVecEnvWrapper,
     policy,
@@ -420,25 +473,7 @@ def collect_pairs(
             buf["perturb_active"].append(active.detach().cpu().clone())
         # Raw robot world-state at the same timestep as obs. Order/dims MUST match
         # state_term_names/state_term_dims in _build_recording_meta.
-        state_parts = [
-            wp.to_torch(robot.data.root_pos_w),      # [N, 3]
-            wp.to_torch(robot.data.root_quat_w),     # [N, 4] (xyzw)
-            wp.to_torch(robot.data.root_link_lin_vel_w),  # [N, 3] (link vel)
-            wp.to_torch(robot.data.root_link_ang_vel_w),  # [N, 3] (link ang vel)
-            wp.to_torch(robot.data.joint_pos),       # [N, num_joints] (raw)
-            wp.to_torch(robot.data.joint_vel),       # [N, num_joints] (raw)
-        ]
-        # Extra body frames: world pose + twist (link frame), appended in order
-        # matching state_term_names: [pos_w(3), quat_w(4), lin_vel_w(3), ang_vel_w(3)].
-        if state_frames:
-            fpos = wp.to_torch(robot.data.body_pos_w)[:, frame_body_idx]        # [N, K, 3]
-            fquat = wp.to_torch(robot.data.body_quat_w)[:, frame_body_idx]      # [N, K, 4]
-            flink = wp.to_torch(robot.data.body_link_vel_w)[:, frame_body_idx]  # [N, K, 6]
-            frame_state = torch.cat(
-                [fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1
-            ).reshape(n_envs, -1)  # [N, K*13]
-            state_parts.append(frame_state)
-        state = torch.cat(state_parts, dim=-1)
+        state = _assemble_state(robot, state_frames, frame_body_idx, n_envs)
         buf["state"].append(state.detach().cpu().clone())
         # Height scan at the same pre-step moment as state (per-ray ground clearance,
         # [N, K]); the dataset picks the snap-row scan as the FM height token.
@@ -466,12 +501,7 @@ def collect_pairs(
         # matches 'state': [root_pos(3), root_quat(4 xyzw), root_lin(3), root_ang(3),
         # joint_pos(nj), joint_vel(nj), <per frame pos(3)/quat(4)/lin(3)/ang(3)>].
         if record_ref_future:
-            pos_w, quat_w, lin_w, ang_w = ref_cmd.get_future_world_base(future_offsets)  # [N,F,·]
-            jp, jv = ref_cmd.get_future_joint_state(future_offsets)                        # [N,F,nj]
-            node = torch.cat([pos_w, quat_w, lin_w, ang_w, jp, jv], dim=-1)               # [N,F,13+2nj]
-            if state_frames:
-                ff = ref_cmd.get_future_world_frames(state_frames, future_offsets)        # [N,F,K,13]
-                node = torch.cat([node, ff.reshape(n_envs, ff.shape[1], -1)], dim=-1)
+            node = _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs)
             buf["ref_future"].append(node.detach().cpu().clone())
             buf["cmd_future"].append(
                 ref_cmd.get_future_command_velocity(future_offsets).detach().cpu().clone()
@@ -532,14 +562,166 @@ def collect_pairs(
     return out
 
 
+def collect_windows(
+    env: RslRlVecEnvWrapper,
+    policy,
+    policy_nn,
+    initial_obs,
+    num_windows: int,
+    history_len: int,
+    stochastic: bool,
+    ref_cmd,
+    ref_base_frame: str,
+    state_frames: list[str] | None,
+    future_len: int,
+    writer,
+    max_steps: int | None = None,
+) -> int:
+    """Roll out and STREAM pre-formed FM snap windows to ``writer`` (bounded RAM).
+
+    Instead of buffering every step (like :func:`collect_pairs`) and discarding all but
+    the snaps at train time, this forms one training window per env per step where the
+    command's re-anchor flag fires AND the env has ``history_len`` consecutive valid (no
+    reset since) history rows, and writes it straight to disk. This is equivalent to
+    ``snap_windows(num_history=history_len, stride=1)`` over a full per-step recording
+    (proven by ``tests/test_record_windows.py``), but never holds more than a per-env
+    ring of the last ``H`` states plus one flush batch in memory.
+
+    Args:
+        env, policy, policy_nn, initial_obs, stochastic: as in :func:`collect_pairs`.
+        num_windows: Stop after streaming this many windows.
+        history_len: ``H``, history-state rows per window (>= trainable N).
+        ref_cmd: Trajectory command exposing the look-ahead accessors + ``_reanchor_active``.
+        state_frames: Extra body frames appended to each state row.
+        future_len: ``F``, future nodes recorded per window.
+        writer: A :class:`RecordedWindowWriter` to append batches to.
+        max_steps: Safety cap on rollout steps (defaults to a generous multiple).
+
+    Returns:
+        The number of windows actually written.
+    """
+    n_envs = env.num_envs
+    device = env.unwrapped.device
+    use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
+    robot = env.unwrapped.scene.articulations["robot"]
+    has_scan = "height_scanner" in env.unwrapped.scene.sensors
+
+    state_frames = list(state_frames or [])
+    frame_body_idx = None
+    if state_frames:
+        body_names = list(robot.data.body_names)
+        frame_body_idx = torch.tensor(
+            [body_names.index(f) for f in state_frames], dtype=torch.long, device=device
+        )
+    future_offsets = torch.arange(int(future_len), device=device)
+
+    obs = initial_obs
+    H = int(history_len)
+    # Per-env history ring ([N, H, node]; row H-1 = most recent) + a consecutive-valid
+    # counter reset to 0 on episode end so a window can never span a reset.
+    hist: torch.Tensor | None = None
+    valid = torch.zeros(n_envs, dtype=torch.long, device=device)
+    # Distinct episode ids per env so the FM's by-episode train/val split has no leakage.
+    episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
+    next_episode_id = int(n_envs)
+
+    if max_steps is None:
+        # Generous cap: snaps fire ~ N/ego_anchor_every per step once rings fill; 50x the
+        # ideal step count still terminates a run whose snaps are unexpectedly sparse.
+        max_steps = 50 * math.ceil(num_windows / max(n_envs, 1)) + 1000
+
+    print(f"[INFO] Streaming up to {num_windows} snap windows (H={H}, F={future_len}) "
+          f"on {n_envs} envs; max_steps={max_steps}...")
+    written = 0
+    step = 0
+    while written < num_windows and step < max_steps:
+        with torch.inference_mode():
+            actions = policy(obs, stochastic_output=stochastic)
+
+        # Pre-step snapshot (aligned with obs), matching collect_pairs' snap timing.
+        state_t = _assemble_state(robot, state_frames, frame_body_idx, n_envs)  # [N, node]
+        if hist is None:
+            hist = torch.zeros(n_envs, H, state_t.shape[1], device=device)
+        reanchor_t = ref_cmd._reanchor_active.to(torch.bool)                    # [N]
+
+        # Push this step's state into the ring; mark the row valid.
+        hist = torch.roll(hist, shifts=-1, dims=1)
+        hist[:, H - 1] = state_t
+        valid = torch.clamp(valid + 1, max=H)
+
+        # Emit a window for each env that snaps AND has a full valid ring.
+        emit = reanchor_t & (valid >= H)
+        if bool(emit.any()):
+            idx = emit.nonzero(as_tuple=False).flatten()
+            ref_future_t = _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs)
+            cmd_future_t = ref_cmd.get_future_command_velocity(future_offsets)  # [N, F, 3]
+            batch = {
+                "history_state": hist[idx].detach().cpu().numpy(),
+                "ref_future": ref_future_t[idx].detach().cpu().numpy(),
+                "cmd_future": cmd_future_t[idx].detach().cpu().numpy(),
+                "episode_id": episode_id[idx].detach().cpu().numpy(),
+            }
+            if has_scan:
+                scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
+                batch["height_scan"] = scan[idx].detach().cpu().numpy()
+            written += writer.write_batch(batch)
+            if written >= num_windows:
+                break
+
+        with torch.inference_mode():
+            obs, _, dones, _ = env.step(actions)
+            if use_policy_reset:
+                policy.reset(dones)
+            else:
+                policy_nn.reset(dones)
+
+        # Invalidate the ring for envs that just reset so the next window can't span it;
+        # assign fresh episode ids (matches collect_pairs' bookkeeping).
+        done_mask = dones.to(torch.bool)
+        n_done = int(done_mask.sum().item())
+        if n_done > 0:
+            valid[done_mask] = 0
+            new_ids = torch.arange(
+                next_episode_id, next_episode_id + n_done, device=device, dtype=torch.int64
+            )
+            episode_id = episode_id.clone()
+            episode_id[done_mask] = new_ids
+            next_episode_id += n_done
+
+        step += 1
+        if step % 100 == 0:
+            print(f"  step {step}: {written}/{num_windows} windows")
+
+    if written < num_windows:
+        print(f"[WARN] Reached max_steps={max_steps} with {written}/{num_windows} windows "
+              f"(snaps sparser than expected); saving what was collected.")
+    return written
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Load a checkpoint, roll it out, and save recorded (obs, action) pairs."""
-    if args_cli.num_pairs <= 0:
-        raise ValueError(f"--num_pairs must be positive; got {args_cli.num_pairs}.")
+    """Load a checkpoint, roll it out, and save recorded (obs, action) pairs.
+
+    Two modes: legacy ``--num_pairs`` buffers every step and writes one ``.npz``;
+    ``--num_windows`` streams only the FM snap windows to a chunked ``.h5`` (bounded RAM).
+    """
+    windowed = args_cli.num_windows is not None
+    if windowed == (args_cli.num_pairs is not None):
+        raise ValueError(
+            "Pass exactly one of --num_pairs (legacy per-step .npz) or "
+            "--num_windows (streamed snap-window .h5)."
+        )
+    count = args_cli.num_windows if windowed else args_cli.num_pairs
+    if count <= 0:
+        raise ValueError(f"--num_{'windows' if windowed else 'pairs'} must be positive; got {count}.")
+    if windowed:
+        if args_cli.history_len < 1:
+            raise ValueError(f"--history_len must be >= 1; got {args_cli.history_len}.")
+        if args_cli.perturb:
+            raise ValueError("--perturb (recovery data) is only supported in --num_pairs mode.")
 
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -593,8 +775,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             policy_nn = runner.alg.actor_critic
 
-        num_pairs = args_cli.num_pairs
-        num_steps = math.ceil(num_pairs / env.num_envs)
+        # Number of records to collect: windows (windowed) or (obs, action) pairs (legacy).
+        num_records = count
 
         # Resolve the trajectory command to record the reference from, plus the extra
         # body frames appended to the recorded state. Default frames = the command's
@@ -617,7 +799,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if state_frames:
             print(f"[INFO] Recording {len(state_frames)} extra state frames: {state_frames}")
 
-        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_pairs, state_frames)
+        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_records, state_frames)
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
         # command exposes the look-ahead accessors + a command velocity, unless disabled.
@@ -641,13 +823,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # update_history=False, so this does not mutate observation history.
         obs = env.get_observations()
 
-        # Warn (don't fail) on very large in-memory datasets: npz buffers
-        # everything in RAM before writing.
-        obs_dim = int(obs["policy"].shape[1])
-        est_bytes = num_pairs * (obs_dim + int(env.num_actions)) * 4
-        if est_bytes > 8 * (1 << 30):
-            print(f"[WARN] Estimated ~{est_bytes / (1 << 30):.1f} GiB of obs+action data will be "
-                  f"buffered in RAM before writing. Consider fewer pairs.")
+        # Warn (don't fail) on very large in-memory datasets: the legacy npz path buffers
+        # everything in RAM before writing (the windowed .h5 path streams, so no warning).
+        if not windowed:
+            obs_dim = int(obs["policy"].shape[1])
+            est_bytes = num_records * (obs_dim + int(env.num_actions)) * 4
+            if est_bytes > 8 * (1 << 30):
+                print(f"[WARN] Estimated ~{est_bytes / (1 << 30):.1f} GiB of obs+action data will be "
+                      f"buffered in RAM before writing. Consider --num_windows (streamed .h5).")
 
         # Export richer provenance YAML (gains, scales, default joint angles).
         # Optional: skip if the task lacks the terms it needs.
@@ -664,6 +847,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy.reset()
         else:
             policy_nn.reset()
+
+        # -- Windowed mode: stream only the FM snap windows to a chunked .h5 --------
+        if windowed:
+            if not will_record_ref_future:
+                raise ValueError(
+                    "--num_windows requires the ego-anchored clip future (ref_future): use a "
+                    "clip-tracking task exposing get_future_world_base + a command velocity, "
+                    "and do not pass --no_ref_future."
+                )
+            if "height_scanner" not in env.unwrapped.scene.sensors:
+                raise ValueError(
+                    "--num_windows requires a height_scanner sensor (the FM's height token); "
+                    "record on a task that has one (e.g. G1-teacher-clf-terrain-play)."
+                )
+            H = int(args_cli.history_len)
+            node_dim = int(sum(meta.state_term_dims))
+            K = int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
+            cmd_dim = int(
+                ref_cmd.get_future_command_velocity(
+                    torch.arange(1, device=env.unwrapped.device)
+                ).shape[-1]
+            )
+            meta.format = "windowed_h5"
+            meta.history_len = H
+            meta.height_scan_dim = K
+            # content_sha256 stays empty for the streamed format (the whole dataset is
+            # never in RAM to hash); sha256_file(<.h5>) identifies the file if needed.
+            out_path = unique_output_path(out_dir, prefix="recorded", ext=".h5")
+            with RecordedWindowWriter(
+                out_path, num_records, H, node_dim, rf_len, K, cmd_dim, meta,
+            ) as writer:
+                n_written = collect_windows(
+                    env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
+                    ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
+                    state_frames=state_frames, future_len=rf_len, writer=writer,
+                )
+            prov_dir = os.path.splitext(out_path)[0] + ".provenance"
+            git_snapshot(prov_dir)
+            try:
+                dump_yaml(os.path.join(prov_dir, "params", "env.yaml"), env_cfg)
+                dump_yaml(os.path.join(prov_dir, "params", "agent.yaml"), agent_cfg)
+            except Exception as exc:
+                print(f"[WARN] recording params dump skipped: {exc}")
+            print(f"[INFO] Streamed {n_written} snap windows to: {out_path}")
+            print(f"[INFO]   H={H} F={rf_len} node_dim={node_dim} K={K} cmd_dim={cmd_dim}; "
+                  f"format=windowed_h5  provenance={prov_dir}")
+            env.close()
+            return
+
+        # -- Legacy mode: buffer every step, write one .npz --------------------------
+        num_steps = math.ceil(num_records / env.num_envs)
 
         # Optional perturbation scheduler for recovery-data collection.
         scheduler = None
@@ -686,7 +920,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
 
         data = collect_pairs(
-            env, policy, policy_nn, obs, num_steps, num_pairs, args_cli.stochastic,
+            env, policy, policy_nn, obs, num_steps, num_records, args_cli.stochastic,
             ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame, state_frames=state_frames,
             scheduler=scheduler, ref_future_len=rf_len,
         )

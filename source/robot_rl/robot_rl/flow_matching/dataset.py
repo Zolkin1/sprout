@@ -227,20 +227,40 @@ class FutureStateDataset(Dataset):
         self.cmd_steps = list(range(0, f, cfg.cmd_stride))
         self.num_cmd_tokens = len(self.cmd_steps) if cmd_dim > 0 else 0
 
-        idx_hist = np.stack(windows).astype(np.int64)  # (Nw, N) history rows; last = snap row
-        snap_rows = idx_hist[:, -1]                    # (Nw,)
-        n_win = idx_hist.shape[0]
-
-        state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
-        rf_t = torch.from_numpy(np.ascontiguousarray(rf)).float()  # (P, F, node)
-
-        # Anchor = robot base at the snap row (xyz+yaw, applied inside relative_state).
+        # Two input formats produce the SAME five raw tensors (hw, p/q_anchor, tw, hs, cf);
+        # everything downstream (relative_state, normalizers, striding, noise) is shared.
+        #   per-step (.npz): ``windows`` = list of length-N row-index arrays into the
+        #     per-step arrays; ``ref_future``/``height_scan``/``cmd_future`` indexed at the
+        #     snap row (window[-1]); history = ``state`` at the N rows.
+        #   windowed (.h5): ``windows`` = a 1-D array of window indices into the pre-formed
+        #     arrays; ``history_state``/``ref_future``/... are already snap-formed.
+        windowed = "history_state" in data
         root_pos_slc, root_quat_slc = s_slc["root_pos_w"], s_slc["root_quat_w"]
-        p_anchor = state_t[snap_rows, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3)
-        q_anchor = state_t[snap_rows, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
-
-        # -- history: N real robot-state rows ending at the snap, in the anchor frame --
-        hw = state_t[idx_hist]  # (Nw, N, state_raw)
+        rf_t = torch.from_numpy(np.ascontiguousarray(rf)).float()  # (P|W, F, node)
+        if windowed:
+            sel = np.asarray(windows, dtype=np.int64)  # (Nw,) window selector
+            n_win = int(sel.shape[0])
+            hs_state = torch.from_numpy(np.ascontiguousarray(data["history_state"])).float()
+            H = int(hs_state.shape[1])
+            if n > H:
+                raise ValueError(
+                    f"num_history_states={n} > recorded history_len={H}; "
+                    "re-record with --history_len >= num_history_states."
+                )
+            hw = hs_state[sel][:, H - n:, :]  # (Nw, n, state_raw); last n of H, snap = last
+            tw = rf_t[sel]                    # (Nw, F, node)
+            p_anchor = hw[:, -1, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3) snap root pose
+            q_anchor = hw[:, -1, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
+        else:
+            idx_hist = np.stack(windows).astype(np.int64)  # (Nw, N) history rows; last = snap
+            snap_rows = idx_hist[:, -1]                    # (Nw,)
+            n_win = idx_hist.shape[0]
+            state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
+            # Anchor = robot base at the snap row (xyz+yaw, applied inside relative_state).
+            p_anchor = state_t[snap_rows, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3)
+            q_anchor = state_t[snap_rows, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
+            hw = state_t[idx_hist]  # (Nw, N, state_raw)
+            tw = rf_t[snap_rows]    # (Nw, F, node)
 
         def _split_hist(name: str) -> torch.Tensor:
             a, b = s_slc[name]
@@ -258,7 +278,7 @@ class FutureStateDataset(Dataset):
         ).reshape(n_win, n, self.state_dim).contiguous()
 
         # -- target: the F-node ego-anchored clip future at the snap, in the same frame --
-        tw = rf_t[snap_rows]  # (Nw, F, node)
+        # (``tw`` gathered above, per input format)
 
         def _split_tgt(name: str) -> torch.Tensor:
             a, b = s_slc[name]
@@ -285,11 +305,11 @@ class FutureStateDataset(Dataset):
 
         # Height token = the recorded height scan at the snap row (per-ray ground
         # clearance, body-relative). Replaces the old root-z scalar. K resolved here.
-        hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P, K)
+        hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P|W, K)
         # Missed ray-cast rays are recorded as -inf; sanitize before the normalizer
         # fit so they don't produce a NaN loss (matches the deploy token builder).
         hs = sanitize_height_scan(hs)
-        self.height = hs[snap_rows].contiguous()  # (Nw, K)
+        self.height = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, K)
         self.height_dim = self.height.shape[1]
         cfg.height_dim = self.height_dim
 
@@ -299,7 +319,8 @@ class FutureStateDataset(Dataset):
 
         # Strided future command tokens.
         if cmd_dim > 0:
-            cf = torch.from_numpy(np.ascontiguousarray(cmd_future)).float()[snap_rows]  # (Nw, F, cmd)
+            cf = torch.from_numpy(np.ascontiguousarray(cmd_future)).float()  # (P|W, F, cmd)
+            cf = cf[sel] if windowed else cf[snap_rows]                       # (Nw, F, cmd)
             cmd_strided = cf[:, self.cmd_steps, :].contiguous()
         else:
             cmd_strided = None
@@ -407,6 +428,9 @@ def build_train_val(
     Returns:
         ``(train_ds, val_ds_or_None)``.
     """
+    # Pre-formed windowed (.h5) recordings skip the snap_windows pass entirely.
+    if "history_state" in data:
+        return _build_train_val_windowed(data, meta, cfg)
     reanchor = data.get("reanchor_active")
     if reanchor is None:
         raise ValueError(
@@ -440,6 +464,45 @@ def build_train_val(
     if len(val_windows) > 0:
         val_ds = FutureStateDataset(
             data, meta, cfg, val_windows,
+            state_normalizer=train_ds.state_normalizer,
+            cmd_normalizer=train_ds.cmd_normalizer,
+            height_normalizer=train_ds.height_normalizer,
+        )
+    return train_ds, val_ds
+
+
+def _build_train_val_windowed(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig
+) -> tuple[FutureStateDataset, FutureStateDataset | None]:
+    """Train/val split for the pre-formed windowed (``.h5``) format.
+
+    The snap windows are already formed at record time (:class:`RecordedWindowWriter`),
+    so there is no :func:`snap_windows` pass: split the ``W`` windows by their per-window
+    snap ``episode_id`` (leakage-free, same RNG/``val_fraction`` as the per-step path) and
+    pass a 1-D window-index selector to :class:`FutureStateDataset`. ``cfg.stride`` applies
+    as a global train-time subsample of each split (a no-op at the default ``stride=1``).
+    """
+    W = int(data["history_state"].shape[0])
+    ep = np.asarray(data["episode_id"]).reshape(-1)  # (W,) snap-row episode id per window
+    unique_eps = np.unique(ep)
+    rng = np.random.default_rng(cfg.seed)
+    n_val = int(round(cfg.val_fraction * len(unique_eps)))
+    val_eps = set(rng.choice(unique_eps, size=n_val, replace=False).tolist()) if n_val > 0 else set()
+
+    all_idx = np.arange(W, dtype=np.int64)
+    in_val = np.isin(ep, list(val_eps)) if val_eps else np.zeros(W, dtype=bool)
+    stride = max(int(cfg.stride), 1)
+    train_idx = all_idx[~in_val][::stride]
+    val_idx = all_idx[in_val][::stride]
+    print(f"[fm-data] {W} snap windows ({train_idx.size} train / {val_idx.size} val) "
+          f"over {len(unique_eps)} episodes [windowed .h5].")
+
+    train_ds = FutureStateDataset(data, meta, cfg, train_idx, add_noise=True)
+    train_ds.val_episode_ids = sorted(int(e) for e in val_eps)  # for the bench's eval split
+    val_ds = None
+    if val_idx.size > 0:
+        val_ds = FutureStateDataset(
+            data, meta, cfg, val_idx,
             state_normalizer=train_ds.state_normalizer,
             cmd_normalizer=train_ds.cmd_normalizer,
             height_normalizer=train_ds.height_normalizer,
