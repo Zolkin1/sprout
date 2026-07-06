@@ -111,6 +111,11 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         self.commands.base_velocity.resampling_time_range = (4.0, 8.0)
         self.commands.base_velocity.max_acc = 1.0
         self.commands.base_velocity.max_acc_frac = 1.0
+        # Disable command debug viz for (headless) training -- the multiskill base
+        # leaves base_velocity.debug_vis=True, which spawns the velocity-goal
+        # point-instancer markers and trips omni/fabric even headless.
+        self.commands.base_velocity.debug_vis = False
+        self.commands.traj_ref.debug_vis = False
 
         ##
         # Rewards
