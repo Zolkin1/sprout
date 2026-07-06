@@ -115,6 +115,12 @@ def main() -> int:
     p.add_argument("--dt", type=float, default=0.02, help="Control-step dt (s).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--exclude-skills", default="", help="Comma-separated skills to never generate on FLAT terrains (e.g. walk_backwards to drop backward walking). Terrain/transition clips are forward-only regardless.")
+    p.add_argument("--flat-skill-frac", action="append", default=None, metavar="SKILL=FRAC",
+                   help="Explicit relative skill weights for the FLAT batch, e.g. --flat-skill-frac walk_forward=0.6 "
+                        "--flat-skill-frac running=0.3 --flat-skill-frac standing=0.1 (repeatable; weights are "
+                        "normalised). Skills omitted here get 0. Overrides the default library trajectory-count "
+                        "proportions. Cannot name the stair skill (flat clips never use stairs) or an --exclude-skills "
+                        "skill. Only the flat batch has a free mix; terrain/transition are stairs / stairs+standing.")
     p.add_argument("--stair-skill", default=None, help="Stair skill subfolder name for the step-dim scan (default: the auto-detected terrain-aware skill).")
     p.add_argument("--stair-width-max", type=float, default=3.0, help="Upper bound (m) when the stair library declares terrain_width as an open range (e.g. {min: 1.0}); tread widths are sampled per terrain in [range_min, this].")
     p.add_argument("--num-steps-min", type=int, default=4)
@@ -189,12 +195,30 @@ def main() -> int:
     # which velocities they emit.)
     buckets = _library_derived_buckets(manager)
     default_probs = {s.name: float(s.num_trajectories) for s in manager.skills}
-    # Flat clips: library proportions, but never the stair skill (and never any
-    # --exclude-skills, e.g. walk_backwards to keep flat clips forward-only).
-    flat_probs = _probs(
-        skill_list,
-        {k: v for k, v in default_probs.items() if k != stair_skill and k not in exclude_skills},
-    )
+    # Flat-batch skill mix.  Default: library trajectory-count proportions, but
+    # never the stair skill and never any --exclude-skills (e.g. walk_backwards).
+    # --flat-skill-frac overrides with explicit relative weights (unlisted -> 0).
+    flat_weights = {
+        k: v for k, v in default_probs.items() if k != stair_skill and k not in exclude_skills
+    }
+    if args.flat_skill_frac:
+        flat_weights = {}
+        for item in args.flat_skill_frac:
+            if "=" not in item:
+                raise SystemExit(f"--flat-skill-frac must be SKILL=FRAC, got {item!r}.")
+            name, val = item.split("=", 1)
+            name = name.strip()
+            if name not in skill_list:
+                raise SystemExit(f"--flat-skill-frac skill {name!r} not in library {skill_list}.")
+            if name == stair_skill:
+                raise SystemExit(f"--flat-skill-frac cannot set the stair skill {name!r}; flat clips never use stairs.")
+            if name in exclude_skills:
+                raise SystemExit(f"--flat-skill-frac skill {name!r} is also in --exclude-skills.")
+            flat_weights[name] = float(val)
+    flat_probs = _probs(skill_list, flat_weights)
+    flat_mix = {n: p for n, p in zip(skill_list, flat_probs) if p > 0}
+    print(f"[generate_terrain_clips] flat skill mix (normalised): "
+          + ", ".join(f"{n}={p:.3f}" for n, p in flat_mix.items()))
     samplers = {"flat": _make_sampler(buckets, skill_list, flat_probs, args.dt, args.seed + 1)}
 
     hd_grid, width_range, specs, walk_names = [], (0.0, 0.0), [], []
@@ -291,6 +315,12 @@ def main() -> int:
     )
 
     gen_config = {
+        # Provenance: enough to re-run this generation by hand.  The source library
+        # is also content-hashed into source_library_fingerprint, but the path/repo
+        # and seed are recorded here in plain form for easy recall.
+        "source": args.source,
+        "hf_repo": args.hf_repo,
+        "seed": args.seed,
         "num_terrains": args.num_terrains,
         "fracs": {"flat": args.frac_flat, "terrain": args.frac_terrain, "transition": args.frac_transition},
         "counts": counts,
@@ -315,6 +345,8 @@ def main() -> int:
         "blend_pace": args.blend_pace,
         "approach_threshold": args.approach_threshold,
         "skill_list": skill_list,
+        "exclude_skills": exclude_skills,
+        "flat_skill_mix": flat_mix,
         "hd_grid": [list(hd) for hd in hd_grid],
         "width_range": list(width_range),
         "stair_width_max": args.stair_width_max,
