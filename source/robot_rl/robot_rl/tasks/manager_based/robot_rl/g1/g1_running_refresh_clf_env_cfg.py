@@ -52,7 +52,9 @@ RUNNING_FLAT_MULTISKILL_CFG = MetaTerrainGeneratorCfg(
     slope_threshold=0.75,
     use_cache=False,
     sub_terrains={
-        "flat": MeshFlatTerrainCfg(proportion=1.0, skill_probs={"running": 1.0}),
+        # Single-skill folder (flat, no subfolder) -> the multiskill loader names
+        # the skill "default"; skill_probs/skill_list/velocity_buckets must agree.
+        "flat": MeshFlatTerrainCfg(proportion=1.0, skill_probs={"default": 1.0}),
     },
 )
 
@@ -85,26 +87,24 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         ##
         # Commands -- single running skill
         ##
-        # FILL IN: point at the regenerated submission running trajectory once it
-        # is ready. The batched loader wants a folder with a ``running/``
-        # subfolder of velocity-indexed running YAMLs (subfolder name must match
-        # the ``skill_list``/bucket key ``running``). Smoke-tested here against
-        # the walk-run merged library, which already contains a ``running`` skill.
-        self.commands.traj_ref.path = "trajectories/retargeted/2026-05-11_12-34-50_merged"
+        # Regenerated submission running trajectory (21 half-periodic solutions,
+        # conditioner vel_x in [1.38, 3.29] m/s). Flat folder of YAMLs -> the
+        # multiskill loader names the single skill "default".
+        self.commands.traj_ref.path = "trajectories/running/2026-07-06_11-46-52_running_config_icra_port"
 
-        # Single skill: only running. lin_vel_x is the submission running sweep;
-        # adjust to the regenerated trajectory's actual speed coverage.
+        # Single skill ("default"); lin_vel_x = the trajectory's actual speed
+        # coverage so commands map to an in-distribution trajectory.
         self.commands.traj_ref.velocity_buckets = {
-            "running": VelocityBucketCfg(lin_vel_x=(1.1, 3.0)),
+            "default": VelocityBucketCfg(lin_vel_x=(1.38, 3.29)),
         }
         # Contact gate on (gait phase-alignment). Non-None is required by the
         # default ``gate_skill_change_on_contact=True`` consistency assert; with
         # one skill the pending-skill-change queue simply never has entries.
         self.commands.traj_ref.contact_gate_window_frac = 0.1
 
-        # Base-velocity envelope (submission running values). Keep
+        # Base-velocity envelope matched to the trajectory's speed coverage. Keep
         # ``skill_transition_prob=None`` (single skill).
-        self.commands.base_velocity.ranges.lin_vel_x = (1.1, 3.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.38, 3.29)
         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
         self.commands.base_velocity.ranges.heading = (0.0, 0.0)
@@ -189,7 +189,7 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
             physics_material=base_terrain.physics_material,
             visual_material=base_terrain.visual_material,
             debug_vis=base_terrain.debug_vis,
-            skill_list=["running"],
+            skill_list=["default"],
         )
         self.scene.height_scanner = None
 
