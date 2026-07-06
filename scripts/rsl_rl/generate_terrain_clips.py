@@ -114,6 +114,7 @@ def main() -> int:
     p.add_argument("--clip-length", type=float, default=12.0, help="Clip length (s).")
     p.add_argument("--dt", type=float, default=0.02, help="Control-step dt (s).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--exclude-skills", default="", help="Comma-separated skills to never generate on FLAT terrains (e.g. walk_backwards to drop backward walking). Terrain/transition clips are forward-only regardless.")
     p.add_argument("--stair-skill", default=None, help="Stair skill subfolder name for the step-dim scan (default: the auto-detected terrain-aware skill).")
     p.add_argument("--stair-width-max", type=float, default=3.0, help="Upper bound (m) when the stair library declares terrain_width as an open range (e.g. {min: 1.0}); tread widths are sampled per terrain in [range_min, this].")
     p.add_argument("--num-steps-min", type=int, default=4)
@@ -153,6 +154,13 @@ def main() -> int:
     manager = MultiSkillManager(args.source, device, env=None, hf_repo=args.hf_repo)
     skill_list = [s.name for s in manager.skills]
 
+    exclude_skills = [s for s in args.exclude_skills.split(",") if s]
+    bad = [s for s in exclude_skills if s not in skill_list]
+    if bad:
+        raise SystemExit(f"--exclude-skills not in library {skill_list}: {bad}")
+    if exclude_skills:
+        print(f"[generate_terrain_clips] excluding skills from flat clips: {exclude_skills}")
+
     # Locate the stair (terrain-aware) skill by conditioning (read straight from
     # each trajectory's conditioner.terrain), not by name.  A flat-only library
     # is fine -- it just yields flat clips (terrain/transition need a stair skill).
@@ -181,8 +189,12 @@ def main() -> int:
     # which velocities they emit.)
     buckets = _library_derived_buckets(manager)
     default_probs = {s.name: float(s.num_trajectories) for s in manager.skills}
-    # Flat clips: library proportions, but never the stair skill.
-    flat_probs = _probs(skill_list, {k: v for k, v in default_probs.items() if k != stair_skill})
+    # Flat clips: library proportions, but never the stair skill (and never any
+    # --exclude-skills, e.g. walk_backwards to keep flat clips forward-only).
+    flat_probs = _probs(
+        skill_list,
+        {k: v for k, v in default_probs.items() if k != stair_skill and k not in exclude_skills},
+    )
     samplers = {"flat": _make_sampler(buckets, skill_list, flat_probs, args.dt, args.seed + 1)}
 
     hd_grid, width_range, specs, walk_names = [], (0.0, 0.0), [], []
@@ -236,9 +248,11 @@ def main() -> int:
             f"stair library vx = [{stair_vx[0]:.2f}, {stair_vx[1]:.2f}])"
         )
         # Terrain-only: forward union-range velocities; Transition: + some standing (no running).
-        samplers["terrain"] = _make_sampler(fwd_buckets, skill_list, _probs(skill_list, {stair_skill: 1.0}), args.dt, args.seed + 2)
+        terrain_w = {k: v for k, v in {stair_skill: 1.0}.items() if k not in exclude_skills}
+        transition_w = {k: v for k, v in {stair_skill: 0.85, "standing": 0.15}.items() if k not in exclude_skills}
+        samplers["terrain"] = _make_sampler(fwd_buckets, skill_list, _probs(skill_list, terrain_w), args.dt, args.seed + 2)
         samplers["transition"] = _make_sampler(
-            fwd_buckets, skill_list, _probs(skill_list, {stair_skill: 0.85, "standing": 0.15}), args.dt, args.seed + 3)
+            fwd_buckets, skill_list, _probs(skill_list, transition_w), args.dt, args.seed + 3)
 
         rng = np.random.default_rng(args.seed)
         specs = sample_terrain_specs(
