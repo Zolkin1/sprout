@@ -16,6 +16,9 @@ import torch
 
 from types import SimpleNamespace
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
+    MotionSequenceCommand,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import sample_terrain_clips
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
     clip_frame_origin,
@@ -117,6 +120,40 @@ def test_clip_frame_origin_flat_at_corner():
     out = clip_frame_origin(corner, center, torch.zeros(1), 0.0)
     assert torch.allclose(out[:, 1], center[:, 1])   # clip_y_center=0 -> centerline == tile center y
     assert torch.allclose(out[:, 2], corner[:, 2])
+
+
+def test_snap_decoupled_from_reanchor():
+    """The re-anchor cadence emits FM snaps for all ``_snap_mask`` envs (flat ego +
+    world-anchored stairs) but re-places the clip only for ``_ego_mask`` (flat ego)
+    envs -- so stair envs get a training window without moving off their treads."""
+    period = 10
+    n = 6
+    placed: dict[str, list[int]] = {}
+
+    def _stub_reanchor_clip_ids(ids: torch.Tensor) -> None:
+        placed["ids"] = ids.tolist()
+
+    # env: 0,1 = flat ego (snap + re-place); 2,3 = stair (snap, NO re-place);
+    #      4 = flat non-ego (never snaps); 5 = stair off-tick (won't fire this step).
+    fake = SimpleNamespace(
+        cfg=SimpleNamespace(ego_anchor_every=period),
+        env=SimpleNamespace(episode_length_buf=torch.tensor([0, 10, 0, 20, 0, 5])),
+        _snap_mask=torch.tensor([1, 1, 1, 1, 0, 1], dtype=torch.bool),
+        _ego_mask=torch.tensor([1, 1, 0, 0, 0, 0], dtype=torch.bool),
+        _reanchor_active=torch.zeros(n, dtype=torch.bool),
+        _reanchor_clip_ids=_stub_reanchor_clip_ids,
+    )
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+
+    tick = fake.env.episode_length_buf % period == 0  # [T, T, T, T, T, F]
+    # Snap flag fires exactly on snap_mask & tick (envs 0,1,2,3 here; env 5 off-tick).
+    assert fake._reanchor_active.tolist() == (fake._snap_mask & tick).tolist()
+    assert fake._reanchor_active.tolist() == [True, True, True, True, False, False]
+    # Clip is re-placed only for ego & tick (the flat ego envs 0,1).
+    assert placed["ids"] == [0, 1]
+    # Stair envs 2,3 snap (FM window) but are NOT re-placed (stay world-locked).
+    assert fake._reanchor_active[2] and fake._reanchor_active[3]
+    assert 2 not in placed["ids"] and 3 not in placed["ids"]
 
 
 def test_flat_bbox_centering_invariant():

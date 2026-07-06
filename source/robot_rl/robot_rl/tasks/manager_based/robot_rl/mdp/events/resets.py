@@ -330,6 +330,7 @@ def _commit_clip_reset(
     world_pos: torch.Tensor,
     world_quat: torch.Tensor,
     ego_mask: torch.Tensor,
+    snap_mask: torch.Tensor | None = None,
 ) -> None:
     """Shared tail of the clip resets: reference world state -> sim + command state.
 
@@ -348,8 +349,15 @@ def _commit_clip_reset(
         start_step: ``[k]`` start step within the clip per resetting env.
         world_pos: ``[k, 3]`` world placement of each clip's frame.
         world_quat: ``[k, 4]`` world placement heading (xyzw, w last) per env.
-        ego_mask: ``[k]`` bool, which envs are ego-anchored this episode.
+        ego_mask: ``[k]`` bool, which envs are ego-anchored (clip re-placed onto the
+            robot root on the cadence) this episode.
+        snap_mask: ``[k]`` bool, which envs emit an FM snap (re-inference) event on the
+            cadence. Defaults to ``ego_mask`` (flat: only ego envs snap). On terrain the
+            caller passes ``ego_mask | ~is_flat`` so world-anchored stair/transition envs
+            also snap (giving the FM a stair training window) without being re-placed.
     """
+    if snap_mask is None:
+        snap_mask = ego_mask
     state = cmd.reference_world_state_at(clip_id, start_step, world_pos, world_quat)
     nj = len(asset.joint_names)
     base_pose = state[:, 0:7]          # [pos(3), quat wxyz(4)]
@@ -362,6 +370,7 @@ def _commit_clip_reset(
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
     cmd._ego_mask[env_ids] = ego_mask
+    cmd._snap_mask[env_ids] = snap_mask
 
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
@@ -510,11 +519,18 @@ def reset_on_terrain_motion_sequence(
         world_pos[is_flat, 0] = cell_center_flat[:, 0] - bbox_center[:, 0]
         world_pos[is_flat, 1] = cell_center_flat[:, 1] - bbox_center[:, 1]
 
-    # 3-5. Ego re-anchor is flat-only (a terrain clip re-anchored onto the robot root
-    #      would decouple from the physical staircase), then compute + write the spawn.
+    # 3-5. Ego re-anchor (clip re-placement) is flat-only -- a terrain clip re-anchored
+    #      onto the robot root would decouple from the physical staircase. But the FM
+    #      SNAP (re-inference) event is emitted on ALL non-flat envs too (snap_mask), so
+    #      the FM still gets a training window on stairs: the stair clip stays
+    #      world-locked while the recorder marks the snap and the dataset ego-anchors the
+    #      recorded clip future to the robot base. Then compute + write the spawn.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
     ego_mask = is_flat & (torch.rand(k, device=device) < ego_frac)
-    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
+    snap_mask = ego_mask | ~is_flat  # flat: ego only; stair/transition: always snap
+    _commit_clip_reset(
+        cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask, snap_mask
+    )
 
 
 def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:

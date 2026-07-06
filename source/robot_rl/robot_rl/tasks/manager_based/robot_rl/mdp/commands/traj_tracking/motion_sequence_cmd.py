@@ -112,10 +112,19 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
         self._ego_mask = torch.zeros(n, dtype=torch.bool, device=dev)
-        # Per-env per-step flag: True on the steps where the clip placement was just
-        # snapped onto the robot root (a re-anchor event). Consumed by the data
-        # recorder so the FM trains only on snap-event anchors (node-0 offset ~ 0),
-        # matching the deploy regime (each FM re-inference is a snap).
+        # Per-env FM SNAP mask: which envs emit a snap (FM re-inference) event on the
+        # re-anchor cadence, DECOUPLED from the clip re-placement (``_ego_mask``). On
+        # flat this equals ``_ego_mask`` (only ego envs snap); on terrain it also
+        # includes the world-anchored stair/transition envs (set in the reset) so the
+        # FM still gets a training window on stairs -- the clip stays locked to the
+        # treads (never re-placed) while the recorder marks the snap. Set per reset in
+        # ``_commit_clip_reset``; defaults to ``_ego_mask`` when not given.
+        self._snap_mask = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-env per-step flag: True on the steps that are FM snap (re-inference) events
+        # for this env (``_snap_mask`` envs on the cadence tick). Consumed by the data
+        # recorder so the FM trains on snap-event anchors (the dataset ego-anchors the
+        # recorded clip future to the robot base at each snap), matching the deploy
+        # regime (each FM re-inference is a snap).
         self._reanchor_active = torch.zeros(n, dtype=torch.bool, device=dev)
         # Phase carrier so the base ``_update_command`` can read manager.phase.
         self.manager.phase = torch.zeros(n, device=dev)
@@ -246,29 +255,32 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.manager.phase = self._step.float() / max(T - 1, 1)
 
     def _reanchor_ego_envs(self) -> None:
-        """Re-place the clip on the robot's current root for ego-anchored envs.
+        """Emit FM snap events on the cadence and re-place the clip for ego envs.
 
-        For envs in ``self._ego_mask`` whose per-episode step hits the re-anchor
-        cadence (``cfg.ego_anchor_every``), recompute the per-env placement
-        (yaw + xy + z) so the clip's *current-step* base coincides with the robot's
-        measured root (planar position + heading + height), keeping only the clip's
-        natural tilt.  Between re-anchors the placement is fixed, so the reference
-        recedes ahead of the robot like a receding-horizon controller that re-plans
-        every few steps.  Snapping z (not the clip's natural height) matches the FM
-        deploy anchor (:meth:`FmTrackingCommand._run_fm`), so the teacher
-        trains against the same robot-height-anchored reference it sees at deploy.
+        The re-anchor cadence timer (``cfg.ego_anchor_every``) fires for EVERY env; two
+        things are then keyed off it, and they are DECOUPLED:
 
-        Fast early-return unless ``cfg.ego_anchor_fraction > 0``.  Naturally
-        idempotent across Isaac Lab's twice-per-step compute (same robot pose +
-        clip step -> same placement), so no extra once-per-step guard is needed.
+        * **FM snap flag** (``_reanchor_active``): set for the ``_snap_mask`` envs on the
+          tick. The recorder logs it and the FM dataset builds one training window per
+          snap. On flat ``_snap_mask == _ego_mask``; on terrain it also covers the
+          world-anchored stair/transition envs, so the FM gets stair windows too (the
+          dataset ego-anchors the recorded clip future to the robot base at each snap).
+        * **Clip re-placement** (``_reanchor_clip_ids``): applied ONLY to ``_ego_mask``
+          envs on the tick -- recompute the placement (yaw + xy + z) so the clip's
+          current-step base coincides with the robot's measured root, keeping only the
+          clip's natural tilt (a receding-horizon reference). Snapping z matches the FM
+          deploy anchor (:meth:`FmTrackingCommand._run_fm`). Stair clips are NEVER in
+          ``_ego_mask`` (a re-placed stair clip would detach from its physical treads),
+          so they stay world-locked while still emitting a snap.
+
+        Naturally idempotent across Isaac Lab's twice-per-step compute (same tick, masks,
+        robot pose + clip step -> same flag + placement), so no once-per-step guard.
         """
-        if self.cfg.ego_anchor_fraction <= 0.0:
-            self._reanchor_active[:] = False
-            return
         period = max(int(self.cfg.ego_anchor_every), 1)
-        due = self._ego_mask & (self.env.episode_length_buf % period == 0)
-        self._reanchor_active = due
-        self._reanchor_clip_ids(torch.nonzero(due, as_tuple=False).squeeze(-1))
+        tick = self.env.episode_length_buf % period == 0
+        self._reanchor_active = self._snap_mask & tick
+        ego_due = self._ego_mask & tick
+        self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
         """Re-place the clip's current-step base onto the robot root for env ``ids``.
