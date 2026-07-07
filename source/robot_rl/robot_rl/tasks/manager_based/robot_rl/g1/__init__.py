@@ -526,6 +526,31 @@ if not _registered:
     )
 
     ## =========================================
+    # Teacher on TERRAIN: terrain-aware clip tracking (stairs + flat, height scan)
+    # The scene ground is a ClipTerrainImporter built from the clip library, and
+    # each env is assigned a clip matching the terrain tile it stands on.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    ## =========================================
     # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
     ## =========================================
     # Closed-loop deploy of the ROBOT-STATE-conditioned FM: the teacher (--load_run)
@@ -537,6 +562,19 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    # Terrain variant: same closed-loop FM deploy, but on the ClipTerrainImporter stairs
+    # (height scan rides the treads). Load the teacher via --load_run + terrain FM via
+    # --fm_checkpoint, --clip_device cpu.
+    gym.register(
+        id="G1-tracker-clf-fm-terrain-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainPlayEnvCfg",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )

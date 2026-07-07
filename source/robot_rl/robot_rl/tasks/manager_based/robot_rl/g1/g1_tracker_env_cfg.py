@@ -36,6 +36,10 @@ from .g1_teacher_env_cfg import (
     G1TeacherTerminationCfg,
     G1TeacherEnvCfg,
 )
+from .g1_teacher_terrain_env_cfg import (
+    DEFAULT_TERRAIN_CLIP_PATH,
+    G1TeacherTerrainSceneCfg,
+)
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
 # Default robot-state-conditioned FM checkpoint (override per-run via --fm_checkpoint).
@@ -115,3 +119,67 @@ class G1FmTrackerPlayEnvCfg(G1FmTrackerEnvCfg):
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
         self.commands.traj_ref.debug_vis = True
+
+
+##
+# Terrain closed-loop deploy: the teacher tracks the terrain-trained FM ON the stairs
+##
+@configclass
+class G1FmTrackerTerrainEnvCfg(G1FmTrackerEnvCfg):
+    """Terrain counterpart of :class:`G1FmTrackerEnvCfg`: the flat ground is swapped for the
+    clip-library :class:`ClipTerrainImporter` (staircases + transitions + flat patches), so
+    the pelvis height scan rides the treads and the robot has real stairs to climb while the
+    teacher tracks the robot-state-conditioned FM.
+
+    Only the scene + reset differ from the flat FM tracker: the terrain-aware reset spawns
+    each env on a clip that matches its tile's ``terrain_id`` (so the robot starts on the
+    right staircase / lead-in), and both the importer mesh AND the command's seed clip
+    library are pinned to the same terrain ``.h5``. The reference is still the FM (the clip
+    only supplies the reset spawn + the ``target_vel`` command that conditions the FM), so
+    a terrain-trained FM should emit climbing references from the live height scan.
+
+    Wiring mirrors :class:`G1TeacherTerrainEnvCfg.__post_init__` (kept inline rather than
+    shared so this addition is purely additive and does not touch the teacher-terrain env).
+    """
+
+    scene: G1TeacherTerrainSceneCfg = G1TeacherTerrainSceneCfg(num_envs=4096, env_spacing=2.5)
+
+    def __post_init__(self):
+        super().__post_init__()  # G1TeacherEnvCfg: FmTrackingCommand + teacher obs + base_fallen
+        # The ClipTerrainImporter builds its mesh from clip_library_path and IGNORES the
+        # inherited flat terrain_generator; clear it to avoid confusion.
+        self.scene.terrain.terrain_generator = None
+        # Terrain-aware reset: each env spawns on a clip matching its tile's terrain_id.
+        self.events.reset_on_clip.func = mdp.reset_on_terrain_motion_sequence
+        # Single clip-library source of truth: importer (mesh + per-env terrain_id) and the
+        # FM command's seed/velocity clips MUST read the same file, or tile terrain ids won't
+        # line up with the clips' terrain ids.
+        self.commands.traj_ref.path = DEFAULT_TERRAIN_CLIP_PATH
+        self.scene.terrain.clip_library_path = DEFAULT_TERRAIN_CLIP_PATH
+        assert self.commands.traj_ref.path == self.scene.terrain.clip_library_path, (
+            "terrain clip library (scene.terrain.clip_library_path) and command clip "
+            "library (commands.traj_ref.path) must be the same file."
+        )
+        # Clips are baked axis-aligned with their staircase -> placement is a pure translation.
+        self.commands.traj_ref.randomize_heading = False
+
+
+@configclass
+class G1FmTrackerTerrainPlayEnvCfg(G1FmTrackerTerrainEnvCfg):
+    """Play/deploy viewer for the terrain FM tracker: one env per terrain tile, noise-free,
+    no pushes. Load the teacher via ``--load_run`` and the terrain-trained robot-state FM via
+    ``--fm_checkpoint``; ``--clip_device cpu`` for the multi-GB terrain clip library."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        # One replica row + one env per tile -> every terrain is shown exactly once.
+        self.scene.terrain.num_rows = 1
+        self.scene.num_envs = 24
+        # Terrain clip library is multi-GB; keep it off a small GPU (device-safe gather).
+        self.commands.traj_ref.clip_device = "cpu"
+        self.observations.policy.enable_corruption = False
+        self.events.push_robot = None
+        self.events.randomize_ground_contact_friction = None
+        # Draw the FM reference markers + the height-scan ray hits on the treads.
+        self.commands.traj_ref.debug_vis = True
+        self.scene.height_scanner.debug_vis = True

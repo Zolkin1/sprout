@@ -6,6 +6,8 @@ Cross-validates batched results against individual TrajectoryManager outputs
 to ensure correctness of the batched tensor implementation.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -193,6 +195,34 @@ class TestConditionerParsing:
         assert vals[0] == 1.0
         assert vals[1] == 2.0
         assert vals[2] == 3.0
+
+    def test_fixed_terrain_dim_bounds(self):
+        """A single-number terrain dim parses to a degenerate range lo == hi."""
+        cond = MultiSkillManager._parse_conditioner(
+            {"terrain": "stairs", "terrain_height": 0.135, "terrain_length": 0.233},
+            "stairs",
+        )
+        assert cond.terrain_height_bounds == (0.135, 0.135)
+        assert cond.terrain_length_bounds == (0.233, 0.233)
+        assert cond.terrain_height == pytest.approx(0.135)
+
+    def test_open_range_terrain_dim(self):
+        """A ``{min: v}`` range (no max) -> (v, +inf); representative = min."""
+        cond = MultiSkillManager._parse_conditioner(
+            {"terrain": "stairs", "terrain_width": {"min": 1.0}}, "stairs",
+        )
+        lo, hi = cond.terrain_width_bounds
+        assert lo == pytest.approx(1.0)
+        assert math.isinf(hi)
+        assert cond.terrain_width == pytest.approx(1.0)
+
+    def test_closed_range_terrain_dim(self):
+        """A ``{min, max}`` range keeps both bounds; representative = midpoint."""
+        cond = MultiSkillManager._parse_conditioner(
+            {"terrain": "stairs", "terrain_width": {"min": 1.0, "max": 2.0}}, "stairs",
+        )
+        assert cond.terrain_width_bounds == (1.0, 2.0)
+        assert cond.terrain_width == pytest.approx(1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1131,44 @@ def multiskill_with_stairs(tmp_path_factory) -> MultiSkillManager:
     return MultiSkillManager(path=str(root), device=DEVICE)
 
 
+@pytest.fixture(scope="module")
+def multiskill_range_stairs(tmp_path_factory) -> MultiSkillManager:
+    """Manager whose stair skill declares terrain dims as ``{min, max}`` ranges.
+
+    ``terrain_height`` is a closed range (a *don't-care* dim: the trajectory
+    works for any step rise in ``[0.10, 0.14]``), ``terrain_width`` an open
+    range (``>= 1.0``), and ``terrain_length`` a fixed value.  Exercises the
+    range-aware terrain-dim filter + bounds tensors.
+    """
+    import yaml
+
+    root = tmp_path_factory.mktemp("range_stair_library")
+    with open(WALKING_YAML, "r") as f:
+        base = yaml.safe_load(f)
+    walk_dir = root / "walk"
+    stairs_dir = root / "stairs"
+    walk_dir.mkdir()
+    stairs_dir.mkdir()
+
+    def _write(folder, name, conditioner):
+        data = dict(base)
+        data["conditioner"] = conditioner
+        with open(folder / name, "w") as f:
+            yaml.safe_dump(data, f)
+
+    _write(walk_dir, "walk.yaml", {"terrain": "flat", "vel_x": 0.5, "vel_y": 0.0, "vel_yaw": 0.0})
+    for vx in (0.4, 0.8):
+        _write(stairs_dir, f"stairs_v{vx}.yaml", {
+            "terrain": "stairs",
+            "terrain_height": {"min": 0.10, "max": 0.14},
+            "terrain_length": 0.20,
+            "terrain_width": {"min": 1.0},
+            "vel_x": vx, "vel_y": 0.0, "vel_yaw": 0.0,
+        })
+
+    return MultiSkillManager(path=str(root), device=DEVICE)
+
+
 def _make_dim_lookup(dims_per_env: torch.Tensor, valid_per_env: torch.Tensor):
     """Fake ``terrain.terrain_dims_at`` returning fixed per-env values."""
 
@@ -1109,6 +1177,50 @@ def _make_dim_lookup(dims_per_env: torch.Tensor, valid_per_env: torch.Tensor):
         return dims_per_env, valid_per_env
 
     return lookup
+
+
+class TestTerrainDimRanges:
+    """Range-valued terrain dims: bounds tensors + range-containment filter."""
+
+    def _stair_block(self, msm: MultiSkillManager) -> slice:
+        idx = msm.skill_name_to_idx["stairs"]
+        off = msm._skill_traj_offset[idx]
+        cnt = msm.skills[idx].num_trajectories
+        return slice(off, off + cnt)
+
+    def test_bounds_tensors_reflect_ranges(self, multiskill_range_stairs):
+        msm = multiskill_range_stairs
+        sl = self._stair_block(msm)
+        lo, hi = msm._terrain_dim_lo[sl], msm._terrain_dim_hi[sl]
+        cnt = lo.shape[0]
+        # width: open range [1.0, +inf); height: [0.10, 0.14]; length fixed 0.20.
+        assert torch.allclose(lo[:, 0], torch.full((cnt,), 1.0), atol=1e-6)
+        assert torch.isinf(hi[:, 0]).all()
+        assert torch.allclose(lo[:, 1], torch.full((cnt,), 0.10), atol=1e-6)
+        assert torch.allclose(hi[:, 1], torch.full((cnt,), 0.14), atol=1e-6)
+        assert torch.allclose(lo[:, 2], torch.full((cnt,), 0.20), atol=1e-6)
+        assert torch.allclose(hi[:, 2], torch.full((cnt,), 0.20), atol=1e-6)
+
+    def test_range_dim_matches_in_range_feature(self, multiskill_range_stairs):
+        """A range height accepts any in-range feature height, rejects outside."""
+        msm = multiskill_range_stairs
+        stairs_idx = msm.skill_name_to_idx["stairs"]
+        sl = self._stair_block(msm)
+        skill_ids = torch.full((3,), stairs_idx, dtype=torch.long)
+        # feature (height, length) below / inside / above the [0.10, 0.14] range.
+        dims = torch.tensor(
+            [_dims3((0.08, 0.20)), _dims3((0.12, 0.20)), _dims3((0.20, 0.20))],
+            dtype=torch.float,
+        )
+        valid = torch.tensor([True, True, True])
+        msm.set_terrain_dim_lookup(_make_dim_lookup(dims, valid))
+        try:
+            mask = msm._terrain_dim_allowed(torch.zeros(3, 2), skill_ids)
+            assert not mask[0, sl].any(), "feature height below the range must be excluded"
+            assert mask[1, sl].all(), "in-range feature height must match every stair traj"
+            assert not mask[2, sl].any(), "feature height above the range must be excluded"
+        finally:
+            msm.set_terrain_dim_lookup(None)
 
 
 class TestTerrainDimFilter:

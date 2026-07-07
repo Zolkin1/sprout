@@ -36,6 +36,18 @@ def _walk_eligible(K: int) -> torch.Tensor:
     return mask
 
 
+def test_single_step_reach_scale_picks_one_step():
+    """With per-step (single-stride) reaches, a small gap picks a single short
+    step -- the granularity the terrain approach now runs at.
+    """
+    step = torch.tensor([0.08, 0.10, 0.20, float("inf")], device=DEVICE)  # single-step reaches
+    elig = torch.ones(1, 4, dtype=torch.bool, device=DEVICE)
+    tgt = torch.tensor([0.15], device=DEVICE)
+    do, forced = plan_slowdown_step(tgt, step, elig, approach_threshold=0.05)
+    assert bool(do[0]) is True
+    assert int(forced[0]) == 1  # 0.10 is the largest single-step reach <= 0.15
+
+
 def test_overshoot_picks_largest_step_not_exceeding_target():
     """Stance far from the stair ref -> slow down with the largest step
     whose reach does not overshoot the target."""

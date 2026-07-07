@@ -128,8 +128,10 @@ def main() -> int:
     p.add_argument("--no-ground-projection", action="store_true",
                    help="Disable pinning stance landings to the ground plane (allows z drift).")
     p.add_argument("--ground-height", type=float, default=0.0, help="Ground plane height for projection (m).")
-    p.add_argument("--seam-blend-steps", type=int, default=8,
-                   help="Cross-fade the new stride's first N steps with the old stride at each seam.")
+    p.add_argument("--transition", choices=("raw", "linear", "quadratic"), default="linear",
+                   help="Skill-transition (seam) strategy: 'linear' cross-fade (default), 'quadratic' ease-in cross-fade (holds the old stride longer), or 'raw' hard cut.")
+    p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
+                   help="Cross-fade completion length as a fraction of a STEP (half-cycle), in (0, 1]. Applies to 'linear'/'quadratic'.")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -149,7 +151,7 @@ def main() -> int:
     gen = OfflineClipGenerator(
         manager, sampler, dt=args.dt, clip_length_s=clip_length_s,
         project_to_ground=not args.no_ground_projection, ground_height=args.ground_height,
-        seam_blend_steps=args.seam_blend_steps, device=device,
+        transition=args.transition, transition_blend_end_phi=args.transition_blend_end_phi, device=device,
     )
 
     gen_config = {
@@ -162,7 +164,8 @@ def main() -> int:
         "skill_list": skill_list,
         "project_to_ground": not args.no_ground_projection,
         "ground_height": args.ground_height,
-        "seam_blend_steps": args.seam_blend_steps,
+        "transition": args.transition,
+        "transition_blend_end_phi": args.transition_blend_end_phi,
         "velocity_buckets": {
             name: {"lin_vel_x": list(b.lin_vel_x), "lin_vel_y": list(b.lin_vel_y),
                    "ang_vel_z": list(b.ang_vel_z), "heading": b.heading}

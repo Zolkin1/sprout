@@ -122,6 +122,8 @@ def main() -> int:
                         "the library and velocity still resamples within that one skill, but there are "
                         "no in-clip skill transitions. None (default) = draw a skill i.i.d. at every "
                         "velocity resample (frequent transitions).")
+    p.add_argument("--debug-interp", action="store_true",
+                   help="Log per-step skill-transition state (blend_active/blend_alpha) into the .h5 for scripts/rsl_rl/plot_clip_frames.py.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--hf-repo", default=None, help="Optional HuggingFace repo id for the source library.")
     p.add_argument("--config", default=None, help="JSON file overriding velocity_buckets / skill_probs.")
@@ -134,9 +136,18 @@ def main() -> int:
     p.add_argument("--no-ground-projection", action="store_true",
                    help="Disable pinning stance landings to the ground plane (allows z drift).")
     p.add_argument("--ground-height", type=float, default=0.0, help="Ground plane height for projection (m).")
-    p.add_argument("--seam-blend-steps", type=int, default=8,
-                   help="Cross-fade the new stride's first N steps with the old stride at each "
-                        "seam to smooth transitions (0 disables).")
+    p.add_argument("--transition", choices=("raw", "linear", "quadratic"), default="linear",
+                   help="Skill-transition (seam) strategy: 'linear' cross-fade old->new (default, "
+                        "online parity), 'quadratic' ease-in cross-fade (holds the old stride "
+                        "longer), or 'raw' hard cut.")
+    p.add_argument("--transition-blend-end-phi", type=float, default=0.3,
+                   help="Cross-fade completion length as a fraction of a STEP "
+                        "(half-cycle), in (0, 1]; e.g. 0.3 settles 30%% into the "
+                        "step. Applies to 'linear'/'quadratic'.")
+    p.add_argument("--blend-pace", choices=("old", "new", "longer"), default="old",
+                   help="Which stride's step DURATION the cross-fade window is a "
+                        "fraction of at a cross-gait seam: 'old' leaving stride "
+                        "(default), 'new' incoming, or 'longer' of the two.")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -214,7 +225,10 @@ def main() -> int:
     gen = OfflineClipGenerator(
         manager, sampler, dt=args.dt, clip_length_s=args.clip_length,
         exclude_skills=exclude_skills, project_to_ground=not args.no_ground_projection,
-        ground_height=args.ground_height, seam_blend_steps=args.seam_blend_steps, device=device,
+        ground_height=args.ground_height, transition=args.transition,
+        transition_blend_end_phi=args.transition_blend_end_phi,
+        blend_pace=args.blend_pace,
+        debug_interp=args.debug_interp, device=device,
     )
 
     # Generator config that fully determines the clips (for the fingerprint).
@@ -236,7 +250,9 @@ def main() -> int:
         "exclude_skills": exclude_skills,
         "project_to_ground": not args.no_ground_projection,
         "ground_height": args.ground_height,
-        "seam_blend_steps": args.seam_blend_steps,
+        "transition": args.transition,
+        "transition_blend_end_phi": args.transition_blend_end_phi,
+        "blend_pace": args.blend_pace,
         "velocity_buckets": {
             name: {"lin_vel_x": list(b.lin_vel_x), "lin_vel_y": list(b.lin_vel_y),
                    "ang_vel_z": list(b.ang_vel_z), "heading": b.heading}

@@ -24,6 +24,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -32,7 +33,11 @@ from torch.utils.tensorboard import SummaryWriter
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
-from recorded_data_io import load_recorded_data  # noqa: E402  isort: skip
+from recorded_data_io import (  # noqa: E402  isort: skip
+    load_recorded_data,
+    load_recorded_windows,
+    is_windowed_recording,
+)
 from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402  isort: skip
 
 from robot_rl.flow_matching import (  # noqa: E402
@@ -438,7 +443,10 @@ def main() -> None:
 
     data_path = _resolve_data_path(args.data)
     print(f"[INFO] Loading dataset: {data_path}")
-    data, meta = load_recorded_data(data_path)
+    if is_windowed_recording(data_path):
+        data, meta = load_recorded_windows(data_path)
+    else:
+        data, meta = load_recorded_data(data_path)
     # Auto-config from the recording's content (only the 'auto' sentinel infers;
     # an explicit --cmd_array / --target_source always wins).
     cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
@@ -659,19 +667,20 @@ def main() -> None:
 
 
 def _resolve_data_path(path: str) -> str:
-    """Accept a recorded ``.npz`` file or a directory.
+    """Accept a recorded ``.npz``/``.h5`` file or a directory.
 
     For a directory (e.g. a run dir or its ``recorded_data/``), return the newest
-    ``recorded_*.npz`` found under it — so you can pass a run name instead of the
-    full timestamped filename.
+    ``recorded_*.npz`` or ``recorded_*.h5`` (windowed) found under it — so you can pass a
+    run name instead of the full timestamped filename.
     """
     if os.path.isfile(path):
         return path
     if os.path.isdir(path):
         import glob  # noqa: PLC0415
         cands = glob.glob(os.path.join(path, "**", "recorded_*.npz"), recursive=True)
+        cands += glob.glob(os.path.join(path, "**", "recorded_*.h5"), recursive=True)
         if not cands:
-            raise FileNotFoundError(f"No recorded_*.npz found under directory: {path}")
+            raise FileNotFoundError(f"No recorded_*.npz/.h5 found under directory: {path}")
         return max(cands, key=os.path.getmtime)
     raise FileNotFoundError(f"--data not found: {path}")
 
@@ -685,7 +694,11 @@ def _resolve_cmd_array(value, data) -> str | None:
     if value in (None, "none", "None"):
         return None
     if value == "auto":
-        return "target_vel" if data.get("target_vel") is not None else None
+        # Per-step recordings carry the command as ``target_vel``; windowed recordings
+        # carry it pre-strided as ``cmd_future``. Either enables command conditioning
+        # (the dataset reads the command from ``cmd_future`` in both cases).
+        has_cmd = data.get("target_vel") is not None or data.get("cmd_future") is not None
+        return "target_vel" if has_cmd else None
     return value
 
 
@@ -709,15 +722,22 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
     normalizers, so eval metrics are leakage-free and directly comparable to val.
     The eval recording must share the train layout (validated below).
     """
-    data, meta = load_recorded_data(eval_path)
-    if data.get("reanchor_active") is None:
-        raise ValueError(f"--eval_data has no 'reanchor_active' (snap flag): {eval_path}")
-    windows = snap_windows(
-        data["episode_id"], data["step_in_episode"], data["done"],
-        data["reanchor_active"], cfg.num_history_states, cfg.stride,
-    )
-    if not windows:
-        raise ValueError(f"--eval_data produced no valid snap windows: {eval_path}")
+    if is_windowed_recording(eval_path):
+        # Pre-formed windowed (.h5) eval set: use ALL windows (no split).
+        data, meta = load_recorded_windows(eval_path)
+        windows = np.arange(int(data["history_state"].shape[0]), dtype=np.int64)
+        if windows.size == 0:
+            raise ValueError(f"--eval_data has no windows: {eval_path}")
+    else:
+        data, meta = load_recorded_data(eval_path)
+        if data.get("reanchor_active") is None:
+            raise ValueError(f"--eval_data has no 'reanchor_active' (snap flag): {eval_path}")
+        windows = snap_windows(
+            data["episode_id"], data["step_in_episode"], data["done"],
+            data["reanchor_active"], cfg.num_history_states, cfg.stride,
+        )
+        if not windows:
+            raise ValueError(f"--eval_data produced no valid snap windows: {eval_path}")
     ds = FutureStateDataset(
         data, meta, cfg, windows,
         state_normalizer=train_ds.state_normalizer,
