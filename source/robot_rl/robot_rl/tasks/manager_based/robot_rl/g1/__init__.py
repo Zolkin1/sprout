@@ -201,6 +201,27 @@ if not _registered:
         }
     )
 
+    # Fast-only: train on just the library's top-speed reference (3.29 m/s)
+    gym.register(
+        id="G1-running-refresh-clf-fast",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFFastEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    gym.register(
+        id="G1-running-refresh-clf-fast-symmetric",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFFastEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        }
+    )
+
     ## =========================================
     # Walk + Run Trajectory Optimization
     ## =========================================

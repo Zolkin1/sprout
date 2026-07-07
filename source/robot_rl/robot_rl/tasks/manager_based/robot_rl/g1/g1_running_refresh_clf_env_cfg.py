@@ -120,10 +120,12 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         ##
         # Rewards
         ##
-        # CLF thresholds at the current (new-formulation) running scale; the
-        # submission's 0.25/0.3 were on the old CLF formulation and do not map 1:1.
-        self.rewards.clf_reward.params["max_eta_err"] = 12.0
-        self.rewards.clf_decreasing_condition.params["eta_max"] = 12.0
+        # CLF error normalizer. Lowered 12 -> 5 to sharpen tracking: V_max scales
+        # with max_eta_err^2, so this makes every output's tracking error ~5.8x
+        # more penalized (converged clf_reward was 9.0/10 at 12, so there is
+        # headroom). eta_max in the decreasing condition kept consistent at 5.
+        self.rewards.clf_reward.params["max_eta_err"] = 5.0
+        self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 24.0
 
         self.rewards.xy_vel.params["std"] = 0.75
@@ -200,13 +202,42 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
 
 
 @configclass
+class G1RunningRefreshCLFFastEnvCfg(G1RunningRefreshCLFEnvCfg):
+    """Single-reference training: pin the command to the library's TOP speed so
+    the conditioner always selects the fastest solution (vel_x=3.29 m/s), straight
+    ahead. Trains on just that one running reference. Inherits max_eta_err=5, the
+    submission-matched DR, and the flight-contact penalty from the parent.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Fastest trajectory in the library (max conditioner vel_x = 3.29 m/s).
+        # For the multiskill velocity cmd the sampled speed comes from the bucket,
+        # so pin the bucket (and the envelope) to 3.29; zero y/yaw so it trains
+        # purely on the single straight-running reference.
+        self.commands.traj_ref.velocity_buckets = {
+            "default": VelocityBucketCfg(lin_vel_x=(3.29, 3.29)),
+        }
+        self.commands.base_velocity.ranges.lin_vel_x = (3.29, 3.29)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+
+
+@configclass
 class G1RunningRefreshCLFEnvCfgPlay(G1RunningRefreshCLFEnvCfg):
     """Play/eval variant: few envs, no corruption, no domain randomization."""
 
     def __post_init__(self):
         super().__post_init__()
 
-        # Fixed play speed (within the running bucket).
+        # Fixed play speed. For the multiskill velocity command the SAMPLED speed
+        # comes from the per-skill bucket (velocity_buckets), NOT ranges.lin_vel_x
+        # -- so pin the bucket to hold a constant eval velocity. (2.5 m/s -> the
+        # nearest trajectory, conditioner vel_x=2.48, is tracked.)
+        self.commands.traj_ref.velocity_buckets = {
+            "default": VelocityBucketCfg(lin_vel_x=(2.5, 2.5)),
+        }
         self.commands.base_velocity.ranges.lin_vel_x = (2.5, 2.5)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
