@@ -812,6 +812,19 @@ def main() -> None:
         import gen_tracker_metrics
         gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
 
+    # Hard-exit to skip the native GL teardown. At interpreter exit the MuJoCo viewer's
+    # GLFW context and pygame/SDL (joystick) race destroying their GLX contexts on the X
+    # server -- this prints "GLXBadContext" and, worse, can DEADLOCK the main thread in
+    # that C teardown, leaving the window "not responding" and unresponsive to Ctrl-C
+    # (the SIGINT handler never runs because we're stuck in native code). Everything the
+    # run produces (metrics CSV, plots, stdout) is already flushed/written by here, so
+    # terminating at the OS level is safe and avoids the hang. Only for viewer runs --
+    # headless/eval has no GL context to tear down and returns normally.
+    if not args.headless:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
 
 if __name__ == "__main__":
     main()
