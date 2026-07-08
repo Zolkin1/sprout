@@ -153,6 +153,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "path"):
                     term.path = args_cli.clip
                     print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
+            # The ClipTerrainImporter builds its terrain mesh + per-env terrain_id from
+            # its OWN clip_library_path, which must stay identical to the command's clip
+            # path (the env cfg asserts this -- tile terrain ids must line up with the
+            # clips' terrain ids). Re-point it too so --clip is a single source of truth.
+            terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+            if terrain is not None and hasattr(terrain, "clip_library_path"):
+                terrain.clip_library_path = args_cli.clip
+                print(f"[INFO] clip path='{args_cli.clip}' for scene.terrain (ClipTerrainImporter).")
 
         # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
         # hydra: the cfg field default is None so hydra rejects a str override).

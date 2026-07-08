@@ -36,7 +36,7 @@ from .g1_teacher_env_cfg import G1TeacherEnvCfg, G1TeacherSceneCfg
 # Default terrain clip library (staircases + transitions + flat patches), generated
 # with scripts/rsl_rl/generate_terrain_clips.py at the env control dt (0.02).  The
 # terrain mesh AND the tracked clips both come from this one file.
-DEFAULT_TERRAIN_CLIP_PATH = "clips/g1_terrain_v2.h5"
+DEFAULT_TERRAIN_CLIP_PATH = "clips/g1_terrain_v3.h5"
 
 
 ##
