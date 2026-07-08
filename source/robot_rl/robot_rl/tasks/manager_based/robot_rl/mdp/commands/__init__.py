@@ -6,4 +6,3 @@
 """Command configurations for the environment."""
 
 from .velocity_commands_cfg import VelocityTrackingCommandCfg
-from .multiskill_velocity_commands_cfg import MultiskillVelocityTrackingCommandCfg, VelocityBucketCfg
