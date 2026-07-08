@@ -205,6 +205,78 @@ def flight_contact_penalty(
     penalty = weight_scalar * torch.tanh(contact_forces / 0.5)
     return flight_mask * speed_mask * penalty
 
+def _active_stance_frame_state(cmd):
+    """World pose + velocity of the currently-active stance reference frame, per env.
+
+    Returns ``(pos [N,3], quat [N,4] wxyz, lin_vel [N,3], ang_vel [N,3],
+    not_flight [N])``. ``not_flight`` is 1 for envs whose reference is in a
+    single-support (contact) domain and 0 during flight -- the holonomic
+    constraints only apply while a foot is planted.
+    """
+    robot = cmd.robot
+    n = cmd.num_envs
+    # active_body: robot body index of the stance ref frame, per env.
+    # ``ref_frame_indices`` is a python list[int]; index it with the per-env
+    # active-frame index (a tensor) via a tensor gather.
+    ref_body_idx = torch.as_tensor(cmd.ref_frame_indices, device=cmd.device, dtype=torch.long)
+    active_body = ref_body_idx[cmd.cur_ref_frame_idx]                    # [N]
+    ar = torch.arange(n, device=cmd.device)
+    body_pos = wp.to_torch(robot.data.body_pos_w)[ar, active_body]       # [N,3]
+    body_quat = wp.to_torch(robot.data.body_quat_w)[ar, active_body]     # [N,4] wxyz
+    body_vel = wp.to_torch(robot.data.body_link_vel_w)[ar, active_body]  # [N,6] (lin, ang)
+    not_flight = (cmd.get_contact_state(cmd.manager.phase).sum(dim=-1) > 0).float()
+    return body_pos, body_quat, body_vel[:, :3], body_vel[:, 3:], not_flight
+
+def holonomic_constraint(env: ManagerBasedRLEnv, command_name: str, sigma_pose: float = math.sqrt(0.05)) -> torch.Tensor:
+    """Reward pinning the stance foot to its anchor pose during single support.
+
+    Exp kernel on the stance foot's drift from the re-anchor pose (the command's
+    ``ref_poses``): e = [dx, dy, dz, roll, d_yaw]. Masked off during flight.
+    Ported from the ICRA HZD running config (weight 4.0), adapted to the batched
+    command's ``ref_poses`` anchor + the active stance-foot body world pose.
+
+    Args:
+        env: The RL environment.
+        command_name: Name of the trajectory-tracking command (the reference).
+        sigma_pose: Kernel width; matches the submission's sqrt(0.05).
+
+    Returns:
+        Per-environment reward in [0, 1] (zero during flight).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    pos, quat, _, _, not_flight = _active_stance_frame_state(cmd)
+    anchor_pos = cmd.ref_poses[:, :3]
+    anchor_quat = cmd.ref_poses[:, 3:]
+
+    delta_xy = pos[:, :2] - anchor_pos[:, :2]                     # [N,2]
+    delta_z = (pos[:, 2] - anchor_pos[:, 2]).unsqueeze(-1)        # [N,1]
+    roll, _, yaw = euler_xyz_from_quat(quat, wrap_to_2pi=False)
+    _, _, anchor_yaw = euler_xyz_from_quat(anchor_quat, wrap_to_2pi=False)
+    delta_psi = wrap_to_pi(yaw - anchor_yaw).unsqueeze(-1)        # [N,1]
+    roll = wrap_to_pi(roll).unsqueeze(-1)                         # [N,1] (near 0 for a flat foot)
+
+    e_pose = torch.cat([delta_xy, delta_z, roll, delta_psi], dim=-1)   # [N,5]
+    return not_flight * torch.exp(-(e_pose ** 2).sum(dim=-1) / sigma_pose ** 2)
+
+def holonomic_constraint_vel(env: ManagerBasedRLEnv, command_name: str, sigma_vel: float = math.sqrt(0.1)) -> torch.Tensor:
+    """Reward zero stance-foot velocity (lin xyz + yaw rate) during single support.
+
+    Exp kernel on the active stance foot's world linear velocity and yaw rate;
+    masked off during flight. Ported from the ICRA HZD running config (weight 2.0).
+
+    Args:
+        env: The RL environment.
+        command_name: Name of the trajectory-tracking command (the reference).
+        sigma_vel: Kernel width; matches the submission's sqrt(0.1).
+
+    Returns:
+        Per-environment reward in [0, 1] (zero during flight).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    _, _, lin_vel, ang_vel, not_flight = _active_stance_frame_state(cmd)
+    e_vel = torch.cat([lin_vel, ang_vel[:, 2:3]], dim=-1)         # [N,4]
+    return not_flight * torch.exp(-(e_vel ** 2).sum(dim=-1) / sigma_vel ** 2)
+
 def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize applied torques if they cross the limits.
 

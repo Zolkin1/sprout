@@ -1,5 +1,7 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
+import copy
+
 ##
 # Lyapunov Weights
 ##
@@ -128,6 +130,22 @@ WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+
+
+##
+# Running: feet-dominant CLF weighting (ICRA-like).
+##
+# Bump the ankle_roll (foot) frames far above the rest so the CLF prioritizes
+# foot Cartesian tracking (~10x the joint weight, echoing the ICRA feet:joints
+# ratio) instead of the uniform WALKING weights, where the joints (3.0) actually
+# outweighed the feet (1.0). Pairs with the holonomic stance-foot constraints.
+# R is left unchanged (reuse WALKING_R_weights).
+RUNNING_Q_weights = copy.deepcopy(WALKING_Q_weights)
+for _name in list(RUNNING_Q_weights.keys()):
+    if "ankle_roll_link:pos" in _name:
+        RUNNING_Q_weights[_name] = [30.0, 3.0]
+    elif "ankle_roll_link:ori" in _name:
+        RUNNING_Q_weights[_name] = [15.0, 3.0]
 
 
 # ##

@@ -30,6 +30,7 @@ from isaaclab.managers import SceneEntityCfg
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .g1_clf_multiskill_base import G1MultiSkillCLFEnvCfg
+from .clf_weights import RUNNING_Q_weights
 from ..mdp.commands.multiskill_velocity_commands_cfg import VelocityBucketCfg
 from ..terrains.meta_terrain_generator_cfg import MetaTerrainGeneratorCfg
 from ..terrains.meta_terrain_importer_cfg import MetaTerrainImporterCfg
@@ -97,10 +98,15 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         self.commands.traj_ref.velocity_buckets = {
             "default": VelocityBucketCfg(lin_vel_x=(1.38, 3.29)),
         }
-        # Contact gate on (gait phase-alignment). Non-None is required by the
-        # default ``gate_skill_change_on_contact=True`` consistency assert; with
-        # one skill the pending-skill-change queue simply never has entries.
-        self.commands.traj_ref.contact_gate_window_frac = 0.1
+        # Feet-dominant CLF weighting (ICRA-like): prioritize foot Cartesian
+        # tracking far above the joints/arms. See clf_weights.RUNNING_Q_weights.
+        self.commands.traj_ref.Q_weights = RUNNING_Q_weights
+        # Time-based reference anchor (match the ICRA anchor). Disable the contact
+        # gate so the phase advances purely on the episode clock and the world
+        # anchor re-anchors at time-based domain boundaries -- no physical-contact
+        # phase resync, i.e. the open-loop time-based reference ICRA used.
+        self.commands.traj_ref.contact_gate_window_frac = None
+        self.commands.traj_ref.gate_skill_change_on_contact = False
 
         # Base-velocity envelope matched to the trajectory's speed coverage. Keep
         # ``skill_transition_prob=None`` (single skill).
@@ -124,12 +130,43 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # with max_eta_err^2, so this makes every output's tracking error ~5.8x
         # more penalized (converged clf_reward was 9.0/10 at 12, so there is
         # headroom). eta_max in the decreasing condition kept consistent at 5.
-        self.rewards.clf_reward.params["max_eta_err"] = 5.0
-        self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
+        # CLF error normalizer, retuned for the feet-dominant weights (Option 2):
+        # with the bumped foot Q, lambda_max(P)~13 and V at good tracking ~12, so
+        # max_eta_err=2.0 puts clf_reward ~0.8 at good tracking (demanding, with
+        # headroom). ICRA's 0.3 does NOT transfer -- the 56-output set still
+        # aggregates joints/wrists into V. Main knob to tune: raise toward 2.5-3
+        # if the reward stays too low, lower toward 1.5 if it saturates high.
+        self.rewards.clf_reward.params["max_eta_err"] = 2.0
+        # CLF decreasing-condition: match the ICRA weight (-1.0) and alpha (0.5);
+        # eta_max kept consistent with clf_reward's max_eta_err. eta_dot_max left
+        # at 24 (per-step ΔV velocity scale -- see the CLF discrete-vs-continuous note).
+        self.rewards.clf_decreasing_condition.weight = -1.0
+        self.rewards.clf_decreasing_condition.params["alpha"] = 0.5
+        self.rewards.clf_decreasing_condition.params["eta_max"] = 2.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 24.0
 
-        self.rewards.xy_vel.params["std"] = 0.75
-        self.rewards.yaw_vel.params["std"] = 0.75
+        # Match the ICRA action-rate penalty (current base default is -0.01).
+        self.rewards.action_rate_l2.weight = -0.001
+
+        # Match the tag: drop explicit velocity-tracking rewards (ICRA relied on
+        # the CLF + holonomic constraints for base motion, not track_lin/ang_vel).
+        self.rewards.xy_vel = None
+        self.rewards.yaw_vel = None
+
+        # Holonomic stance-foot constraints (revived from the ICRA HZD running
+        # config): pin the stance foot's pose (weight 4.0) and velocity (weight
+        # 2.0) to its anchor during single support. Adapted to the batched
+        # command's ref_poses anchor + active stance-foot body world state.
+        self.rewards.holonomic_constraint = RewTerm(
+            func=mdp.holonomic_constraint,
+            weight=4.0,
+            params={"command_name": "traj_ref"},
+        )
+        self.rewards.holonomic_constraint_vel = RewTerm(
+            func=mdp.holonomic_constraint_vel,
+            weight=2.0,
+            params={"command_name": "traj_ref"},
+        )
 
         # Running-specific flight-contact penalty (revived). Starts inert at
         # weight_scalar=0.0 and is ramped by contact_penalty_curriculum. The term
@@ -160,9 +197,11 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         self.events.gain_randomization.params["damping_distribution_params"] = (-2.0, 2.0)
         self.events.gain_randomization.params["operation"] = "add"
 
-        # Torso mass: additive +-5 kg on waist_yaw_link (submission).
-        self.events.add_base_mass.params["mass_distribution_params"] = (-5.0, 5.0)
-        self.events.add_base_mass.params["operation"] = "add"
+        # Torso mass on waist_yaw_link: SCALE (0.8, 1.2) -- the submission's
+        # effective DR (set in G1RoughLipEnvCfg), i.e. +-20% of torso mass, not
+        # an additive +-5 kg.
+        self.events.add_base_mass.params["mass_distribution_params"] = (0.8, 1.2)
+        self.events.add_base_mass.params["operation"] = "scale"
 
         # COM randomization on the torso (waist_yaw_link).
         self.events.base_com.params["asset_cfg"] = SceneEntityCfg("robot", body_names="waist_yaw_link")
@@ -236,7 +275,7 @@ class G1RunningRefreshCLFEnvCfgPlay(G1RunningRefreshCLFEnvCfg):
         # -- so pin the bucket to hold a constant eval velocity. (2.5 m/s -> the
         # nearest trajectory, conditioner vel_x=2.48, is tracked.)
         self.commands.traj_ref.velocity_buckets = {
-            "default": VelocityBucketCfg(lin_vel_x=(2.5, 2.5)),
+            "default": VelocityBucketCfg(lin_vel_x=(3.29, 3.29)),
         }
         self.commands.base_velocity.ranges.lin_vel_x = (2.5, 2.5)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
