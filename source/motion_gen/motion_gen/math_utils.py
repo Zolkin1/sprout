@@ -76,3 +76,30 @@ def quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     xyz = quat[:, 1:]
     t = xyz.cross(vec, dim=-1) * 2
     return (vec + quat[:, 0:1] * t + xyz.cross(t, dim=-1)).view(shape)
+
+
+def matrix_to_quat(m: torch.Tensor) -> torch.Tensor:
+    """Batched rotation matrix ``[..., 3, 3]`` -> unit quaternion ``[..., 4]`` (wxyz).
+
+    Numerically stable branchless form (Shepperd's method by the largest diagonal term).
+    """
+    shape = m.shape[:-2]
+    m = m.reshape(-1, 3, 3)
+    m00, m11, m22 = m[:, 0, 0], m[:, 1, 1], m[:, 2, 2]
+    # Four candidate quaternions (one per Shepperd case), pick the numerically best.
+    q_w = torch.stack([1.0 + m00 + m11 + m22, m[:, 2, 1] - m[:, 1, 2],
+                       m[:, 0, 2] - m[:, 2, 0], m[:, 1, 0] - m[:, 0, 1]], dim=-1)
+    q_x = torch.stack([m[:, 2, 1] - m[:, 1, 2], 1.0 + m00 - m11 - m22,
+                       m[:, 1, 0] + m[:, 0, 1], m[:, 0, 2] + m[:, 2, 0]], dim=-1)
+    q_y = torch.stack([m[:, 0, 2] - m[:, 2, 0], m[:, 1, 0] + m[:, 0, 1],
+                       1.0 - m00 + m11 - m22, m[:, 2, 1] + m[:, 1, 2]], dim=-1)
+    q_z = torch.stack([m[:, 1, 0] - m[:, 0, 1], m[:, 0, 2] + m[:, 2, 0],
+                       m[:, 2, 1] + m[:, 1, 2], 1.0 - m00 - m11 + m22], dim=-1)
+    cand = torch.stack([q_w, q_x, q_y, q_z], dim=1)                 # [N, 4, 4]
+    diag = torch.stack([m00 + m11 + m22, m00, m11, m22], dim=-1)    # trace + diagonals
+    pick = diag.argmax(dim=-1)                                      # [N]
+    q = cand[torch.arange(cand.shape[0], device=m.device), pick]   # [N, 4]
+    q = normalize(q)
+    # canonical sign (w >= 0)
+    q = torch.where((q[:, :1] < 0), -q, q)
+    return q.reshape(*shape, 4)

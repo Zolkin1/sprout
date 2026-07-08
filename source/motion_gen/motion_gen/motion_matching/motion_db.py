@@ -146,6 +146,7 @@ class MotionDB:
         w1 = F.group_weight_vector(cfg, device=dev)                      # [pfd]
         weight = w1.repeat(len(offs))                                    # [D]
         self.mean, self.std, self.weight = mean, std, weight
+        self.desc_raw = raw                                              # [N, D] pre-normalization
         self.desc_norm = ((raw - mean) / std) * weight
         return self
 
@@ -188,6 +189,7 @@ class MotionDB:
             valid=self.valid.cpu().numpy(), source_kind=self.source_kind.cpu().numpy(),
             skill_id=self.skill_id.cpu().numpy(), stride_idx=self.stride_idx.cpu().numpy(),
             phase=self.phase.cpu().numpy(), future_vel=self.future_vel.cpu().numpy(),
+            desc_raw=self.desc_raw.cpu().numpy(),
             desc_norm=self.desc_norm.cpu().numpy(), mean=self.mean.cpu().numpy(),
             std=self.std.cpu().numpy(), weight=self.weight.cpu().numpy(),
             source_names=np.array(self.source_names, dtype=object),
@@ -199,7 +201,7 @@ class MotionDB:
         z = np.load(path, allow_pickle=True)
         db = cls(cfg, device)
         for k in ("joint_pos", "joint_vel", "root_pos", "root_quat", "root_lin_vel",
-                  "root_ang_vel", "future_vel", "desc_norm", "mean", "std", "weight"):
+                  "root_ang_vel", "future_vel", "desc_raw", "desc_norm", "mean", "std", "weight"):
             setattr(db, k, torch.as_tensor(z[k], dtype=torch.float32, device=device))
         for k in ("owner", "local", "source_kind", "skill_id", "stride_idx"):
             setattr(db, k, torch.as_tensor(z[k], dtype=torch.long, device=device))
