@@ -41,14 +41,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from isaaclab.utils.math import quat_apply, yaw_quat
+from motion_gen.math_utils import quat_apply, yaw_quat
 
-from ...guidance import goal_pd_commands
+from motion_gen.guidance_math import goal_pd_commands
 from ..multiskill_manager import _HALF_PERIODIC_INT, MultiSkillManager
 from ..sagittal_reflector import swap_left_right
 from ..skill_bucket import bucket_for_velocity
-from ..terrain_aware_ref import stair_stance_ref
-from ..terrain_transition import plan_slowdown_step
+# NOTE: the terrain helpers ``stair_stance_ref`` / ``plan_slowdown_step`` still live in
+# the RL package (they pull in IsaacLab terrain geometry).  They are imported lazily
+# via the ``_stair_stance_ref`` / ``_plan_slowdown_step`` proxies below so that
+# ``import motion_gen`` and flat clip generation work with no IsaacLab present; only
+# the terrain generation path needs them (and still requires IsaacLab).
 from ..world_lift import anchor_inv_yaw, bake_outputs_to_world, lift_orientation, lift_position
 from .offline_velocity_sampler import OfflineVelocitySampler
 from .transition_strategy import TransitionStrategy, make_transition_strategy
@@ -63,6 +66,24 @@ _END_PHASE = 1.0 - 1e-4
 # Back-off used to read the mid-cycle (LEFT) foot landing just before ``phi_mid``,
 # so the lookup stays inside the first half's last domain.
 _MID_READ_EPS = 1e-4
+
+
+def _stair_stance_ref(*args, **kwargs):
+    """Lazy proxy to the RL package's terrain ``stair_stance_ref`` (terrain path only)."""
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.terrain_aware_ref import (
+        stair_stance_ref,
+    )
+
+    return stair_stance_ref(*args, **kwargs)
+
+
+def _plan_slowdown_step(*args, **kwargs):
+    """Lazy proxy to the RL package's terrain ``plan_slowdown_step`` (terrain path only)."""
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.terrain_transition import (
+        plan_slowdown_step,
+    )
+
+    return plan_slowdown_step(*args, **kwargs)
 
 
 class OfflineClipGenerator:
@@ -756,7 +777,7 @@ class OfflineClipGenerator:
             dom = self.manager._get_domain_indices(torch.zeros(n, device=dev), stride)
             # Spawn is always on the first band (band_idx = 0).
             band0_project = lambda pts: self._band_project(pts, band_idx)
-            anchor_pos = stair_stance_ref(self.manager, band0_project, stride, anchor_pos, dom)
+            anchor_pos = _stair_stance_ref(self.manager, band0_project, stride, anchor_pos, dom)
             skill = self._traj_skill_idx[stride]
         else:
             skill, stride = self._select_strides(vel, anchor_xy=None, eligible=self._flat_eligible(n))
@@ -901,7 +922,7 @@ class OfflineClipGenerator:
         # overshot the top of band cur_band snaps to that band's exit level
         # rather than teleporting onto band+1.
         band_project = lambda pts: self._band_project(pts, cur_band)
-        stair_ref = stair_stance_ref(self.manager, band_project, stair_stride, land_pos, dom)  # [K, 3]
+        stair_ref = _stair_stance_ref(self.manager, band_project, stair_stride, land_pos, dom)  # [K, 3]
 
         # Forward distance from the landed foot to the stair stance reference.
         fwd = quat_apply(yaw_quat(land_quat), self._fwd_local.expand(K, 3))   # [K, 3]
@@ -910,7 +931,7 @@ class OfflineClipGenerator:
         # Approach slow-down decision (only meaningful for flat clips).
         appr_elig = self._ctx_approach_eligible if self._ctx_approach_eligible is not None else self._approach_eligible
         elig = appr_elig.unsqueeze(0).expand(K, -1)                          # [K, T]
-        do_appr, forced = plan_slowdown_step(
+        do_appr, forced = _plan_slowdown_step(
             tgt, self._traj_step_length, elig, self.approach_threshold,
         )
 

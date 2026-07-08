@@ -32,13 +32,13 @@ class _B:
 
 
 def test_half_periodic_library_is_rejected():
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+    from motion_gen.multiskill_manager import (
         MultiSkillManager,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+    from motion_gen.clips.offline_clip_generator import (
         OfflineClipGenerator,
     )
 

@@ -1,0 +1,23 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motion_gen"
+version = "0.1.0"
+description = "IsaacLab-free offline motion/clip generation for the G1 RL pipeline (reference engine, offline clip stitcher, motion matching)."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "h5py",
+    "pyyaml",
+    "tensordict",
+    "huggingface_hub",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["motion_gen*"]

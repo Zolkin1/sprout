@@ -27,11 +27,11 @@ import warp as wp
 from isaaclab.utils.math import quat_from_angle_axis
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
-from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
-from .clips.clip_io import load_clip_library
-from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
-from .clips.clip_manager import MotionClipManager
-from .world_lift import (
+from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
+from motion_gen.clips.clip_io import load_clip_library
+from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
+from motion_gen.clips.clip_manager import MotionClipManager
+from motion_gen.world_lift import (
     ego_placement,
     lift_base_world_state,
     lift_orientation,

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.sagittal_reflector import (
+from motion_gen.sagittal_reflector import (
     NamedReflector,
     SagittalReflectionConfig,
     swap_left_right,

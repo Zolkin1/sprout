@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import torch
 
-from .library_manager import LibraryManager
-from .manager_base import ManagerBase
+from motion_gen.library_manager import LibraryManager
+from motion_gen.manager_base import ManagerBase
 from .phased_trajectory_cmd import PhasedTrajectoryCommand
-from .trajectory_manager import TrajectoryManager
+from motion_gen.trajectory_manager import TrajectoryManager
 
 
 class TrajectoryCommand(PhasedTrajectoryCommand):

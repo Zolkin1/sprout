@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
+from motion_gen.world_lift import (
     lift_position,
 )
 
@@ -448,7 +448,7 @@ def reset_on_terrain_motion_sequence(
         base_frame_name: Trajectory base frame (must match the command cfg).
         asset_cfg: Robot asset config.
     """
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+    from motion_gen.clips.clip_io import (
         group_clips_by_terrain,
     )
     from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (

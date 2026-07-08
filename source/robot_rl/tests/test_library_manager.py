@@ -9,7 +9,7 @@ TODO: Delete this file when :mod:`library_manager` is removed.
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_manager import LibraryManager
+from motion_gen.library_manager import LibraryManager
 from conftest import MERGED_LIBRARY_DIR, DEVICE
 
 

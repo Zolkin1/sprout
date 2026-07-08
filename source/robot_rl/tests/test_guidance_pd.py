@@ -9,7 +9,7 @@ import math
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.guidance import (
+from motion_gen.guidance_math import (
     guidance_pd_commands,
 )
 

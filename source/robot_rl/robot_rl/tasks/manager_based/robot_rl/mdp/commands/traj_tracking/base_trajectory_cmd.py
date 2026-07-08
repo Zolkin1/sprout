@@ -26,11 +26,11 @@ from isaaclab.utils.math import (
 )
 
 from .clf import CLF
-from .manager_base import ManagerBase
-from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
+from motion_gen.manager_base import ManagerBase
+from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .terrain_aware_ref import apply_terrain_aware_ref
-from .trajectory_manager import TrajectoryType
-from .world_lift import lift_base_world_state
+from motion_gen.trajectory_manager import TrajectoryType
+from motion_gen.world_lift import lift_base_world_state
 
 
 class BaseTrajectoryCommand(CommandTerm):

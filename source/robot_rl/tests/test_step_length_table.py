@@ -25,10 +25,10 @@ DEVICE = "cpu"
 
 @pytest.fixture(scope="module")
 def manager_and_table():
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+    from motion_gen.multiskill_manager import (
         MultiSkillManager,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.step_length_table import (
+    from motion_gen.clips.step_length_table import (
         expand_ref_frames,
         traj_step_length_table,
     )
@@ -120,7 +120,7 @@ def test_landing_foot_at_first_gate_is_left_for_walk(manager_and_table):
     Gate 0 is the mid-cycle strike; its expected-contact body (A1) is the left
     ankle, and the step-length table's landing-foot resolution must agree.
     """
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.step_length_table import (
+    from motion_gen.clips.step_length_table import (
         _landing_foot_pos_x_cols,
     )
 

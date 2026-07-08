@@ -43,7 +43,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.composite import (
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.flat import FlatBlockCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.stair import StairBlockCfg
 
-from .offline_clip_generator import OfflineClipGenerator
+from motion_gen.clips.offline_clip_generator import OfflineClipGenerator
 from .offline_stair_projector import make_offline_stair_projector, make_offline_multi_stair_projector
 
 # Small x-clearance placing the nav goal before the far edge (m).

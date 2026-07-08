@@ -32,7 +32,7 @@ import numpy as np
 import viser
 from viser.extras import ViserUrdf
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     load_clip_library,
 )
 from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz

@@ -24,7 +24,7 @@ import math
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
+from motion_gen.world_lift import (
     ego_placement,
     _yaw_from_quat,
 )

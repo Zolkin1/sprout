@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     ClipLibraryData,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_manager import (
+from motion_gen.clips.clip_manager import (
     MotionClipManager,
 )
 

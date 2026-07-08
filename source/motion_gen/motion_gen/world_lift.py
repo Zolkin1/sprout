@@ -24,7 +24,7 @@ Quaternions are xyzw to match Isaac Lab's math utils.
 from __future__ import annotations
 
 import torch
-from isaaclab.utils.math import quat_apply, quat_inv, quat_mul, yaw_quat
+from motion_gen.math_utils import quat_apply, quat_inv, quat_mul, yaw_quat
 
 
 def anchor_inv_yaw(anchor_quat: torch.Tensor) -> torch.Tensor:

@@ -33,13 +33,13 @@ class _Bucket:
 
 @pytest.fixture(scope="module")
 def generated():
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+    from motion_gen.multiskill_manager import (
         MultiSkillManager,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+    from motion_gen.clips.offline_clip_generator import (
         OfflineClipGenerator,
     )
 
@@ -131,10 +131,10 @@ def test_seams_alternate_landing_foot(generated):
 def test_blend_window_must_be_step_fraction(generated):
     """``transition_blend_end_phi`` is a fraction of a STEP -> must be in (0, 1]."""
     m, _, _ = generated
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+    from motion_gen.clips.offline_clip_generator import (
         OfflineClipGenerator,
     )
     skills = [s.name for s in m.skills]
@@ -175,10 +175,10 @@ def test_uniform_timeline_no_dropped_frames(generated):
 def test_debug_interp_logs_blend_state(generated):
     """``debug_interp=True`` adds per-step blend_active/blend_alpha for plotting."""
     m, _, _ = generated
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+    from motion_gen.clips.offline_clip_generator import (
         OfflineClipGenerator,
     )
     skills = [s.name for s in m.skills]

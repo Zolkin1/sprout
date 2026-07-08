@@ -8,7 +8,7 @@ import warp as wp
 from typing import Sequence, TYPE_CHECKING
 
 from .guidance import guidance_pd_commands
-from .traj_tracking.skill_bucket import clamp_pd_channels_to_buckets
+from motion_gen.skill_bucket import clamp_pd_channels_to_buckets
 from .velocity_commands import VelocityTrackingCommand
 
 if TYPE_CHECKING:
