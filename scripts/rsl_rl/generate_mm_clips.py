@@ -24,7 +24,7 @@ import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.motion_matching import features as F
-from motion_gen.motion_matching.bones_ingest import ingest_bones
+from motion_gen.motion_matching.bones_ingest import ingest_bones, load_cache
 from motion_gen.motion_matching.mm_clip_generator import MotionMatchClipGenerator
 from motion_gen.motion_matching.motion_db import MotionDB
 from motion_gen.motion_matching.trajopt_ingest import ingest_trajopt
@@ -37,13 +37,21 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Traj-opt stride library root.")
     p.add_argument("--out", required=True, help="Output .h5 clip path.")
-    p.add_argument("--dataset", default=None, help="bones-seed dataset dir (omit to skip bones).")
+    p.add_argument("--dataset", default=None, help="bones-seed dataset dir (live ingest; omit to skip bones).")
+    p.add_argument("--bones-cache", default=None,
+                   help="Precomputed bones cache .h5 (from precompute_bones_cache.py); "
+                        "preferred over --dataset (no CSV parse / FK at run time).")
     p.add_argument("--dt", type=float, default=0.02)
     p.add_argument("--clip-length", type=float, default=9.0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--bones-limit", type=int, default=200, help="Max bones clips to ingest.")
+    p.add_argument("--bones-limit", type=int, default=None, help="Cap bones clips (default: all that pass the filter).")
     p.add_argument("--bones-package", default="Locomotion")
-    p.add_argument("--bones-style", default="neutral")
+    p.add_argument("--bones-style", default=None, help="Comma list of styles (default: any).")
+    p.add_argument("--bones-movement", default=None, help="Comma list of content_type_of_movement (e.g. walking,jogging).")
+    p.add_argument("--bones-body", default=None, help="Comma list of content_body_position (e.g. standing).")
+    p.add_argument("--index", dest="index", action="store_true", default=True, help="Build PCA->KD-tree index (default).")
+    p.add_argument("--no-index", dest="index", action="store_false", help="Use exact brute-force search instead.")
+    p.add_argument("--n-pca", type=int, default=48, help="PCA dims for the KD-tree index.")
     p.add_argument("--skills", default="standing,running,walk_forward",
                    help="Traj-opt skills to ingest into the DB.")
     p.add_argument("--run-vx", type=float, default=2.5)
@@ -60,15 +68,31 @@ def main() -> int:
 
     print(f"[mm] ingesting traj-opt strides for skills={skills} ...")
     sources = ingest_trajopt(manager, dt=args.dt, skills=skills, device=dev)
-    if args.dataset:
-        print(f"[mm] ingesting bones-seed ({args.bones_package}/{args.bones_style}, "
-              f"limit={args.bones_limit}) ...")
-        sources += ingest_bones(args.dataset, filters={"package": args.bones_package},
-                                styles=[args.bones_style], limit=args.bones_limit,
-                                dt=args.dt, device=dev)
-    print(f"[mm] building DB from {len(sources)} sources ...")
-    db = MotionDB(cfg, dev).build(sources, fk)
-    print(f"[mm] DB frames = {db.owner.shape[0]}, descriptor dim = {db.desc_norm.shape[1]}")
+
+    def _csv_set(s):
+        return None if not s else [x.strip() for x in s.split(",") if x.strip()]
+
+    bfilters = {"package": args.bones_package}
+    if args.bones_movement:
+        bfilters["content_type_of_movement"] = _csv_set(args.bones_movement)
+    if args.bones_body:
+        bfilters["content_body_position"] = _csv_set(args.bones_body)
+
+    if args.bones_cache:
+        print(f"[mm] loading bones cache {args.bones_cache} (filters={bfilters}, style={args.bones_style}) ...")
+        bsrc, _ = load_cache(args.bones_cache, filters=bfilters, styles=_csv_set(args.bones_style),
+                             limit=args.bones_limit, device=dev)
+        sources += bsrc
+        print(f"[mm]   {len(bsrc)} bones clips from cache")
+    elif args.dataset:
+        print(f"[mm] live-ingesting bones-seed (filters={bfilters}, limit={args.bones_limit}) ...")
+        sources += ingest_bones(args.dataset, filters=bfilters, styles=_csv_set(args.bones_style),
+                                limit=args.bones_limit, dt=args.dt, device=dev)
+
+    mode = "streaming PCA->KD-tree" if args.index else "dense brute-force"
+    print(f"[mm] building DB from {len(sources)} sources ({mode}) ...")
+    db = MotionDB(cfg, dev).build(sources, fk, index=args.index, n_pca=args.n_pca, w_vel=args.w_vel)
+    print(f"[mm] DB frames = {db.owner.shape[0]}")
     if args.db_out:
         db.save(args.db_out)
 

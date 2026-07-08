@@ -20,8 +20,10 @@ clips are finite recordings, so they ingest as ``wrap="episodic"`` (edge-repeat)
 from __future__ import annotations
 
 import csv as _csv
+import json
 import os
 
+import h5py
 import numpy as np
 import torch
 
@@ -52,9 +54,21 @@ def load_metadata(csv_path: str) -> list[dict]:
         return list(_csv.DictReader(f))
 
 
+def _match(row_val: str, want) -> bool:
+    """Case-insensitive match; ``want`` may be a scalar (exact) or a list/set (membership)."""
+    if isinstance(want, (list, set, tuple)):
+        return _norm(row_val) in {_norm(v) for v in want}
+    return _norm(row_val) == _norm(want)
+
+
 def filter_rows(rows, filters=None, styles=None, exclude_mirror=True,
                 exclude_name_substrings=None) -> list[dict]:
-    """Apply the package/category/... filter chain (case-insensitive exact match)."""
+    """Apply the package/category/... filter chain (case-insensitive).
+
+    ``filters`` maps a metadata column to a required value; the value may be a scalar
+    (exact match) or a list/set (membership, e.g. ``content_type_of_movement`` in
+    ``{walking, jogging}``).
+    """
     filters = filters or {}
     allowed_styles = {_norm(s) for s in (styles or [])}
     excl_sub = [_norm(s) for s in (exclude_name_substrings or [])]
@@ -64,13 +78,36 @@ def filter_rows(rows, filters=None, styles=None, exclude_mirror=True,
             continue
         if allowed_styles and _norm(r.get("content_uniform_style", "")) not in allowed_styles:
             continue
-        if any(_norm(r.get(col, "")) != _norm(val) for col, val in filters.items()):
+        if any(not _match(r.get(col, ""), val) for col, val in filters.items()):
             continue
         name = _norm(r.get("filename", ""))
         if any(sub in name for sub in excl_sub):
             continue
         out.append(r)
     return out
+
+
+def clip_to_state(file_path: str, src_fps: float = 120.0, dt: float = 0.02,
+                  device: str | torch.device = "cpu"):
+    """Parse + resample + finite-difference one seed CSV -> per-frame world state tensors.
+
+    Returns ``(joint_pos[F,21], root_pos[F,3], root_quat[F,4] wxyz, root_lin_vel[F,3],
+    root_ang_vel[F,3])`` or ``None`` if the file is missing/unparseable/too short.
+    """
+    if not os.path.isfile(file_path):
+        return None
+    try:
+        root_pos, root_quat, joints29 = parse_csv_g1(file_path)
+    except Exception:
+        return None
+    rp, qq, jj = _resample(root_pos, root_quat, joints29, src_fps, dt)
+    joint_pos = torch.as_tensor(jj[:, _G1_FROM_CSV], dtype=torch.float32, device=device)
+    root_pos_t = torch.as_tensor(rp, dtype=torch.float32, device=device)
+    root_quat_t = torch.as_tensor(qq, dtype=torch.float32, device=device)
+    joint_vel = IC.central_diff(joint_pos, dt)
+    root_lin_vel = IC.central_diff(root_pos_t, dt)
+    root_ang_vel = IC.angular_velocity_from_quat(root_quat_t, dt)
+    return joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel
 
 
 # ---- CSV parse (no pinocchio) ----------------------------------------------
@@ -175,24 +212,13 @@ def ingest_bones(
         rel = r.get("move_g1_path", "").strip()
         if not rel:
             continue
-        path = os.path.join(dataset_dir, rel)
-        if not os.path.isfile(path):
+        st = clip_to_state(os.path.join(dataset_dir, rel), src_fps, dt, device)
+        if st is None or st[0].shape[0] < min_frames:
             continue
-        try:
-            root_pos, root_quat, joints29 = parse_csv_g1(path)
-        except Exception:
-            continue
-        rp, qq, jj = _resample(root_pos, root_quat, joints29, src_fps, dt)
-        if rp.shape[0] < min_frames:
-            continue
-        joint_pos = torch.as_tensor(jj[:, _G1_FROM_CSV], dtype=torch.float32, device=device)
-        root_pos_t = torch.as_tensor(rp, dtype=torch.float32, device=device)
-        root_quat_t = torch.as_tensor(qq, dtype=torch.float32, device=device)
-        joint_vel = IC.central_diff(joint_pos, dt)
-        root_lin_vel = IC.central_diff(root_pos_t, dt)
-        root_ang_vel = IC.angular_velocity_from_quat(root_quat_t, dt)
+        joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel = st
         sources.append(MotionSource(
-            joint_pos=joint_pos, joint_vel=joint_vel, root_pos=root_pos_t, root_quat=root_quat_t,
+            joint_pos=joint_pos, joint_vel=IC.central_diff(joint_pos, dt),
+            root_pos=root_pos_t, root_quat=root_quat_t,
             root_lin_vel=root_lin_vel, root_ang_vel=root_ang_vel,
             source_kind=BONES, skill_id=-1, wrap="episodic",
             name=f"bones:{r.get('filename', '')}",
@@ -200,3 +226,72 @@ def ingest_bones(
         if limit is not None and len(sources) >= limit:
             break
     return sources
+
+
+# meta_<shortkey> dataset  ->  the metadata column name filter_rows expects
+_CACHE_META = {
+    "package": "package", "category": "category", "style": "content_uniform_style",
+    "movement": "content_type_of_movement", "body": "content_body_position",
+    "is_mirror": "is_mirror", "filename": "filename",
+}
+
+
+def load_cache(
+    cache_path: str,
+    filters: dict | None = None,
+    styles: list[str] | None = None,
+    exclude_mirror: bool = True,
+    exclude_name_substrings: list[str] | None = None,
+    limit: int | None = None,
+    device: str | torch.device = "cpu",
+) -> tuple[list[MotionSource], dict]:
+    """Load a precomputed bones cache, filter clips, return (sources, cache-attrs).
+
+    Sources carry the cached per-frame features (``MotionSource.feat``) so the DB build
+    skips FK entirely.  ``filters`` values may be scalars or lists (see :func:`filter_rows`),
+    e.g. ``{"content_type_of_movement": ["walking", "jogging"], "content_body_position": "standing"}``.
+    """
+    def _maybe_json(v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    f = h5py.File(cache_path, "r")
+    attrs = {k: _maybe_json(v) for k, v in f.attrs.items()}
+    C = int(f.attrs["n_clips"])
+    cols = {orig: [(s.decode() if isinstance(s, bytes) else s) for s in f[f"meta_{sk}"][:]]
+            for sk, orig in _CACHE_META.items()}
+    rows = [{**{orig: cols[orig][i] for orig in cols}, "_idx": i} for i in range(C)]
+    kept = filter_rows(rows, filters=filters, styles=styles, exclude_mirror=exclude_mirror,
+                       exclude_name_substrings=exclude_name_substrings)
+    if limit is not None:
+        kept = kept[:limit]
+
+    dt = json.loads(f.attrs["dt"])
+    cs = f["clip_start"][:]
+    cl = f["clip_len"][:]
+    # Read the arrays we need once (cache fits RAM), then slice per clip.
+    arrs = {k: f[k][:] for k in ("joint_pos", "root_pos", "root_quat", "root_lin_vel",
+                                 "root_ang_vel", "feat")}
+    f.close()
+
+    def T(a, dtype=torch.float32):
+        return torch.as_tensor(a, dtype=dtype, device=device)
+
+    sources: list[MotionSource] = []
+    for r in kept:
+        i = r["_idx"]; a = int(cs[i]); b = a + int(cl[i])
+        rq = T(arrs["root_quat"][a:b])
+        rq = rq / rq.norm(dim=-1, keepdim=True).clamp_min(1e-9)   # fp16 renorm
+        jp = T(arrs["joint_pos"][a:b])
+        sources.append(MotionSource(
+            joint_pos=jp, joint_vel=IC.central_diff(jp, dt),
+            root_pos=T(arrs["root_pos"][a:b]), root_quat=rq,
+            root_lin_vel=T(arrs["root_lin_vel"][a:b]), root_ang_vel=T(arrs["root_ang_vel"][a:b]),
+            source_kind=BONES, skill_id=-1, wrap="episodic",
+            feat=T(arrs["feat"][a:b]), name=f"bones:{r.get('filename', '')}",
+        ))
+    return sources, attrs

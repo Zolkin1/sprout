@@ -198,21 +198,21 @@ class MotionMatchClipGenerator:
         def play_transition(seg):
             """Match -> play matched source -> hand off. Returns (target_src, target_frame)."""
             nonlocal heading
+            tgt_skill = self.skill_of_name[seg["skill"]]
             q = self._query_descriptor(Wp, Wq, Wj)
             vel_bias = torch.tensor([[seg["vx"], 0.0, seg["wz"]]], device=self.device)
             gi, cost, _ = self.db.nn_search(q, vel_bias=vel_bias, w_vel=self.w_vel)
             gi = int(gi[0])
             msi, mf = int(self.db.owner[gi]), int(self.db.local[gi])
             ms = self.sources[msi]
-            tgt_mask = self._skill_mask(seg["skill"])
 
             # Pass 1: over the horizon, score each played frame against the target skill.
             best_k, best_cost, best_tgi = 0, float("inf"), -1
             for k in range(self.horizon):
                 fr = (mf + k) % ms.n if ms.wrap == "periodic" else min(mf + k, ms.n - 1)
                 g_idx = self.src_start[msi] + fr
-                tgi, tcost, _ = self.db.nn_search(self.db.desc_raw[g_idx:g_idx + 1],
-                                                  candidate_mask=tgt_mask)
+                tgi, tcost, _ = self.db.nn_search(self.db.frame_descriptor(g_idx),
+                                                  candidate_skill=tgt_skill)
                 if float(tcost[0]) < best_cost:
                     best_cost, best_k, best_tgi = float(tcost[0]), k, int(tgi[0])
             if best_cost > self.warn_cost_threshold:
@@ -235,7 +235,10 @@ class MotionMatchClipGenerator:
                         else ms.root_pos[fr] - ms.root_pos[prev_fr]
                     world_pos = world_pos + quat_apply(gq.unsqueeze(0), src_step.unsqueeze(0))[0]
                 wq = quat_mul(gq.unsqueeze(0), ms.root_quat[fr].unsqueeze(0))[0]
-                append(world_pos, wq, ms.joint_pos[fr], -1, -1, [float(seg["vx"]), 0.0, float(seg["wz"])])
+                # MM frame: valid target skill_id (frames are becoming the target skill);
+                # stride_idx = -1 is what marks them as motion-matched (not a steady stride).
+                append(world_pos, wq, ms.joint_pos[fr], tgt_skill, -1,
+                       [float(seg["vx"]), 0.0, float(seg["wz"])])
                 prev_fr = fr
             heading = torch.atan2(2 * (Wq[-1][0] * Wq[-1][3] + Wq[-1][1] * Wq[-1][2]),
                                   1 - 2 * (Wq[-1][2] ** 2 + Wq[-1][3] ** 2))
