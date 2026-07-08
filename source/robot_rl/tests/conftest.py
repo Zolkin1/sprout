@@ -9,7 +9,6 @@ import pytest
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_manager import TrajectoryManager
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_manager import LibraryManager
 
 TEST_DATA = Path(__file__).parent / "test_data"
 STANDING_YAML = str(TEST_DATA / "standing.yaml")
@@ -56,9 +55,3 @@ def walking_manager() -> TrajectoryManager:
 def running_manager() -> TrajectoryManager:
     """Running trajectory: half_periodic, 2 domains (single_support + flight_phase), T=0.299."""
     return TrajectoryManager(RUNNING_YAML, None, DEVICE)
-
-
-@pytest.fixture(scope="module")
-def merged_library() -> LibraryManager:
-    """Merged walk/run library: 19 YAML files, mixed speeds."""
-    return LibraryManager(MERGED_LIBRARY_DIR, None, DEVICE)

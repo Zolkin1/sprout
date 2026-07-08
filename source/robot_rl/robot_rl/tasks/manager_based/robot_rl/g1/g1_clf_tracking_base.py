@@ -33,7 +33,7 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
 ##
 # Robot RL
 ##
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.assets.robots import G1_ACTION_SCALE
 from robot_rl.assets.robots.g1_21j import G1_CFG  # isort: skip
@@ -133,26 +133,12 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
 ##
 @configclass
 class G1ClfTrackingCommandCfg:
-    # TODO: Migrate to BatchedMultiSkillCommandCfg.  Single-skill
-    # TrajectoryCommandCfg is slated for deletion; see
-    # ``g1_clf_multiskill_base.G1MultiSkillCommandsCfg`` for the
-    # equivalent multi-skill setup (folder of skill subfolders + skill
-    # conditioner instead of ``manager_type="library"``).  Sin/cos phase
-    # observations need a multi-skill replacement as well — see
-    # ``observations._phased_cmd``.
-    traj_ref = TrajectoryCommandCfg(
-        contact_bodies = [".*_ankle_roll_link"],
-
-        manager_type="library",
-        hf_repo = "zolkin/robot_rl",
-        path = "trajectories/walking",
-
-        conditioner_generator_name = "base_velocity",
-        Q_weights = WALKING_Q_weights,
-        R_weights = WALKING_R_weights,
-        hold_phi_threshold = 0.1,
-        heuristic_func=None,
-        phasing_boundaries=4,
+    # Placeholder default so the base env cfg constructs; every concrete env
+    # (teacher / FM tracker) overrides ``commands`` with its own command cfg.
+    traj_ref = MotionSequenceCommandCfg(
+        contact_bodies=[".*_ankle_roll_link"],
+        Q_weights=WALKING_Q_weights,
+        R_weights=WALKING_R_weights,
     )
 
     base_velocity = VelocityTrackingCommandCfg(
@@ -197,12 +183,6 @@ class G1ClfTrackingObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05)
         actions = ObsTerm(func=mdp.last_action, clip=(-20.0,20.0))
 
-        # TODO: Move everything to the multiskill phase as its general and can even work for single skills
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
-
-
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
@@ -223,10 +203,6 @@ class G1ClfTrackingObservationsCfg:
         joint_pos = ObsTerm(func=mdp.joint_pos_rel,)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
         actions = ObsTerm(func=mdp.last_action, clip=(-20.0,20.0))
-
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
 
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})

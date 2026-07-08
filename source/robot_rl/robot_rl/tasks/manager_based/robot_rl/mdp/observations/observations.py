@@ -10,10 +10,6 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs.mdp.observations import generated_commands
 from isaaclab.utils.math import quat_apply, quat_box_minus, quat_inv
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.phased_trajectory_cmd import (
-    PhasedTrajectoryCommand,
-)
-
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -37,44 +33,6 @@ def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch
     act_traj_vel = cmd.dy_act
     return act_traj_vel
 
-
-# TODO: Delete ``_phased_cmd``, ``ref_sin_phase``, ``ref_cos_phase``
-# along with :class:`PhasedTrajectoryCommand`.  The multi-skill bases
-# use :func:`multiskill_phase` (below) which reads the multi-skill
-# command's phase directly — replace any g1 single-skill obs that still
-# wires up sin/cos phase via ``_phased_cmd`` before removing.
-def _phased_cmd(env: ManagerBasedRLEnv, command_name: str) -> PhasedTrajectoryCommand:
-    cmd = env.command_manager.get_term(command_name)
-    if not isinstance(cmd, PhasedTrajectoryCommand):
-        raise TypeError(
-            f"Phase observation requires a PhasedTrajectoryCommand for "
-            f"'{command_name}', got {type(cmd).__name__}."
-        )
-    return cmd
-
-
-def ref_sin_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    cmd = _phased_cmd(env, command_name)
-
-    phase = 2*torch.pi * cmd.get_phasing_var()
-
-    sphase = torch.sin(phase)
-    if sphase.ndim == 1:
-        # [B] → [B, 1]
-        sphase = sphase.unsqueeze(-1)
-
-    return sphase
-
-def ref_cos_phase(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
-    cmd = _phased_cmd(env, command_name)
-
-    phase = 2*torch.pi * cmd.get_phasing_var()
-
-    cphase = torch.cos(phase)
-    if cphase.ndim == 1:
-        # [B] → [B, 1]
-        cphase = cphase.unsqueeze(-1)
-    return cphase
 
 def grace_period_active(
     env: ManagerBasedRLEnv,

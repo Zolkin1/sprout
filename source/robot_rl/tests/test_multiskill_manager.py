@@ -19,9 +19,6 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory
     TrajectoryManager,
     TrajectoryType,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_manager import (
-    LibraryManager,
-)
 from conftest import MERGED_LIBRARY_DIR, STANDING_YAML, WALKING_YAML, RUNNING_YAML, DEVICE, TEST_DATA
 
 
@@ -88,12 +85,6 @@ def reference_managers() -> list[TrajectoryManager]:
     # Sort by first conditioner value (same as MultiSkillManager/LibraryManager)
     managers.sort(key=lambda m: m.traj_data.conditioner[0])
     return managers
-
-
-@pytest.fixture(scope="module")
-def reference_library() -> LibraryManager:
-    """LibraryManager for comparison."""
-    return LibraryManager(MERGED_LIBRARY_DIR, None, DEVICE)
 
 
 # ---------------------------------------------------------------------------

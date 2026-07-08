@@ -24,8 +24,6 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
     joint_vel_ref,
     multiskill_phase,
     ref_base_velocity_local,
-    ref_cos_phase,
-    ref_sin_phase,
 )
 
 # Trajectory command term names to search for (in priority order)
@@ -427,13 +425,6 @@ class DataLogger:
                 step["phase_obs"] = multiskill_phase(unwrapped, self._phase_frequency_list, self._traj_term_name).clone()
             except Exception as exc:
                 self._warn("phase_obs", f"Could not compute multiskill_phase: {exc}")
-        elif self._phase_term_type == "sin_cos":
-            try:
-                s = ref_sin_phase(unwrapped, self._traj_term_name)
-                c = ref_cos_phase(unwrapped, self._traj_term_name)
-                step["phase_obs"] = torch.cat([s, c], dim=-1).clone()
-            except Exception as exc:
-                self._warn("phase_obs", f"Could not compute sin/cos phase: {exc}")
 
         for key, val in step.items():
             self._data[key].append(val)
@@ -544,9 +535,6 @@ class DataLogger:
                 sin_labels = [f"sin({f:.2f}Hz)" for f in freq_list]
                 cos_labels = [f"cos({f:.2f}Hz)" for f in freq_list]
                 self.metadata["phase_obs_labels"] = sin_labels + cos_labels
-            elif "sin_phase" in policy_terms or "cos_phase" in policy_terms:
-                self._phase_term_type = "sin_cos"
-                self.metadata["phase_obs_labels"] = ["sin_phase", "cos_phase"]
         except Exception as exc:
             print(f"[WARN DataLogger] Could not detect phase observations: {exc}")
 
