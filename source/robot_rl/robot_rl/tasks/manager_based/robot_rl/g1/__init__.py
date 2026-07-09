@@ -222,6 +222,27 @@ if not _registered:
         }
     )
 
+    # Mid-only: train on just the library's ~2.3 m/s reference
+    gym.register(
+        id="G1-running-refresh-clf-mid",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFMidEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        }
+    )
+
+    gym.register(
+        id="G1-running-refresh-clf-mid-symmetric",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_running_refresh_clf_env_cfg:G1RunningRefreshCLFMidEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
+        }
+    )
+
     ## =========================================
     # Walk + Run Trajectory Optimization
     ## =========================================

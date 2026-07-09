@@ -242,25 +242,37 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
 
 @configclass
 class G1RunningRefreshCLFFastEnvCfg(G1RunningRefreshCLFEnvCfg):
-    """Single-reference training: pin the command to the library's TOP speed so
-    the conditioner always selects the fastest solution (vel_x=3.29 m/s), straight
-    ahead. Trains on just that one running reference. Inherits max_eta_err=5, the
-    submission-matched DR, and the flight-contact penalty from the parent.
+    """Single-reference training: pin the command to ONE library speed so the
+    conditioner always selects that solution, straight ahead -- trains on just
+    that one running reference. ``fixed_speed`` picks which clip and must be a
+    conditioner vel_x present in the library (~1.38-3.29 m/s); subclass and
+    override it for another speed. Inherits the submission DR, the flight-contact
+    penalty, and the feet-dominant CLF from the parent.
     """
+
+    # Plain class var (no type annotation -> NOT a config field). Library top speed.
+    fixed_speed = 3.29
 
     def __post_init__(self):
         super().__post_init__()
 
-        # Fastest trajectory in the library (max conditioner vel_x = 3.29 m/s).
         # For the multiskill velocity cmd the sampled speed comes from the bucket,
-        # so pin the bucket (and the envelope) to 3.29; zero y/yaw so it trains
-        # purely on the single straight-running reference.
+        # so pin the bucket (and the envelope) to ``fixed_speed``; zero y/yaw so it
+        # trains purely on the single straight-running reference.
+        s = self.fixed_speed
         self.commands.traj_ref.velocity_buckets = {
-            "default": VelocityBucketCfg(lin_vel_x=(3.29, 3.29)),
+            "default": VelocityBucketCfg(lin_vel_x=(s, s)),
         }
-        self.commands.base_velocity.ranges.lin_vel_x = (3.29, 3.29)
+        self.commands.base_velocity.ranges.lin_vel_x = (s, s)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+
+
+@configclass
+class G1RunningRefreshCLFMidEnvCfg(G1RunningRefreshCLFFastEnvCfg):
+    """Single-reference training at a mid library speed (conditioner vel_x=2.3 m/s)."""
+
+    fixed_speed = 2.3
 
 
 @configclass
