@@ -239,6 +239,15 @@ def _frame_pos_mse(result: WorkerResult, vi: int, frame: str) -> float:
     return float(np.nanmean(result.pos_err_mse[vi, idxs]))
 
 
+def _frame_pos_mse_std(result: WorkerResult, vi: int, frame: str) -> float:
+    """Std proxy for one frame's position-output MSE (mean of the per-axis MSE stds)."""
+    idxs = [i for i, nm in enumerate(result.pos_names)
+            if nm.startswith(f"{frame}:pos_")]
+    if not idxs or result.pos_err_mse_std.size == 0:
+        return float("nan")
+    return float(np.nanmean(result.pos_err_mse_std[vi, idxs]))
+
+
 # ---------------------------------------------------------------------------
 # Comparison plots
 # ---------------------------------------------------------------------------
@@ -570,6 +579,11 @@ def write_comparison_stats(results: list[WorkerResult], save_dir: str) -> None:
                 for fi, f in enumerate(r.frame_names):
                     if r.frame_track_err_mean.size:
                         emit(f"frame_track_err:{f}", r.frame_track_err_mean[vi, fi])
+                    if r.frame_track_err_std.size:
+                        emit(f"frame_track_err_std:{f}", r.frame_track_err_std[vi, fi])
+                    if r.pos_err_mse.size:  # per-frame position MSE (+ std) for the m^2 bar
+                        emit(f"frame_pos_mse:{f}", _frame_pos_mse(r, vi, f))
+                        emit(f"frame_pos_mse_std:{f}", _frame_pos_mse_std(r, vi, f))
                 for g, pat in _POS_GROUPS.items():
                     if r.pos_err_mse.size:
                         emit(f"pos_mse_group:{g}", _group_mean(r.pos_names, r.pos_err_mse[vi], pat))

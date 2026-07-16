@@ -107,6 +107,11 @@ parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point",
                     help="RL agent configuration entry point.")
 parser.add_argument("--seed", type=int, default=0,
                     help="Shared deterministic seed so every policy sees identical conditions.")
+parser.add_argument("--stochastic", action="store_true", default=False,
+                    help="Run policies in torch .train() mode with STOCHASTIC action sampling "
+                         "(mirrors play.py --train_mode) to compare under training-like action "
+                         "noise. Default is .eval() + deterministic mean actions. Pair with a "
+                         "DR-on --task (e.g. a training task) to reproduce full training conditions.")
 parser.add_argument("--use_pretrained_checkpoint", action="store_true")
 parser.add_argument("--velocities", type=float, nargs="+", default=[0.0, 1.0, 2.0],
                     help="Forward velocities (m/s) to evaluate at (vy=0, yaw=0).")
@@ -461,6 +466,11 @@ def _run_worker(env_cfg, agent_cfg) -> None:
         raise ValueError(f"Unsupported runner class: {runner_class}")
     runner.load(resume_path)
     policy = runner.get_inference_policy(device=env.unwrapped.device)
+    if args_cli.stochastic:
+        # Match play.py --train_mode: .train() mode + stochastic action sampling
+        # (below), so the comparison runs under training-like action noise.
+        runner.alg.train_mode()
+        print("[worker] STOCHASTIC eval: torch .train() mode + stochastic actions.")
 
     unwrapped = env.unwrapped
     dev = unwrapped.device
@@ -560,7 +570,7 @@ def _run_worker(env_cfg, agent_cfg) -> None:
             abs_err = torch.abs(vx_act - vx)
 
             with torch.inference_mode():
-                actions = policy(obs, stochastic_output=False)
+                actions = policy(obs, stochastic_output=args_cli.stochastic)
                 obs, _, dones, infos = env.step(actions)
                 if version.parse(installed_version) >= version.parse("4.0.0"):
                     policy.reset(dones)
@@ -697,6 +707,8 @@ def _worker_argv(task: str, ckpt: str, dump: str, label: str) -> list[str]:
         "--out_dump", dump, "--policy_label", label,
         "--headless",
     ]
+    if args_cli.stochastic:
+        argv.append("--stochastic")
     if args_cli.shared_traj_path:
         argv += ["--shared_traj_path", args_cli.shared_traj_path]
     if args_cli.device is not None:

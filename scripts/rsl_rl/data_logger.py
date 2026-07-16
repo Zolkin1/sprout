@@ -215,6 +215,33 @@ class DataLogger:
             except Exception as exc:
                 self._warn("target_vel", f"Could not read commanded target velocity: {exc}")
 
+        # 1c. Reference (desired) vs actual foot contact, per contact body, for the
+        # contact-alignment diagnostic. ``ref_contact`` is the trajectory's desired
+        # contact state at the current phase; ``foot_contact`` is the measured
+        # contact (foot sensor net force > 1 N), ordered to match the reference's
+        # ``contact_bodies`` by left/right side.
+        if self._traj_term_name is not None:
+            try:
+                ref = unwrapped.command_manager.get_term(self._traj_term_name)
+                mgr = getattr(ref, "manager", None)
+                bodies = getattr(ref, "contact_bodies", None)
+                if (hasattr(ref, "get_contact_state") and mgr is not None
+                        and getattr(mgr, "phase", None) is not None and bodies):
+                    ref_c = (ref.get_contact_state(mgr.phase) > 0.5).float()  # [N, C]
+                    step["ref_contact"] = ref_c.clone()
+                    actual = torch.zeros_like(ref_c)
+                    sensors = unwrapped.scene.sensors
+                    for ci, body in enumerate(bodies):
+                        side = "left" if "left" in body else ("right" if "right" in body else "")
+                        sname = f"{side}_foot_contact"
+                        if side and sname in sensors:
+                            f = _to_torch(sensors[sname].data.net_forces_w_history)  # [N,H,B,3]
+                            mag = torch.linalg.norm(f[:, 0], dim=-1).amax(dim=-1)      # [N]
+                            actual[:, ci] = (mag > 1.0).float()
+                    step["foot_contact"] = actual.clone()
+            except Exception as exc:
+                self._warn("contact_align", f"Could not record contact alignment: {exc}")
+
         # 1b'. Trajectory-reference POLICY OBSERVATIONS (computed clean, no obs
         # corruption) -- the exact base-relative reference signals the policy
         # consumes, for obs-level diagnostics (e.g. spotting lookahead truncation
@@ -501,6 +528,8 @@ class DataLogger:
                     self.metadata["vel_names"] = list(ref.ordered_vel_output_names)
                 if hasattr(ref, "ref_frames"):
                     self.metadata["ref_frames"] = list(ref.ref_frames)
+                if hasattr(ref, "contact_bodies"):  # contact-alignment plot labels
+                    self.metadata["contact_bodies"] = list(ref.contact_bodies)
                 if hasattr(ref, "resolve_ee_frames"):  # ee_ref obs column labels
                     self.metadata["ee_frames"] = list(ref.resolve_ee_frames())
                 # Flow-matching prediction-window geometry (generator command only):

@@ -1785,7 +1785,95 @@ def plot_obs_clip_fm_diff(
     print(f"[plot] obs_clip_fm_diff: wrote ranked bar charts + obs_clip_fm_diff_env*.csv to {save_dir}")
 
 
+def plot_contact_alignment(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+) -> None:
+    """Foot-contact alignment: measured contact vs the trajectory's desired contact.
+
+    Prints time-in-alignment stats (per foot + aggregate + flight-phase) over the
+    requested envs, and saves a per-env contact raster (reference vs actual). Use
+    to compare how trackable a reference is (e.g. kinematic vs dynamic clip):
+    higher aligned % / lower missed+early % = the robot's stance/flight timing
+    matches the reference better.
+    """
+    if "ref_contact" not in data or "foot_contact" not in data:
+        print("[WARN plot_contact_alignment] no ref_contact/foot_contact logged "
+              "(needs a trajectory-tracking task with foot contact sensors); skipping.")
+        return
+
+    ref = data["ref_contact"]     # [T, N, C] in {0,1}
+    act = data["foot_contact"]    # [T, N, C] in {0,1}
+    C = ref.shape[-1]
+    bodies = metadata.get("contact_bodies", [f"foot{i}" for i in range(C)])
+    dt = float(metadata.get("dt", 1.0))
+
+    # --- aggregate stats over the requested envs ---
+    r = ref[:, env_ids, :].reshape(-1, C)
+    a = act[:, env_ids, :].reshape(-1, C)
+    n = r.shape[0]
+    total_s = ref.shape[0] * dt
+    print("\n=== Foot-contact alignment: actual vs reference (per foot) ===")
+    print(f"  ({len(env_ids)} env(s) x {ref.shape[0]} steps, {total_s:.1f}s each; contact = foot sensor > 1 N)")
+    for ci, body in enumerate(bodies):
+        aligned = (r[:, ci] == a[:, ci]).mean() * 100.0
+        missed = ((r[:, ci] == 1) & (a[:, ci] == 0)).mean() * 100.0   # ref stance, foot airborne
+        early = ((r[:, ci] == 0) & (a[:, ci] == 1)).mean() * 100.0    # ref swing, foot planted
+        print(f"  {body:26s}: aligned {aligned:5.1f}%   missed-contact {missed:5.1f}%   extra-contact {early:5.1f}%")
+    both = (r == a).all(axis=-1).mean() * 100.0
+    ref_flight = (r.sum(axis=-1) == 0)
+    act_flight = (a.sum(axis=-1) == 0)
+    flight_al = (ref_flight == act_flight).mean() * 100.0
+    print(f"  {'ALL feet aligned':26s}: {both:5.1f}%")
+    print(f"  {'flight-phase aligned':26s}: {flight_al:5.1f}%   (reference is in flight {ref_flight.mean()*100:.1f}% of the time)")
+
+    # --- persist stats (CSV) + raw contact series (npz) for offline comparison ---
+    import csv as _csv
+    stats_path = os.path.join(save_dir, "contact_alignment_stats.csv")
+    with open(stats_path, "w", newline="") as fh:
+        w = _csv.writer(fh)
+        w.writerow(["metric", "value_pct"])
+        for ci, body in enumerate(bodies):
+            w.writerow([f"{body}:aligned", f"{(r[:, ci] == a[:, ci]).mean() * 100:.3f}"])
+            w.writerow([f"{body}:missed_contact", f"{((r[:, ci] == 1) & (a[:, ci] == 0)).mean() * 100:.3f}"])
+            w.writerow([f"{body}:extra_contact", f"{((r[:, ci] == 0) & (a[:, ci] == 1)).mean() * 100:.3f}"])
+        w.writerow(["all_feet_aligned", f"{both:.3f}"])
+        w.writerow(["flight_phase_aligned", f"{flight_al:.3f}"])
+        w.writerow(["reference_flight_fraction", f"{ref_flight.mean() * 100:.3f}"])
+        w.writerow(["num_envs", len(env_ids)])
+        w.writerow(["num_steps", int(ref.shape[0])])
+        w.writerow(["dt", dt])
+    np.savez(
+        os.path.join(save_dir, "contact_alignment_data.npz"),
+        ref_contact=ref[:, env_ids, :], foot_contact=act[:, env_ids, :],
+        contact_bodies=np.asarray(bodies, dtype=object), dt=dt,
+    )
+    print(f"[plot] contact_alignment: wrote contact_alignment_stats.csv + "
+          f"contact_alignment_data.npz + rasters to {save_dir}")
+
+    # --- per-env raster ---
+    for env_id in env_ids:
+        t = np.arange(ref.shape[0]) * dt
+        fig, axes = plt.subplots(C, 1, figsize=(11, 2.0 * C), squeeze=False)
+        for ci in range(C):
+            ax = axes[ci, 0]
+            ax.plot(t, ref[:, env_id, ci], label="reference (desired)", linewidth=2.0)
+            ax.plot(t, act[:, env_id, ci], label="actual (measured)", linewidth=1.3, alpha=0.85)
+            al = (ref[:, env_id, ci] == act[:, env_id, ci]).mean() * 100.0
+            ax.set_title(f"{bodies[ci]} contact  -  aligned {al:.1f}%")
+            ax.set_ylim(-0.15, 1.15)
+            ax.set_yticks([0, 1]); ax.set_yticklabels(["swing", "contact"])
+            ax.set_xlabel("Time (s)"); ax.legend(fontsize=8, loc="upper right"); ax.grid(True, alpha=0.3)
+        fig.suptitle(f"Contact alignment (Env {env_id})", fontsize=14)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(os.path.join(save_dir, f"contact_alignment_env{env_id}.png"), dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+
 PLOT_REGISTRY: dict[str, Callable] = {
+    "contact_alignment": plot_contact_alignment,
     "positions": plot_positions,
     "trajectory_obs": plot_trajectory_obs,
     "obs_clip_fm_diff": plot_obs_clip_fm_diff,
