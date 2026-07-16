@@ -109,16 +109,27 @@ def clf_curriculum(
 
 def contact_curriculum(env: ManagerBasedRLEnv, env_ids: Sequence[int], max_weight: float, update_amnt: float,
                        update_interval: int = 100) -> float:
-    """Curriculum to adjust the weight on the contact penalty."""
-    term_cfg = env.reward_manager.get_term_cfg("flight_contact_penalty")
-    new_weight = term_cfg.params["weight_scalar"]
-    if env.common_step_counter >= update_interval and env.common_step_counter % update_interval == 0:
-        # Compute new contact weight
-        new_weight = min(new_weight + update_amnt, max_weight)
+    """Ramp the ``flight_contact_penalty`` reward weight as a function of elapsed steps.
 
+    The weight is set to ``update_amnt * (common_step_counter // update_interval)``,
+    clamped at ``max_weight`` -- i.e. it steps up by ``update_amnt`` every
+    ``update_interval`` environment steps.
+
+    This is deterministic in ``common_step_counter`` alone, so the ramp is
+    identical across runs regardless of reset timing. The curriculum manager is
+    only invoked on steps where at least one env resets (IsaacLab calls it inside
+    ``_reset_idx``), so the previous exact-equality trigger
+    (``common_step_counter % update_interval == 0``) silently skipped an interval
+    whenever no env happened to reset on that exact step -- and reset timing is
+    policy/trajectory-dependent, making the ramp diverge between otherwise-identical
+    runs. Computing the target weight directly avoids that: a missed boundary step
+    self-heals on the next reset, and no interval is ever permanently skipped.
+    """
+    term_cfg = env.reward_manager.get_term_cfg("flight_contact_penalty")
+    new_weight = min(update_amnt * (env.common_step_counter // update_interval), max_weight)
+    if new_weight != term_cfg.params["weight_scalar"]:
         term_cfg.params["weight_scalar"] = new_weight
         env.reward_manager.set_term_cfg("flight_contact_penalty", term_cfg)
-
 
     return new_weight
 
