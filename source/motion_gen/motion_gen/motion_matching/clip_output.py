@@ -3,9 +3,11 @@
 """Turn a world-frame ``(root_pos, root_quat, joint_pos)`` trajectory into clip outputs.
 
 Shared by any generator (vanilla motion matching now; the skill/traj-opt path later): the
-constraint-frame poses come from FK, ``dy_des`` from finite differences, and ``contact`` is
-a best-effort foot-ground estimate.  Produces exactly the dense arrays
-:class:`~motion_gen.clips.clip_io.ClipLibraryWriter` expects, in the manager's channel order.
+constraint-frame poses come from FK, ``dy_des`` from finite differences, and ``contact`` is a
+foot-ground estimate from the foot collision BOX -- a foot is "in contact" when a bottom corner of
+its box reaches the ground (the box + its corners come from ``g1_21j.xml``; this replaces the old
+coarse ``ankle_roll_link``-origin height threshold, and is the same geometry the foot-lock uses).
+Produces exactly the dense arrays :class:`~motion_gen.clips.clip_io.ClipLibraryWriter` expects.
 """
 
 from __future__ import annotations
@@ -19,12 +21,26 @@ from . import ingest_common as IC
 
 _FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
+# G1 foot collision box, per ``ankle_roll_link`` (transfer/sim/robots/g1/g1_21j.xml; MuJoCo box
+# ``size`` = half-extents, no rotation).  The 4 BOTTOM corners are the ground-contact geometry
+# used for both the ``contact`` signal and the foot-lock (flat -> all 4 down; heel/toe -> 2 down).
+_FOOT_BOX_CENTER = (0.03592, 0.0, -0.02517)
+_FOOT_BOX_HALF = (0.101555, 0.032735, 0.009255)
+
+
+def foot_box_corners(device="cpu", dtype=torch.float32) -> torch.Tensor:
+    """The 4 bottom corners of the foot collision box in the ``ankle_roll_link`` frame ``[4,3]``."""
+    cx, cy, cz = _FOOT_BOX_CENTER
+    hx, hy, hz = _FOOT_BOX_HALF
+    return torch.tensor([[cx + sx * hx, cy + sy * hy, cz - hz]
+                         for sx in (1.0, -1.0) for sy in (1.0, -1.0)], dtype=dtype, device=device)
+
 
 class ClipOutputBuilder:
     """Builds ``y_des``/``dy_des``/``contact`` from a world trajectory in the clip layout."""
 
     def __init__(self, pos_output_names, vel_output_names, *, mjcf_path=None,
-                 contact_frames=_FOOT, ground_height=0.0, contact_z_thresh=0.06,
+                 contact_frames=_FOOT, ground_height=0.0, contact_z_thresh=0.02,
                  device="cpu"):
         self.pos_names = list(pos_output_names)
         self.vel_names = list(vel_output_names)
@@ -33,7 +49,8 @@ class ClipOutputBuilder:
         self.device = torch.device(device)
         self.contact_frames = list(contact_frames)
         self.ground_height = float(ground_height)
-        self.contact_z_thresh = float(contact_z_thresh)
+        self.contact_z_thresh = float(contact_z_thresh)   # a box bottom-corner within this of ground
+        self._foot_corners = foot_box_corners(device=device)              # [4,3] ankle-frame
 
         self.frames = []
         for n in self.pos_names:
@@ -81,7 +98,12 @@ class ClipOutputBuilder:
             dy[:, self._v_ang[f]] = IC.angular_velocity_from_quat(wquat[f], dt)
         dy[:, self._v_joint] = IC.central_diff(joints, dt)
 
+        # contact: a foot is loaded when a bottom corner of its collision box reaches the ground.
         contact = torch.zeros(T, len(self.contact_frames), dtype=torch.uint8, device=self.device)
+        ce = self._foot_corners[None].expand(T, 4, 3)                     # [T,4,3] ankle-frame corners
         for j, f in enumerate(self.contact_frames):
-            contact[:, j] = (wpos[f][:, 2] < self.ground_height + self.contact_z_thresh).to(torch.uint8)
+            qe = wquat[f][:, None, :].expand(T, 4, 4)
+            corners_w = wpos[f][:, None, :] + quat_apply(qe, ce)          # [T,4,3] world corners
+            min_cz = corners_w[..., 2].amin(dim=1)                       # lowest corner per frame
+            contact[:, j] = (min_cz < self.ground_height + self.contact_z_thresh).to(torch.uint8)
         return y, dy, contact

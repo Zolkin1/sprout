@@ -64,8 +64,10 @@ class VanillaConfig:
     # moving -> foot slide).  A clip is still cut short if it runs out.
     min_dwell_s: float = 0.4
     # Inertialization: on a jump, decay the (old - new) offset in joints / root
-    # orientation / root velocity to zero over this window, so nothing pops.
-    blend_time_s: float = 0.25
+    # orientation / root velocity to zero over this window.  Shorter = less planted-foot slide at
+    # cut seams (a long decay drags the foot), at the cost of a snappier transition; 0.12 chosen
+    # over the old 0.25 after the foot-slide investigation.
+    blend_time_s: float = 0.12
     # Clean steady-state preference (STEADY tier).  One-sided: during steady command regions,
     # penalize VARIED (bones) candidates by this much (in KD-tree distance units) so clean/STEADY
     # clips win the greedy query; ramped to 0 around command changes.  w_tier=0 -> vanilla as-is

@@ -205,6 +205,9 @@ def main() -> int:
     p.add_argument("--tier-nn-k", type=int, default=1,
                    help="Reward the k clean clips nearest the command by velocity (k=1 = single "
                         "NN; velocity ties broken toward the stillest clip, e.g. stand over shuffle).")
+    p.add_argument("--blend-time", type=float, default=0.12,
+                   help="Inertialization time (s) for the offset-decay at each cut; shorter = less "
+                        "foot slide but a snappier transition (0.25 was the old smoother default).")
     # --- dp (exact backward DP) knobs ---
     p.add_argument("--dp-cut-penalty", type=float, default=3.0, help="[dp] additive cost per cut.")
     p.add_argument("--dp-w-track", type=float, default=1.0, help="[dp] velocity-tracking weight.")
@@ -230,7 +233,7 @@ def main() -> int:
                         min_dwell_s=args.min_dwell, inertia_ratio=args.inertia_ratio,
                         w_tier=args.w_tier, soft_tier_penalty=args.soft_tier_penalty,
                         regime_ramp_s=args.regime_ramp, tier_k=args.tier_k,
-                        tier_nn_k=args.tier_nn_k)
+                        tier_nn_k=args.tier_nn_k, blend_time_s=args.blend_time)
     filters = {"package": args.bones_package}
     if args.bones_category:
         filters["category"] = _csv_set(args.bones_category)
