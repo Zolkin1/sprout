@@ -183,6 +183,57 @@ def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(verts), np.concatenate(faces)
 
 
+def _central_diff(a: np.ndarray, dt: float) -> np.ndarray:
+    d = np.zeros_like(a)
+    if a.shape[0] > 2:
+        d[1:-1] = (a[2:] - a[:-2]) / (2.0 * dt)
+        d[0] = (a[1] - a[0]) / dt
+        d[-1] = (a[-1] - a[-2]) / dt
+    return d
+
+
+def _tracking_image(base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
+                    target_vel: np.ndarray, dt: float):
+    """Render a body-frame root-velocity-vs-target tracking plot to an RGB array.
+
+    Actual: world pelvis velocity rotated into the yaw (body) frame -> (vx fwd, vy left),
+    plus yaw rate.  Target: the stored command ``target_vel`` (vx, vy, wz).  Returns
+    ``None`` if matplotlib is unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    w, x, y, z = base_quat_wxyz[:, 0], base_quat_wxyz[:, 1], base_quat_wxyz[:, 2], base_quat_wxyz[:, 3]
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    vw = _central_diff(base_pos[:, :2], dt)                      # world xy velocity
+    c, s = np.cos(yaw), np.sin(yaw)
+    vx_b = c * vw[:, 0] + s * vw[:, 1]                           # forward
+    vy_b = -s * vw[:, 0] + c * vw[:, 1]                          # left
+    wz = _central_diff(np.unwrap(yaw)[:, None], dt)[:, 0]        # yaw rate
+    T = base_pos.shape[0]
+    t = np.arange(T) * dt
+    fig, axs = plt.subplots(3, 1, figsize=(5.2, 4.4), dpi=100, sharex=True)
+    rows = [(axs[0], vx_b, target_vel[:, 0], "vx fwd"),
+            (axs[1], vy_b, target_vel[:, 1], "vy left"),
+            (axs[2], wz, target_vel[:, 2], "wz yaw")]
+    for ax, act, tgt, lab in rows:
+        ax.plot(t, act, "k", lw=1.3, label="actual")
+        ax.plot(t, tgt, "--", color="#d62728", lw=1.2, label="target")
+        ax.set_ylabel(lab, fontsize=8); ax.tick_params(labelsize=7); ax.grid(alpha=0.3)
+    axs[0].set_title("body-frame root velocity vs target", fontsize=9)
+    axs[0].legend(fontsize=7, loc="upper right", ncol=2)
+    axs[2].set_xlabel("t (s)", fontsize=8)
+    fig.tight_layout()
+    fig.canvas.draw()
+    h, wd = fig.canvas.get_width_height()[::-1]
+    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, wd, 4)[..., :3].copy()
+    plt.close(fig)
+    return img
+
+
 class ClipScene:
     """Builds and updates all viser nodes for one clip at a time."""
 
@@ -245,6 +296,10 @@ class ClipScene:
         self._target_vel = None       # [T, 3] sampled (vx, vy, wz), or None if absent
         self.show_tracks = True
         self.show_tube = False
+        self.show_command = True
+        self._cmd_handle = None       # command-reference path polyline
+        self.show_plot = True
+        self._plot_handle = None      # body-frame velocity-tracking plot (GUI image)
         self.num_ghosts = min(max_ghosts, max_ghosts)
         self.clip_idx = -1
 
@@ -341,6 +396,45 @@ class ClipScene:
                     visible=self.show_tracks,
                 )
 
+        # Command reference path: integrate the stored target_vel (vx, vy, wz) in the
+        # world frame from the clip's start pose -- where the base "should" go if it
+        # followed the velocity command open-loop.  Drawn at pelvis height so the gap to
+        # the base track (orange) IS the motion-matching tracking error.
+        if self._cmd_handle is not None:
+            self._cmd_handle.remove()
+            self._cmd_handle = None
+        if self._target_vel is not None:
+            dt = float(self.lib.meta["dt"])
+            bp = self._world_base_pos
+            q0 = self._world_base_quat[0]                       # wxyz
+            yaw = float(np.arctan2(2 * (q0[0] * q0[3] + q0[1] * q0[2]),
+                                   1 - 2 * (q0[2] ** 2 + q0[3] ** 2)))
+            T = bp.shape[0]
+            ref = np.zeros((T, 3), np.float32)
+            x, yy = float(bp[0, 0]), float(bp[0, 1])
+            for t in range(T):
+                ref[t] = (x, yy, float(bp[t, 2]))
+                vx, vy, wz = (float(v) for v in self._target_vel[t])
+                x += (np.cos(yaw) * vx - np.sin(yaw) * vy) * dt
+                yy += (np.sin(yaw) * vx + np.cos(yaw) * vy) * dt
+                yaw += wz * dt
+            csegs = np.stack([ref[:-1], ref[1:]], axis=1).astype(np.float32)
+            self._cmd_handle = self.server.scene.add_line_segments(
+                "/command_path", points=csegs, colors=(0.1, 0.95, 0.2),
+                line_width=6.0, visible=self.show_command,
+            )
+
+        # Body-frame root-velocity-vs-target tracking plot, embedded in the GUI panel.
+        if self._plot_handle is not None:
+            self._plot_handle.remove()
+            self._plot_handle = None
+        if self._target_vel is not None:
+            img = _tracking_image(self._world_base_pos, self._world_base_quat,
+                                  self._target_vel, float(self.lib.meta["dt"]))
+            if img is not None:
+                self._plot_handle = self.server.gui.add_image(
+                    img, label="tracking: body vel vs target", visible=self.show_plot)
+
         # Foot touchdown markers (contact rising edges per contact frame).
         for h in self._touchdown_handles:
             h.remove()
@@ -407,6 +501,16 @@ class ClipScene:
         if self._tube_handle is not None:
             self._tube_handle.visible = show
 
+    def set_show_command(self, show: bool) -> None:
+        self.show_command = show
+        if self._cmd_handle is not None:
+            self._cmd_handle.visible = show
+
+    def set_show_plot(self, show: bool) -> None:
+        self.show_plot = show
+        if self._plot_handle is not None:
+            self._plot_handle.visible = show
+
     def target_vel_at(self, step: int) -> np.ndarray | None:
         """Sampled (vx, vy, wz) command at ``step``, or None if not stored."""
         if self._target_vel is None:
@@ -443,6 +547,8 @@ def main() -> int:
     gui_play = server.gui.add_checkbox("play", True)
     gui_ghosts = server.gui.add_slider("ghosts", 0, args.max_ghosts, 1, scene.num_ghosts)
     gui_tracks = server.gui.add_checkbox("show trajectories", True)
+    gui_command = server.gui.add_checkbox("command path (green)", True)
+    gui_plot = server.gui.add_checkbox("tracking plot", True)
     gui_tube = server.gui.add_checkbox(f"termination tube ({args.term_dist:.2f} m)", False)
     gui_vel = server.gui.add_text("target vel (vx,vy,wz)", "", disabled=True)
     gui_info = server.gui.add_text("info", "", disabled=True)
@@ -487,6 +593,14 @@ def main() -> int:
     @gui_tracks.on_update
     def _(_=None):
         scene.set_show_tracks(bool(gui_tracks.value))
+
+    @gui_command.on_update
+    def _(_=None):
+        scene.set_show_command(bool(gui_command.value))
+
+    @gui_plot.on_update
+    def _(_=None):
+        scene.set_show_plot(bool(gui_plot.value))
 
     @gui_tube.on_update
     def _(_=None):
