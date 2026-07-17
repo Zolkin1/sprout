@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import torch
 
@@ -53,22 +54,32 @@ DEFAULT_SCHEDULE = [
 
 
 def _make_command(schedule: list[dict]):
-    """Build ``command(t)->(vx,vy,wz)`` from a list of ``{t, vx, vy, wz}`` segments +
-    the total duration (piecewise-constant, holding the last segment past the end)."""
-    segs = [(float(s["t"]), float(s.get("vx", 0.0)), float(s.get("vy", 0.0)), float(s.get("wz", 0.0)))
-            for s in schedule]
-    edges = []
+    """Build ``command(t)->(vx,vy,wz)`` + total duration from a list of segments.
+
+    Each segment is ``{t, vx, vy, wz}``; by default it HOLDS ``(vx,vy,wz)`` constant for ``t``
+    seconds (a step change from the previous segment = a velocity JUMP).  Add ``"to":
+    {vx,vy,wz}`` to make the segment linearly RAMP from ``(vx,vy,wz)`` to ``to`` across its
+    duration.  (A ramp keeps the regime signal ~0 throughout; a jump dips it around the step.)"""
+    def _v(d):
+        return (float(d.get("vx", 0.0)), float(d.get("vy", 0.0)), float(d.get("wz", 0.0)))
+
+    edges = []            # (t_start, t_end, v0, v1)
     acc = 0.0
-    for dur, vx, vy, wz in segs:
+    for s in schedule:
+        dur = float(s["t"]); v0 = _v(s)
+        v1 = _v(s["to"]) if isinstance(s.get("to"), dict) else v0
+        edges.append((acc, acc + dur, v0, v1))
         acc += dur
-        edges.append((acc, vx, vy, wz))
     total = acc
 
     def command(t: float):
-        for end, vx, vy, wz in edges:
-            if t < end:
-                return (vx, vy, wz)
-        return (edges[-1][1], edges[-1][2], edges[-1][3])
+        for t0, t1, v0, v1 in edges:
+            if t < t1:
+                if v0 == v1 or t1 <= t0:
+                    return v0
+                a = (t - t0) / (t1 - t0)
+                return tuple((1.0 - a) * c0 + a * c1 for c0, c1 in zip(v0, v1))
+        return edges[-1][3]                                  # hold the last segment's end value
 
     return command, total
 
@@ -88,23 +99,31 @@ def _load_schedule(spec: str | None) -> list[dict]:
     return json.loads(spec)
 
 
-def _build_or_load_graph(matcher, args, filters):
+def _build_or_load_graph(matcher, args, filters, clean_paths=None):
     """Load the cached candidate graph for this DB/config, or build+cache it.  Shared by the
-    beam and dp branches (both use the identical postural eps-ball graph)."""
+    beam and dp branches (both use the identical postural eps-ball graph).  When
+    ``--include-clean``, the clean clips are tagged STEADY + given a periodic wrap edge, and the
+    clean-library identity is folded into the cache key (distinct from the bones-only graph)."""
     gcfg = GraphConfig(k_min=args.graph_k_min, k_max=args.graph_k_max, k_target=args.graph_k_target,
                        same_clip_cap=args.graph_same_clip_cap, dt=args.dt)
+    include_clean = bool(getattr(args, "include_clean", False))
+    steady_mask = matcher._src_steady if include_clean else None
+    periodic_mask = matcher._src_periodic if include_clean else None
     key = graph_cache_key(args.bones_cache, filters=filters, styles=_csv_set(args.bones_style),
                           exclude_mirror=True, exclude_name_substrings=_csv_set(args.exclude_name),
-                          limit=args.bones_limit, pose_weights=matcher.pose_weights(), cfg=gcfg)
+                          limit=args.bones_limit, pose_weights=matcher.pose_weights(), cfg=gcfg,
+                          include_clean=include_clean, clean_sources=clean_paths)
     cache_file = args.graph_cache or str(graph_cache_path(key))
     graph = None if args.rebuild_graph else CandidateGraph.load(cache_file, expected_key=key)
     if graph is None:
         print(f"[toy] building candidate graph (postural eps-ball, k in "
-              f"[{args.graph_k_min},{args.graph_k_max}]) ...")
+              f"[{args.graph_k_min},{args.graph_k_max}]{', +clean' if include_clean else ''}) ...")
         cost_feat = matcher._norm[:, matcher._traj_dim:]         # full 27-D pose (jump_cost)
         select_feat = cost_feat[:, POSE_POSTURAL_IDX]           # postural (feet+hand pos) selection
         graph = build_candidate_graph(select_feat, cost_feat, matcher.feat_raw, matcher.owner,
-                                      matcher.src_start, matcher.src_len, matcher.yaw_all, gcfg, key=key)
+                                      matcher.src_start, matcher.src_len, matcher.yaw_all, gcfg,
+                                      steady_owner_mask=steady_mask, periodic_owner_mask=periodic_mask,
+                                      key=key)
         graph.save(cache_file)
         print(f"[toy] cached candidate graph -> {cache_file}")
     else:
@@ -164,9 +183,28 @@ def main() -> int:
     p.add_argument("--w-traj", type=float, default=0.0,
                    help="[beam] local 1s-trajectory match weight (superseded by --w-pos; off by default).")
     p.add_argument("--w-tier", type=float, default=0.0,
-                   help="[beam] STEADY/VARIED tier weight (inert for bones-only).")
+                   help="clean STEADY-tier weight for the ACTIVE method (vanilla/beam/dp); needs "
+                        "--include-clean; 0 = off (bones-only behavior).")
     p.add_argument("--track-window", type=int, default=10,
                    help="[beam] bidirectional velocity-match half-window W (frames).")
+    # --- clean steady-state trajectory library (STEADY tier) ---
+    p.add_argument("--include-clean", action="store_true",
+                   help="Fold the clean periodic steady-state trajectory library into the DB (STEADY tier).")
+    p.add_argument("--clean-source", default="trajectories/skills/library_v1",
+                   help="Clean library path (local dir, or HF-relative when --clean-hf-repo is set).")
+    p.add_argument("--clean-hf-repo", default="zolkin/robot_rl",
+                   help="HuggingFace repo for the clean library (downloads to ./hf/<path>).")
+    p.add_argument("--clean-skills", default=None,
+                   help="';'-separated subset of clean skills to include (default: all).")
+    p.add_argument("--regime-ramp", type=float, default=0.5,
+                   help="Steady->neutral ramp half-width (s) for the tier cost (~1 s around a change).")
+    p.add_argument("--soft-tier-penalty", type=float, default=2.0,
+                   help="Magnitude of the per-frame VARIED penalty during steady regions.")
+    p.add_argument("--tier-k", type=int, default=16,
+                   help="[vanilla] nearest neighbours to re-rank when the tier penalty is on.")
+    p.add_argument("--tier-nn-k", type=int, default=1,
+                   help="Reward the k clean clips nearest the command by velocity (k=1 = single "
+                        "NN; velocity ties broken toward the stillest clip, e.g. stand over shuffle).")
     # --- dp (exact backward DP) knobs ---
     p.add_argument("--dp-cut-penalty", type=float, default=3.0, help="[dp] additive cost per cut.")
     p.add_argument("--dp-w-track", type=float, default=1.0, help="[dp] velocity-tracking weight.")
@@ -189,7 +227,10 @@ def main() -> int:
 
     dev = args.device
     cfg = VanillaConfig(dt=args.dt, search_interval_s=args.search_interval,
-                        min_dwell_s=args.min_dwell, inertia_ratio=args.inertia_ratio)
+                        min_dwell_s=args.min_dwell, inertia_ratio=args.inertia_ratio,
+                        w_tier=args.w_tier, soft_tier_penalty=args.soft_tier_penalty,
+                        regime_ramp_s=args.regime_ramp, tier_k=args.tier_k,
+                        tier_nn_k=args.tier_nn_k)
     filters = {"package": args.bones_package}
     if args.bones_category:
         filters["category"] = _csv_set(args.bones_category)
@@ -207,6 +248,16 @@ def main() -> int:
     sources, _ = load_cache(args.bones_cache, filters=filters, styles=_csv_set(args.bones_style),
                             exclude_name_substrings=_csv_set(args.exclude_name),
                             limit=args.bones_limit, device=dev)
+    clean_paths = None
+    if args.include_clean:
+        from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+        print(f"[toy] ingesting clean library {args.clean_source} (hf_repo={args.clean_hf_repo}) ...")
+        clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt,
+                                     device=dev, skills=_csv_set(args.clean_skills))
+        print(f"[toy] + {len(clean)} clean STEADY clips (periodic)")
+        sources = sources + clean
+        base = (Path("hf") / args.clean_source) if args.clean_hf_repo else Path(args.clean_source)
+        clean_paths = [str(base / "manifest.csv")]     # library identity for the graph cache key
     nframes = sum(s.n for s in sources)
     if args.method == "vanilla":
         print(f"[toy] {len(sources)} clips; building vanilla matcher (KD-tree over {nframes} frames) ...")
@@ -216,16 +267,20 @@ def main() -> int:
         print(f"[toy] {len(sources)} clips; building beam matcher DB ({nframes} frames) ...")
         bcfg = BeamConfig(dt=args.dt, beam_width=args.beam_width, min_cut_gap_s=args.min_cut_gap,
                           cut_penalty=args.cut_penalty, w_track=args.w_track, w_pos=args.w_pos,
-                          w_traj=args.w_traj, w_tier=args.w_tier, track_window=args.track_window)
+                          w_traj=args.w_traj, w_tier=args.w_tier, track_window=args.track_window,
+                          soft_tier_penalty=args.soft_tier_penalty, regime_ramp_s=args.regime_ramp,
+                          tier_nn_k=args.tier_nn_k)
         matcher = BeamMatcher(sources, cfg, bcfg, device=dev)
-        matcher.attach_graph(_build_or_load_graph(matcher, args, filters))
+        matcher.attach_graph(_build_or_load_graph(matcher, args, filters, clean_paths))
         generator_name = "beam_motion_matching"
     else:  # dp -- exact backward DP, local-velocity only
         print(f"[toy] {len(sources)} clips; building DP matcher DB ({nframes} frames) ...")
         dcfg = DPConfig(dt=args.dt, cut_penalty=args.dp_cut_penalty, w_track=args.dp_w_track,
-                        w_traj=args.dp_w_traj, track_window=args.dp_track_window)
+                        w_traj=args.dp_w_traj, track_window=args.dp_track_window,
+                        w_tier=args.w_tier, soft_tier_penalty=args.soft_tier_penalty,
+                        regime_ramp_s=args.regime_ramp, tier_nn_k=args.tier_nn_k)
         matcher = DPMatcher(sources, cfg, dcfg, device=dev)
-        matcher.attach_graph(_build_or_load_graph(matcher, args, filters))
+        matcher.attach_graph(_build_or_load_graph(matcher, args, filters, clean_paths))
         generator_name = "dp_motion_matching"
 
     print(f"[toy] [{args.method}] matching {T} steps ({clip_len:.1f}s) against the velocity profile ...")

@@ -45,6 +45,8 @@ class MotionSource:
     wrap: str = "episodic"                   # "periodic" (full-cycle strides) | "episodic" (recordings)
     feat: torch.Tensor | None = None         # [Fi, pfd] precomputed per-frame features (skip FK)
     name: str = ""
+    steady: bool = False                     # clean steady-state clip -> STEADY tier (else VARIED)
+    steady_vel: torch.Tensor | None = None   # [3] (vx, vy, wz) steady command this clip tracks, else None
 
     @property
     def n(self) -> int:

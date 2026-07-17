@@ -124,12 +124,19 @@ def graph_cache_key(
     limit: int | None,
     pose_weights: tuple[float, ...],
     cfg: GraphConfig,
+    include_clean: bool = False,
+    clean_sources: list[str] | None = None,
 ) -> str:
     """Content hash of everything the graph depends on (mirrors the library-cache key).
 
     Folds the bones cache file identity (path/size/mtime), the resolved filter set (which
     frames are in the DB), the pose weights (the metric), and the graph params + version.
     Any change -> a different key -> a fresh build (never a stale hit).
+
+    When ``include_clean`` is set, the clean-trajectory library's identity (each
+    ``clean_sources`` path's size/mtime) is folded in too, so the clean-DB graph gets a
+    DISTINCT key and the bones-only graph (``include_clean=False``, unchanged payload) keeps
+    its existing cache -- no rebuild of the expensive bones graph.
     """
     h = hashlib.sha256()
     h.update(f"version={_GRAPH_CACHE_VERSION};".encode())
@@ -152,6 +159,16 @@ def graph_cache_key(
         "same_clip_cap": cfg.same_clip_cap, "min_same_clip_gap": cfg.min_same_clip_gap,
         "dt": round(float(cfg.dt), 6), "tier_mode": cfg.tier_mode,
     }
+    if include_clean:
+        cs = []
+        for cp in sorted(clean_sources or []):
+            try:
+                s = Path(cp).stat()
+                cs.append([str(cp), s.st_size, s.st_mtime_ns])
+            except OSError:
+                cs.append([str(cp), -1, -1])
+        payload["include_clean"] = True
+        payload["clean"] = cs
     h.update(json.dumps(payload, sort_keys=True).encode())
     return h.hexdigest()
 
@@ -208,6 +225,7 @@ def build_candidate_graph(
     cfg: GraphConfig,
     *,
     steady_owner_mask: torch.Tensor | None = None,  # [C] bool -> those clips' frames tagged STEADY
+    periodic_owner_mask: torch.Tensor | None = None,  # [C] bool -> those clips loop (wrap edge)
     key: str | None = None,
 ) -> CandidateGraph:
     from scipy.spatial import cKDTree
@@ -225,6 +243,13 @@ def build_candidate_graph(
     # continue edge: f+1 unless f is the last frame of its clip
     is_last = (local + 1) >= sl[owner_np]
     next_frame = np.where(is_last, np.int32(-1), (np.arange(N) + 1).astype(np.int32))
+    # periodic (clean) clips LOOP: the last frame continues (cost 0, not a cut) to the clip's
+    # SECOND frame -- frame 0 is the closure-duplicate of the last frame, so continuing to frame 1
+    # avoids replaying it (matches the feature-wrap continuation).  Playback re-anchors SE(2) here.
+    if periodic_owner_mask is not None:
+        per = periodic_owner_mask.cpu().numpy().astype(bool)[owner_np]   # [N]
+        wrap_last = is_last & per & (sl[owner_np] >= 2)
+        next_frame[wrap_last] = (ss[owner_np] + 1).astype(np.int32)[wrap_last]
 
     # ---- postural nearest neighbours (KD-tree over the position-only metric) ----
     sel = select_feat.detach().cpu().numpy().astype(np.float64)

@@ -22,12 +22,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from ..fk import FKChain
 from ..math_utils import quat_mul
 from . import features as F
 from . import ingest_common as IC
+from .graph import STEADY, VARIED
 from .playback import play_frame_path
 
 _FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -64,6 +66,20 @@ class VanillaConfig:
     # Inertialization: on a jump, decay the (old - new) offset in joints / root
     # orientation / root velocity to zero over this window, so nothing pops.
     blend_time_s: float = 0.25
+    # Clean steady-state preference (STEADY tier).  One-sided: during steady command regions,
+    # penalize VARIED (bones) candidates by this much (in KD-tree distance units) so clean/STEADY
+    # clips win the greedy query; ramped to 0 around command changes.  w_tier=0 -> vanilla as-is
+    # (k=1 query).  tier_k = how many nearest to re-rank when the penalty is on.
+    w_tier: float = 0.0
+    soft_tier_penalty: float = 2.0
+    regime_ramp_s: float = 0.5
+    tier_k: int = 16
+    # The clean-tier bonus is a NEAREST-NEIGHBOUR by velocity: it rewards the ``tier_nn_k`` clean
+    # clips whose steady velocity is closest to the command (k=1 -> the single best-matching clip;
+    # the DP then paths between these per-velocity "waypoints").  Velocity ties (clips at the same
+    # steady velocity, e.g. `standing` vs a step-in-place `side_step`) are broken toward the clip
+    # with the LEAST extraneous motion, so a stop picks `standing`, not a shuffle.
+    tier_nn_k: int = 1
 
     def traj_frames(self) -> list[int]:
         return [int(round(t / self.dt)) for t in self.traj_times_s]
@@ -95,12 +111,49 @@ def vanilla_weight_vector(cfg: VanillaConfig, device="cpu") -> torch.Tensor:
     return torch.cat(parts).to(device)
 
 
-def compute_vanilla_features(root_pos, root_quat, joint_pos, joint_vel, fk_ee, cfg):
+def _periodic_extension(xy: torch.Tensor, yaw: torch.Tensor, K: int):
+    """Continue a periodic clip's world planar pose ``(xy[Fr,2], yaw[Fr])`` for ``K`` more
+    frames by looping its own per-step local deltas, so the future-trajectory window of the
+    clip's tail frames reflects the NEXT period (not a clamped stall).
+
+    The clip is a single closed cycle whose last frame duplicates the first in pose (traj-opt
+    closure), so the distinct period is ``P = Fr - 1`` and continuation after frame ``Fr-1``
+    replays the deltas of frames ``1..Fr-1`` (== the next period's frames), rotated by the
+    accumulated heading -- exactly how playback loops the clip.  Returns
+    ``(ext_xy[Fr+K,2], ext_yaw[Fr+K])`` (``ext_yaw`` unwrapped past the seam)."""
+    dev = xy.device
+    Fr = xy.shape[0]
+    P = Fr - 1
+    dpos = xy[1:Fr] - xy[0:Fr - 1]                          # [P,2] world per-step delta
+    yprev = yaw[0:Fr - 1]
+    c, s = torch.cos(yprev), torch.sin(yprev)
+    dl_x = c * dpos[:, 0] + s * dpos[:, 1]                  # [P] local (heading-aligned) delta
+    dl_y = -s * dpos[:, 0] + c * dpos[:, 1]
+    dth = yaw[1:Fr] - yaw[0:Fr - 1]                         # [P] per-step yaw delta
+    idx = torch.arange(K, device=dev) % P                  # loop steps 1..P
+    dth_seq = dth[idx]                                      # [K]
+    cum = torch.cumsum(dth_seq, 0)
+    heading = yaw[Fr - 1] + torch.cat([torch.zeros(1, device=dev), cum[:-1]])   # heading BEFORE each step
+    ch, sh = torch.cos(heading), torch.sin(heading)
+    wl_x = ch * dl_x[idx] - sh * dl_y[idx]                  # rotate local delta to world
+    wl_y = sh * dl_x[idx] + ch * dl_y[idx]
+    ext_xy_cont = xy[Fr - 1] + torch.stack(
+        [torch.cumsum(wl_x, 0), torch.cumsum(wl_y, 0)], dim=-1)                 # [K,2]
+    ext_yaw_cont = yaw[Fr - 1] + cum                       # [K]
+    return torch.cat([xy, ext_xy_cont], 0), torch.cat([yaw, ext_yaw_cont], 0)
+
+
+def compute_vanilla_features(root_pos, root_quat, joint_pos, joint_vel, fk_ee, cfg,
+                             wrap: str = "episodic"):
     """Per-frame vanilla feature ``[F, dim]`` (raw). Layout: for each traj time
     [Δpos(2), facing(2)], then feet pos(6), feet vel(6), hand pos(6), hand vel(6),
     root lin vel(3).  Feet/hand pos+vel are in the pelvis (FK base) frame; root lin vel
     and the trajectory block are in the current frame's ground/yaw root frame.  ``root_vel``
-    stays the LAST 3 dims (the beam graph reads body vx/vy from ``feat[..., -3:-1]``)."""
+    stays the LAST 3 dims (the beam graph reads body vx/vy from ``feat[..., -3:-1]``).
+
+    ``wrap="periodic"`` continues the future-trajectory window across the clip's loop seam
+    (via :func:`_periodic_extension`) so a single-cycle clean clip's tail frames get their
+    real next-period future; ``"episodic"`` clamps to the clip end (edge-repeat), unchanged."""
     Fr = root_pos.shape[0]
     yaw = _yaw(root_quat)                                   # [F]
     cy, sy = torch.cos(yaw), torch.sin(yaw)
@@ -116,13 +169,21 @@ def compute_vanilla_features(root_pos, root_quat, joint_pos, joint_vel, fk_ee, c
     root_vel = torch.stack([cy * vw[:, 0] + sy * vw[:, 1],
                             -sy * vw[:, 0] + cy * vw[:, 1], vw[:, 2]], dim=-1)  # [F,3]
     # trajectory (future), in the current-frame yaw/ground frame
+    periodic = (wrap == "periodic" and Fr >= 3)
+    if periodic:
+        ext_xy, ext_yaw = _periodic_extension(root_pos[:, :2], yaw, max(cfg.traj_frames()))
     traj = []
     for df in cfg.traj_frames():
-        j = torch.clamp(torch.arange(Fr) + df, 0, Fr - 1)
-        dxy = root_pos[j, :2] - root_pos[:, :2]             # [F,2] world
+        if periodic:
+            j = torch.arange(Fr, device=root_pos.device) + df       # into the extended arrays
+            dxy = ext_xy[j] - root_pos[:, :2]
+            dyaw = ext_yaw[j] - yaw
+        else:
+            j = torch.clamp(torch.arange(Fr) + df, 0, Fr - 1)
+            dxy = root_pos[j, :2] - root_pos[:, :2]                  # [F,2] world
+            dyaw = yaw[j] - yaw
         px = cy * dxy[:, 0] + sy * dxy[:, 1]
         py = -sy * dxy[:, 0] + cy * dxy[:, 1]
-        dyaw = yaw[j] - yaw
         traj += [px, py, torch.cos(dyaw), torch.sin(dyaw)]
     traj = torch.stack(traj, dim=-1)                        # [F, 4*len]
     return torch.cat([traj, feet_pos, feet_vel, hand_pos, hand_vel, root_vel], dim=-1)
@@ -166,7 +227,8 @@ class VanillaMatcher:
         acc = 0
         for s in sources:
             f = compute_vanilla_features(s.root_pos.to(device), s.root_quat.to(device),
-                                         s.joint_pos.to(device), s.joint_vel.to(device), fk, cfg)
+                                         s.joint_pos.to(device), s.joint_vel.to(device), fk, cfg,
+                                         wrap=getattr(s, "wrap", "episodic"))
             feats.append(f)
             self.src_start.append(acc); self.src_len.append(s.n); acc += s.n
             rp.append(s.root_pos.to(device)); rq.append(s.root_quat.to(device)); jp.append(s.joint_pos.to(device))
@@ -178,6 +240,33 @@ class VanillaMatcher:
                            for i in range(len(sources))]).to(device)
         self.owner = owner
         self.yaw_all = _yaw(self.root_quat)                 # [N]
+        # Per-source tier / periodicity (graph-independent -- computed from the sources so the
+        # greedy matcher, which has no candidate graph, can read them too).  Clean steady-state
+        # clips are STEADY + periodic; bones are VARIED + episodic.
+        src_periodic = torch.tensor([getattr(s, "wrap", "episodic") == "periodic"
+                                     for s in sources], dtype=torch.bool, device=device)
+        src_steady = torch.tensor([bool(getattr(s, "steady", False))
+                                   for s in sources], dtype=torch.bool, device=device)
+        self._src_periodic = src_periodic                   # [C]
+        self._src_steady = src_steady                        # [C]
+        self.is_periodic_frame = src_periodic[owner]        # [N] bool
+        self._tier = torch.full((owner.shape[0],), VARIED, dtype=torch.uint8, device=device)
+        self._tier[src_steady[owner]] = STEADY              # [N] STEADY where clean
+        # per-clip nominal steady velocity ((vx,vy,wz); 0 for non-steady) + per-clip "activity" =
+        # mean foot speed (used to break velocity ties toward the stillest clip, e.g. stand vs
+        # step-in-place).  The velocity-NN tier bonus (below) reads these.
+        src_sv = torch.zeros(len(sources), 3, device=device)
+        for i, s in enumerate(sources):
+            sv = getattr(s, "steady_vel", None)
+            if sv is not None:
+                src_sv[i] = torch.as_tensor(sv, dtype=torch.float32, device=device)
+        self._src_steady_vel = src_sv                       # [C, 3]
+        _tdim = 4 * len(cfg.traj_times_s)
+        feet_vel = self.feat_raw[:, _tdim + 6:_tdim + 12]   # pose block feet_vel(6)
+        act_frame = feet_vel.norm(dim=1)                    # [N] per-frame foot speed
+        self._src_activity = torch.zeros(len(sources), device=device)
+        for i in range(len(sources)):
+            self._src_activity[i] = act_frame[owner == i].mean()             # [C]
         # normalize + weight, build KD-tree (dim ~39 -> KD-tree works directly, no PCA)
         self.mean = self.feat_raw.mean(0)
         self.std = self.feat_raw.std(0).clamp_min(1e-6)
@@ -190,7 +279,9 @@ class VanillaMatcher:
         # cause an end-of-clip latch -- so they are excluded as candidates (still playable).
         self._max_traj = max(cfg.traj_frames())
         local = torch.arange(self.feat_raw.shape[0], device=device) - self.src_start[self.owner]
-        cand = local + self._max_traj < self.src_len[self.owner]
+        # Periodic (clean) clips have a valid wrapped future at every frame, so all their frames
+        # are candidates; episodic clips still exclude their last max_traj frames (clamped future).
+        cand = (local + self._max_traj < self.src_len[self.owner]) | self.is_periodic_frame
         self._cand_idx = cand.nonzero(as_tuple=False).flatten()               # [Nc] global indices
         # Full-feature KD-tree (greedy search only).  BeamMatcher passes build_tree=False --
         # it searches the precomputed candidate graph instead, so this build is skipped.
@@ -201,6 +292,48 @@ class VanillaMatcher:
         # standing-est start = candidate with the smallest future displacement
         ci = self._cand_idx
         self._stationary = int(ci[self.feat_raw[ci, :2].pow(2).sum(1).argmin()])
+
+    def _precompute_regime(self, target: np.ndarray, ramp_s: float) -> np.ndarray:
+        """Smoothed steady/transition signal in ``[0,1]`` (1 = steady), ramped over ``ramp_s``
+        seconds around command changes (a ramp keeps it ~0 throughout; a jump dips it ~ramp_s
+        each side).  Shared by the tier cost in the greedy/beam/DP matchers."""
+        T = target.shape[0]
+        changed = np.zeros(T, dtype=bool)
+        if T > 1:
+            changed[1:] = np.abs(np.diff(target, axis=0)).sum(1) > 1e-6
+        big = T + 1
+        dpast = np.full(T, big); d = big
+        for t in range(T):
+            d = 0 if changed[t] else d + 1
+            dpast[t] = d
+        dfut = np.full(T, big); d = big
+        for t in range(T - 1, -1, -1):
+            d = 0 if changed[t] else d + 1
+            dfut[t] = d
+        dist = np.minimum(dpast, dfut).astype(np.float64) * self.cfg.dt
+        x = np.clip(dist / max(1e-6, ramp_s), 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)                       # smoothstep -> steady weight
+
+    def _precompute_tier_nn(self, target: np.ndarray, k: int, vel_eps: float = 0.15):
+        """Per-timestep boolean ``[T, C]``: which clips are the velocity-nearest clean clips to the
+        command (the ``k`` clean clips whose steady velocity is closest to ``target[t]``).  Velocity
+        ties (within ``vel_eps`` of the nearest) are broken toward the clip with the LEAST foot
+        motion, so a stop command selects ``standing`` over a step-in-place ``side_step``.  Returns
+        ``None`` if there are no clean clips."""
+        steady = self._src_steady.cpu().numpy()
+        clean = np.nonzero(steady)[0]                        # clean clip indices
+        if clean.size == 0:
+            return None
+        sv = self._src_steady_vel.cpu().numpy()[clean]       # [m,3]
+        act = self._src_activity.cpu().numpy()[clean]        # [m]
+        C = steady.shape[0]; T = target.shape[0]
+        kk = min(max(1, k), clean.size)
+        rewarded = np.zeros((T, C), dtype=bool)
+        for t in range(T):
+            d = np.sqrt(((sv - target[t]) ** 2).sum(1))      # velocity distance
+            order = np.lexsort((act, np.round(d / max(1e-6, vel_eps))))   # bucket by vel, tie->stillness
+            rewarded[t, clean[order[:kk]]] = True
+        return rewarded
 
     def _local_delta(self, gi: int) -> torch.Tensor:
         """Per-step root position delta in the clip's own frame at frame ``gi``."""
@@ -230,15 +363,33 @@ class VanillaMatcher:
         o = int(self.owner[gi]); l = int(gi - self.src_start[o])
         frame_path: list[int] = []
         jumped_path: list[bool] = []
+        # Clean-tier preference: penalize VARIED candidates during steady command regions (ramped
+        # to 0 around changes) so the greedy query prefers clean/STEADY clips.  Off (w_tier=0) ->
+        # k=1 query, byte-identical to the no-clean vanilla.
+        w_tier = float(cfg.w_tier)
+        owner_np_sel = self.owner.cpu().numpy()
+        cand_idx_np = self._cand_idx.cpu().numpy()
+        src_periodic = self._src_periodic.cpu().numpy()
+        regime = None
+        tier_rewarded = None
+        Kq = 1
+        if w_tier != 0.0:
+            target = np.array([command(i * cfg.dt) for i in range(T)], dtype=np.float64)
+            regime = self._precompute_regime(target, cfg.regime_ramp_s)
+            tier_rewarded = self._precompute_tier_nn(target, cfg.tier_nn_k)     # [T,C] or None
+            Kq = int(min(max(1, cfg.tier_k), cand_idx_np.shape[0]))
+        use_tier = w_tier != 0.0 and tier_rewarded is not None
         for step in range(T):
             jumped = False
-            # Play each clip through to its natural end; jump only at a re-query tick or when
-            # the clip runs out.  (We may PLAY into the last max_traj frames -- real mocap --
-            # but the candidate mask keeps us from ever MATCHING into a tail.  Forcing a
-            # re-query at the tail re-enters short clips at their start and micro-latches ->
-            # foot slide; don't do that.)
+            # Play each clip through to its natural end; jump only at a re-query tick or when the
+            # clip runs out.  PERIODIC (clean) clips instead LOOP at their end -- continue to frame
+            # 1 (frame 0 is the closure-duplicate of the last frame), a wrap-continue (not a cut);
+            # the regular stride re-query still fires and can leave the clip when the command shifts.
             clip_ended = l >= int(self.src_len[o])
-            if clip_ended:
+            if clip_ended and bool(src_periodic[o]) and int(self.src_len[o]) >= 2:
+                l = 1                                        # wrap to the clip's second frame
+                clip_ended = False                           # a loop, not an end -> no forced jump
+            elif clip_ended:
                 l = int(self.src_len[o]) - 1
             g_abs = int(self.src_start[o] + l)
             if step > 0 and (step % stride == 0 or clip_ended):
@@ -246,10 +397,26 @@ class VanillaMatcher:
                 dtraj = desired_trajectory(vx, vy, om, cfg, device=self.device)
                 pose = self.feat_raw[g_abs, self._traj_dim:]
                 qn = ((torch.cat([dtraj, pose]) - self.mean) / self.std) * self.weight
-                dist, ti = self._tree.query(qn.cpu().numpy().astype("float64"), k=1)
-                best = int(self._cand_idx[int(ti)])          # tree index -> global candidate
-                cont = float((qn - self._norm[g_abs]).norm())
-                if clip_ended or (dwell >= min_dwell and float(dist) < cfg.inertia_ratio * cont):
+                qn_np = qn.cpu().numpy().astype("float64")
+                if use_tier:
+                    r = float(regime[step])
+                    dists, tis = self._tree.query(qn_np, k=Kq)
+                    dists = np.atleast_1d(dists); tis = np.atleast_1d(tis)
+                    cg = cand_idx_np[tis]                    # global candidate indices
+                    # penalty on every candidate EXCEPT the velocity-nearest clean clip(s)
+                    pen = w_tier * cfg.soft_tier_penalty * r
+                    mism_cg = 1.0 - tier_rewarded[step][owner_np_sel[cg]]
+                    scores = dists + pen * mism_cg
+                    bi = int(np.argmin(scores))
+                    best = int(cg[bi]); best_cost = float(scores[bi])
+                    cont = (float((qn - self._norm[g_abs]).norm())
+                            + pen * (1.0 - float(tier_rewarded[step][owner_np_sel[g_abs]])))
+                else:
+                    dist, ti = self._tree.query(qn_np, k=1)
+                    best = int(self._cand_idx[int(ti)])      # tree index -> global candidate
+                    best_cost = float(dist)
+                    cont = float((qn - self._norm[g_abs]).norm())
+                if clip_ended or (dwell >= min_dwell and best_cost < cfg.inertia_ratio * cont):
                     jumped = True
                     dwell = 0
                     o = int(self.owner[best]); l = int(best - self.src_start[o])

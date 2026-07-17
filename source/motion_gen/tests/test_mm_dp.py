@@ -18,7 +18,7 @@ import torch
 
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
-from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
+from motion_gen.motion_matching.graph import VARIED, GraphConfig, build_candidate_graph
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
 
 
@@ -188,3 +188,63 @@ def test_dp_objective_le_unconstrained_beam():
     dp_obj = _path_objective(dm, dp_path, dp_j, T)
     be_obj = _path_objective(dm, be_path, be_j, T)          # score beam's path under the same objective
     assert dp_obj <= be_obj + 1e-4, f"DP {dp_obj} should be <= beam {be_obj}"
+
+
+# ---- clean STEADY-tier cost (one-sided, regime-ramped) ---------------------------------
+def _steady(s, vel):
+    s.steady = True; s.wrap = "periodic"; s.steady_vel = torch.tensor(vel, dtype=torch.float32)
+    return s
+
+
+def test_dp_match_cost_all_equals_match_cost_with_tier():
+    # exactness linchpin still holds with the (velocity-matched) tier term on -- it is pure (frame,t)
+    srcs = [_steady(_clip(90, seed=1, vx=0.8), (0.8, 0.0, 0.0)), _clip(80, seed=2, vx=0.0)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=1.5, soft_tier_penalty=2.0))
+    T = 100
+    cmd = lambda t: (0.8, 0.0, 0.0) if t < 1.0 else (0.0, 0.0, 0.0)
+    dm._prepare(cmd, T)
+    fr = np.array([0, 40, 100, dm._bvel.shape[0] - 3])
+    for t in (5, 30, 49, 50, 51, 90):
+        assert np.allclose(dm._match_cost_all(t)[fr], dm._match_cost(fr, t), rtol=1e-9, atol=1e-9)
+
+
+def test_dp_tier_nearest_neighbour():
+    # 1-NN tier: under a steady command (regime==1), ONLY the velocity-nearest clean clip gets the
+    # bonus (no extra cost); a clean clip at the WRONG velocity AND bones both pay the FULL penalty.
+    # (The key fix: not a blanket "any clean" preference -- the wrong-velocity clean clip is not
+    # rewarded, so a stop won't grab a moving clean clip.)
+    match = _steady(_clip(90, seed=1, vx=0.8), (0.8, 0.0, 0.0))   # clean, matches command
+    off = _steady(_clip(90, seed=2, vx=0.0), (0.0, 0.0, 0.0))     # clean, WRONG velocity
+    bones = _clip(90, seed=3, vx=0.4)                             # VARIED
+    W, soft = 1.5, 2.0
+    base = _dp([match, off, bones], dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=0.0))
+    tier = _dp([match, off, bones], dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=W,
+                                                  soft_tier_penalty=soft, tier_nn_k=1))
+    T = 100
+    base._prepare(lambda t: (0.8, 0.0, 0.0), T); tier._prepare(lambda t: (0.8, 0.0, 0.0), T)
+    delta = tier._match_cost_all(50) - base._match_cost_all(50)
+    owner = tier._owner_np
+    assert np.allclose(delta[owner == 0], 0.0, atol=1e-6)         # NN clean clip -> no penalty
+    assert np.allclose(delta[owner == 1], W * soft)              # clean but wrong velocity -> full
+    assert np.allclose(delta[owner == 2], W * soft)              # bones -> full penalty
+
+
+def test_dp_tier_tiebreak_prefers_stillest():
+    # two clean clips at the SAME steady velocity (0,0,0) -- a still "stand" and a moving
+    # "shuffle" -- must be broken by stillness: the NN reward goes to the stiller clip.
+    still = _steady(_clip(60, seed=1, vx=0.0), (0.0, 0.0, 0.0)); still.joint_vel = torch.zeros(60, 21)
+    shuffle = _steady(_clip(60, seed=2, vx=0.0), (0.0, 0.0, 0.0)); shuffle.joint_vel = 2.0 * torch.randn(60, 21)
+    dm = _dp([still, shuffle], dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=1.0, tier_nn_k=1))
+    dm._prepare(lambda t: (0.0, 0.0, 0.0), 20)
+    assert dm._src_activity[0] < dm._src_activity[1]            # still clip has lower foot motion
+    assert int(np.flatnonzero(dm._tier_rewarded[0])[0]) == 0    # ... and it is the rewarded NN clip
+
+
+def test_dp_regime_neutral_in_transition():
+    # regime ~0 around a command change (tier neutral there) and ~1 in steady stretches
+    srcs = [_steady(_clip(90, seed=1, vx=0.8), (0.8, 0.0, 0.0)), _clip(90, seed=2, vx=0.0)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=2.0, regime_ramp_s=0.5))
+    T = 100
+    dm._prepare(lambda t: (0.8, 0.0, 0.0) if t < 1.0 else (0.0, 0.0, 0.0), T)   # jump at t=50
+    assert dm._regime[50] < 0.1                             # neutral at the change
+    assert dm._regime[5] > 0.9 and dm._regime[95] > 0.9     # steady far from it

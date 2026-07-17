@@ -28,6 +28,7 @@ import csv
 import json
 import os
 import random
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -42,7 +43,7 @@ from motion_gen.motion_matching.bones_ingest import load_cache            # noqa
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher             # noqa: E402
 from motion_gen.motion_matching.clip_output import ClipOutputBuilder      # noqa: E402
 from motion_gen.motion_matching.graph import (                            # noqa: E402
-    CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_key, graph_cache_path)
+    STEADY, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_key, graph_cache_path)
 from motion_gen.motion_matching.playback import play_frame_path           # noqa: E402
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig  # noqa: E402
 from motion_gen.multiskill_manager import MultiSkillManager               # noqa: E402
@@ -190,6 +191,15 @@ def main() -> int:
     p.add_argument("--dt", type=float, default=0.02)
     p.add_argument("--n-random", type=int, default=5)
     p.add_argument("--seed", type=int, default=7)
+    # clean steady-state library (STEADY tier) -- compare {vanilla,beam,dp} x {no-clean, clean}
+    p.add_argument("--include-clean", action="store_true")
+    p.add_argument("--clean-source", default="trajectories/skills/library_v1")
+    p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
+    p.add_argument("--w-tier", type=float, default=0.0, help="STEADY-tier weight (needs --include-clean).")
+    p.add_argument("--regime-ramp", type=float, default=0.5)
+    p.add_argument("--soft-tier-penalty", type=float, default=2.0)
+    p.add_argument("--tier-k", type=int, default=16)
+    p.add_argument("--tier-nn-k", type=int, default=1)
     args = p.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     dev = args.device
@@ -203,24 +213,40 @@ def main() -> int:
 
     print("[exp] loading sources + building DB (once) ...")
     sources, _ = load_cache(args.bones_cache, filters=_FILTERS, exclude_name_substrings=_EXCLUDE, device=dev)
-    vcfg = VanillaConfig(dt=args.dt); bcfg = BeamConfig(dt=args.dt)
+    clean_paths = None
+    if args.include_clean:
+        from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+        clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt, device=dev)
+        print(f"[exp] + {len(clean)} clean STEADY clips")
+        sources = sources + clean
+        base = (Path("hf") / args.clean_source) if args.clean_hf_repo else Path(args.clean_source)
+        clean_paths = [str(base / "manifest.csv")]
+    tier_kw = dict(w_tier=args.w_tier, soft_tier_penalty=args.soft_tier_penalty,
+                   regime_ramp_s=args.regime_ramp, tier_nn_k=args.tier_nn_k)
+    vcfg = VanillaConfig(dt=args.dt, tier_k=args.tier_k, **tier_kw)
+    bcfg = BeamConfig(dt=args.dt, **tier_kw)
     bm = BeamMatcher(sources, vcfg, bcfg, device=dev)
     gcfg = GraphConfig(dt=args.dt)
+    steady_mask = bm._src_steady if args.include_clean else None
+    periodic_mask = bm._src_periodic if args.include_clean else None
     key = graph_cache_key(args.bones_cache, filters=_FILTERS, styles=None, exclude_mirror=True,
                           exclude_name_substrings=_EXCLUDE, limit=None,
-                          pose_weights=bm.pose_weights(), cfg=gcfg)
+                          pose_weights=bm.pose_weights(), cfg=gcfg,
+                          include_clean=args.include_clean, clean_sources=clean_paths)
     graph = CandidateGraph.load(graph_cache_path(key), expected_key=key)
     if graph is None:
         print("[exp] building candidate graph (cache miss) ...")
         cost_feat = bm._norm[:, bm._traj_dim:]
         graph = build_candidate_graph(cost_feat[:, POSE_POSTURAL_IDX], cost_feat, bm.feat_raw,
-                                      bm.owner, bm.src_start, bm.src_len, bm.yaw_all, gcfg, key=key)
+                                      bm.owner, bm.src_start, bm.src_len, bm.yaw_all, gcfg,
+                                      steady_owner_mask=steady_mask, periodic_owner_mask=periodic_mask,
+                                      key=key)
         graph.save(graph_cache_path(key))
     bm.attach_graph(graph)
     print("[exp] building vanilla full-feature KD-tree ...")
     bm._tree = cKDTree(bm._norm[bm._cand_idx].cpu().numpy().astype("float64"))
     print("[exp] building DP matcher (shares the same graph) ...")
-    dm = DPMatcher(sources, vcfg, DPConfig(dt=args.dt), graph=graph, device=dev)
+    dm = DPMatcher(sources, vcfg, DPConfig(dt=args.dt, **tier_kw), graph=graph, device=dev)
 
     manager = MultiSkillManager(args.source, dev, env=None)
     builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
@@ -244,7 +270,8 @@ def main() -> int:
                 dm._prepare(command, T)
                 fp, jm = dm._reconstruct(dm._dp_backward(T), T)
             rp, rq, jj, m, s = _analyze(mm, command, T, fp, jm, method)
-            m = {"schedule": name, **m}
+            m = {"schedule": name, "clean_frac": float((graph.tier[np.asarray(fp)] == STEADY).mean()),
+                 **m}
             rows.append(m)
             # clip
             y, dy, contact = builder.build(rp, rq, jj, args.dt)
@@ -261,7 +288,7 @@ def main() -> int:
             print(f"[exp] {name:12s} {method:8s} cuts={m['n_cuts']:3d} travel={m['travel_ratio']:.2f} "
                   f"gap={m['final_gap_m']:.2f} MAE={m['vel_MAE']:.3f}")
 
-    cols = ["schedule", "method", "n_cuts", "mean_dwell_s", "min_dwell_s", "travel_ratio",
+    cols = ["schedule", "method", "clean_frac", "n_cuts", "mean_dwell_s", "min_dwell_s", "travel_ratio",
             "final_gap_m", "mean_pos_err_m", "vel_MAE", "mae_vx", "mae_vy", "mae_wz",
             "sum_match_cost", "sum_jump_cost", "cut_penalty_total", "T"]
     with open(os.path.join(args.out_dir, "summary.csv"), "w", newline="") as fh:

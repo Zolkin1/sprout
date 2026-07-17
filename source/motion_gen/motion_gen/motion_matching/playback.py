@@ -47,7 +47,9 @@ def play_frame_path(frame_path, jumped, db, cfg, *, debug: bool = False):
         jumped: length-``T`` bools; ``True`` marks a cut (re-anchor + inertialize).
             ``jumped[0]`` must be ``False`` -- step 0 establishes the initial anchor.
         db: object exposing ``device``, ``yaw_all``, ``root_pos``, ``joints``, ``owner``,
-            ``src_start`` and the methods ``_wquat(g_yaw, gi)`` / ``_local_delta(gi)``.
+            ``src_start`` and the methods ``_wquat(g_yaw, gi)`` / ``_local_delta(gi)``.  For
+            periodic (clean) clips it also exposes ``src_len`` and ``is_periodic_frame`` so the
+            loop seam is handled (a continue that jumps backward to the clip start).
         cfg: carries ``dt`` and ``blend_time_s``.
         debug: also return the vanilla-format trace.
 
@@ -79,8 +81,10 @@ def play_frame_path(frame_path, jumped, db, cfg, *, debug: bool = False):
     prev_wz = float(db.root_pos[g0, 2])                 # last emitted world z
     blend_k = blend_n                                   # not blending initially
     Wp, Wq, Wj = [], [], []
+    _is_per = getattr(db, "is_periodic_frame", None)
     for step in range(T):
         g_abs = int(frame_path[step])
+        prev_abs = int(frame_path[step - 1]) if step > 0 else g_abs
         if step > 0 and bool(jumped[step]):
             # capture offset (old output - new clip), re-anchor yaw, start the decay
             g_yaw = world_yaw - float(db.yaw_all[g_abs])
@@ -90,6 +94,15 @@ def play_frame_path(frame_path, jumped, db, cfg, *, debug: bool = False):
             off_q = quat_mul(prev_q.unsqueeze(0), quat_inv(new_q.unsqueeze(0)))[0]
             off_z = prev_wz - float(db.root_pos[g_abs, 2])
             blend_k = 0
+        elif (step > 0 and _is_per is not None and g_abs != prev_abs + 1
+              and bool(_is_per[g_abs])):
+            # PERIODIC LOOP SEAM (a continue that wrapped backward to the clip start): advance
+            # the running yaw by the clip's net-per-period yaw so heading continues (for turns);
+            # the pose is periodic-continuous so NO inertialization and NOT a cut (jumped stays
+            # False).  Position keeps advancing via the clip's per-step delta below.
+            o = int(db.owner[g_abs]); first = int(db.src_start[o])
+            last = first + int(db.src_len[o]) - 1
+            g_yaw += float(db.yaw_all[last]) - float(db.yaw_all[first])
         base_q = db._wquat(g_yaw, g_abs)
         base_v = rz(g_yaw, db._local_delta(g_abs))
         base_j = db.joints[g_abs]

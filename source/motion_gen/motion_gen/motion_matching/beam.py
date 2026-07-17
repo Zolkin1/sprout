@@ -39,11 +39,13 @@ class BeamConfig:
     w_track: float = 1.0               # instantaneous velocity-window tracking (local smoothness/gait)
     w_pos: float = 2.0                 # GLOBAL position tracking: accumulated world pos vs integrated ref
     w_traj: float = 0.0                # LOCAL 1s-trajectory match (superseded by w_pos; off by default)
-    w_tier: float = 0.0                # inert for bones-only (all VARIED)
+    w_tier: float = 0.0                # clean STEADY-tier preference (0 = off / bones-only)
     track_window: int = 10             # W: velocity-match window half-width (frames)
     track_decay: float = 0.85          # geometric decay per |offset| in the window
     soft_tier_penalty: float = 2.0
-    regime_ramp_s: float = 0.4
+    regime_ramp_s: float = 0.5
+    tier_one_sided: bool = True        # one-sided (prefer clean in steady only) vs two-sided
+    tier_nn_k: int = 1                 # reward the k velocity-nearest clean clips (k=1 = single NN)
     dt: float = 0.02
 
 
@@ -67,6 +69,7 @@ class BeamMatcher(VanillaMatcher):
         w_pos, w_dir = 1.0, 0.5            # facing is partly covered by wz velocity tracking
         self._traj_w = np.array([w for _ in vcfg.traj_times_s
                                  for w in (w_pos, w_pos, w_dir, w_dir)], dtype=np.float64)
+        self._tier_rewarded = None                          # [T,C] set in _prepare when w_tier!=0
         self.warnings: list[str] = []
         self.graph = None
         if graph is not None:
@@ -162,6 +165,8 @@ class BeamMatcher(VanillaMatcher):
         self._dtraj = (self._precompute_desired_traj(self._target, T)
                        if self.bcfg.w_traj != 0.0 else None)
         self._regime = self._precompute_regime(self._target) if self.bcfg.w_tier != 0.0 else None
+        self._tier_rewarded = (self._precompute_tier_nn(self._target, self.bcfg.tier_nn_k)
+                               if self.bcfg.w_tier != 0.0 else None)
 
     def _match_cost(self, frames: np.ndarray, t: int) -> np.ndarray:
         """Velocity-window + future-trajectory tracking cost for ``frames`` at time ``t``."""
@@ -181,10 +186,14 @@ class BeamMatcher(VanillaMatcher):
         if bc.w_traj != 0.0:
             d = self._traj_feat[frames] - self._dtraj[t][None]                  # [M, traj_dim]
             cost = cost + bc.w_traj * (d * d * self._traj_w[None]).sum(-1)
-        if bc.w_tier != 0.0 and self._regime is not None:
+        if bc.w_tier != 0.0 and self._tier_rewarded is not None:
             r = float(self._regime[t])
-            tier = self._tier[frames]
-            mism = r * (tier == VARIED) + (1.0 - r) * (tier == STEADY)
+            reward = self._tier_rewarded[t][self._owner_np[frames]]     # 1 = velocity-nearest clean clip
+            # one-sided: reward the command-matching clean clip during steady regime (penalize
+            # everything else); two-sided additionally prefers non-matching frames in transitions.
+            mism = r * (1.0 - reward)
+            if not bc.tier_one_sided:
+                mism = mism + (1.0 - r) * reward
             cost = cost + bc.w_tier * bc.soft_tier_penalty * mism
         return cost
 

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from .graph import STEADY, VARIED
 from .playback import play_frame_path
 from .vanilla import VanillaConfig, VanillaMatcher
 
@@ -45,6 +46,15 @@ class DPConfig:
                                        # w_traj=1.  Pose continuity is handled by the graph/jump_cost.
     track_window: int = 10             # W: velocity-match window half-width (frames)
     track_decay: float = 0.85          # geometric decay per |offset| in the window
+    # Clean steady-state preference (STEADY tier).  ONE-SIDED: during steady command regions add a
+    # penalty to VARIED (bones) frames so clean/STEADY clips win; ramped to 0 (neutral) around
+    # command changes so transitions still use bones.  w_tier=0 -> exactly the no-clean DP.
+    w_tier: float = 0.0
+    soft_tier_penalty: float = 2.0     # magnitude of the per-frame penalty (steady regime)
+    regime_ramp_s: float = 0.5         # steady->neutral ramp half-width (~1 s total around a change)
+    tier_nn_k: int = 1                 # reward the k clean clips nearest the command by velocity
+                                       # (k=1 = the single best-matching "waypoint" trajectory);
+                                       # velocity ties broken toward the stillest clip.
     dt: float = 0.02
 
 
@@ -67,6 +77,9 @@ class DPMatcher(VanillaMatcher):
         w_pos, w_dir = 1.0, 0.5
         self._traj_w = np.array([w for _ in vcfg.traj_times_s
                                  for w in (w_pos, w_pos, w_dir, w_dir)], dtype=np.float64)
+        self._tier_np = self._tier.cpu().numpy().astype(np.int64)   # [N] STEADY/VARIED (from sources)
+        self._regime = None                                         # [T] set in _prepare when w_tier!=0
+        self._tier_rewarded = None                                  # [T,C] set in _prepare when w_tier!=0
         self.warnings: list[str] = []
         self.graph = None
         if graph is not None:
@@ -102,6 +115,9 @@ class DPMatcher(VanillaMatcher):
         if dc.w_traj != 0.0:
             d = self._traj_feat[frames] - self._dtraj[t]
             cost = cost + dc.w_traj * (d * d * self._traj_w).sum(-1)
+        if dc.w_tier != 0.0 and self._tier_rewarded is not None:
+            reward = self._tier_rewarded[t][self._owner_np[frames]]           # 1 = velocity-nearest clean
+            cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
         return cost
 
     def _precompute_ABC(self) -> None:
@@ -194,6 +210,9 @@ class DPMatcher(VanillaMatcher):
         if dc.w_traj != 0.0:
             d = self._traj_feat - self._dtraj[t]                    # [N, traj_dim]
             cost = cost + dc.w_traj * (d * d * self._traj_w).sum(1)
+        if dc.w_tier != 0.0 and self._tier_rewarded is not None:
+            reward = self._tier_rewarded[t][self._owner_np]        # [N] 1 = velocity-nearest clean clip
+            cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
         return cost
 
     def _prepare(self, command, T: int) -> None:
@@ -203,6 +222,9 @@ class DPMatcher(VanillaMatcher):
             self._precompute_constant_mask(T)
         if self.dcfg.w_traj != 0.0:
             self._dtraj = self._precompute_desired_traj(self._target, T)
+        if self.dcfg.w_tier != 0.0:
+            self._regime = self._precompute_regime(self._target, self.dcfg.regime_ramp_s)
+            self._tier_rewarded = self._precompute_tier_nn(self._target, self.dcfg.tier_nn_k)
 
     # ---- the exact backward DP -------------------------------------------------------
     def _dp_backward(self, T: int):
