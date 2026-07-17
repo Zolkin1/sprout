@@ -55,8 +55,11 @@ def main() -> int:
     p.add_argument("--device", default="cpu")
     p.add_argument("--bones-package", default="Locomotion")
     p.add_argument("--bones-style", default=None)
-    p.add_argument("--bones-movement", default=None)
-    p.add_argument("--bones-body", default=None)
+    # Default set covers the toy command: walk/jog + turning + a way to decelerate/stop
+    # ("standing idle" + start/stop "transition").  Turning + stop data are REQUIRED for
+    # the toy to turn and to come to rest (see the foot-skate diagnosis).
+    p.add_argument("--bones-movement", default="walking,jogging,turning,standing idle,transition")
+    p.add_argument("--bones-body", default="standing")
     p.add_argument("--bones-limit", type=int, default=None)
     p.add_argument("--search-interval", type=float, default=0.1)
     args = p.parse_args()
