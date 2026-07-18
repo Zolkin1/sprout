@@ -38,6 +38,7 @@ import torch                      # noqa: E402
 from scipy.spatial import cKDTree  # noqa: E402
 
 from motion_gen.clips.clip_io import ClipLibraryWriter                     # noqa: E402
+from motion_gen.world_lift import _ANCHOR_MASK_FLAT                        # noqa: E402
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher        # noqa: E402
 from motion_gen.motion_matching.bones_ingest import load_cache            # noqa: E402
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher             # noqa: E402
@@ -280,7 +281,8 @@ def main() -> int:
                      "skill_id": torch.zeros(1, T, dtype=torch.uint8, device=dev),
                      "stride_idx": torch.full((1, T), -1, dtype=torch.int32, device=dev),
                      "target_vel": tvel.unsqueeze(0), "terrain_id": torch.tensor([-1], dtype=torch.int32),
-                     "terrain_type": "flat"}
+                     "terrain_type": "flat",
+                     "anchor_mask": torch.tensor([_ANCHOR_MASK_FLAT], dtype=torch.uint8)}
             meta = {**base_meta, "clip_length_s": total, "num_steps": int(T)}
             out_h5 = os.path.join(args.out_dir, f"{name}_{method}.h5")
             w = ClipLibraryWriter(out_h5, 1, meta); w.set_attr("generator", f"{method}_mm"); w.write_batch(0, batch); w.close()

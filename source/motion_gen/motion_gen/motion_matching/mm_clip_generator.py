@@ -33,6 +33,7 @@ from ..math_utils import (
     quat_mul,
     yaw_quat,
 )
+from ..world_lift import _ANCHOR_MASK_FLAT
 from . import features as F
 from . import ingest_common as IC
 from .motion_db import TRAJOPT, MotionDB, MotionSource
@@ -61,8 +62,11 @@ class MotionMatchClipGenerator:
         warn_cost_threshold: float = 8.0,
         ground_height: float = 0.0,
         contact_z_thresh: float = 0.06,
+        anchor_mask: int = _ANCHOR_MASK_FLAT,
     ):
         self.m = manager
+        # Per-clip RL anchor mask (default flat: FREE x,y,yaw; z/roll/pitch clip-fixed).
+        self._anchor_mask = int(anchor_mask)
         self.db = db
         self.sources = sources
         self.cfg = cfg
@@ -286,6 +290,7 @@ class MotionMatchClipGenerator:
             "target_vel": torch.tensor(tvel_tr, dtype=torch.float32, device=self.device).unsqueeze(0),
             "terrain_id": torch.tensor([-1], dtype=torch.int32, device=self.device),
             "terrain_type": "flat",
+            "anchor_mask": torch.tensor([self._anchor_mask], dtype=torch.uint8, device=self.device),
         }
 
     def _world_to_outputs(self, root_pos, root_quat, joints):

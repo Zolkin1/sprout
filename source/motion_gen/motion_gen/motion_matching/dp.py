@@ -227,9 +227,14 @@ class DPMatcher(VanillaMatcher):
             self._tier_rewarded = self._precompute_tier_nn(self._target, self.dcfg.tier_nn_k)
 
     # ---- the exact backward DP -------------------------------------------------------
-    def _dp_backward(self, T: int):
+    def _dp_backward(self, T: int, terminal_cost: np.ndarray | None = None):
         """Backward pass -> action table ``A_act[N,T]`` (0=continue, else 1+jump-slot); also
-        sets ``self._V0`` = cost-to-go from the start layer."""
+        sets ``self._V0`` = cost-to-go from the start layer.
+
+        ``terminal_cost[N]`` (optional) is ADDED to the terminal layer ``V[:, T-1]`` -- the
+        approach DP passes the terrain-entry boundary cost here so the optimal path ENDS at
+        (the frame closest to) the terrain entry state (the "start at the terrain bit, work
+        backwards" pin).  ``None`` = the ordinary command-only terminal."""
         N = self._bvel.shape[0]
         cut = self.dcfg.cut_penalty
         cand, jc, nxt = self._cand, self._jcost, self._next
@@ -239,6 +244,8 @@ class DPMatcher(VanillaMatcher):
         idxN = np.arange(N)
 
         V_next = self._match_cost_all(T - 1)                 # V[:, T-1]
+        if terminal_cost is not None:
+            V_next = V_next + np.asarray(terminal_cost, dtype=np.float64)
         for t in range(T - 2, -1, -1):
             Vc = np.where(has_cont, V_next[safe_next], np.inf)          # continue value
             Vj_all = V_next[cand] + jc + cut                           # [N,K] (inf slots stay inf)
@@ -250,12 +257,17 @@ class DPMatcher(VanillaMatcher):
         self._V0 = V_next
         return action
 
-    def _reconstruct(self, action: np.ndarray, T: int):
+    def _reconstruct(self, action: np.ndarray, T: int, start_frame: int | None = None):
+        """Forward-reconstruct the optimal frame path from the action table.
+
+        Starts at ``self._stationary`` (the standing-est frame) unless ``start_frame`` is
+        given -- the exit DP seeds this with the frame closest to the terrain EXIT state so
+        the recovery path continues from where the played interior left off."""
         cand, nxt = self._cand, self._next
         path = np.zeros(T, dtype=np.int64)
         jumped = [False] * T
         forced = 0
-        f = int(self._stationary)
+        f = int(self._stationary if start_frame is None else start_frame)
         for t in range(T):
             path[t] = f
             if t == T - 1:
@@ -277,18 +289,42 @@ class DPMatcher(VanillaMatcher):
             self.warnings.append(f"{forced}/{self.n_cuts} cuts were forced at clip ends.")
         return path, jumped
 
-    def generate(self, command, T: int, debug: bool = False):
+    def generate(self, command, T: int, debug: bool = False,
+                 terminal_cost: np.ndarray | None = None, start_frame: int | None = None):
         """Exact backward-DP match against ``command`` then play the optimal path.
+
+        ``terminal_cost`` pins the terminal layer (approach: end at the terrain entry);
+        ``start_frame`` overrides the reconstruction start (exit: begin at the terrain exit).
+        The chosen frame path is stashed on ``self.frame_path`` for the splice/handoff.
         Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
         if self.graph is None:
             raise RuntimeError("DPMatcher.generate called before a candidate graph was attached.")
         self.warnings = []
         self._prepare(command, T)
-        action = self._dp_backward(T)
-        if not np.isfinite(self._V0[int(self._stationary)]):
-            raise RuntimeError("DP found no finite-cost path from the stationary start.")
-        path, jumped = self._reconstruct(action, T)
+        action = self._dp_backward(T, terminal_cost=terminal_cost)
+        start = int(self._stationary if start_frame is None else start_frame)
+        if not np.isfinite(self._V0[start]):
+            raise RuntimeError("DP found no finite-cost path from the start frame.")
+        path, jumped = self._reconstruct(action, T, start_frame=start_frame)
         frame_path = torch.as_tensor(path, dtype=torch.long, device=self.device)
+        self.frame_path = frame_path
         root_pos, root_quat, joints, dbg = play_frame_path(frame_path, jumped, self, self.cfg, debug=debug)
         self.dbg = dbg
         return root_pos, root_quat, joints
+
+    # ---- boundary-value entry points (approach into / exit out of a played terrain segment) ----
+    def generate_approach(self, command, T: int, entry_desc: np.ndarray,
+                          boundary_weight: float = 50.0, debug: bool = False):
+        """Approach DP: track ``command`` and END at the terrain ENTRY state (backward pin).
+
+        ``entry_desc`` is the terrain clip's entry descriptor (see
+        :meth:`VanillaMatcher.boundary_descriptors`).  ``boundary_weight`` scales the terminal
+        pin relative to the per-step match cost; large -> the last frame is forced onto the
+        entry-nearest frame so the played interior splices on cleanly."""
+        terminal = boundary_weight * self.boundary_cost(entry_desc)
+        return self.generate(command, T, debug=debug, terminal_cost=terminal)
+
+    def generate_exit(self, command, T: int, exit_desc: np.ndarray, debug: bool = False):
+        """Exit DP: START at the terrain EXIT state and track the resumed ``command`` forward."""
+        start = int(self.boundary_cost(exit_desc).argmin())
+        return self.generate(command, T, debug=debug, start_frame=start)

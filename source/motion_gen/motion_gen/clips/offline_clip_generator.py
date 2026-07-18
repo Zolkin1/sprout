@@ -52,7 +52,14 @@ from ..skill_bucket import bucket_for_velocity
 # via the ``_stair_stance_ref`` / ``_plan_slowdown_step`` proxies below so that
 # ``import motion_gen`` and flat clip generation work with no IsaacLab present; only
 # the terrain generation path needs them (and still requires IsaacLab).
-from ..world_lift import anchor_inv_yaw, bake_outputs_to_world, lift_orientation, lift_position
+from ..world_lift import (
+    _ANCHOR_MASK_FLAT,
+    _ANCHOR_MASK_STAIRS,
+    anchor_inv_yaw,
+    bake_outputs_to_world,
+    lift_orientation,
+    lift_position,
+)
 from .offline_velocity_sampler import OfflineVelocitySampler
 from .transition_strategy import TransitionStrategy, make_transition_strategy
 from .step_length_table import (
@@ -326,6 +333,9 @@ class OfflineClipGenerator:
         self._band_projectors = None
         self._terrain_id = -1
         self._terrain_type = "flat"
+        # Per-clip RL anchor mask; None => derive from terrain_type at emit time
+        # (flat => FREE x,y,yaw; terrain/transition => FREE y only).
+        self._anchor_mask: int | None = None
         self._spawn_anchor_pos: torch.Tensor | None = None
         self._spawn_anchor_quat: torch.Tensor | None = None
         self._spawn_on_stairs = False
@@ -396,6 +406,7 @@ class OfflineClipGenerator:
         straight_only: bool = False,
         flat_exclude_skills: Sequence[str] = (),
         approach_skills: Sequence[str] | None = None,
+        anchor_mask: int | None = None,
     ) -> None:
         """Bind one uniform terrain for the next :meth:`generate_batch`.
 
@@ -477,6 +488,7 @@ class OfflineClipGenerator:
         self._band_exit_z = torch.tensor(list(band_exit_z), device=self.device, dtype=torch.float32)
         self._terrain_id = int(terrain_id)
         self._terrain_type = str(terrain_type)
+        self._anchor_mask = None if anchor_mask is None else int(anchor_mask)
         self._steer_to_goal = bool(steer_to_goal)
         self._straight_only = bool(straight_only)
         self._nav_goal_xy = (
@@ -518,6 +530,7 @@ class OfflineClipGenerator:
         self._band_projectors = None
         self._terrain_id = -1
         self._terrain_type = "flat"
+        self._anchor_mask = None
         self._steer_to_goal = False
         self._straight_only = False
         self._nav_goal_xy = None
@@ -1367,6 +1380,11 @@ class OfflineClipGenerator:
             "ref_frame": self.ref_frame,
             "skill_list": list(self.sampler.skill_list),
         }
+        # Per-clip RL anchor mask: explicit override, else derived from terrain type
+        # (flat => FREE x,y,yaw; terrain/transition => FREE y only, locked to the treads).
+        anchor_mask = self._anchor_mask
+        if anchor_mask is None:
+            anchor_mask = _ANCHOR_MASK_FLAT if self._terrain_type == "flat" else _ANCHOR_MASK_STAIRS
         out = {
             "y_des": y_des,
             "dy_des": dy_des,
@@ -1376,6 +1394,7 @@ class OfflineClipGenerator:
             "target_vel": target_vel_buf,
             "terrain_id": torch.full((n,), self._terrain_id, dtype=torch.int32, device=dev),
             "terrain_type": self._terrain_type,
+            "anchor_mask": torch.full((n,), int(anchor_mask), dtype=torch.uint8, device=dev),
             "meta": meta,
         }
         if self.debug_interp:

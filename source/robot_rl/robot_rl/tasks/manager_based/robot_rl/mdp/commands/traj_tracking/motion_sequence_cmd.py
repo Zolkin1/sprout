@@ -32,7 +32,7 @@ from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from motion_gen.clips.clip_manager import MotionClipManager
 from motion_gen.world_lift import (
-    ego_placement,
+    ego_placement_masked,
     lift_base_world_state,
     lift_orientation,
     lift_orientation_batched,
@@ -108,6 +108,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.clip_world_pos = torch.zeros(n, 3, device=dev)
         self.clip_world_quat = torch.zeros(n, 4, device=dev)
         self.clip_world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
+        # Reset-time placement (the clip's terrain-cell anchor), set in
+        # ``_commit_clip_reset``. FIXED anchor-mask DOFs pin to this on the ego
+        # re-anchor cadence so terrain-fixed axes never drift onto the robot.
+        self._reset_world_pos = torch.zeros(n, 3, device=dev)
+        self._reset_world_yaw = torch.zeros(n, device=dev)
         # Per-env ego-centric re-anchor assignment (re-rolled per reset in
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
@@ -283,13 +288,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
-        """Re-place the clip's current-step base onto the robot root for env ``ids``.
+        """Re-place the clip for env ``ids`` per each clip's root-DOF anchor mask.
 
         The placement update shared by the cadence-based ego re-anchor
         (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
         re-anchor on a different schedule (e.g. the generator command re-anchoring
-        the clip on the FM's re-plan steps). Yaw + xy + z onto the robot root,
-        keeping only the clip's natural tilt. No-op for empty ``ids``.
+        the clip on the FM's re-plan steps). Each clip's per-clip anchor mask decides
+        which root DOFs re-anchor onto the robot root (FREE) vs stay pinned to the
+        clip's reset-time terrain-cell placement (FIXED); roll/pitch are always the
+        clip's natural tilt. With the legacy mask (flat libraries pre-dating the mask)
+        this is yaw + xy + z onto the robot, i.e. the old behavior. No-op for empty
+        ``ids``.
         """
         if ids.numel() == 0:
             return
@@ -297,11 +306,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         y, _ = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
         base_pos_cf = y[:, self._base_idx["pos"]]   # [k, 3]
         base_ori_cf = y[:, self._base_idx["ori"]]   # [k, 4] xyzw
-        # Target = robot root link (planar position + heading + HEIGHT); keep tilt.
+        # Target = robot root link (planar position + heading + HEIGHT for FREE DOFs).
         target_pos_w = wp.to_torch(self.robot.data.root_pos_w)[ids]
         target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
-        world_pos, world_quat = ego_placement(
-            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w
+        world_pos, world_quat = ego_placement_masked(
+            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
+            anchor_mask=self.manager.gather_anchor_mask(self.clip_id[ids]),
+            cell_anchor_pos=self._reset_world_pos[ids],
+            cell_anchor_yaw=self._reset_world_yaw[ids],
         )
         self.clip_world_pos[ids] = world_pos
         self.clip_world_quat[ids] = world_quat

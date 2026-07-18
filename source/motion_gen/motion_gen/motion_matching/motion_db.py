@@ -47,6 +47,10 @@ class MotionSource:
     name: str = ""
     steady: bool = False                     # clean steady-state clip -> STEADY tier (else VARIED)
     steady_vel: torch.Tensor | None = None   # [3] (vx, vy, wz) steady command this clip tracks, else None
+    # --- terrain-clip extras (None for flat/bones sources) ---
+    contact: torch.Tensor | None = None      # [Fi, C] uint8 per-foot in-contact flags (aligned to frames)
+    terrain_meta: dict | None = None         # geometry the clip was solved on (box/stairs; see terrain_ingest)
+    provenance: dict | None = None           # link back to the bones source clip + crop (lead-up handoff)
 
     @property
     def n(self) -> int:

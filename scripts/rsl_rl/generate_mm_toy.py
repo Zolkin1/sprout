@@ -39,6 +39,7 @@ from motion_gen.motion_matching.graph import (
 )
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
 from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
@@ -226,7 +227,14 @@ def main() -> int:
                    help="[beam] force a rebuild even if a cached graph matches.")
     p.add_argument("--print-clips", action="store_true",
                    help="Print which bones clip is played over which time interval.")
+    p.add_argument("--flat-anchor", default="x,y,yaw",
+                   help="Comma-separated FREE root DOFs (of x,y,z,roll,pitch,yaw) for the RL "
+                        "anchor mask; the rest stay clip-fixed. Default 'x,y,yaw' (z clip-fixed). "
+                        "Use 'x,y,z,yaw' for the legacy behavior (z re-anchored to the robot).")
     args = p.parse_args()
+    flat_anchor_mask = anchor_mask_from_free(
+        [d.strip() for d in args.flat_anchor.split(",") if d.strip()]
+    )
 
     dev = args.device
     cfg = VanillaConfig(dt=args.dt, search_interval_s=args.search_interval,
@@ -319,6 +327,7 @@ def main() -> int:
         "stride_idx": torch.full((1, T), -1, dtype=torch.int32, device=dev),
         "target_vel": tvel.unsqueeze(0), "terrain_id": torch.tensor([-1], dtype=torch.int32, device=dev),
         "terrain_type": "flat",
+        "anchor_mask": torch.tensor([flat_anchor_mask], dtype=torch.uint8, device=dev),
     }
     meta = {
         "dt": args.dt, "clip_length_s": clip_len, "num_steps": int(T),

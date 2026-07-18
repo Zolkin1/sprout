@@ -41,6 +41,11 @@ class MotionClipManager(ManagerBase):
         self.num_steps: int = int(lib.meta["num_steps"])
         self.num_clips: int = lib.num_clips
 
+        # Per-clip root-DOF anchor bitmask (bit SET = FREE). A pre-mask library
+        # resolves to the legacy mask for every clip here (single interpretation
+        # point), so downstream re-anchoring never special-cases missing masks.
+        self.anchor_mask: torch.Tensor = lib.anchor_mask_or_legacy(self.device)  # [num_clips] uint8
+
         # Per-env phase carrier (set by the owning command each step so the
         # base ``_update_command`` can read ``manager.phase``).  Allocated by
         # the command via :meth:`ensure_state`.
@@ -140,6 +145,15 @@ class MotionClipManager(ManagerBase):
     def has_target_vel(self) -> bool:
         """Whether the loaded library carries a per-step commanded velocity."""
         return self.lib.target_vel.numel() > 0
+
+    def gather_anchor_mask(self, clip_id: torch.Tensor) -> torch.Tensor:
+        """Return the per-clip root-DOF anchor bitmask ``[N]`` uint8 for each env's clip.
+
+        Step-invariant (a clip's mask is constant over its length), so this takes
+        only ``clip_id``.  Follows the same CPU-lib / CUDA-env device shuttle as
+        :meth:`gather`.
+        """
+        return self.anchor_mask[clip_id.to(self.anchor_mask.device)].to(clip_id.device)
 
     # ------------------------------------------------------------------
     # ManagerBase abstract methods (trivial for fixed clips; the command's

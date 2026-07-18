@@ -17,6 +17,7 @@ from motion_gen.clips.clip_io import (
 from motion_gen.clips.clip_manager import (
     MotionClipManager,
 )
+from motion_gen.world_lift import _ANCHOR_MASK_FLAT, _ANCHOR_MASK_LEGACY, _ANCHOR_MASK_STAIRS
 
 DEVICE = "cpu"
 
@@ -47,6 +48,8 @@ def _synthetic_lib(num_clips=4, T=10) -> ClipLibraryData:
         target_vel=torch.zeros(num_clips, T, 3),
         terrain_id=torch.full((num_clips,), -1, dtype=torch.int32),
         terrain_type_code=torch.zeros(num_clips, dtype=torch.uint8),
+        anchor_mask=torch.empty(0, dtype=torch.uint8),  # empty => legacy fallback
+        anchor_mask_t=torch.empty(0, dtype=torch.uint8),  # empty => broadcast per-clip mask
         meta=meta, attrs={},
     )
 
@@ -82,3 +85,22 @@ def test_gather_desired_indexes_per_env():
     assert torch.equal(y[1], torch.tensor([3050.0, 3051, 3052, 3053]))  # c3 t5
     assert torch.equal(y[2], torch.tensor([1090.0, 1091, 1092, 1093]))  # c1 t9
     assert torch.allclose(dy, y + 0.5)
+
+
+def test_gather_anchor_mask_legacy_default():
+    """A library with no per-clip mask (empty) resolves to the legacy mask for all clips."""
+    m = MotionClipManager(_synthetic_lib(num_clips=4))
+    assert m.anchor_mask.tolist() == [_ANCHOR_MASK_LEGACY] * 4
+    got = m.gather_anchor_mask(torch.tensor([2, 0, 3]))
+    assert got.tolist() == [_ANCHOR_MASK_LEGACY] * 3
+
+
+def test_gather_anchor_mask_per_clip():
+    """An explicit per-clip mask is gathered by clip_id."""
+    lib = _synthetic_lib(num_clips=3)
+    lib.anchor_mask = torch.tensor(
+        [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT], dtype=torch.uint8
+    )
+    m = MotionClipManager(lib)
+    got = m.gather_anchor_mask(torch.tensor([1, 2, 0]))
+    assert got.tolist() == [_ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_FLAT]

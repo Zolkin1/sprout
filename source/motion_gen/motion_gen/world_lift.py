@@ -23,8 +23,62 @@ Quaternions are xyzw to match Isaac Lab's math utils.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 from motion_gen.math_utils import quat_apply, quat_inv, quat_mul, yaw_quat
+
+
+# ----------------------------------------------------------------------
+# Per-clip root-DOF anchor mask.
+#
+# A clip declares, per root DOF, whether that DOF is FREE (re-anchored onto
+# the robot at runtime) or FIXED (taken from the clip on its terrain cell,
+# not the robot).  The mask is a uint8 bitmask over the 6 DOFs below; a SET
+# bit means FREE.  The legacy default reproduces today's ``ego_placement``
+# (x, y, z, yaw FREE; roll, pitch kept from the clip).
+# ----------------------------------------------------------------------
+
+_ANCHOR_DOF_NAMES: list[str] = ["x", "y", "z", "roll", "pitch", "yaw"]  # bit index = list index
+_ANCHOR_DOF_INDEX: dict[str, int] = {n: i for i, n in enumerate(_ANCHOR_DOF_NAMES)}
+
+
+def anchor_mask_from_free(free: Iterable[str]) -> int:
+    """Build a uint8 anchor bitmask (bit SET = FREE) from FREE DOF names.
+
+    Args:
+        free: DOF names to mark FREE (a subset of :data:`_ANCHOR_DOF_NAMES`).
+
+    Returns:
+        The integer bitmask.
+    """
+    mask = 0
+    for name in free:
+        if name not in _ANCHOR_DOF_INDEX:
+            raise ValueError(f"unknown anchor DOF '{name}'; expected one of {_ANCHOR_DOF_NAMES}")
+        mask |= 1 << _ANCHOR_DOF_INDEX[name]
+    return mask
+
+
+def anchor_mask_free_names(mask: int) -> list[str]:
+    """The FREE DOF names encoded in ``mask`` (inverse of :func:`anchor_mask_from_free`)."""
+    return [n for n, i in _ANCHOR_DOF_INDEX.items() if (int(mask) >> i) & 1]
+
+
+# Named masks (computed, not hand-typed, to stay in lock-step with the bit order).
+_ANCHOR_MASK_LEGACY: int = anchor_mask_from_free({"x", "y", "z", "yaw"})  # 0b100111 = 39; today's ego_placement
+_ANCHOR_MASK_FLAT: int = anchor_mask_from_free({"x", "y", "yaw"})          # 0b100011 = 35; flat, z clip-fixed
+_ANCHOR_MASK_STAIRS: int = anchor_mask_from_free({"y"})                    # 0b000010 = 2
+_ANCHOR_MASK_SLOPE: int = anchor_mask_from_free({"x", "y"})                # 0b000011 = 3; yaw FIXED (uniform plane)
+_ANCHOR_MASK_BOX: int = anchor_mask_from_free({"y"})                       # 0b000010 = 2; box MOUNT (jump-on)
+# Box clips use a PER-FRAME mask.  This constant is the jump-ON (mount) phase: y FREE so the
+# lateral landing follows the robot's approach (approach a little off-center -> the reference
+# slides over, same as stairs), while x/z/yaw stay FIXED (world-pinned to the box) so the
+# takeoff distance + height + heading make the ballistic arc land on the box.  The on-top
+# walk / dismount / recovery phases use ``_ANCHOR_MASK_FLAT`` (ego).  Requires the box sized
+# wide enough in y to absorb the free-y lateral spread (like stairs spanning the corridor).
+# Frame note: the mask is applied in the WORLD frame and terrain clips place with identity
+# heading (yaw=0), so world-y == lateral-across-the-box (holds only while axis-aligned).
 
 
 def anchor_inv_yaw(anchor_quat: torch.Tensor) -> torch.Tensor:
@@ -100,43 +154,68 @@ def _yaw_from_quat(quat_xyzw: torch.Tensor) -> torch.Tensor:
     return torch.atan2(siny_cosp, cosy_cosp)
 
 
-def ego_placement(
+def ego_placement_masked(
     base_pos_cf: torch.Tensor,
     base_ori_cf: torch.Tensor,
     target_pos_w: torch.Tensor,
     target_quat_w: torch.Tensor,
+    anchor_mask: torch.Tensor | int,
+    cell_anchor_pos: torch.Tensor,
+    cell_anchor_yaw: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-env yaw+xy+z placement putting a clip's current-step base onto a target root.
+    """Per-env placement honoring a per-clip root-DOF anchor mask.
 
     Solves for the runtime *placement* (a yaw-only ground frame: ``world_pos``
     plus a pure-yaw ``world_quat``) such that lifting the clip-world base pose
-    ``(base_pos_cf, base_ori_cf)`` through it reproduces the target root's planar
-    position, heading, AND height (z) -- keeping only the clip's natural tilt
-    (roll/pitch).  This mirrors the FM deploy-time anchor
-    (:meth:`FmTrackingCommand._run_fm`), which snaps the reference base
-    xy+z+yaw onto the robot root so the receding-horizon reference rides at the
-    robot's actual height rather than the clip's natural height; the future window
-    then recedes from this placement with the clip's natural z variation.  This is
-    the runtime, robot-targeting counterpart of the reset placement in
-    ``reset_on_motion_sequence`` (which targets the env origin at the start step):
-    it re-anchors an ego-centric, receding-horizon clip onto the robot's root every
-    few steps.
+    ``(base_pos_cf, base_ori_cf)`` through it puts each root DOF where the clip's
+    :func:`anchor_mask_from_free` mask says:
 
-    All quaternions are ``(x, y, z, w)`` (scalar-last).  The returned ``world_quat``
-    is pure-yaw, so lifting with it reduces to a planar rotation + translation (see
-    :func:`anchor_inv_yaw`: ``anchor_inv_yaw(Q) == Q`` for pure-yaw ``Q``).
+      * **FREE** DOF -> re-anchored onto the robot ``target`` (as today);
+      * **FIXED** DOF -> pinned to the clip on its terrain cell, i.e. the
+        component of ``cell_anchor_pos`` / ``cell_anchor_yaw`` (the reset
+        placement), so the clip's baked motion plays out from there unchanged.
+
+    The returned ``world_quat`` is always pure-yaw (roll/pitch are never
+    re-anchored -- they ride through the ``base:ori`` lift as the clip's natural
+    tilt), which every downstream lift relies on.  ``roll`` / ``pitch`` FREE bits
+    are reserved and rejected (a full-quat placement would break the pure-yaw
+    invariant).
+
+    With ``anchor_mask == _ANCHOR_MASK_LEGACY`` and zero cell anchor this
+    reproduces :func:`ego_placement` exactly.  All quaternions are ``(x, y, z, w)``.
 
     Args:
         base_pos_cf: ``[N, 3]`` clip-world base position at the current step.
         base_ori_cf: ``[N, 4]`` clip-world base orientation (xyzw) at the current step.
-        target_pos_w: ``[N, 3]`` target root world position (the robot's root) --
-            its z is snapped onto, not just its xy.
-        target_quat_w: ``[N, 4]`` target root world orientation (xyzw).
+        target_pos_w: ``[N, 3]`` target root (robot) world position.
+        target_quat_w: ``[N, 4]`` target root (robot) world orientation (xyzw).
+        anchor_mask: ``[N]`` uint8 bitmask (bit SET = FREE), or a scalar int
+            broadcast to all envs.
+        cell_anchor_pos: ``[N, 3]`` terrain-cell world anchor for FIXED DOFs
+            (the reset placement position); zeros for flat.
+        cell_anchor_yaw: ``[N]`` terrain-cell heading (rad) for a FIXED yaw;
+            ``None`` treats it as 0 (identity heading, all current terrain cases).
 
     Returns:
         ``(world_pos[N, 3], world_quat[N, 4] xyzw)`` -- the per-env placement.
     """
-    yaw = _yaw_from_quat(target_quat_w) - _yaw_from_quat(base_ori_cf)  # [N]
+    n = base_pos_cf.shape[0]
+    device, dtype = base_pos_cf.device, base_pos_cf.dtype
+    if not torch.is_tensor(anchor_mask):
+        anchor_mask = torch.full((n,), int(anchor_mask), dtype=torch.long, device=device)
+    m = anchor_mask.to(device=device, dtype=torch.long)
+    free = {name: ((m >> i) & 1).bool() for name, i in _ANCHOR_DOF_INDEX.items()}  # [N] bool each
+    if bool(free["roll"].any()) or bool(free["pitch"].any()):
+        raise ValueError("free roll/pitch is reserved and unsupported; the mask must FIX roll & pitch")
+
+    if cell_anchor_yaw is None:
+        cell_anchor_yaw = torch.zeros(n, device=device, dtype=dtype)
+    else:
+        cell_anchor_yaw = cell_anchor_yaw.to(device=device, dtype=dtype)
+
+    # Placement yaw: robot-relative when yaw is FREE, else the terrain-cell heading.
+    yaw_free = _yaw_from_quat(target_quat_w) - _yaw_from_quat(base_ori_cf)  # [N]
+    yaw = torch.where(free["yaw"], yaw_free, cell_anchor_yaw)  # [N]
     half = 0.5 * yaw
     zeros = torch.zeros_like(yaw)
     world_quat = torch.stack([zeros, zeros, torch.sin(half), torch.cos(half)], dim=-1)
@@ -147,19 +226,48 @@ def ego_placement(
     rot_x = cos_y * base_pos_cf[:, 0] - sin_y * base_pos_cf[:, 1]
     rot_y = sin_y * base_pos_cf[:, 0] + cos_y * base_pos_cf[:, 1]
 
+    # lifted base = world_pos + R(yaw) . base_pos_cf.  FREE d: solve so lifted == target[d];
+    # FIXED d: set the placement origin to the cell anchor so lifted == cell + clip motion.
     world_pos = torch.empty_like(target_pos_w)
-    world_pos[:, 0] = target_pos_w[:, 0] - rot_x  # so lifted base xy == target xy
-    world_pos[:, 1] = target_pos_w[:, 1] - rot_y
-    # Snap the current-step base HEIGHT onto the target root too. z is yaw-invariant
-    # (the pure-yaw lift leaves it as lifted_z = world_pos.z + base_pos_cf.z), so this
-    # makes the lifted current-step base z == target_pos_w.z exactly. Matches the FM
-    # deploy anchor (FmTrackingCommand._run_fm pins reference z to the robot
-    # root); the future window recedes with the clip's natural z variation relative to
-    # this anchor. Anchoring z (not the clip's natural height) means a sinking robot
-    # drags the reference height down with it -- there is no free recovery-height target
-    # -- so the teacher must learn to stay up / avoid states the reference cannot hold.
-    world_pos[:, 2] = target_pos_w[:, 2] - base_pos_cf[:, 2]
+    world_pos[:, 0] = torch.where(free["x"], target_pos_w[:, 0] - rot_x, cell_anchor_pos[:, 0])
+    world_pos[:, 1] = torch.where(free["y"], target_pos_w[:, 1] - rot_y, cell_anchor_pos[:, 1])
+    world_pos[:, 2] = torch.where(free["z"], target_pos_w[:, 2] - base_pos_cf[:, 2], cell_anchor_pos[:, 2])
     return world_pos, world_quat
+
+
+def ego_placement(
+    base_pos_cf: torch.Tensor,
+    base_ori_cf: torch.Tensor,
+    target_pos_w: torch.Tensor,
+    target_quat_w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Legacy per-env yaw+xy+z placement putting a clip's current-step base onto a target root.
+
+    Thin wrapper over :func:`ego_placement_masked` with the legacy mask
+    (``x, y, z, yaw`` FREE; roll/pitch kept from the clip) and a zero terrain-cell
+    anchor -- i.e. the reference base xy+z+yaw are all snapped onto the robot root.
+    This mirrors the FM deploy-time anchor (:meth:`FmTrackingCommand._run_fm`), which
+    pins the reference base xy+z+yaw onto the robot so the receding-horizon reference
+    rides at the robot's actual height; the future window then recedes with the clip's
+    natural z variation.  Anchoring z (not the clip's natural height) means a sinking
+    robot drags the reference height down with it -- so the teacher must learn to stay up.
+
+    Prefer :func:`ego_placement_masked` for terrain-aware clips (per-DOF FREE/FIXED).
+
+    Args:
+        base_pos_cf: ``[N, 3]`` clip-world base position at the current step.
+        base_ori_cf: ``[N, 4]`` clip-world base orientation (xyzw) at the current step.
+        target_pos_w: ``[N, 3]`` target root world position (its z is snapped onto too).
+        target_quat_w: ``[N, 4]`` target root world orientation (xyzw).
+
+    Returns:
+        ``(world_pos[N, 3], world_quat[N, 4] xyzw)`` -- the per-env placement.
+    """
+    return ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
+        anchor_mask=_ANCHOR_MASK_LEGACY,
+        cell_anchor_pos=torch.zeros_like(target_pos_w),
+    )
 
 
 # ----------------------------------------------------------------------

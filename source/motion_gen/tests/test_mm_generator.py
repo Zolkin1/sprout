@@ -63,6 +63,10 @@ def test_generate_valid_clip(tmp_path):
     assert int((batch["stride_idx"][0] == -1).sum()) > 0
     # terrain tags
     assert batch["terrain_type"] == "flat" and int(batch["terrain_id"][0]) == -1
+    # anchor mask: flat default => FREE x,y,yaw (z clip-fixed) == 0b100011 = 35
+    from motion_gen.world_lift import _ANCHOR_MASK_FLAT
+    assert batch["anchor_mask"].dtype == torch.uint8
+    assert batch["anchor_mask"].tolist() == [_ANCHOR_MASK_FLAT]
     assert isinstance(gen.warnings, list)
 
 

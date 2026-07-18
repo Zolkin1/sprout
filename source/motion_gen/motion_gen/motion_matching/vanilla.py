@@ -224,6 +224,7 @@ class VanillaMatcher:
         self.device = torch.device(device)
         self.src_names = [s.name for s in sources]
         fk = make_ee_fk(mjcf_path, device=device)
+        self._fk = fk   # cached for boundary_descriptors (feature a clip not in the DB)
         feats, self.src_start, self.src_len = [], [], []
         rp, rq, jp = [], [], []
         acc = 0
@@ -294,6 +295,31 @@ class VanillaMatcher:
         # standing-est start = candidate with the smallest future displacement
         ci = self._cand_idx
         self._stationary = int(ci[self.feat_raw[ci, :2].pow(2).sum(1).argmin()])
+
+    # ---- boundary states (for the boundary-value DP around a PLAYED terrain segment) ----
+    def boundary_descriptors(self, source) -> tuple[np.ndarray, np.ndarray]:
+        """Normalized descriptor of a source's ENTRY (frame 0) and EXIT (frame -1) frames,
+        in THIS matcher's feature space.  The source need NOT be in the DB -- its features are
+        computed with the same FK + cfg and normalized with the matcher's mean/std/weight, so
+        the descriptors live in the same space as :attr:`_norm`.  Used to pin a played terrain
+        interaction's boundary into the approach/exit DP.  Returns ``(entry[dim], exit[dim])``."""
+        feat = compute_vanilla_features(
+            source.root_pos.to(self.device), source.root_quat.to(self.device),
+            source.joint_pos.to(self.device), source.joint_vel.to(self.device),
+            self._fk, self.cfg, wrap=getattr(source, "wrap", "episodic"))
+        norm = ((feat - self.mean) / self.std) * self.weight            # [F, dim]
+        return (norm[0].detach().cpu().numpy(), norm[-1].detach().cpu().numpy())
+
+    def boundary_cost(self, desc: np.ndarray) -> np.ndarray:
+        """Per-DB-frame L2 distance ``[N]`` from every frame's normalized descriptor to ``desc``.
+
+        This is the boundary-match cost the approach DP pins its terminal to (arrive at the
+        terrain entry state) and the exit DP seeds its start from (continue from the exit state).
+        Pose + future-trajectory + velocity all live in the descriptor, so foot placement /
+        heading / speed are matched jointly.
+        """
+        dv = torch.as_tensor(desc, dtype=self._norm.dtype, device=self.device)
+        return (self._norm - dv).norm(dim=1).detach().cpu().numpy()
 
     def _precompute_regime(self, target: np.ndarray, ramp_s: float) -> np.ndarray:
         """Smoothed steady/transition signal in ``[0,1]`` (1 = steady), ramped over ``ramp_s``

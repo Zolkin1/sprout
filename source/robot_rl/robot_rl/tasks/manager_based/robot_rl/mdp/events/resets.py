@@ -11,6 +11,7 @@ from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
 from motion_gen.world_lift import (
     lift_position,
+    _yaw_from_quat,
 )
 
 if TYPE_CHECKING:
@@ -369,6 +370,12 @@ def _commit_clip_reset(
     cmd.start_step[env_ids] = start_step
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
+    # Reset-time placement = the clip's terrain-cell anchor. FIXED anchor-mask DOFs
+    # pin to this on the ego re-anchor cadence (so terrain-fixed axes stay put while
+    # FREE axes track the robot). For flat, world_pos.z is the env-origin ground, so
+    # a FIXED-z clip keeps its natural height above the ground rather than the robot's.
+    cmd._reset_world_pos[env_ids] = world_pos
+    cmd._reset_world_yaw[env_ids] = _yaw_from_quat(world_quat)
     cmd._ego_mask[env_ids] = ego_mask
     cmd._snap_mask[env_ids] = snap_mask
 

@@ -150,20 +150,34 @@ def _box(xmin, xmax, ymin, ymax, zmin, zmax) -> tuple[np.ndarray, np.ndarray]:
     return v, f
 
 
+def _ramp(xmin, xmax, ymin, ymax, base_z, z_at_xmin, z_at_xmax) -> tuple[np.ndarray, np.ndarray]:
+    """Prism with a flat bottom (``base_z``) and a top tilted in x (a uniform slope)."""
+    v = np.array([
+        [xmin, ymin, base_z], [xmax, ymin, base_z], [xmax, ymax, base_z], [xmin, ymax, base_z],
+        [xmin, ymin, z_at_xmin], [xmax, ymin, z_at_xmax], [xmax, ymax, z_at_xmax], [xmin, ymax, z_at_xmin],
+    ], dtype=np.float32)
+    f = np.array([
+        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+        [2, 3, 7], [2, 7, 6], [1, 2, 6], [1, 6, 5], [3, 0, 4], [3, 4, 7],
+    ], dtype=np.uint32)
+    return v, f
+
+
 def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     """Build a solid multi-band terrain mesh (verts, faces) from a manifest entry.
 
     Flat bands render as a full-corridor-width slab at their level; stair bands
-    render as solid tread pillars spanning the (narrower, centered) stair width.
-    All in the clip-world (local-corner) frame the clip is stored in.  Falls back
-    to the legacy single-stair keys for pre-multi-band manifests.
+    render as solid tread pillars spanning the (narrower, centered) stair width;
+    slope bands render as a tilted ramp (0 -> ``rise`` over the band span).  All in
+    the clip-world (local-corner) frame the clip is stored in.  Falls back to the
+    legacy single-stair keys for pre-multi-band manifests.
     """
     size_y = float(m.get("size_y", 1.2))
-    w = float(m["dims"]["w"]); d = float(m["dims"]["d"])
+    w = float(m["dims"]["w"])
     cy = size_y / 2.0
     symin, symax = cy - w / 2.0, cy + w / 2.0
     base_z = -0.08
-    boxes = []
+    boxes, ramps = [], []
     bands = m.get("bands")
     if bands is None:  # legacy single-stair manifest
         bands = [{"block_type": "StairBlock", "aabb": [m["span_xmin"], m["span_xmax"], 0.0, size_y],
@@ -171,11 +185,40 @@ def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     for b in bands:
         x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
         if b["block_type"] == "StairBlock":
+            d = float(m["dims"]["d"])
             for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # tread pillars
                 boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, base_z, float(cz)))
+        elif b["block_type"] == "SlopeBlock":  # tilted ramp, full width, 0 -> rise over the span
+            rise = float(b.get("rise", m["dims"].get("rise", 0.0)))
+            ramps.append((x0, x1, symin, symax, base_z, 0.0, rise))
         else:  # flat slab, full corridor width, at the band's level
             boxes.append((x0, x1, 0.0, size_y, base_z, float(b["exit_z"])))
 
+    verts, faces, off = [], [], 0
+    for b in boxes:
+        v, f = _box(*b)
+        verts.append(v); faces.append(f + off); off += 8
+    for r in ramps:
+        v, f = _ramp(*r)
+        verts.append(v); faces.append(f + off); off += 8
+    return np.concatenate(verts), np.concatenate(faces)
+
+
+def _box_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Flat ground slab + overlay volume(s) for a ``box`` manifest entry -> (verts, faces).
+
+    The clip is baked in its local-corner frame, so the ground spans ``[0,size_x] x [0,size_y]``
+    and each overlay sits at its ``pos_xy`` (local) -- the same frame the clip's world base path
+    is drawn in, so the box lines up under the jump.
+    """
+    size_x, size_y = float(m["size_x"]), float(m["size_y"])
+    base_z = -0.08
+    boxes = [(0.0, size_x, 0.0, size_y, base_z, 0.0)]        # ground slab
+    for ov in m.get("overlays", []):
+        px, py = float(ov["pos_xy"][0]), float(ov["pos_xy"][1])
+        sx, sy, sz = (float(v) for v in ov["size_xyz"])
+        bz = float(ov.get("base_z", 0.0))
+        boxes.append((px - sx / 2.0, px + sx / 2.0, py - sy / 2.0, py + sy / 2.0, bz, bz + sz))
     verts, faces, off = [], [], 0
     for b in boxes:
         v, f = _box(*b)
@@ -337,7 +380,8 @@ class ClipScene:
         tid = int(self.clip_terrain_id[clip_idx]) if self.clip_terrain_id.numel() else -1
         if tid in self.terrain_manifest:
             mm = self.terrain_manifest[tid]
-            tv_v, tv_f = _stair_terrain_mesh(mm)
+            tv_v, tv_f = (_box_terrain_mesh(mm) if (mm.get("type") == "box" or "overlays" in mm)
+                          else _stair_terrain_mesh(mm))
             self._terrain_handle = self.server.scene.add_mesh_simple(
                 "/terrain", vertices=tv_v, faces=tv_f,
                 color=(0.62, 0.62, 0.66), opacity=1.0, side="double", flat_shading=True,

@@ -29,6 +29,7 @@ from motion_gen.motion_matching.mm_clip_generator import MotionMatchClipGenerato
 from motion_gen.motion_matching.motion_db import MotionDB
 from motion_gen.motion_matching.trajopt_ingest import ingest_trajopt
 from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
@@ -58,6 +59,10 @@ def main() -> int:
     p.add_argument("--walk-vx", type=float, default=1.0)
     p.add_argument("--w-vel", type=float, default=3.0)
     p.add_argument("--db-out", default=None, help="Optional .npz to cache the built DB.")
+    p.add_argument("--flat-anchor", default="x,y,yaw",
+                   help="Comma-separated FREE root DOFs (of x,y,z,roll,pitch,yaw) for the RL "
+                        "anchor mask; the rest stay clip-fixed. Default 'x,y,yaw' (z clip-fixed). "
+                        "Use 'x,y,z,yaw' for the legacy behavior (z re-anchored to the robot).")
     args = p.parse_args()
 
     dev = args.device
@@ -96,7 +101,8 @@ def main() -> int:
     if args.db_out:
         db.save(args.db_out)
 
-    gen = MotionMatchClipGenerator(manager, db, sources, cfg, dt=args.dt, device=dev, w_vel=args.w_vel)
+    gen = MotionMatchClipGenerator(manager, db, sources, cfg, dt=args.dt, device=dev, w_vel=args.w_vel,
+                                   anchor_mask=anchor_mask_from_free(_csv_set(args.flat_anchor)))
     schedule = [
         {"skill": "standing", "vx": 0.0, "wz": 0.0, "duration_s": 1.5},
         {"skill": "running", "vx": args.run_vx, "wz": 0.0, "duration_s": 3.0},

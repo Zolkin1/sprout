@@ -62,16 +62,24 @@ def _match(row_val: str, want) -> bool:
 
 
 def filter_rows(rows, filters=None, styles=None, exclude_mirror=True,
-                exclude_name_substrings=None) -> list[dict]:
+                exclude_name_substrings=None, include_name_substrings=None) -> list[dict]:
     """Apply the package/category/... filter chain (case-insensitive).
 
     ``filters`` maps a metadata column to a required value; the value may be a scalar
     (exact match) or a list/set (membership, e.g. ``content_type_of_movement`` in
     ``{walking, jogging}``).
+
+    ``include_name_substrings`` (if given) is an allow-list on the filename: a row is
+    kept only if its filename contains at least one of the substrings.  This selects
+    motion *families* by name (e.g. ``["jump_over_obstacle", "jump_on", "jump_off"]``
+    for the terrain lead-ins) where a column filter is too coarse -- the ``Stunts``
+    category is a junk-mixed bag and ``jumping`` movement is too broad.  ``exclude_
+    name_substrings`` is applied after and wins on conflict.
     """
     filters = filters or {}
     allowed_styles = {_norm(s) for s in (styles or [])}
     excl_sub = [_norm(s) for s in (exclude_name_substrings or [])]
+    incl_sub = [_norm(s) for s in (include_name_substrings or [])]
     out = []
     for r in rows:
         if exclude_mirror and str(r.get("is_mirror", "")).strip() == "True":
@@ -81,6 +89,8 @@ def filter_rows(rows, filters=None, styles=None, exclude_mirror=True,
         if any(not _match(r.get(col, ""), val) for col, val in filters.items()):
             continue
         name = _norm(r.get("filename", ""))
+        if incl_sub and not any(sub in name for sub in incl_sub):
+            continue
         if any(sub in name for sub in excl_sub):
             continue
         out.append(r)
@@ -242,6 +252,7 @@ def load_cache(
     styles: list[str] | None = None,
     exclude_mirror: bool = True,
     exclude_name_substrings: list[str] | None = None,
+    include_name_substrings: list[str] | None = None,
     limit: int | None = None,
     device: str | torch.device = "cpu",
 ) -> tuple[list[MotionSource], dict]:
@@ -266,7 +277,8 @@ def load_cache(
             for sk, orig in _CACHE_META.items()}
     rows = [{**{orig: cols[orig][i] for orig in cols}, "_idx": i} for i in range(C)]
     kept = filter_rows(rows, filters=filters, styles=styles, exclude_mirror=exclude_mirror,
-                       exclude_name_substrings=exclude_name_substrings)
+                       exclude_name_substrings=exclude_name_substrings,
+                       include_name_substrings=include_name_substrings)
     if limit is not None:
         kept = kept[:limit]
 

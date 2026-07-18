@@ -1,0 +1,284 @@
+#!/usr/bin/env python
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""Generate box / terrain TRAVERSAL clips: DP(approach) + PLAY(terrain) + DP(exit).
+
+The terrain interaction (a box jump, a stair stride) is PLAYED from the terrain traj-opt
+library (``trajectories/skills/terrain_v1``, ingested with its exported contacts + geometry);
+the exact backward DP only fills the free-locomotion approach (pinned to arrive at the terrain
+ENTRY state) and the exit (seeded from the terrain EXIT state).  The three world-space segments
+are rigid-SE(2)+z spliced (heading-normalized, seam frame dropped) and the exported box / stair
+geometry rides along the same transform.  Output is a standard clip ``.h5`` with a per-STEP
+anchor mask (jump-on world-pinned, approach / recovery ego) + a ``box`` terrain manifest.
+
+Runs with NO IsaacLab.  The graph DB is flat locomotion (bones + clean strides) PLUS the jump
+lead-ins (``jump_on`` / ``jump_over`` / ... families) so the approach can reach the takeoff.
+
+    python scripts/rsl_rl/generate_box_clips.py \
+        --source hf/trajectories/retargeted/<merged> --bones-cache clips/bones_cache_locomotion.h5 \
+        --terrain-lib trajectories/skills/terrain_v1 --out clips/g1_box_v1.h5 --device cpu
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import torch
+
+from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
+from motion_gen.motion_matching.bones_ingest import load_cache
+from motion_gen.motion_matching.box_clip import (
+    align_and_concat,
+    build_anchor_mask_t,
+    transform_boxes,
+    yaw_normalize,
+)
+from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+from motion_gen.motion_matching.clip_output import ClipOutputBuilder
+from motion_gen.motion_matching.dp import DPConfig, DPMatcher
+from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
+from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
+from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
+from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
+
+_CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
+
+# The jump / step-box lead-in families (bones filename prefixes) that make the terrain entry
+# reachable from flat locomotion; exclude the ladder / wall / roll look-alikes.
+_TERRAIN_INCLUDE = ["jump_over_obstacle", "jump_on", "jump_off", "come_up", "come_down"]
+_TERRAIN_EXCLUDE = ["ladder", "wall", "roll", "monkey", "shoulder", "safety", "hook"]
+# Flat-locomotion movement labels for the approach/exit steady tracking.
+_FLAT_MOVEMENT = ["walking", "jogging", "running", "running, turning", "turning",
+                  "standing idle", "transition"]
+_FLAT_EXCLUDE = ["injured", "limp", "drunk", "jump", "roll"]
+
+
+def _steady_cmd(vx: float):
+    return lambda _t: (float(vx), 0.0, 0.0)
+
+
+def _approach_cmd(vx: float, entry_vx: float, T: int, ramp_frames: int, dt: float):
+    """Approach command: hold ``vx`` (walk/run), then linearly RAMP to ``entry_vx`` over the last
+    ``ramp_frames`` so the run-up decelerates into the jump takeoff (the DP terminal pin then
+    lands the exact entry state).  A hard step from running straight to a standing takeoff would
+    teleport/foot-slide at the handoff -- the ramp gives the deceleration room."""
+    def cmd(t):
+        f = t / dt
+        if f <= T - ramp_frames:
+            return (float(vx), 0.0, 0.0)
+        a = min(1.0, (f - (T - ramp_frames)) / max(1, ramp_frames))
+        return (float((1.0 - a) * vx + a * entry_vx), 0.0, 0.0)
+    return cmd
+
+
+def _pad_or_trim(t: torch.Tensor, T: int) -> torch.Tensor:
+    """Pad (repeat last frame) or trim a ``[t0, ...]`` tensor to length ``T`` along dim 0."""
+    n = t.shape[0]
+    if n == T:
+        return t
+    if n > T:
+        return t[:T]
+    pad = t[-1:].expand((T - n,) + tuple(t.shape[1:]))
+    return torch.cat([t, pad], dim=0)
+
+
+def _build_matcher(args, dev):
+    """Flat locomotion (bones + clean) + jump lead-ins -> DPMatcher with a candidate graph."""
+    print("[box] loading flat-locomotion bones ...")
+    flat, _ = load_cache(args.bones_cache, filters={"package": "Locomotion",
+                         "content_type_of_movement": _FLAT_MOVEMENT, "content_body_position": "standing"},
+                         exclude_name_substrings=_FLAT_EXCLUDE, limit=args.bones_limit, device=dev)
+    print(f"[box] + {len(flat)} flat bones clips")
+    print("[box] loading jump/step lead-ins ...")
+    leadins, _ = load_cache(args.bones_cache, filters={"package": "Locomotion"},
+                            include_name_substrings=_TERRAIN_INCLUDE,
+                            exclude_name_substrings=_TERRAIN_EXCLUDE, limit=args.leadin_limit, device=dev)
+    print(f"[box] + {len(leadins)} lead-in clips")
+    clean = []
+    if args.include_clean:
+        print(f"[box] ingesting clean library {args.clean_source} ...")
+        clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt, device=dev)
+        print(f"[box] + {len(clean)} clean STEADY strides")
+    sources = flat + clean + leadins
+    vcfg = VanillaConfig(dt=args.dt)
+    dcfg = DPConfig(dt=args.dt, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0)
+    nframes = sum(s.n for s in sources)
+    print(f"[box] building DP matcher DB ({len(sources)} clips, {nframes} frames) ...")
+    matcher = DPMatcher(sources, vcfg, dcfg, device=dev)
+    gcfg = GraphConfig(k_min=args.graph_k_min, k_max=args.graph_k_max,
+                       k_target=args.graph_k_target, dt=args.dt)
+    print("[box] building candidate graph ...")
+    cost_feat = matcher._norm[:, matcher._traj_dim:]
+    select_feat = cost_feat[:, POSE_POSTURAL_IDX]
+    graph = build_candidate_graph(select_feat, cost_feat, matcher.feat_raw, matcher.owner,
+                                  matcher.src_start, matcher.src_len, matcher.yaw_all, gcfg,
+                                  steady_owner_mask=matcher._src_steady,
+                                  periodic_owner_mask=matcher._src_periodic)
+    matcher.attach_graph(graph)
+    return matcher
+
+
+def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
+    """One traversal: DP(approach @ approach_vx) + PLAY(ts) + exit -> (records dict) for padding."""
+    T_app = max(1, int(round(args.approach_s / args.dt)))
+    T_exit = max(1, int(round(args.recovery_s / args.dt)))
+    entry_vx = float(ts.steady_vel[0]) if ts.steady_vel is not None else 0.0
+    ramp = max(1, int(round(args.approach_ramp_s / args.dt)))
+    entry_desc, exit_desc = matcher.boundary_descriptors(ts)
+
+    app_cmd = _approach_cmd(approach_vx, entry_vx, T_app, ramp, args.dt)
+    ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_desc,
+                                           boundary_weight=args.boundary_weight)
+    terr = (ts.root_pos.to(dev), ts.root_quat.to(dev), ts.joint_pos.to(dev))
+    # Interaction-aware exit: if the clip ends ELEVATED (jumped ONTO a box, no dismount in the
+    # played clip), HOLD the stand-on-box pose so the recovery doesn't float; otherwise (lands
+    # back on the ground) run a flat-locomotion recovery DP seeded from the exit state.
+    ended_elevated = float(ts.root_pos[-1, 2] - ts.root_pos[0, 2]) > 0.15
+    if ended_elevated:
+        re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
+        qe = ts.root_quat[-1:].to(dev).repeat(T_exit, 1)
+        je = ts.joint_pos[-1:].to(dev).repeat(T_exit, 1)
+    else:
+        re, qe, je = matcher.generate_exit(_steady_cmd(entry_vx), T_exit, exit_desc)
+
+    Wp, Wq, Wj, bounds, tfs = align_and_concat([(ra, qa, ja), terr, (re, qe, je)])
+
+    # The exported box geometry (in the terrain clip's own frame) glued to the played segment via
+    # its splice transform -- this is where the CLIP says the box goes, not a heuristic.
+    gq_t, t_t = tfs[1]
+    boxes = transform_boxes(ts.terrain_meta["terrain"].get("boxes", []), gq_t, t_t)
+    # Normalize the whole traversal (clip + boxes) so the terrain is axis-aligned (box yaw -> ~0):
+    # the approach heading is arbitrary, and leaving it in yaws the box under the motion.
+    Wp, Wq, boxes = yaw_normalize(Wp, Wq, boxes, gq_t)
+
+    # Re-center to a local-corner frame (xy only; z is world/ground-relative) so the baked clip
+    # + its terrain geometry share the clip's local (0,0) corner, like the other terrain clips.
+    corner = torch.stack([Wp[:, 0].min(), Wp[:, 1].min()])
+    Wp = Wp.clone(); Wp[:, 0] -= corner[0]; Wp[:, 1] -= corner[1]
+
+    y, dy, contact = builder.build(Wp, Wq, Wj, args.dt)
+    # Splice the terrain segment's REAL exported foot contacts over the kinematic ones.
+    a, b = bounds[1]
+    if ts.contact is not None:
+        contact[a:b] = ts.contact[1:1 + (b - a)].to(contact.dtype).to(dev)
+
+    T = Wp.shape[0]
+    amt = build_anchor_mask_t(T, bounds, [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT], device=dev)
+
+    overlays = [{"kind": "box", "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],
+                 "size_xyz": [float(v) for v in b_["size"]], "base_z": float(b_["pos"][2] - b_["size"][2] / 2.0),
+                 "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
+    size_x = float(Wp[:, 0].max() - Wp[:, 0].min()) + args.footprint_margin
+    size_y = float(Wp[:, 1].max() - Wp[:, 1].min()) + args.footprint_margin
+    manifest_entry = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y,
+                      "overlays": overlays}
+    # target_vel: the ramped approach command over the approach frames, then the (near-zero)
+    # entry velocity through the played jump + hold.
+    tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
+    a0, a1 = bounds[0]
+    for f in range(a0, a1):
+        tvel[f, 0] = app_cmd(f * args.dt)[0]
+    tvel[a1:, 0] = entry_vx
+    return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
+            "terrain_id": tid, "n": T, "manifest": manifest_entry, "name": ts.name}
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", required=True, help="Traj-opt library (output channel layout).")
+    p.add_argument("--bones-cache", required=True)
+    p.add_argument("--terrain-lib", default="trajectories/skills/terrain_v1")
+    p.add_argument("--terrain-hf-repo", default="zolkin/robot_rl")
+    p.add_argument("--terrain-skills", default=None, help="';'-sep subset of terrain skills (default all).")
+    p.add_argument("--out", required=True)
+    p.add_argument("--dt", type=float, default=0.02)
+    p.add_argument("--approach-s", type=float, default=2.5, help="Approach (DP) duration (s).")
+    p.add_argument("--recovery-s", type=float, default=1.0, help="Exit/recovery (DP) duration (s).")
+    p.add_argument("--approach-vels", default="0.0",
+                   help="';'-separated approach forward speeds (m/s); one CLIP per (terrain x speed). "
+                        "e.g. '0.8;1.6;2.4;3.2' for walk->run run-ups into the jump.")
+    p.add_argument("--approach-ramp-s", type=float, default=0.8,
+                   help="Seconds over which the run-up decelerates to the jump entry speed.")
+    p.add_argument("--clip-length", type=float, default=None,
+                   help="Fixed clip length (s); default = the longest traversal.")
+    p.add_argument("--boundary-weight", type=float, default=200.0,
+                   help="Terminal-pin weight for the approach DP (larger = harder entry pin).")
+    p.add_argument("--footprint-margin", type=float, default=2.0, help="Tile footprint margin (m).")
+    p.add_argument("--cut-penalty", type=float, default=3.0)
+    p.add_argument("--include-clean", action="store_true", help="Fold in the clean STEADY strides.")
+    p.add_argument("--clean-source", default="trajectories/skills/library_v1")
+    p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
+    p.add_argument("--bones-limit", type=int, default=None)
+    p.add_argument("--leadin-limit", type=int, default=None)
+    p.add_argument("--graph-k-max", type=int, default=50)
+    p.add_argument("--graph-k-min", type=int, default=25)
+    p.add_argument("--graph-k-target", type=int, default=40)
+    p.add_argument("--device", default="cpu")
+    args = p.parse_args()
+    dev = args.device
+
+    def _csv(s):
+        return None if not s else [x.strip() for x in s.split(";") if x.strip()]
+
+    matcher = _build_matcher(args, dev)
+    manager = MultiSkillManager(args.source, dev, env=None)
+    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+                                contact_frames=_CONTACT, device=dev)
+
+    print(f"[box] ingesting terrain library {args.terrain_lib} ...")
+    terr_srcs = ingest_terrain_library(args.terrain_lib, hf_repo=args.terrain_hf_repo, dt=args.dt,
+                                       device=dev, skills=_csv(args.terrain_skills))
+    print(f"[box] {len(terr_srcs)} terrain interaction clips")
+
+    approach_vels = [float(v) for v in _csv(args.approach_vels)]
+    print(f"[box] approach speeds: {approach_vels}  -> {len(terr_srcs) * len(approach_vels)} clips")
+    records = []
+    tid = 0
+    for ts in terr_srcs:
+        for vx in approach_vels:
+            print(f"[box] splicing {ts.name} @ approach vx={vx} (terrain_id={tid}) ...")
+            rec = _make_box_clip(matcher, builder, ts, tid, vx, args, dev)
+            rec["approach_vx"] = vx
+            for w in getattr(matcher, "warnings", []) or []:
+                print(f"[box][WARN] {w}")
+            records.append(rec)
+            tid += 1
+
+    T = (int(round(args.clip_length / args.dt)) if args.clip_length
+         else max(r["n"] for r in records))
+    print(f"[box] padding {len(records)} clips to T={T} steps")
+
+    meta = {"dt": args.dt, "clip_length_s": T * args.dt, "num_steps": int(T),
+            "pos_output_names": list(manager.pos_output_names),
+            "vel_output_names": list(manager.vel_output_names),
+            "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
+            "skill_list": [s.name for s in manager.skills]}
+    writer = ClipLibraryWriter(args.out, len(records), meta)
+    writer.set_attr("generator", "box_clip_splice")
+    writer.set_attr("terrain_manifest", [r["manifest"] for r in records])
+    for i, r in enumerate(records):
+        batch = {
+            "y_des": _pad_or_trim(r["y"], T).unsqueeze(0),
+            "dy_des": _pad_or_trim(r["dy"], T).unsqueeze(0),
+            "contact": _pad_or_trim(r["contact"], T).unsqueeze(0),
+            "skill_id": torch.zeros(1, T, dtype=torch.uint8, device=dev),
+            "stride_idx": torch.full((1, T), -1, dtype=torch.int32, device=dev),
+            "target_vel": _pad_or_trim(r["target_vel"], T).unsqueeze(0),
+            "terrain_id": torch.tensor([r["terrain_id"]], dtype=torch.int32, device=dev),
+            "terrain_type": "box",
+            "anchor_mask": torch.tensor([_ANCHOR_MASK_BOX], dtype=torch.uint8, device=dev),
+            "anchor_mask_t": _pad_or_trim(r["anchor_mask_t"], T).unsqueeze(0),
+        }
+        writer.write_batch(i, batch)
+    writer.close()
+
+    lib = load_clip_library(args.out)
+    yy = torch.as_tensor(lib.y_des)
+    print(f"[box] wrote {args.out}: {lib.num_clips} clips x {lib.num_steps} steps, "
+          f"y_des {tuple(yy.shape)} finite={bool(torch.isfinite(yy).all())}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
