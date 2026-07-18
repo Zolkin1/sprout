@@ -297,29 +297,51 @@ class VanillaMatcher:
         self._stationary = int(ci[self.feat_raw[ci, :2].pow(2).sum(1).argmin()])
 
     # ---- boundary states (for the boundary-value DP around a PLAYED terrain segment) ----
-    def boundary_descriptors(self, source) -> tuple[np.ndarray, np.ndarray]:
-        """Normalized descriptor of a source's ENTRY (frame 0) and EXIT (frame -1) frames,
-        in THIS matcher's feature space.  The source need NOT be in the DB -- its features are
-        computed with the same FK + cfg and normalized with the matcher's mean/std/weight, so
-        the descriptors live in the same space as :attr:`_norm`.  Used to pin a played terrain
-        interaction's boundary into the approach/exit DP.  Returns ``(entry[dim], exit[dim])``."""
+    def _source_descriptors(self, source) -> torch.Tensor:
+        """Normalized per-frame descriptors ``[F, dim]`` of a source, in THIS matcher's feature
+        space.  The source need NOT be in the DB -- features are computed with the same FK + cfg
+        and normalized with the matcher's mean/std/weight, so they live in the same space as
+        :attr:`_norm`."""
         feat = compute_vanilla_features(
             source.root_pos.to(self.device), source.root_quat.to(self.device),
             source.joint_pos.to(self.device), source.joint_vel.to(self.device),
             self._fk, self.cfg, wrap=getattr(source, "wrap", "episodic"))
-        norm = ((feat - self.mean) / self.std) * self.weight            # [F, dim]
+        return ((feat - self.mean) / self.std) * self.weight            # [F, dim]
+
+    def boundary_descriptors(self, source) -> tuple[np.ndarray, np.ndarray]:
+        """A source's ENTRY (frame 0) and EXIT (frame -1) normalized descriptors -- to pin a
+        played terrain interaction's boundary into the approach/exit DP.  ``(entry[dim], exit[dim])``."""
+        norm = self._source_descriptors(source)
         return (norm[0].detach().cpu().numpy(), norm[-1].detach().cpu().numpy())
 
-    def boundary_cost(self, desc: np.ndarray) -> np.ndarray:
-        """Per-DB-frame L2 distance ``[N]`` from every frame's normalized descriptor to ``desc``.
+    def entry_descriptors(self, source, entry_frac: float = 0.5) -> np.ndarray:
+        """The source's first ``entry_frac`` frames' descriptors ``[M, dim]`` -- the ALLOWED entry
+        frames the approach DP may hand off into (not just frame 0).  Letting the approach merge
+        into whichever early terrain frame best matches its incoming speed avoids forcing a full
+        stop at frame 0; ``entry_frac`` (first half by default) keeps it from skipping the whole
+        interaction by entering near the end."""
+        norm = self._source_descriptors(source)
+        m = max(1, int(round(entry_frac * norm.shape[0])))
+        return norm[:m].detach().cpu().numpy()
 
-        This is the boundary-match cost the approach DP pins its terminal to (arrive at the
-        terrain entry state) and the exit DP seeds its start from (continue from the exit state).
-        Pose + future-trajectory + velocity all live in the descriptor, so foot placement /
-        heading / speed are matched jointly.
+    def boundary_cost(self, desc: np.ndarray) -> np.ndarray:
+        """Per-DB-frame L2 distance ``[N]`` from every frame's descriptor to a single ``desc``."""
+        return self.boundary_cost_multi(desc)
+
+    def boundary_cost_multi(self, descs: np.ndarray) -> np.ndarray:
+        """Per-DB-frame distance ``[N]`` to the NEAREST of several boundary descriptors.
+
+        ``descs`` is ``[K, dim]`` (or ``[dim]``).  Pose + future-trajectory + velocity all live in
+        the descriptor, so foot placement / heading / speed are matched jointly; taking the min over
+        ``K`` lets the approach terminal pin to whichever allowed entry frame is cheapest to reach.
         """
-        dv = torch.as_tensor(desc, dtype=self._norm.dtype, device=self.device)
-        return (self._norm - dv).norm(dim=1).detach().cpu().numpy()
+        d = torch.as_tensor(descs, dtype=self._norm.dtype, device=self.device)
+        if d.ndim == 1:
+            d = d.unsqueeze(0)
+        # The matmul-expansion cdist loses precision (a spurious ~1e-2 for identical vectors);
+        # use the exact mode so a frame's own descriptor scores ~0 (matches motion_db.nn_search).
+        return torch.cdist(self._norm, d,
+                           compute_mode="donot_use_mm_for_euclid_dist").min(dim=1).values.detach().cpu().numpy()
 
     def _precompute_regime(self, target: np.ndarray, ramp_s: float) -> np.ndarray:
         """Smoothed steady/transition signal in ``[0,1]`` (1 = steady), ramped over ``ramp_s``

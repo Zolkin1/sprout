@@ -22,6 +22,7 @@ lead-ins (``jump_on`` / ``jump_over`` / ... families) so the approach can reach 
 from __future__ import annotations
 
 import argparse
+import math
 
 import torch
 
@@ -58,18 +59,30 @@ def _steady_cmd(vx: float):
     return lambda _t: (float(vx), 0.0, 0.0)
 
 
-def _approach_cmd(vx: float, entry_vx: float, T: int, ramp_frames: int, dt: float):
-    """Approach command: hold ``vx`` (walk/run), then linearly RAMP to ``entry_vx`` over the last
-    ``ramp_frames`` so the run-up decelerates into the jump takeoff (the DP terminal pin then
-    lands the exact entry state).  A hard step from running straight to a standing takeoff would
-    teleport/foot-slide at the handoff -- the ramp gives the deceleration room."""
+def _ramp_cmd(vx0: float, approach_s: float, ramp_s: float, vx1: float = 0.0):
+    """Hold ``vx0``, then linearly decelerate to ``vx1`` over the last ``ramp_s`` seconds.
+
+    The DP TRACKS this decelerating command (relax_tail=0), forcing a real stepping deceleration
+    into the entry instead of searching a transition (which stitches jarring fast->slow cuts)."""
+    t0 = max(0.0, approach_s - ramp_s)
     def cmd(t):
-        f = t / dt
-        if f <= T - ramp_frames:
-            return (float(vx), 0.0, 0.0)
-        a = min(1.0, (f - (T - ramp_frames)) / max(1, ramp_frames))
-        return (float((1.0 - a) * vx + a * entry_vx), 0.0, 0.0)
+        a = 0.0 if t <= t0 else min(1.0, (t - t0) / max(1e-6, ramp_s))
+        return (float(vx0 + (vx1 - vx0) * a), 0.0, 0.0)
     return cmd
+
+
+def _entry_vx(ts, dt: float) -> float:
+    """Forward (heading-frame) speed at the START of the terrain clip -- the ramp target.
+
+    The approach decelerates to whatever speed the played interaction begins at: ~0 for a standing
+    ``jump_on`` (the clip opens standing), the run speed for a future running vault whose frame 0 is
+    already moving.  Finite-differenced from the first two root frames, projected onto frame-0 heading."""
+    if int(ts.root_pos.shape[0]) < 2:
+        return 0.0
+    vx, vy = ((ts.root_pos[1, :2] - ts.root_pos[0, :2]) / dt).tolist()
+    w, x, y, z = (float(c) for c in ts.root_quat[0])
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return max(0.0, math.cos(yaw) * vx + math.sin(yaw) * vy)
 
 
 def _pad_or_trim(t: torch.Tensor, T: int) -> torch.Tensor:
@@ -102,7 +115,8 @@ def _build_matcher(args, dev):
         print(f"[box] + {len(clean)} clean STEADY strides")
     sources = flat + clean + leadins
     vcfg = VanillaConfig(dt=args.dt)
-    dcfg = DPConfig(dt=args.dt, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0)
+    dcfg = DPConfig(dt=args.dt, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0,
+                    w_ground=args.ground_penalty, ground_z=0.0, max_pelvis_z=args.max_pelvis_z)
     nframes = sum(s.n for s in sources)
     print(f"[box] building DP matcher DB ({len(sources)} clips, {nframes} frames) ...")
     matcher = DPMatcher(sources, vcfg, dcfg, device=dev)
@@ -123,18 +137,33 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     """One traversal: DP(approach @ approach_vx) + PLAY(ts) + exit -> (records dict) for padding."""
     T_app = max(1, int(round(args.approach_s / args.dt)))
     T_exit = max(1, int(round(args.recovery_s / args.dt)))
-    entry_vx = float(ts.steady_vel[0]) if ts.steady_vel is not None else 0.0
-    ramp = max(1, int(round(args.approach_ramp_s / args.dt)))
-    entry_desc, exit_desc = matcher.boundary_descriptors(ts)
+    tail = max(1, int(round(args.approach_ramp_s / args.dt)))
+    # Allow the approach to hand off into ANY of the terrain clip's early frames (first
+    # ``entry_frac``), not just frame 0 -- a faster run-up can merge into a later moving frame
+    # when the clip HAS one (a standing jump only has frame 0, so it lands there).
+    entry_descs = matcher.entry_descriptors(ts, entry_frac=args.entry_frac)
+    _, exit_desc = matcher.boundary_descriptors(ts)
+    entry_vx = _entry_vx(ts, args.dt)       # the played interaction's start speed (ramp target)
 
-    app_cmd = _approach_cmd(approach_vx, entry_vx, T_app, ramp, args.dt)
-    ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_desc,
-                                           boundary_weight=args.boundary_weight)
-    terr = (ts.root_pos.to(dev), ts.root_quat.to(dev), ts.joint_pos.to(dev))
+    # Two ways to reach the pinned entry (see --transition):
+    #   ramp  = prescribe a velocity decel to the terrain clip's START speed and TRACK it
+    #           (relax_tail=0) -> a real stepping gait into the entry (default; least foot slide);
+    #   relax = hold the command + relax tracking near the terminal -> DP searches the transition
+    #           (smoother root velocity, but stitches jarring fast->slow cuts -> more foot slide).
+    if args.transition == "ramp":
+        app_cmd = _ramp_cmd(approach_vx, args.approach_s, args.approach_ramp_s, vx1=entry_vx)
+        ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
+                                               boundary_weight=args.boundary_weight, relax_tail=0)
+    else:
+        app_cmd = _steady_cmd(approach_vx)
+        ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
+                                               boundary_weight=args.boundary_weight, relax_tail=tail)
+    k = int(matcher.matched_entry)          # play the terrain interaction FROM the matched entry frame
+    terr = (ts.root_pos[k:].to(dev), ts.root_quat[k:].to(dev), ts.joint_pos[k:].to(dev))
     # Interaction-aware exit: if the clip ends ELEVATED (jumped ONTO a box, no dismount in the
     # played clip), HOLD the stand-on-box pose so the recovery doesn't float; otherwise (lands
     # back on the ground) run a flat-locomotion recovery DP seeded from the exit state.
-    ended_elevated = float(ts.root_pos[-1, 2] - ts.root_pos[0, 2]) > 0.15
+    ended_elevated = float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15
     if ended_elevated:
         re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
         qe = ts.root_quat[-1:].to(dev).repeat(T_exit, 1)
@@ -161,7 +190,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     # Splice the terrain segment's REAL exported foot contacts over the kinematic ones.
     a, b = bounds[1]
     if ts.contact is not None:
-        contact[a:b] = ts.contact[1:1 + (b - a)].to(contact.dtype).to(dev)
+        contact[a:b] = ts.contact[k + 1:k + 1 + (b - a)].to(contact.dtype).to(dev)
 
     T = Wp.shape[0]
     amt = build_anchor_mask_t(T, bounds, [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT], device=dev)
@@ -179,9 +208,10 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     a0, a1 = bounds[0]
     for f in range(a0, a1):
         tvel[f, 0] = app_cmd(f * args.dt)[0]
-    tvel[a1:, 0] = entry_vx
+    # terrain + exit run at ~the played interaction's low entry speed (near 0 for a jump).
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
-            "terrain_id": tid, "n": T, "manifest": manifest_entry, "name": ts.name}
+            "terrain_id": tid, "n": T, "manifest": manifest_entry, "name": ts.name,
+            "entry_frame": k, "n_terr": int(ts.n)}
 
 
 def main() -> int:
@@ -199,13 +229,29 @@ def main() -> int:
                    help="';'-separated approach forward speeds (m/s); one CLIP per (terrain x speed). "
                         "e.g. '0.8;1.6;2.4;3.2' for walk->run run-ups into the jump.")
     p.add_argument("--approach-ramp-s", type=float, default=0.8,
-                   help="Seconds over which the run-up decelerates to the jump entry speed.")
+                   help="Seconds over which the run-up decelerates to the jump entry speed "
+                        "(--transition=ramp) or the tracking-relax window (--transition=relax).")
+    p.add_argument("--transition", choices=["relax", "ramp"], default="ramp",
+                   help="How the approach reaches the terrain entry. 'ramp' (default): prescribe a "
+                        "velocity decel the DP tracks -> a real stepping gait (less foot slide). "
+                        "'relax': hold the command + relax tracking near the terminal so the DP "
+                        "searches the transition (smoother root vel, but more foot slide at speed).")
     p.add_argument("--clip-length", type=float, default=None,
                    help="Fixed clip length (s); default = the longest traversal.")
     p.add_argument("--boundary-weight", type=float, default=200.0,
                    help="Terminal-pin weight for the approach DP (larger = harder entry pin).")
+    p.add_argument("--entry-frac", type=float, default=0.5,
+                   help="The approach may hand off into the terrain clip's first this-fraction of "
+                        "frames (0..1), picking whichever best matches its incoming speed. 0.5 = "
+                        "first half (keeps it from skipping the interaction by entering near the end).")
     p.add_argument("--footprint-margin", type=float, default=2.0, help="Tile footprint margin (m).")
     p.add_argument("--cut-penalty", type=float, default=3.0)
+    p.add_argument("--ground-penalty", type=float, default=12.0,
+                   help="Weight penalizing candidate frames whose pelvis is above --max-pelvis-z over "
+                        "the flat approach ground (keeps on-box/on-stairs lead-in frames out of the "
+                        "run-up). 0 = off.")
+    p.add_argument("--max-pelvis-z", type=float, default=0.95,
+                   help="Pelvis-above-ground ceiling (m) before the ground penalty kicks in.")
     p.add_argument("--include-clean", action="store_true", help="Fold in the clean STEADY strides.")
     p.add_argument("--clean-source", default="trajectories/skills/library_v1")
     p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
@@ -240,6 +286,7 @@ def main() -> int:
             print(f"[box] splicing {ts.name} @ approach vx={vx} (terrain_id={tid}) ...")
             rec = _make_box_clip(matcher, builder, ts, tid, vx, args, dev)
             rec["approach_vx"] = vx
+            print(f"[box]   -> entered terrain at frame {rec['entry_frame']}/{rec['n_terr']}")
             for w in getattr(matcher, "warnings", []) or []:
                 print(f"[box][WARN] {w}")
             records.append(rec)

@@ -55,6 +55,16 @@ class DPConfig:
     tier_nn_k: int = 1                 # reward the k clean clips nearest the command by velocity
                                        # (k=1 = the single best-matching "waypoint" trajectory);
                                        # velocity ties broken toward the stillest clip.
+    # Ground/elevation penalty.  The descriptors are HEIGHT-BLIND (trajectory = relative Δxy, pose =
+    # feet relative to the pelvis), so a "walking/standing ON A BOX" frame is descriptor-identical to
+    # walking on the ground -- a ``come_up_50cm_box`` lead-in can leak an on-the-box (airborne) segment
+    # into a flat run-up for free.  This penalizes candidates whose pelvis is above ``max_pelvis_z``
+    # over the DP's ground.  ``ground_z`` is that ground height: 0 for the flat approach/exit; a future
+    # terrain-aware DP can pass the terrain surface so the SAME term is correct on stairs/boxes (a
+    # legitimately-elevated pose over its own terrain is then NOT penalized).  w_ground=0 -> off.
+    w_ground: float = 0.0
+    ground_z: float = 0.0
+    max_pelvis_z: float = 0.95         # pelvis-above-ground ceiling (standing ~0.78, running bounce ~0.9)
     dt: float = 0.02
 
 
@@ -78,6 +88,10 @@ class DPMatcher(VanillaMatcher):
         self._traj_w = np.array([w for _ in vcfg.traj_times_s
                                  for w in (w_pos, w_pos, w_dir, w_dir)], dtype=np.float64)
         self._tier_np = self._tier.cpu().numpy().astype(np.int64)   # [N] STEADY/VARIED (from sources)
+        self._pelvis_z = self.root_pos[:, 2].detach().cpu().numpy().astype(np.float64)  # [N] abs pelvis height
+        self._mc_scale = None                                       # [T] per-step tracking-cost scale (transition window)
+        self._boundary_pin = None                                   # [N] per-frame boundary distance (approach funnel)
+        self._pin_scale = None                                      # [T] weight ramping the pin up over the window
         self._regime = None                                         # [T] set in _prepare when w_tier!=0
         self._tier_rewarded = None                                  # [T,C] set in _prepare when w_tier!=0
         self.warnings: list[str] = []
@@ -118,6 +132,8 @@ class DPMatcher(VanillaMatcher):
         if dc.w_tier != 0.0 and self._tier_rewarded is not None:
             reward = self._tier_rewarded[t][self._owner_np[frames]]           # 1 = velocity-nearest clean
             cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
+        if dc.w_ground != 0.0:
+            cost = cost + dc.w_ground * np.maximum(0.0, self._pelvis_z[frames] - dc.ground_z - dc.max_pelvis_z)
         return cost
 
     def _precompute_ABC(self) -> None:
@@ -203,16 +219,25 @@ class DPMatcher(VanillaMatcher):
         Velocity uses the fast A/B/C form (exact gather near command boundaries); trajectory is a
         direct ``[N,traj_dim]`` compare (no window, no pose term -- the graph handles pose)."""
         dc = self.dcfg
-        cost = 0.0
+        track = 0.0
         if dc.w_track != 0.0:
-            cost = cost + (self._mc_from_g(self._target[t]) if self._constant_window[t]
-                           else self._match_cost_all_exact(t))
+            track = track + (self._mc_from_g(self._target[t]) if self._constant_window[t]
+                             else self._match_cost_all_exact(t))
         if dc.w_traj != 0.0:
             d = self._traj_feat - self._dtraj[t]                    # [N, traj_dim]
-            cost = cost + dc.w_traj * (d * d * self._traj_w).sum(1)
+            track = track + dc.w_traj * (d * d * self._traj_w).sum(1)
+        # Transition window: ramp the command-tracking weight down (``_mc_scale``) and the terrain-entry
+        # pin up (``_pin_scale``) over the last frames, so the DP smoothly transitions from tracking the
+        # steady approach to funnelling into the pinned entry -- a distributed pin (not just at the
+        # terminal) gives the deceleration ROOM (a terminal-only pin makes it run then hard-stop).
+        cost = track if self._mc_scale is None else (float(self._mc_scale[t]) * track)
+        if self._boundary_pin is not None:
+            cost = cost + float(self._pin_scale[t]) * self._boundary_pin
         if dc.w_tier != 0.0 and self._tier_rewarded is not None:
             reward = self._tier_rewarded[t][self._owner_np]        # [N] 1 = velocity-nearest clean clip
             cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
+        if dc.w_ground != 0.0:
+            cost = cost + dc.w_ground * np.maximum(0.0, self._pelvis_z - dc.ground_z - dc.max_pelvis_z)
         return cost
 
     def _prepare(self, command, T: int) -> None:
@@ -227,14 +252,12 @@ class DPMatcher(VanillaMatcher):
             self._tier_rewarded = self._precompute_tier_nn(self._target, self.dcfg.tier_nn_k)
 
     # ---- the exact backward DP -------------------------------------------------------
-    def _dp_backward(self, T: int, terminal_cost: np.ndarray | None = None):
+    def _dp_backward(self, T: int):
         """Backward pass -> action table ``A_act[N,T]`` (0=continue, else 1+jump-slot); also
         sets ``self._V0`` = cost-to-go from the start layer.
 
-        ``terminal_cost[N]`` (optional) is ADDED to the terminal layer ``V[:, T-1]`` -- the
-        approach DP passes the terrain-entry boundary cost here so the optimal path ENDS at
-        (the frame closest to) the terrain entry state (the "start at the terrain bit, work
-        backwards" pin).  ``None`` = the ordinary command-only terminal."""
+        The terrain-entry pin (``self._boundary_pin`` weighted by ``self._pin_scale``) is folded
+        into ``mc(f, t)`` in :meth:`_match_cost_all`, so the terminal layer already carries it."""
         N = self._bvel.shape[0]
         cut = self.dcfg.cut_penalty
         cand, jc, nxt = self._cand, self._jcost, self._next
@@ -243,9 +266,7 @@ class DPMatcher(VanillaMatcher):
         action = np.zeros((N, T), dtype=np.int16)            # 1+k <= 1+k_max; int16 headroom
         idxN = np.arange(N)
 
-        V_next = self._match_cost_all(T - 1)                 # V[:, T-1]
-        if terminal_cost is not None:
-            V_next = V_next + np.asarray(terminal_cost, dtype=np.float64)
+        V_next = self._match_cost_all(T - 1)                 # V[:, T-1] (incl. the terminal pin)
         for t in range(T - 2, -1, -1):
             Vc = np.where(has_cont, V_next[safe_next], np.inf)          # continue value
             Vj_all = V_next[cand] + jc + cut                           # [N,K] (inf slots stay inf)
@@ -290,18 +311,30 @@ class DPMatcher(VanillaMatcher):
         return path, jumped
 
     def generate(self, command, T: int, debug: bool = False,
-                 terminal_cost: np.ndarray | None = None, start_frame: int | None = None):
+                 boundary_pin: np.ndarray | None = None, start_frame: int | None = None,
+                 relax_tail: int = 0):
         """Exact backward-DP match against ``command`` then play the optimal path.
 
-        ``terminal_cost`` pins the terminal layer (approach: end at the terrain entry);
-        ``start_frame`` overrides the reconstruction start (exit: begin at the terrain exit).
-        The chosen frame path is stashed on ``self.frame_path`` for the splice/handoff.
+        ``boundary_pin[N]`` (per-frame terrain-entry distance) pins the approach onto the entry.
+        With ``relax_tail>0`` the command-tracking ramps DOWN and the pin ramps UP over the last
+        ``relax_tail`` frames (a distributed pin = smooth transition); with ``relax_tail=0`` the pin
+        applies only at the terminal frame.  ``start_frame`` overrides the reconstruction start
+        (exit: begin at the terrain exit).  The chosen frame path is stashed on ``self.frame_path``.
         Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
         if self.graph is None:
             raise RuntimeError("DPMatcher.generate called before a candidate graph was attached.")
         self.warnings = []
         self._prepare(command, T)
-        action = self._dp_backward(T, terminal_cost=terminal_cost)
+        self._boundary_pin = None if boundary_pin is None else np.asarray(boundary_pin, dtype=np.float64)
+        self._mc_scale = np.ones(T)
+        self._pin_scale = np.zeros(T)
+        if relax_tail > 0:                                   # transition window: track down, pin up
+            tt = np.arange(T)
+            self._mc_scale = np.clip((T - 1 - tt) / float(max(1, relax_tail)), 0.0, 1.0)
+            self._pin_scale = 1.0 - self._mc_scale
+        elif self._boundary_pin is not None:                 # terminal-only pin (no window)
+            self._pin_scale[T - 1] = 1.0
+        action = self._dp_backward(T)
         start = int(self._stationary if start_frame is None else start_frame)
         if not np.isfinite(self._V0[start]):
             raise RuntimeError("DP found no finite-cost path from the start frame.")
@@ -313,16 +346,22 @@ class DPMatcher(VanillaMatcher):
         return root_pos, root_quat, joints
 
     # ---- boundary-value entry points (approach into / exit out of a played terrain segment) ----
-    def generate_approach(self, command, T: int, entry_desc: np.ndarray,
-                          boundary_weight: float = 50.0, debug: bool = False):
-        """Approach DP: track ``command`` and END at the terrain ENTRY state (backward pin).
+    def generate_approach(self, command, T: int, entry_descs: np.ndarray,
+                          boundary_weight: float = 50.0, debug: bool = False, relax_tail: int = 0):
+        """Approach DP: track ``command`` and END at the NEAREST of the allowed terrain ENTRY frames.
 
-        ``entry_desc`` is the terrain clip's entry descriptor (see
-        :meth:`VanillaMatcher.boundary_descriptors`).  ``boundary_weight`` scales the terminal
-        pin relative to the per-step match cost; large -> the last frame is forced onto the
-        entry-nearest frame so the played interior splices on cleanly."""
-        terminal = boundary_weight * self.boundary_cost(entry_desc)
-        return self.generate(command, T, debug=debug, terminal_cost=terminal)
+        ``entry_descs`` is ``[K, dim]`` (or a single ``[dim]``) -- the allowed entry-frame
+        descriptors (see :meth:`VanillaMatcher.entry_descriptors`).  The terminal is pinned to the
+        cheapest-to-reach one, so a faster run-up merges into a later (moving) entry frame instead of
+        being forced to a full stop at frame 0.  The matched entry-frame INDEX is stored on
+        ``self.matched_entry`` -- the caller plays the terrain interaction FROM that frame."""
+        descs = np.atleast_2d(entry_descs)
+        pin = boundary_weight * self.boundary_cost_multi(descs)
+        out = self.generate(command, T, debug=debug, boundary_pin=pin, relax_tail=relax_tail)
+        last = int(self.frame_path[-1])
+        d = torch.as_tensor(descs, dtype=self._norm.dtype, device=self.device)
+        self.matched_entry = int(torch.cdist(self._norm[last:last + 1], d).argmin())
+        return out
 
     def generate_exit(self, command, T: int, exit_desc: np.ndarray, debug: bool = False):
         """Exit DP: START at the terrain EXIT state and track the resumed ``command`` forward."""
