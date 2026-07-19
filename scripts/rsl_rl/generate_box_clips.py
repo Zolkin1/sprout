@@ -207,13 +207,17 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     size_y = float(Wp[:, 1].max() - Wp[:, 1].min()) + args.footprint_margin
     manifest_entry = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y,
                       "overlays": overlays}
-    # target_vel: the ramped approach command over the approach frames, then the (near-zero)
-    # entry velocity through the played jump + hold.
+    # TWO-VELOCITY SPLIT (the RL command != the DP generation command). The DP RAMPS the command
+    # down (app_cmd) so the approach decelerates smoothly into the jump, but the RL-visible
+    # ``target_vel`` is HELD FORWARD at the approach speed through the approach AND jump -- so
+    # "velocity heading to 0" stays an unambiguous STOP signal and the policy learns "hold forward
+    # + box => jump" (not "decelerate => jump"); the DP's ramp lives only in the achieved motion
+    # (y/dy). The matching stop-before clips carry a target_vel that DOES ramp to 0. Only the on-box
+    # recovery reads 0 (arrived; the box is now behind/below in the scan, so this 0 is distinguishable
+    # from a stop BEFORE the box).
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
-    a0, a1 = bounds[0]
-    for f in range(a0, a1):
-        tvel[f, 0] = app_cmd(f * args.dt)[0]
-    # terrain + exit run at ~the played interaction's low entry speed (near 0 for a jump).
+    jump_end = bounds[1][1]                       # end of the played jump segment (approach + jump)
+    tvel[:jump_end, 0] = float(approach_vx)       # held forward; recovery stays 0 (stand on box)
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": tid, "n": T, "manifest": manifest_entry, "name": ts.name,
             "entry_frame": k, "n_terr": int(ts.n)}
