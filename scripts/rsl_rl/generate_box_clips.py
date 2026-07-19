@@ -193,6 +193,11 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
         contact[a:b] = ts.contact[k + 1:k + 1 + (b - a)].to(contact.dtype).to(dev)
 
     T = Wp.shape[0]
+    # Per-segment anchor: ONLY the box interaction (the jump) is world-pinned (BOX: y-free,
+    # x/z/yaw pinned to the box) so the arc lands on the fixed box; the lead-up AND recovery stay
+    # FLAT (ego) so the robot handles them as ordinary flat locomotion. The FLAT->BOX seam is a
+    # snap-in of the jump relative to the (perceived/fixed) box that the RL learns to absorb --
+    # matching deploy, where the FM places the jump from perception, not from a world-pinned path.
     amt = build_anchor_mask_t(T, bounds, [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT], device=dev)
 
     overlays = [{"kind": "box", "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],

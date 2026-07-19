@@ -526,15 +526,17 @@ def reset_on_terrain_motion_sequence(
         world_pos[is_flat, 0] = cell_center_flat[:, 0] - bbox_center[:, 0]
         world_pos[is_flat, 1] = cell_center_flat[:, 1] - bbox_center[:, 1]
 
-    # 3-5. Ego re-anchor (clip re-placement) is flat-only -- a terrain clip re-anchored
-    #      onto the robot root would decouple from the physical staircase. But the FM
-    #      SNAP (re-inference) event is emitted on ALL non-flat envs too (snap_mask), so
-    #      the FM still gets a training window on stairs: the stair clip stays
-    #      world-locked while the recorder marks the snap and the dataset ego-anchors the
-    #      recorded clip future to the robot base. Then compute + write the spawn.
+    # 3-5. Ego re-anchor (clip re-placement) applies to ALL envs -- the re-placement is
+    #      per-DOF MASKED (see MotionSequenceCommand._reanchor_clip_ids), so a terrain env
+    #      re-anchors only its FREE axes onto the robot while FIXED axes stay pinned to the
+    #      terrain cell: a stair clip snaps only y (keeping x/z/yaw on the treads), a box
+    #      clip follows its per-step mask (y-free-pinned approach/jump, ego recovery). So
+    #      terrain no longer detaches, and every env is partial-ego with probability
+    #      ego_frac. The FM snap still fires on ALL non-flat envs regardless (snap_mask), so
+    #      even a non-ego terrain env gets an FM training window. Then compute + write the spawn.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
-    ego_mask = is_flat & (torch.rand(k, device=device) < ego_frac)
-    snap_mask = ego_mask | ~is_flat  # flat: ego only; stair/transition: always snap
+    ego_mask = torch.rand(k, device=device) < ego_frac
+    snap_mask = ego_mask | ~is_flat  # non-flat: always snap (even when not ego this episode)
     _commit_clip_reset(
         cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask, snap_mask
     )

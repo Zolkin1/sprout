@@ -104,3 +104,32 @@ def test_gather_anchor_mask_per_clip():
     m = MotionClipManager(lib)
     got = m.gather_anchor_mask(torch.tensor([1, 2, 0]))
     assert got.tolist() == [_ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_FLAT]
+
+
+def test_gather_anchor_mask_at_step_broadcasts_per_clip():
+    """Without a per-step schedule, the step gather equals the per-clip mask at EVERY step."""
+    lib = _synthetic_lib(num_clips=3, T=10)
+    lib.anchor_mask = torch.tensor(
+        [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT], dtype=torch.uint8
+    )
+    m = MotionClipManager(lib)  # anchor_mask_t empty -> broadcast
+    clip_id = torch.tensor([1, 1, 0])
+    for step in (torch.tensor([0, 9, 4]), torch.tensor([3, 3, 3])):
+        got = m.gather_anchor_mask_at_step(clip_id, step)
+        assert got.tolist() == [_ANCHOR_MASK_STAIRS, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT]
+
+
+def test_gather_anchor_mask_at_step_varies_within_clip():
+    """A per-step schedule (box clip) is indexed by (clip_id, step): anchoring changes mid-clip."""
+    T = 10
+    lib = _synthetic_lib(num_clips=2, T=T)
+    # clip 0 = box: y-free-pinned (STAIRS==BOX==2) for the approach+jump, FLAT ego recovery.
+    amt = torch.empty(2, T, dtype=torch.uint8)
+    amt[0, :6] = _ANCHOR_MASK_STAIRS
+    amt[0, 6:] = _ANCHOR_MASK_FLAT
+    amt[1, :] = _ANCHOR_MASK_FLAT
+    lib.anchor_mask_t = amt
+    m = MotionClipManager(lib)
+    # same clip, different steps -> different mask (within-clip variation); other clip uniform.
+    got = m.gather_anchor_mask_at_step(torch.tensor([0, 0, 1]), torch.tensor([2, 8, 3]))
+    assert got.tolist() == [_ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_FLAT]

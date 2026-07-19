@@ -270,13 +270,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
           snap. On flat ``_snap_mask == _ego_mask``; on terrain it also covers the
           world-anchored stair/transition envs, so the FM gets stair windows too (the
           dataset ego-anchors the recorded clip future to the robot base at each snap).
-        * **Clip re-placement** (``_reanchor_clip_ids``): applied ONLY to ``_ego_mask``
-          envs on the tick -- recompute the placement (yaw + xy + z) so the clip's
-          current-step base coincides with the robot's measured root, keeping only the
-          clip's natural tilt (a receding-horizon reference). Snapping z matches the FM
-          deploy anchor (:meth:`FmTrackingCommand._run_fm`). Stair clips are NEVER in
-          ``_ego_mask`` (a re-placed stair clip would detach from its physical treads),
-          so they stay world-locked while still emitting a snap.
+        * **Clip re-placement** (``_reanchor_clip_ids``): applied to ``_ego_mask`` envs on
+          the tick -- recompute the placement so the FREE root DOFs of the clip's
+          CURRENT-STEP anchor mask coincide with the robot's measured root, while FIXED
+          DOFs stay pinned to the reset-time terrain-cell anchor. Because the re-placement
+          is per-DOF MASKED, terrain envs can be ego too: a stair clip re-places only its
+          free y onto the robot, keeping x/z/yaw locked to the treads (it no longer
+          detaches), and a box clip's mask varies per step (y-free-pinned approach/jump,
+          then ego recovery). So all envs may be partial-ego; the mask governs which axes
+          float. Snapping matches the FM deploy anchor (:meth:`FmTrackingCommand._run_fm`).
 
         Naturally idempotent across Isaac Lab's twice-per-step compute (same tick, masks,
         robot pose + clip step -> same flag + placement), so no once-per-step guard.
@@ -293,7 +295,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         The placement update shared by the cadence-based ego re-anchor
         (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
         re-anchor on a different schedule (e.g. the generator command re-anchoring
-        the clip on the FM's re-plan steps). Each clip's per-clip anchor mask decides
+        the clip on the FM's re-plan steps). Each clip's CURRENT-STEP anchor mask decides
         which root DOFs re-anchor onto the robot root (FREE) vs stay pinned to the
         clip's reset-time terrain-cell placement (FIXED); roll/pitch are always the
         clip's natural tilt. With the legacy mask (flat libraries pre-dating the mask)
@@ -311,7 +313,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
         world_pos, world_quat = ego_placement_masked(
             base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
-            anchor_mask=self.manager.gather_anchor_mask(self.clip_id[ids]),
+            anchor_mask=self.manager.gather_anchor_mask_at_step(self.clip_id[ids], self._step[ids]),
             cell_anchor_pos=self._reset_world_pos[ids],
             cell_anchor_yaw=self._reset_world_yaw[ids],
         )
