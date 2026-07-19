@@ -103,21 +103,23 @@ def cold_perceivable(heatmap: np.ndarray, perceivable: np.ndarray, max_count: in
 
 
 def place_boxes(cold: np.ndarray, box_xy: tuple[float, float], cell: float, origin: np.ndarray,
-                n_boxes: int, min_sep: float, order: np.ndarray | None = None) -> list[tuple[float, float]]:
+                n_boxes: int, min_sep: float, target: np.ndarray | None = None) -> list[tuple[float, float]]:
     """Place up to ``n_boxes`` axis-aligned boxes of full extent ``box_xy`` (m) into ``cold`` cells.
 
     A box may sit where its WHOLE footprint lands on cold cells (erode ``cold`` by the box
-    half-extent), and centers are greedily picked spread by at least ``min_sep`` (m). ``order`` (an
-    optional permutation of the candidate list, for run-to-run variety without a live RNG) reorders
-    the greedy pick; default = raster order. Returns ``(x, y)`` box-center world positions.
+    half-extent), and centers are greedily picked spread by at least ``min_sep`` (m). ``target``
+    (world xy) orders candidates by distance to it, nearest first -- pass the point the robot HEADS
+    toward (ahead of the path end) so boxes land where the motion is going, not at the raster corner.
+    Default (``None``) = raster order. Returns ``(x, y)`` box-center world positions.
     """
     half_i = int(np.ceil(box_xy[0] / 2.0 / cell))
     half_j = int(np.ceil(box_xy[1] / 2.0 / cell))
     se = np.ones((2 * half_i + 1, 2 * half_j + 1), dtype=bool)
     fit = ndimage.binary_erosion(cold, structure=se, border_value=0)   # centers where the box fits
     cand = np.argwhere(fit)
-    if order is not None and len(cand):
-        cand = cand[np.asarray(order)[: len(cand)]]
+    if target is not None and len(cand):
+        cxy = origin + cand * cell
+        cand = cand[np.argsort(((cxy - np.asarray(target, dtype=np.float64)) ** 2).sum(1))]
     sep2 = (min_sep / cell) ** 2
     chosen: list[tuple[int, int]] = []
     for i, j in cand:
@@ -132,7 +134,7 @@ def distractor_layout(body_pts: list[np.ndarray], pelvis_paths: list[np.ndarray]
                       cell: float, tile_margin: float, robot_radius: float,
                       scan_fwd_offset: float, scan_reach: float,
                       box_xy: tuple[float, float], n_boxes: int, min_sep: float,
-                      max_count: int = 0, order: np.ndarray | None = None):
+                      max_count: int = 0):
     """End-to-end for one clip GROUP -> box (x,y) centers in the shared cold+perceivable space.
 
     ``body_pts[c]`` = [P,2] feet+pelvis xy over clip ``c`` (occupancy); ``pelvis_paths[c]`` = [T,2]
@@ -152,5 +154,9 @@ def distractor_layout(body_pts: list[np.ndarray], pelvis_paths: list[np.ndarray]
     for pp in pelvis_paths:
         perc |= perceivable_grid(pp, origin, cell, shape, scan_fwd_offset, scan_reach)
     cold = cold_perceivable(heat, perc, max_count)
-    boxes = place_boxes(cold, box_xy, cell, origin, n_boxes, min_sep, order=order)
+    # Bias placement toward where the robot HEADS at the END (the stop point / corridor end / turn),
+    # looking scan_fwd_offset ahead -- so a box lands where the motion is going (e.g. AHEAD of the
+    # stop for a stop-before tile), not at the raster corner near the spawn.
+    tgt = np.mean([pp[-1] + scan_fwd_offset * _heading_tangent(pp)[-1] for pp in pelvis_paths], axis=0)
+    boxes = place_boxes(cold, box_xy, cell, origin, n_boxes, min_sep, target=tgt)
     return boxes, (origin, shape, heat, cold)
