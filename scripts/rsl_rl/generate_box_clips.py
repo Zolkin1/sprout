@@ -134,48 +134,53 @@ def _build_matcher(args, dev):
 
 
 def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
-    """One traversal: DP(approach @ approach_vx) + PLAY(ts) + exit -> (records dict) for padding."""
-    T_app = max(1, int(round(args.approach_s / args.dt)))
-    T_exit = max(1, int(round(args.recovery_s / args.dt)))
-    tail = max(1, int(round(args.approach_ramp_s / args.dt)))
-    # Allow the approach to hand off into ANY of the terrain clip's early frames (first
-    # ``entry_frac``), not just frame 0 -- a faster run-up can merge into a later moving frame
-    # when the clip HAS one (a standing jump only has frame 0, so it lands there).
-    entry_descs = matcher.entry_descriptors(ts, entry_frac=args.entry_frac)
-    _, exit_desc = matcher.boundary_descriptors(ts)
-    entry_vx = _entry_vx(ts, args.dt)       # the played interaction's start speed (ramp target)
+    """One box clip -> (records dict) for padding.
 
-    # Two ways to reach the pinned entry (see --transition):
-    #   ramp  = prescribe a velocity decel to the terrain clip's START speed and TRACK it
-    #           (relax_tail=0) -> a real stepping gait into the entry (default; least foot slide);
-    #   relax = hold the command + relax tracking near the terminal -> DP searches the transition
-    #           (smoother root velocity, but stitches jarring fast->slow cuts -> more foot slide).
-    if args.transition == "ramp":
-        app_cmd = _ramp_cmd(approach_vx, args.approach_s, args.approach_ramp_s, vx1=entry_vx)
-        ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
-                                               boundary_weight=args.boundary_weight, relax_tail=0)
+    ``--mode full`` (default): DP(approach @ approach_vx) + PLAY(ts) + exit -- the traversal.
+    ``--mode pure``: just PLAY(ts) from frame 0 -- the BARE interaction (spawn-at-box, world-pinned
+    BOX throughout), a small-fraction skill anchor that drills the core jump undiluted by a lead-in.
+    """
+    if args.mode == "pure":
+        k = 0
+        terr = (ts.root_pos.to(dev), ts.root_quat.to(dev), ts.joint_pos.to(dev))
+        segments, box_seg, seg_masks = [terr], 0, [_ANCHOR_MASK_BOX]
     else:
-        app_cmd = _steady_cmd(approach_vx)
-        ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
-                                               boundary_weight=args.boundary_weight, relax_tail=tail)
-    k = int(matcher.matched_entry)          # play the terrain interaction FROM the matched entry frame
-    terr = (ts.root_pos[k:].to(dev), ts.root_quat[k:].to(dev), ts.joint_pos[k:].to(dev))
-    # Interaction-aware exit: if the clip ends ELEVATED (jumped ONTO a box, no dismount in the
-    # played clip), HOLD the stand-on-box pose so the recovery doesn't float; otherwise (lands
-    # back on the ground) run a flat-locomotion recovery DP seeded from the exit state.
-    ended_elevated = float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15
-    if ended_elevated:
-        re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
-        qe = ts.root_quat[-1:].to(dev).repeat(T_exit, 1)
-        je = ts.joint_pos[-1:].to(dev).repeat(T_exit, 1)
-    else:
-        re, qe, je = matcher.generate_exit(_steady_cmd(entry_vx), T_exit, exit_desc)
+        T_app = max(1, int(round(args.approach_s / args.dt)))
+        T_exit = max(1, int(round(args.recovery_s / args.dt)))
+        tail = max(1, int(round(args.approach_ramp_s / args.dt)))
+        # Hand off into ANY of the terrain clip's first ``entry_frac`` frames (a faster run-up can
+        # merge into a later moving frame; a standing jump only has frame 0, so it lands there).
+        entry_descs = matcher.entry_descriptors(ts, entry_frac=args.entry_frac)
+        _, exit_desc = matcher.boundary_descriptors(ts)
+        entry_vx = _entry_vx(ts, args.dt)   # the played interaction's start speed (ramp target)
+        # --transition ramp (default): prescribe a velocity decel to entry_vx and TRACK it (real
+        # stepping gait into the entry, least foot slide); relax: hold the command + relax tracking.
+        if args.transition == "ramp":
+            app_cmd = _ramp_cmd(approach_vx, args.approach_s, args.approach_ramp_s, vx1=entry_vx)
+            ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
+                                                   boundary_weight=args.boundary_weight, relax_tail=0)
+        else:
+            app_cmd = _steady_cmd(approach_vx)
+            ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
+                                                   boundary_weight=args.boundary_weight, relax_tail=tail)
+        k = int(matcher.matched_entry)      # play the interaction FROM the matched entry frame
+        terr = (ts.root_pos[k:].to(dev), ts.root_quat[k:].to(dev), ts.joint_pos[k:].to(dev))
+        # Interaction-aware exit: ELEVATED end (jumped ONTO a box, no dismount) -> HOLD the
+        # stand-on-box pose; else run a flat recovery DP seeded from the exit state.
+        if float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15:
+            re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
+            qe = ts.root_quat[-1:].to(dev).repeat(T_exit, 1)
+            je = ts.joint_pos[-1:].to(dev).repeat(T_exit, 1)
+        else:
+            re, qe, je = matcher.generate_exit(_steady_cmd(entry_vx), T_exit, exit_desc)
+        segments, box_seg, seg_masks = ([(ra, qa, ja), terr, (re, qe, je)], 1,
+                                        [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT])
 
-    Wp, Wq, Wj, bounds, tfs = align_and_concat([(ra, qa, ja), terr, (re, qe, je)])
+    Wp, Wq, Wj, bounds, tfs = align_and_concat(segments)
 
     # The exported box geometry (in the terrain clip's own frame) glued to the played segment via
     # its splice transform -- this is where the CLIP says the box goes, not a heuristic.
-    gq_t, t_t = tfs[1]
+    gq_t, t_t = tfs[box_seg]
     boxes = transform_boxes(ts.terrain_meta["terrain"].get("boxes", []), gq_t, t_t)
     # Normalize the whole traversal (clip + boxes) so the terrain is axis-aligned (box yaw -> ~0):
     # the approach heading is arbitrary, and leaving it in yaws the box under the motion.
@@ -187,10 +192,12 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     Wp = Wp.clone(); Wp[:, 0] -= corner[0]; Wp[:, 1] -= corner[1]
 
     y, dy, contact = builder.build(Wp, Wq, Wj, args.dt)
-    # Splice the terrain segment's REAL exported foot contacts over the kinematic ones.
-    a, b = bounds[1]
+    # Splice the terrain segment's REAL exported foot contacts over the kinematic ones. Segment 0
+    # keeps its seam frame (offset k); later segments dropped theirs in align_and_concat (offset k+1).
+    a, b = bounds[box_seg]
+    c_off = k if box_seg == 0 else k + 1
     if ts.contact is not None:
-        contact[a:b] = ts.contact[k + 1:k + 1 + (b - a)].to(contact.dtype).to(dev)
+        contact[a:b] = ts.contact[c_off:c_off + (b - a)].to(contact.dtype).to(dev)
 
     T = Wp.shape[0]
     # Per-segment anchor: ONLY the box interaction (the jump) is world-pinned (BOX: y-free,
@@ -198,7 +205,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     # FLAT (ego) so the robot handles them as ordinary flat locomotion. The FLAT->BOX seam is a
     # snap-in of the jump relative to the (perceived/fixed) box that the RL learns to absorb --
     # matching deploy, where the FM places the jump from perception, not from a world-pinned path.
-    amt = build_anchor_mask_t(T, bounds, [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT], device=dev)
+    amt = build_anchor_mask_t(T, bounds, seg_masks, device=dev)
 
     overlays = [{"kind": "box", "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],
                  "size_xyz": [float(v) for v in b_["size"]], "base_z": float(b_["pos"][2] - b_["size"][2] / 2.0),
@@ -216,7 +223,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     # recovery reads 0 (arrived; the box is now behind/below in the scan, so this 0 is distinguishable
     # from a stop BEFORE the box).
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
-    jump_end = bounds[1][1]                       # end of the played jump segment (approach + jump)
+    jump_end = bounds[box_seg][1]                 # end of the played jump segment (approach + jump)
     tvel[:jump_end, 0] = float(approach_vx)       # held forward; recovery stays 0 (stand on box)
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": tid, "n": T, "manifest": manifest_entry, "name": ts.name,
@@ -236,7 +243,13 @@ def main() -> int:
     p.add_argument("--recovery-s", type=float, default=1.0, help="Exit/recovery (DP) duration (s).")
     p.add_argument("--approach-vels", default="0.0",
                    help="';'-separated approach forward speeds (m/s); one CLIP per (terrain x speed). "
-                        "e.g. '0.8;1.6;2.4;3.2' for walk->run run-ups into the jump.")
+                        "e.g. '0.8;1.6;2.4;3.2' for walk->run run-ups into the jump. In --mode pure "
+                        "the motion is identical across speeds (no approach); the speed only labels "
+                        "the held-forward target_vel (jump intent), so a few values give speed-invariance.")
+    p.add_argument("--mode", choices=["full", "pure"], default="full",
+                   help="'full' (default): DP(approach) + PLAY(jump) + recovery -- the traversal. "
+                        "'pure': just PLAY the bare interaction from frame 0 (spawn-at-box skill "
+                        "anchor, world-pinned BOX throughout, no lead-in / no walk-on-box).")
     p.add_argument("--approach-ramp-s", type=float, default=0.8,
                    help="Seconds over which the run-up decelerates to the jump entry speed "
                         "(--transition=ramp) or the tracking-relax window (--transition=relax).")
