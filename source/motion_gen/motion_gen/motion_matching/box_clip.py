@@ -96,14 +96,21 @@ def _quat_yaw_wxyz(theta: float) -> torch.Tensor:
 
 def yaw_normalize(root_pos: torch.Tensor, root_quat: torch.Tensor, boxes: list[dict],
                   ref_gq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
-    """Rotate the whole clip + its boxes about the world origin by ``-yaw(ref_gq)``.
+    """Rotate the whole clip + its boxes about the world origin so the TERRAIN is axis-aligned.
 
-    ``ref_gq`` is the played terrain segment's alignment quaternion, whose yaw is the arbitrary
-    approach heading the traversal ended up at.  Removing it makes the terrain **axis-aligned**
-    (box yaw -> ~0), matching the axis-aligned terrain-tile convention (and the axis-aligned
-    ``OverlayVolumeCfg`` / viewer) so the box isn't left rotated under the motion.
+    Since the DP builds backward from the (globally placed) terrain interaction, the terrain
+    GEOMETRY sets the frame: rotate so the box / tread yaw -> 0, and the rigidly-attached played
+    motion (and the DP approach spliced onto it) rotate with it.  This lands the treads axis-aligned
+    (width across world-y, depth/descent along world-x) so the descent falls on the anchor mask's
+    PINNED x-axis and the axis-aligned ``OverlayVolumeCfg`` / viewer render them correctly.
+
+    Aligning by the box yaw (not ``ref_gq``, the arbitrary approach/splice heading) is what fixes a
+    staircase: its treads carry a native world yaw (~-85 deg) that ``ref_gq`` does NOT cancel, which
+    left the tread slab rotated ~90 deg (long axis along the descent) and put the descent on the
+    y-free anchor axis.  ``ref_gq`` is the fallback heading when the clip carries no boxes.
     """
-    gq = _quat_yaw_wxyz(-_yaw_of(ref_gq)).to(root_pos.device)
+    ref_yaw = float(boxes[0]["yaw"]) if boxes else _yaw_of(ref_gq)
+    gq = _quat_yaw_wxyz(-ref_yaw).to(root_pos.device)
     n = root_pos.shape[0]
     rp = quat_apply(gq.unsqueeze(0).expand(n, 4), root_pos)
     rq = quat_mul(gq.unsqueeze(0).expand(n, 4), root_quat)

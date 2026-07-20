@@ -186,9 +186,19 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     # the approach heading is arbitrary, and leaving it in yaws the box under the motion.
     Wp, Wq, boxes = yaw_normalize(Wp, Wq, boxes, gq_t)
 
-    # Re-center to a local-corner frame (xy only; z is world/ground-relative) so the baked clip
-    # + its terrain geometry share the clip's local (0,0) corner, like the other terrain clips.
-    corner = torch.stack([Wp[:, 0].min(), Wp[:, 1].min()])
+    # Tile footprint = union of the clip PATH and the BOX footprint, with margin on ALL sides, so the
+    # box sits fully INSIDE the tile (not overhanging the void gap) and inset from the edges instead of
+    # jammed in the (0,0) corner. Re-center so the union-min sits ``footprint_margin`` inside the tile.
+    m = args.footprint_margin
+    if boxes:
+        bxy = torch.tensor([[float(b_["pos"][0]), float(b_["pos"][1])] for b_ in boxes])
+        bhf = torch.tensor([[float(b_["size"][0]) / 2.0, float(b_["size"][1]) / 2.0] for b_ in boxes])
+        box_lo, box_hi = (bxy - bhf).amin(0), (bxy + bhf).amax(0)
+    else:
+        box_lo, box_hi = Wp[:, :2].amin(0), Wp[:, :2].amax(0)
+    lo = torch.minimum(Wp[:, :2].amin(0), box_lo)
+    hi = torch.maximum(Wp[:, :2].amax(0), box_hi)
+    corner = lo - m                              # union-min -> margin inside the tile
     Wp = Wp.clone(); Wp[:, 0] -= corner[0]; Wp[:, 1] -= corner[1]
 
     y, dy, contact = builder.build(Wp, Wq, Wj, args.dt)
@@ -210,8 +220,8 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev):
     overlays = [{"kind": "box", "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],
                  "size_xyz": [float(v) for v in b_["size"]], "base_z": float(b_["pos"][2] - b_["size"][2] / 2.0),
                  "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
-    size_x = float(Wp[:, 0].max() - Wp[:, 0].min()) + args.footprint_margin
-    size_y = float(Wp[:, 1].max() - Wp[:, 1].min()) + args.footprint_margin
+    size_x = float(hi[0] - lo[0]) + 2 * m       # margin on BOTH sides (was one-sided)
+    size_y = float(hi[1] - lo[1]) + 2 * m
     manifest_entry = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y,
                       "overlays": overlays}
     # TWO-VELOCITY SPLIT (the RL command != the DP generation command). The DP RAMPS the command
@@ -289,7 +299,11 @@ def main() -> int:
     def _csv(s):
         return None if not s else [x.strip() for x in s.split(";") if x.strip()]
 
-    matcher = _build_matcher(args, dev)
+    # --mode pure plays the bare interaction (no approach/exit DP), so the candidate graph is unused:
+    # skip the expensive build (and the bones-cache load) entirely.
+    matcher = _build_matcher(args, dev) if args.mode == "full" else None
+    if matcher is None:
+        print("[box] --mode pure: skipping candidate-graph build (approach DP not used)")
     manager = MultiSkillManager(args.source, dev, env=None)
     builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)

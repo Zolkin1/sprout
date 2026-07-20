@@ -121,6 +121,7 @@ def sample_terrain_specs(
     nav_width_range: tuple[float, float],
     flat_width_margin: float,
     transition_length: float,
+    single_step_frac: float = 0.0,
 ) -> list[TerrainSpec]:
     """Sample per-terrain band chains for the terrain + transition sets.
 
@@ -132,15 +133,20 @@ def sample_terrain_specs(
     the robot spawns on the ambient ground right before the first riser and
     climbs).  ``transition`` uses >= 2 staircases separated by
     flat bands and is built to a FIXED total length ``transition_length``: the
-    staircases are sampled freely (varied step count) and the flat bands (lead-in
-    + inter-stair + top) absorb the remaining length, so every transition terrain
-    is the same size_x while the stairs still vary.  ``lead_in_range[0]`` /
-    ``inter_flat_range[0]`` / ``end_platform`` are the per-band flat FLOORS.
-    The lead-in (start platform) is additionally CLAMPED to ``lead_in_range``
-    ``[min, max]``: if the fixed-length fill would grow it past the max, the
-    excess is redistributed onto the other flat bands (inter-stair flats + top
-    platform) so the total stays ``transition_length``.  ``inter_flat_range[1]``
-    is still unused (inter-stair flats have no max).
+    staircases are sampled freely (varied step count) and the TOP platform absorbs
+    the remaining length, so every transition terrain is the same size_x while the
+    stairs still vary.  The lead-in (start platform) is sampled in ``lead_in_range``
+    ``[min, max]`` and the inter-stair flats in ``inter_flat_range`` ``[min, max]``
+    (so a flat between two staircases is always in that range -- the slack does NOT
+    pile onto them); the TOP platform (last ``flat_after``) takes whatever is left to
+    hit ``transition_length`` (floored at ``end_platform``).  If the sampled stairs +
+    flats overrun the fixed length, step counts are trimmed first (kept >=
+    ``num_steps_range[0]``), then the lead-in / inter-flat slack above their floors is
+    shaved -- inter-flats stay within ``inter_flat_range``.
+
+    ``single_step_frac`` of the transitions are SINGLE-STEP curbs: one staircase of
+    one riser with a flat lead-in and a long top platform (step up a curb, then walk),
+    for learning small step-ups independent of full staircases.
 
     ``width_range`` is the stair tread width ``(lo, hi)``: a fixed-width library
     has ``lo == hi`` (every terrain uses that width), a range library (a stair
@@ -174,45 +180,48 @@ def sample_terrain_specs(
         tid += 1
 
     min_lead, max_lead = lead_in_range
-    min_inter, min_end = inter_flat_range[0], end_platform
+    min_inter, max_inter = inter_flat_range
+    min_end = end_platform
     if max_lead < min_lead:
         raise ValueError(f"lead_in_range max {max_lead} < min {min_lead}")
+    if max_inter < min_inter:
+        raise ValueError(f"inter_flat_range max {max_inter} < min {min_inter}")
     nt_lo = max(2, num_transitions_range[0])                 # >= 2 staircases per transition
     nt_hi = max(nt_lo, num_transitions_range[1])
     for _ in range(n_transition):
         h, d = hd_grid[int(rng.integers(len(hd_grid)))]
-        n = int(rng.integers(nt_lo, nt_hi + 1))
-        # Flat floors: lead-in + (n-1) inter-stair + top platform.
-        min_flat_total = min_lead + (n - 1) * min_inter + min_end
-        max_total_steps = int((transition_length - min_flat_total) / d)
-        if max_total_steps < n * num_steps_range[0]:
-            raise ValueError(
-                f"--transition-length {transition_length:.2f}m too short for {n} staircases of "
-                f">= {num_steps_range[0]} steps at depth {d:.3f}m + flat floors ({min_flat_total:.2f}m)."
-            )
-        # Sample per-band step counts, then trim (from bands above the min) so the
-        # stairs + minimum flats fit the fixed length.
-        steps = [int(rng.integers(num_steps_range[0], num_steps_range[1] + 1)) for _ in range(n)]
-        while sum(steps) > max_total_steps:
+        if rng.random() < single_step_frac:
+            n, steps = 1, [1]                                # single-step curb: one riser + platform
+        else:
+            n = int(rng.integers(nt_lo, nt_hi + 1))
+            steps = [int(rng.integers(num_steps_range[0], num_steps_range[1] + 1)) for _ in range(n)]
+        # Lead-in + inter-stair flats are sampled IN their ranges; the TOP platform absorbs the slack
+        # to hit the fixed transition_length (so inter-stair flats stay bounded, not slack-inflated).
+        lead_in = float(rng.uniform(min_lead, max_lead))
+        inter = rng.uniform(min_inter, max_inter, size=max(0, n - 1))
+
+        def _end():                                          # top-platform length that fills to L
+            return transition_length - lead_in - float(sum(steps)) * d - float(inter.sum())
+
+        # If the draw overruns L, trim steps first (kept >= min), then shave lead-in / inter slack
+        # above their floors -- inter-flats stay within [min_inter, max_inter].
+        while _end() < min_end and any(s > num_steps_range[0] for s in steps):
             above = [i for i, s in enumerate(steps) if s > num_steps_range[0]]
             steps[above[int(rng.integers(len(above)))]] -= 1
-        # Distribute the leftover length across the n+1 flat bands (floors + slack).
-        flat_total = transition_length - sum(steps) * d
-        slack = flat_total - min_flat_total
-        w = rng.uniform(size=n + 1); w = w / w.sum()
-        extra = w * slack
-        lead_in = min_lead + extra[0]
-        # Clamp the lead-in (start platform) to [min_lead, max_lead]; push any
-        # excess onto the other flat bands (inter-stair + top) so the total stays
-        # == transition_length.  (min_lead is already the floor via `extra >= 0`.)
-        if lead_in > max_lead:
-            excess = lead_in - max_lead
-            lead_in = max_lead
-            rw = w[1:]
-            rw = rw / rw.sum() if rw.sum() > 0 else np.full(n, 1.0 / n)
-            extra[1:] = extra[1:] + excess * rw
+        if _end() < min_end:
+            over = min_end - _end()
+            slack = (lead_in - min_lead) + float((inter - min_inter).sum())
+            if slack > 1e-9:
+                fr = min(1.0, over / slack)
+                lead_in -= fr * (lead_in - min_lead)
+                inter = inter - fr * (inter - min_inter)
+        if _end() < min_end - 1e-6:
+            raise ValueError(
+                f"--transition-length {transition_length:.2f}m too short for {n} staircase(s) of "
+                f">= {num_steps_range[0]} steps at depth {d:.3f}m + flat floors."
+            )
         lead_in = float(lead_in)
-        flat_after = [float(min_inter + extra[1 + i]) for i in range(n - 1)] + [float(min_end + extra[n])]
+        flat_after = [float(x) for x in inter] + [float(_end())]
 
         nav_width = float(rng.uniform(*nav_width_range))
         off_max = max(0.0, nav_width / 2.0 - flat_width_margin)

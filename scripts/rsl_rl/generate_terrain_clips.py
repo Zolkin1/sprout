@@ -123,8 +123,8 @@ def main() -> int:
                         "skill. Only the flat batch has a free mix; terrain/transition are stairs / stairs+standing.")
     p.add_argument("--stair-skill", default=None, help="Stair skill subfolder name for the step-dim scan (default: the auto-detected terrain-aware skill).")
     p.add_argument("--stair-width-max", type=float, default=3.0, help="Upper bound (m) when the stair library declares terrain_width as an open range (e.g. {min: 1.0}); tread widths are sampled per terrain in [range_min, this].")
-    p.add_argument("--num-steps-min", type=int, default=4)
-    p.add_argument("--num-steps-max", type=int, default=8)
+    p.add_argument("--num-steps-min", type=int, default=2)
+    p.add_argument("--num-steps-max", type=int, default=7)
     p.add_argument("--lead-in-min", type=float, default=1.5, help="[transition] flat lead-in (start platform) FLOOR (m).")
     p.add_argument("--lead-in-max", type=float, default=4.0, help="[transition] flat lead-in (start platform) CAP (m); excess slack is redistributed to the other flat bands.")
     p.add_argument("--end-platform", type=float, default=1.0, help="[transition] top-platform FLOOR after the last staircase (m), at exit_z.")
@@ -133,8 +133,9 @@ def main() -> int:
     p.add_argument("--transition-length", type=float, default=16.0, help="[transition] FIXED total length (m) of every transition terrain; flats absorb the slack.")
     p.add_argument("--num-transitions-min", type=int, default=2, help="[transition] min staircases per terrain (floored at 2).")
     p.add_argument("--num-transitions-max", type=int, default=3, help="[transition] max staircases per terrain.")
-    p.add_argument("--inter-flat-min", type=float, default=3.0, help="[transition] inter-stair flat FLOOR (m); absorbs slack to hit --transition-length.")
-    p.add_argument("--inter-flat-max", type=float, default=5.0, help="[transition] ignored — inter-stair flats are set by the fixed-length fill.")
+    p.add_argument("--inter-flat-min", type=float, default=3.0, help="[transition] inter-stair flat MIN (m); each inter-stair flat is sampled in [min, max].")
+    p.add_argument("--inter-flat-max", type=float, default=5.0, help="[transition] inter-stair flat MAX (m); the TOP platform (not the inter-flats) absorbs the fixed-length slack.")
+    p.add_argument("--single-step-frac", type=float, default=0.1, help="[transition] fraction built as a SINGLE-STEP curb (one riser + long platform) for curb-height step-ups.")
     p.add_argument("--nav-width-min", type=float, default=1.5, help="[transition] min corridor width (m); the flat bands span this, stairs are centered narrower.")
     p.add_argument("--nav-width-max", type=float, default=3.0, help="[transition] max corridor width (m).")
     p.add_argument("--flat-width-margin", type=float, default=0.5, help="[transition] keep the spawn corner this far (m) from the corridor y-edge.")
@@ -289,6 +290,7 @@ def main() -> int:
             nav_width_range=(args.nav_width_min, args.nav_width_max),
             flat_width_margin=args.flat_width_margin,
             transition_length=args.transition_length,
+            single_step_frac=args.single_step_frac,
         )
 
     # One generator; its sampler is swapped per batch and terrain context bound
