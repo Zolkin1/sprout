@@ -8,6 +8,11 @@ import numpy as np
 import torch
 import trimesh
 
+from robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair_decor_cfg import (
+    StairDecorCfg,
+    StairSideDecorCfg,
+)
+
 if TYPE_CHECKING:
     from robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair_cfg import (
         MeshXStairsDownTerrainCfg,
@@ -49,10 +54,73 @@ def _make_project_fn(stair_top_centers: torch.Tensor, step_depth: float, num_ste
     return project
 
 
-def _add_walls(
+def _resolve_decor(cfg) -> StairDecorCfg:
+    """Return the explicit, deterministic decoration for a staircase span.
+
+    If ``cfg.decor`` is set (the offline clip pipeline), it is used **verbatim** and
+    no random numbers are drawn -- so the generator, the RL importer, and the viewers
+    all rebuild identical geometry.  Otherwise the legacy probability fields
+    (``float_prob`` / ``wall_prob`` / ``pole_prob`` + the thickness/height/spacing
+    ranges) are sampled **once** into a :class:`StairDecorCfg`, now with independent
+    per-side decoration (the old mutually-exclusive wall/pole coin flip is preserved
+    for the legacy path, but expressed as resolved left/right sides).
+
+    Args:
+        cfg: A stair cfg (``StairBlockCfg`` / ``MeshXStairsUpTerrainCfg``) or any
+            object exposing the decoration fields.
+
+    Returns:
+        The resolved :class:`StairDecorCfg`.
+    """
+    existing = getattr(cfg, "decor", None)
+    if existing is not None:
+        return existing
+
+    float_prob = float(getattr(cfg, "float_prob", 0.0))
+    is_floating = np.random.random() < float_prob
+    float_thickness = (
+        float(np.random.uniform(*getattr(cfg, "float_thick_range", (0.025, 0.075))))
+        if is_floating else 0.0
+    )
+
+    def _side(kind: str) -> StairSideDecorCfg:
+        if kind == "wall":
+            return StairSideDecorCfg(
+                kind="wall",
+                thickness=float(getattr(cfg, "wall_thickness", 0.1)),
+                height=float(getattr(cfg, "wall_height", 1.5)),
+            )
+        if kind == "posts":
+            return StairSideDecorCfg(
+                kind="posts",
+                thickness=float(np.random.uniform(*getattr(cfg, "pole_thickness_range", (0.05, 0.15)))),
+                height=float(getattr(cfg, "pole_height", 1.5)),
+                spacing=float(np.random.uniform(*getattr(cfg, "pole_spacing_range", (0.3, 0.8)))),
+            )
+        return StairSideDecorCfg(kind="none")
+
+    left_kind = right_kind = "none"
+    if np.random.random() < float(getattr(cfg, "wall_prob", 0.0)):
+        kind = "posts" if np.random.random() < float(getattr(cfg, "pole_prob", 0.0)) else "wall"
+        if np.random.random() < 0.5:            # both sides
+            left_kind = right_kind = kind
+        elif np.random.random() < 0.5:          # one random side
+            left_kind = kind
+        else:
+            right_kind = kind
+
+    return StairDecorCfg(
+        float_thickness=float_thickness,
+        left=_side(left_kind),
+        right=_side(right_kind),
+    )
+
+
+def _add_wall_one_side(
     meshes: list[trimesh.Trimesh],
-    cfg,
+    side: StairSideDecorCfg,
     *,
+    left: bool,
     size_x: float,
     x_offset: float,
     y_center: float,
@@ -61,29 +129,86 @@ def _add_walls(
     z_min: float,
     step_height: float,
 ) -> None:
-    """Append solid sidewall boxes to ``meshes`` (full stair length)."""
+    """Append one solid full-length sidewall box to ``meshes`` (deterministic)."""
     wall_z_bot = z_min - step_height
-    wall_z_top = z_max + cfg.wall_height
+    wall_z_top = z_max + float(side.height)
     wall_h = wall_z_top - wall_z_bot
     wall_cz = (wall_z_top + wall_z_bot) / 2.0
-
-    def make_one(left: bool) -> None:
-        sgn = -1.0 if left else 1.0
-        cy = y_center + sgn * (stair_width / 2.0 + cfg.wall_thickness / 2.0)
-        dims = (size_x, cfg.wall_thickness, wall_h)
-        pos = (x_offset + size_x / 2.0, cy, wall_cz)
-        meshes.append(trimesh.creation.box(dims, trimesh.transformations.translation_matrix(pos)))
-
-    if np.random.random() < 0.5:
-        make_one(True)
-        make_one(False)
-    else:
-        make_one(np.random.random() < 0.5)
+    sgn = -1.0 if left else 1.0
+    cy = y_center + sgn * (stair_width / 2.0 + float(side.thickness) / 2.0)
+    dims = (size_x, float(side.thickness), wall_h)
+    pos = (x_offset + size_x / 2.0, cy, wall_cz)
+    meshes.append(trimesh.creation.box(dims, trimesh.transformations.translation_matrix(pos)))
 
 
-def _add_poles(
+def _add_posts_one_side(
     meshes: list[trimesh.Trimesh],
-    cfg,
+    side: StairSideDecorCfg,
+    *,
+    left: bool,
+    size_x: float,
+    x_offset: float,
+    y_center: float,
+    stair_width: float,
+    z_max: float,
+    z_min: float,
+    step_height: float,
+) -> None:
+    """March uniform vertical railing posts along one stair edge (deterministic)."""
+    thickness = float(side.thickness)
+    spacing = float(side.spacing)
+    if thickness <= _LAYOUT_TOL:
+        return
+    pole_z_bot = z_min - step_height
+    pole_z_top = z_max + float(side.height)
+    pole_h = pole_z_top - pole_z_bot
+    pole_cz = (pole_z_top + pole_z_bot) / 2.0
+    sgn = -1.0 if left else 1.0
+    cy = y_center + sgn * (stair_width / 2.0 + thickness / 2.0)
+    current_x = 0.0
+    while current_x + thickness <= size_x + _LAYOUT_TOL:
+        cx = x_offset + current_x + thickness / 2.0
+        dims = (thickness, thickness, pole_h)
+        pos = (cx, cy, pole_cz)
+        meshes.append(trimesh.creation.box(dims, trimesh.transformations.translation_matrix(pos)))
+        current_x += thickness + spacing
+
+
+def _rounded_nosing(
+    front_x: float,
+    y_center: float,
+    top_z: float,
+    width: float,
+    radius: float,
+    segments: int,
+    step_height: float,
+    step_depth: float,
+) -> trimesh.Trimesh | None:
+    """Build a rounded (bull-nose) lip along a tread's leading top edge.
+
+    A cylinder (axis along y, spanning the tread width) sits with its top flush at
+    ``top_z`` and its axis over the tread's leading edge ``front_x``, so it rounds the
+    top-front corner (protruding forward of the riser by ``radius`` and blending back
+    into the tread).  No CSG -- the cylinder simply overlaps the tread box.  The
+    radius is clamped to ``<= min(step_height, step_depth) / 2`` so the lip stays
+    within the riser and never reaches the neighbouring tread.
+
+    Returns ``None`` if the clamped radius is negligible.
+    """
+    r = min(float(radius), 0.5 * min(float(step_height), float(step_depth)))
+    if r <= _LAYOUT_TOL:
+        return None
+    sections = max(6, 2 * int(segments))
+    cyl = trimesh.creation.cylinder(radius=r, height=float(width), sections=sections)
+    # trimesh cylinders are built along +z; rotate so the axis runs along y.
+    cyl.apply_transform(trimesh.transformations.rotation_matrix(np.pi / 2.0, (1.0, 0.0, 0.0)))
+    cyl.apply_translation((float(front_x), float(y_center), float(top_z) - r))
+    return cyl
+
+
+def _apply_decor(
+    meshes: list[trimesh.Trimesh],
+    decor: StairDecorCfg,
     *,
     size_x: float,
     x_offset: float,
@@ -93,34 +218,16 @@ def _add_poles(
     z_min: float,
     step_height: float,
 ) -> None:
-    """Append vertical pole pillars along the stair edges."""
-    pole_z_bot = z_min - step_height
-    pole_z_top = z_max + cfg.pole_height
-    pole_h = pole_z_top - pole_z_bot
-    pole_cz = (pole_z_top + pole_z_bot) / 2.0
-
-    def march(left: bool) -> None:
-        sgn = -1.0 if left else 1.0
-        current_x = 0.0
-        while current_x < size_x:
-            thickness = float(np.random.uniform(*cfg.pole_thickness_range))
-            spacing = float(np.random.uniform(*cfg.pole_spacing_range))
-            if current_x + thickness > size_x:
-                break
-            cx = x_offset + current_x + thickness / 2.0
-            cy = y_center + sgn * (stair_width / 2.0 + thickness / 2.0)
-            dims = (thickness, thickness, pole_h)
-            pos = (cx, cy, pole_cz)
-            meshes.append(
-                trimesh.creation.box(dims, trimesh.transformations.translation_matrix(pos))
-            )
-            current_x += thickness + spacing
-
-    if np.random.random() < 0.5:
-        march(True)
-        march(False)
-    else:
-        march(np.random.random() < 0.5)
+    """Render both sides' decoration onto ``meshes`` (deterministic; no RNG)."""
+    kw = dict(
+        size_x=size_x, x_offset=x_offset, y_center=y_center, stair_width=stair_width,
+        z_max=z_max, z_min=z_min, step_height=step_height,
+    )
+    for side, is_left in ((decor.left, True), (decor.right, False)):
+        if side.kind == "wall":
+            _add_wall_one_side(meshes, side, left=is_left, **kw)
+        elif side.kind == "posts":
+            _add_posts_one_side(meshes, side, left=is_left, **kw)
 
 
 def _build_stair_steps(
@@ -212,11 +319,12 @@ def _build_stair_steps(
         z_highest_top = half_range
     y_center = y_offset + size_y / 2.0
 
-    # 4. Floating treads vs solid step boxes.
-    is_floating = np.random.random() < cfg.float_prob
-    floating_thickness = (
-        float(np.random.uniform(*cfg.float_thick_range)) if is_floating else 0.0
-    )
+    # 4. Resolve decoration (floating / per-side walls-or-posts / nosing).  When
+    # ``cfg.decor`` is set this is deterministic (offline clip path); otherwise it
+    # is sampled once from the cfg probabilities (online / legacy path).
+    decor = _resolve_decor(cfg)
+    is_floating = decor.float_thickness > 0.0
+    floating_thickness = float(decor.float_thickness)
 
     meshes: list[trimesh.Trimesh] = []
     stair_top_centers = np.zeros((num_steps, 3), dtype=np.float32)
@@ -254,8 +362,21 @@ def _build_stair_steps(
             trimesh.creation.box(dims, trimesh.transformations.translation_matrix((cx, cy, cz)))
         )
 
-    # 5. Walls / poles (mutually exclusive — wall takes priority).
-    wall_kwargs = dict(
+        # Rounded leading nosing on this tread (the exposed top-front edge over the
+        # riser): -x edge for an up-stair, +x edge for a down-stair.
+        if decor.nosing_radius > 0.0:
+            front_x = (cx - this_depth / 2.0) if going_up else (cx + this_depth / 2.0)
+            nose = _rounded_nosing(
+                front_x, cy, top_z, stair_width, decor.nosing_radius,
+                decor.nosing_segments, step_height, this_depth,
+            )
+            if nose is not None:
+                meshes.append(nose)
+
+    # 5. Per-side decoration (independent walls / posts / none on each side).
+    _apply_decor(
+        meshes,
+        decor,
         size_x=size_x,
         x_offset=x_offset,
         y_center=y_center,
@@ -264,11 +385,6 @@ def _build_stair_steps(
         z_min=z_lowest_top,
         step_height=step_height,
     )
-    if np.random.random() < cfg.wall_prob:
-        if np.random.random() < cfg.pole_prob:
-            _add_poles(meshes, cfg, **wall_kwargs)
-        else:
-            _add_walls(meshes, cfg, **wall_kwargs)
 
     return (
         meshes,

@@ -44,6 +44,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.flat import FlatBlock
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.stair import StairBlockCfg
 
 from motion_gen.clips.offline_clip_generator import OfflineClipGenerator
+from motion_gen.motion_matching.terrain_variants import resolve_stair_decor
 from .offline_stair_projector import make_offline_stair_projector, make_offline_multi_stair_projector
 
 # Small x-clearance placing the nav goal before the far edge (m).
@@ -64,6 +65,7 @@ class TerrainSpec:
     flat_after: list[float]        # flat band length after each stair band (last = top platform)
     nav_width: float               # corridor width in y (transition nav); == width for terrain-only
     spawn_y_offset: float          # signed lateral spawn offset from centerline (transition turn)
+    stair_decor: list[dict] = field(default_factory=list)  # resolved decor per stair band (aligned w/ stair_steps)
 
 
 @dataclass
@@ -122,6 +124,7 @@ def sample_terrain_specs(
     flat_width_margin: float,
     transition_length: float,
     single_step_frac: float = 0.0,
+    decor_params: dict | None = None,
 ) -> list[TerrainSpec]:
     """Sample per-terrain band chains for the terrain + transition sets.
 
@@ -159,6 +162,17 @@ def sample_terrain_specs(
     tid = 0
     w_lo, w_hi = float(width_range[0]), float(width_range[1])
 
+    # Stair decoration (floating / walls / posts / nosing).  Only draw when a knob is
+    # actually on, so an all-zero spec consumes NO rng and reproduces prior libraries
+    # byte-for-byte.  When enabled, resolve one decor dict per stair band.
+    _dp = decor_params or {}
+    _decor_on = any(float(_dp.get(k, 0.0)) > 0.0 for k in
+                    ("float_frac", "side_wall_frac", "side_posts_frac", "nosing_frac"))
+
+    def _decor(n_bands: int) -> list[dict]:
+        """Resolve ``n_bands`` stair-decor dicts (empty when decor is disabled)."""
+        return [resolve_stair_decor(rng, **_dp) for _ in range(n_bands)] if _decor_on else []
+
     def _sample_width(cap: float | None = None) -> float:
         """Uniform tread width in the range (fixed when lo == hi), capped."""
         hi = w_hi if cap is None else min(w_hi, cap)
@@ -175,7 +189,7 @@ def sample_terrain_specs(
         specs.append(TerrainSpec(
             terrain_id=tid, ttype="terrain", step_height=float(h), step_depth=float(d),
             width=w, lead_in=0.0, stair_steps=[ns], flat_after=[0.0],
-            nav_width=w, spawn_y_offset=0.0,
+            nav_width=w, spawn_y_offset=0.0, stair_decor=_decor(1),
         ))
         tid += 1
 
@@ -228,10 +242,11 @@ def sample_terrain_specs(
         # Tread width sampled in the range, capped at this corridor so the
         # stairs stay within the flat corridor leading up to them.
         tread_w = _sample_width(cap=nav_width)
+        spawn_y_offset = float(rng.uniform(-off_max, off_max))
         specs.append(TerrainSpec(
             terrain_id=tid, ttype="transition", step_height=float(h), step_depth=float(d),
             width=tread_w, lead_in=lead_in, stair_steps=steps, flat_after=flat_after,
-            nav_width=nav_width, spawn_y_offset=float(rng.uniform(-off_max, off_max)),
+            nav_width=nav_width, spawn_y_offset=spawn_y_offset, stair_decor=_decor(len(steps)),
         ))
         tid += 1
     return specs
@@ -326,12 +341,19 @@ def build_terrain(spec: TerrainSpec, geom_seed: int, device, size_y_floor: float
     # Manifest: all bands (for viser meshes) + nav goal; legacy band-0 stair
     # keys kept for backward-compatible readers (plots / old viz).
     band_meta = []
+    stair_band_i = 0
     for b in meta["blocks"]:
         entry = {"block_type": b["block_type"], "aabb": list(b["aabb"]),
                  "entry_z": float(b["entry_z"]), "exit_z": float(b["exit_z"])}
         if b["extras"].get("is_stair"):
             entry["stair_top_centers"] = b["extras"]["stair_top_centers"].cpu().tolist()
             entry["num_steps"] = int(b["extras"]["num_steps"])
+            # Resolved decoration for this stair band (deterministic; rebuilt by the
+            # importer + viewers).  Aligned with ``spec.stair_steps`` order; absent
+            # when decoration is disabled (=> bare solid stairs).
+            if stair_band_i < len(spec.stair_decor):
+                entry["decor"] = spec.stair_decor[stair_band_i]
+            stair_band_i += 1
         band_meta.append(entry)
     sb0 = spans[0]
     manifest = {

@@ -22,6 +22,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import (
     build_overlay,
     composite_terrain,
 )
+from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
     assemble_clip_terrain,
 )
@@ -108,3 +109,60 @@ def test_assemble_box_tile_from_manifest():
     bmin, bmax = mesh.bounds
     assert bmin[0] <= bx <= bmax[0]
     assert bmin[1] <= by <= bmax[1]
+
+
+# --- box support-structure variants (floating top / center leg / corner legs) ---
+
+def test_overlay_variant_top_z_invariant():
+    """Every variant keeps the walkable top + aabb of the equivalent solid box."""
+    size, pos, base_z = (0.6, 0.6, 0.4), (2.0, 2.0), 0.0
+    solid = build_overlay(OverlayVolumeCfg(size_xyz=size, pos_xy=pos, base_z=base_z, variant="solid"))
+    for variant in ("floating", "floating_center_leg", "floating_corner_legs"):
+        o = build_overlay(OverlayVolumeCfg(size_xyz=size, pos_xy=pos, base_z=base_z, variant=variant))
+        assert o.top_z == pytest.approx(solid.top_z)          # landing height unchanged
+        assert o.aabb == solid.aabb                            # bounding footprint x height unchanged
+        # The mesh top face reaches exactly top_z (the slab/box top).
+        assert float(o.mesh.bounds[1][2]) == pytest.approx(o.top_z)
+
+
+def test_overlay_sub_box_counts():
+    args = ("solid", (0.6, 0.6, 0.4), (0.0, 0.0), 0.0, 0.1, (0.1, 0.1), 0.05)
+    assert len(overlay_sub_boxes(*args)) == 1
+    assert len(overlay_sub_boxes("floating", *args[1:])) == 1
+    assert len(overlay_sub_boxes("floating_center_leg", *args[1:])) == 2
+    assert len(overlay_sub_boxes("floating_corner_legs", *args[1:])) == 5
+
+
+def test_overlay_floating_has_gap_below_slab():
+    """A floating box's mesh sits ONLY near the top (a thin slab), not down to base_z."""
+    o = build_overlay(OverlayVolumeCfg(size_xyz=(0.6, 0.6, 0.4), pos_xy=(0.0, 0.0),
+                                       base_z=0.0, variant="floating", slab_thickness=0.1))
+    zmin = float(o.mesh.bounds[0][2])
+    assert zmin == pytest.approx(0.3)                          # top_z (0.4) - slab (0.1); gap [0, 0.3) below
+
+
+def test_overlay_corner_legs_positions():
+    """Four legs sit inset from the footprint corners; slab spans the full top."""
+    subs = overlay_sub_boxes("floating_corner_legs", (1.0, 1.0, 0.5), (0.0, 0.0), 0.0, 0.1, (0.1, 0.1), 0.05)
+    legs = subs[1:]
+    assert len(legs) == 4
+    off = 1.0 / 2.0 - 0.05 - 0.1 / 2.0                          # 0.4
+    for cx, cy, _cz, _sx, _sy, _sz in legs:
+        assert abs(abs(cx) - off) < 1e-9 and abs(abs(cy) - off) < 1e-9
+
+
+def test_overlay_variant_round_trips_through_manifest():
+    """A variant overlay survives the composite metadata + assemble round-trip."""
+    sub = CompositeSubTerrainCfg(
+        size=(4.0, 4.0), blocks=[FlatBlockCfg(size_x=4.0, skill_probs=_FLAT)],
+        overlays=[OverlayVolumeCfg(size_xyz=(0.6, 0.6, 0.4), pos_xy=(2.0, 2.0),
+                                   variant="floating_corner_legs", slab_thickness=0.08,
+                                   leg_size=(0.09, 0.09), leg_inset=0.04)],
+    )
+    _meshes, _origin, meta = composite_terrain(0.0, sub)
+    ov = meta["overlays"][0]
+    assert ov["variant"] == "floating_corner_legs"
+    assert ov["slab_thickness"] == pytest.approx(0.08)
+    assert tuple(ov["leg_size"]) == pytest.approx((0.09, 0.09))
+    assert ov["leg_inset"] == pytest.approx(0.04)
+    assert ov["top_z"] == pytest.approx(0.4)

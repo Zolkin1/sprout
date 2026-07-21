@@ -140,6 +140,12 @@ def composite_terrain(
             "base_z": float(ov_cfg.base_z),
             "walkable_top": bool(ov.walkable_top),
             "top_z": float(ov.top_z),
+            # Support-structure variant + its geometry, so downstream renderers
+            # (colored overlay redraw, reset placement) can rebuild the sub-boxes.
+            "variant": str(ov_cfg.variant),
+            "slab_thickness": float(ov_cfg.slab_thickness),
+            "leg_size": (float(ov_cfg.leg_size[0]), float(ov_cfg.leg_size[1])),
+            "leg_inset": float(ov_cfg.leg_inset),
         })
 
     meta_data = {

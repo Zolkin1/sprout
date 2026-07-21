@@ -41,6 +41,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import (
     OverlayVolumeCfg,
     composite_terrain,
 )
+from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
     assemble_clip_terrain,
 )
@@ -67,20 +68,30 @@ def _add_mesh(server: viser.ViserServer, name: str, mesh: trimesh.Trimesh,
 
 def _add_overlay_boxes(server: viser.ViserServer, prefix: str,
                        overlays: list[dict], offset_xy: tuple[float, float]) -> None:
-    """Draw each overlay volume as a colour-coded solid box at world coords.
+    """Draw each overlay volume as colour-coded solid box(es) at world coords.
 
     ``overlays`` are the per-overlay metadata dicts emitted by
-    :func:`composite_terrain` (``pos_xy`` / ``size_xyz`` / ``base_z`` in the
-    tile's local frame); ``offset_xy`` shifts the tile's local origin into world.
+    :func:`composite_terrain` (``pos_xy`` / ``size_xyz`` / ``base_z`` / ``variant``
+    in the tile's local frame); ``offset_xy`` shifts the tile's local origin into
+    world.  Multi-part variants (floating top + support legs) are drawn as their
+    actual sub-boxes via the shared :func:`overlay_sub_boxes`, so the colored redraw
+    matches the grey mesh instead of painting one solid box over a floating one.
     """
     for j, ov in enumerate(overlays):
-        sx, sy, sz = (float(v) for v in ov["size_xyz"])
-        px, py = float(ov["pos_xy"][0]), float(ov["pos_xy"][1])
-        bz = float(ov["base_z"])
-        box = trimesh.creation.box(extents=(sx, sy, sz))
-        box.apply_translation((offset_xy[0] + px, offset_xy[1] + py, bz + sz / 2.0))
+        subs = overlay_sub_boxes(
+            str(ov.get("variant", "solid")),
+            tuple(float(v) for v in ov["size_xyz"]),
+            (float(ov["pos_xy"][0]), float(ov["pos_xy"][1])),
+            float(ov["base_z"]),
+            float(ov.get("slab_thickness", 0.1)),
+            tuple(ov.get("leg_size", (0.1, 0.1))),
+            float(ov.get("leg_inset", 0.05)),
+        )
         color = _KIND_COLOR.get(str(ov.get("kind", "box")), _GROUND_COLOR)
-        _add_mesh(server, f"{prefix}/overlay_{j}", box, color)
+        for k, (cx, cy, cz, sx, sy, sz) in enumerate(subs):
+            box = trimesh.creation.box(extents=(sx, sy, sz))
+            box.apply_translation((offset_xy[0] + cx, offset_xy[1] + cy, cz))
+            _add_mesh(server, f"{prefix}/overlay_{j}_{k}", box, color)
 
 
 def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int) -> trimesh.Trimesh:

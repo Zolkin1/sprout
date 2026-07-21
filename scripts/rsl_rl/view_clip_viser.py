@@ -36,6 +36,7 @@ from motion_gen.clips.clip_io import (
     load_clip_library,
 )
 from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
+from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 
 # Distinct colours (RGB 0-1) cycled across reference frames.
 _FRAME_COLORS = [
@@ -163,13 +164,49 @@ def _ramp(xmin, xmax, ymin, ymax, base_z, z_at_xmin, z_at_xmax) -> tuple[np.ndar
     return v, f
 
 
+def _stair_decor_boxes(b: dict, dims: dict, symin: float, symax: float) -> list[tuple]:
+    """Axis-aligned boxes for one stair band's decoration (walls / posts).
+
+    Mirrors the shared builder ``trimesh/stair.py`` (``_add_wall_one_side`` /
+    ``_add_posts_one_side``) so the viser view matches the sim collider: walls / posts
+    span ``[min_top - h, max_top + side.height]`` in z, sit just outside the tread
+    edge (``symin`` / ``symax``) in y, and posts march uniformly along x.
+    """
+    decor = b.get("decor") or {}
+    centers = np.array(b["stair_top_centers"], dtype=float)
+    if centers.size == 0:
+        return []
+    x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
+    h = float(dims["h"])
+    z_bot = float(centers[:, 2].min()) - h
+    boxes: list[tuple] = []
+    for side_key, is_left in (("left", True), ("right", False)):
+        side = decor.get(side_key) or {}
+        kind = side.get("kind", "none")
+        if kind == "none":
+            continue
+        th = float(side.get("thickness", 0.0))
+        z_top = float(centers[:, 2].max()) + float(side.get("height", 0.0))
+        y_lo, y_hi = (symin - th, symin) if is_left else (symax, symax + th)
+        if kind == "wall":
+            boxes.append((x0, x1, y_lo, y_hi, z_bot, z_top))
+        elif kind == "posts" and th > 1e-5:
+            sp = float(side.get("spacing", 0.0))
+            cur = 0.0
+            while cur + th <= (x1 - x0) + 1e-5:
+                boxes.append((x0 + cur, x0 + cur + th, y_lo, y_hi, z_bot, z_top))
+                cur += th + sp
+    return boxes
+
+
 def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     """Build a solid multi-band terrain mesh (verts, faces) from a manifest entry.
 
     Flat bands render as a full-corridor-width slab at their level; stair bands
-    render as solid tread pillars spanning the (narrower, centered) stair width;
-    slope bands render as a tilted ramp (0 -> ``rise`` over the band span).  All in
-    the clip-world (local-corner) frame the clip is stored in.  Falls back to the
+    render as solid tread pillars (or thin floating slabs when ``decor.float_thickness
+    > 0``) spanning the (narrower, centered) stair width, plus any per-side wall / post
+    decoration; slope bands render as a tilted ramp (0 -> ``rise`` over the band span).
+    All in the clip-world (local-corner) frame the clip is stored in.  Falls back to the
     legacy single-stair keys for pre-multi-band manifests.
     """
     size_y = float(m.get("size_y", 1.2))
@@ -177,7 +214,7 @@ def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     cy = size_y / 2.0
     symin, symax = cy - w / 2.0, cy + w / 2.0
     base_z = -0.08
-    boxes, ramps = [], []
+    boxes, ramps, noses = [], [], []
     bands = m.get("bands")
     if bands is None:  # legacy single-stair manifest
         bands = [{"block_type": "StairBlock", "aabb": [m["span_xmin"], m["span_xmax"], 0.0, size_y],
@@ -185,22 +222,32 @@ def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     for b in bands:
         x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
         if b["block_type"] == "StairBlock":
-            d = float(m["dims"]["d"])
-            for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # tread pillars
-                boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, base_z, float(cz)))
+            d, h = float(m["dims"]["d"]), float(m["dims"]["h"])
+            decor = b.get("decor") or {}
+            ft = float(decor.get("float_thickness", 0.0))
+            nr = min(float(decor.get("nosing_radius", 0.0)), 0.5 * min(h, d))
+            nseg = int(decor.get("nosing_segments", 6))
+            for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # treads
+                ztop = float(cz)
+                zbot = (ztop - ft) if ft > 0.0 else base_z   # thin floating slab vs solid pillar
+                boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, zbot, ztop))
+                if nr > 1e-5:  # rounded lip over the (up-stair) leading -x edge
+                    noses.append((cx - d / 2.0, symin, symax, ztop - nr, nr, nseg))
+            boxes.extend(_stair_decor_boxes(b, m["dims"], symin, symax))
         elif b["block_type"] == "SlopeBlock":  # tilted ramp, full width, 0 -> rise over the span
             rise = float(b.get("rise", m["dims"].get("rise", 0.0)))
             ramps.append((x0, x1, symin, symax, base_z, 0.0, rise))
         else:  # flat slab, full corridor width, at the band's level
             boxes.append((x0, x1, 0.0, size_y, base_z, float(b["exit_z"])))
 
+    # Accumulate every piece generically (boxes/ramps are 8-vert, nosing tubes vary).
+    pieces = [_box(*b) for b in boxes] + [_ramp(*r) for r in ramps]
+    for front_x, y_lo, y_hi, cz, rad, seg in noses:
+        path = np.array([[front_x, y_lo, cz], [front_x, y_hi, cz]], dtype=float)
+        pieces.append(_tube_mesh(path, rad, max(6, 2 * seg)))
     verts, faces, off = [], [], 0
-    for b in boxes:
-        v, f = _box(*b)
-        verts.append(v); faces.append(f + off); off += 8
-    for r in ramps:
-        v, f = _ramp(*r)
-        verts.append(v); faces.append(f + off); off += 8
+    for v, f in pieces:
+        verts.append(v); faces.append(f + off); off += len(v)
     return np.concatenate(verts), np.concatenate(faces)
 
 
@@ -209,16 +256,28 @@ def _box_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
 
     The clip is baked in its local-corner frame, so the ground spans ``[0,size_x] x [0,size_y]``
     and each overlay sits at its ``pos_xy`` (local) -- the same frame the clip's world base path
-    is drawn in, so the box lines up under the jump.
+    is drawn in, so the box lines up under the jump.  Support-structure variants (floating top,
+    center / corner legs) are expanded via the shared :func:`overlay_sub_boxes` so the viser view
+    matches the sim collider.
     """
     size_x, size_y = float(m["size_x"]), float(m["size_y"])
-    base_z = -0.08
-    boxes = [(0.0, size_x, 0.0, size_y, base_z, 0.0)]        # ground slab
-    for ov in m.get("overlays", []):
-        px, py = float(ov["pos_xy"][0]), float(ov["pos_xy"][1])
-        sx, sy, sz = (float(v) for v in ov["size_xyz"])
-        bz = float(ov.get("base_z", 0.0))
-        boxes.append((px - sx / 2.0, px + sx / 2.0, py - sy / 2.0, py + sy / 2.0, bz, bz + sz))
+    ovs = m.get("overlays", [])
+    # A stair/descent tile has treads going BELOW z=0; the treads are the ground, so skip the flat
+    # z=0 slab (it would slice through the descent). Flat-based tiles (box jump) keep their slab.
+    below = any(float(ov.get("base_z", 0.0)) < -0.05 for ov in ovs)
+    boxes = [] if below else [(0.0, size_x, 0.0, size_y, -0.08, 0.0)]    # ground slab (flat-based only)
+    for ov in ovs:
+        for cx, cy2, cz, sx, sy, sz in overlay_sub_boxes(
+            str(ov.get("variant", "solid")),
+            tuple(float(v) for v in ov["size_xyz"]),
+            (float(ov["pos_xy"][0]), float(ov["pos_xy"][1])),
+            float(ov.get("base_z", 0.0)),
+            float(ov.get("slab_thickness", 0.1)),
+            tuple(ov.get("leg_size", (0.1, 0.1))),
+            float(ov.get("leg_inset", 0.05)),
+        ):
+            boxes.append((cx - sx / 2.0, cx + sx / 2.0, cy2 - sy / 2.0, cy2 + sy / 2.0,
+                          cz - sz / 2.0, cz + sz / 2.0))
     verts, faces, off = [], [], 0
     for b in boxes:
         v, f = _box(*b)

@@ -42,6 +42,7 @@ from .blocks import (
 )
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
+from .trimesh.stair_decor_cfg import StairDecorCfg, StairSideDecorCfg
 
 _TRIVIAL_SKILL = "standing"          # blocks need a valid skill; unused for baked clips
 _FLAT_TERRAIN_ID = -1
@@ -69,6 +70,34 @@ class ClipTerrainLayout:
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
     terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
+
+
+def _stair_decor_from_manifest(decor: dict | None) -> StairDecorCfg | None:
+    """Rebuild a :class:`StairDecorCfg` from a manifest band's ``decor`` dict.
+
+    Returns ``None`` when the band carries no ``decor`` key (pre-decor manifests
+    and undecorated stairs), which makes the tread builder render solid, square,
+    bare stairs -- exactly the legacy behaviour.
+    """
+    if not decor:
+        return None
+
+    def _side(d: dict | None) -> StairSideDecorCfg:
+        d = d or {}
+        return StairSideDecorCfg(
+            kind=str(d.get("kind", "none")),
+            thickness=float(d.get("thickness", 0.1)),
+            height=float(d.get("height", 1.5)),
+            spacing=float(d.get("spacing", 0.5)),
+        )
+
+    return StairDecorCfg(
+        float_thickness=float(decor.get("float_thickness", 0.0)),
+        nosing_radius=float(decor.get("nosing_radius", 0.0)),
+        nosing_segments=int(decor.get("nosing_segments", 6)),
+        left=_side(decor.get("left")),
+        right=_side(decor.get("right")),
+    )
 
 
 def _blocks_from_manifest(entry: dict, footprint_x: float, front_pad: float = 0.0) -> list[TerrainBlockCfg]:
@@ -100,6 +129,7 @@ def _blocks_from_manifest(entry: dict, footprint_x: float, front_pad: float = 0.
                 step_dim_options=[(h, d)], stair_width_range=(w, w),
                 start_platform_length=0.0, end_platform_length=0.0,
                 origin_distance_from_back=0.0, skill_probs={_TRIVIAL_SKILL: 1.0},
+                decor=_stair_decor_from_manifest(band.get("decor")),
             ))
         elif bt == "SlopeBlock":
             # Uniform ramp: fixed total rise over this band's span (a rotated flat clip).
@@ -144,12 +174,17 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
     """
     out: list[OverlayVolumeCfg] = []
     for ov in entry.get("overlays", []):
+        leg_size = ov.get("leg_size", (0.1, 0.1))
         out.append(OverlayVolumeCfg(
             kind=str(ov.get("kind", "box")),
             size_xyz=tuple(float(v) for v in ov["size_xyz"]),
             pos_xy=tuple(float(v) for v in ov["pos_xy"]),
             base_z=float(ov.get("base_z", 0.0)),
             walkable_top=bool(ov.get("walkable_top", True)),
+            variant=str(ov.get("variant", "solid")),
+            slab_thickness=float(ov.get("slab_thickness", 0.1)),
+            leg_size=(float(leg_size[0]), float(leg_size[1])),
+            leg_inset=float(ov.get("leg_inset", 0.05)),
         ))
     return out
 

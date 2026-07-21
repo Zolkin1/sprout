@@ -136,6 +136,19 @@ def main() -> int:
     p.add_argument("--inter-flat-min", type=float, default=3.0, help="[transition] inter-stair flat MIN (m); each inter-stair flat is sampled in [min, max].")
     p.add_argument("--inter-flat-max", type=float, default=5.0, help="[transition] inter-stair flat MAX (m); the TOP platform (not the inter-flats) absorbs the fixed-length slack.")
     p.add_argument("--single-step-frac", type=float, default=0.1, help="[transition] fraction built as a SINGLE-STEP curb (one riser + long platform) for curb-height step-ups.")
+    # -- stair decoration knobs (per stair band; all default 0 => bare solid stairs, byte-for-byte reproducible) --
+    p.add_argument("--stair-float-frac", type=float, default=0.0, help="[decor] fraction of stair bands built with FLOATING (riser-less) thin treads.")
+    p.add_argument("--stair-side-wall-frac", type=float, default=0.0, help="[decor] PER-SIDE probability of a solid sidewall (each side drawn independently).")
+    p.add_argument("--stair-side-posts-frac", type=float, default=0.0, help="[decor] PER-SIDE probability of vertical railing posts (each side drawn independently; combined with --stair-side-wall-frac must be <= 1).")
+    p.add_argument("--stair-nosing-frac", type=float, default=0.0, help="[decor] fraction of stair bands with a rounded leading NOSING on each tread (stretch).")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06), metavar=("MIN", "MAX"), help="[decor] floating-tread thickness range (m).")
+    p.add_argument("--stair-wall-thickness", type=float, default=0.1, help="[decor] sidewall thickness (m).")
+    p.add_argument("--stair-wall-height", type=float, default=1.0, help="[decor] sidewall height above the top tread (m).")
+    p.add_argument("--stair-post-thickness", type=float, default=0.06, help="[decor] railing-post cross-section side length (m).")
+    p.add_argument("--stair-post-spacing", type=float, default=0.4, help="[decor] gap between consecutive railing posts (m).")
+    p.add_argument("--stair-post-height", type=float, default=1.0, help="[decor] railing-post height above the top tread (m).")
+    p.add_argument("--stair-nosing-radius-range", type=float, nargs=2, default=(0.02, 0.05), metavar=("MIN", "MAX"), help="[decor] rounded-nosing radius range (m).")
+    p.add_argument("--stair-nosing-segments", type=int, default=6, help="[decor] rounded-nosing arc tessellation.")
     p.add_argument("--nav-width-min", type=float, default=1.5, help="[transition] min corridor width (m); the flat bands span this, stairs are centered narrower.")
     p.add_argument("--nav-width-max", type=float, default=3.0, help="[transition] max corridor width (m).")
     p.add_argument("--flat-width-margin", type=float, default=0.5, help="[transition] keep the spawn corner this far (m) from the corridor y-edge.")
@@ -291,6 +304,20 @@ def main() -> int:
             flat_width_margin=args.flat_width_margin,
             transition_length=args.transition_length,
             single_step_frac=args.single_step_frac,
+            decor_params={
+                "float_frac": args.stair_float_frac,
+                "side_wall_frac": args.stair_side_wall_frac,
+                "side_posts_frac": args.stair_side_posts_frac,
+                "nosing_frac": args.stair_nosing_frac,
+                "float_thick_range": tuple(args.stair_float_thick_range),
+                "wall_thickness": args.stair_wall_thickness,
+                "wall_height": args.stair_wall_height,
+                "post_thickness": args.stair_post_thickness,
+                "post_spacing": args.stair_post_spacing,
+                "post_height": args.stair_post_height,
+                "nosing_radius_range": tuple(args.stair_nosing_radius_range),
+                "nosing_segments": args.stair_nosing_segments,
+            },
         )
 
     # One generator; its sampler is swapped per batch and terrain context bound
