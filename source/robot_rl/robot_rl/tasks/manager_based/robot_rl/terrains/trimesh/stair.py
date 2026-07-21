@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import trimesh
 
+from motion_gen.motion_matching.stair_geom import stair_tread_layout
 from robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair_decor_cfg import (
     StairDecorCfg,
     StairSideDecorCfg,
@@ -287,37 +288,22 @@ def _build_stair_steps(
     step_depth_nominal = float(step_depth_nominal)
     stair_width = float(np.random.uniform(*cfg.stair_width_range))
 
-    # 2. Pick step depth + step count to fill the span.
-    if getattr(cfg, "allow_partial_last_step", False):
-        step_depth = step_depth_nominal
-        num_full = int(size_x // step_depth)
-        leftover = size_x - num_full * step_depth
-        has_partial = leftover > _LAYOUT_TOL
-        num_steps = num_full + (1 if has_partial else 0)
-        if num_steps == 0:
-            num_steps = 1
-            step_depth = size_x
-            has_partial = False
-            leftover = 0.0
-    else:
-        num_steps = max(1, int(round(size_x / step_depth_nominal)))
-        step_depth = size_x / num_steps
-        has_partial = False
-        leftover = 0.0
-    partial_step_length: float | None = float(leftover) if has_partial else None
-
-    # 3. Vertical anchoring.  Default: centre the staircase around z = 0.
-    # If ``start_z_zero`` is set on the cfg, anchor the lowest stair's top at
-    # z = 0 so the whole staircase rises above z = 0 (and the env origin can
-    # spawn at ground level on the first stair).
-    if getattr(cfg, "start_z_zero", False):
-        z_lowest_top = 0.0
-        z_highest_top = (num_steps - 1) * step_height
-    else:
-        half_range = (num_steps - 1) * step_height / 2.0
-        z_lowest_top = -half_range
-        z_highest_top = half_range
-    y_center = y_offset + size_y / 2.0
+    # 2-3. Step depth/count, vertical anchoring, and per-tread centers come from the shared,
+    # isaaclab-free ``stair_tread_layout`` -- the SINGLE SOURCE OF TRUTH also used by the offline
+    # clip generator, so a generated descent lands on precisely these treads.  This block only
+    # wraps them with the box meshes + decoration below.
+    layout = stair_tread_layout(
+        size_x=size_x, size_y=size_y, step_height=step_height,
+        step_depth_nominal=step_depth_nominal, going_up=going_up,
+        x_offset=x_offset, y_offset=y_offset,
+        start_z_zero=bool(getattr(cfg, "start_z_zero", False)),
+        allow_partial_last_step=bool(getattr(cfg, "allow_partial_last_step", False)),
+    )
+    step_depth = layout.step_depth
+    num_steps = layout.num_steps
+    partial_step_length: float | None = layout.partial_step_length
+    z_lowest_top, z_highest_top = layout.z_lowest_top, layout.z_highest_top
+    y_center = y_offset + size_y / 2.0                      # span centre-line (for side decor)
 
     # 4. Resolve decoration (floating / per-side walls-or-posts / nosing).  When
     # ``cfg.decor`` is set this is deterministic (offline clip path); otherwise it
@@ -327,25 +313,13 @@ def _build_stair_steps(
     floating_thickness = float(decor.float_thickness)
 
     meshes: list[trimesh.Trimesh] = []
-    stair_top_centers = np.zeros((num_steps, 3), dtype=np.float32)
+    stair_top_centers = layout.tread_top_centers.copy()
 
     for i in range(num_steps):
         # Order along +x: stair 0 is at the span's xmin. For up stairs stair 0
-        # is lowest; for down stairs stair 0 is highest.
-        if going_up:
-            top_z = z_lowest_top + i * step_height
-        else:
-            top_z = z_highest_top - i * step_height
-
-        is_partial = has_partial and i == num_steps - 1
-        this_depth = leftover if is_partial else step_depth
-        if is_partial:
-            cx_local = num_full * step_depth + this_depth / 2.0
-        else:
-            cx_local = (i + 0.5) * step_depth
-        cx = x_offset + cx_local
-        cy = y_center
-        stair_top_centers[i] = (cx, cy, top_z)
+        # is lowest; for down stairs stair 0 is highest.  Centers/depths precomputed above.
+        cx, cy, top_z = (float(v) for v in stair_top_centers[i])
+        this_depth = float(layout.step_depths[i])
 
         if is_floating:
             dims = (this_depth, stair_width, floating_thickness)

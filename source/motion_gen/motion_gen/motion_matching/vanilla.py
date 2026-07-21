@@ -324,6 +324,16 @@ class VanillaMatcher:
         m = max(1, int(round(entry_frac * norm.shape[0])))
         return norm[:m].detach().cpu().numpy()
 
+    def exit_descriptors(self, source, exit_frac: float = 0.5) -> np.ndarray:
+        """The source's LAST ``exit_frac`` frames' descriptors ``[M, dim]`` -- the ALLOWED exit frames
+        the transition DP may peel off FROM (mirror of :meth:`entry_descriptors`).  Returned in
+        forward order (frame ``n-m`` first), so an index ``j`` maps to source frame ``n-m+j``; the
+        DP picks whichever exit frame seams cleanest into the resumed locomotion instead of being
+        nailed to the last frame."""
+        norm = self._source_descriptors(source)
+        m = max(1, int(round(exit_frac * norm.shape[0])))
+        return norm[-m:].detach().cpu().numpy()
+
     def boundary_cost(self, desc: np.ndarray) -> np.ndarray:
         """Per-DB-frame L2 distance ``[N]`` from every frame's descriptor to a single ``desc``."""
         return self.boundary_cost_multi(desc)

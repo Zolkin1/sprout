@@ -445,10 +445,13 @@ class ClipScene:
                 "/terrain", vertices=tv_v, faces=tv_f,
                 color=(0.62, 0.62, 0.66), opacity=1.0, side="double", flat_shading=True,
             )
-            # Ground grid sized to the terrain chunk, centered on it.
+            # Ground grid sized to the terrain chunk. For a stair/descent tile (treads below z=0),
+            # drop the grid to the geometry floor instead of drawing a misleading z=0 plane.
             sx, sy = float(mm["size_x"]), float(mm["size_y"])
+            _bzs = [float(ov.get("base_z", 0.0)) for ov in mm.get("overlays", [])]
+            gz = min(_bzs) if (_bzs and min(_bzs) < -0.05) else 0.0
             self._grid_handle = self.server.scene.add_grid(
-                "/grid", width=sx, height=sy, cell_size=1.0, position=(sx / 2.0, sy / 2.0, 0.0),
+                "/grid", width=sx, height=sy, cell_size=1.0, position=(sx / 2.0, sy / 2.0, gz),
             )
             # Spawn (green) + nav goal (red) markers.
             pts, cols = [], []

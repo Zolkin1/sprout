@@ -38,6 +38,46 @@ def nlerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
     return q / q.norm().clamp_min(1e-9)
 
 
+def inertialize_seam(root_pos, root_quat, joints, seam, blend_n, *, anchored_after):
+    """Ease the FREE side of a spliced seam toward the ANCHORED side over ``blend_n`` frames -- the SAME
+    inertialization :func:`play_frame_path` applies at a cut (root pos + joints decayed additively, root
+    quat by :func:`nlerp`), so a terrain-clip transition eases exactly like a normal flat clip transition.
+
+    The offline terrain splice joins a played terrain segment (the "anchored" side, kept pristine on its
+    treads) to a DP-generated flat segment (the "free" side).  Rather than a rigid SE(2)+z weld -- which
+    pins the whole free segment to the anchored boundary's (possibly crouched) height and drops its feet
+    off its own ground -- each segment keeps its OWN ground-referenced height and this decays the seam
+    discontinuity, so the free side eases in over the blend while staying grounded away from the seam.
+
+    Args:
+        root_pos/root_quat/joints: the concatenated clip ``[T, ...]`` (modified copies returned).
+        seam: index of the ANCHORED segment's boundary -- its FIRST frame when ``anchored_after`` (the
+            anchored segment starts at ``seam``; free frames are ``< seam``), else its LAST frame is
+            ``seam-1`` (anchored segment ends there; free frames are ``>= seam``).
+        blend_n: blend length in frames.
+        anchored_after: ``True`` if the anchored (terrain) segment is AFTER the seam.
+    """
+    root_pos, root_quat, joints = root_pos.clone(), root_quat.clone(), joints.clone()
+    T = root_pos.shape[0]
+    if anchored_after:                        # anchored starts at `seam`; ease the free TAIL (< seam)
+        ref = seam
+        idxs = [(seam - 1 - j, j) for j in range(min(int(blend_n), seam))]
+    else:                                     # anchored ends at `seam-1`; ease the free HEAD (>= seam)
+        ref = seam - 1
+        idxs = [(seam + j, j) for j in range(min(int(blend_n), T - seam))]
+    off_p = root_pos[ref] - root_pos[idxs[0][0]] if idxs else None
+    off_j = joints[ref] - joints[idxs[0][0]] if idxs else None
+    off_q = (quat_mul(root_quat[ref].unsqueeze(0), quat_inv(root_quat[idxs[0][0]].unsqueeze(0)))[0]
+             if idxs else None)
+    for f, j in idxs:
+        d = smoothstep(1.0 - j / float(blend_n))
+        root_pos[f] = root_pos[f] + off_p * d
+        joints[f] = joints[f] + off_j * d
+        tgt_q = quat_mul(off_q.unsqueeze(0), root_quat[f].unsqueeze(0))[0]
+        root_quat[f] = nlerp(root_quat[f], tgt_q, d)
+    return root_pos, root_quat, joints
+
+
 def play_frame_path(frame_path, jumped, db, cfg, *, debug: bool = False):
     """Turn a selected DB-frame path into a world trajectory.
 

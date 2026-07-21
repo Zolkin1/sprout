@@ -27,6 +27,7 @@ import math
 import torch
 
 from ..math_utils import quat_apply, quat_inv, quat_mul, yaw_quat
+from .stair_geom import stair_tread_layout
 
 
 def _yaw_of(q: torch.Tensor) -> float:
@@ -87,6 +88,140 @@ def align_and_concat(
         cursor += arp.shape[0]
         transforms.append((gq, t))
     return torch.cat(out_p), torch.cat(out_q), torch.cat(out_j), bounds, transforms
+
+
+def n_periodic_loops(root_pos: torch.Tensor, wrap: str, boxes: list[dict]) -> int:
+    """How many times to loop a PERIODIC terrain stride to traverse its geometry (episodic -> 1).
+
+    A periodic stride (e.g. one stair descent cycle) covers only part of a multi-step staircase; loop
+    it until the geometry's vertical span is covered.  ``N = round(total tread z-span / stride net
+    z-travel)`` (>=1).  Geometry-driven, so a taller staircase gets more loops with no per-terrain code.
+    """
+    if wrap != "periodic" or not boxes:
+        return 1
+    stride_dz = abs(float(root_pos[0, 2] - root_pos[-1, 2]))
+    if stride_dz < 1e-3:
+        return 1
+    zs = [float(b["pos"][2]) for b in boxes]
+    return max(1, round((max(zs) - min(zs)) / stride_dz))
+
+
+def periodic_tread_offset(root_pos: torch.Tensor, wrap: str, boxes: list[dict]):
+    """Per-period translation that lands each loop on an EXACT tread (``None`` if not applicable).
+
+    From the uniform stair geometry: the mean tread->tread step vector (in descent order) times the
+    number of treads one period covers (``round(period z-travel / riser)``).  Feeding this to
+    :func:`loop_periodic` places every period exactly on a tread instead of drifting by the stride's
+    own slightly-off net travel.  Wide top/bottom PLATFORMS (size_x >> the step depth) are excluded so
+    the step vector is a true tread-to-tread rise.
+    """
+    if wrap != "periodic" or not boxes:
+        return None
+    min_sx = min(float(b["size"][0]) for b in boxes)
+    steps = sorted((b for b in boxes if float(b["size"][0]) <= 1.5 * min_sx),
+                   key=lambda b: -float(b["pos"][2]))               # high -> low (descent order)
+    if len(steps) < 2:
+        return None
+    pos = torch.tensor([[float(v) for v in b["pos"]] for b in steps])
+    step_vec = (pos[1:] - pos[:-1]).mean(0)                         # per-tread step, down the descent
+    riser = abs(float(step_vec[2]))
+    if riser < 1e-6:
+        return None
+    ptreads = max(1, round(abs(float(root_pos[0, 2] - root_pos[-1, 2])) / riser))
+    return (ptreads * step_vec).tolist()
+
+
+def stair_tile_boxes(
+    *,
+    step_height: float,
+    step_depth: float,
+    num_steps: int,
+    tread_width: float,
+    ttype: str = "terrain",
+    top_platform_len: float = 0.0,
+    bottom_platform_len: float = 0.0,
+    nav_width: float | None = None,
+) -> list[dict]:
+    """FIXED tile geometry for a uniform stair DESCENT (tile-local, axis-aligned, +x = travel).
+
+    Authored ONCE per tile and shared by all of its clips (no per-clip transform) -- this is what
+    makes many clips reuse one terrain.  ``+x`` runs downhill: ``[top platform (high)] -> [treads
+    descending] -> [bottom platform (floor, z=0)]``.  The highest tread top sits at ``N*h`` (flush
+    with the top platform); the lowest at ``h`` (one riser above the z=0 floor, where the bottom
+    platform / recovery sits) -- mirroring the v8 leveling conventions so no post-hoc leveling is
+    needed.  Tread x-spacing comes from :func:`stair_geom.stair_tread_layout` (the shared layout SoT).
+
+    Boxes are ``{pos:[x,y,z], size:[sx,sy,sz], yaw:0}``.  Steps are NARROW (``size_x == d``); the
+    platforms are WIDE, so the downstream pipeline tells them apart by width.  ``ttype == "terrain"``
+    (pure stairs) emits the treads only -- no platforms.
+
+    Args:
+        step_height / step_depth: Uniform riser / tread depth (m).
+        num_steps: Number of treads ``N``.
+        tread_width: Tread y-width (m).
+        ttype: ``"terrain"`` (treads only) or ``"transition"`` (add top + bottom platforms).
+        top_platform_len / bottom_platform_len: Platform x-lengths (m); typically sized to the
+            longest approach / recovery that will run on the tile (transition only).
+        nav_width: Platform y-width (m); defaults to ``tread_width``.
+    """
+    h, d, N = float(step_height), float(step_depth), int(num_steps)
+    w = float(tread_width)
+    nav = float(nav_width) if nav_width else w
+    top_len = float(top_platform_len) if ttype != "terrain" else 0.0
+    # start_z_zero => lowest tread top at 0, highest at (N-1)h; shift +h so the floor (bottom
+    # platform / recovery) is at z=0 one riser below the lowest tread.
+    lay = stair_tread_layout(size_x=N * d, size_y=w, step_height=h, step_depth_nominal=d,
+                             going_up=False, x_offset=top_len, y_offset=-w / 2.0, start_z_zero=True)
+    boxes: list[dict] = []
+    for c in lay.tread_top_centers:
+        cx, top = float(c[0]), float(c[2]) + h                # solid tread box from z=0 up to its top
+        boxes.append({"pos": [cx, 0.0, top / 2.0], "size": [d, w, top], "yaw": 0.0})
+    if ttype != "terrain":
+        top_top = N * h                                       # top platform flush with the highest tread
+        boxes.insert(0, {"pos": [top_len / 2.0, 0.0, top_top / 2.0],
+                         "size": [max(top_len, 1e-3), nav, top_top], "yaw": 0.0})
+        bx0 = top_len + N * d
+        bot_len = max(float(bottom_platform_len), 1e-3)
+        # Bottom platform flush with the LOWEST tread (top z=h), symmetric with the top platform: the
+        # recovery walks off the last step onto it continuously (no float).  (A floor-level landing one
+        # riser lower would need the descent to include a final step-down -- a later refinement.)
+        boxes.append({"pos": [bx0 + bot_len / 2.0, 0.0, h / 2.0],
+                      "size": [bot_len, nav, h], "yaw": 0.0})
+    return boxes
+
+
+def loop_periodic(rp: torch.Tensor, rq: torch.Tensor, jt: torch.Tensor,
+                  contact: torch.Tensor | None, n_loops: int, offset=None, start: int = 0):
+    """Play the FULL periodic stride from frame ``start``, then wrap it forward ``n_loops-1`` more times.
+
+    ``rp/rq/jt`` are the whole stride (``n`` frames).  The first (partial) period runs frames
+    ``[start, n)`` -- so the approach can hand off at ANY ``start`` in the period, not just frame 0 --
+    and each following FULL period ``[0, n)`` wraps on (its duplicate seam frame dropped, C0).
+
+    Two placements for the wrapped periods:
+
+    * ``offset=None`` -- rigid-aligned onto the previous period's last frame (``align_and_concat``),
+      continuing by the stride's OWN net travel.  Simple, but tiny per-stride error accumulates.
+    * ``offset`` (a 3-vector) -- each period translated by an EXACT ``i * offset`` (orientation +
+      joints repeat unchanged): an integer-tread offset from the uniform stair geometry, so every
+      period lands exactly on a tread -- the per-period re-projection that stops drift accumulating.
+
+    ``n_loops <= 1`` is a single play from ``start`` (an episodic box jump from its matched entry).
+    Returns ``(rp, rq, jt, contact)``.
+    """
+    if n_loops <= 1:
+        s = slice(start, None)
+        return rp[s], rq[s], jt[s], (None if contact is None else contact[s])
+    if offset is None:
+        segs = [(rp[start:], rq[start:], jt[start:])] + [(rp, rq, jt)] * (n_loops - 1)
+        lrp, lrq, ljt, _, _ = align_and_concat(segs)
+    else:
+        off = torch.as_tensor(offset, device=rp.device, dtype=rp.dtype)
+        lrp = torch.cat([rp[start:]] + [rp[1:] + i * off for i in range(1, n_loops)])
+        lrq = torch.cat([rq[start:]] + [rq[1:]] * (n_loops - 1))    # pure translation between periods
+        ljt = torch.cat([jt[start:]] + [jt[1:]] * (n_loops - 1))
+    lc = None if contact is None else torch.cat([contact[start:]] + [contact[1:]] * (n_loops - 1))
+    return lrp, lrq, ljt, lc
 
 
 def _quat_yaw_wxyz(theta: float) -> torch.Tensor:

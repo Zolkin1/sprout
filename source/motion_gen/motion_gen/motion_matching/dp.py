@@ -74,7 +74,7 @@ class DPMatcher(VanillaMatcher):
     ``src_names`` / ``n_cuts``) so the CLI + experiment + diagnostics are method-agnostic."""
 
     def __init__(self, sources, vcfg: VanillaConfig, dcfg: DPConfig, graph=None,
-                 mjcf_path=None, device="cpu"):
+                 mjcf_path=None, device="cpu", categories: list[str] | None = None):
         super().__init__(sources, vcfg, mjcf_path=mjcf_path, device=device, build_tree=False)
         self.dcfg = dcfg
         self.bcfg = dcfg                 # alias: mm_experiment._analyze reads `.bcfg.cut_penalty`
@@ -89,6 +89,15 @@ class DPMatcher(VanillaMatcher):
                                  for w in (w_pos, w_pos, w_dir, w_dir)], dtype=np.float64)
         self._tier_np = self._tier.cpu().numpy().astype(np.int64)   # [N] STEADY/VARIED (from sources)
         self._pelvis_z = self.root_pos[:, 2].detach().cpu().numpy().astype(np.float64)  # [N] abs pelvis height
+        # Per-frame source CATEGORY (e.g. "flat"/"clean"/"leadin"), so a generate() call can restrict
+        # the DP to a subset of the DB -- the candidate graph is built ONCE over the union of all
+        # categories and each tile type filters it per-generate (see :meth:`_set_category_filter`).
+        if categories is not None and len(categories) != len(self.src_names):
+            raise ValueError(f"categories ({len(categories)}) must match #sources ({len(self.src_names)}).")
+        self._frame_cat = (np.array(categories, dtype=object)[self._owner_np]
+                           if categories is not None else None)      # [N] category per frame, or None
+        self._allowed_frame = None                                   # [N] bool set per-generate (None = all)
+        self._cat_penalty = None                                     # [N] additive +inf on disallowed frames
         self._mc_scale = None                                       # [T] per-step tracking-cost scale (transition window)
         self._boundary_pin = None                                   # [N] per-frame boundary distance (approach funnel)
         self._pin_scale = None                                      # [T] weight ramping the pin up over the window
@@ -109,6 +118,20 @@ class DPMatcher(VanillaMatcher):
         self._jcost = graph.jump_cost.astype(np.float64)    # [N,K] (promote from fp16; inf in unused)
         self._next = graph.next_frame                       # [N]  int32 (-1 = clip end)
         self._bvel = graph.body_vel.astype(np.float64)      # [N,3]
+
+    def _set_category_filter(self, allowed) -> None:
+        """Restrict the DP to frames whose source category is in ``allowed`` (an iterable of category
+        names, e.g. ``{"flat", "clean"}``); ``None`` clears the filter.  Disallowed frames get a +inf
+        match cost, so the backward DP never routes onto them.  Safe on the SHARED candidate graph
+        because a frame's CONTINUE edge stays within its own clip (same category) -- an allowed frame
+        is never stranded mid-clip; only a dead-end allowed frame (clip end + every jump filtered) gets
+        cost-to-go +inf and is simply avoided.  An unreachable start raises in :meth:`generate`."""
+        if allowed is None or self._frame_cat is None:
+            self._allowed_frame = None
+            self._cat_penalty = None
+            return
+        self._allowed_frame = np.isin(self._frame_cat, list(allowed))
+        self._cat_penalty = np.where(self._allowed_frame, 0.0, np.inf)
 
     # ---- match cost (velocity window + / or trajectory lookahead) -------------------
     def _match_cost(self, frames: np.ndarray, t: int) -> np.ndarray:
@@ -134,6 +157,8 @@ class DPMatcher(VanillaMatcher):
             cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
         if dc.w_ground != 0.0:
             cost = cost + dc.w_ground * np.maximum(0.0, self._pelvis_z[frames] - dc.ground_z - dc.max_pelvis_z)
+        if self._cat_penalty is not None:
+            cost = cost + self._cat_penalty[frames]
         return cost
 
     def _precompute_ABC(self) -> None:
@@ -238,6 +263,8 @@ class DPMatcher(VanillaMatcher):
             cost = cost + (dc.w_tier * dc.soft_tier_penalty * float(self._regime[t]) * (1.0 - reward))
         if dc.w_ground != 0.0:
             cost = cost + dc.w_ground * np.maximum(0.0, self._pelvis_z - dc.ground_z - dc.max_pelvis_z)
+        if self._cat_penalty is not None:
+            cost = cost + self._cat_penalty
         return cost
 
     def _prepare(self, command, T: int) -> None:
@@ -312,18 +339,22 @@ class DPMatcher(VanillaMatcher):
 
     def generate(self, command, T: int, debug: bool = False,
                  boundary_pin: np.ndarray | None = None, start_frame: int | None = None,
-                 relax_tail: int = 0):
+                 relax_tail: int = 0, allowed_categories=None):
         """Exact backward-DP match against ``command`` then play the optimal path.
 
         ``boundary_pin[N]`` (per-frame terrain-entry distance) pins the approach onto the entry.
         With ``relax_tail>0`` the command-tracking ramps DOWN and the pin ramps UP over the last
         ``relax_tail`` frames (a distributed pin = smooth transition); with ``relax_tail=0`` the pin
         applies only at the terminal frame.  ``start_frame`` overrides the reconstruction start
-        (exit: begin at the terrain exit).  The chosen frame path is stashed on ``self.frame_path``.
+        (exit: begin at the terrain exit).  ``allowed_categories`` (an iterable of source-category
+        names, e.g. ``{"flat", "clean"}``) restricts the DB to those categories for this call
+        (``None`` = the whole DB); requires the matcher to have been built with ``categories``.
+        The chosen frame path is stashed on ``self.frame_path``.
         Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
         if self.graph is None:
             raise RuntimeError("DPMatcher.generate called before a candidate graph was attached.")
         self.warnings = []
+        self._set_category_filter(allowed_categories)        # restrict the DB to the allowed categories
         self._prepare(command, T)
         self._boundary_pin = None if boundary_pin is None else np.asarray(boundary_pin, dtype=np.float64)
         self._mc_scale = np.ones(T)
@@ -337,7 +368,9 @@ class DPMatcher(VanillaMatcher):
         action = self._dp_backward(T)
         start = int(self._stationary if start_frame is None else start_frame)
         if not np.isfinite(self._V0[start]):
-            raise RuntimeError("DP found no finite-cost path from the start frame.")
+            extra = (f" under allowed_categories={sorted(allowed_categories)}"
+                     if allowed_categories is not None else "")
+            raise RuntimeError(f"DP found no finite-cost path from the start frame{extra}.")
         path, jumped = self._reconstruct(action, T, start_frame=start_frame)
         frame_path = torch.as_tensor(path, dtype=torch.long, device=self.device)
         self.frame_path = frame_path
@@ -347,23 +380,43 @@ class DPMatcher(VanillaMatcher):
 
     # ---- boundary-value entry points (approach into / exit out of a played terrain segment) ----
     def generate_approach(self, command, T: int, entry_descs: np.ndarray,
-                          boundary_weight: float = 50.0, debug: bool = False, relax_tail: int = 0):
+                          boundary_weight: float = 50.0, debug: bool = False, relax_tail: int = 0,
+                          allowed_categories=None):
         """Approach DP: track ``command`` and END at the NEAREST of the allowed terrain ENTRY frames.
 
         ``entry_descs`` is ``[K, dim]`` (or a single ``[dim]``) -- the allowed entry-frame
         descriptors (see :meth:`VanillaMatcher.entry_descriptors`).  The terminal is pinned to the
         cheapest-to-reach one, so a faster run-up merges into a later (moving) entry frame instead of
         being forced to a full stop at frame 0.  The matched entry-frame INDEX is stored on
-        ``self.matched_entry`` -- the caller plays the terrain interaction FROM that frame."""
+        ``self.matched_entry`` -- the caller plays the terrain interaction FROM that frame.
+        ``allowed_categories`` (forwarded to :meth:`generate`) restricts the DB to those source
+        categories -- e.g. ``{"flat", "clean"}`` so a stair approach can't grab box-climb lead-ins."""
         descs = np.atleast_2d(entry_descs)
         pin = boundary_weight * self.boundary_cost_multi(descs)
-        out = self.generate(command, T, debug=debug, boundary_pin=pin, relax_tail=relax_tail)
+        out = self.generate(command, T, debug=debug, boundary_pin=pin, relax_tail=relax_tail,
+                            allowed_categories=allowed_categories)
         last = int(self.frame_path[-1])
         d = torch.as_tensor(descs, dtype=self._norm.dtype, device=self.device)
         self.matched_entry = int(torch.cdist(self._norm[last:last + 1], d).argmin())
         return out
 
-    def generate_exit(self, command, T: int, exit_desc: np.ndarray, debug: bool = False):
-        """Exit DP: START at the terrain EXIT state and track the resumed ``command`` forward."""
-        start = int(self.boundary_cost(exit_desc).argmin())
-        return self.generate(command, T, debug=debug, start_frame=start)
+    def generate_exit(self, command, T: int, exit_descs: np.ndarray, debug: bool = False,
+                      allowed_categories=None):
+        """Exit DP: START from the terrain's EXIT WINDOW and track the resumed ``command`` forward.
+
+        Mirror of :meth:`generate_approach`: ``exit_descs`` is ``[K, dim]`` (or ``[dim]``) -- the
+        allowed exit-frame descriptors (see :meth:`VanillaMatcher.exit_descriptors`).  We start the
+        forward DP from the DB frame nearest ANY of them (the cheapest seam), and store on
+        ``self.matched_exit`` WHICH exit frame that is (index into ``exit_descs``) -- the caller
+        truncates the played interaction there, so it peels off at whichever phase seams cleanest
+        into the resumed locomotion instead of being nailed to the final frame.  ``allowed_categories``
+        restricts BOTH the seed frame and the forward DP to those source categories."""
+        descs = np.atleast_2d(exit_descs)
+        bc = self.boundary_cost_multi(descs)                         # per-DB-frame distance to the exit window
+        if allowed_categories is not None and self._frame_cat is not None:
+            bc = np.where(np.isin(self._frame_cat, list(allowed_categories)), bc, np.inf)
+        start = int(bc.argmin())                                     # nearest ALLOWED DB frame to the exit
+        d = torch.as_tensor(descs, dtype=self._norm.dtype, device=self.device)
+        self.matched_exit = int(torch.cdist(self._norm[start:start + 1], d).argmin())
+        return self.generate(command, T, debug=debug, start_frame=start,
+                            allowed_categories=allowed_categories)
