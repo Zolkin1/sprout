@@ -92,6 +92,18 @@ def _ramp_cmd(vx0: float, approach_s: float, ramp_s: float, vx1: float = 0.0):
     return cmd
 
 
+def _ramp_up_cmd(vx0: float, ramp_s: float, vx1: float):
+    """Ramp ``vx0`` -> ``vx1`` over the FIRST ``ramp_s`` seconds, then HOLD ``vx1``.
+
+    Mirror of :func:`_ramp_cmd` for the RECOVERY: start at the terrain-exit speed (``vx0``, the played
+    interaction's slow exit) and accelerate back up to the commanded target (``vx1``) so the exit motion
+    matches the held-forward RL ``target_vel`` instead of walking away at the descent speed."""
+    def cmd(t):
+        a = 1.0 if ramp_s <= 0.0 else min(1.0, t / max(1e-6, ramp_s))
+        return (float(vx0 + (vx1 - vx0) * a), 0.0, 0.0)
+    return cmd
+
+
 def _entry_vx(ts, dt: float) -> float:
     """Forward (heading-frame) speed at the START of the terrain clip -- the ramp target.
 
@@ -534,26 +546,31 @@ def _splice_around(descent, approach, recovery, top_surf, bot_surf, blend_n):
     return Wp, Wq, Wj, bounds, box_seg
 
 
-def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev, top_len, bot_len):
+def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev, top_len, bot_len,
+                               approach_s, recovery_s):
     """TRANSITION stair TILE clip -> records dict (phase B, full path).
 
-    approach (DP, ramps to the descent entry speed) on the top platform -> descent (played, SHARED
-    :func:`_place_descent_on_tile`) -> recovery (DP, from the exit window) on the bottom platform, on a
-    FIXED transition tile (flat -> single staircase -> flat).  Many approach speeds share the tile's
-    geometry + ``terrain_id`` (the reuse invariant).  Grounding is inherited from the tile-anchored
-    descent via the seam splice (approach on the top platform ~N*h, recovery on the bottom platform ~h).
+    approach (DP, ``approach_s`` long, ramps DOWN to the descent entry speed) on the top platform ->
+    descent (played, SHARED :func:`_place_descent_on_tile`) -> recovery (DP, ``recovery_s`` long, ramps
+    UP from the descent exit speed back to ``approach_vx``) on the bottom platform, on a FIXED transition
+    tile (flat -> single staircase -> flat).  Many approach speeds share the tile's geometry +
+    ``terrain_id`` (the reuse invariant); ``approach_s`` / ``recovery_s`` are sampled per clip (the
+    platform is sized to the longest possible).  The RL-visible ``target_vel`` is held at ``approach_vx``
+    the whole clip, so the recovery ramp-up makes the exit MOTION match that command instead of walking
+    away at the slow descent speed.  Grounding is inherited from the tile-anchored descent via the seam
+    splice (approach on the top platform ~N*h, recovery on the bottom platform ~h).
     """
     boxes = stair_tile_boxes(step_height=tile.step_height, step_depth=tile.step_depth,
                              num_steps=int(tile.stair_steps[0]), tread_width=tile.width,
                              ttype="transition", top_platform_len=top_len, bottom_platform_len=bot_len,
                              nav_width=tile.nav_width)
-    T_app = max(1, int(round(args.approach_s / args.dt)))
-    T_exit = max(1, int(round(args.recovery_s / args.dt)))
+    T_app = max(1, int(round(approach_s / args.dt)))
+    T_exit = max(1, int(round(recovery_s / args.dt)))
     # Hand off near the TOP (descent_entry_frac cap) so the FULL descent plays.
     efrac = min(args.entry_frac, args.descent_entry_frac)
     entry_descs = matcher.entry_descriptors(ts, entry_frac=efrac)
     entry_vx = _entry_vx(ts, args.dt)
-    app_cmd = _ramp_cmd(approach_vx, args.approach_s, args.approach_ramp_s, vx1=entry_vx)
+    app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
     ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
                                            boundary_weight=args.boundary_weight, relax_tail=0,
                                            allowed_categories=_APPROACH_FILTERS["stair_transition"])
@@ -605,7 +622,10 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
 
     src_desc = matcher._source_descriptors(ts)       # [nper, dim] normalized descriptors
     exit_descs = src_desc[[_src_frame(int(f)) for f in allowed]].detach().cpu().numpy()
-    re, qe, je = matcher.generate_exit(_steady_cmd(entry_vx), T_exit, exit_descs,
+    # Recovery ACCELERATES from the descent exit speed back up to the commanded approach speed (mirror of
+    # the approach ramp-down), so the exit motion matches the held-forward RL target_vel.
+    rec_cmd = _ramp_up_cmd(entry_vx, args.recovery_ramp_s, approach_vx)
+    re, qe, je = matcher.generate_exit(rec_cmd, T_exit, exit_descs,
                                        allowed_categories=_APPROACH_FILTERS["stair_transition"])
     cut = int(allowed[int(matcher.matched_exit)]) + 1   # peel off at the DP-chosen qualifying frame
     cf = cut - 1                                         # the chosen exit frame (index into the full descent)
@@ -675,8 +695,16 @@ def main() -> int:
     p.add_argument("--terrain-skills", default=None, help="';'-sep subset of terrain skills (default all).")
     p.add_argument("--out", required=True)
     p.add_argument("--dt", type=float, default=0.02)
-    p.add_argument("--approach-s", type=float, default=2.5, help="Approach (DP) duration (s).")
-    p.add_argument("--recovery-s", type=float, default=1.0, help="Exit/recovery (DP) duration (s).")
+    p.add_argument("--approach-s", type=float, default=2.5, help="Approach (DP) duration (s) [box path].")
+    p.add_argument("--recovery-s", type=float, default=1.0, help="Exit/recovery (DP) duration (s) [box path].")
+    p.add_argument("--approach-s-range", type=float, nargs=2, default=(1.0, 4.0), metavar=("MIN", "MAX"),
+                   help="[tiles] Sample the transition-tile approach (lead-in) duration (s) uniformly from "
+                        "this range, PER CLIP.  Platforms are sized to MAX * the fastest speed.")
+    p.add_argument("--recovery-s-range", type=float, nargs=2, default=(1.0, 4.0), metavar=("MIN", "MAX"),
+                   help="[tiles] Sample the transition-tile recovery (exit) duration (s) uniformly per clip.")
+    p.add_argument("--recovery-ramp-s", type=float, default=0.8,
+                   help="[tiles] Seconds over which the recovery accelerates from the descent exit speed "
+                        "back up to the commanded (approach) speed at the bottom of the stairs.")
     p.add_argument("--approach-vels", default="0.0",
                    help="';'-separated approach forward speeds (m/s); one CLIP per (terrain x speed). "
                         "e.g. '0.8;1.6;2.4;3.2' for walk->run run-ups into the jump. In --mode pure "
@@ -832,21 +860,28 @@ def main() -> int:
             num_steps_range=(args.tile_num_steps_min, args.tile_num_steps_max),
             lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
             nav_width_range=(args.tile_width_min, args.tile_width_max), flat_width_margin=0.3)
+        # Dedicated rng for the per-clip approach/recovery DURATION sampling (distinct seed so it does
+        # not perturb the tile-geometry rng above -> both stay reproducible from --tile-seed).
+        time_rng = np.random.default_rng(args.tile_seed + 1)
         for tile in tiles:
             if tile.ttype == "terrain":
                 print(f"[box] pure tile {tile.terrain_id}: {tile.stair_steps[0]} steps, width {tile.width:.2f}")
                 records.append(_make_pure_tile_clip(builder, src, tile, args, dev))
             else:
                 mx = max(tvels)
-                top_len = args.approach_s * mx + 1.0             # platform >= the longest approach/recovery
-                bot_len = args.recovery_s * mx + 1.0
+                # Platforms sized to the LONGEST POSSIBLE sampled lead-in / recovery (range max * fastest vx).
+                top_len = args.approach_s_range[1] * mx + 1.0
+                bot_len = args.recovery_s_range[1] * mx + 1.0
                 print(f"[box] transition tile {tile.terrain_id}: {tile.stair_steps[0]} steps, "
                       f"width {tile.width:.2f}, platforms top={top_len:.1f} bot={bot_len:.1f} m, vels {tvels}")
                 for vx in tvels:
+                    a_s = float(time_rng.uniform(*args.approach_s_range))   # per-clip lead-in / recovery s
+                    r_s = float(time_rng.uniform(*args.recovery_s_range))
                     rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
-                                                     top_len, bot_len)
+                                                     top_len, bot_len, a_s, r_s)
                     rec["approach_vx"] = vx
-                    print(f"[box]   -> tile {tile.terrain_id} vx={vx}: entered at frame {rec['entry_frame']}/{rec['n_terr']}")
+                    print(f"[box]   -> tile {tile.terrain_id} vx={vx}: approach_s={a_s:.2f} recovery_s={r_s:.2f}, "
+                          f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
                     records.append(rec)
     else:
         tid = 0
