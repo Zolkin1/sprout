@@ -69,6 +69,9 @@ def main() -> int:
     p.add_argument("--pure-tiles", type=int, default=8)
     p.add_argument("--transition-tiles", type=int, default=8)
     p.add_argument("--transition-vels", default="0.8;1.5;2.5")
+    p.add_argument("--stair-floor-frac", type=float, default=0.5,
+                   help="Fraction of stair tiles (pure + transition) that keep a flat ground plane; the "
+                        "rest are the bare stairs (+ platforms) with no ground under them.")
     p.add_argument("--box-tiles", type=int, default=8, help="Jump-on box tiles (one fixed box each).")
     p.add_argument("--box-clips-per-tile", type=int, default=4,
                    help="Approach speeds per box tile (all share the tile's box + terrain_id).")
@@ -111,6 +114,7 @@ def main() -> int:
             "--terrain-lib", args.terrain_lib, "--terrain-skills", "stairs_down",
             "--n-pure-tiles", str(args.pure_tiles), "--n-transition-tiles", str(args.transition_tiles),
             "--transition-vels", args.transition_vels, "--tile-seed", str(args.seed),
+            "--stair-floor-frac", str(args.stair_floor_frac),
             "--out", fam["stairs"]])
     if "boxes" not in skip:
         _run("boxes", "generate_box_clips.py", common + bl + [

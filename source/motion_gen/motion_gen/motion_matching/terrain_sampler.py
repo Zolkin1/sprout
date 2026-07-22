@@ -55,6 +55,8 @@ class TerrainSpec:
     nav_width: float               # corridor width in y (transition nav); == width for terrain-only
     spawn_y_offset: float          # signed lateral spawn offset from centerline (transition turn)
     stair_decor: list[dict] = field(default_factory=list)  # resolved decor per stair band (aligned w/ stair_steps)
+    has_floor: bool = True          # stair tiles: False => stairs (+ platforms) with NO flat ground plane
+                                    # (isolated structure; the scan sees a drop-off beside it)
 
 
 def split_counts(num_terrains: int, fracs: dict[str, float]) -> dict[str, int]:
@@ -240,6 +242,7 @@ def sample_stair_tiles(
     nav_width_range: tuple[float, float],
     flat_width_margin: float,
     single_step_frac: float = 0.0,
+    floor_frac: float = 1.0,
     decor_params: dict | None = None,
 ) -> list[TerrainSpec]:
     """Sample the offline stair TILE population -- phase A of the tiles-then-clips generator.
@@ -253,9 +256,11 @@ def sample_stair_tiles(
       learning the on/off transitions.  ``single_step_frac`` of them are single-riser curbs.
 
     Both draw dims from ``hd_grid``, tread width from ``width_range``, step count from
-    ``num_steps_range`` (transitions), and decoration from ``decor_params``.  The merged list is
-    re-numbered so ``terrain_id`` is contiguous ``0..N-1`` (each tile is reused by many clips
-    downstream, so one id == one physical tile).
+    ``num_steps_range`` (transitions), and decoration from ``decor_params``.  ``floor_frac`` of ALL the
+    stair tiles (pure + transition) keep a flat ground plane; the rest (``has_floor=False``) are the bare
+    stairs (+ platforms) as an isolated structure (no ground plane; the scan sees a drop-off beside them).
+    The merged list is re-numbered so ``terrain_id`` is contiguous ``0..N-1`` (each tile is reused by
+    many clips downstream, so one id == one physical tile).
     """
     common = dict(
         hd_grid=hd_grid, width_range=width_range, num_steps_range=num_steps_range,
@@ -269,6 +274,8 @@ def sample_stair_tiles(
                                  transition_length=transition_length,
                                  single_step_frac=single_step_frac, **common)
     tiles = pure + trans
+    for t in tiles:                                          # per-tile: keep the ground plane or not
+        t.has_floor = bool(rng.random() < floor_frac)
     for i, t in enumerate(tiles):
         t.terrain_id = i                                     # contiguous ids across the merged set
     return tiles

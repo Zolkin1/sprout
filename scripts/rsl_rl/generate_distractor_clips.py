@@ -236,13 +236,20 @@ def _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev):
     for o in overlays:
         o["pos_xy"] = _clear_box(o["pos_xy"], o["size"], o.pop("_dir"), occ, origin, args.cell, args.box_clearance)
 
-    # re-center clips + boxes to the tile local corner (min over footprints AND box extents)
-    cx0 = float(min(allpts[:, 0].min(), min(o["pos_xy"][0] - o["size"][0] / 2 for o in overlays)))
-    cy0 = float(min(allpts[:, 1].min(), min(o["pos_xy"][1] - o["size"][1] / 2 for o in overlays)))
+    # Tile bbox over the swept footprint AND every box extent, then pad by ``footprint_margin`` on
+    # ALL FOUR sides (corner = min - margin, size = span + 2*margin) so there is always ground around
+    # every box/wall -- the height scan sees floor beside an obstacle instead of it sitting flush at
+    # the tile edge.  The clips recenter by the same corner (cx0, cy0) below.
+    m = float(args.footprint_margin)
+    xmin = float(min(allpts[:, 0].min(), min(o["pos_xy"][0] - o["size"][0] / 2 for o in overlays)))
+    xmax = float(max(allpts[:, 0].max(), max(o["pos_xy"][0] + o["size"][0] / 2 for o in overlays)))
+    ymin = float(min(allpts[:, 1].min(), min(o["pos_xy"][1] - o["size"][1] / 2 for o in overlays)))
+    ymax = float(max(allpts[:, 1].max(), max(o["pos_xy"][1] + o["size"][1] / 2 for o in overlays)))
+    cx0, cy0 = xmin - m, ymin - m
     ov_manifest = [{"kind": "box", "pos_xy": [o["pos_xy"][0] - cx0, o["pos_xy"][1] - cy0],
                     "size_xyz": o["size"], "base_z": 0.0, "walkable_top": True, "yaw": 0.0} for o in overlays]
-    size_x = float(max(allpts[:, 0].max(), max(o["pos_xy"][0] + o["size"][0] / 2 for o in overlays)) - cx0) + args.footprint_margin
-    size_y = float(max(allpts[:, 1].max(), max(o["pos_xy"][1] + o["size"][1] / 2 for o in overlays)) - cy0) + args.footprint_margin
+    size_x = (xmax - xmin) + 2 * m
+    size_y = (ymax - ymin) + 2 * m
     manifest = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y, "overlays": ov_manifest}
 
     records = []

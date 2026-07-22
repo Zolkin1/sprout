@@ -60,6 +60,23 @@ def test_ids_contiguous_across_merged_population():
     assert sum(t.ttype == "transition" for t in tiles) == 3
 
 
+def test_floor_frac_controls_stair_ground_plane():
+    # Default (floor_frac=1.0): every stair tile keeps its ground plane.
+    all_floor = sample_stair_tiles(np.random.default_rng(10), n_pure=4, n_transition=12,
+                                   pure_length=20.0, transition_length=16.0, **_COMMON)
+    assert all(t.has_floor for t in all_floor)
+    # floor_frac=0.0: NO tile keeps it -- pure AND transition.
+    none_floor = sample_stair_tiles(np.random.default_rng(11), n_pure=4, n_transition=12,
+                                    pure_length=20.0, transition_length=16.0, floor_frac=0.0, **_COMMON)
+    assert not any(t.has_floor for t in none_floor)
+    # A partial fraction over many tiles yields a mix within BOTH families.
+    mixed = sample_stair_tiles(np.random.default_rng(12), n_pure=30, n_transition=30,
+                               pure_length=20.0, transition_length=16.0, floor_frac=0.5, **_COMMON)
+    for tt in ("terrain", "transition"):
+        flags = [t.has_floor for t in mixed if t.ttype == tt]
+        assert any(flags) and not all(flags)                 # both grounded and floorless present per family
+
+
 def test_pure_length_scales_with_target():
     short = sample_stair_tiles(np.random.default_rng(5), n_pure=1, n_transition=0,
                                pure_length=10.0, transition_length=16.0, **_COMMON)[0]

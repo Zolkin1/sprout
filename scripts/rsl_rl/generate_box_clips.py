@@ -546,7 +546,8 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev):
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "terrain",
-                      "size_x": size_x, "size_y": size_y, "overlays": overlays}
+                      "size_x": size_x, "size_y": size_y, "overlays": overlays,
+                      "has_floor": bool(tile.has_floor)}      # False => no flat ground plane in the loader
     tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)      # pure descent: no forward-cmd label
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
@@ -727,7 +728,8 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "transition",
-                      "size_x": size_x, "size_y": size_y, "overlays": overlays}
+                      "size_x": size_x, "size_y": size_y, "overlays": overlays,
+                      "has_floor": bool(tile.has_floor)}       # False => no flat ground plane in the loader
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
     tvel[:, 0] = float(approach_vx)                               # hold forward down the stairs + off
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
@@ -882,6 +884,9 @@ def main() -> int:
                    help="[tiles] ';'-sep approach speeds per transition tile (all share the tile).")
     p.add_argument("--tile-num-steps-min", type=int, default=3, help="[tiles] min stairs per transition tile.")
     p.add_argument("--tile-num-steps-max", type=int, default=7, help="[tiles] max stairs per transition tile.")
+    p.add_argument("--stair-floor-frac", type=float, default=0.5,
+                   help="[tiles] fraction of stair tiles (pure + transition) that keep a flat ground plane; "
+                        "the rest are the bare stairs (+ platforms) with NO ground under them (isolated).")
     p.add_argument("--num-box-tiles", type=int, default=0,
                    help="[tiles] If >0, generate N jump-on BOX tiles (fixed box on flat ground); each is "
                         "REUSED by --box-clips-per-tile approach speeds (shared terrain_id, no 1:1 tid).")
@@ -962,7 +967,8 @@ def main() -> int:
             width_range=(args.tile_width_min, args.tile_width_max),
             num_steps_range=(args.tile_num_steps_min, args.tile_num_steps_max),
             lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
-            nav_width_range=(args.tile_width_min, args.tile_width_max), flat_width_margin=0.3)
+            nav_width_range=(args.tile_width_min, args.tile_width_max), flat_width_margin=0.3,
+            floor_frac=args.stair_floor_frac)
         # Dedicated rng for the per-clip approach/recovery DURATION sampling (distinct seed so it does
         # not perturb the tile-geometry rng above -> both stay reproducible from --tile-seed).
         time_rng = np.random.default_rng(args.tile_seed + 1)

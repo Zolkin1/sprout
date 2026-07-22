@@ -39,6 +39,7 @@ from .blocks import (
     OverlayVolumeCfg,
     SlopeBlockCfg,
     StairBlockCfg,
+    build_overlay,
 )
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
@@ -198,9 +199,35 @@ def _tile_mesh(
 
     Returns the mesh plus the per-overlay metadata list emitted by
     :func:`composite_terrain` (empty when the tile has no overlays).
+
+    An empty ``blocks`` builds a NO-GROUND tile: only the overlay volumes are meshed (a
+    self-supporting structure such as a floating staircase), with no flat ground plane filling the
+    footprint. ``composite_terrain`` requires a base block, so that path is built directly here; the
+    per-overlay metadata mirrors ``composite_terrain``'s so downstream consumers are unaffected.
     """
+    overlays = list(overlays or [])
+    if not blocks:
+        meshes: list[trimesh.Trimesh] = []
+        ov_meta: list[dict] = []
+        for ov_cfg in overlays:
+            ov = build_overlay(ov_cfg)
+            meshes.append(ov.mesh)
+            ov_meta.append({
+                "kind": ov.kind,
+                "aabb": tuple(float(v) for v in ov.aabb),
+                "pos_xy": (float(ov_cfg.pos_xy[0]), float(ov_cfg.pos_xy[1])),
+                "size_xyz": tuple(float(v) for v in ov_cfg.size_xyz),
+                "base_z": float(ov_cfg.base_z),
+                "walkable_top": bool(ov.walkable_top),
+                "top_z": float(ov.top_z),
+                "variant": str(ov_cfg.variant),
+                "slab_thickness": float(ov_cfg.slab_thickness),
+                "leg_size": (float(ov_cfg.leg_size[0]), float(ov_cfg.leg_size[1])),
+                "leg_inset": float(ov_cfg.leg_inset),
+            })
+        return trimesh.util.concatenate(meshes), ov_meta
     sub = CompositeSubTerrainCfg(
-        size=footprint, blocks=blocks, overlays=list(overlays or []),
+        size=footprint, blocks=blocks, overlays=overlays,
         origin_block_index=0, start_z=0.0,
     )
     meshes, _origin, meta = composite_terrain(0.0, sub)
@@ -307,14 +334,32 @@ def assemble_clip_terrain(
     terrain_overlays: dict[int, list[dict]] = {}
     specs: list[tuple[int, int, tuple[float, float], list[TerrainBlockCfg], float, list[OverlayVolumeCfg]]] = []
     for m in terr:
+        # NEW tiles-then-clips schema: the generator emits the staircase as explicit walkable
+        # tread overlay boxes (source of truth) -- flat ground + those overlays, exactly like a box
+        # tile. ``has_floor=False`` drops the ground plane (isolated staircase). LEGACY schema
+        # (``dims``/``bands``) recomputes StairBlock geometry.
         tid = int(m["terrain_id"])
-        specs.append((tid, 1, terr_fp, _blocks_from_manifest(m, terr_fp[0]), 0.0, []))
+        if "overlays" in m:
+            ground = ([FlatBlockCfg(size_x=terr_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
+                      if m.get("has_floor", True) else [])
+            specs.append((tid, 1, terr_fp, ground, 0.0, _overlays_from_manifest(m)))
+        else:
+            specs.append((tid, 1, terr_fp, _blocks_from_manifest(m, terr_fp[0]), 0.0, []))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 1
     for m in trans:
+        # NEW schema: explicit overlays, and the clip is already in the tile-local frame (recentered
+        # by the tile corner at generation), so no front-pad shift. LEGACY: front-padded StairBlock.
+        # ``has_floor=False`` (per-tile) drops the flat ground plane: the stairs+platforms stand as an
+        # isolated structure (empty ``blocks`` -> overlays only), so the scan sees a drop-off beside it.
         tid = int(m["terrain_id"])
-        specs.append((tid, 2, trans_fp,
-                      _blocks_from_manifest(m, trans_fp[0], front_pad=transition_back_buffer),
-                      transition_back_buffer, []))
+        if "overlays" in m:
+            ground = ([FlatBlockCfg(size_x=trans_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
+                      if m.get("has_floor", True) else [])
+            specs.append((tid, 2, trans_fp, ground, 0.0, _overlays_from_manifest(m)))
+        else:
+            specs.append((tid, 2, trans_fp,
+                          _blocks_from_manifest(m, trans_fp[0], front_pad=transition_back_buffer),
+                          transition_back_buffer, []))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 2
     for m in slope:
         tid = int(m["terrain_id"])
