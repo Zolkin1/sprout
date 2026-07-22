@@ -31,6 +31,7 @@ from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.motion_matching.bones_ingest import load_cache
 from motion_gen.motion_matching.box_clip import (
     align_and_concat,
+    box_tile_box,
     build_anchor_mask_t,
     loop_periodic,
     n_periodic_loops,
@@ -47,7 +48,7 @@ from motion_gen.motion_matching.dp import DPConfig, DPMatcher
 from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
 from motion_gen.motion_matching.playback import inertialize_seam
 from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
-from motion_gen.motion_matching.terrain_sampler import sample_stair_tiles
+from motion_gen.motion_matching.terrain_sampler import sample_box_tiles, sample_stair_tiles
 from motion_gen.motion_matching.terrain_variants import resolve_box_variant
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
 from motion_gen.multiskill_manager import MultiSkillManager
@@ -486,6 +487,27 @@ def _place_descent_on_tile(ts, tile, boxes, dev, k=0, truncate=True):
     return Wp, Wq, Wj, terr_contact
 
 
+def _place_jump_on_tile(ts, tile_box, dev, k=0):
+    """Play the source jump from frame ``k`` (episodic), yaw-normalize so its box is axis-aligned, and
+    ANCHOR that box onto the tile's FIXED box -- the box-family mirror of :func:`_place_descent_on_tile`.
+
+    So every approach speed that shares the tile jumps onto the SAME fixed box.  ``tile_box`` is the
+    authored tile box (:func:`box_clip.box_tile_box`).  Returns ``(Wp, Wq, Wj, terr_contact)`` in the tile
+    frame (base at z=0; the jump lands on the box top).
+    """
+    rp, rq, jt, terr_contact = loop_periodic(
+        ts.root_pos.to(dev), ts.root_quat.to(dev), ts.joint_pos.to(dev),
+        None if ts.contact is None else ts.contact.to(dev), 1, offset=None, start=k)   # episodic: play once
+    Wp, Wq, Wj, _, _ = align_and_concat([(rp, rq, jt)])
+    src = dict(ts.terrain_meta.get("terrain", {}).get("boxes", [{}])[0])
+    Wp, Wq, aligned = yaw_normalize(Wp, Wq, [src], Wq[0])   # rotate so the box yaw -> 0 (axis-aligned)
+    sc = aligned[0]["pos"]                                  # source box CENTER in the aligned frame
+    sh = torch.tensor([float(tile_box["pos"][j]) - float(sc[j]) for j in range(3)],
+                      device=Wp.device, dtype=Wp.dtype)
+    Wp = Wp + sh                                            # land the jump's box on the fixed tile box
+    return Wp, Wq, Wj, terr_contact
+
+
 def _make_pure_tile_clip(builder, ts, tile, args, dev):
     """PURE stair TILE clip -> records dict (phase B, pure path).
 
@@ -713,6 +735,48 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
             "entry_frame": k, "n_terr": int(ts.n)}
 
 
+def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
+                        tile_box, overlay, corner, size_x, size_y, approach_s, recovery_s):
+    """One BOX-TILE clip (one approach speed) -> records dict.
+
+    Many approach speeds SHARE the tile's FIXED box + ``terrain_id`` + manifest (the box-family analog of
+    :func:`_make_transition_tile_clip`): DP(approach on flat, ``approach_s`` long) + PLAY(jump onto the fixed
+    box via :func:`_place_jump_on_tile`) + hold-on-box recovery, eased-spliced (jump-anchored `_splice_around`)
+    and recentered by the tile's FIXED ``corner`` so every clip on the tile emits identical geometry.  The
+    RL-visible ``target_vel`` is held FORWARD through approach+jump then 0 on the box (arrived).
+    """
+    T_app = max(1, int(round(approach_s / args.dt)))
+    T_exit = max(1, int(round(recovery_s / args.dt)))
+    entry_descs = matcher.entry_descriptors(ts, entry_frac=args.entry_frac)
+    entry_vx = _entry_vx(ts, args.dt)
+    app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
+    ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs, boundary_weight=args.boundary_weight,
+                                           relax_tail=0, allowed_categories=_APPROACH_FILTERS["box"])
+    k = int(matcher.matched_entry)
+    Wp_j, Wq_j, Wj_j, terr_contact = _place_jump_on_tile(ts, tile_box, dev, k=k)
+    # jump_on ends ELEVATED (standing on the box) -> HOLD that pose for the recovery (no dismount).
+    re = Wp_j[-1:].repeat(T_exit, 1); qe = Wq_j[-1:].repeat(T_exit, 1); je = Wj_j[-1:].repeat(T_exit, 1)
+    blend_n = int(round(args.seam_blend_s / args.dt))
+    Wp, Wq, Wj, bounds, box_seg = _splice_around(
+        (Wp_j, Wq_j, Wj_j), (ra.to(dev), qa.to(dev), ja.to(dev)), (re, qe, je),
+        top_surf=0.0, bot_surf=0.0, blend_n=blend_n)     # approach on flat z=0; held recovery already on the box
+    seg_masks = [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT]
+    Wp = Wp.clone(); Wp[:, 0] -= float(corner[0]); Wp[:, 1] -= float(corner[1])   # FIXED per-tile recenter
+    y, dy, contact = builder.build(Wp, Wq, Wj, args.dt)
+    a, b = bounds[box_seg]
+    if terr_contact is not None:                          # jump is the anchor -> kept fully (c_off=0)
+        contact[a:b] = terr_contact[:b - a].to(contact.dtype)
+    T = Wp.shape[0]
+    amt = build_anchor_mask_t(T, bounds, seg_masks, device=dev)
+    manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
+                      "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
+    tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
+    tvel[:bounds[box_seg][1], 0] = float(approach_vx)     # held forward through approach+jump; recovery 0 (on box)
+    return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
+            "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
+            "entry_frame": k, "n_terr": int(ts.n)}
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Traj-opt library (output channel layout).")
@@ -818,6 +882,13 @@ def main() -> int:
                    help="[tiles] ';'-sep approach speeds per transition tile (all share the tile).")
     p.add_argument("--tile-num-steps-min", type=int, default=3, help="[tiles] min stairs per transition tile.")
     p.add_argument("--tile-num-steps-max", type=int, default=7, help="[tiles] max stairs per transition tile.")
+    p.add_argument("--num-box-tiles", type=int, default=0,
+                   help="[tiles] If >0, generate N jump-on BOX tiles (fixed box on flat ground); each is "
+                        "REUSED by --box-clips-per-tile approach speeds (shared terrain_id, no 1:1 tid).")
+    p.add_argument("--box-clips-per-tile", type=int, default=4,
+                   help="[tiles] approach-speed clips per box tile (all share the tile's box + terrain_id).")
+    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.8, 3.0), metavar=("MIN", "MAX"),
+                   help="[tiles] approach forward-speed range (m/s) sampled per box-tile clip.")
     p.add_argument("--seam-blend-s", type=float, default=0.12,
                    help="[tiles] inertialization blend time (s) at the approach/descent/recovery splice "
                         "seams -- decays the joint discontinuity so transitions aren't snappy (0 = off).")
@@ -831,8 +902,8 @@ def main() -> int:
     # The matcher (candidate graph) is only needed where an approach/exit DP runs: the transition-tile
     # path and the legacy source-driven full path.  Pure tiles / --mode pure play the bare interaction
     # -> skip the expensive build.
-    need_matcher = args.n_transition_tiles > 0 or (
-        args.n_pure_tiles == 0 and args.mode == "full")
+    need_matcher = args.n_transition_tiles > 0 or args.num_box_tiles > 0 or (
+        args.n_pure_tiles == 0 and args.num_box_tiles == 0 and args.mode == "full")
     matcher = _build_matcher(args, dev) if need_matcher else None
     if matcher is None:
         print("[box] no approach DP needed: skipping candidate-graph build")
@@ -915,6 +986,50 @@ def main() -> int:
                     print(f"[box]   -> tile {tile.terrain_id} vx={vx}: approach_s={a_s:.2f} recovery_s={r_s:.2f}, "
                           f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
                     records.append(rec)
+    elif args.num_box_tiles > 0:
+        # Phase B for BOXES: N box tiles (source jump + variant + lateral offset), each a FIXED box on flat
+        # ground SHARED by --box-clips-per-tile approach speeds (the box-family reuse invariant; NO 1:1 tid).
+        C = int(args.box_clips_per_tile)
+        vlo, vhi = float(args.box_vel_range[0]), float(args.box_vel_range[1])
+        approach_len = args.approach_s_range[1] * max(vhi, 1e-3) + 1.0      # flat run-up >= the longest approach
+        m = args.footprint_margin
+        box_tiles = sample_box_tiles(np.random.default_rng(args.tile_seed),
+                                     n_tiles=args.num_box_tiles, n_sources=len(terr_srcs),
+                                     variant_fracs=box_variant_fracs,
+                                     nav_width_range=(args.tile_width_min, args.tile_width_max))
+        vel_rng = np.random.default_rng(args.tile_seed + 2)
+        time_rng = np.random.default_rng(args.tile_seed + 3)
+        print(f"[box] box tiles: {args.num_box_tiles} tiles x {C} clips, approach_len={approach_len:.1f} m, "
+              f"vel range [{vlo:.1f},{vhi:.1f}] from {len(terr_srcs)} source(s)")
+        for tile in box_tiles:
+            ts = terr_srcs[tile.source_idx]
+            box_size = [float(v) for v in ts.terrain_meta["terrain"]["boxes"][0]["size"]]
+            tile_box = box_tile_box(box_size=box_size, approach_len=approach_len, y_offset=tile.y_offset)
+            vp = resolve_box_variant(np.random.default_rng(args.seed + tile.terrain_id), box_size,
+                                     fracs={tile.variant: 1.0}, slab_thickness=args.slab_thickness,
+                                     leg_size=tuple(args.leg_size), leg_inset=args.leg_inset)
+            bx, by = float(tile_box["pos"][0]), float(tile_box["pos"][1])
+            sx, sy, sz = (float(v) for v in tile_box["size"])
+            x_lo, x_hi = bx - sx / 2.0 - approach_len, bx + sx / 2.0        # flat approach region + box
+            y_lo, y_hi = by - tile.nav_width / 2.0, by + tile.nav_width / 2.0
+            corner = (x_lo - m, y_lo - m)                                  # FIXED per tile -> identical geometry
+            size_x, size_y = (x_hi - x_lo) + 2 * m, (y_hi - y_lo) + 2 * m
+            overlay = {"kind": "box", "pos_xy": [bx - corner[0], by - corner[1]],
+                       "size_xyz": [sx, sy, sz], "base_z": float(tile_box["pos"][2] - sz / 2.0),
+                       "walkable_top": True, "yaw": float(tile_box["yaw"])}
+            overlay.update(vp)                                             # variant sub-boxes (fixed per tile)
+            vels = [float(vel_rng.uniform(vlo, vhi)) for _ in range(C)]
+            print(f"[box] box tile {tile.terrain_id}: src={tile.source_idx} variant={tile.variant} "
+                  f"box_h={sz:.2f} x{C} vels {[round(v, 2) for v in vels]}")
+            for vx in vels:
+                a_s = float(time_rng.uniform(*args.approach_s_range))
+                r_s = float(time_rng.uniform(*args.recovery_s_range))
+                rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
+                                          tile_box, overlay, corner, size_x, size_y, a_s, r_s)
+                rec["approach_vx"] = vx
+                print(f"[box]   -> box tile {tile.terrain_id} vx={vx:.2f}: approach_s={a_s:.2f} "
+                      f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
+                records.append(rec)
     else:
         tid = 0
         # Per-clip approach/recovery DURATION sampling for --box-splice eased (distinct seed so it does

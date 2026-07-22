@@ -10,7 +10,8 @@ results into a single training library at controlled per-family tile proportions
 
 * **stairs**      -- ``generate_box_clips`` tiles path (pure looped descents + flat->stairs->flat
   transition tiles), many approach speeds sharing each tile.
-* **boxes**       -- ``generate_box_clips --mode full`` jump-on-box traversals (eased splice).
+* **boxes**       -- ``generate_box_clips`` box-tiles path (a fixed jump-on box per tile, many approach
+  speeds sharing each tile -- the box analog of the stair transition tiles).
 * **distractors** -- ``generate_distractor_clips`` (a box is seen but NOT jumped: stop / turn / between).
 * **flat**        -- ``generate_mm_clips`` free flat locomotion (the negative-space majority class).
 
@@ -68,7 +69,11 @@ def main() -> int:
     p.add_argument("--pure-tiles", type=int, default=8)
     p.add_argument("--transition-tiles", type=int, default=8)
     p.add_argument("--transition-vels", default="0.8;1.5;2.5")
-    p.add_argument("--box-vels", default="0.5;1.0;1.5;2.0;2.5;3.0;3.5")
+    p.add_argument("--box-tiles", type=int, default=8, help="Jump-on box tiles (one fixed box each).")
+    p.add_argument("--box-clips-per-tile", type=int, default=4,
+                   help="Approach speeds per box tile (all share the tile's box + terrain_id).")
+    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
+                   help="Approach forward-speed range (m/s) sampled per box-tile clip.")
     p.add_argument("--distractor-clips-per-tile", type=int, default=6)
     p.add_argument("--flat-clip-length", type=float, default=9.0)
     # --- composed distribution (per-family tile counts + clips/tile cap) ---
@@ -84,7 +89,8 @@ def main() -> int:
     if args.quick:                                          # shrink everything for a fast pipeline check
         args.bones_limit = 1500
         args.pure_tiles, args.transition_tiles = 1, 1
-        args.transition_vels, args.box_vels = "0.8;1.5", "1.0;2.0"
+        args.transition_vels = "0.8;1.5"
+        args.box_tiles, args.box_clips_per_tile = 2, 2
         args.distractor_clips_per_tile = 3
         args.flat_clip_length = 6.0
         args.mix_stairs = args.mix_boxes = args.mix_distractors = args.mix_flat = 4
@@ -108,8 +114,10 @@ def main() -> int:
             "--out", fam["stairs"]])
     if "boxes" not in skip:
         _run("boxes", "generate_box_clips.py", common + bl + [
-            "--mode", "full", "--terrain-lib", args.terrain_lib, "--terrain-skills", "jump_on",
-            "--approach-vels", args.box_vels, "--seed", str(args.seed), "--out", fam["boxes"]])
+            "--terrain-lib", args.terrain_lib, "--terrain-skills", "jump_on",
+            "--num-box-tiles", str(args.box_tiles), "--box-clips-per-tile", str(args.box_clips_per_tile),
+            "--box-vel-range", str(args.box_vel_range[0]), str(args.box_vel_range[1]),
+            "--tile-seed", str(args.seed), "--seed", str(args.seed), "--out", fam["boxes"]])
     if "distractors" not in skip:
         _run("distractors", "generate_distractor_clips.py", common + bl + [
             "--clips-per-tile", str(args.distractor_clips_per_tile), "--seed", str(args.seed),

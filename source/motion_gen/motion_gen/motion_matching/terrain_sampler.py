@@ -19,7 +19,25 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from motion_gen.motion_matching.terrain_variants import resolve_stair_decor
+from motion_gen.motion_matching.terrain_variants import normalize_box_variant_fracs, resolve_stair_decor
+
+
+@dataclass
+class BoxTileSpec:
+    """One jump-on BOX tile to build clips on -- a fixed box on flat ground that many approach speeds
+    (clips_per_tile) SHARE downstream (the box-family analog of a ``transition`` stair tile).
+
+    The box SIZE / height comes from the played jump ``source_idx`` (resolved in the generator, which
+    holds the sources); this spec carries only the tile-distinguishing choices so ``terrain_sampler``
+    stays isaaclab-free and geometry-free.  With a single jump source every tile shares that height and
+    varies by ``variant`` + ``y_offset``; more sources give height/motion diversity for free.
+    """
+
+    terrain_id: int
+    source_idx: int                # which played jump source (box height + motion) this tile uses
+    variant: str                   # box support variant: solid | floating | floating_center_leg | floating_corner_legs
+    y_offset: float                # signed lateral box offset from the corridor centerline (m)
+    nav_width: float               # corridor width in y
 
 
 @dataclass
@@ -253,4 +271,43 @@ def sample_stair_tiles(
     tiles = pure + trans
     for i, t in enumerate(tiles):
         t.terrain_id = i                                     # contiguous ids across the merged set
+    return tiles
+
+
+def sample_box_tiles(
+    rng: np.random.Generator,
+    *,
+    n_tiles: int,
+    n_sources: int,
+    variant_fracs: dict | None,
+    nav_width_range: tuple[float, float],
+    y_offset_max_frac: float = 0.3,
+) -> list[BoxTileSpec]:
+    """Sample the offline BOX tile population -- phase A of tiles-then-clips for jump-on boxes.
+
+    Each tile fixes a played jump ``source_idx`` (box height + motion), a support ``variant`` (drawn by
+    ``variant_fracs``), and a lateral ``y_offset`` within a per-tile corridor; ``clips_per_tile`` approach
+    speeds SHARE the tile downstream.  ``terrain_id`` is contiguous ``0..n_tiles-1`` (one id == one tile).
+
+    Args:
+        rng: numpy Generator.
+        n_tiles: number of box tiles.
+        n_sources: number of played jump sources to choose from (>= 1).
+        variant_fracs: box support-variant weights (see ``normalize_box_variant_fracs``; ``None`` => solid).
+        nav_width_range: corridor width (m), sampled per tile.
+        y_offset_max_frac: max ``|box offset|`` as a fraction of half the corridor width.
+
+    Returns:
+        A list of :class:`BoxTileSpec`.
+    """
+    fr = normalize_box_variant_fracs(variant_fracs)
+    names = list(fr.keys())
+    weights = np.array([fr[n] for n in names], dtype=float)
+    tiles: list[BoxTileSpec] = []
+    for tid in range(int(n_tiles)):
+        src = int(rng.integers(0, max(1, int(n_sources))))
+        variant = str(rng.choice(names, p=weights))
+        nav = float(rng.uniform(*nav_width_range))
+        yoff = float(rng.uniform(-1.0, 1.0)) * float(y_offset_max_frac) * (nav / 2.0)
+        tiles.append(BoxTileSpec(terrain_id=tid, source_idx=src, variant=variant, y_offset=yoff, nav_width=nav))
     return tiles

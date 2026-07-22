@@ -190,6 +190,24 @@ def stair_tile_boxes(
     return boxes
 
 
+def box_tile_box(*, box_size, approach_len: float, y_offset: float = 0.0) -> dict:
+    """FIXED tile geometry for a single jump-on BOX: one walkable box on flat ground (tile-local, +x = travel).
+
+    Authored ONCE per tile and SHARED by all of its clips (many approach speeds jump onto the SAME box) --
+    the box-family analog of :func:`stair_tile_boxes`.  The box's near face sits ``approach_len`` down the
+    flat run-up (so the tile holds the longest approach in front of it); its top (``base_z + sz``) is the
+    landing surface.  Returns one ``{pos:[x,y,z], size:[sx,sy,sz], yaw:0}`` (base at z=0).
+
+    Args:
+        box_size: the played jump source's box extents ``(sx, sy, sz)``.
+        approach_len: flat run-up length (m) in front of the box (>= the longest approach that shares the tile).
+        y_offset: signed lateral offset of the box from the corridor centerline (m).
+    """
+    sx, sy, sz = (float(v) for v in box_size)
+    return {"pos": [float(approach_len) + sx / 2.0, float(y_offset), sz / 2.0],
+            "size": [sx, sy, sz], "yaw": 0.0}
+
+
 def loop_periodic(rp: torch.Tensor, rq: torch.Tensor, jt: torch.Tensor,
                   contact: torch.Tensor | None, n_loops: int, offset=None, start: int = 0):
     """Play the FULL periodic stride from frame ``start``, then wrap it forward ``n_loops-1`` more times.
