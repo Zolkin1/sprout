@@ -961,7 +961,10 @@ def main() -> int:
             "stride_idx": torch.full((1, T), -1, dtype=torch.int32, device=dev),
             "target_vel": _pad_or_trim(r["target_vel"], T).unsqueeze(0),
             "terrain_id": torch.tensor([r["terrain_id"]], dtype=torch.int32, device=dev),
-            "terrain_type": "box",
+            # Tag the per-clip terrain_type_code from THIS clip's manifest ("box" for jumps/distractors,
+            # "terrain" for pure stair tiles, "transition" for stair-transition tiles) -- was hardcoded
+            # "box", which mislabeled every stair tile as a box.
+            "terrain_type": r["manifest"]["type"],
             "anchor_mask": torch.tensor([_ANCHOR_MASK_BOX], dtype=torch.uint8, device=dev),
             "anchor_mask_t": _pad_or_trim(r["anchor_mask_t"], T).unsqueeze(0),
         }
