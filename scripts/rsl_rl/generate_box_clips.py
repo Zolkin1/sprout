@@ -185,7 +185,7 @@ def _build_matcher(args, dev):
 
 
 def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
-                   box_variant_seed=0, box_variant_params=None):
+                   box_variant_seed=0, box_variant_params=None, approach_s=None, recovery_s=None):
     """One box clip -> (records dict) for padding.
 
     ``--mode full`` (default): DP(approach @ approach_vx) + PLAY(ts) + exit -- the traversal.
@@ -196,8 +196,12 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
     (solid / floating-top / center-leg / corner-legs).  The seed is keyed on the
     physical terrain (not the approach speed) so a terrain's box looks identical
     across speeds; the variant is applied only when the terrain has exactly one
-    walkable box (a jump box), never to multi-box stair-as-boxes traversals.
+    walkable box (a jump box), never to multi-box stair-as-boxes traversals.  ``approach_s`` /
+    ``recovery_s`` override the fixed approach/recovery durations (``--box-splice eased`` passes
+    per-clip sampled values so the run-up / recovery lengths vary like the stair tiles).
     """
+    approach_s = args.approach_s if approach_s is None else float(approach_s)
+    recovery_s = args.recovery_s if recovery_s is None else float(recovery_s)
     # Loop a PERIODIC terrain stride (e.g. stairs) enough times to traverse its geometry; an EPISODIC
     # interaction (a box jump) loops once. Geometry-driven, so it stays terrain-generic (no stair code).
     boxes_geom = ts.terrain_meta.get("terrain", {}).get("boxes", [])
@@ -212,8 +216,8 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         terr = (rp, rq, jt)
         segments, box_seg, seg_masks = [terr], 0, [_ANCHOR_MASK_BOX]
     else:
-        T_app = max(1, int(round(args.approach_s / args.dt)))
-        T_exit = max(1, int(round(args.recovery_s / args.dt)))
+        T_app = max(1, int(round(approach_s / args.dt)))
+        T_exit = max(1, int(round(recovery_s / args.dt)))
         tail = max(1, int(round(args.approach_ramp_s / args.dt)))
         # Hand off into ANY of the terrain clip's first ``entry_frac`` frames (a faster run-up can
         # merge into a later moving frame; a standing jump only has frame 0, so it lands there).
@@ -230,7 +234,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         # --transition ramp (default): prescribe a velocity decel to entry_vx and TRACK it (real
         # stepping gait into the entry, least foot slide); relax: hold the command + relax tracking.
         if args.transition == "ramp":
-            app_cmd = _ramp_cmd(approach_vx, args.approach_s, args.approach_ramp_s, vx1=entry_vx)
+            app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
             ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
                                                    boundary_weight=args.boundary_weight, relax_tail=0,
                                                    allowed_categories=_APPROACH_FILTERS["box"])
@@ -249,7 +253,8 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         terr = (rp, rq, jt)
         # Interaction-aware exit: ELEVATED end (jumped ONTO a box, no dismount) -> HOLD the
         # stand-on-box pose; else run a flat recovery DP seeded from the exit state.
-        if float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15:
+        elevated = float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15
+        if elevated:
             re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
             qe = ts.root_quat[-1:].to(dev).repeat(T_exit, 1)
             je = ts.joint_pos[-1:].to(dev).repeat(T_exit, 1)
@@ -270,64 +275,85 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         segments, box_seg, seg_masks = ([(ra, qa, ja), terr, (re, qe, je)], 1,
                                         [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT])
 
-    Wp, Wq, Wj, bounds, tfs = align_and_concat(segments)
+    # --- Choose the splice: EASED (jump-anchored, the SAME path the stair tiles use) or the legacy
+    # rigid SE(2)+z WELD.  Eased applies only to an EPISODIC full traversal (a box jump); pure mode and
+    # periodic (stairs-as-boxes) traversals stay on the weld. ---
+    use_eased = (args.box_splice == "eased" and args.mode != "pure"
+                 and box_seg == 1 and n_loops == 1)
+    if use_eased:
+        # Jump is the ANCHOR (kept pristine), so its box geometry rides along UNCHANGED (no per-segment
+        # transform) and stays 1:1 with the played contacts (c_off=0).  The flat approach / recovery are
+        # placed grounded to their OWN surface and each seam is eased via inertialize_seam (not welded).
+        boxes = ts.terrain_meta["terrain"].get("boxes", [])
+        jP, jQ = terr[0], terr[1]
+        top_surf = _ground_z_under(jP[0, :2], boxes)                          # surface under the jump ENTRY
+        bot_surf = 0.0 if elevated else _ground_z_under(jP[-1, :2], boxes)    # held pose is already placed
+        blend_n = int(round(args.seam_blend_s / args.dt))
+        Wp, Wq, Wj, bounds, box_seg = _splice_around(terr, (ra, qa, ja), (re, qe, je),
+                                                     top_surf, bot_surf, blend_n)
+        Wp, Wq, boxes = yaw_normalize(Wp, Wq, boxes, jQ[0])   # axis-align the whole traversal by the box yaw
+        c_off = 0
+    else:
+        if args.box_splice == "eased" and args.mode != "pure" and box_seg == 1 and n_loops > 1:
+            print("[box][WARN] --box-splice eased is episodic-only; this periodic traversal falls back to weld.")
+        Wp, Wq, Wj, bounds, tfs = align_and_concat(segments)
 
-    # The exported box geometry (in the terrain clip's own frame) glued to the played segment via
-    # its splice transform -- this is where the CLIP says the box goes, not a heuristic.
-    gq_t, t_t = tfs[box_seg]
-    boxes = transform_boxes(ts.terrain_meta["terrain"].get("boxes", []), gq_t, t_t)
-    # Normalize the whole traversal (clip + boxes) so the terrain is axis-aligned (box yaw -> ~0):
-    # the approach heading is arbitrary, and leaving it in yaws the box under the motion.
-    Wp, Wq, boxes = yaw_normalize(Wp, Wq, boxes, gq_t)
+        # The exported box geometry (in the terrain clip's own frame) glued to the played segment via
+        # its splice transform -- this is where the CLIP says the box goes, not a heuristic.
+        gq_t, t_t = tfs[box_seg]
+        boxes = transform_boxes(ts.terrain_meta["terrain"].get("boxes", []), gq_t, t_t)
+        # Normalize the whole traversal (clip + boxes) so the terrain is axis-aligned (box yaw -> ~0):
+        # the approach heading is arbitrary, and leaving it in yaws the box under the motion.
+        Wp, Wq, boxes = yaw_normalize(Wp, Wq, boxes, gq_t)
 
-    # Place a looped periodic traversal at the FIRST tread. The source period is cropped from wherever
-    # it happened to sit on the staircase (often MID-flight), so its entry lands on a middle tread and
-    # the N loops then run off the end. Detect the first tread (highest for a descent, lowest for a
-    # climb) and shift the whole clip so the entry stands on THAT tread instead -- preserving the
-    # source's foot->tread offset (which the per-loop check confirmed) but starting at the top/bottom,
-    # so every loop lands on a real tread. Generic: needs only the traversal's net z-direction.
-    if n_loops > 1 and boxes:
-        k0, k1 = bounds[box_seg]
-        descends = float(Wp[k0, 2] - Wp[k1 - 1, 2]) > 0.0
-        # STEP treads only -- exclude the wide top/bottom PLATFORMS (size_x >> the step depth), or the
-        # entry gets centered on a platform instead of standing on the first step.
-        min_sx = min(float(b["size"][0]) for b in boxes)
-        steps = [i for i, b in enumerate(boxes) if float(b["size"][0]) <= 1.5 * min_sx] or list(range(len(boxes)))
-        tread_top = {i: float(boxes[i]["pos"][2]) + float(boxes[i]["size"][2]) / 2.0 for i in steps}
-        first = (max if descends else min)(steps, key=lambda i: tread_top[i])
-        exy = Wp[k0, :2].tolist()
-        cur = min(steps, key=lambda i: (boxes[i]["pos"][0] - exy[0]) ** 2 + (boxes[i]["pos"][1] - exy[1]) ** 2)
-        sh = torch.tensor([boxes[first]["pos"][j] - boxes[cur]["pos"][j] for j in range(3)],
-                          device=Wp.device, dtype=Wp.dtype)
-        Wp = Wp + sh                                 # entry now stands on the first STEP tread
-        # Level the top/bottom PLATFORMS (wide boxes) flush with the END treads. The source puts them
-        # one riser BEYOND the extreme steps (a real upper/lower floor), but the played motion starts
-        # and ends ON the extreme treads -- so a floor one riser off leaves a phantom step at the
-        # stair<->platform junction. Flushing them to the end treads makes the approach/recovery level
-        # with where the descent actually begins/ends.
-        ttops = sorted(float(boxes[i]["pos"][2]) + float(boxes[i]["size"][2]) / 2.0 for i in steps)
-        hi_t, lo_t = ttops[-1], ttops[0]
-        riser = (hi_t - lo_t) / max(1, len(ttops) - 1)
-        for j, b in enumerate(boxes):
-            if j not in steps:                       # a platform (wide box)
-                top = float(b["pos"][2]) + float(b["size"][2]) / 2.0
-                # The motion STARTS on the first (highest) step but ENDS one riser BELOW the last step,
-                # on the floor -- so the TOP platform is flush with the first step, the BOTTOM platform
-                # is the floor one riser under the last step (else it duplicates the last step).
-                tgt = hi_t if abs(top - hi_t) < abs(top - lo_t) else (lo_t - riser)
-                b["pos"] = [float(b["pos"][0]), float(b["pos"][1]), tgt - float(b["size"][2]) / 2.0]
+        # Place a looped periodic traversal at the FIRST tread. The source period is cropped from wherever
+        # it happened to sit on the staircase (often MID-flight), so its entry lands on a middle tread and
+        # the N loops then run off the end. Detect the first tread (highest for a descent, lowest for a
+        # climb) and shift the whole clip so the entry stands on THAT tread instead -- preserving the
+        # source's foot->tread offset (which the per-loop check confirmed) but starting at the top/bottom,
+        # so every loop lands on a real tread. Generic: needs only the traversal's net z-direction.
+        if n_loops > 1 and boxes:
+            k0, k1 = bounds[box_seg]
+            descends = float(Wp[k0, 2] - Wp[k1 - 1, 2]) > 0.0
+            # STEP treads only -- exclude the wide top/bottom PLATFORMS (size_x >> the step depth), or the
+            # entry gets centered on a platform instead of standing on the first step.
+            min_sx = min(float(b["size"][0]) for b in boxes)
+            steps = [i for i, b in enumerate(boxes) if float(b["size"][0]) <= 1.5 * min_sx] or list(range(len(boxes)))
+            tread_top = {i: float(boxes[i]["pos"][2]) + float(boxes[i]["size"][2]) / 2.0 for i in steps}
+            first = (max if descends else min)(steps, key=lambda i: tread_top[i])
+            exy = Wp[k0, :2].tolist()
+            cur = min(steps, key=lambda i: (boxes[i]["pos"][0] - exy[0]) ** 2 + (boxes[i]["pos"][1] - exy[1]) ** 2)
+            sh = torch.tensor([boxes[first]["pos"][j] - boxes[cur]["pos"][j] for j in range(3)],
+                              device=Wp.device, dtype=Wp.dtype)
+            Wp = Wp + sh                                 # entry now stands on the first STEP tread
+            # Level the top/bottom PLATFORMS (wide boxes) flush with the END treads. The source puts them
+            # one riser BEYOND the extreme steps (a real upper/lower floor), but the played motion starts
+            # and ends ON the extreme treads -- so a floor one riser off leaves a phantom step at the
+            # stair<->platform junction. Flushing them to the end treads makes the approach/recovery level
+            # with where the descent actually begins/ends.
+            ttops = sorted(float(boxes[i]["pos"][2]) + float(boxes[i]["size"][2]) / 2.0 for i in steps)
+            hi_t, lo_t = ttops[-1], ttops[0]
+            riser = (hi_t - lo_t) / max(1, len(ttops) - 1)
+            for j, b in enumerate(boxes):
+                if j not in steps:                       # a platform (wide box)
+                    top = float(b["pos"][2]) + float(b["size"][2]) / 2.0
+                    # The motion STARTS on the first (highest) step but ENDS one riser BELOW the last step,
+                    # on the floor -- so the TOP platform is flush with the first step, the BOTTOM platform
+                    # is the floor one riser under the last step (else it duplicates the last step).
+                    tgt = hi_t if abs(top - hi_t) < abs(top - lo_t) else (lo_t - riser)
+                    b["pos"] = [float(b["pos"][0]), float(b["pos"][1]), tgt - float(b["size"][2]) / 2.0]
 
-    # Ground the FLAT approach on its walkable surface -- generic "DB height + ground height". A flat DB
-    # clip is grounded to soles-at-0, so on an elevated surface it just gets that surface height ADDED:
-    # 0 on flat ground (unchanged), the platform height on a stair TOP platform. Using the DB-grounded
-    # approach root (``ra``, feet~0) + the surface under the terrain ENTRY -- rather than the z the seam
-    # chain happened to leave it at -- is what lifts the lead-in walk up onto the platform instead of
-    # into it. (Recovery is the mirror, grounded to its EXIT surface; handled next.)
-    if box_seg > 0 and boxes:
-        a0, a1 = bounds[0]                                       # approach segment slice
-        entry_gh = _ground_z_under(Wp[a1, :2], boxes)           # surface the terrain entry stands on
-        Wp = Wp.clone()
-        Wp[a0:a1, 2] = ra[:, 2].to(Wp) + entry_gh
+        # Ground the FLAT approach on its walkable surface -- generic "DB height + ground height". A flat DB
+        # clip is grounded to soles-at-0, so on an elevated surface it just gets that surface height ADDED:
+        # 0 on flat ground (unchanged), the platform height on a stair TOP platform. Using the DB-grounded
+        # approach root (``ra``, feet~0) + the surface under the terrain ENTRY -- rather than the z the seam
+        # chain happened to leave it at -- is what lifts the lead-in walk up onto the platform instead of into it.
+        if box_seg > 0 and boxes:
+            a0, a1 = bounds[0]                                       # approach segment slice
+            entry_gh = _ground_z_under(Wp[a1, :2], boxes)           # surface the terrain entry stands on
+            Wp = Wp.clone()
+            Wp[a0:a1, 2] = ra[:, 2].to(Wp) + entry_gh
+        c_off = 0 if box_seg == 0 else 1                            # align_and_concat drops each non-anchor seam frame
 
     # Tile footprint = union of the clip PATH and the BOX footprint, with margin on ALL sides, so the
     # box sits fully INSIDE the tile (not overhanging the void gap) and inset from the edges instead of
@@ -348,7 +374,8 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
     # Splice the terrain segment's REAL exported foot contacts (looped with the motion) over the
     # kinematic ones. Segment 0 keeps its seam frame; later segments dropped theirs in align_and_concat.
     a, b = bounds[box_seg]
-    c_off = 0 if box_seg == 0 else 1
+    # ``c_off`` set by the splice branch above: weld drops each non-anchor seam frame (1); eased keeps
+    # the anchored jump's frames intact (0).
     if terr_contact is not None:
         contact[a:b] = terr_contact[c_off:c_off + (b - a)].to(contact.dtype)
 
@@ -722,6 +749,11 @@ def main() -> int:
                         "velocity decel the DP tracks -> a real stepping gait (less foot slide). "
                         "'relax': hold the command + relax tracking near the terminal so the DP "
                         "searches the transition (smoother root vel, but more foot slide at speed).")
+    p.add_argument("--box-splice", choices=["weld", "eased"], default="eased",
+                   help="How the box approach/recovery join the played jump. 'eased' (default): the SAME "
+                        "jump-anchored inertialize_seam splice the stair tiles use, with per-clip SAMPLED "
+                        "durations from --approach-s-range/--recovery-s-range (episodic jumps only). 'weld': "
+                        "the legacy rigid SE(2)+z C0 weld (align_and_concat) with FIXED --approach-s/--recovery-s.")
     p.add_argument("--clip-length", type=float, default=None,
                    help="Fixed clip length (s); default = the longest traversal.")
     p.add_argument("--boundary-weight", type=float, default=200.0,
@@ -885,12 +917,22 @@ def main() -> int:
                     records.append(rec)
     else:
         tid = 0
+        # Per-clip approach/recovery DURATION sampling for --box-splice eased (distinct seed so it does
+        # not perturb the box-variant rng); weld keeps the fixed --approach-s/--recovery-s.
+        box_time_rng = np.random.default_rng(args.seed + 7919)
         for ti, ts in enumerate(terr_srcs):
             for vx in approach_vels:
-                print(f"[box] splicing {ts.name} @ approach vx={vx} (terrain_id={tid}) ...")
+                if args.box_splice == "eased":
+                    a_s = float(box_time_rng.uniform(*args.approach_s_range))
+                    r_s = float(box_time_rng.uniform(*args.recovery_s_range))
+                else:
+                    a_s, r_s = args.approach_s, args.recovery_s
+                print(f"[box] splicing {ts.name} @ approach vx={vx} (terrain_id={tid}) "
+                      f"[{args.box_splice}: approach_s={a_s:.2f} recovery_s={r_s:.2f}] ...")
                 rec = _make_box_clip(matcher, builder, ts, tid, vx, args, dev,
                                      box_variant_seed=args.seed + ti,
-                                     box_variant_params=box_variant_params)
+                                     box_variant_params=box_variant_params,
+                                     approach_s=a_s, recovery_s=r_s)
                 rec["approach_vx"] = vx
                 print(f"[box]   -> entered terrain at frame {rec['entry_frame']}/{rec['n_terr']}")
                 for w in getattr(matcher, "warnings", []) or []:
