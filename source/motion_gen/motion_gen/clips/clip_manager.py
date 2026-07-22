@@ -45,6 +45,8 @@ class MotionClipManager(ManagerBase):
         # resolves to the legacy mask for every clip here (single interpretation
         # point), so downstream re-anchoring never special-cases missing masks.
         self.anchor_mask: torch.Tensor = lib.anchor_mask_or_legacy(self.device)  # [num_clips] uint8
+        # Per-clip REAL length (valid frames before padding); full ``num_steps`` for legacy libs.
+        self.clip_len: torch.Tensor = lib.clip_len_or_full(self.device)          # [num_clips] long
         # Per-STEP root-DOF anchor bitmask [num_clips, T] for clips whose anchoring varies
         # WITHIN the clip (box clips: y-free-pinned approach/jump, then ego recovery). For
         # clips without a per-step schedule this broadcasts the per-clip mask across T, so

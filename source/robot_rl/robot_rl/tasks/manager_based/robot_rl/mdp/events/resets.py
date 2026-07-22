@@ -287,8 +287,10 @@ def reset_on_motion_sequence(
     if cmd.cfg.random_start_phase:
         # Leave at least random_start_min_remaining_s of clip after the start.
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        hi = max(1, num_steps - margin)
-        start_step = torch.randint(0, hi, (k,), device=device)
+        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
+        # so a short clip's random start doesn't land in (or past) its padding tail.
+        hi = (cmd.manager.clip_len[clip_id].to(device) - margin).clamp(min=1)
+        start_step = (torch.rand(k, device=device) * hi.float()).long()
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
@@ -488,8 +490,10 @@ def reset_on_terrain_motion_sequence(
     clip_id = sample_terrain_clips(env_tid, groups)
     if cmd.cfg.random_start_phase:
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        hi = max(1, num_steps - margin)
-        start_step = torch.randint(0, hi, (k,), device=device)
+        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
+        # so a short clip's random start doesn't land in (or past) its padding tail.
+        hi = (cmd.manager.clip_len[clip_id].to(device) - margin).clamp(min=1)
+        start_step = (torch.rand(k, device=device) * hi.float()).long()
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 

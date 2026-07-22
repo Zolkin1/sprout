@@ -49,6 +49,7 @@ def _synthetic_lib(num_clips=4, T=10) -> ClipLibraryData:
         terrain_id=torch.full((num_clips,), -1, dtype=torch.int32),
         terrain_type_code=torch.zeros(num_clips, dtype=torch.uint8),
         anchor_mask=torch.empty(0, dtype=torch.uint8),  # empty => legacy fallback
+        clip_len=torch.empty(0, dtype=torch.int32),  # empty => full num_steps
         anchor_mask_t=torch.empty(0, dtype=torch.uint8),  # empty => broadcast per-clip mask
         meta=meta, attrs={},
     )

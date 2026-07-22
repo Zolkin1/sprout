@@ -92,6 +92,9 @@ def _clip_batch(lib, idx: int, T: int, new_tid: int, dev):
         "terrain_type": lib.attrs.get("terrain_type_names", ["flat", "terrain", "transition", "slope", "box"])[
             int(lib.terrain_type_code[idx])],
         "anchor_mask": lib.anchor_mask_or_legacy()[idx:idx + 1],
+        # Carry the source clip's REAL length (not the new common T) so a short clip padded into a
+        # longer composed library still ends the episode at its own last frame.
+        "clip_len": lib.clip_len_or_full()[idx:idx + 1].to(torch.int32),
     }
     if has_amt:
         b["anchor_mask_t"] = _pad(lib.anchor_mask_t[idx], T).unsqueeze(0)

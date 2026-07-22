@@ -965,6 +965,7 @@ def main() -> int:
             # "terrain" for pure stair tiles, "transition" for stair-transition tiles) -- was hardcoded
             # "box", which mislabeled every stair tile as a box.
             "terrain_type": r["manifest"]["type"],
+            "clip_len": torch.tensor([int(r["n"])], dtype=torch.int32, device=dev),  # real length pre-pad
             "anchor_mask": torch.tensor([_ANCHOR_MASK_BOX], dtype=torch.uint8, device=dev),
             "anchor_mask_t": _pad_or_trim(r["anchor_mask_t"], T).unsqueeze(0),
         }

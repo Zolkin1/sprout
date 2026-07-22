@@ -59,6 +59,10 @@ _PERCLIP_DTYPES: dict[str, str] = {
     "terrain_id": "int32",
     "terrain_type_code": "uint8",
     "anchor_mask": "uint8",
+    # Real length (valid frames) before padding.  Clips are stored padded to a common ``T``
+    # (repeat-last-frame); ``clip_len`` marks where the actual motion ends so the RL can end
+    # the episode at the clip's own last frame instead of playing the held padding tail.
+    "clip_len": "int32",
 }
 
 # Canonical terrain-type ordering (code = index; APPEND only -- codes are stored
@@ -91,6 +95,7 @@ class ClipLibraryWriter:
         self.num_clips = int(num_clips)
         self.meta = dict(meta)
         T = int(meta["num_steps"])
+        self._T = T
         P = len(meta["pos_output_names"])
         V = len(meta["vel_output_names"])
         C = len(meta["contact_frames"])
@@ -119,6 +124,10 @@ class ClipLibraryWriter:
         # writer that sets nothing reproduces today's re-anchoring behavior.
         self._f.create_dataset("anchor_mask", shape=(num_clips,), dtype="uint8")
         self._f["anchor_mask"][...] = _ANCHOR_MASK_LEGACY
+        # Per-clip real length (valid frames before padding); default = full T so a writer that sets
+        # nothing => the whole clip is real (no early clip-end, i.e. today's behavior).
+        self._f.create_dataset("clip_len", shape=(num_clips,), dtype="int32")
+        self._f["clip_len"][...] = T
         self._f.attrs["terrain_type_names"] = json.dumps(_TERRAIN_TYPE_NAMES)
         # Store layout metadata as JSON attrs.
         for k, v in self.meta.items():
@@ -150,6 +159,10 @@ class ClipLibraryWriter:
         if "anchor_mask" in batch:
             am = batch["anchor_mask"].detach().to("cpu").numpy()
             self._f["anchor_mask"][start_idx:end] = am.astype("uint8", copy=False)
+        # Per-clip real length (optional; leave the full-T default if the batch omits it), clamped to T.
+        if "clip_len" in batch:
+            cl = batch["clip_len"].detach().to("cpu").numpy()
+            self._f["clip_len"][start_idx:end] = np.clip(cl, 1, self._T).astype("int32", copy=False)
         # Optional per-STEP anchor mask [N, T] -- box clips vary anchoring by segment (jump-on
         # world-pinned, approach / on-top walk / recovery ego), so a single per-clip mask can't
         # express them.  Lazily created; absent -> the per-clip ``anchor_mask`` applies to every
@@ -207,6 +220,7 @@ class ClipLibraryData:
     terrain_id: torch.Tensor     # [N] int32 manifest id (-1 flat); empty if absent
     terrain_type_code: torch.Tensor  # [N] uint8 index into terrain_type_names; empty if absent
     anchor_mask: torch.Tensor    # [N] uint8 root-DOF FREE/FIXED bitmask; empty (=> legacy) if absent
+    clip_len: torch.Tensor       # [N] int32 real length before padding; empty (=> full T) if absent
     anchor_mask_t: torch.Tensor  # [N, T] uint8 per-STEP anchor mask (box clips); empty if absent
     meta: dict
     attrs: dict
@@ -230,6 +244,18 @@ class ClipLibraryData:
         if self.anchor_mask.numel() == 0:
             return torch.full((self.num_clips,), _ANCHOR_MASK_LEGACY, dtype=torch.uint8, device=dev)
         return self.anchor_mask.to(dev)
+
+    def clip_len_or_full(self, device: str | torch.device | None = None) -> torch.Tensor:
+        """Per-clip real length ``[N]`` (long); a full ``num_steps`` tensor if the dataset is absent.
+
+        A library written before ``clip_len`` existed loads it empty; those clips are treated as
+        full-length (no early clip-end), i.e. exactly the previous behavior.  Single interpretation
+        point so consumers always get a valid per-clip length.
+        """
+        dev = device if device is not None else self.clip_len.device
+        if self.clip_len.numel() == 0:
+            return torch.full((self.num_clips,), self.num_steps, dtype=torch.long, device=dev)
+        return self.clip_len.to(dev).long()
 
     def anchor_mask_per_step(self, device: str | torch.device | None = None) -> torch.Tensor:
         """Per-clip-per-step anchor mask ``[N, T]`` uint8.
