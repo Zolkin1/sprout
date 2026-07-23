@@ -281,7 +281,7 @@ def main() -> int:
     p.add_argument("--footprint-margin", type=float, default=1.0)
     p.add_argument("--cut-penalty", type=float, default=3.0)
     p.add_argument("--include-clean", action="store_true")
-    p.add_argument("--clean-source", default="trajectories/skills/library_v1")
+    p.add_argument("--clean-source", default="trajectories/skills/library_v2")
     p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
     p.add_argument("--bones-limit", type=int, default=1500)
     p.add_argument("--graph-k-max", type=int, default=50)

@@ -58,7 +58,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Retargeted merged library (output channel layout).")
     p.add_argument("--bones-cache", required=True)
-    p.add_argument("--terrain-lib", default="trajectories/skills/terrain_v1")
+    p.add_argument("--terrain-lib", default="trajectories/skills/library_v2")
     p.add_argument("--out", required=True, help="Final composed training library .h5.")
     p.add_argument("--work-dir", default="clips/_families", help="Where the per-family .h5 are written.")
     p.add_argument("--device", default="cpu")

@@ -254,6 +254,12 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         terr = (rp, rq, jt)
         # Interaction-aware exit: ELEVATED end (jumped ONTO a box, no dismount) -> HOLD the
         # stand-on-box pose; else run a flat recovery DP seeded from the exit state.
+        #
+        # TODO(on/off transitions): practice the transitions by playing REAL locomotion around the
+        # interaction instead of a static hold -- i.e. WALK on top after a jump_on (continue on the
+        # box surface / walk toward the far edge) and WALK on top BEFORE a jump_off (approach the
+        # edge on the box, then dismount).  Needs an on-box locomotion source anchored to the box
+        # top.  Deferred (RL kickoff first); see also library_v2 jump_off / jump_off_front skills.
         elevated = float(ts.root_pos[-1, 2] - ts.root_pos[k, 2]) > 0.15
         if elevated:
             re = ts.root_pos[-1:].to(dev).repeat(T_exit, 1)
@@ -783,7 +789,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Traj-opt library (output channel layout).")
     p.add_argument("--bones-cache", required=True)
-    p.add_argument("--terrain-lib", default="trajectories/skills/terrain_v1")
+    p.add_argument("--terrain-lib", default="trajectories/skills/library_v2")
     p.add_argument("--terrain-hf-repo", default="zolkin/robot_rl")
     p.add_argument("--terrain-skills", default=None, help="';'-sep subset of terrain skills (default all).")
     p.add_argument("--out", required=True)
@@ -857,7 +863,7 @@ def main() -> int:
     p.add_argument("--max-pelvis-z", type=float, default=0.95,
                    help="Pelvis-above-ground ceiling (m) before the ground penalty kicks in.")
     p.add_argument("--include-clean", action="store_true", help="Fold in the clean STEADY strides.")
-    p.add_argument("--clean-source", default="trajectories/skills/library_v1")
+    p.add_argument("--clean-source", default="trajectories/skills/library_v2")
     p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
     p.add_argument("--bones-limit", type=int, default=None)
     p.add_argument("--leadin-limit", type=int, default=None)

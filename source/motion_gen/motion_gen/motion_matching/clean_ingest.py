@@ -136,6 +136,12 @@ def ingest_clean_library(
         skill = (r.get("skill") or "").strip()
         if allow is not None and skill not in allow:
             continue
+        # Combined libraries (e.g. library_v2) hold BOTH flat locomotion and terrain interactions in
+        # one manifest; the terrain rows carry a non-empty ``terrain`` column and belong to
+        # terrain_ingest, not the clean/steady tier -- skip them here.  Older clean-only libraries
+        # (library_v1) have no ``terrain`` column, so nothing is dropped.
+        if (r.get("terrain") or "").strip():
+            continue
         rel = (r.get("file") or "").strip()
         if not rel:
             continue
