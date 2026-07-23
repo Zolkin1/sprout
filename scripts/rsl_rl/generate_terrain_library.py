@@ -144,7 +144,7 @@ def main() -> int:
         _run("flat", "generate_mm_clips.py", [
             "--source", args.source, "--bones-cache", args.bones_cache, "--device", args.device,
             "--bones-limit", str(args.bones_limit), "--clip-length", str(args.flat_clip_length),
-            "--out", fam["flat"]])
+            "--n-clips", str(args.flat_clips), "--seed", str(args.seed), "--out", fam["flat"]])
 
     # --- compose the generated families into ONE training library ---
     # Each new stair/box skill mixes at its cousin's proportion (stairs_up ~ stairs; dismounts ~ boxes).

@@ -123,10 +123,17 @@ def periodic_tread_offset(root_pos: torch.Tensor, wrap: str, boxes: list[dict]):
     if len(steps) < 2:
         return None
     pos = torch.tensor([[float(v) for v in b["pos"]] for b in steps])
-    step_vec = (pos[1:] - pos[:-1]).mean(0)                         # per-tread step, down the descent
+    step_vec = (pos[1:] - pos[:-1]).mean(0)                         # per-tread step (descent-ordered geometry)
     riser = abs(float(step_vec[2]))
     if riser < 1e-6:
         return None
+    # Orient the per-period offset to the source's ACTUAL travel direction: ``step_vec`` is derived from
+    # the geometry in descent order (points DOWN), which is correct for a descent but OPPOSITE an ascent
+    # (stairs_up).  A downward offset on an upward-climbing loop makes each period wrap backwards/down
+    # (the teleport).  Flip to agree with the source's net per-period displacement.
+    net = root_pos[-1] - root_pos[0]
+    if float(torch.dot(step_vec, net.to(step_vec.dtype))) < 0.0:
+        step_vec = -step_vec
     ptreads = max(1, round(abs(float(root_pos[0, 2] - root_pos[-1, 2])) / riser))
     return (ptreads * step_vec).tolist()
 

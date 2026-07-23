@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
@@ -57,6 +58,10 @@ def main() -> int:
                    help="Traj-opt skills to ingest into the DB.")
     p.add_argument("--run-vx", type=float, default=2.5)
     p.add_argument("--walk-vx", type=float, default=1.0)
+    p.add_argument("--n-clips", type=int, default=24,
+                   help="Number of VARIED flat clips to generate (each a randomized speed/turn schedule).")
+    p.add_argument("--seed", type=int, default=0, help="RNG seed for the randomized schedules.")
+    p.add_argument("--turn-max", type=float, default=0.8, help="Max |yaw-rate| (rad/s) for turning segments.")
     p.add_argument("--w-vel", type=float, default=3.0)
     p.add_argument("--db-out", default=None, help="Optional .npz to cache the built DB.")
     p.add_argument("--flat-anchor", default="x,y,yaw",
@@ -103,15 +108,41 @@ def main() -> int:
 
     gen = MotionMatchClipGenerator(manager, db, sources, cfg, dt=args.dt, device=dev, w_vel=args.w_vel,
                                    anchor_mask=anchor_mask_from_free(_csv_set(args.flat_anchor)))
-    schedule = [
-        {"skill": "standing", "vx": 0.0, "wz": 0.0, "duration_s": 1.5},
-        {"skill": "running", "vx": args.run_vx, "wz": 0.0, "duration_s": 3.0},
-        {"skill": "walk_forward", "vx": args.walk_vx, "wz": 0.0, "duration_s": 3.0},
-        {"skill": "standing", "vx": 0.0, "wz": 0.0, "duration_s": 1.5},
-    ]
-    print("[mm] generating clip: stand -> run -> walk -> stand ...")
-    batch = gen.generate(schedule, clip_length_s=args.clip_length)
-    T = batch["y_des"].shape[1]
+
+    # Generate N VARIED flat clips: each is a randomized schedule over the available skills with random
+    # forward speeds AND turning (wz != 0) -- so the flat family covers the (vx, wz) command space with
+    # motion-matched, blended transitions, instead of one straight stand->run->walk->stand clip.
+    rng = np.random.default_rng(args.seed)
+    move = [s for s in skills if s != "standing"] or skills
+
+    def _seg_vel(sk):
+        if sk == "standing":
+            return 0.0, 0.0
+        base = args.run_vx if sk == "running" else args.walk_vx
+        sign = -1.0 if "backward" in sk else 1.0
+        vx = sign * float(rng.uniform(0.45, 1.05)) * base
+        wz = float(rng.uniform(-1.0, 1.0)) * args.turn_max if rng.random() < 0.6 else 0.0  # turn ~60% of segments
+        return vx, wz
+
+    def _schedule():
+        segs = [{"skill": "standing", "vx": 0.0, "wz": 0.0, "duration_s": 1.0}]   # clean standing start
+        t = 1.0
+        while t < args.clip_length - 0.5:
+            sk = str(rng.choice(move)) if rng.random() < 0.85 else "standing"     # mostly moving, occasional pause
+            dur = float(rng.uniform(1.5, 3.0))
+            vx, wz = _seg_vel(sk)
+            segs.append({"skill": sk, "vx": vx, "wz": wz, "duration_s": dur})
+            t += dur
+        return segs
+
+    N = int(args.n_clips)
+    print(f"[mm] generating {N} varied flat clips (skills={skills}, turn_max={args.turn_max}) ...")
+    batches = []
+    for i in range(N):
+        sched = _schedule()
+        batches.append(gen.generate(sched, clip_length_s=args.clip_length))
+        print(f"[mm]   clip {i}: " + " -> ".join(f"{s['skill']}(vx{s['vx']:+.1f},wz{s['wz']:+.1f})" for s in sched))
+    T = int(batches[0]["y_des"].shape[1])
 
     meta = {
         "dt": args.dt, "clip_length_s": args.clip_length, "num_steps": int(T),
@@ -121,10 +152,13 @@ def main() -> int:
         "ref_frame": "pelvis_link",             # root-driven clips: pelvis is the anchor
         "skill_list": [s.name for s in manager.skills],
     }
-    writer = ClipLibraryWriter(args.out, 1, meta)
+    writer = ClipLibraryWriter(args.out, N, meta)
     writer.set_attr("source_library_fingerprint", manager.library_fingerprint)
     writer.set_attr("generator", "motion_matching_v1")
-    writer.write_batch(0, batch)
+    for i, b in enumerate(batches):
+        b = dict(b)
+        b["clip_len"] = torch.tensor([T], dtype=torch.int32, device=dev)   # flat clips run full length
+        writer.write_batch(i, b)
     writer.close()
     print(f"[mm] wrote {args.out}")
 

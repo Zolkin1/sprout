@@ -819,15 +819,21 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     source box -> the dismount lands at tile ground z=0), then a **DP-matched walk-away RECOVERY** on the
     flat (``generate_exit`` seeded from the dismount's exit window -- the exit analog of jump_on's DP
     approach), eased-spliced onto the landing.  No approach (spawn on box), so needs the matcher only for
-    the recovery.  Anchor mask ``[BOX (dismount) -> FLAT (walk-away)]``; ``target_vel`` held FORWARD the
-    whole clip (dismount + keep walking -> an unambiguous "keep moving" intent, never a stop).
+    the recovery.  Anchor mask ``[BOX (dismount) -> FLAT (walk-away)]``; ``target_vel`` is held at the
+    SIGNED local-x speed the whole clip -- NEGATIVE for a backward dismount (jump_off), positive for
+    jump_off_front -- so "keep moving" points AWAY from the box (never into it).
     """
     T_exit = max(1, int(round(recovery_s / args.dt)))
+    # Walk-away DIRECTION: a backward dismount (jump_off) must recover BACKWARD (negative local-x) so the
+    # robot moves AWAY from the box, not forward into it; jump_off_front recovers forward (positive).
+    backward = "front" not in str(ts.terrain_meta.get("skill", ""))
+    sgn = -1.0 if backward else 1.0
     Wp_d, Wq_d, Wj_d, terr_contact = _place_jump_on_tile(ts, tile_box, dev, k=0)     # dismount, box-anchored
     # DP walk-away recovery on the flat, seeded from the dismount's exit window (mirror of jump_on's DP
-    # approach, on the exit side); truncate the played dismount at the DP-chosen exit frame.
+    # approach, on the exit side); command the walk-away in the dismount's travel direction (backward for
+    # jump_off) so it never walks forward into the box.  Truncate the played dismount at the exit frame.
     exit_descs = matcher.exit_descriptors(ts, exit_frac=args.exit_frac)
-    re, qe, je = matcher.generate_exit(_steady_cmd(fwd_vx), T_exit, exit_descs,
+    re, qe, je = matcher.generate_exit(_steady_cmd(sgn * fwd_vx), T_exit, exit_descs,
                                        allowed_categories=_APPROACH_FILTERS["box"])
     m_exit = max(1, int(round(args.exit_frac * ts.root_pos.shape[0])))
     cut = max(1, min(Wp_d.shape[0] - m_exit + int(matcher.matched_exit) + 1, Wp_d.shape[0]))
@@ -850,7 +856,7 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
                       "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
-    tvel[:, 0] = float(fwd_vx)                            # forward through the dismount AND the walk-away
+    tvel[:, 0] = float(sgn * fwd_vx)                      # signed local-x: NEGATIVE for jump_off (backward), + for _front
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
             "entry_frame": 0, "n_terr": int(ts.n)}
@@ -974,6 +980,9 @@ def main() -> int:
     p.add_argument("--box-footprint-scale", type=float, nargs=2, default=(1.0, 1.6), metavar=("MIN", "MAX"),
                    help="[tiles] expand-only random scale on the box footprint (x,y) -- the NON-critical "
                         "dims (jump depends only on height); (1,1) disables.")
+    p.add_argument("--box-tile-buffer", type=float, default=2.0,
+                   help="[tiles] ground buffer (m) added on each side of the union of a box tile's clip "
+                        "motion + the box, so the scan sees ground around the whole traversal.")
     p.add_argument("--seam-blend-s", type=float, default=0.12,
                    help="[tiles] inertialization blend time (s) at the approach/descent/recovery splice "
                         "seams -- decays the joint discontinuity so transitions aren't snappy (0 = off).")
@@ -1104,13 +1113,17 @@ def main() -> int:
         time_rng = np.random.default_rng(args.tile_seed + 3)
         print(f"[box] box tiles: {args.num_box_tiles} tiles x {C} clips, approach_len={approach_len:.1f} m, "
               f"vel range [{vlo:.1f},{vhi:.1f}] from {len(terr_srcs)} source(s)")
+        # Tile footprint = the UNION of all the tile's clips' body positions + the box, padded by
+        # ``box_tile_buffer`` m on each side (sized to the actual motion, not a fixed +x approach corridor
+        # -- so the long axis follows wherever the clips travel).  pos_x / pos_y channels of y_des:
+        _px = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_x")]
+        _py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
+        buf = float(args.box_tile_buffer)
         for tile in box_tiles:
             ts = terr_srcs[tile.source_idx]
             box_size = [float(v) for v in ts.terrain_meta["terrain"]["boxes"][0]["size"]]
             # Height (z) is CRITICAL (the jump depends on it) -> keep the solved variant's value; the
-            # footprint (x, y) is free (outer=None) -> expand per the tile's sampled scales (#3).  The
-            # jump is center-anchored onto the box (_place_jump_on_tile), so a bigger top pad keeps the
-            # landing valid.  Guard on the declared critical dims (skip scaling if x/y ever go critical).
+            # footprint (x, y) is free (outer=None) -> expand per the tile's sampled scales (#3).
             if set(ts.terrain_meta["terrain"].get("critical", [])) <= {"height"}:
                 box_size = [box_size[0] * tile.sx_scale, box_size[1] * tile.sy_scale, box_size[2]]
             tile_box = box_tile_box(box_size=box_size, approach_len=approach_len, y_offset=tile.y_offset)
@@ -1119,15 +1132,14 @@ def main() -> int:
                                      leg_size=tuple(args.leg_size), leg_inset=args.leg_inset)
             bx, by = float(tile_box["pos"][0]), float(tile_box["pos"][1])
             sx, sy, sz = (float(v) for v in tile_box["size"])
-            x_lo, x_hi = bx - sx / 2.0 - approach_len, bx + sx / 2.0        # flat approach region + box
-            y_lo, y_hi = by - tile.nav_width / 2.0, by + tile.nav_width / 2.0
-            corner = (x_lo - m, y_lo - m)                                  # FIXED per tile -> identical geometry
-            size_x, size_y = (x_hi - x_lo) + 2 * m, (y_hi - y_lo) + 2 * m
-            overlay = {"kind": "box", "pos_xy": [bx - corner[0], by - corner[1]],
-                       "size_xyz": [sx, sy, sz], "base_z": float(tile_box["pos"][2] - sz / 2.0),
-                       "walkable_top": True, "yaw": float(tile_box["yaw"])}
+            # Build clips + overlay in the TILE-BOX frame (corner=(0,0), size TBD); the tile is sized +
+            # recentered to the motion union below.
+            overlay = {"kind": "box", "pos_xy": [bx, by], "size_xyz": [sx, sy, sz],
+                       "base_z": float(tile_box["pos"][2] - sz / 2.0), "walkable_top": True,
+                       "yaw": float(tile_box["yaw"])}
             overlay.update(vp)                                             # variant sub-boxes (fixed per tile)
             kind = str(ts.terrain_meta["terrain"].get("kind", "on"))
+            tile_recs = []
             if kind == "off":                                          # DISMOUNT (jump_off / jump_off_front)
                 print(f"[box] box tile {tile.terrain_id}: src={tile.source_idx} variant={tile.variant} "
                       f"box_h={sz:.2f} DISMOUNT x{C}")
@@ -1135,9 +1147,9 @@ def main() -> int:
                     r_s = float(time_rng.uniform(*args.recovery_s_range))
                     fwd = float(vel_rng.uniform(vlo, vhi))             # forward walk-away speed after the dismount
                     rec = _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
-                                                  tile_box, overlay, corner, size_x, size_y, r_s, fwd)
+                                                  tile_box, overlay, (0.0, 0.0), 0.0, 0.0, r_s, fwd)
                     rec["approach_vx"] = fwd
-                    records.append(rec)
+                    tile_recs.append(rec)
             else:                                                      # MOUNT (jump_on)
                 vels = [float(vel_rng.uniform(vlo, vhi)) for _ in range(C)]
                 print(f"[box] box tile {tile.terrain_id}: src={tile.source_idx} variant={tile.variant} "
@@ -1146,11 +1158,31 @@ def main() -> int:
                     a_s = float(time_rng.uniform(*args.approach_s_range))
                     r_s = float(time_rng.uniform(*args.recovery_s_range))
                     rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
-                                              tile_box, overlay, corner, size_x, size_y, a_s, r_s)
+                                              tile_box, overlay, (0.0, 0.0), 0.0, 0.0, a_s, r_s)
                     rec["approach_vx"] = vx
                     print(f"[box]   -> box tile {tile.terrain_id} vx={vx:.2f}: approach_s={a_s:.2f} "
                           f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
-                    records.append(rec)
+                    tile_recs.append(rec)
+            # Size the tile to the union of ALL its clips' body positions + the box, + buf each side.
+            xmin = ymin = float("inf"); xmax = ymax = float("-inf")
+            for rec in tile_recs:
+                yy = rec["y"]
+                xmin = min(xmin, float(yy[:, _px].min())); xmax = max(xmax, float(yy[:, _px].max()))
+                ymin = min(ymin, float(yy[:, _py].min())); ymax = max(ymax, float(yy[:, _py].max()))
+            xmin = min(xmin, bx - sx / 2.0); xmax = max(xmax, bx + sx / 2.0)
+            ymin = min(ymin, by - sy / 2.0); ymax = max(ymax, by + sy / 2.0)
+            cx, cy = xmin - buf, ymin - buf
+            tsize_x, tsize_y = (xmax - xmin) + 2.0 * buf, (ymax - ymin) + 2.0 * buf
+            print(f"[box]   -> tile {tile.terrain_id} footprint sized to motion: "
+                  f"{tsize_x:.1f} x {tsize_y:.1f} m (+{buf:.0f}m buffer)")
+            for rec in tile_recs:                                          # recenter to the tile corner + fix footprint
+                yy = rec["y"]
+                yy[:, _px] = yy[:, _px] - cx
+                yy[:, _py] = yy[:, _py] - cy
+                rec["manifest"]["size_x"] = float(tsize_x)
+                rec["manifest"]["size_y"] = float(tsize_y)
+                rec["manifest"]["overlays"][0]["pos_xy"] = [bx - cx, by - cy]
+                records.append(rec)
     else:
         tid = 0
         # Per-clip approach/recovery DURATION sampling for --box-splice eased (distinct seed so it does
