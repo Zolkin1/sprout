@@ -153,6 +153,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "path"):
                     term.path = args_cli.clip
                     print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
+            # A ClipTerrainImporter builds its terrain mesh from the SAME library the
+            # command tracks, so repoint it too -- else the tiles' terrain_ids won't line
+            # up with the clips (the terrain env cfg asserts these two paths match).
+            terrain = getattr(env_cfg.scene, "terrain", None)
+            if terrain is not None and hasattr(terrain, "clip_library_path"):
+                terrain.clip_library_path = args_cli.clip
+                print(f"[INFO] clip path='{args_cli.clip}' for scene.terrain (importer mesh).")
 
         # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
         # hydra: the cfg field default is None so hydra rejects a str override).

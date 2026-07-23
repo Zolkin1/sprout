@@ -201,26 +201,41 @@ class BaseTrajectoryCommand(CommandTerm):
                 raise ValueError(f"Velocity output name '{vel_name}' not found in position output names.")
 
         # --- Reference frames ---------------------------------------------
+        # The foot STANCE reference-frame path (``get_measured_outputs``) re-anchors a clip to a
+        # planted foot and is used ONLY by the online CLF commands, whose reference frames ARE
+        # contact bodies.  The teacher / FM tracker anchor via the per-DOF anchor mask (world or
+        # periodic ego re-anchoring) and declare a NON-contact reference frame (e.g. pelvis_link);
+        # for those the stance bookkeeping is skipped -- ``uses_stance_ref`` gates it.
+        #
+        # TODO(foot-ref-frame removal / "scope 2"): the whole foot-stance paradigm is slated for
+        # deletion -- clips should be world-anchored OR periodically ego-anchored via the anchor
+        # mask, nothing else.  This ``uses_stance_ref`` guard is the interim decouple (scope 1) so
+        # the teacher/tracker work now.  Scope 2 = delete ``get_measured_outputs`` +
+        # ``terrain_aware_ref.py`` + this stance bookkeeping + manager ``ref_frame`` + the clip-io
+        # ``ref_frame`` meta, which requires removing the online CLF commands
+        # (TrajectoryCommand / BatchedMultiSkillCommand) that still use it -- see the
+        # remove-online-multiskill effort.
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(
             self.manager.get_reference_frames()
         )
-        for ref_frame in self.ref_frames:
-            if ref_frame not in self.contact_bodies:
-                raise ValueError(
-                    f"Reference frame '{ref_frame}' is not in the contact frames list: {self.contact_bodies}"
-                )
+        self.uses_stance_ref = all(rf in self.contact_bodies for rf in self.ref_frames)
+        if self.uses_stance_ref:
+            # Mapping from ref_frames to contact_bodies indices (needed by get_symmetric_contacts).
+            self.ref_to_contact_idx = torch.zeros(len(self.ref_frames), dtype=torch.long, device=self.device)
+            for i, ref_frame in enumerate(self.ref_frames):
+                self.ref_to_contact_idx[i] = self.contact_bodies.index(ref_frame)
+        else:
+            # World / ego (anchor-mask) anchoring only: no stance-frame contact tracking.
+            self.ref_to_contact_idx = torch.zeros(0, dtype=torch.long, device=self.device)
 
-        # Mapping from ref_frames to contact_bodies indices (needed by get_symmetric_contacts)
-        self.ref_to_contact_idx = torch.zeros(len(self.ref_frames), dtype=torch.long, device=self.device)
-        for i, ref_frame in enumerate(self.ref_frames):
-            self.ref_to_contact_idx[i] = self.contact_bodies.index(ref_frame)
-
-        # Current reference frame poses — [N, 7] = [pos_x, pos_y, pos_z, qx, qy, qz, qw]
+        # Current reference frame poses — [N, 7] = [pos_x, pos_y, pos_z, qx, qy, qz, qw].
+        # Always allocated: the teacher / tracker reuse this as the clip WORLD-placement scratch
+        # (see motion_sequence_cmd._clip_world_frames), independent of the stance path.
         self.ref_poses = torch.zeros((self.num_envs, 7), device=self.device)
         self.ref_poses[:, 6] = 1.0  # identity quaternion
 
         # Index (into self.ref_frames) of the ref frame currently in contact
-        # per env.  Updated each step inside get_measured_outputs.  Exposed
+        # per env.  Updated each step inside get_measured_outputs (stance path only).  Exposed
         # for logging / debug visualisation.
         self.cur_ref_frame_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -278,6 +293,10 @@ class BaseTrajectoryCommand(CommandTerm):
     # Measured outputs
     # ------------------------------------------------------------------
 
+    # TODO(foot-ref-frame removal / "scope 2"): this method IS the foot-stance re-anchoring
+    # paradigm (planted-foot refresh gate + apply_terrain_aware_ref).  Only the online CLF
+    # commands call it; the teacher/tracker use world/ego(mask) anchoring instead.  Delete this
+    # (and terrain_aware_ref.py) when the online commands are removed.  See base __init__ TODO.
     def get_measured_outputs(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> None:
         """Compute measured outputs from the robot state.
 

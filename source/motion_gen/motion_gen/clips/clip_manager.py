@@ -35,6 +35,10 @@ class MotionClipManager(ManagerBase):
         self.vel_output_names: list[str] = list(lib.meta["vel_output_names"])
         self.num_pos_outputs = len(self.pos_output_names)
         self.num_vel_outputs = len(self.vel_output_names)
+        # TODO(foot-ref-frame removal / "scope 2"): ``ref_frame`` is a vestige of the foot-stance
+        # paradigm.  Teacher/tracker clips are world/ego(mask)-anchored and set it to the base frame
+        # (pelvis_link), not a stance foot; it (and get_reference_frames below) can be dropped once
+        # the foot-stance paradigm + online CLF commands are removed. See base_trajectory_cmd.py.
         self.ref_frame: str = lib.meta["ref_frame"]
         self.contact_frames: list[str] = list(lib.meta["contact_frames"])
         self.dt: float = float(lib.meta["dt"])

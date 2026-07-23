@@ -80,12 +80,16 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         return MotionClipManager(self._clip_lib)
 
     def _verify_contact_frames(self) -> None:
-        """The clip's stance reference frame must be a tracked contact body."""
-        ref = self.manager.ref_frame
-        if ref not in self.contact_bodies:
-            raise ValueError(
-                f"Clip reference frame '{ref}' is not in contact_bodies {self.contact_bodies}."
-            )
+        """No stance reference frame to verify: teacher clips are world/ego(mask)-anchored.
+
+        The teacher never runs the foot-stance path (it overrides ``_update_command`` and anchors
+        via the per-DOF anchor mask), so the clip's ``ref_frame`` need not be a contact body -- it
+        is just the clip's base/world frame (e.g. ``pelvis_link``).
+
+        TODO(foot-ref-frame removal / "scope 2"): once the foot-stance paradigm is deleted (see the
+        TODO in base_trajectory_cmd.py), the clip ``ref_frame`` meta and this hook go away entirely.
+        """
+        return
 
     def _post_init(self) -> None:
         """Allocate clip state, validate dt, map contacts, record fingerprint."""
