@@ -38,6 +38,8 @@ class BoxTileSpec:
     variant: str                   # box support variant: solid | floating | floating_center_leg | floating_corner_legs
     y_offset: float                # signed lateral box offset from the corridor centerline (m)
     nav_width: float               # corridor width in y
+    sx_scale: float = 1.0          # expand-only scale on the box footprint x (free/non-critical dim)
+    sy_scale: float = 1.0          # expand-only scale on the box footprint y (free/non-critical dim)
 
 
 @dataclass
@@ -289,6 +291,7 @@ def sample_box_tiles(
     variant_fracs: dict | None,
     nav_width_range: tuple[float, float],
     y_offset_max_frac: float = 0.3,
+    footprint_scale_range: tuple[float, float] = (1.0, 1.0),
 ) -> list[BoxTileSpec]:
     """Sample the offline BOX tile population -- phase A of tiles-then-clips for jump-on boxes.
 
@@ -303,6 +306,9 @@ def sample_box_tiles(
         variant_fracs: box support-variant weights (see ``normalize_box_variant_fracs``; ``None`` => solid).
         nav_width_range: corridor width (m), sampled per tile.
         y_offset_max_frac: max ``|box offset|`` as a fraction of half the corridor width.
+        footprint_scale_range: expand-only scale range for the box footprint (x, y) -- these are the
+            NON-critical dims (the jump depends only on box HEIGHT), so we randomize them for variety;
+            ``(1.0, 1.0)`` disables it.  ``< 1`` is clamped to 1 (never shrink below the solved support).
 
     Returns:
         A list of :class:`BoxTileSpec`.
@@ -310,11 +316,16 @@ def sample_box_tiles(
     fr = normalize_box_variant_fracs(variant_fracs)
     names = list(fr.keys())
     weights = np.array([fr[n] for n in names], dtype=float)
+    flo, fhi = float(footprint_scale_range[0]), float(footprint_scale_range[1])
+    flo, fhi = max(1.0, flo), max(1.0, fhi)                  # expand-only: never shrink the landing pad
     tiles: list[BoxTileSpec] = []
     for tid in range(int(n_tiles)):
         src = int(rng.integers(0, max(1, int(n_sources))))
         variant = str(rng.choice(names, p=weights))
         nav = float(rng.uniform(*nav_width_range))
         yoff = float(rng.uniform(-1.0, 1.0)) * float(y_offset_max_frac) * (nav / 2.0)
-        tiles.append(BoxTileSpec(terrain_id=tid, source_idx=src, variant=variant, y_offset=yoff, nav_width=nav))
+        sx_scale = float(rng.uniform(flo, fhi))
+        sy_scale = float(rng.uniform(flo, fhi))
+        tiles.append(BoxTileSpec(terrain_id=tid, source_idx=src, variant=variant, y_offset=yoff,
+                                 nav_width=nav, sx_scale=sx_scale, sy_scale=sy_scale))
     return tiles

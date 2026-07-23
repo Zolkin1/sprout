@@ -66,6 +66,43 @@ def test_transition_tile_adds_flush_top_and_floor_bottom():
     assert bot_plat["pos"][0] > max(b["pos"][0] for b in steps)   # bottom platform after the treads
 
 
+def test_ascent_treads_rise_in_x():
+    """going_up=True (stairs_up): tread tops INCREASE along +x (mirror of the descent ordering)."""
+    h, d, N = 0.15, 0.19, 8
+    boxes = stair_tile_boxes(step_height=h, step_depth=d, num_steps=N, tread_width=1.0,
+                             ttype="terrain", going_up=True)
+    tops = [b["pos"][2] + b["size"][2] / 2.0 for b in boxes]
+    xs = [b["pos"][0] for b in boxes]
+    assert xs == sorted(xs)
+    for i in range(1, N):
+        assert abs((tops[i] - tops[i - 1]) - h) < 1e-5           # z RISES by one riser per step
+    assert abs(min(tops) - h) < 1e-5 and abs(max(tops) - N * h) < 1e-5
+
+
+def test_ascent_transition_platforms_flip():
+    """Ascent transition: approach platform (low x) is LOW, recovery (high x) is HIGH -- the flip
+    of the descent case, but each still flush with its adjacent tread."""
+    h, d, N = 0.15, 0.19, 5
+    boxes = stair_tile_boxes(step_height=h, step_depth=d, num_steps=N, tread_width=0.9,
+                             ttype="transition", top_platform_len=3.0, bottom_platform_len=2.0,
+                             nav_width=1.4, going_up=True)
+    steps, plats = _steps_and_platforms(boxes)
+    assert len(steps) == N and len(plats) == 2
+    low_x_plat = min(plats, key=lambda b: b["pos"][0])           # approach (low x)
+    high_x_plat = max(plats, key=lambda b: b["pos"][0])          # recovery (high x)
+    low_x_plat_top = low_x_plat["pos"][2] + low_x_plat["size"][2] / 2.0
+    high_x_plat_top = high_x_plat["pos"][2] + high_x_plat["size"][2] / 2.0
+    assert abs(low_x_plat_top - h) < 1e-5                        # approach flush with lowest tread (h)
+    assert abs(high_x_plat_top - N * h) < 1e-5                   # recovery flush with highest tread (N*h)
+
+
+def test_descent_unchanged_by_going_up_flag():
+    """going_up=False must reproduce the descent geometry exactly (regression guard)."""
+    kw = dict(step_height=0.15, step_depth=0.19, num_steps=6, tread_width=0.9,
+              ttype="transition", top_platform_len=3.0, bottom_platform_len=2.0, nav_width=1.4)
+    assert stair_tile_boxes(**kw) == stair_tile_boxes(**kw, going_up=False)
+
+
 def test_transition_x_layout_contiguous():
     h, d, N, top, bot = 0.15, 0.19, 4, 3.0, 2.0
     boxes = stair_tile_boxes(step_height=h, step_depth=d, num_steps=N, tread_width=1.0,

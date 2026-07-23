@@ -141,15 +141,18 @@ def stair_tile_boxes(
     top_platform_len: float = 0.0,
     bottom_platform_len: float = 0.0,
     nav_width: float | None = None,
+    going_up: bool = False,
 ) -> list[dict]:
-    """FIXED tile geometry for a uniform stair DESCENT (tile-local, axis-aligned, +x = travel).
+    """FIXED tile geometry for a uniform staircase (tile-local, axis-aligned, +x = direction of travel).
 
     Authored ONCE per tile and shared by all of its clips (no per-clip transform) -- this is what
-    makes many clips reuse one terrain.  ``+x`` runs downhill: ``[top platform (high)] -> [treads
-    descending] -> [bottom platform (floor, z=0)]``.  The highest tread top sits at ``N*h`` (flush
-    with the top platform); the lowest at ``h`` (one riser above the z=0 floor, where the bottom
-    platform / recovery sits) -- mirroring the v8 leveling conventions so no post-hoc leveling is
-    needed.  Tread x-spacing comes from :func:`stair_geom.stair_tread_layout` (the shared layout SoT).
+    makes many clips reuse one terrain.  ``going_up=False`` (DESCENT): ``+x`` runs downhill,
+    ``[approach platform (high)] -> [treads descending] -> [recovery platform (low)]``.
+    ``going_up=True`` (ASCENT, e.g. the ``stairs_up`` skill): ``+x`` runs uphill,
+    ``[approach platform (low)] -> [treads ascending] -> [recovery platform (high)]``.  Either way the
+    approach platform sits at low ``x`` and is flush with the nearest (low-x) tread; the recovery
+    platform sits at high ``x`` flush with the high-x tread -- so the direction only flips which end is
+    high.  Tread x-spacing / z-ordering come from :func:`stair_geom.stair_tread_layout` (shared SoT).
 
     Boxes are ``{pos:[x,y,z], size:[sx,sy,sz], yaw:0}``.  Steps are NARROW (``size_x == d``); the
     platforms are WIDE, so the downstream pipeline tells them apart by width.  ``ttype == "terrain"``
@@ -159,34 +162,36 @@ def stair_tile_boxes(
         step_height / step_depth: Uniform riser / tread depth (m).
         num_steps: Number of treads ``N``.
         tread_width: Tread y-width (m).
-        ttype: ``"terrain"`` (treads only) or ``"transition"`` (add top + bottom platforms).
-        top_platform_len / bottom_platform_len: Platform x-lengths (m); typically sized to the
-            longest approach / recovery that will run on the tile (transition only).
+        ttype: ``"terrain"`` (treads only) or ``"transition"`` (add approach + recovery platforms).
+        top_platform_len / bottom_platform_len: Approach / recovery platform x-lengths (m); typically
+            sized to the longest approach / recovery that will run on the tile (transition only).
         nav_width: Platform y-width (m); defaults to ``tread_width``.
+        going_up: Ascend (+x uphill) instead of descend.  Descent is byte-identical to the prior code.
     """
     h, d, N = float(step_height), float(step_depth), int(num_steps)
     w = float(tread_width)
     nav = float(nav_width) if nav_width else w
     top_len = float(top_platform_len) if ttype != "terrain" else 0.0
-    # start_z_zero => lowest tread top at 0, highest at (N-1)h; shift +h so the floor (bottom
-    # platform / recovery) is at z=0 one riser below the lowest tread.
+    # start_z_zero => lowest tread top at 0, highest at (N-1)h; shift +h so the floor is at z=0 one
+    # riser below the lowest tread.  going_up flips the tread z-ordering along +x (see stair_geom).
     lay = stair_tread_layout(size_x=N * d, size_y=w, step_height=h, step_depth_nominal=d,
-                             going_up=False, x_offset=top_len, y_offset=-w / 2.0, start_z_zero=True)
+                             going_up=going_up, x_offset=top_len, y_offset=-w / 2.0, start_z_zero=True)
     boxes: list[dict] = []
     for c in lay.tread_top_centers:
         cx, top = float(c[0]), float(c[2]) + h                # solid tread box from z=0 up to its top
         boxes.append({"pos": [cx, 0.0, top / 2.0], "size": [d, w, top], "yaw": 0.0})
     if ttype != "terrain":
-        top_top = N * h                                       # top platform flush with the highest tread
-        boxes.insert(0, {"pos": [top_len / 2.0, 0.0, top_top / 2.0],
-                         "size": [max(top_len, 1e-3), nav, top_top], "yaw": 0.0})
+        # Platforms flush with the adjacent tread: approach (low x) == first tread top, recovery
+        # (high x) == last tread top.  Direction-agnostic -- descent gives approach=N*h/recovery=h
+        # (byte-identical to before), ascent gives approach=h/recovery=N*h.
+        approach_top = float(boxes[0]["size"][2])
+        recovery_top = float(boxes[-1]["size"][2])
+        boxes.insert(0, {"pos": [top_len / 2.0, 0.0, approach_top / 2.0],
+                         "size": [max(top_len, 1e-3), nav, approach_top], "yaw": 0.0})
         bx0 = top_len + N * d
         bot_len = max(float(bottom_platform_len), 1e-3)
-        # Bottom platform flush with the LOWEST tread (top z=h), symmetric with the top platform: the
-        # recovery walks off the last step onto it continuously (no float).  (A floor-level landing one
-        # riser lower would need the descent to include a final step-down -- a later refinement.)
-        boxes.append({"pos": [bx0 + bot_len / 2.0, 0.0, h / 2.0],
-                      "size": [bot_len, nav, h], "yaw": 0.0})
+        boxes.append({"pos": [bx0 + bot_len / 2.0, 0.0, recovery_top / 2.0],
+                      "size": [bot_len, nav, recovery_top], "yaw": 0.0})
     return boxes
 
 

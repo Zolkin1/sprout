@@ -105,8 +105,9 @@ def main() -> int:
     bl = ["--bones-limit", str(args.bones_limit)]
     fam = {                                                 # family -> output .h5
         k: os.path.join(args.work_dir, f"family_{k}.h5")
-        for k in ("stairs", "boxes", "distractors", "flat")
+        for k in ("stairs", "stairs_up", "boxes", "jump_off", "jump_off_front", "distractors", "flat")
     }
+    box_vr = ["--box-vel-range", str(args.box_vel_range[0]), str(args.box_vel_range[1])]
 
     t0 = time.time()
     if "stairs" not in skip:
@@ -116,12 +117,25 @@ def main() -> int:
             "--transition-vels", args.transition_vels, "--tile-seed", str(args.seed),
             "--stair-floor-frac", str(args.stair_floor_frac),
             "--out", fam["stairs"]])
+    if "stairs_up" not in skip:
+        # Ascent: PURE tiles only (transition-ascent peel-off is a TODO -> raises); the riser x tread
+        # grid gives the geometry variety.  Pure is matcher-free.
+        _run("stairs_up", "generate_box_clips.py", common + bl + [
+            "--terrain-lib", args.terrain_lib, "--terrain-skills", "stairs_up",
+            "--n-pure-tiles", str(args.pure_tiles), "--n-transition-tiles", "0",
+            "--tile-seed", str(args.seed), "--stair-floor-frac", str(args.stair_floor_frac),
+            "--out", fam["stairs_up"]])
     if "boxes" not in skip:
         _run("boxes", "generate_box_clips.py", common + bl + [
             "--terrain-lib", args.terrain_lib, "--terrain-skills", "jump_on",
             "--num-box-tiles", str(args.box_tiles), "--box-clips-per-tile", str(args.box_clips_per_tile),
-            "--box-vel-range", str(args.box_vel_range[0]), str(args.box_vel_range[1]),
-            "--tile-seed", str(args.seed), "--seed", str(args.seed), "--out", fam["boxes"]])
+            "--tile-seed", str(args.seed), "--seed", str(args.seed), "--out", fam["boxes"]] + box_vr)
+    for off in ("jump_off", "jump_off_front"):              # DISMOUNTS: spawn-on-box -> play -> DP walk-away
+        if off not in skip:
+            _run(off, "generate_box_clips.py", common + bl + [
+                "--terrain-lib", args.terrain_lib, "--terrain-skills", off,
+                "--num-box-tiles", str(args.box_tiles), "--box-clips-per-tile", str(args.box_clips_per_tile),
+                "--tile-seed", str(args.seed), "--seed", str(args.seed), "--out", fam[off]] + box_vr)
     if "distractors" not in skip:
         _run("distractors", "generate_distractor_clips.py", common + bl + [
             "--clips-per-tile", str(args.distractor_clips_per_tile), "--seed", str(args.seed),
@@ -133,8 +147,11 @@ def main() -> int:
             "--out", fam["flat"]])
 
     # --- compose the generated families into ONE training library ---
+    # Each new stair/box skill mixes at its cousin's proportion (stairs_up ~ stairs; dismounts ~ boxes).
     mix = ", ".join(f"{fam[k]}:{c}" for k, c in
-                    (("stairs", args.mix_stairs), ("boxes", args.mix_boxes),
+                    (("stairs", args.mix_stairs), ("stairs_up", args.mix_stairs),
+                     ("boxes", args.mix_boxes), ("jump_off", args.mix_boxes),
+                     ("jump_off_front", args.mix_boxes),
                      ("distractors", args.mix_distractors)) if k not in skip)
     compose = ["--mix", mix, "--max-clips-per-tile", str(args.max_clips_per_tile),
                "--out", args.out, "--device", args.device]

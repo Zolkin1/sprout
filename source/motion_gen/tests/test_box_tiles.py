@@ -71,6 +71,19 @@ def test_zero_offset_frac_centers_box():
     assert all(abs(t.y_offset) < 1e-12 for t in tiles)
 
 
+def test_footprint_scale_expand_only():
+    # Default (1,1) -> no scaling.
+    tiles = sample_box_tiles(np.random.default_rng(8), n_tiles=20, n_sources=1,
+                             variant_fracs=None, nav_width_range=(1.0, 1.4))
+    assert all(t.sx_scale == 1.0 and t.sy_scale == 1.0 for t in tiles)
+    # A range expands (>= 1) and stays within [max(1,lo), hi]; a <1 lo is clamped to 1.
+    tiles = sample_box_tiles(np.random.default_rng(9), n_tiles=60, n_sources=1,
+                             variant_fracs=None, nav_width_range=(1.0, 1.4),
+                             footprint_scale_range=(0.5, 1.8))
+    assert all(1.0 <= t.sx_scale <= 1.8 and 1.0 <= t.sy_scale <= 1.8 for t in tiles)
+    assert any(t.sx_scale > 1.01 for t in tiles)             # actually varies
+
+
 def test_box_tile_box_geometry():
     sx, sy, sz = 0.8, 0.45, 0.47
     approach_len, yoff = 6.0, 0.12
