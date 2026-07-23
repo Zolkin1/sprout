@@ -337,20 +337,42 @@ class DPMatcher(VanillaMatcher):
             self.warnings.append(f"{forced}/{self.n_cuts} cuts were forced at clip ends.")
         return path, jumped
 
+    def _moving_start(self, target_vel) -> int:
+        """Reconstruction start for an APPROACH lead-in: the candidate DB frame already MOVING closest to
+        ``target_vel`` (planar vx, vy) that still has a FINITE cost-to-go to the pinned terminal.
+
+        The default start (``self._stationary``) is the single standing-est frame, so a short approach
+        begins from a dead stop and never gets going before it must settle into the near-standing stair
+        entry -- it shuffles in place.  Seeding a frame already IN MOTION lets the lead-in walk the full
+        distance.  Restricting to finite ``self._V0`` keeps the start both reachable to the entry AND
+        in-category (disallowed frames carry a +inf category penalty in the cost-to-go).  Falls back to
+        ``self._stationary`` if nothing moving is reachable."""
+        if getattr(self, "_vel_np", None) is None:
+            self._vel_np = self.feat_raw[:, :2].detach().cpu().numpy().astype(np.float64)   # [N,2] planar vel
+            self._cand_np = self._cand_idx.detach().cpu().numpy()                            # valid start frames
+        tgt = np.asarray(target_vel[:2], dtype=np.float64)
+        d = ((self._vel_np - tgt) ** 2).sum(1)
+        d = np.where(np.isfinite(self._V0), d, np.inf)          # reachable to the entry + in-category only
+        dc = np.full(d.shape, np.inf); dc[self._cand_np] = d[self._cand_np]
+        best = int(dc.argmin())
+        return best if np.isfinite(dc[best]) else int(self._stationary)
+
     def generate(self, command, T: int, debug: bool = False,
                  boundary_pin: np.ndarray | None = None, start_frame: int | None = None,
-                 relax_tail: int = 0, allowed_categories=None):
+                 relax_tail: int = 0, allowed_categories=None, start_vel=None):
         """Exact backward-DP match against ``command`` then play the optimal path.
 
         ``boundary_pin[N]`` (per-frame terrain-entry distance) pins the approach onto the entry.
         With ``relax_tail>0`` the command-tracking ramps DOWN and the pin ramps UP over the last
         ``relax_tail`` frames (a distributed pin = smooth transition); with ``relax_tail=0`` the pin
         applies only at the terminal frame.  ``start_frame`` overrides the reconstruction start
-        (exit: begin at the terrain exit).  ``allowed_categories`` (an iterable of source-category
-        names, e.g. ``{"flat", "clean"}``) restricts the DB to those categories for this call
-        (``None`` = the whole DB); requires the matcher to have been built with ``categories``.
-        The chosen frame path is stashed on ``self.frame_path``.
-        Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
+        (exit: begin at the terrain exit).  ``start_vel`` (a ``(vx, vy[, wz])`` command) instead starts
+        from a frame already MOVING at that velocity -- for an APPROACH lead-in, so it begins in motion
+        rather than from the single standing-est frame (``start_frame`` takes precedence if both given).
+        ``allowed_categories`` (an iterable of source-category names, e.g. ``{"flat", "clean"}``)
+        restricts the DB to those categories for this call (``None`` = the whole DB); requires the
+        matcher to have been built with ``categories``.  The chosen frame path is stashed on
+        ``self.frame_path``.  Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
         if self.graph is None:
             raise RuntimeError("DPMatcher.generate called before a candidate graph was attached.")
         self.warnings = []
@@ -366,12 +388,17 @@ class DPMatcher(VanillaMatcher):
         elif self._boundary_pin is not None:                 # terminal-only pin (no window)
             self._pin_scale[T - 1] = 1.0
         action = self._dp_backward(T)
-        start = int(self._stationary if start_frame is None else start_frame)
+        if start_frame is not None:
+            start = int(start_frame)                     # exit: seed at the terrain exit frame
+        elif start_vel is not None:
+            start = self._moving_start(start_vel)        # approach: begin already IN MOTION
+        else:
+            start = int(self._stationary)                # default: begin from the standing-est frame
         if not np.isfinite(self._V0[start]):
             extra = (f" under allowed_categories={sorted(allowed_categories)}"
                      if allowed_categories is not None else "")
             raise RuntimeError(f"DP found no finite-cost path from the start frame{extra}.")
-        path, jumped = self._reconstruct(action, T, start_frame=start_frame)
+        path, jumped = self._reconstruct(action, T, start_frame=start)
         frame_path = torch.as_tensor(path, dtype=torch.long, device=self.device)
         self.frame_path = frame_path
         root_pos, root_quat, joints, dbg = play_frame_path(frame_path, jumped, self, self.cfg, debug=debug)
@@ -393,8 +420,10 @@ class DPMatcher(VanillaMatcher):
         categories -- e.g. ``{"flat", "clean"}`` so a stair approach can't grab box-climb lead-ins."""
         descs = np.atleast_2d(entry_descs)
         pin = boundary_weight * self.boundary_cost_multi(descs)
+        # Begin the lead-in already IN MOTION at the initial commanded velocity (not the standing-est
+        # frame), so the approach walks the full distance up to the stairs instead of shuffling in place.
         out = self.generate(command, T, debug=debug, boundary_pin=pin, relax_tail=relax_tail,
-                            allowed_categories=allowed_categories)
+                            allowed_categories=allowed_categories, start_vel=command(0.0))
         last = int(self.frame_path[-1])
         d = torch.as_tensor(descs, dtype=self._norm.dtype, device=self.device)
         self.matched_entry = int(torch.cdist(self._norm[last:last + 1], d).argmin())

@@ -37,6 +37,7 @@ from ..world_lift import _ANCHOR_MASK_FLAT
 from . import features as F
 from . import ingest_common as IC
 from .motion_db import TRAJOPT, MotionDB, MotionSource
+from .playback import inertialize_seam
 
 _FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
@@ -60,6 +61,7 @@ class MotionMatchClipGenerator:
         w_vel: float = 3.0,
         handoff_horizon_s: float = 0.6,
         warn_cost_threshold: float = 8.0,
+        seam_blend_s: float = 0.15,
         ground_height: float = 0.0,
         contact_z_thresh: float = 0.06,
         anchor_mask: int = _ANCHOR_MASK_FLAT,
@@ -75,6 +77,10 @@ class MotionMatchClipGenerator:
         self.w_vel = float(w_vel)
         self.horizon = max(1, int(round(handoff_horizon_s / dt)))
         self.warn_cost_threshold = float(warn_cost_threshold)
+        # Seam inertialization: ease each skill-transition handoff (the matched stride's first frames)
+        # toward the pose it hands off FROM over this many frames, so the joints don't snap (the flat
+        # analog of the terrain splice's inertialize_seam).  0 disables.
+        self.blend_n = int(round(seam_blend_s / dt)) if seam_blend_s > 0 else 0
         self.ground_height = float(ground_height)
         self.contact_z_thresh = float(contact_z_thresh)
         self.warnings: list[str] = []
@@ -264,8 +270,13 @@ class MotionMatchClipGenerator:
         play_steady(si0, 0, n0, self.skill_of_name[seg0["skill"]], stride0, vx0, seg0["wz"])
 
         # --- remaining segments: transition then steady ---
+        # Each transition has TWO joint-space seams (the matched stride is played verbatim): the
+        # steady -> matched-stride handoff (t0) and the matched-stride -> target-steady handoff (t1).
+        trans_spans: list[tuple[int, int]] = []
         for seg in schedule[1:]:
+            t0 = len(Wp)                               # steady -> matched-stride handoff
             tsrc, tframe = play_transition(seg)
+            trans_spans.append((t0, len(Wp)))          # matched-stride -> target-steady handoff
             _, vxn = self._nearest_stride(seg["skill"], seg["vx"])
             stride_gi = int(self.sources[tsrc].stride_idx[0])
             n = max(1, int(round(seg["duration_s"] / dt)))
@@ -280,6 +291,27 @@ class MotionMatchClipGenerator:
         skill_tr, stride_tr, tvel_tr = skill_tr[:T], stride_tr[:T], tvel_tr[:T]
 
         root_pos = torch.stack(Wp); root_quat = torch.stack(Wq); joints = torch.stack(Wj)
+        # Inertialize BOTH handoffs of every transition (the flat analog of the terrain splice): ease each
+        # free HEAD toward its predecessor over ``blend_n`` frames so the joints decay in instead of
+        # snapping.  Do the matched-stride -> steady seams (t1) FIRST, so the t0 blend -- capped to the
+        # (often short) transition length so it can't bleed into the steady -- can't perturb the t1
+        # reference frame.  anchored_after=False: the frames before the seam are the anchor.
+        T_full = root_pos.shape[0]
+        if self.blend_n >= 2:
+            # t1 (matched-stride -> target-steady) seams FIRST, using each transition's ORIGINAL last frame
+            # as the anchor; then t0 (steady -> matched-stride) seams.  The t0 blend uses the full length
+            # (no cap): when the transition is short/degenerate (e.g. a 1-frame handoff, best_k=0) it bleeds
+            # across it into the new steady, easing that toward the OLD steady -- which is exactly what a
+            # near-instant handoff needs.  Its anchor (t0-1, the old steady) is never touched by the t1
+            # pass, so order is safe.
+            for _t0, t1 in trans_spans:
+                if 1 <= t1 < T_full:
+                    root_pos, root_quat, joints = inertialize_seam(
+                        root_pos, root_quat, joints, t1, self.blend_n, anchored_after=False)
+            for t0, _t1 in trans_spans:
+                if 1 <= t0 < T_full:
+                    root_pos, root_quat, joints = inertialize_seam(
+                        root_pos, root_quat, joints, t0, self.blend_n, anchored_after=False)
         y_des, dy_des, contact = self._world_to_outputs(root_pos, root_quat, joints)
         return {
             "y_des": y_des.unsqueeze(0),

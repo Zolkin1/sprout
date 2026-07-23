@@ -426,7 +426,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
             "entry_frame": k, "n_terr": int(ts.n)}
 
 
-def _place_descent_on_tile(ts, tile, boxes, dev, k=0, truncate=True, going_up=False):
+def _place_descent_on_tile(ts, tile, boxes, dev, k=0, truncate=True, going_up=False, end_buffer_treads=0):
     """Loop the source descent from frame ``k`` and place it on the FIXED tile treads -- SHARED by the
     pure and transition paths so their descent geometry is identical.
 
@@ -483,16 +483,17 @@ def _place_descent_on_tile(ts, tile, boxes, dev, k=0, truncate=True, going_up=Fa
     Wp = Wp + sh
 
     if truncate:
-        # Pure path: end once the root has traversed (N-1) risers from the start tread (reached the far
-        # tread), so a pure clip doesn't overshoot past the tile geometry.  Descent falls to z_lowest;
-        # ascent rises to z_highest.
+        # Pure path: stop ``end_buffer_treads`` treads BEFORE the far end so the clip always leaves that
+        # many stairs ahead of the robot (a landing buffer, never ending on the last tread at a cliff
+        # edge).  Descent falls toward z_lowest; ascent rises toward z_highest.
         N = int(tile.stair_steps[0])
+        risers = max(1, (N - 1) - int(end_buffer_treads))   # treads traversed before stopping (>=1)
         tol = 0.02 * float(tile.step_height)
         if going_up:
-            z_target = float(Wp[0, 2]) + (N - 1) * float(tile.step_height)
+            z_target = float(Wp[0, 2]) + risers * float(tile.step_height)
             reached = (Wp[:, 2] >= z_target - tol).nonzero(as_tuple=False)
         else:
-            z_target = float(Wp[0, 2]) - (N - 1) * float(tile.step_height)
+            z_target = float(Wp[0, 2]) - risers * float(tile.step_height)
             reached = (Wp[:, 2] <= z_target + tol).nonzero(as_tuple=False)
         if reached.numel() > 0:
             cut = int(reached[0].item()) + 1
@@ -523,19 +524,24 @@ def _place_jump_on_tile(ts, tile_box, dev, k=0):
     return Wp, Wq, Wj, terr_contact
 
 
-def _make_pure_tile_clip(builder, ts, tile, args, dev):
+def _make_pure_tile_clip(builder, ts, tile, args, dev, target_vx=0.0):
     """PURE stair TILE clip -> records dict (phase B, pure path).
 
     Loops the source descent stride down a FIXED, sampled staircase ``tile`` (its own dims / #steps /
     width) and emits the tile's fixed geometry + the tile's shared ``terrain_id``.  Matcher-free (no
     approach): the long looped-descent clip for a pure-stair terrain tile.  Descent placement is the
     SHARED :func:`_place_descent_on_tile` (same code the transition path uses).
+
+    ``target_vx`` is the COMMANDED forward speed (m/s) written to the RL-visible ``target_vel`` -- the
+    robot tracks it as best it can; the played gait (``ts``) is the nearest achievable one, so its actual
+    speed may differ (#3).  Forward (+x heading) for both ascent and descent.
     """
     going_up = float(ts.terrain_meta.get("terrain", {}).get("direction_z", -1)) > 0
     boxes = stair_tile_boxes(step_height=tile.step_height, step_depth=tile.step_depth,
                              num_steps=int(tile.stair_steps[0]), tread_width=tile.width, ttype="terrain",
                              going_up=going_up)
-    Wp, Wq, Wj, terr_contact = _place_descent_on_tile(ts, tile, boxes, dev, k=0, going_up=going_up)
+    Wp, Wq, Wj, terr_contact = _place_descent_on_tile(ts, tile, boxes, dev, k=0, going_up=going_up,
+                                                       end_buffer_treads=args.pure_end_buffer)
     bounds = [(0, Wp.shape[0])]
 
     # Recenter by the FIXED tile boxes (NOT the motion) so every clip on this tile emits identical
@@ -565,7 +571,8 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev):
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "terrain",
                       "size_x": size_x, "size_y": size_y, "overlays": overlays,
                       "has_floor": bool(tile.has_floor)}      # False => no flat ground plane in the loader
-    tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)      # pure descent: no forward-cmd label
+    tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)
+    tvel[:, 0] = float(target_vx)                                  # commanded forward speed (best-effort track)
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
             "entry_frame": 0, "n_terr": int(ts.n)}
@@ -633,21 +640,23 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     away at the slow descent speed.  Grounding is inherited from the tile-anchored descent via the seam
     splice (approach on the top platform ~N*h, recovery on the bottom platform ~h).
     """
-    # TODO(transition-ascent): the exit peel-off gate + recovery ramp below are tuned for DESCENT (single
-    # support on the LOWEST tread, recovery on the bottom platform).  Ascent transition (stairs_up: peel
-    # off the HIGHEST tread onto the top platform) is not yet validated, so stairs_up is generated as
-    # PURE ascent tiles only (see the driver).  Fail loudly rather than emit a wrong clip.
-    if float(ts.terrain_meta.get("terrain", {}).get("direction_z", -1)) > 0:
-        raise NotImplementedError(
-            "transition-ascent (stairs_up transition tiles) is not implemented; use --n-transition-tiles 0 "
-            "for ascent sources and generate stairs_up as pure ascent tiles.")
+    # Ascent (stairs_up) vs descent (stairs_down): the transition is MIRRORED.  A descent approaches on the
+    # TOP platform and the recovery peels off the LOWEST tread onto the bottom platform; an ascent
+    # approaches on the BOTTOM platform and the recovery peels off the HIGHEST tread onto the top platform.
+    # The played traversal is source-relative (entry = source start either way, handed off near the START);
+    # only the peel-off tread, the swing-clear direction, and the approach/recovery platform surfaces flip.
+    going_up = float(ts.terrain_meta.get("terrain", {}).get("direction_z", -1)) > 0
     boxes = stair_tile_boxes(step_height=tile.step_height, step_depth=tile.step_depth,
                              num_steps=int(tile.stair_steps[0]), tread_width=tile.width,
                              ttype="transition", top_platform_len=top_len, bottom_platform_len=bot_len,
-                             nav_width=tile.nav_width)
+                             nav_width=tile.nav_width, going_up=going_up)
+    top_surf = int(tile.stair_steps[0]) * float(tile.step_height)   # top platform (= highest tread top)
+    bot_surf = float(tile.step_height)                               # bottom platform (= lowest tread top)
+    peel_tread = top_surf if going_up else bot_surf                  # tread the recovery peels off from
     T_app = max(1, int(round(approach_s / args.dt)))
     T_exit = max(1, int(round(recovery_s / args.dt)))
-    # Hand off near the TOP (descent_entry_frac cap) so the FULL descent plays.
+    # Hand off near the START (descent_entry_frac cap) so the FULL traversal plays -- the source start is
+    # the top for a descent, the bottom for an ascent (source-relative either way).
     efrac = min(args.entry_frac, args.descent_entry_frac)
     entry_descs = matcher.entry_descriptors(ts, entry_frac=efrac)
     entry_vx = _entry_vx(ts, args.dt)
@@ -656,19 +665,19 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
                                            boundary_weight=args.boundary_weight, relax_tail=0,
                                            allowed_categories=_APPROACH_FILTERS["stair_transition"])
     k = int(matcher.matched_entry)
-    # Full looped descent (NOT truncated): the exit peel-off needs the settled frames ON the lowest tread.
-    Wp_d, Wq_d, Wj_d, terr_contact = _place_descent_on_tile(ts, tile, boxes, dev, k=k, truncate=False)
+    # Full looped traversal (NOT truncated): the exit peel-off needs the settled frames ON the peel tread.
+    Wp_d, Wq_d, Wj_d, terr_contact = _place_descent_on_tile(ts, tile, boxes, dev, k=k, truncate=False,
+                                                            going_up=going_up)
 
-    # EXIT peel-off gate: the recovery may hand off ONLY from a SINGLE-support frame near the bottom of the
-    # descent -- the stance foot in CONTACT with the LAST (lowest) tread while the SWING foot is still clear
-    # of it.  That is a mid-stride, pelvis-UP pose; the terminal double-support settle (both feet on the
-    # bottom platform) is deliberately excluded because there the pelvis bottoms out and welds low, which is
-    # exactly what the descent->recovery seam-ease then has to lift the robot out of (the exit "pop").  FK
-    # the placed descent for foot heights; the DP still CHOOSES among the qualifying frames.
+    # EXIT peel-off gate: the recovery may hand off ONLY from a SINGLE-support frame in the on-tread
+    # contact window -- the stance foot in CONTACT with the PEEL tread (lowest for a descent, highest for
+    # an ascent) while the SWING foot is clear of it (LIFTED above it -- both directions, see below).  This
+    # ``on_single``/``on_contact`` gate only marks candidate frames; WHICH one we peel off in is chosen
+    # further down and differs by direction, because a looped climb and a looped descent are NOT mirror
+    # images at the exit (the swing moves toward the platform on a descent but away from it on an ascent).
     _SOLE = 0.034
-    h = float(tile.step_height)                      # lowest tread top (tile-local); tile treads are h..N*h
-    tol = 0.02                                        # tight: stance foot must be ON the tread, not past it
-    swing_clear = min(0.05, 0.5 * h)                 # swing foot must clear the lowest tread by this (single support)
+    tol = 0.02                                        # tight: stance foot must be ON the peel tread, not past it
+    swing_clear = min(0.05, 0.5 * float(tile.step_height))   # swing foot must clear the peel tread by this
     yd, _dyd, _cd = builder.build(Wp_d, Wq_d, Wj_d, args.dt)
     lz = builder.pos_names.index("left_ankle_roll_link:pos_z")
     rz = builder.pos_names.index("right_ankle_roll_link:pos_z")
@@ -676,23 +685,51 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     rsole = yd[:, rz].numpy() - _SOLE
     tc = (terr_contact.cpu().numpy() if terr_contact is not None
           else np.zeros((Wp_d.shape[0], 2), dtype=np.uint8))
-    l_on = (tc[:, 0] > 0) & (np.abs(lsole - h) < tol)   # left stance foot planted on the lowest tread
-    r_on = (tc[:, 1] > 0) & (np.abs(rsole - h) < tol)   # right stance foot planted on the lowest tread
-    on_contact = l_on | r_on                            # some foot down on the lowest tread (the old gate)
-    on_single = ((l_on & (rsole > h + swing_clear))     # + the OTHER (swing) foot still clear of the tread
-                 | (r_on & (lsole > h + swing_clear)))
-    allowed = np.nonzero(on_single)[0]
+    l_on = (tc[:, 0] > 0) & (np.abs(lsole - peel_tread) < tol)   # left stance foot planted on the peel tread
+    r_on = (tc[:, 1] > 0) & (np.abs(rsole - peel_tread) < tol)   # right stance foot planted on the peel tread
+    on_contact = l_on | r_on                            # some foot down on the peel tread
+    _clear = lambda o: o > peel_tread + swing_clear     # swing foot lifted ABOVE the peel tread (both dirs)
+    on_single = (l_on & _clear(rsole)) | (r_on & _clear(lsole))     # + the OTHER (swing) foot still clear
+    # WHERE in the on-tread contact window to hand off to the flat recovery.  The looped stair gait is
+    # continuous single support (no double-support settle, either direction) and NEVER "arrives" at the exit
+    # floor -- it just keeps stepping onto phantom treads past the tile end.  So the swing foot always
+    # passes THROUGH the exit-platform level (= peel tread) mid-stride; the clean hand-off is where the
+    # swing foot is closest to that level while the recovery can still continue its motion onto the platform
+    # WITHOUT the eased seam dragging the foot through the step.
+    #
+    # DESCENT: the platform is BELOW, so "toward the platform" is DOWNWARD-from-above -- the swing is above
+    # the peel tread and falling onto it, and can never clip (it stays above the step).  Peel off in the
+    # FIRST half of the window (arrived at the bottom tread; walk straight off onto the flat).
+    #
+    # ASCENT: the platform is at the TOP, so a swing that is "above the peel tread" is the trailing foot
+    # rising toward a PHANTOM next step -- up-and-AWAY from the platform.  Waiting for it to clear (the old
+    # "second half") picks it near its APEX (~a full riser up); the flat recovery then yanks that high foot
+    # back down onto the platform -- the big foot jump.  Handing off BELOW the peel tread (swing still coming
+    # up off the last step) would instead let the eased recovery drag the low foot forward THROUGH the top
+    # riser.  So take the swing frame CLOSEST to the platform from ABOVE -- above the step (the eased
+    # recovery can't clip the riser) yet dropping the least, and reading like an ordinary flat mid-stride so
+    # the recovery DP matches it cleanly.  A low band (not just the single lowest frame) leaves the DP a
+    # choice of recovery phase.
+    swing_ht = np.maximum(lsole, rsole)          # the airborne (swing) foot; the other is ~on the peel tread
+    if going_up:
+        exit_band = max(0.5 * float(tile.step_height), swing_clear + 0.05)   # small drop, strictly > swing_clear
+        keep = swing_ht <= peel_tread + exit_band
+    else:
+        cf_all = np.nonzero(on_contact)[0]
+        keep = ((np.arange(Wp_d.shape[0]) <= (int(cf_all.min()) + int(cf_all.max())) // 2)
+                if cf_all.size else np.ones(Wp_d.shape[0], dtype=bool))
+    allowed = np.nonzero(on_single & keep)[0]
     if allowed.size == 0:                               # no clean single-support frame -> contact-only fallback
-        allowed = np.nonzero(on_contact)[0]
+        allowed = np.nonzero(on_contact & keep)[0]
         if allowed.size:
             print(f"[box][WARN] transition tile {tile.terrain_id}: no single-support exit frame "
-                  f"(swing_clear={swing_clear:.3f} m); falling back to contact-only peel-off "
-                  f"(exit pose may be low).")
+                  f"({'ascent low-swing band' if going_up else 'descent first half'}, "
+                  f"swing_clear={swing_clear:.3f} m); falling back to contact-only peel-off (exit pose may be low).")
     if allowed.size == 0:
         raise ValueError(
-            f"transition tile {tile.terrain_id}: the descent never lands a foot on the lowest tread "
-            f"(top z={h:.3f}, tol={tol}); cannot pick an exit frame (loop-count / coverage bug -- this "
-            f"should not happen).")
+            f"transition tile {tile.terrain_id}: the traversal never lands a foot on the peel tread "
+            f"(peel z={peel_tread:.3f}, tol={tol}); cannot pick an exit frame (loop-count / coverage bug -- "
+            f"this should not happen).")
     # Descent frame -> source-period frame (loop_periodic offset layout): the first play is source[k:],
     # then wrapped periods are source[1:].  Descriptors are placement/yaw-invariant, so a descent frame's
     # descriptor == its source-period frame's.
@@ -714,22 +751,23 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     # single-support, pelvis-up pose (not a low double-support settle) -- i.e. the seam z-residual is small.
     print(f"[box]   -> exit peel-off frame {cf}/{Wp_d.shape[0] - 1} of {len(allowed)} candidates: "
           f"contact=(L{int(tc[cf, 0])},R{int(tc[cf, 1])}) "
-          f"sole-vs-tread L={lsole[cf] - h:+.3f} R={rsole[cf] - h:+.3f} m, "
-          f"pelvis-above-tread={float(Wp_d[cf, 2]) - h:.3f} m")
+          f"sole-vs-tread L={lsole[cf] - peel_tread:+.3f} R={rsole[cf] - peel_tread:+.3f} m, "
+          f"pelvis-above-tread={float(Wp_d[cf, 2]) - peel_tread:.3f} m")
     Wp_d, Wq_d, Wj_d = Wp_d[:cut], Wq_d[:cut], Wj_d[:cut]
     if terr_contact is not None:
         terr_contact = terr_contact[:cut]
 
-    # Splice: approach + recovery grounded to their platforms (top = N*h, bottom = h) and eased into the
-    # descent like a normal clip cut -- NOT z-welded (which dropped the flat feet into the platform).
-    top_surf = int(tile.stair_steps[0]) * float(tile.step_height)   # top platform (= highest tread)
-    bot_surf = float(tile.step_height)                               # bottom platform (= lowest tread)
+    # Splice: approach + recovery grounded to THEIR platforms and eased into the traversal like a normal
+    # clip cut -- NOT z-welded (which dropped the flat feet into the platform).  Descent: approach lands on
+    # the top platform, recovery on the bottom; ascent: approach on the bottom, recovery on the top.
+    approach_surf = bot_surf if going_up else top_surf
+    recovery_surf = top_surf if going_up else bot_surf
     blend_n = int(round(args.seam_blend_s / args.dt))
     Wp, Wq, Wj, bounds, box_seg = _splice_around(
         (Wp_d, Wq_d, Wj_d),
         (ra.to(dev), qa.to(dev), ja.to(dev)),
         (re.to(dev), qe.to(dev), je.to(dev)),
-        top_surf, bot_surf, blend_n)
+        approach_surf, recovery_surf, blend_n)
     seg_masks = [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT]
 
     # Recenter by the FIXED tile boxes so every clip on this tile emits identical geometry.
@@ -766,6 +804,47 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
             "entry_frame": k, "n_terr": int(ts.n)}
+
+
+def _size_stair_tile_to_motion(tile_recs, builder, m, is_pure):
+    """Widen a stair tile's WALKABLE surfaces to the UNION lateral (y) extent of ALL its clips + margin so
+    the robot never drifts OFF them (#4/#5).
+
+    The robot drifts sideways over the long flat approach/recovery (transition) or the looped traversal
+    (pure); once it leaves the narrow walkable box it steps onto the ground plane a full riser below and
+    "drops off" the stairs/platform.  Fix: grow the walkable surface in y to span wherever the clips
+    actually go --
+
+    * transition (``is_pure=False``): widen only the WIDE approach/recovery PLATFORMS; the narrow treads
+      keep their authored width (the stairs stay the same width -- #4).
+    * pure (``is_pure=True``): there is no platform, so widen EVERY tread for now (#5).
+      TODO(stair-lateral-drift): the real fix is to CORRECT the accumulated lateral drift in the looped
+      placement (keep the traversal on the tread centerline) rather than papering over it with wider treads.
+
+    All clips on a tile share ONE geometry (the reuse invariant), so the width is computed ONCE from the
+    union of every clip and written identically to each.  The clips + overlays are re-shifted in y so the
+    union sits at ``m`` (tile-local y in ``[m, m+span]``), keeping the walkable box aligned to [0, size_y].
+    """
+    py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
+    ylo = min(float(np.asarray(r["y"])[:, py].min()) for r in tile_recs)
+    yhi = max(float(np.asarray(r["y"])[:, py].max()) for r in tile_recs)
+    # Also cover the fixed boxes so a widened surface never leaves an authored tread/platform uncovered.
+    for o in tile_recs[0]["manifest"]["overlays"]:
+        ylo = min(ylo, o["pos_xy"][1] - o["size_xyz"][1] / 2.0)
+        yhi = max(yhi, o["pos_xy"][1] + o["size_xyz"][1] / 2.0)
+    span = yhi - ylo
+    shift = m - ylo                                  # bring the union min to y = m (consistent [0, size_y])
+    size_y = span + 2.0 * m
+    for r in tile_recs:
+        r["y"][:, py] = r["y"][:, py] + shift        # rigid lateral re-shift (velocities are unaffected)
+        ovs = r["manifest"]["overlays"]
+        min_sx = min(o["size_xyz"][0] for o in ovs)
+        for o in ovs:
+            o["pos_xy"][1] = o["pos_xy"][1] + shift
+            if is_pure or o["size_xyz"][0] > 1.5 * min_sx:      # pure: every tread; transition: platforms only
+                o["size_xyz"][1] = size_y                       # fill the tile width
+                o["pos_xy"][1] = size_y / 2.0
+        r["manifest"]["size_y"] = size_y
 
 
 def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
@@ -954,6 +1033,9 @@ def main() -> int:
     p.add_argument("--pure-seconds", type=float, default=20.0,
                    help="[tiles] Target duration (s) for a pure looped-descent clip; sets the tile length "
                         "(#steps ~ pure_seconds * stair_vx / tread_depth).")
+    p.add_argument("--pure-end-buffer", type=int, default=3,
+                   help="[tiles] Stairs left AHEAD of the robot at the end of a PURE clip (a landing buffer "
+                        "so the clip never ends on the last tread at a cliff edge).")
     p.add_argument("--stair-vx", type=float, default=None,
                    help="[tiles] Descent forward speed (m/s) for the pure-length calc (default: measured "
                         "from the source stride).")
@@ -1048,11 +1130,26 @@ def main() -> int:
             st = sorted((b for b in sb if b["size"][0] <= 1.5 * msx), key=lambda b: -b["pos"][2])
             sv = np.mean(np.diff(np.array([b["pos"] for b in st], dtype=float), axis=0), axis=0)
             return (round(abs(float(sv[2])), 6), round(float(np.hypot(sv[0], sv[1])), 6))
+
+        def _src_vx(ts):
+            """The source stride's natural forward speed (net horizontal travel / duration, m/s)."""
+            n = int(ts.root_pos.shape[0])
+            return float(torch.norm(ts.root_pos[-1, :2] - ts.root_pos[0, :2]) / max((n - 1) * args.dt, 1e-6))
+
+        # (riser,tread) -> ALL sources at that geometry, each with its natural speed (#3): the robot may be
+        # commanded ANY velocity on the stairs and does its best to track it -- so we filter to the tile's
+        # geometry (riser/tread are CRITICAL -> must come from a solved variant, never free-randomized) then
+        # pick the gait whose natural speed is CLOSEST to the command (the achievable one; it may run slower
+        # or faster than asked).  The RL-visible target_vel carries the COMMAND, not the gait speed.
         variants: dict = {}
-        for ts in terr_srcs:                                     # (riser,tread) -> source (first wins)
-            variants.setdefault(_riser_tread(ts), ts)
+        for ts in terr_srcs:
+            variants.setdefault(_riser_tread(ts), []).append((ts, _src_vx(ts)))
         hd_grid = sorted(variants.keys())
-        _src_for = lambda h, d: variants[min(variants, key=lambda k: (k[0] - h) ** 2 + (k[1] - d) ** 2)]
+
+        def _src_for(h, d, vx_cmd):
+            """Source clip for a tile clip: nearest (riser,tread) geometry, then nearest natural speed to the command."""
+            key = min(variants, key=lambda k: (k[0] - h) ** 2 + (k[1] - d) ** 2)
+            return min(variants[key], key=lambda tv: abs(tv[1] - float(vx_cmd)))[0]
         src0 = terr_srcs[0]
         going_up0 = float(src0.terrain_meta.get("terrain", {}).get("direction_z", -1)) > 0
         dur = max((src0.root_pos.shape[0] - 1) * args.dt, 1e-6)
@@ -1076,11 +1173,18 @@ def main() -> int:
         # not perturb the tile-geometry rng above -> both stay reproducible from --tile-seed).
         time_rng = np.random.default_rng(args.tile_seed + 1)
         for tile in tiles:
-            src = _src_for(tile.step_height, tile.step_depth)   # the variant clip matching this tile's (riser,tread)
+            tile_recs = []
             if tile.ttype == "terrain":
+                # PURE tile: one clip per commanded velocity (#3), each a looped traversal of the tile's
+                # geometry played by the nearest-achievable gait, labelled with the COMMAND as target_vel.
                 print(f"[box] pure tile {tile.terrain_id}: {tile.stair_steps[0]} steps "
-                      f"(riser {tile.step_height:.3f}, tread {tile.step_depth:.3f}), width {tile.width:.2f}")
-                records.append(_make_pure_tile_clip(builder, src, tile, args, dev))
+                      f"(riser {tile.step_height:.3f}, tread {tile.step_depth:.3f}), width {tile.width:.2f}, vels {tvels}")
+                for vx in tvels:
+                    src = _src_for(tile.step_height, tile.step_depth, vx)   # geometry-matched, nearest-speed gait
+                    rec = _make_pure_tile_clip(builder, src, tile, args, dev, target_vx=vx)
+                    rec["approach_vx"] = vx
+                    tile_recs.append(rec)
+                _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=True)
             else:
                 mx = max(tvels)
                 # Platforms sized to the LONGEST POSSIBLE sampled lead-in / recovery (range max * fastest vx).
@@ -1089,6 +1193,7 @@ def main() -> int:
                 print(f"[box] transition tile {tile.terrain_id}: {tile.stair_steps[0]} steps, "
                       f"width {tile.width:.2f}, platforms top={top_len:.1f} bot={bot_len:.1f} m, vels {tvels}")
                 for vx in tvels:
+                    src = _src_for(tile.step_height, tile.step_depth, vx)   # geometry-matched, nearest-speed gait
                     a_s = float(time_rng.uniform(*args.approach_s_range))   # per-clip lead-in / recovery s
                     r_s = float(time_rng.uniform(*args.recovery_s_range))
                     rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
@@ -1096,7 +1201,9 @@ def main() -> int:
                     rec["approach_vx"] = vx
                     print(f"[box]   -> tile {tile.terrain_id} vx={vx}: approach_s={a_s:.2f} recovery_s={r_s:.2f}, "
                           f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
-                    records.append(rec)
+                    tile_recs.append(rec)
+                _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=False)
+            records.extend(tile_recs)
     elif args.num_box_tiles > 0:
         # Phase B for BOXES: N box tiles (source jump + variant + lateral offset), each a FIXED box on flat
         # ground SHARED by --box-clips-per-tile approach speeds (the box-family reuse invariant; NO 1:1 tid).

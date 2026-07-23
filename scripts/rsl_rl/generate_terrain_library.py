@@ -118,12 +118,14 @@ def main() -> int:
             "--stair-floor-frac", str(args.stair_floor_frac),
             "--out", fam["stairs"]])
     if "stairs_up" not in skip:
-        # Ascent: PURE tiles only (transition-ascent peel-off is a TODO -> raises); the riser x tread
-        # grid gives the geometry variety.  Pure is matcher-free.
+        # Ascent: pure + transition tiles.  Transition-ascent now peels off the HIGHEST tread onto the top
+        # platform (mirror of the descent peel-off); the riser x tread grid gives the geometry variety.
+        # Pure is matcher-free; transition needs the matcher for the flat approach/recovery.
         _run("stairs_up", "generate_box_clips.py", common + bl + [
             "--terrain-lib", args.terrain_lib, "--terrain-skills", "stairs_up",
-            "--n-pure-tiles", str(args.pure_tiles), "--n-transition-tiles", "0",
-            "--tile-seed", str(args.seed), "--stair-floor-frac", str(args.stair_floor_frac),
+            "--n-pure-tiles", str(args.pure_tiles), "--n-transition-tiles", str(args.transition_tiles),
+            "--transition-vels", args.transition_vels, "--tile-seed", str(args.seed),
+            "--stair-floor-frac", str(args.stair_floor_frac),
             "--out", fam["stairs_up"]])
     if "boxes" not in skip:
         _run("boxes", "generate_box_clips.py", common + bl + [

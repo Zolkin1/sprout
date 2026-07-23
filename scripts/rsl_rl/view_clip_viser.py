@@ -417,9 +417,17 @@ class ClipScene:
     def load_clip(self, clip_idx: int) -> None:
         """Reconstruct world tracks + robot poses for ``clip_idx`` and redraw."""
         self.clip_idx = clip_idx
-        y = self.lib.y_des[clip_idx]                 # [T, P] clip-world
-        skill = self.lib.skill_id[clip_idx].cpu().numpy()
-        contact = self.lib.contact[clip_idx].cpu().numpy()
+        # Respect the clip's OWN length: clips are stored padded to the library's max T (a rectangular
+        # h5 array), the tail being held-static frames.  The RL uses clip_len (reset samples within it,
+        # termination cuts at clip_len-1), so the pad is inert there; the viewer must likewise stop at
+        # clip_len or it shows a long frozen tail after the real motion.
+        cl = self.lib.clip_len
+        y = self.lib.y_des[clip_idx]                 # [T, P] clip-world (padded)
+        n = int(cl[clip_idx]) if (cl is not None and cl.numel()) else y.shape[0]
+        self.num_steps = max(1, min(n, y.shape[0]))  # per-clip real length (drives slider / play / ghosts)
+        y = y[: self.num_steps]
+        skill = self.lib.skill_id[clip_idx].cpu().numpy()[: self.num_steps]
+        contact = self.lib.contact[clip_idx].cpu().numpy()[: self.num_steps]
 
         # Robot base world pose + joint config for every step.  The stored
         # quaternion is xyzw (Isaac Lab); viser frames want wxyz.
@@ -429,7 +437,7 @@ class ClipScene:
 
         # Sampled (target) velocity per step, if the library stored it.
         tv = self.lib.target_vel
-        self._target_vel = tv[clip_idx].cpu().numpy() if tv.numel() > 0 else None
+        self._target_vel = tv[clip_idx].cpu().numpy()[: self.num_steps] if tv.numel() > 0 else None
 
         # Terrain mesh for this clip (flat clips keep the bare grid).
         for h in (self._terrain_handle, self._grid_handle, self._spawngoal_handle):
@@ -672,7 +680,7 @@ def main() -> int:
         tid = int(lib.terrain_id[ci]) if lib.terrain_id.numel() else -1
         tinfo = f"{ttype}" + (f" (terrain {tid})" if tid >= 0 else "")
         gui_info.value = (
-            f"clip {ci} [{tinfo}] | step {step}/{lib.num_steps - 1} | now: {cur_skill} | "
+            f"clip {ci} [{tinfo}] | step {step}/{scene.num_steps - 1} | now: {cur_skill} | "
             f"clip skills: {', '.join(skills)}"
         )
         tv = scene.target_vel_at(step)
@@ -684,6 +692,7 @@ def main() -> int:
     @gui_clip.on_update
     def _(_=None):
         scene.load_clip(int(gui_clip.value))
+        gui_frame.max = scene.num_steps - 1          # clip's real length (no padding tail)
         gui_frame.value = 0
         _update_info()
 
@@ -713,6 +722,7 @@ def main() -> int:
         scene.set_show_tube(bool(gui_tube.value))
 
     scene.load_clip(args.clip)
+    gui_frame.max = scene.num_steps - 1              # clip's real length (no padding tail)
     _update_info()
     print(f"[view_clip_viser] serving on http://localhost:{args.port}  (Ctrl-C to stop)")
 
@@ -720,7 +730,7 @@ def main() -> int:
     try:
         while True:
             if gui_play.value:
-                nxt = (int(gui_frame.value) + 1) % lib.num_steps
+                nxt = (int(gui_frame.value) + 1) % scene.num_steps
                 scene.set_frame(nxt)       # pose the scrubber directly
                 gui_frame.value = nxt       # reflect in the slider / info
                 _update_info()
