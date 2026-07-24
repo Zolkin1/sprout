@@ -51,6 +51,7 @@ from motion_gen.motion_matching.locomotion_db import (
     build_locomotion_matcher,
     clean_library_fingerprint,
 )
+from motion_gen.motionbricks.distractor_plan import profile_cmd
 from motion_gen.multiskill_manager import MultiSkillManager
 from motion_gen.world_lift import anchor_mask_from_free
 
@@ -59,24 +60,10 @@ _FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _PINNED = anchor_mask_from_free(set())               # world-pinned: no root DOF re-anchors to the robot
 
 
-# ---- velocity profiles (command = f(t_seconds) -> (vx, vy, wz)) ----
-def _straight(vx):
-    return lambda _t: (float(vx), 0.0, 0.0)
-
-
-def _stop(vx, t_stop, ramp_s):
-    t0 = t_stop - ramp_s
-    def cmd(t):
-        if t <= t0:
-            return (float(vx), 0.0, 0.0)
-        if t >= t_stop:
-            return (0.0, 0.0, 0.0)
-        return (float(vx * (1.0 - (t - t0) / ramp_s)), 0.0, 0.0)
-    return cmd
-
-
-def _turn(vx, wz):
-    return lambda _t: (float(vx), 0.0, float(wz))
+# ---- velocity profiles ------------------------------------------------------------------------------
+# The profiles are DATA (:mod:`motion_gen.motionbricks.distractor_plan`), not closures built here, so the
+# same spec can be handed to a Motion Bricks generator running in the other conda env and still produce the
+# command this side writes as ``target_vel``. ``profile_cmd`` turns a spec back into ``cmd(t)``.
 
 
 # ---- flat matcher: the SHARED locomotion DB (flat bones + clean library_v2), NO terrain lead-ins ----
@@ -165,21 +152,30 @@ def _box_pool(args, n_tiles, rng):
             sz = (float(bx * jx), float(by * jy), float(bz * jz))
             if kind == "stop":
                 vx = float(rng.uniform(0.9, 2.2))
-                cmds = [_stop(vx, ts, args.stop_ramp_s)
-                        for ts in np.linspace(0.4 * args.short_s, 0.6 * args.short_s, n)]
+                specs = [{"kind": "stop", "vx": vx, "t_stop": float(ts), "ramp_s": float(args.stop_ramp_s),
+                          "secs": float(args.short_s)}
+                         for ts in np.linspace(0.4 * args.short_s, 0.6 * args.short_s, n)]
             elif kind == "turn":
                 wz = float(rng.choice([-1, 1])) * float(rng.uniform(0.4, 0.7))
-                cmds = [_turn(1.2, wz) for _ in range(n)]
+                specs = [{"kind": "turn", "vx": 1.2, "wz": wz, "secs": float(args.short_s)}
+                         for _ in range(n)]
             else:
                 vx = float(rng.uniform(0.9, 1.8))
-                cmds = [_straight(v) for v in np.linspace(0.7 * vx, 1.3 * vx, n)]
-            tiles.append((kind, sz, cmds))
+                specs = [{"kind": "straight", "vx": float(v), "secs": float(args.short_s)}
+                         for v in np.linspace(0.7 * vx, 1.3 * vx, n)]
+            tiles.append((kind, sz, specs))
     return tiles
 
 
-def _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev):
+def _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev, gen=None):
     """Generate a tile's motions, align each by its box-relevant frame, fit the box per type ->
-    (records, manifest). All motions in the tile share the one box, placed coherently."""
+    (records, manifest). All motions in the tile share the one box, placed coherently.
+
+    ``gen(spec, cmd, T, i) -> (root_pos, root_quat, joints)`` supplies the MOTION. It defaults to the DP
+    matcher; the Motion Bricks distractor path passes a loader for its pre-generated flat motions instead.
+    Everything after that call -- alignment, the swept-footprint occupancy grid, per-type box fitting, the
+    push-clear, the tile footprint and the manifest -- is independent of where the motion came from.
+    """
     pos = builder.pos_names
     pxy = [pos.index("pelvis_link:pos_x"), pos.index("pelvis_link:pos_y")]
     fxy = [[pos.index(f"{l}:pos_x"), pos.index(f"{l}:pos_y")] for l in _FEET]
@@ -188,13 +184,18 @@ def _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev):
     bx, by, bz = box_xyz
 
     clips, tvels, foot_pts, turn_x = [], [], [], []
-    for i, cmd in enumerate(cmds):
-        sf = None if args.stand_start else _start_frame(matcher, cmd(0.0))
-        rp, rq, jt = matcher.generate(cmd, T, start_frame=sf, allowed_categories=APPROACH_FILTERS["distractor"])
+    for i, spec in enumerate(specs):
+        cmd = profile_cmd(spec)
+        if gen is not None:
+            rp, rq, jt = gen(spec, cmd, T, i)
+        else:
+            sf = None if args.stand_start else _start_frame(matcher, cmd(0.0))
+            rp, rq, jt = matcher.generate(cmd, T, start_frame=sf,
+                                          allowed_categories=APPROACH_FILTERS["distractor"])
         if kind == "stop":
             # STOP `gap` behind the box near-face (which sits at x=0); vary gap across the tile so
             # the tile's clips stop at a range of distances. gap is pelvis->near-face (~body+0.2).
-            gap = float(np.linspace(0.4, 0.7, len(cmds))[i])
+            gap = float(np.linspace(0.4, 0.7, len(specs))[i])
             rp2, rq2 = _align(rp, rq, rp.shape[0] - 1, (-gap, 0.0), dev)
         else:
             rp2, rq2 = _align(rp, rq, 0, (0.0, 0.0), dev)          # start at origin facing +x
@@ -270,8 +271,8 @@ def _distractor_tile_worker(tid: int):
     in order (unit_pool flattens the per-tile lists)."""
     S = _SHARED
     matcher, builder, args, dev, T = S["matcher"], S["builder"], S["args"], S["dev"], S["T"]
-    kind, box_xyz, cmds = S["tiles"][tid]
-    recs, manifest = _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev)
+    kind, box_xyz, specs = S["tiles"][tid]
+    recs, manifest = _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev)
     if recs:
         recs[0]["_manifest"] = manifest
     print(f"[distractor] tile {tid} {kind}: {len(recs)} clips, {len(manifest['overlays'])} box(es)")

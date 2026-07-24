@@ -51,7 +51,35 @@ _FRAME_COLORS = [
 _SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot
 _GHOST_COLOR = (0.45, 0.55, 0.70)       # translucent steel-blue ghosts
 _GHOST_ALPHA_NEAR, _GHOST_ALPHA_FAR = 0.7, 0.18
+_KEYFRAME_COLOR = (0.95, 0.80, 0.15)    # gold -- pinned target keyframes (Phase-2 mb_encode overlay)
+_KEYFRAME_ALPHA = 0.55
 _DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j.urdf"
+
+
+def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
+    """Load an ``mb_encode.py`` ``_keyframes.npz`` sidecar -> per-clip posed-keyframe arrays.
+
+    Returns ``{clip_idx: {"pos": [K,3], "wxyz": [K,4], "cfg": [K,nj], "t": [K]}}`` where ``cfg`` is
+    already permuted into the URDF joint order. Keyframe qpos is MuJoCo layout
+    ``[root_pos(3), root_quat_wxyz(4), joints(29)]`` with joints in the sidecar's ``joint_names`` order.
+    """
+    import json as _json
+
+    d = np.load(path, allow_pickle=False)
+    clip_idx, qpos = d["clip_idx"], d["qpos"]
+    tks = d["t"] if "t" in d else np.zeros(len(qpos), np.float32)
+    joint_names = _json.loads(str(d["joint_names"]))
+    perm = recording_to_urdf_perm(joint_names, urdf)
+    out: dict[int, dict] = {}
+    for ci in np.unique(clip_idx):
+        m = clip_idx == ci
+        out[int(ci)] = {
+            "pos": qpos[m, 0:3].astype(np.float32),
+            "wxyz": qpos[m, 3:7].astype(np.float32),
+            "cfg": qpos[m, 7:][:, perm].astype(np.float32),
+            "t": tks[m].astype(np.float32),
+        }
+    return out
 
 
 def _frame_pos_indices(pos_names: list[str]) -> dict[str, list[int]]:
@@ -388,6 +416,13 @@ class ClipScene:
             )
             self._ghosts.append((fr, gh))
 
+        # Pinned-keyframe ghost pool (gold) -- the Phase-2 target poses fed to Motion Bricks' predict().
+        # Populated only when a --keyframes sidecar is supplied; sized on first set_keyframes.
+        self._keyframes: dict[int, dict] | None = None
+        self._kf_ghosts: list[tuple[viser.FrameHandle, ViserUrdf]] = []
+        self._kf_markers: viser.SceneNodeHandle | None = None
+        self.show_keyframes = False   # default off -- many robot meshes can hang the browser; toggle via GUI
+
         # Termination-distance corridor tube around the base path (hidden by default).
         self._tube_handle: viser.SceneNodeHandle | None = None
 
@@ -570,7 +605,43 @@ class ClipScene:
             self._touchdown_handles.append(h)
 
         self.refresh_ghosts()
+        self._refresh_keyframes()
         self.set_frame(0)
+
+    def set_keyframes(self, kf_by_clip: dict[int, dict]) -> None:
+        """Attach pinned-keyframe data and build the gold ghost pool sized to the busiest clip."""
+        self._keyframes = kf_by_clip
+        pool = max((len(v["pos"]) for v in kf_by_clip.values()), default=0)
+        for s in range(pool):
+            fr = self.server.scene.add_frame(f"/keyframes/{s}", show_axes=False, visible=False)
+            gh = ViserUrdf(self.server, self.urdf, root_node_name=f"/keyframes/{s}",
+                           mesh_color_override=(*_KEYFRAME_COLOR, _KEYFRAME_ALPHA))
+            self._kf_ghosts.append((fr, gh))
+
+    def _refresh_keyframes(self) -> None:
+        """Pose the gold keyframe ghosts (+ root markers) for the current clip; hide the rest."""
+        kf = (self._keyframes or {}).get(self.clip_idx)
+        if self._kf_markers is not None:
+            self._kf_markers.remove()
+            self._kf_markers = None
+        for s, (fr, gh) in enumerate(self._kf_ghosts):
+            if kf is not None and self.show_keyframes and s < len(kf["pos"]):
+                fr.position = kf["pos"][s]
+                fr.wxyz = kf["wxyz"][s]
+                gh.update_cfg(kf["cfg"][s])
+                fr.visible = True
+            else:
+                fr.visible = False
+        if kf is not None and self.show_keyframes and len(kf["pos"]):
+            self._kf_markers = self.server.scene.add_point_cloud(
+                "/keyframe_roots", points=kf["pos"].astype(np.float32),
+                colors=np.tile(np.array(_KEYFRAME_COLOR, np.float32), (len(kf["pos"]), 1)),
+                point_size=0.05, point_shape="circle",
+            )
+
+    def set_show_keyframes(self, show: bool) -> None:
+        self.show_keyframes = show
+        self._refresh_keyframes()
 
     def refresh_ghosts(self) -> None:
         """Pose the active ghost robots at evenly-spaced steps along the clip."""
@@ -640,9 +711,13 @@ def main() -> int:
     p.add_argument("--urdf", default=_DEFAULT_URDF, help="G1 URDF path.")
     p.add_argument("--port", type=int, default=8080, help="Viser server port.")
     p.add_argument("--max-ghosts", type=int, default=10, help="Ghost robot pool size.")
-    p.add_argument("--ghosts", type=int, default=8, help="Initial ghost count.")
+    p.add_argument("--ghosts", type=int, default=0,
+                   help="Initial trajectory-ghost count (default 0 -- many robot meshes can hang the browser; "
+                        "raise via the GUI slider as needed).")
     p.add_argument("--term-dist", type=float, default=0.25,
                    help="Base-pose-error termination distance (m); radius of the corridor tube.")
+    p.add_argument("--keyframes", default=None,
+                   help="Optional mb_encode.py _keyframes.npz sidecar: overlay the pinned target poses (gold).")
     args = p.parse_args()
 
     lib = load_clip_library(args.lib, "cpu")
@@ -654,6 +729,11 @@ def main() -> int:
 
     scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist)
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
+    keyframes = _load_keyframe_sidecar(args.keyframes, urdf) if args.keyframes else None
+    if keyframes is not None:
+        scene.set_keyframes(keyframes)
+        nkf = sum(len(v["pos"]) for v in keyframes.values())
+        print(f"[view_clip_viser] loaded {nkf} pinned keyframes over {len(keyframes)} clips from {args.keyframes}")
 
     # ---- GUI ----
     gui_clip = server.gui.add_slider("clip", 0, lib.num_clips - 1, 1, args.clip)
@@ -664,6 +744,8 @@ def main() -> int:
     gui_command = server.gui.add_checkbox("command path (green)", True)
     gui_plot = server.gui.add_checkbox("tracking plot", True)
     gui_tube = server.gui.add_checkbox(f"termination tube ({args.term_dist:.2f} m)", False)
+    if keyframes is not None:
+        gui_keyframes = server.gui.add_checkbox("pinned keyframes (gold)", scene.show_keyframes)
     gui_vel = server.gui.add_text("target vel (vx,vy,wz)", "", disabled=True)
     gui_info = server.gui.add_text("info", "", disabled=True)
 
@@ -720,6 +802,11 @@ def main() -> int:
     @gui_tube.on_update
     def _(_=None):
         scene.set_show_tube(bool(gui_tube.value))
+
+    if keyframes is not None:
+        @gui_keyframes.on_update
+        def _(_=None):
+            scene.set_show_keyframes(bool(gui_keyframes.value))
 
     scene.load_clip(args.clip)
     gui_frame.max = scene.num_steps - 1              # clip's real length (no padding tail)

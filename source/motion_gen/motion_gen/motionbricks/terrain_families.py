@@ -1,0 +1,226 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""What differs between terrain skills, in one place: the family table + the boundary-frame gates.
+
+Every Motion-Bricks terrain clip has the SAME shape -- ``MB approach -> replayed terrain -> MB exit`` --
+and the families differ only in a handful of declarative facts (does the traversal loop, which walkable
+level does the approach run on, which way does the exit walk away) plus HOW the two boundary frames of
+the replay are chosen:
+
+* **Episodic** interactions (a box mount / dismount) are played whole, so the boundaries are simply the
+  first and last frame (:func:`episodic_boundaries`).
+* **Periodic** interactions (a stair stride looped up/down a staircase) have no natural first/last frame:
+  cutting anywhere would start a foot inside a tread or end it on a phantom stair past the tile.  So the
+  boundary frames are FILTERED by contact + geometry (:func:`boundary_candidates`): a foot planted on a
+  walkable level with the other foot a small height above it -- an ordinary single-support mid-stride pose
+  the flat MB segment can hand off to / pick up from.
+
+This module is numpy-only (no torch, no Motion Bricks, no IsaacLab imports) so it loads in the Motion
+Bricks conda env as well as in ``env_isaaclab`` -- the terrain plan (:mod:`.terrain_plan`) is built on one
+side and consumed on the other.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+# Height of the ankle_roll_link frame origin above the sole with the foot flat on a surface (m).  Sole
+# height = ankle-frame z - this, which is what the contact gates compare against a tread / box top.
+SOLE_Z = 0.034
+
+
+@dataclass(frozen=True)
+class TerrainFamily:
+    """Declarative description of one terrain skill for the Motion-Bricks terrain pipeline.
+
+    ``lower`` / ``upper`` name the two walkable LEVELS a tile has: for stairs the bottom platform (flush
+    with the lowest tread) and the top platform (flush with the highest tread); for a box the ground and
+    the box top.  A family says which level its approach runs on and which its exit runs on -- everything
+    directional (which tread the traversal peels off, which surface each MB segment is grounded to)
+    follows from that, so no generator carries per-skill branches.
+    """
+
+    skill: str                  # terrain library skill name (manifest "skill" column)
+    geom: str                   # "stairs" | "box" -- which tile geometry to author
+    periodic: bool              # True => loop the stride onto the tile; False => play once (episodic)
+    going_up: bool              # stairs: +x runs uphill.  Unused (False) for the box family
+    approach_level: str         # "lower" | "upper" -- level the MB approach walks/stands on
+    exit_level: str             # "lower" | "upper" -- level the MB exit walks/stands on
+    approach_mode: str          # "walk" (locomote into the terrain) | "stand" (settle in place on it)
+    exit_mode: str              # "walk" (locomote away) | "stand" (arrived; hold position)
+    exit_sign: float            # exit travel direction along tile +x: +1 forward, -1 backward
+    terrain_tvel: str           # RL target_vel over the replay: "steady" | "hold_approach" | "exit_walk"
+    pin_future: bool            # approach pin tracks the replay's FUTURE frames (see below) vs holds the entry
+    blurb: str                  # one-line human description (printed by the drivers)
+
+
+# ``pin_future``: the approach's target keyframe sits ~1 s ahead of the robot, so near the hand-off it can
+# either keep walking forward into the replay's own future frames or hold the entry pose.  Tracking the
+# future keeps the arrival MOVING at the entry velocity, which is what an ASCENT wants (its future rises, and
+# Motion Bricks partly follows the rise into the climb).  A DESCENT's future drops BELOW the platform the
+# approach is still walking on, so tracking it drags the robot off its surface before the seam; and an
+# EPISODIC boundary's future is the takeoff itself, so tracking it generates a half-jump the splice then has
+# to undo.  Measured boundary-pose error (joint L2 at the seam, lower is better):
+#   stairs_up   future 0.66 rad | hold 1.05 | unpinned 1.56
+#   stairs_down future 1.70 rad | hold 0.79 | unpinned 1.68
+
+
+# ``jump_on`` is the only MOUNT in the library (there is no backward mount), so the box family covers
+# mount + both dismount directions: ``jump_off`` steps off backwards, ``jump_off_front`` forwards.
+FAMILIES: dict[str, TerrainFamily] = {
+    "stairs_up": TerrainFamily(
+        skill="stairs_up", geom="stairs", periodic=True, going_up=True,
+        approach_level="lower", exit_level="upper", approach_mode="walk", exit_mode="walk",
+        exit_sign=1.0, terrain_tvel="steady", pin_future=True,
+        blurb="walk in on the bottom platform, climb the treads, walk off the top platform"),
+    "stairs_down": TerrainFamily(
+        skill="stairs_down", geom="stairs", periodic=True, going_up=False,
+        approach_level="upper", exit_level="lower", approach_mode="walk", exit_mode="walk",
+        exit_sign=1.0, terrain_tvel="steady", pin_future=False,
+        blurb="walk in on the top platform, descend the treads, walk off the bottom platform"),
+    "jump_on": TerrainFamily(
+        skill="jump_on", geom="box", periodic=False, going_up=False,
+        approach_level="lower", exit_level="upper", approach_mode="walk", exit_mode="stand",
+        exit_sign=1.0, terrain_tvel="hold_approach", pin_future=False,
+        blurb="walk in on the ground, jump onto the box, stand on top"),
+    "jump_off": TerrainFamily(
+        skill="jump_off", geom="box", periodic=False, going_up=False,
+        approach_level="upper", exit_level="lower", approach_mode="stand", exit_mode="walk",
+        exit_sign=-1.0, terrain_tvel="exit_walk", pin_future=False,
+        blurb="stand on the box, drop off BACKWARDS, walk away backwards"),
+    "jump_off_front": TerrainFamily(
+        skill="jump_off_front", geom="box", periodic=False, going_up=False,
+        approach_level="upper", exit_level="lower", approach_mode="stand", exit_mode="walk",
+        exit_sign=1.0, terrain_tvel="exit_walk", pin_future=False,
+        blurb="stand on the box, drop off FORWARDS, walk away forwards"),
+}
+
+
+def family_for(skill: str) -> TerrainFamily:
+    """The :class:`TerrainFamily` for a terrain library ``skill``, or a clear error listing what exists."""
+    try:
+        return FAMILIES[skill]
+    except KeyError:
+        raise KeyError(f"no Motion-Bricks terrain family for skill {skill!r}; "
+                       f"have {sorted(FAMILIES)}") from None
+
+
+@dataclass(frozen=True)
+class BoundaryGate:
+    """Result of a boundary-frame filter: which frames the replay may start / stop at, and how it got them."""
+
+    frames: np.ndarray          # [K] int candidate frame indices (ascending, possibly empty)
+    strict: bool                # True => single-support candidates; False => the contact-only fallback
+    n_planted: int              # frames with SOME foot planted on a level (before the swing-foot test)
+    reason: str                 # one-line diagnostic for the generator log
+
+
+def sole_heights(y: np.ndarray, pos_names: list[str],
+                 frames: tuple[str, str] = ("left_ankle_roll_link", "right_ankle_roll_link"),
+                 sole_offset: float = SOLE_Z) -> np.ndarray:
+    """Per-frame SOLE heights ``[T, 2]`` (left, right) from a built clip-output block ``y[T, P]``.
+
+    ``y`` is what :class:`~motion_gen.motion_matching.clip_output.ClipOutputBuilder` produces (the
+    ``pos_output_names`` layout); the ankle-frame z is lowered by ``sole_offset`` so the value can be
+    compared directly against a tread / box top height.
+    """
+    cols = [pos_names.index(f"{f}:pos_z") for f in frames]
+    return np.asarray(y, dtype=np.float64)[:, cols] - float(sole_offset)
+
+
+def boundary_candidates(soles: np.ndarray, contact: np.ndarray, levels, *,
+                        tol: float = 0.02, swing_clear: float = 0.05, swing_band: float = 0.15,
+                        window: tuple[int, int] | None = None) -> BoundaryGate:
+    """Frames where the traversal is in a clean SINGLE-SUPPORT pose on a walkable level.
+
+    The hand-off test, in both directions: one foot is IN CONTACT and its sole sits (within ``tol``) on one
+    of the walkable ``levels``, while the other (swing) foot is clear ABOVE that same level -- lifted by
+    more than ``swing_clear`` (so an eased seam cannot drag it through the step) but by no more than
+    ``swing_band`` (so it is not near its apex a full riser up, which a flat segment would have to yank
+    back down).  That window reads like an ordinary flat mid-stride, which is exactly what makes it
+    spliceable onto a flat Motion-Bricks segment.
+
+    ``levels`` may be a single height (the one surface the boundary must sit on -- e.g. the top tread an
+    ascent peels off) or a list of heights (any tread, e.g. for an ENTRY whose stance tread is whichever
+    the placement will anchor onto the tile's first tread).
+
+    If no frame passes, falls back to the contact-only test (some foot planted on a level) and says so via
+    :attr:`BoundaryGate.strict`, so the caller can warn instead of failing outright.
+
+    Args:
+        soles: ``[T, 2]`` sole heights (see :func:`sole_heights`).
+        contact: ``[T, 2]`` per-foot in-contact flags (nonzero == in contact).
+        levels: walkable surface height(s) the stance foot may rest on (m).
+        tol: how close the stance sole must be to a level to count as planted (m).
+        swing_clear / swing_band: allowed swing-foot height above the stance level (m).
+        window: optional ``(lo, hi)`` half-open frame range to restrict candidates to.
+
+    Returns:
+        :class:`BoundaryGate`.
+    """
+    soles = np.asarray(soles, dtype=np.float64)
+    contact = np.asarray(contact)
+    if soles.ndim != 2 or soles.shape[1] != 2:
+        raise ValueError(f"soles must be [T, 2], got {soles.shape}")
+    if contact.shape[:1] != soles.shape[:1]:
+        raise ValueError(f"contact {contact.shape} does not match soles {soles.shape}")
+    lv = np.atleast_1d(np.asarray(levels, dtype=np.float64)).reshape(-1)
+    T = soles.shape[0]
+
+    nearest = lv[np.abs(soles[:, :, None] - lv[None, None, :]).argmin(axis=-1)]   # [T,2] level under each foot
+    planted = (contact[:, :2] > 0) & (np.abs(soles - nearest) < float(tol))       # [T,2]
+    swing = soles[:, ::-1] - nearest                     # the OTHER foot's height above this foot's level
+    ok_swing = (swing > float(swing_clear)) & (swing <= float(swing_band))
+    strict_mask = (planted & ok_swing).any(axis=1)
+    planted_mask = planted.any(axis=1)
+
+    keep = np.ones(T, dtype=bool)
+    if window is not None:
+        lo, hi = int(window[0]), int(window[1])
+        keep[:] = False
+        keep[max(0, lo):max(0, hi)] = True
+
+    frames = np.nonzero(strict_mask & keep)[0]
+    if frames.size:
+        return BoundaryGate(frames=frames.astype(np.int64), strict=True, n_planted=int(planted_mask.sum()),
+                            reason=f"{frames.size} single-support candidates on levels "
+                                   f"{np.round(lv, 3).tolist()}")
+    frames = np.nonzero(planted_mask & keep)[0]
+    return BoundaryGate(
+        frames=frames.astype(np.int64), strict=False, n_planted=int(planted_mask.sum()),
+        reason=(f"no single-support frame (swing band ({swing_clear:.3f}, {swing_band:.3f}] m); "
+                f"fell back to {frames.size} contact-only candidates"))
+
+
+def episodic_boundaries(n_frames: int) -> tuple[int, int]:
+    """Boundary frames of an EPISODIC interaction: the whole thing plays, so ``(0, n_frames - 1)``.
+
+    A box mount starts standing on the ground and ends standing on the box (and a dismount the reverse):
+    both ends are already settled double-support poses solved for exactly that surface, so there is
+    nothing to filter -- the approach hands off at frame 0 and the exit picks up at the last frame.
+    """
+    if n_frames < 2:
+        raise ValueError(f"episodic interaction needs >= 2 frames, got {n_frames}")
+    return 0, n_frames - 1
+
+
+def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
+    """Choose ONE frame from a candidate gate -- the hand-picked hard-pin frame.
+
+    ``prefer="first"`` takes the earliest candidate: for an ENTRY that is the earliest clean hand-off in
+    the first stride (least flat walking replaced by replayed terrain), and for an EXIT the first clean
+    arrival on the far surface (the traversal stops as soon as it has landed, never stepping onto a
+    phantom tread past the tile).  ``prefer="last"`` takes the latest, ``prefer="middle"`` the median
+    candidate (a phase in the interior of the window, away from both edges).
+    """
+    if gate.frames.size == 0:
+        raise ValueError(f"no boundary candidates to pick from ({gate.reason})")
+    if prefer == "first":
+        return int(gate.frames[0])
+    if prefer == "last":
+        return int(gate.frames[-1])
+    if prefer == "middle":
+        return int(gate.frames[gate.frames.size // 2])
+    raise ValueError(f"unknown boundary preference {prefer!r} (first | last | middle)")

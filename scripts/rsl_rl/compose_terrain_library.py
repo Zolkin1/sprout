@@ -65,6 +65,52 @@ def _sample(idxs: list[int], k: int) -> list[int]:
     return list(idxs)[:: max(1, len(idxs) // k)][:k]
 
 
+# Meta keys that MUST agree across sources: the composed library keeps ONE meta (the first source's), so a
+# mismatch here silently reinterprets another source's data -- different dt, or y_des/dy_des/contact columns
+# meaning different channels.  ``skill_list`` only labels the (RL-unused) skill_id dataset, so it warns.
+_META_MUST_MATCH = ("dt", "pos_output_names", "vel_output_names", "contact_frames", "ref_frame")
+_META_SHOULD_MATCH = ("skill_list",)
+
+
+def _fmt(v) -> str:
+    """Compact display for a meta value (long channel-name lists get elided)."""
+    if isinstance(v, list) and len(v) > 4:
+        return f"[{len(v)} items: {v[0]}, {v[1]}, ..., {v[-1]}]"
+    return repr(v)
+
+
+def _validate_meta(paths: list[str]) -> None:
+    """Fail loudly if the sources' clip metas are not composable.
+
+    The writer stores one meta for the whole library, so composing sources whose channel layout, control dt
+    or reference frame differ produces a library that is silently wrong rather than obviously broken -- worth
+    an explicit gate now that libraries come from more than one generator (DP matcher vs Motion Bricks).
+    """
+    ref_path, rest = paths[0], paths[1:]
+    ref = _get_lib(ref_path).meta
+    problems: list[str] = []
+    soft: dict[str, set[str]] = {}
+    for path in rest:
+        m = _get_lib(path).meta
+        for k in _META_MUST_MATCH:
+            if m.get(k) != ref.get(k):
+                problems.append(f"  {k}: {ref_path} has {_fmt(ref.get(k))}\n"
+                                f"      {' ' * len(k)}{path} has {_fmt(m.get(k))}")
+        for k in _META_SHOULD_MATCH:
+            if m.get(k) != ref.get(k):
+                soft.setdefault(k, set()).add(path.split("/")[-1])
+    # One line per key, not per source: composing per-family libraries always differs in skill_list, and a
+    # warning per source buries the real errors.
+    for k, srcs in soft.items():
+        print(f"[compose][WARN] {k} differs across {len(srcs)} source(s) ({', '.join(sorted(srcs))}); "
+              f"keeping {ref_path.split('/')[-1]}'s {_fmt(ref.get(k))}. Only the (RL-unused) skill_id "
+              f"dataset is labelled by it.")
+    if problems:
+        raise SystemExit("[compose] sources are not composable -- incompatible clip meta:\n"
+                         + "\n".join(problems)
+                         + "\n[compose] regenerate the odd source with the same --source / --dt, or drop it.")
+
+
 def _load_source(path: str):
     """-> (is_flat, tiles). ``tiles`` = list of (manifest_entry|None, [clip_idx]) grouped by
     terrain_id (one 'tile' each); a source of only terrain_id -1 clips is flat (one pseudo-tile)."""
@@ -128,6 +174,7 @@ def main() -> int:
 
     loaded = [(_load_source(path), path, n) for path, n in specs]
     paths_for_T = [path for _, path, _ in loaded] + ([args.flat_from] if args.flat_from else [])
+    _validate_meta(paths_for_T)                                      # before any clip is copied
     T = args.num_steps or max(int(_get_lib(path).num_steps) for path in paths_for_T)
     print(f"[compose] common num_steps = {T}")
 
