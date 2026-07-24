@@ -91,7 +91,7 @@ def test_ingest_basic(tmp_path):
         # resampled length ~ span * (1/dt); span = (T-1)*sim_dt
         span = (int({"walk_forward": 417, "walk_turn": 401, "run_forward": 137}[skill]) - 1) * _SIM_DT
         assert abs(s.n - round(span / dt)) <= 1
-        assert s.joint_pos.shape[1] == 21 and s.root_quat.shape[1] == 4
+        assert s.joint_pos.shape[1] == len(_G1_FROM_CSV) and s.root_quat.shape[1] == 4
 
 
 def test_joint_map_and_velocity(tmp_path):

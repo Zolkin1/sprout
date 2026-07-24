@@ -17,8 +17,10 @@ from motion_gen.motion_matching.graph import (
 from motion_gen.motion_matching.playback import play_frame_path
 from motion_gen.motion_matching.vanilla import (
     VanillaConfig, compute_vanilla_features, make_ee_fk, _periodic_extension)
+from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
 
 _DT = 0.02
+_NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width
 
 
 class _LoopDB:
@@ -87,7 +89,7 @@ def _straight_clip(n, vx, z=0.78):
     """A closed straight clip: constant pose, root advancing at body vx (identity yaw)."""
     rp = torch.zeros(n, 3); rp[:, 0] = torch.arange(n) * vx * _DT; rp[:, 2] = z
     rq = torch.zeros(n, 4); rq[:, 0] = 1.0
-    jp = torch.zeros(n, 21); jv = torch.zeros(n, 21)
+    jp = torch.zeros(n, _NJ); jv = torch.zeros(n, _NJ)
     return rp, rq, jp, jv
 
 
@@ -240,7 +242,7 @@ def _clip_ns(n, vx, seed, steady, wrap, wz=0.0, z=0.78):
     dx = step * torch.cos(yaw); dy = step * torch.sin(yaw)
     rp[:, 0] = torch.cumsum(dx, 0) - dx[0]; rp[:, 1] = torch.cumsum(dy, 0) - dy[0]
     rq = torch.stack([torch.cos(yaw / 2), torch.zeros(n), torch.zeros(n), torch.sin(yaw / 2)], -1)
-    jp = 0.15 * torch.randn(n, 21, generator=g); jv = 0.15 * torch.randn(n, 21, generator=g)
+    jp = 0.15 * torch.randn(n, _NJ, generator=g); jv = 0.15 * torch.randn(n, _NJ, generator=g)
     sv = torch.tensor([vx, 0.0, wz], dtype=torch.float32) if steady else None
     return SimpleNamespace(name=f"c{seed}", n=n, root_pos=rp, root_quat=rq, joint_pos=jp,
                            joint_vel=jv, steady=steady, wrap=wrap, steady_vel=sv)

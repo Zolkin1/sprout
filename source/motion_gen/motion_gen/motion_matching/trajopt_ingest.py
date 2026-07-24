@@ -34,7 +34,13 @@ def ingest_trajopt(
 ) -> list[MotionSource]:
     """Build one :class:`MotionSource` per library stride (optionally skill-filtered)."""
     pn = manager.pos_output_names
-    jidx = torch.tensor(IC.joint_channel_index(pn, F.G1_JOINT_NAMES), device=device)
+    # Tolerate a source library that solved FEWER joints than the full G1 set: joints absent from the
+    # library (e.g. waist roll/pitch + wrists in a 21-DoF traj-opt library) are held at 0 here, so a
+    # legacy library still ingests as a 29-DoF motion source (0 for the unsolved DOFs).
+    _pn_idx = {n: i for i, n in enumerate(pn)}
+    _jcols = [_pn_idx.get(f"joint:{jn}", -1) for jn in F.G1_JOINT_NAMES]
+    jidx = torch.tensor([c if c >= 0 else 0 for c in _jcols], device=device)
+    _jmiss = torch.tensor([c < 0 for c in _jcols], device=device, dtype=torch.bool)
     ppos, pori = IC.frame_pose_index(pn, "pelvis_link")
     ppos = torch.tensor(ppos, device=device)
     pori = torch.tensor(pori, device=device)
@@ -57,6 +63,10 @@ def ingest_trajopt(
         manager.set_trajectory_indices(torch.full((Fi,), gi, dtype=torch.long, device=device))
         ypos, _ = manager.get_output(phase)                                 # [Fi, P]
         joint_pos = ypos[:, jidx]
+        if bool(_jmiss.any()):
+            joint_pos = joint_pos.clone()
+            joint_pos[:, _jmiss] = 0.0                  # unsolved joints (not in the source library) -> 0
+
         root_pos = ypos[:, ppos]
         root_quat = ypos[:, pori]                                           # wxyz
         root_quat = root_quat / root_quat.norm(dim=-1, keepdim=True).clamp_min(1e-9)

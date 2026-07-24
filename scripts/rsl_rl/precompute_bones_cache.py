@@ -84,7 +84,7 @@ def main() -> int:
         rows = rows[: args.limit]
     print(f"[precompute] {len(rows)} clips pass the filter -> {args.out}")
 
-    dims = {"joint_pos": 21, "root_pos": 3, "root_quat": 4, "root_lin_vel": 3,
+    dims = {"joint_pos": len(F.G1_JOINT_NAMES), "root_pos": 3, "root_quat": 4, "root_lin_vel": 3,
             "root_ang_vel": 3, "feat": pfd}
     f = h5py.File(args.out, "w")
     ds = {k: f.create_dataset(k, shape=(0, d), maxshape=(None, d), dtype="float16",

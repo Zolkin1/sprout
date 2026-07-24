@@ -331,8 +331,8 @@ def main() -> int:
     }
     meta = {
         "dt": args.dt, "clip_length_s": clip_len, "num_steps": int(T),
-        "pos_output_names": list(manager.pos_output_names),
-        "vel_output_names": list(manager.vel_output_names),
+        "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
+        "vel_output_names": list(builder.vel_names),
         "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
         "skill_list": [s.name for s in manager.skills],
     }

@@ -144,6 +144,7 @@ def test_upright_slope_keeps_pelvis_vertical_and_climbs(tmp_path):
     m = MultiSkillManager(_FIX, "cpu", env=None)
     pn, vn = list(m.pos_output_names), list(m.vel_output_names)
     builder = ClipOutputBuilder(pn, vn, device="cpu")
+    pn, vn = list(builder.pos_names), list(builder.vel_names)   # builder rebuilds joints to the full 29-DoF layout
 
     T = 20
     root_pos = torch.zeros(T, 3); root_pos[:, 0] = torch.linspace(0.0, 1.0, T); root_pos[:, 2] = 0.75

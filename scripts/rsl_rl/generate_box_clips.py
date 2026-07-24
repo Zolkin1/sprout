@@ -42,6 +42,7 @@ from motion_gen.motion_matching.box_clip import (
 )
 from motion_gen.math_utils import quat_apply, quat_mul
 from motion_gen.motion_matching.clip_output import ClipOutputBuilder
+from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
@@ -463,11 +464,18 @@ def _place_descent_on_tile(ts, tile, boxes, dev, k=0, truncate=True, going_up=Fa
 
 def _place_jump_on_tile(ts, tile_box, dev, k=0):
     """Play the source jump from frame ``k`` (episodic), yaw-normalize so its box is axis-aligned, and
-    ANCHOR that box onto the tile's FIXED box -- the box-family mirror of :func:`_place_descent_on_tile`.
+    ANCHOR that box (center) onto the tile's FIXED box -- the box-family mirror of
+    :func:`_place_descent_on_tile`.
 
     So every approach speed that shares the tile jumps onto the SAME fixed box.  ``tile_box`` is the
     authored tile box (:func:`box_clip.box_tile_box`).  Returns ``(Wp, Wq, Wj, terr_contact)`` in the tile
     frame (base at z=0; the jump lands on the box top).
+
+    NOTE: the box DEPTH (travel-direction x) is NOT randomized -- it is kept at the source size (see
+    ``_box_tile_worker``) so the played jump lands on the box EXACTLY as it was solved (a bigger depth
+    would leave the box's near footprint under the forward run-up, which the approach then walks
+    through).  Only the lateral width (y) is expanded for variety, so a center-align is correct: the
+    robot is laterally centered, and depth/height match the source.
     """
     rp, rq, jt, terr_contact = loop_periodic(
         ts.root_pos.to(dev), ts.root_quat.to(dev), ts.joint_pos.to(dev),
@@ -865,7 +873,7 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     # robot moves AWAY from the box, not forward into it; jump_off_front recovers forward (positive).
     backward = "front" not in str(ts.terrain_meta.get("skill", ""))
     sgn = -1.0 if backward else 1.0
-    Wp_d, Wq_d, Wj_d, terr_contact = _place_jump_on_tile(ts, tile_box, dev, k=0)     # dismount, box-anchored
+    Wp_d, Wq_d, Wj_d, terr_contact = _place_jump_on_tile(ts, tile_box, dev, k=0)      # dismount, box-anchored
     # DP walk-away recovery on the flat, seeded from the dismount's exit window (mirror of jump_on's DP
     # approach, on the exit side); command the walk-away in the dismount's travel direction (backward for
     # jump_off) so it never walks forward into the box.  Truncate the played dismount at the exit frame.
@@ -897,6 +905,121 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest_entry, "name": ts.name,
             "entry_frame": 0, "n_terr": int(ts.n)}
+
+
+# ---- parallel tile generation (fork pool; one worker builds ALL clips for ONE tile) --------------
+# Clips within a tile are COUPLED -- the tile footprint is sized to the union of its clips and every
+# clip recentered to the tile corner -- so a whole tile is the parallel unit.  Read-only state (the
+# matcher / builder / sampled tiles) is shared with the forked workers by copy-on-write via ``_SHARED``
+# (set in main() BEFORE the pool); per-tile RNG is seeded by ``(tile_seed, terrain_id)`` so the output
+# is reproducible and independent of which worker runs which tile.
+_SHARED: dict = {}
+
+
+def _src_for_variants(variants, h, d, vx_cmd):
+    """Source clip for a stair-tile clip: nearest (riser, tread) geometry, then nearest natural speed."""
+    key = min(variants, key=lambda k: (k[0] - h) ** 2 + (k[1] - d) ** 2)
+    return min(variants[key], key=lambda tv: abs(tv[1] - float(vx_cmd)))[0]
+
+
+def _stair_tile_worker(i: int):
+    """Generate every clip for stair tile ``i`` (pure looped traversal, or approach+descent+recovery per
+    velocity), then size the tile to the union of its clips.  Returns the tile's record list."""
+    S = _SHARED
+    args, dev, matcher, builder = S["args"], S["dev"], S["matcher"], S["builder"]
+    variants, tvels = S["variants"], S["tvels"]
+    tile = S["tiles"][i]
+    time_rng = np.random.default_rng([args.tile_seed + 1, int(tile.terrain_id)])
+    tile_recs = []
+    if tile.ttype == "terrain":                                    # PURE: one looped clip per commanded vel
+        for vx in tvels:
+            src = _src_for_variants(variants, tile.step_height, tile.step_depth, vx)
+            rec = _make_pure_tile_clip(builder, src, tile, args, dev, target_vx=vx)
+            rec["approach_vx"] = vx
+            tile_recs.append(rec)
+        _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=True)
+    else:                                                          # TRANSITION: approach+descent+recovery per vel
+        mx = max(tvels)
+        top_len = args.approach_s_range[1] * mx + 1.0
+        bot_len = args.recovery_s_range[1] * mx + 1.0
+        for vx in tvels:
+            src = _src_for_variants(variants, tile.step_height, tile.step_depth, vx)
+            a_s = float(time_rng.uniform(*args.approach_s_range))
+            r_s = float(time_rng.uniform(*args.recovery_s_range))
+            rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
+                                             top_len, bot_len, a_s, r_s)
+            rec["approach_vx"] = vx
+            tile_recs.append(rec)
+        _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=False)
+    print(f"[box] stair tile {tile.terrain_id} ({tile.ttype}): {len(tile_recs)} clips")
+    return tile_recs
+
+
+def _box_tile_worker(i: int):
+    """Generate every clip (one per sampled approach speed) for box tile ``i`` on its fixed box, then size
+    the tile to the union of its clips + the box.  Returns the tile's record list."""
+    S = _SHARED
+    args, dev, matcher, builder = S["args"], S["dev"], S["matcher"], S["builder"]
+    terr_srcs, approach_len = S["terr_srcs"], S["approach_len"]
+    _px, _py, buf = S["_px"], S["_py"], S["buf"]
+    C = int(args.box_clips_per_tile)
+    vlo, vhi = float(args.box_vel_range[0]), float(args.box_vel_range[1])
+    tile = S["box_tiles"][i]
+    vel_rng = np.random.default_rng([args.tile_seed + 2, int(tile.terrain_id)])
+    time_rng = np.random.default_rng([args.tile_seed + 3, int(tile.terrain_id)])
+    ts = terr_srcs[tile.source_idx]
+    box_size = [float(v) for v in ts.terrain_meta["terrain"]["boxes"][0]["size"]]
+    if set(ts.terrain_meta["terrain"].get("critical", [])) <= {"height"}:
+        box_size = [box_size[0] * tile.sx_scale, box_size[1] * tile.sy_scale, box_size[2]]
+    tile_box = box_tile_box(box_size=box_size, approach_len=approach_len, y_offset=tile.y_offset)
+    vp = resolve_box_variant(np.random.default_rng(args.seed + int(tile.terrain_id)), box_size,
+                             fracs={tile.variant: 1.0}, slab_thickness=args.slab_thickness,
+                             leg_size=tuple(args.leg_size), leg_inset=args.leg_inset)
+    bx, by = float(tile_box["pos"][0]), float(tile_box["pos"][1])
+    sx, sy, sz = (float(v) for v in tile_box["size"])
+    overlay = {"kind": "box", "pos_xy": [bx, by], "size_xyz": [sx, sy, sz],
+               "base_z": float(tile_box["pos"][2] - sz / 2.0), "walkable_top": True,
+               "yaw": float(tile_box["yaw"])}
+    overlay.update(vp)                                             # variant sub-boxes (fixed per tile)
+    kind = str(ts.terrain_meta["terrain"].get("kind", "on"))
+    tile_recs = []
+    if kind == "off":                                              # DISMOUNT (jump_off / jump_off_front)
+        for _ in range(C):
+            r_s = float(time_rng.uniform(*args.recovery_s_range))
+            fwd = float(vel_rng.uniform(vlo, vhi))                 # forward walk-away speed after the dismount
+            rec = _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
+                                          tile_box, overlay, (0.0, 0.0), 0.0, 0.0, r_s, fwd)
+            rec["approach_vx"] = fwd
+            tile_recs.append(rec)
+    else:                                                          # MOUNT (jump_on)
+        vels = [float(vel_rng.uniform(vlo, vhi)) for _ in range(C)]
+        for vx in vels:
+            a_s = float(time_rng.uniform(*args.approach_s_range))
+            r_s = float(time_rng.uniform(*args.recovery_s_range))
+            rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
+                                      tile_box, overlay, (0.0, 0.0), 0.0, 0.0, a_s, r_s)
+            rec["approach_vx"] = vx
+            tile_recs.append(rec)
+    # Size the tile to the union of ALL its clips' body positions + the box, + buf each side.
+    xmin = ymin = float("inf"); xmax = ymax = float("-inf")
+    for rec in tile_recs:
+        yy = rec["y"]
+        xmin = min(xmin, float(yy[:, _px].min())); xmax = max(xmax, float(yy[:, _px].max()))
+        ymin = min(ymin, float(yy[:, _py].min())); ymax = max(ymax, float(yy[:, _py].max()))
+    xmin = min(xmin, bx - sx / 2.0); xmax = max(xmax, bx + sx / 2.0)
+    ymin = min(ymin, by - sy / 2.0); ymax = max(ymax, by + sy / 2.0)
+    cx, cy = xmin - buf, ymin - buf
+    tsize_x, tsize_y = (xmax - xmin) + 2.0 * buf, (ymax - ymin) + 2.0 * buf
+    for rec in tile_recs:                                          # recenter to the tile corner + fix footprint
+        yy = rec["y"]
+        yy[:, _px] = yy[:, _px] - cx
+        yy[:, _py] = yy[:, _py] - cy
+        rec["manifest"]["size_x"] = float(tsize_x)
+        rec["manifest"]["size_y"] = float(tsize_y)
+        rec["manifest"]["overlays"][0]["pos_xy"] = [bx - cx, by - cy]
+    print(f"[box] box tile {tile.terrain_id}: {len(tile_recs)} clips ({kind}), "
+          f"footprint {tsize_x:.1f}x{tsize_y:.1f} m")
+    return tile_recs
 
 
 def main() -> int:
@@ -1016,9 +1139,12 @@ def main() -> int:
                    help="[tiles] approach-speed clips per box tile (all share the tile's box + terrain_id).")
     p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.8, 3.0), metavar=("MIN", "MAX"),
                    help="[tiles] approach forward-speed range (m/s) sampled per box-tile clip.")
-    p.add_argument("--box-footprint-scale", type=float, nargs=2, default=(1.0, 1.6), metavar=("MIN", "MAX"),
-                   help="[tiles] expand-only random scale on the box footprint (x,y) -- the NON-critical "
-                        "dims (jump depends only on height); (1,1) disables.")
+    p.add_argument("--box-footprint-scale", type=float, nargs=2, default=(1.0, 1.0), metavar=("MIN", "MAX"),
+                   help="[tiles] expand-only random scale on the box footprint (x,y); (1,1) = OFF (default). "
+                        "DISABLED by default: expanding the DEPTH (x) leaves the box's near footprint under "
+                        "the forward run-up (the approach then walks through it) and the robot lands too "
+                        "deep -> knee clips the face.  A proper fix needs depth-aware, one-sided extension "
+                        "away from the approach/takeoff; until then keep boxes at the solved source size.")
     p.add_argument("--box-tile-buffer", type=float, default=2.0,
                    help="[tiles] ground buffer (m) added on each side of the union of a box tile's clip "
                         "motion + the box, so the scan sees ground around the whole traversal.")
@@ -1026,6 +1152,8 @@ def main() -> int:
                    help="[tiles] inertialization blend time (s) at the approach/descent/recovery splice "
                         "seams -- decays the joint discontinuity so transitions aren't snappy (0 = off).")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--workers", type=int, default=0,
+                   help="Parallel tile-generation workers (0 = all cores - 2); tiles fan across a fork pool.")
     args = p.parse_args()
     dev = args.device
 
@@ -1126,127 +1254,39 @@ def main() -> int:
             lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
             nav_width_range=(args.tile_width_min, args.tile_width_max), flat_width_margin=0.3,
             floor_frac=args.stair_floor_frac)
-        # Dedicated rng for the per-clip approach/recovery DURATION sampling (distinct seed so it does
-        # not perturb the tile-geometry rng above -> both stay reproducible from --tile-seed).
-        time_rng = np.random.default_rng(args.tile_seed + 1)
-        for tile in tiles:
-            tile_recs = []
-            if tile.ttype == "terrain":
-                # PURE tile: one clip per commanded velocity (#3), each a looped traversal of the tile's
-                # geometry played by the nearest-achievable gait, labelled with the COMMAND as target_vel.
-                print(f"[box] pure tile {tile.terrain_id}: {tile.stair_steps[0]} steps "
-                      f"(riser {tile.step_height:.3f}, tread {tile.step_depth:.3f}), width {tile.width:.2f}, vels {tvels}")
-                for vx in tvels:
-                    src = _src_for(tile.step_height, tile.step_depth, vx)   # geometry-matched, nearest-speed gait
-                    rec = _make_pure_tile_clip(builder, src, tile, args, dev, target_vx=vx)
-                    rec["approach_vx"] = vx
-                    tile_recs.append(rec)
-                _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=True)
-            else:
-                mx = max(tvels)
-                # Platforms sized to the LONGEST POSSIBLE sampled lead-in / recovery (range max * fastest vx).
-                top_len = args.approach_s_range[1] * mx + 1.0
-                bot_len = args.recovery_s_range[1] * mx + 1.0
-                print(f"[box] transition tile {tile.terrain_id}: {tile.stair_steps[0]} steps, "
-                      f"width {tile.width:.2f}, platforms top={top_len:.1f} bot={bot_len:.1f} m, vels {tvels}")
-                for vx in tvels:
-                    src = _src_for(tile.step_height, tile.step_depth, vx)   # geometry-matched, nearest-speed gait
-                    a_s = float(time_rng.uniform(*args.approach_s_range))   # per-clip lead-in / recovery s
-                    r_s = float(time_rng.uniform(*args.recovery_s_range))
-                    rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
-                                                     top_len, bot_len, a_s, r_s)
-                    rec["approach_vx"] = vx
-                    print(f"[box]   -> tile {tile.terrain_id} vx={vx}: approach_s={a_s:.2f} recovery_s={r_s:.2f}, "
-                          f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
-                    tile_recs.append(rec)
-                _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=False)
-            records.extend(tile_recs)
+        # Fan the tiles across the fork pool: one worker builds ALL clips for one tile (matcher / builder /
+        # tiles / variants shared COW via _SHARED); per-tile approach/recovery RNG is seeded by
+        # (tile_seed, terrain_id) inside the worker, so the output is reproducible and worker-order
+        # independent.  unit_pool flattens the per-tile record lists in tile order.
+        _SHARED.update(args=args, dev=dev, matcher=matcher, builder=builder, variants=variants,
+                       tvels=tvels, tiles=tiles)
+        n_workers = default_workers(len(tiles), args.workers)
+        print(f"[box] generating {len(tiles)} stair tiles x {len(tvels)} clips across {n_workers} worker(s) ...")
+        records.extend(unit_pool(_stair_tile_worker, range(len(tiles)), n_workers))
     elif args.num_box_tiles > 0:
         # Phase B for BOXES: N box tiles (source jump + variant + lateral offset), each a FIXED box on flat
         # ground SHARED by --box-clips-per-tile approach speeds (the box-family reuse invariant; NO 1:1 tid).
         C = int(args.box_clips_per_tile)
         vlo, vhi = float(args.box_vel_range[0]), float(args.box_vel_range[1])
         approach_len = args.approach_s_range[1] * max(vhi, 1e-3) + 1.0      # flat run-up >= the longest approach
-        m = args.footprint_margin
         box_tiles = sample_box_tiles(np.random.default_rng(args.tile_seed),
                                      n_tiles=args.num_box_tiles, n_sources=len(terr_srcs),
                                      variant_fracs=box_variant_fracs,
                                      nav_width_range=(args.tile_width_min, args.tile_width_max),
                                      footprint_scale_range=tuple(args.box_footprint_scale))
-        vel_rng = np.random.default_rng(args.tile_seed + 2)
-        time_rng = np.random.default_rng(args.tile_seed + 3)
-        print(f"[box] box tiles: {args.num_box_tiles} tiles x {C} clips, approach_len={approach_len:.1f} m, "
-              f"vel range [{vlo:.1f},{vhi:.1f}] from {len(terr_srcs)} source(s)")
         # Tile footprint = the UNION of all the tile's clips' body positions + the box, padded by
-        # ``box_tile_buffer`` m on each side (sized to the actual motion, not a fixed +x approach corridor
-        # -- so the long axis follows wherever the clips travel).  pos_x / pos_y channels of y_des:
+        # ``box_tile_buffer`` m on each side (sized inside the worker).  pos_x / pos_y channels of y_des:
         _px = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_x")]
         _py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
         buf = float(args.box_tile_buffer)
-        for tile in box_tiles:
-            ts = terr_srcs[tile.source_idx]
-            box_size = [float(v) for v in ts.terrain_meta["terrain"]["boxes"][0]["size"]]
-            # Height (z) is CRITICAL (the jump depends on it) -> keep the solved variant's value; the
-            # footprint (x, y) is free (outer=None) -> expand per the tile's sampled scales (#3).
-            if set(ts.terrain_meta["terrain"].get("critical", [])) <= {"height"}:
-                box_size = [box_size[0] * tile.sx_scale, box_size[1] * tile.sy_scale, box_size[2]]
-            tile_box = box_tile_box(box_size=box_size, approach_len=approach_len, y_offset=tile.y_offset)
-            vp = resolve_box_variant(np.random.default_rng(args.seed + tile.terrain_id), box_size,
-                                     fracs={tile.variant: 1.0}, slab_thickness=args.slab_thickness,
-                                     leg_size=tuple(args.leg_size), leg_inset=args.leg_inset)
-            bx, by = float(tile_box["pos"][0]), float(tile_box["pos"][1])
-            sx, sy, sz = (float(v) for v in tile_box["size"])
-            # Build clips + overlay in the TILE-BOX frame (corner=(0,0), size TBD); the tile is sized +
-            # recentered to the motion union below.
-            overlay = {"kind": "box", "pos_xy": [bx, by], "size_xyz": [sx, sy, sz],
-                       "base_z": float(tile_box["pos"][2] - sz / 2.0), "walkable_top": True,
-                       "yaw": float(tile_box["yaw"])}
-            overlay.update(vp)                                             # variant sub-boxes (fixed per tile)
-            kind = str(ts.terrain_meta["terrain"].get("kind", "on"))
-            tile_recs = []
-            if kind == "off":                                          # DISMOUNT (jump_off / jump_off_front)
-                print(f"[box] box tile {tile.terrain_id}: src={tile.source_idx} variant={tile.variant} "
-                      f"box_h={sz:.2f} DISMOUNT x{C}")
-                for _ in range(C):
-                    r_s = float(time_rng.uniform(*args.recovery_s_range))
-                    fwd = float(vel_rng.uniform(vlo, vhi))             # forward walk-away speed after the dismount
-                    rec = _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
-                                                  tile_box, overlay, (0.0, 0.0), 0.0, 0.0, r_s, fwd)
-                    rec["approach_vx"] = fwd
-                    tile_recs.append(rec)
-            else:                                                      # MOUNT (jump_on)
-                vels = [float(vel_rng.uniform(vlo, vhi)) for _ in range(C)]
-                print(f"[box] box tile {tile.terrain_id}: src={tile.source_idx} variant={tile.variant} "
-                      f"box_h={sz:.2f} x{C} vels {[round(v, 2) for v in vels]}")
-                for vx in vels:
-                    a_s = float(time_rng.uniform(*args.approach_s_range))
-                    r_s = float(time_rng.uniform(*args.recovery_s_range))
-                    rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
-                                              tile_box, overlay, (0.0, 0.0), 0.0, 0.0, a_s, r_s)
-                    rec["approach_vx"] = vx
-                    print(f"[box]   -> box tile {tile.terrain_id} vx={vx:.2f}: approach_s={a_s:.2f} "
-                          f"entered at frame {rec['entry_frame']}/{rec['n_terr']}")
-                    tile_recs.append(rec)
-            # Size the tile to the union of ALL its clips' body positions + the box, + buf each side.
-            xmin = ymin = float("inf"); xmax = ymax = float("-inf")
-            for rec in tile_recs:
-                yy = rec["y"]
-                xmin = min(xmin, float(yy[:, _px].min())); xmax = max(xmax, float(yy[:, _px].max()))
-                ymin = min(ymin, float(yy[:, _py].min())); ymax = max(ymax, float(yy[:, _py].max()))
-            xmin = min(xmin, bx - sx / 2.0); xmax = max(xmax, bx + sx / 2.0)
-            ymin = min(ymin, by - sy / 2.0); ymax = max(ymax, by + sy / 2.0)
-            cx, cy = xmin - buf, ymin - buf
-            tsize_x, tsize_y = (xmax - xmin) + 2.0 * buf, (ymax - ymin) + 2.0 * buf
-            print(f"[box]   -> tile {tile.terrain_id} footprint sized to motion: "
-                  f"{tsize_x:.1f} x {tsize_y:.1f} m (+{buf:.0f}m buffer)")
-            for rec in tile_recs:                                          # recenter to the tile corner + fix footprint
-                yy = rec["y"]
-                yy[:, _px] = yy[:, _px] - cx
-                yy[:, _py] = yy[:, _py] - cy
-                rec["manifest"]["size_x"] = float(tsize_x)
-                rec["manifest"]["size_y"] = float(tsize_y)
-                rec["manifest"]["overlays"][0]["pos_xy"] = [bx - cx, by - cy]
-                records.append(rec)
+        # Fan the box tiles across the fork pool: one worker builds ALL clips for one box tile + sizes it;
+        # per-tile velocity/duration RNG seeded by (tile_seed, terrain_id) inside the worker.
+        _SHARED.update(args=args, dev=dev, matcher=matcher, builder=builder, terr_srcs=terr_srcs,
+                       approach_len=approach_len, box_tiles=box_tiles, _px=_px, _py=_py, buf=buf)
+        n_workers = default_workers(len(box_tiles), args.workers)
+        print(f"[box] generating {len(box_tiles)} box tiles x {C} clips across {n_workers} worker(s), "
+              f"approach_len={approach_len:.1f} m, vel range [{vlo:.1f},{vhi:.1f}] from {len(terr_srcs)} source(s)")
+        records.extend(unit_pool(_box_tile_worker, range(len(box_tiles)), n_workers))
     else:
         tid = 0
         # Per-clip approach/recovery DURATION sampling for --box-splice eased (distinct seed so it does
@@ -1277,8 +1317,8 @@ def main() -> int:
     print(f"[box] padding {len(records)} clips to T={T} steps")
 
     meta = {"dt": args.dt, "clip_length_s": T * args.dt, "num_steps": int(T),
-            "pos_output_names": list(manager.pos_output_names),
-            "vel_output_names": list(manager.vel_output_names),
+            "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
+            "vel_output_names": list(builder.vel_names),
             "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
             "skill_list": [s.name for s in manager.skills]}
     writer = ClipLibraryWriter(args.out, len(records), meta)

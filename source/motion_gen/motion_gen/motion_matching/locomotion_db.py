@@ -22,7 +22,7 @@ from __future__ import annotations
 from .bones_ingest import load_cache
 from .clean_ingest import _resolve_dir, ingest_clean_library
 from .dp import DPConfig, DPMatcher
-from .graph import GraphConfig, build_candidate_graph
+from .graph import _GRAPH_CACHE_VERSION, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_path
 from .vanilla import POSE_POSTURAL_IDX, VanillaConfig
 
 # FLAT-locomotion bones filter: keep walking/jogging/running/turning on the feet; DROP everything that
@@ -52,13 +52,19 @@ def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_re
                              cut_penalty: float = 3.0, w_traj: float = 1.0, w_track: float = 0.0,
                              ground_penalty: float = 12.0, max_pelvis_z: float = 0.95,
                              graph_k_min: int = 25, graph_k_max: int = 50, graph_k_target: int = 40,
-                             log=print) -> DPMatcher:
+                             use_graph_cache: bool = True, log=print) -> DPMatcher:
     """Build the shared locomotion :class:`DPMatcher` (union DB + candidate graph, categorised).
 
     ``include_leadins=False`` skips the lead-in load entirely (flat/stairs/distractor never need it);
     when ``True`` the lead-ins are in the graph but a caller still filters them out per-generate.  The
     DP cost weights (``cut_penalty`` / ``w_traj`` / ...) do not affect the DB or graph -- only matching
     at generate time -- so passing family-specific weights keeps the library identical across families.
+
+    ``use_graph_cache`` (default on) content-addresses the candidate graph to
+    ``graph_cache_path(...)``: the DB build is deterministic given (bones cache, filters, limits, clean
+    lib, lead-in flag), so the first family to run a given DB variant builds the graph and every later
+    family loads it instead of rebuilding -- the two variants (with / without lead-ins) get distinct
+    keys and never collide.  The matcher itself is always rebuilt (cheap next to the graph).
     """
     log(f"[locomotion_db] flat-locomotion bones (limit={bones_limit}) ...")
     flat, _ = load_cache(bones_cache, filters={"package": "Locomotion",
@@ -80,15 +86,57 @@ def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_re
                     w_ground=ground_penalty, ground_z=0.0, max_pelvis_z=max_pelvis_z)
     log(f"[locomotion_db] DP matcher DB: {len(sources)} clips, {sum(s.n for s in sources)} frames")
     matcher = DPMatcher(sources, VanillaConfig(dt=dt), dcfg, device=device, categories=categories)
-    log("[locomotion_db] building candidate graph ...")
-    cost_feat = matcher._norm[:, matcher._traj_dim:]
-    select_feat = cost_feat[:, POSE_POSTURAL_IDX]
-    graph = build_candidate_graph(
-        select_feat, cost_feat, matcher.feat_raw, matcher.owner, matcher.src_start, matcher.src_len,
-        matcher.yaw_all, GraphConfig(k_min=graph_k_min, k_max=graph_k_max, k_target=graph_k_target, dt=dt),
-        steady_owner_mask=matcher._src_steady, periodic_owner_mask=matcher._src_periodic)
+
+    cfg = GraphConfig(k_min=graph_k_min, k_max=graph_k_max, k_target=graph_k_target, dt=dt)
+    graph, cache_key = None, None
+    if use_graph_cache:
+        cache_key = _graph_cache_key(bones_cache, bones_limit, include_leadins, leadin_limit,
+                                     clean_library_fingerprint(clean_source, clean_hf_repo)["hash"], cfg)
+        cache_file = graph_cache_path(cache_key)
+        graph = CandidateGraph.load(cache_file, expected_key=cache_key)
+        if graph is not None:
+            log(f"[locomotion_db] loaded cached candidate graph {cache_file.name}")
+    if graph is None:
+        log("[locomotion_db] building candidate graph ...")
+        cost_feat = matcher._norm[:, matcher._traj_dim:]
+        select_feat = cost_feat[:, POSE_POSTURAL_IDX]
+        graph = build_candidate_graph(
+            select_feat, cost_feat, matcher.feat_raw, matcher.owner, matcher.src_start, matcher.src_len,
+            matcher.yaw_all, cfg, steady_owner_mask=matcher._src_steady, periodic_owner_mask=matcher._src_periodic)
+        if use_graph_cache:
+            graph.key = cache_key
+            graph.save(cache_file)
+            log(f"[locomotion_db] cached candidate graph -> {cache_file}")
     matcher.attach_graph(graph)
     return matcher
+
+
+def _graph_cache_key(bones_cache: str, bones_limit: int | None, include_leadins: bool,
+                     leadin_limit: int | None, clean_hash: str, cfg: GraphConfig) -> str:
+    """Content hash of EVERYTHING the candidate graph depends on: the bones cache file identity, the
+    flat + lead-in filter sets and limits, the clean library content, and the graph params + version.
+
+    The lead-in flag/filter/limit are folded in so the with-lead-ins graph (box/jump) and the
+    without-lead-ins graph (flat/distractor/stairs) get DISTINCT keys and never load each other's."""
+    import hashlib
+    import json
+    from pathlib import Path
+
+    st = Path(bones_cache).stat()
+    payload = {
+        "version": _GRAPH_CACHE_VERSION,
+        "bones": [str(Path(bones_cache)), st.st_size, st.st_mtime_ns],
+        "flat_movement": sorted(_FLAT_MOVEMENT), "flat_exclude": sorted(_FLAT_EXCLUDE),
+        "bones_limit": bones_limit,
+        "clean_hash": clean_hash,
+        "include_leadins": bool(include_leadins),
+        "leadin_include": sorted(_TERRAIN_INCLUDE), "leadin_exclude": sorted(_TERRAIN_EXCLUDE),
+        "leadin_limit": leadin_limit,
+        "cfg": {"k_min": cfg.k_min, "k_max": cfg.k_max, "k_target": cfg.k_target,
+                "same_clip_cap": cfg.same_clip_cap, "min_same_clip_gap": cfg.min_same_clip_gap,
+                "dt": round(float(cfg.dt), 6), "tier_mode": cfg.tier_mode},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def clean_library_fingerprint(clean_source: str, clean_hf_repo: str | None = "zolkin/robot_rl") -> dict:

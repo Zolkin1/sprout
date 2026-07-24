@@ -43,13 +43,13 @@ class G1TrajMimicRewards:
         func=mdp.joint_pos_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 0.2 * math.sqrt(21)}
+                "sigma": 0.2 * math.sqrt(29)}     # 29 = len(G1_JOINT_NAMES), the tracked-joint count
     )
     joint_vel = RewTerm(
         func=mdp.joint_vel_reward,
         weight=1.0,
         params={"command_name": "traj_ref",
-                "sigma": 3.0 * math.sqrt(21)}
+                "sigma": 3.0 * math.sqrt(29)}     # 29 = len(G1_JOINT_NAMES), the tracked-joint count
     )
 
     # Bodies

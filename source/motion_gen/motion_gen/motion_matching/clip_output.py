@@ -42,8 +42,14 @@ class ClipOutputBuilder:
     def __init__(self, pos_output_names, vel_output_names, *, mjcf_path=None,
                  contact_frames=_FOOT, ground_height=0.0, contact_z_thresh=0.02,
                  device="cpu"):
-        self.pos_names = list(pos_output_names)
-        self.vel_names = list(vel_output_names)
+        # The clip OUTPUT carries the FULL ``F.G1_JOINT_NAMES`` joint set: the joint VALUES come from the
+        # matched 29-DoF motion sources (bones / clean / terrain), NOT from the ``--source`` traj-opt
+        # library, which may declare a different (e.g. 21-DoF) joint set.  So keep the source's FRAME
+        # channels + order and (re)build the ``joint:*`` channels from ``G1_JOINT_NAMES`` -- decoupling the
+        # emitted joint set from however many joints the source library happened to solve.
+        _pj = [f"joint:{j}" for j in F.G1_JOINT_NAMES]
+        self.pos_names = [n for n in pos_output_names if not n.startswith("joint:")] + _pj
+        self.vel_names = [n for n in vel_output_names if not n.startswith("joint:")] + _pj
         self.P = len(self.pos_names)
         self.V = len(self.vel_names)
         self.device = torch.device(device)

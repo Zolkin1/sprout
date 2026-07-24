@@ -45,6 +45,7 @@ from motion_gen.math_utils import quat_apply, quat_mul
 from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, se2z_align
 from motion_gen.motion_matching.clip_output import ClipOutputBuilder
 from motion_gen.motion_matching.distractor import occupancy_grid
+from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
@@ -142,25 +143,37 @@ def _clear_box(center, size, direction, occ, origin, cell, clearance, step=0.05,
     return [cx, cy]
 
 
-def _box_pool(args):
-    """(kind, box_xyz, n_clips, cmd-builder) tiles. Size axis: small cube -> big box -> wall."""
+def _box_pool(args, n_tiles, rng):
+    """``n_tiles`` distractor tiles split ~4:3:2 across stop / turn / walk-between, each a distinct box
+    (base size + per-tile jitter so tiles differ) plus ``--clips-per-tile`` motions.  Size axis per kind
+    spans small cube -> big box -> wall."""
     n = args.clips_per_tile
-    stop_sizes = [(0.5, 0.5, 0.4), (0.8, 0.45, 0.5), (0.6, 0.6, 0.9), (2.5, 0.4, 1.2)]     # ...last = wall
-    turn_sizes = [(0.6, 0.6, 0.6), (0.9, 0.5, 0.9), (2.5, 0.4, 1.3)]                        # ...last = wall
-    wall_sizes = [(3.0, 0.3, 1.0), (2.0, 0.3, 1.5)]                                         # between: 2 walls each
+    base = {
+        "stop": [(0.5, 0.5, 0.4), (0.8, 0.45, 0.5), (0.6, 0.6, 0.9), (2.5, 0.4, 1.2)],   # ...last = wall
+        "turn": [(0.6, 0.6, 0.6), (0.9, 0.5, 0.9), (2.5, 0.4, 1.3)],                      # ...last = wall
+        "between": [(3.0, 0.3, 1.0), (2.0, 0.3, 1.5)],                                    # 2 walls each
+    }
+    # Split n_tiles across the three kinds in ~4:3:2 proportion (matching the original 4/3/2 tiles).
+    n_stop = max(1, round(n_tiles * 4 / 9))
+    n_turn = max(1, round(n_tiles * 3 / 9))
+    n_between = max(1, n_tiles - n_stop - n_turn)
     tiles = []
-    for sz in stop_sizes:
-        vx = float(np.random.uniform(0.9, 2.2))
-        cmds = [_stop(vx, ts, args.stop_ramp_s) for ts in np.linspace(0.4 * args.short_s, 0.6 * args.short_s, n)]
-        tiles.append(("stop", sz, cmds))
-    for sz in turn_sizes:
-        wz = float(np.random.choice([-1, 1])) * float(np.random.uniform(0.4, 0.7))
-        cmds = [_turn(1.2, wz) for _ in range(n)]
-        tiles.append(("turn", sz, cmds))
-    for sz in wall_sizes:
-        vx = float(np.random.uniform(0.9, 1.8))
-        cmds = [_straight(v) for v in np.linspace(0.7 * vx, 1.3 * vx, n)]
-        tiles.append(("between", sz, cmds))
+    for kind, cnt in (("stop", n_stop), ("turn", n_turn), ("between", n_between)):
+        for j in range(cnt):
+            bx, by, bz = base[kind][j % len(base[kind])]
+            jx, jy, jz = rng.uniform(0.85, 1.15), rng.uniform(0.85, 1.15), rng.uniform(0.9, 1.1)
+            sz = (float(bx * jx), float(by * jy), float(bz * jz))
+            if kind == "stop":
+                vx = float(rng.uniform(0.9, 2.2))
+                cmds = [_stop(vx, ts, args.stop_ramp_s)
+                        for ts in np.linspace(0.4 * args.short_s, 0.6 * args.short_s, n)]
+            elif kind == "turn":
+                wz = float(rng.choice([-1, 1])) * float(rng.uniform(0.4, 0.7))
+                cmds = [_turn(1.2, wz) for _ in range(n)]
+            else:
+                vx = float(rng.uniform(0.9, 1.8))
+                cmds = [_straight(v) for v in np.linspace(0.7 * vx, 1.3 * vx, n)]
+            tiles.append((kind, sz, cmds))
     return tiles
 
 
@@ -244,6 +257,27 @@ def _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev):
     return records, manifest
 
 
+# ---- parallel tile generation (fork pool; tiles are independent) --------------------------------
+# Read-only state (matcher / builder / sampled tiles) is shared with the forked workers by copy-on-write
+# via ``_SHARED`` (set in main() BEFORE the pool).  Each tile is deterministic given its sampled box +
+# commands (fixed in _box_pool), so no per-tile RNG is needed in the worker.
+_SHARED: dict = {}
+
+
+def _distractor_tile_worker(tid: int):
+    """Generate every clip for distractor tile ``tid`` on its one box.  Returns the tile's record list
+    with the tile MANIFEST stashed on the first record (``_manifest``) so the parent can collect them
+    in order (unit_pool flattens the per-tile lists)."""
+    S = _SHARED
+    matcher, builder, args, dev, T = S["matcher"], S["builder"], S["args"], S["dev"], S["T"]
+    kind, box_xyz, cmds = S["tiles"][tid]
+    recs, manifest = _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev)
+    if recs:
+        recs[0]["_manifest"] = manifest
+    print(f"[distractor] tile {tid} {kind}: {len(recs)} clips, {len(manifest['overlays'])} box(es)")
+    return recs
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Traj-opt library (output channel layout).")
@@ -269,10 +303,13 @@ def main() -> int:
     p.add_argument("--graph-k-min", type=int, default=25)
     p.add_argument("--graph-k-target", type=int, default=40)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num-tiles", type=int, default=9,
+                   help="Distractor tiles (split ~4:3:2 across stop/turn/between).")
+    p.add_argument("--workers", type=int, default=0,
+                   help="Parallel tile-generation workers (0 = all cores - 2); tiles fan across a fork pool.")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
     dev = args.device
-    np.random.seed(args.seed)
 
     matcher = _build_flat_matcher(args, dev)
     manager = MultiSkillManager(args.source, dev, env=None)
@@ -280,18 +317,19 @@ def main() -> int:
                                 contact_frames=_CONTACT, device=dev)
     T = max(1, int(round(args.short_s / args.dt)))
 
-    tiles = _box_pool(args)
-    print(f"[distractor] {len(tiles)} box tiles x {args.clips_per_tile} clips = {len(tiles) * args.clips_per_tile}")
-    records, manifests = [], []
-    for tid, (kind, box_xyz, cmds) in enumerate(tiles):
-        recs, manifest = _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev)
-        print(f"[distractor] tile {tid} {kind} box {box_xyz}: {len(recs)} clips, {len(manifest['overlays'])} box(es)")
-        records.extend(recs)
-        manifests.append(manifest)
+    tiles = _box_pool(args, args.num_tiles, np.random.default_rng(args.seed))
+    # Fan the independent tiles across the fork pool (matcher/builder/tiles shared COW via _SHARED); each
+    # worker returns one tile's clips with its manifest stashed on the first record.
+    _SHARED.update(matcher=matcher, builder=builder, args=args, dev=dev, T=T, tiles=tiles)
+    n_workers = default_workers(len(tiles), args.workers)
+    print(f"[distractor] {len(tiles)} box tiles x {args.clips_per_tile} clips = "
+          f"{len(tiles) * args.clips_per_tile} across {n_workers} worker(s)")
+    records = unit_pool(_distractor_tile_worker, range(len(tiles)), n_workers)
+    manifests = [r["_manifest"] for r in records if "_manifest" in r]
 
     meta = {"dt": args.dt, "clip_length_s": T * args.dt, "num_steps": int(T),
-            "pos_output_names": list(manager.pos_output_names),
-            "vel_output_names": list(manager.vel_output_names),
+            "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
+            "vel_output_names": list(builder.vel_names),
             "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
             "skill_list": [s.name for s in manager.skills]}
     writer = ClipLibraryWriter(args.out, len(records), meta)

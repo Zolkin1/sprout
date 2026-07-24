@@ -86,8 +86,12 @@ class MotionMatchClipGenerator:
         self.warnings: list[str] = []
 
         # ---- output channel layout -----------------------------------------
-        self.pos_names = list(manager.pos_output_names)
-        self.vel_names = list(manager.vel_output_names)
+        # The clip OUTPUT carries the FULL ``F.G1_JOINT_NAMES`` joint set (joint values come from the
+        # matched motion sources, not the source library); keep the source's FRAME channels + order and
+        # (re)build the ``joint:*`` channels from ``G1_JOINT_NAMES`` -- see ClipOutputBuilder.
+        _pj = [f"joint:{j}" for j in F.G1_JOINT_NAMES]
+        self.pos_names = [n for n in manager.pos_output_names if not n.startswith("joint:")] + _pj
+        self.vel_names = [n for n in manager.vel_output_names if not n.startswith("joint:")] + _pj
         self.P = len(self.pos_names)
         self.V = len(self.vel_names)
         self.frames = []

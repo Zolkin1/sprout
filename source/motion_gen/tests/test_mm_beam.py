@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
+from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
 from motion_gen.motion_matching.graph import (
     VARIED,
     CandidateGraph,
@@ -24,6 +25,8 @@ from motion_gen.motion_matching.graph import (
     build_candidate_graph,
     graph_cache_key,
 )
+
+_NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
 
 
@@ -40,8 +43,8 @@ def _clip(n, *, seed, vx=0.6, wz=0.0, z=0.78):
     rp[:, 0] = torch.cumsum(dx, 0) - dx[0]
     rp[:, 1] = torch.cumsum(dy, 0) - dy[0]
     rq = torch.stack([torch.cos(yaw / 2), torch.zeros(n), torch.zeros(n), torch.sin(yaw / 2)], -1)
-    jp = 0.15 * torch.randn(n, 21, generator=g)
-    jv = 0.15 * torch.randn(n, 21, generator=g)
+    jp = 0.15 * torch.randn(n, _NJ, generator=g)
+    jv = 0.15 * torch.randn(n, _NJ, generator=g)
     return SimpleNamespace(name=f"clip{seed}", n=n, root_pos=rp, root_quat=rq,
                            joint_pos=jp, joint_vel=jv)
 
@@ -188,7 +191,7 @@ def test_beam_runs_and_plays():
     bm = _beam(srcs)
     T = 200
     rp, rq, jj = bm.generate(_const_cmd(1.0), T, debug=True)
-    assert rp.shape == (T, 3) and rq.shape == (T, 4) and jj.shape == (T, 21)
+    assert rp.shape == (T, 3) and rq.shape == (T, 4) and jj.shape == (T, _NJ)
     assert torch.isfinite(rp).all() and torch.isfinite(rq).all() and torch.isfinite(jj).all()
     assert bm.dbg is not None and len(bm.dbg) == T
     assert bm.dbg[0][1] is False                     # step 0 is never a cut

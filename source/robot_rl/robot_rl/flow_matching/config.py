@@ -70,9 +70,9 @@ class FlowMatchingConfig:
     # -- dimensions (resolved from the dataset at build time) --
     # Per-step state width of every token: 2*nj + 15*(1 + num_extra_frames). History
     # and predicted states share this single representation (one shared normalizer).
-    state_dim: int = 57
+    state_dim: int = 73        # 2*nj + 15 = 2*29 + 15 (nj=29); resolved from the dataset at build time
     # Per-step history-token width (= state_dim; resolved at build time).
-    history_dim: int = 57
+    history_dim: int = 73
     # Width of the height conditioning token: the number of ray-cast ground-clearance
     # values in the height scan (embedded through one MLP into a single token). Resolved
     # from the recorded ``height_scan`` at dataset build time.
@@ -143,7 +143,7 @@ class FlowMatchingConfig:
     fk_pose_weight: float = 0.01 #0.0
     fk_vel_weight: float = 0.001 #0.0
     consistency_tau_min: float = 0.75
-    fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
+    fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
 
     # -- terrain penetration (penalize predicted feet going below the ground) --
     # ``terrain_penetration_mode``: "ankle" (penalize the ankle-frame origin) or

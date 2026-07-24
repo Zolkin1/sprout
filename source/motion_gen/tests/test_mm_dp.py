@@ -19,7 +19,10 @@ import torch
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
 from motion_gen.motion_matching.graph import VARIED, GraphConfig, build_candidate_graph
+from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
+
+_NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width
 
 
 def _clip(n, *, seed, vx=0.6, wz=0.0, z=0.78):
@@ -31,7 +34,7 @@ def _clip(n, *, seed, vx=0.6, wz=0.0, z=0.78):
     dx = step * torch.cos(yaw); dy = step * torch.sin(yaw)
     rp[:, 0] = torch.cumsum(dx, 0) - dx[0]; rp[:, 1] = torch.cumsum(dy, 0) - dy[0]
     rq = torch.stack([torch.cos(yaw / 2), torch.zeros(n), torch.zeros(n), torch.sin(yaw / 2)], -1)
-    jp = 0.15 * torch.randn(n, 21, generator=g); jv = 0.15 * torch.randn(n, 21, generator=g)
+    jp = 0.15 * torch.randn(n, _NJ, generator=g); jv = 0.15 * torch.randn(n, _NJ, generator=g)
     return SimpleNamespace(name=f"clip{seed}", n=n, root_pos=rp, root_quat=rq, joint_pos=jp, joint_vel=jv)
 
 
@@ -114,7 +117,7 @@ def test_dp_runs_and_plays():
     dm = _dp([_clip(120, seed=1, vx=0.0), _clip(120, seed=2, vx=1.0), _clip(120, seed=3, vx=0.6, wz=0.4)])
     T = 200
     rp, rq, jj = dm.generate(_const_cmd(1.0), T, debug=True)
-    assert rp.shape == (T, 3) and rq.shape == (T, 4) and jj.shape == (T, 21)
+    assert rp.shape == (T, 3) and rq.shape == (T, 4) and jj.shape == (T, _NJ)
     assert torch.isfinite(rp).all() and torch.isfinite(rq).all() and torch.isfinite(jj).all()
     assert dm.dbg is not None and len(dm.dbg) == T and dm.dbg[0][1] is False
 
@@ -232,8 +235,8 @@ def test_dp_tier_nearest_neighbour():
 def test_dp_tier_tiebreak_prefers_stillest():
     # two clean clips at the SAME steady velocity (0,0,0) -- a still "stand" and a moving
     # "shuffle" -- must be broken by stillness: the NN reward goes to the stiller clip.
-    still = _steady(_clip(60, seed=1, vx=0.0), (0.0, 0.0, 0.0)); still.joint_vel = torch.zeros(60, 21)
-    shuffle = _steady(_clip(60, seed=2, vx=0.0), (0.0, 0.0, 0.0)); shuffle.joint_vel = 2.0 * torch.randn(60, 21)
+    still = _steady(_clip(60, seed=1, vx=0.0), (0.0, 0.0, 0.0)); still.joint_vel = torch.zeros(60, _NJ)
+    shuffle = _steady(_clip(60, seed=2, vx=0.0), (0.0, 0.0, 0.0)); shuffle.joint_vel = 2.0 * torch.randn(60, _NJ)
     dm = _dp([still, shuffle], dcfg=DPConfig(dt=0.02, w_track=0.0, w_traj=1.0, w_tier=1.0, tier_nn_k=1))
     dm._prepare(lambda t: (0.0, 0.0, 0.0), 20)
     assert dm._src_activity[0] < dm._src_activity[1]            # still clip has lower foot motion
