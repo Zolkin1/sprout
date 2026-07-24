@@ -28,7 +28,6 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.bones_ingest import load_cache
 from motion_gen.motion_matching.box_clip import (
     align_and_concat,
     box_tile_box,
@@ -42,39 +41,25 @@ from motion_gen.motion_matching.box_clip import (
     yaw_normalize,
 )
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching.clean_ingest import ingest_clean_library
 from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.dp import DPConfig, DPMatcher
-from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
+from motion_gen.motion_matching.locomotion_db import (
+    APPROACH_FILTERS,
+    build_locomotion_matcher,
+    clean_library_fingerprint,
+)
 from motion_gen.motion_matching.playback import inertialize_seam
 from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
 from motion_gen.motion_matching.terrain_sampler import sample_box_tiles, sample_stair_tiles
 from motion_gen.motion_matching.terrain_variants import resolve_box_variant
-from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
 from motion_gen.multiskill_manager import MultiSkillManager
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
-# The jump / step-box lead-in families (bones filename prefixes) that make the terrain entry
-# reachable from flat locomotion; exclude the ladder / wall / roll look-alikes.
-_TERRAIN_INCLUDE = ["jump_over_obstacle", "jump_on", "jump_off", "come_up", "come_down"]
-_TERRAIN_EXCLUDE = ["ladder", "wall", "roll", "monkey", "shoulder", "safety", "hook"]
-# Flat-locomotion movement labels for the approach/exit steady tracking.
-_FLAT_MOVEMENT = ["walking", "jogging", "running", "running, turning", "turning",
-                  "standing idle", "transition"]
-_FLAT_EXCLUDE = ["injured", "limp", "drunk", "jump", "roll"]
-
-# Per terrain tile TYPE: which bones-source CATEGORIES the approach/recovery DP may draw from.
-# The candidate graph is built ONCE over the union (flat + clean + leadin); each tile type filters it
-# per-generate (see ``DPMatcher._set_category_filter``).  A stair traversal is PLAYED, so its approach
-# and recovery are ordinary flat locomotion -> {flat, clean} only; the box/jump lead-ins (``come_up`` /
-# ``jump_on`` ...) would otherwise leak elevated on-box frames into a flat run-up (the entry pop).  A box
-# jump must SYNTHESISE a takeoff, so it also needs the lead-ins.  Pure stair tiles are matcher-free.
-_APPROACH_FILTERS = {
-    "stair_transition": frozenset({"flat", "clean"}),
-    "box": frozenset({"flat", "clean", "leadin"}),
-}
+# The shared locomotion DB (flat bones + clean library_v2 + jump lead-ins, categorised) + its per-family
+# category filters live in ``motion_gen.motion_matching.locomotion_db`` so flat / stairs / boxes /
+# distractors all match against ONE library.  ``APPROACH_FILTERS`` keys used here: "stair_transition"
+# (a played traversal -> {flat, clean}) and "box" (a jump synthesises a takeoff -> +leadin).
 
 
 def _steady_cmd(vx: float):
@@ -146,43 +131,16 @@ def _pad_or_trim(t: torch.Tensor, T: int) -> torch.Tensor:
 
 
 def _build_matcher(args, dev):
-    """Flat locomotion (bones + clean) + jump lead-ins -> DPMatcher with a candidate graph."""
-    print("[box] loading flat-locomotion bones ...")
-    flat, _ = load_cache(args.bones_cache, filters={"package": "Locomotion",
-                         "content_type_of_movement": _FLAT_MOVEMENT, "content_body_position": "standing"},
-                         exclude_name_substrings=_FLAT_EXCLUDE, limit=args.bones_limit, device=dev)
-    print(f"[box] + {len(flat)} flat bones clips")
-    print("[box] loading jump/step lead-ins ...")
-    leadins, _ = load_cache(args.bones_cache, filters={"package": "Locomotion"},
-                            include_name_substrings=_TERRAIN_INCLUDE,
-                            exclude_name_substrings=_TERRAIN_EXCLUDE, limit=args.leadin_limit, device=dev)
-    print(f"[box] + {len(leadins)} lead-in clips")
-    clean = []
-    if args.include_clean:
-        print(f"[box] ingesting clean library {args.clean_source} ...")
-        clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt, device=dev)
-        print(f"[box] + {len(clean)} clean STEADY strides")
-    sources = flat + clean + leadins
-    # Per-source category, aligned with ``sources`` order -- lets each tile type filter the shared DB
-    # per-generate (``_APPROACH_FILTERS``) without rebuilding the candidate graph.
-    categories = ["flat"] * len(flat) + ["clean"] * len(clean) + ["leadin"] * len(leadins)
-    vcfg = VanillaConfig(dt=args.dt)
-    dcfg = DPConfig(dt=args.dt, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0,
-                    w_ground=args.ground_penalty, ground_z=0.0, max_pelvis_z=args.max_pelvis_z)
-    nframes = sum(s.n for s in sources)
-    print(f"[box] building DP matcher DB ({len(sources)} clips, {nframes} frames) ...")
-    matcher = DPMatcher(sources, vcfg, dcfg, device=dev, categories=categories)
-    gcfg = GraphConfig(k_min=args.graph_k_min, k_max=args.graph_k_max,
-                       k_target=args.graph_k_target, dt=args.dt)
-    print("[box] building candidate graph ...")
-    cost_feat = matcher._norm[:, matcher._traj_dim:]
-    select_feat = cost_feat[:, POSE_POSTURAL_IDX]
-    graph = build_candidate_graph(select_feat, cost_feat, matcher.feat_raw, matcher.owner,
-                                  matcher.src_start, matcher.src_len, matcher.yaw_all, gcfg,
-                                  steady_owner_mask=matcher._src_steady,
-                                  periodic_owner_mask=matcher._src_periodic)
-    matcher.attach_graph(graph)
-    return matcher
+    """The SHARED locomotion matcher (flat bones + clean library_v2 + jump lead-ins, categorised) -- the
+    same DB every generator uses.  Boxes/jumps keep the lead-ins in the graph and filter to them per
+    generate; stair transitions filter to {flat, clean}."""
+    return build_locomotion_matcher(
+        bones_cache=args.bones_cache, clean_source=args.clean_source, clean_hf_repo=args.clean_hf_repo,
+        bones_limit=args.bones_limit, leadin_limit=args.leadin_limit, include_leadins=True,
+        dt=args.dt, device=dev, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0,
+        ground_penalty=args.ground_penalty, max_pelvis_z=args.max_pelvis_z,
+        graph_k_min=args.graph_k_min, graph_k_max=args.graph_k_max, graph_k_target=args.graph_k_target,
+        log=lambda m: print(m.replace("[locomotion_db]", "[box]")))
 
 
 def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
@@ -238,12 +196,12 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
             app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
             ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
                                                    boundary_weight=args.boundary_weight, relax_tail=0,
-                                                   allowed_categories=_APPROACH_FILTERS["box"])
+                                                   allowed_categories=APPROACH_FILTERS["box"])
         else:
             app_cmd = _steady_cmd(approach_vx)
             ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
                                                    boundary_weight=args.boundary_weight, relax_tail=tail,
-                                                   allowed_categories=_APPROACH_FILTERS["box"])
+                                                   allowed_categories=APPROACH_FILTERS["box"])
         k = int(matcher.matched_entry)      # play the interaction FROM the matched entry frame
         # Periodic: play from the DP-chosen entry `k` (any frame in the first fraction), then WRAP the
         # full period forward -- so the seam matches where the approach actually hands off (no jump),
@@ -267,7 +225,7 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
             je = ts.joint_pos[-1:].to(dev).repeat(T_exit, 1)
         else:
             re, qe, je = matcher.generate_exit(_steady_cmd(entry_vx), T_exit, exit_descs,
-                                               allowed_categories=_APPROACH_FILTERS["box"])
+                                               allowed_categories=APPROACH_FILTERS["box"])
             # Peel off at the DP-chosen exit frame (mirror of the entry `matched_entry` play-from):
             # `matched_exit` indexes into the last `exit_frac` of the SOURCE period; because the loop is
             # periodic that window equals the played descent's last `m` frames, so truncate the descent
@@ -663,7 +621,7 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
     ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs,
                                            boundary_weight=args.boundary_weight, relax_tail=0,
-                                           allowed_categories=_APPROACH_FILTERS["stair_transition"])
+                                           allowed_categories=APPROACH_FILTERS["stair_transition"])
     k = int(matcher.matched_entry)
     # Full looped traversal (NOT truncated): the exit peel-off needs the settled frames ON the peel tread.
     Wp_d, Wq_d, Wj_d, terr_contact = _place_descent_on_tile(ts, tile, boxes, dev, k=k, truncate=False,
@@ -744,7 +702,7 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     # the approach ramp-down), so the exit motion matches the held-forward RL target_vel.
     rec_cmd = _ramp_up_cmd(entry_vx, args.recovery_ramp_s, approach_vx)
     re, qe, je = matcher.generate_exit(rec_cmd, T_exit, exit_descs,
-                                       allowed_categories=_APPROACH_FILTERS["stair_transition"])
+                                       allowed_categories=APPROACH_FILTERS["stair_transition"])
     cut = int(allowed[int(matcher.matched_exit)]) + 1   # peel off at the DP-chosen qualifying frame
     cf = cut - 1                                         # the chosen exit frame (index into the full descent)
     # Diagnostic: report the chosen peel-off frame's support state + pelvis height so we can confirm it is a
@@ -863,7 +821,7 @@ def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
     entry_vx = _entry_vx(ts, args.dt)
     app_cmd = _ramp_cmd(approach_vx, approach_s, args.approach_ramp_s, vx1=entry_vx)
     ra, qa, ja = matcher.generate_approach(app_cmd, T_app, entry_descs, boundary_weight=args.boundary_weight,
-                                           relax_tail=0, allowed_categories=_APPROACH_FILTERS["box"])
+                                           relax_tail=0, allowed_categories=APPROACH_FILTERS["box"])
     k = int(matcher.matched_entry)
     Wp_j, Wq_j, Wj_j, terr_contact = _place_jump_on_tile(ts, tile_box, dev, k=k)
     # jump_on ends ELEVATED (standing on the box) -> HOLD that pose for the recovery (no dismount).
@@ -913,7 +871,7 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     # jump_off) so it never walks forward into the box.  Truncate the played dismount at the exit frame.
     exit_descs = matcher.exit_descriptors(ts, exit_frac=args.exit_frac)
     re, qe, je = matcher.generate_exit(_steady_cmd(sgn * fwd_vx), T_exit, exit_descs,
-                                       allowed_categories=_APPROACH_FILTERS["box"])
+                                       allowed_categories=APPROACH_FILTERS["box"])
     m_exit = max(1, int(round(args.exit_frac * ts.root_pos.shape[0])))
     cut = max(1, min(Wp_d.shape[0] - m_exit + int(matcher.matched_exit) + 1, Wp_d.shape[0]))
     Wp_d, Wq_d, Wj_d = Wp_d[:cut], Wq_d[:cut], Wj_d[:cut]
@@ -1018,7 +976,6 @@ def main() -> int:
                         "run-up). 0 = off.")
     p.add_argument("--max-pelvis-z", type=float, default=0.95,
                    help="Pelvis-above-ground ceiling (m) before the ground penalty kicks in.")
-    p.add_argument("--include-clean", action="store_true", help="Fold in the clean STEADY strides.")
     p.add_argument("--clean-source", default="trajectories/skills/library_v2")
     p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
     p.add_argument("--bones-limit", type=int, default=None)
@@ -1326,6 +1283,7 @@ def main() -> int:
             "skill_list": [s.name for s in manager.skills]}
     writer = ClipLibraryWriter(args.out, len(records), meta)
     writer.set_attr("generator", "box_clip_splice")
+    writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))
     writer.set_attr("terrain_manifest", [r["manifest"] for r in records])
     for i, r in enumerate(records):
         batch = {

@@ -42,25 +42,19 @@ import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching.bones_ingest import load_cache
 from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, se2z_align
-from motion_gen.motion_matching.clean_ingest import ingest_clean_library
 from motion_gen.motion_matching.clip_output import ClipOutputBuilder
 from motion_gen.motion_matching.distractor import occupancy_grid
-from motion_gen.motion_matching.dp import DPConfig, DPMatcher
-from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
-from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
+from motion_gen.motion_matching.locomotion_db import (
+    APPROACH_FILTERS,
+    build_locomotion_matcher,
+    clean_library_fingerprint,
+)
 from motion_gen.multiskill_manager import MultiSkillManager
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
-_FLAT_MOVEMENT = ["walking", "jogging", "running", "running, turning", "turning",
-                  "standing idle", "transition"]
-# Exclude non-flat-locomotion junk that the movement labels don't catch: "in_place" (jog/run/march
-# in place -- the "jump rope" bounce), "fall"/"crazy" (falls, erratic), "crouch"/"squat" (low
-# postures). SEPARATE from generate_box_clips's terrain-jump include -- does NOT touch the mantle jumps.
-_FLAT_EXCLUDE = ["injured", "limp", "drunk", "jump", "roll", "in_place", "fall", "crazy", "crouch", "squat"]
 _PINNED = anchor_mask_from_free(set())               # world-pinned: no root DOF re-anchors to the robot
 
 
@@ -84,27 +78,15 @@ def _turn(vx, wz):
     return lambda _t: (float(vx), 0.0, float(wz))
 
 
-# ---- flat matcher (bones + optional clean, NO terrain lead-ins) ----
+# ---- flat matcher: the SHARED locomotion DB (flat bones + clean library_v2), NO terrain lead-ins ----
 def _build_flat_matcher(args, dev):
-    print("[distractor] loading flat-locomotion bones ...")
-    flat, _ = load_cache(args.bones_cache, filters={"package": "Locomotion",
-                         "content_type_of_movement": _FLAT_MOVEMENT, "content_body_position": "standing"},
-                         exclude_name_substrings=_FLAT_EXCLUDE, limit=args.bones_limit, device=dev)
-    print(f"[distractor] + {len(flat)} flat bones clips")
-    clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt,
-                                 device=dev) if args.include_clean else []
-    sources = flat + clean
-    dcfg = DPConfig(dt=args.dt, cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0)
-    print(f"[distractor] building DP matcher DB ({len(sources)} clips, {sum(s.n for s in sources)} frames) ...")
-    matcher = DPMatcher(sources, VanillaConfig(dt=args.dt), dcfg, device=dev)
-    gcfg = GraphConfig(k_min=args.graph_k_min, k_max=args.graph_k_max, k_target=args.graph_k_target, dt=args.dt)
-    print("[distractor] building candidate graph ...")
-    cost_feat = matcher._norm[:, matcher._traj_dim:]
-    graph = build_candidate_graph(cost_feat[:, POSE_POSTURAL_IDX], cost_feat, matcher.feat_raw,
-                                  matcher.owner, matcher.src_start, matcher.src_len, matcher.yaw_all, gcfg,
-                                  steady_owner_mask=matcher._src_steady, periodic_owner_mask=matcher._src_periodic)
-    matcher.attach_graph(graph)
-    return matcher
+    """The same union matcher every generator uses, filtered to ``{flat, clean}`` at generate time."""
+    return build_locomotion_matcher(
+        bones_cache=args.bones_cache, clean_source=args.clean_source, clean_hf_repo=args.clean_hf_repo,
+        bones_limit=args.bones_limit, include_leadins=False, dt=args.dt, device=dev,
+        cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0,
+        graph_k_min=args.graph_k_min, graph_k_max=args.graph_k_max, graph_k_target=args.graph_k_target,
+        log=lambda m: print(m.replace("[locomotion_db]", "[distractor]")))
 
 
 def _start_frame(matcher, cmd0):
@@ -195,7 +177,7 @@ def _make_tile(matcher, builder, kind, box_xyz, cmds, tid, T, args, dev):
     clips, tvels, foot_pts, turn_x = [], [], [], []
     for i, cmd in enumerate(cmds):
         sf = None if args.stand_start else _start_frame(matcher, cmd(0.0))
-        rp, rq, jt = matcher.generate(cmd, T, start_frame=sf)
+        rp, rq, jt = matcher.generate(cmd, T, start_frame=sf, allowed_categories=APPROACH_FILTERS["distractor"])
         if kind == "stop":
             # STOP `gap` behind the box near-face (which sits at x=0); vary gap across the tile so
             # the tile's clips stop at a range of distances. gap is pelvis->near-face (~body+0.2).
@@ -280,7 +262,6 @@ def main() -> int:
     p.add_argument("--cell", type=float, default=0.1)
     p.add_argument("--footprint-margin", type=float, default=1.0)
     p.add_argument("--cut-penalty", type=float, default=3.0)
-    p.add_argument("--include-clean", action="store_true")
     p.add_argument("--clean-source", default="trajectories/skills/library_v2")
     p.add_argument("--clean-hf-repo", default="zolkin/robot_rl")
     p.add_argument("--bones-limit", type=int, default=1500)
@@ -315,6 +296,7 @@ def main() -> int:
             "skill_list": [s.name for s in manager.skills]}
     writer = ClipLibraryWriter(args.out, len(records), meta)
     writer.set_attr("generator", "distractor")
+    writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))
     writer.set_attr("terrain_manifest", manifests)
     for i, r in enumerate(records):
         writer.write_batch(i, {

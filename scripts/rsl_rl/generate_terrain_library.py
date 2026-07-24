@@ -58,7 +58,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Retargeted merged library (output channel layout).")
     p.add_argument("--bones-cache", required=True)
-    p.add_argument("--terrain-lib", default="trajectories/skills/library_v2")
+    p.add_argument("--terrain-lib", default="trajectories/skills/library_v2",
+                   help="The ONE unified library every family matches against: terrain skills "
+                        "(stairs/jump geometry) AND clean locomotion strides (walk/run/side_step/turn/"
+                        "backwards).  Drives both --terrain-lib (geometry) and --clean-source (motion).")
     p.add_argument("--out", required=True, help="Final composed training library .h5.")
     p.add_argument("--work-dir", default="clips/_families", help="Where the per-family .h5 are written.")
     p.add_argument("--device", default="cpu")
@@ -101,7 +104,9 @@ def main() -> int:
 
     os.makedirs(os.path.join(_REPO, args.work_dir), exist_ok=True)
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
-    common = ["--source", args.source, "--bones-cache", args.bones_cache, "--device", args.device]
+    # Every family matches the SAME unified library: --terrain-lib drives the clean motion source too.
+    common = ["--source", args.source, "--bones-cache", args.bones_cache, "--device", args.device,
+              "--clean-source", args.terrain_lib]
     bl = ["--bones-limit", str(args.bones_limit)]
     fam = {                                                 # family -> output .h5
         k: os.path.join(args.work_dir, f"family_{k}.h5")
@@ -145,6 +150,7 @@ def main() -> int:
     if "flat" not in skip:
         _run("flat", "generate_mm_clips.py", [
             "--source", args.source, "--bones-cache", args.bones_cache, "--device", args.device,
+            "--clean-source", args.terrain_lib,
             "--bones-limit", str(args.bones_limit), "--clip-length", str(args.flat_clip_length),
             "--n-clips", str(args.flat_clips), "--seed", str(args.seed), "--out", fam["flat"]])
 
