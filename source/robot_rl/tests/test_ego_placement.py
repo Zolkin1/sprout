@@ -25,15 +25,19 @@ import math
 import torch
 
 from motion_gen.world_lift import (
-    ego_placement,
-    ego_placement_masked,
     anchor_mask_from_free,
     anchor_mask_free_names,
-    _yaw_from_quat,
     _ANCHOR_MASK_LEGACY,
     _ANCHOR_MASK_FLAT,
     _ANCHOR_MASK_STAIRS,
     _ANCHOR_MASK_SLOPE,
+)
+# The placement/lift helpers are quaternion-order sensitive, so Isaac Lab-side code
+# (these tests included) must reach them through the scalar-last adapter.
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift_isaac import (
+    ego_placement,
+    ego_placement_masked,
+    yaw_from_quat as _yaw_from_quat,
 )
 
 DEVICE = "cpu"

@@ -31,7 +31,7 @@ from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConf
 from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
 from motion_gen.clips.clip_manager import MotionClipManager
-from motion_gen.world_lift import (
+from .world_lift_isaac import (
     ego_placement_masked,
     lift_base_world_state,
     lift_orientation,
@@ -139,9 +139,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.manager.phase = torch.zeros(n, device=dev)
 
         # Base-frame output indices for world reconstruction (placement / obs).
-        # Force the orientation channels to xyzw order (the YAML stores ori
-        # scalar-first as ori_w, but Isaac Lab's quat math is scalar-last), so
-        # the lifted base quaternion matches root_quat_w / write_root_pose.
+        # Force the orientation channels to xyzw order: clips store ori scalar-first
+        # (ori_w) while Isaac Lab is scalar-last, and ``world_lift_isaac`` -- the one
+        # place that reorders -- takes this index scalar-last (it permutes back to the
+        # scalar-first core itself).  So the lifted base quaternion is xyzw, matching
+        # root_quat_w / write_root_pose_to_sim_index.
         base = self.cfg.base_frame_name
         self._base_idx = dict(self._reference_world_indices(base))
         self._base_idx["ori"] = torch.tensor(
@@ -660,7 +662,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             clip_id: ``[K]`` clip indices.
             step: ``[K]`` step indices.
             world_pos: ``[K, 3]`` clip-placement world positions.
-            world_quat: ``[K, 4]`` clip-placement world quaternions (wxyz).
+            world_quat: ``[K, 4]`` clip-placement world quaternions (xyzw).
 
         Returns:
             ``[K, 3+4+3+3+2*nj]`` world reference state.

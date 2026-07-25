@@ -30,7 +30,7 @@ from motion_gen.manager_base import ManagerBase
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from .terrain_aware_ref import apply_terrain_aware_ref
 from motion_gen.trajectory_manager import TrajectoryType
-from motion_gen.world_lift import lift_base_world_state
+from .world_lift_isaac import lift_base_world_state
 
 
 class BaseTrajectoryCommand(CommandTerm):
