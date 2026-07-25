@@ -831,13 +831,21 @@ def _stair_tile_worker(i: int):
     tile = S["tiles"][i]
     time_rng = np.random.default_rng([args.tile_seed + 1, int(tile.terrain_id)])
     tile_recs = []
+    # A single (tile, velocity) clip that hits a generation edge case (e.g. the peel-off exit-frame
+    # picker finding no clean hand-off for an awkward geometry/speed) must NOT abort the whole multi-hour
+    # run -- skip that clip and keep the rest of the tile.
     if tile.ttype == "terrain":                                    # PURE: one looped clip per commanded vel
         for vx in tvels:
             src = _src_for_variants(variants, tile.step_height, tile.step_depth, vx)
-            rec = _make_pure_tile_clip(builder, src, tile, args, dev, target_vx=vx)
+            try:
+                rec = _make_pure_tile_clip(builder, src, tile, args, dev, target_vx=vx)
+            except Exception as e:                                 # noqa: BLE001 - skip the bad clip, keep the tile
+                print(f"[box][WARN] stair tile {tile.terrain_id} vx={vx:.2f}: skipped ({e})")
+                continue
             rec["approach_vx"] = vx
             tile_recs.append(rec)
-        _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=True)
+        if tile_recs:
+            _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=True)
     else:                                                          # TRANSITION: approach+descent+recovery per vel
         mx = max(tvels)
         top_len = args.approach_s_range[1] * mx + 1.0
@@ -846,12 +854,20 @@ def _stair_tile_worker(i: int):
             src = _src_for_variants(variants, tile.step_height, tile.step_depth, vx)
             a_s = float(time_rng.uniform(*args.approach_s_range))
             r_s = float(time_rng.uniform(*args.recovery_s_range))
-            rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
-                                             top_len, bot_len, a_s, r_s)
+            try:
+                rec = _make_transition_tile_clip(matcher, builder, src, tile, vx, args, dev,
+                                                 top_len, bot_len, a_s, r_s)
+            except Exception as e:                                 # noqa: BLE001 - skip the bad clip, keep the tile
+                print(f"[box][WARN] stair tile {tile.terrain_id} vx={vx:.2f}: skipped ({e})")
+                continue
             rec["approach_vx"] = vx
             tile_recs.append(rec)
-        _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=False)
-    print(f"[box] stair tile {tile.terrain_id} ({tile.ttype}): {len(tile_recs)} clips")
+        if tile_recs:
+            _size_stair_tile_to_motion(tile_recs, builder, args.footprint_margin, is_pure=False)
+    if not tile_recs:
+        print(f"[box][WARN] stair tile {tile.terrain_id} ({tile.ttype}): ALL clips skipped -> dropping tile")
+    else:
+        print(f"[box] stair tile {tile.terrain_id} ({tile.ttype}): {len(tile_recs)} clips")
     return tile_recs
 
 
@@ -883,12 +899,17 @@ def _box_tile_worker(i: int):
     overlay.update(vp)                                             # variant sub-boxes (fixed per tile)
     kind = str(ts.terrain_meta["terrain"].get("kind", "on"))
     tile_recs = []
+    # As in the stair worker: a single bad clip must not abort the whole run -- skip it, keep the tile.
     if kind == "off":                                              # DISMOUNT (jump_off / jump_off_front)
         for _ in range(C):
             r_s = float(time_rng.uniform(*args.recovery_s_range))
             fwd = float(vel_rng.uniform(vlo, vhi))                 # forward walk-away speed after the dismount
-            rec = _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
-                                          tile_box, overlay, (0.0, 0.0), 0.0, 0.0, r_s, fwd)
+            try:
+                rec = _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
+                                              tile_box, overlay, (0.0, 0.0), 0.0, 0.0, r_s, fwd)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[box][WARN] box tile {tile.terrain_id} (off) fwd={fwd:.2f}: skipped ({e})")
+                continue
             rec["approach_vx"] = fwd
             tile_recs.append(rec)
     else:                                                          # MOUNT (jump_on)
@@ -896,10 +917,17 @@ def _box_tile_worker(i: int):
         for vx in vels:
             a_s = float(time_rng.uniform(*args.approach_s_range))
             r_s = float(time_rng.uniform(*args.recovery_s_range))
-            rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
-                                      tile_box, overlay, (0.0, 0.0), 0.0, 0.0, a_s, r_s)
+            try:
+                rec = _make_box_tile_clip(matcher, builder, ts, tile, vx, args, dev,
+                                          tile_box, overlay, (0.0, 0.0), 0.0, 0.0, a_s, r_s)
+            except Exception as e:                                 # noqa: BLE001
+                print(f"[box][WARN] box tile {tile.terrain_id} (on) vx={vx:.2f}: skipped ({e})")
+                continue
             rec["approach_vx"] = vx
             tile_recs.append(rec)
+    if not tile_recs:                                              # every clip skipped -> drop the tile
+        print(f"[box][WARN] box tile {tile.terrain_id} ({kind}): ALL clips skipped -> dropping tile")
+        return tile_recs
     # Size the tile to the union of ALL its clips' body positions + the box, + buf each side.
     xmin = ymin = float("inf"); xmax = ymax = float("-inf")
     for rec in tile_recs:
