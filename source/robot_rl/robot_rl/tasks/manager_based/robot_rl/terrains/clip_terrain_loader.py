@@ -448,33 +448,30 @@ def assemble_clip_terrain(
 
 def clip_frame_origin(
     cell_corner: torch.Tensor,
-    cell_center: torch.Tensor,
-    clip_y_center: torch.Tensor,
     clip_x_offset: torch.Tensor | float = 0.0,
 ) -> torch.Tensor:
     """World position to place a clip's local-corner (0,0,0) frame on its tile.
 
-    The clip is baked in the terrain's local-corner frame, so aligning it to the
-    tile is a pure translation (identity heading): x-corner on the tile corner
-    (plus ``clip_x_offset`` -- the flat back-buffer prepended to transition tiles,
-    so the clip's geometry sits AFTER the buffer), and the clip's centerline
-    (``clip_y_center`` = ``size_y/2`` for terrain clips, ``~0`` for flat clips) on
-    the tile centerline (absorbs the stair re-centering to the tile's footprint
-    width).  z = tile ground (0); the clip's own baked z rides the treads with no
-    double-count.
+    A terrain clip is baked in the TILE-LOCAL corner frame: every generator recentres its clips onto the
+    tile's own datum (``terrain_splice.footprint_recenter`` / ``_size_stair_tile_to_motion`` /
+    ``generate_distractor_clips``), so the tile's geometry AND motion span ``[0, size]`` with the footprint
+    margin on each side.  The tile's mesh is likewise emitted in that frame and translated to
+    ``cell_corner``.  So placement is a pure translation onto the corner, in BOTH axes (identity heading);
+    ``clip_x_offset`` adds the flat back-buffer prepended to LEGACY transition tiles, so their clip geometry
+    sits after the buffer.  z = tile ground (0); the clip's baked z rides the treads with no double-count.
+
+    Do NOT centre the clip in the cell: a cell is sized to the LARGEST tile of its class (plus
+    ``size_margin``), while each tile's mesh sits at the corner, so centring shifts the clip off its own
+    geometry by half the class-vs-tile size difference -- metres for a class whose tiles vary in width.
 
     Args:
         cell_corner: ``[N, 3]`` world position of each tile's local (0,0) corner.
-        cell_center: ``[N, 3]`` world position of each tile's center.
-        clip_y_center: ``[N]`` the clip frame y that lands on the tile centerline.
         clip_x_offset: ``[N]`` (or scalar) x-shift of the clip within the tile
-            (the transition back-buffer; 0 for terrain / flat).
+            (the legacy transition back-buffer; 0 otherwise).
 
     Returns:
         ``[N, 3]`` world placement for each clip's local-corner frame.
     """
-    out = torch.zeros_like(cell_corner)
+    out = cell_corner.clone()
     out[:, 0] = cell_corner[:, 0] + clip_x_offset
-    out[:, 1] = cell_center[:, 1] - clip_y_center
-    out[:, 2] = cell_corner[:, 2]
     return out

@@ -248,9 +248,12 @@ def main() -> int:
         for r in terr_rows:
             by_type.setdefault(r["type"], []).append(r)
         for t, rows in sorted(by_type.items()):
-            print(f"    type '{t}': {len(rows)} clips, "
-                  f"seam_speed_max median {np.nanmedian([r['seam_speed_max'] for r in rows]):.3f} m/s, "
-                  f"slide_p95 median {np.nanmedian([r['slide_p95'] for r in rows]):.3f} m/s")
+            # A family with no per-step anchor mask (pure tiles, distractors) has no seams to measure, so
+            # every seam value is nan -- report that rather than letting nanmedian warn on an all-nan slice.
+            seams = [r["seam_speed_max"] for r in rows if np.isfinite(r["seam_speed_max"])]
+            seam_txt = f"{np.median(seams):.3f} m/s" if seams else "n/a (no spliced seams)"
+            print(f"    type '{t}': {len(rows)} clips, seam_speed_max median {seam_txt}, "
+                  f"slide_p95 median {np.nanmedian([r['slide_p95'] for r in rows]):.3f} m/stance")
 
     for key in ("slide_p95", "seam_speed_max", "err_steady_p95"):
         rows = (flat_rows + terr_rows) if key != "err_steady_p95" else flat_rows

@@ -50,7 +50,8 @@ def _ramp(v0: float, v1: float, frac: float) -> float:
 
 def _generate_approach(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, plan, *,
                        pin: str, pin_future: bool, ramp_s: float, secs: float, seed: int,
-                       pin_lead: float | None = None, pin_tail: float = 0.5):
+                       pin_lead: float | None = None, pin_tail: float = 0.5,
+                       start: str = "stand"):
     """The approach segment: steady locomotion into the terrain entry pose.
 
     The command holds ``plan.approach_vx`` and ramps to ``plan.entry_vx`` over the last ``ramp_s`` seconds
@@ -69,22 +70,36 @@ def _generate_approach(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, plan
       extra seconds are generated past the nominal arrival and the splice picks the best-matching frame
       (:func:`~motion_gen.motionbricks.terrain_splice.match_arrival`).
 
+    ``start`` picks what the approach BEGINS from:
+
+    * ``"stand"`` -- the agent's reset (standing) state, so the clip opens with an acceleration run-up.
+    * ``"steady"`` -- CONTEXT-SEEDED from the matched steady stride (the same priming the exit uses), so the
+      robot is already travelling at the approach command on frame 0. This is the deployment case -- the
+      robot reaches terrain while walking -- and it stops the run-up from eating the clip at high speed.
+
+    Both are wanted in a library: a stand start teaches the approach-from-rest, a steady start teaches the
+    arrival at speed. The caller decides per clip (``mb_plan_library --steady-approach-frac``).
+
     Returns ``(qpos[T,36], cmd[T,3])``.
     """
-    # TODO(steady-approach): let a walking approach START AT STEADY STATE instead of from a stand.
-    # ``mb.reset`` leaves the model in its standing state, so every transition clip opens with an
-    # acceleration run-up: the faster the clip, the more of it is spent getting up to speed (and the
-    # longer the platform the tile has to author -- ``_author_tile`` sizes it as approach_s * speed).
-    # It also means the teacher never sees the robot ARRIVE at terrain already moving, which is the
-    # deployment case.  Fix: context-seed the approach the way the exit already is -- prime the agent
-    # with a window of the matched steady stride (``targeter.window(targeter.nearest(cmd0))``) via
-    # ``mb.prime`` before the loop, instead of starting from reset.  Then ``--approach-s`` can shrink
-    # to just the pin lead-in plus a stride or two, which shortens the platforms as well.
     mb.reset(seed)
     horizon = float(mb.lookahead_times[0])
     lead = horizon if pin_lead is None else float(pin_lead)
     n_steps = max(2, int(round((secs + max(0.0, pin_tail)) * mb.fps)))
     standing = plan.approach_mode == "stand"
+    # STEADY start: prime the buffer from a stride already moving at the approach command, so frame 0 is
+    # mid-gait rather than a stand.  The bank's strides are feet-at-zero at the MB frame rate, which is the
+    # frame every MB segment is generated in, so the seed needs no shifting (unlike the exit's, which comes
+    # off the terrain and is lowered by its surface height).  A STANDING approach (settling on a box top)
+    # has no steady state to seed from.
+    if start == "steady" and not standing:
+        cmd0 = np.array([float(plan.approach_vx), 0.0, 0.0], np.float32)
+        win = targeter.window(targeter.nearest(cmd0), advance=1)
+        mb.set_target_pose(win)
+        mb.set_regime(1.0, 0.0)
+        seed_ctx = t.as_tensor(np.asarray(win, np.float32), dtype=t.float32,
+                               device=mb.agent._device)[None]
+        mb.prime(mb_env.walk_control(seed_ctx, cmd0, mb.lookahead_times))
     qpos_stream, cmd_stream = [], []
     for step in range(n_steps):
         t_now = step * mb.dt
@@ -168,14 +183,15 @@ def _generate_exit(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, plan, *,
 
 
 def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, out: str,
-                  args, raw_schema, quiet: bool = False, plan_path: str | None = None) -> str:
+                  args, raw_schema, quiet: bool = False, plan_path: str | None = None,
+                  start: str = "stand") -> str:
     """Generate ONE segment (``side`` of ``plan``) and write it as a ``RawMotion``; returns the path."""
     seed = (args.seed * (1 + (side == "exit")) * 2333) % (2 ** 32 - 1)
     if side == "approach":
         pin_future = family.pin_future if args.pin_future == "auto" else (args.pin_future == "on")
         qpos, cmd = _generate_approach(mb, targeter, plan, pin=pin, pin_future=pin_future,
                                        ramp_s=args.ramp_s, secs=secs, seed=seed,
-                                       pin_lead=args.pin_lead, pin_tail=args.pin_tail)
+                                       pin_lead=args.pin_lead, pin_tail=args.pin_tail, start=start)
     else:
         qpos, cmd = _generate_exit(mb, targeter, plan, pin=pin, ramp_s=args.ramp_s, secs=secs, seed=seed)
     motion = raw_schema.RawMotion(
@@ -187,9 +203,14 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
                     # Bricks was context-seeded from the terrain (its output then opens by re-predicting
                     # the seed frames, which the splice skips).
                     "frame": "flat", "seeded": bool(side == "exit" and pin == "hard"),
+                    "start": start if side == "approach" else "",
                     "skill": plan.skill, "seed": int(seed),
                     "plan": os.path.abspath(plan_path) if plan_path else "",
+                    # The full set of knobs that shape this motion -- ``_gen_params`` compares them on
+                    # resume so a settings change regenerates instead of silently reusing a stale segment
+                    # (they are NOT in the request key, which only describes WHAT to reach, not HOW).
                     "secs": secs, "ramp_s": args.ramp_s, "pin_future": args.pin_future,
+                    "pin_lead": args.pin_lead, "pin_tail": args.pin_tail,
                     "stride_bank": os.path.abspath(args.stride_bank),
                     "mb_root": os.path.abspath(args.mb_root)},
     )
@@ -205,6 +226,40 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
     return out
 
 
+# Generation knobs that change the MOTION for the same request. The key deliberately does not include
+# them (it says which boundary pose to reach and at what command), so resume compares them explicitly.
+_GEN_KNOBS = ("ramp_s", "pin_future", "pin_lead", "pin_tail", "start", "secs", "pin")
+
+
+def _gen_params(args, side: str, pin: str, secs: float, start: str) -> dict:
+    """The generation knobs this run would use for one segment."""
+    return {"ramp_s": args.ramp_s, "pin_future": args.pin_future, "pin_lead": args.pin_lead,
+            "pin_tail": args.pin_tail, "start": start if side == "approach" else "",
+            "secs": float(secs), "pin": pin}
+
+
+def _is_stale(path: str, want: dict, raw_schema) -> str | None:
+    """``None`` if the segment on disk was generated with ``want``; else the first differing knob.
+
+    Without this, changing e.g. ``--pin-lead`` would leave every already-generated segment in place: the
+    request key is unchanged, so resume would treat stale motion as done.
+    """
+    try:
+        prov = dict(raw_schema.load_raw_motion(path).provenance or {})
+    except Exception:
+        return "unreadable"
+    for k in _GEN_KNOBS:
+        if k not in prov:
+            return f"{k} (not recorded)"
+        a, b = prov[k], want[k]
+        if isinstance(b, float) and isinstance(a, (int, float)):
+            if abs(float(a) - b) > 1e-9:
+                return f"{k}: {a} != {b}"
+        elif a != b:
+            return f"{k}: {a!r} != {b!r}"
+    return None
+
+
 def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
     """BATCH mode: generate every unique segment in ``requests.json``, in this one process.
 
@@ -216,13 +271,10 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
     with open(args.requests) as f:
         reqs = json.load(f)["requests"]
     plans: dict[str, object] = {}
-    done = fail = skipped = 0
+    done = fail = skipped = stale = 0
     print(f"[mb_seg] batch: {len(reqs)} unique segments (work-dir {work})")
     for i, r in enumerate(reqs):
         out = os.path.join(work, r["out"])
-        if os.path.exists(out):
-            skipped += 1
-            continue
         try:
             ppath = os.path.join(work, r["plan"])
             if ppath not in plans:
@@ -230,8 +282,17 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
             plan = plans[ppath]
             family = families.family_for(plan.skill)
             secs = float(plan.approach_s if r["side"] == "approach" else plan.exit_s)
+            if os.path.exists(out):
+                why = _is_stale(out, _gen_params(args, r["side"], r["pin"], secs,
+                                                 r.get("start", "stand")), raw_schema)
+                if why is None:
+                    skipped += 1
+                    continue
+                if stale == 0:
+                    print(f"[mb_seg] regenerating: on-disk segments differ ({why})", flush=True)
+                stale += 1
             _emit_segment(mb, targeter, plan, family, r["side"], r["pin"], secs, out, args,
-                          raw_schema, quiet=True, plan_path=ppath)
+                          raw_schema, quiet=True, plan_path=ppath, start=r.get("start", "stand"))
             done += 1
         except (Exception, SystemExit) as e:     # one bad segment costs one clip, not the library
             fail += 1
@@ -239,7 +300,8 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
         if (i + 1) % 25 == 0 or i + 1 == len(reqs):
             print(f"[mb_seg]   {i + 1}/{len(reqs)}  generated={done} reused={skipped} failed={fail}",
                   flush=True)
-    print(f"[mb_seg] batch done: {done} generated, {skipped} already present, {fail} FAILED")
+    print(f"[mb_seg] batch done: {done} generated ({stale} of them stale + regenerated), "
+          f"{skipped} reused, {fail} FAILED")
     return 1 if (fail and not done) else 0
 
 
@@ -274,6 +336,10 @@ def main() -> int:
                         "own FUTURE frames (on) or hold the entry pose (off). auto = the family's own "
                         "setting (on for ascents only -- see terrain_families.pin_future for the measured "
                         "comparison).")
+    p.add_argument("--approach-start", default="stand", choices=["stand", "steady"],
+                   help="[single-plan] what the approach begins from: 'stand' (reset, run-up) or 'steady' "
+                        "(context-seeded from the matched stride, already at the command). In batch mode "
+                        "this comes per request from mb_plan_library --steady-approach-frac.")
     p.add_argument("--pin-tail", type=float, default=0.5,
                    help="[hard approach] extra seconds generated past the nominal arrival, so pass 2 can pick "
                         "the frame that actually matches the entry pose.")
@@ -318,7 +384,7 @@ def main() -> int:
         secs = approach_s if side == "approach" else exit_s
         written.append(_emit_segment(mb, targeter, plan, family, side, pin, secs,
                                      os.path.join(args.out_dir, f"{side}{tag}.npz"), args, raw_schema,
-                                     plan_path=args.plan))
+                                     plan_path=args.plan, start=args.approach_start))
 
     kf_t, kf_qpos = mb.captured_keyframes()
     sidecar = os.path.join(args.out_dir, "_keyframes.npz")

@@ -71,12 +71,16 @@ def _redatum_tile(recs: list[dict], boxes: list[dict], margin: float) -> tuple[f
             if o["size_xyz"][0] > 1.5 * min_sx:
                 o["size_xyz"][1] = size_y
                 o["pos_xy"][1] = size_y / 2.0
-    px, py = _SHARED["px"], _SHARED["py"]
+    # Shift EVERY position channel, not just the root: ``y_des`` carries one column per constraint frame
+    # (pelvis + both ankles + wrists), all of them world positions in the tile frame. Moving only the root
+    # would leave the feet behind -- the clip would still look self-consistent in a root-only plot while its
+    # feet sat metres from the treads. (Same convention as generate_box_clips / generate_distractor_clips.)
+    x_ch, y_ch = _SHARED["x_ch"], _SHARED["y_ch"]
     for r in recs:
         dx, dy = r["corner"][0] - CORNER[0], r["corner"][1] - CORNER[1]
         if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-            r["y"][:, px] += dx
-            r["y"][:, py] += dy
+            r["y"][:, x_ch] += dx
+            r["y"][:, y_ch] += dy
         r["manifest"] = dict(r["manifest"])
         r["manifest"].update(size_x=float(size_x), size_y=float(size_y), overlays=overlays)
         r["corner"] = CORNER
@@ -196,8 +200,8 @@ def main() -> int:
 
     builder = make_builder(args, args.device)
     _SHARED.update(args=args, work=work, builder=builder, dev=args.device, tiles=tiles,
-                   px=builder.pos_names.index("pelvis_link:pos_x"),
-                   py=builder.pos_names.index("pelvis_link:pos_y"))
+                   x_ch=[i for i, n in enumerate(builder.pos_names) if n.endswith(":pos_x")],
+                   y_ch=[i for i, n in enumerate(builder.pos_names) if n.endswith(":pos_y")])
     n_workers = default_workers(len(tiles), args.workers)
     print(f"[mb_asm] {len(jobs)} clips over {len(tiles)} tiles, workers={n_workers}")
     recs = unit_pool(_tile_worker, range(len(tiles)), n_workers)

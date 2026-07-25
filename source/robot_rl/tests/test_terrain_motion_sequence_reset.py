@@ -94,32 +94,32 @@ def test_default_num_flat_tiles_fallback_without_metadata():
     assert default_num_flat_tiles(lib) == 8
 
 
-def test_clip_frame_origin_terrain_centerline():
-    """A terrain clip's centerline (clip_y_center = size_y/2) lands on the tile
-    centerline; x is the corner + back-buffer; z is the tile ground."""
+def test_clip_frame_origin_is_the_tile_corner():
+    """A clip is baked TILE-LOCAL, so placement is a pure translation onto the tile corner.
+
+    The tile's mesh is emitted in the same local frame and translated to the corner, so anything else --
+    notably centring the clip in its CELL -- shifts the motion off its own geometry (a cell is sized to the
+    largest tile of its class, so the error is half the class-vs-tile size difference).
+    """
     corner = torch.tensor([[10.0, 4.0, 0.5]])
-    center = torch.tensor([[11.0, 5.0, 0.5]])  # footprint (2, 2) around corner
-    size_y = torch.tensor([1.2])
     x_off = torch.tensor([0.3])
-    out = clip_frame_origin(corner, center, 0.5 * size_y, x_off)
+    out = clip_frame_origin(corner, x_off)
 
-    assert torch.allclose(out[:, 0], corner[:, 0] + x_off)          # x: corner + buffer
-    assert torch.allclose(out[:, 1], center[:, 1] - 0.5 * size_y)   # y: centerline shift
-    assert torch.allclose(out[:, 2], corner[:, 2])                  # z: tile ground
+    assert torch.allclose(out[:, 0], corner[:, 0] + x_off)   # x: corner + legacy back-buffer
+    assert torch.allclose(out[:, 1], corner[:, 1])           # y: the corner, NOT the cell centre
+    assert torch.allclose(out[:, 2], corner[:, 2])           # z: tile ground
 
-    # Invariant: a reference point on the clip's own centerline (local y = size_y/2)
-    # ends up exactly on the tile centerline in world.
-    world_y_at_centerline = out[:, 1] + 0.5 * size_y
-    assert torch.allclose(world_y_at_centerline, center[:, 1])
+    # Invariant: a clip point at local (a, b) lands on the tile's geometry at local (a, b).
+    for a, b in ((0.0, 0.0), (2.5, 1.2), (7.0, 3.4)):
+        assert torch.allclose(out[:, 0] - x_off + a, corner[:, 0] + a)
+        assert torch.allclose(out[:, 1] + b, corner[:, 1] + b)
 
 
-def test_clip_frame_origin_flat_at_corner():
-    """A flat clip (clip_y_center = 0, no x-offset) is anchored at the tile corner."""
-    corner = torch.tensor([[10.0, 4.0, 0.0]])
-    center = torch.tensor([[15.0, 9.0, 0.0]])
-    out = clip_frame_origin(corner, center, torch.zeros(1), 0.0)
-    assert torch.allclose(out[:, 1], center[:, 1])   # clip_y_center=0 -> centerline == tile center y
-    assert torch.allclose(out[:, 2], corner[:, 2])
+def test_clip_frame_origin_ignores_the_cell_size():
+    """Two tiles of different size in the same class place their clips identically on their own corners."""
+    corner = torch.tensor([[10.0, 4.0, 0.0], [10.0, 20.0, 0.0]])
+    out = clip_frame_origin(corner, torch.zeros(2))
+    assert torch.allclose(out[:, :2], corner[:, :2])
 
 
 def test_snap_decoupled_from_reanchor():

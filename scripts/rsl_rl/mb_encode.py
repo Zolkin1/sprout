@@ -184,7 +184,9 @@ def main() -> int:
     p.add_argument("--allowed-mode", default=None)
     args = p.parse_args()
 
-    mb_env.enter_mb_root(args, ("stride_bank", "out_dir"))
+    # Every path argument must be listed: the harness resolves these BEFORE it chdirs into the Motion
+    # Bricks root, so anything left out is looked up relative to that root instead of the repo.
+    mb_env.enter_mb_root(args, ("stride_bank", "out_dir", "schedules"))
     raw_schema = mb_env.load_schema_module("raw_schema")
     os.makedirs(args.out_dir, exist_ok=True)
     strides, steady_vel, bank_meta = mb_env.load_bank(args.stride_bank)

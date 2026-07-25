@@ -133,6 +133,13 @@ def main() -> int:
     p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
     p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"))
     p.add_argument("--stair-floor-frac", type=float, default=0.5)
+    p.add_argument("--steady-approach-frac", type=float, default=0.5,
+                   help="Fraction of terrain clips whose approach starts ALREADY AT SPEED rather than from "
+                        "a stand (see mb_terrain_segments --approach-start).")
+    p.add_argument("--pin-lead", type=float, default=2.0,
+                   help="Seconds before the arrival that the terrain pose pin engages on the approach. The "
+                        "model's planning horizon is ~1 s, so a longer lead gives it several replans under "
+                        "the pin to in-between into the entry pose instead of one.")
     p.add_argument("--rl-vels", default="raw", choices=["raw", "snapped"],
                    help="Which command channel the flat clips expose to the RL (see generate_mb_clips.py).")
     p.add_argument("--extra-mix", default="",
@@ -175,7 +182,8 @@ def main() -> int:
             "--clips-per-tile", str(cpt), "--seed", str(args.seed), "--device", args.device,
             "--stair-vel-range", *(str(v) for v in args.stair_vel_range),
             "--box-vel-range", *(str(v) for v in args.box_vel_range),
-            "--stair-floor-frac", str(args.stair_floor_frac)])
+            "--stair-floor-frac", str(args.stair_floor_frac),
+            "--steady-approach-frac", str(args.steady_approach_frac)])
     if stage in ("all", "a") and args.distractor_tiles > 0 \
             and not os.path.exists(os.path.join(_REPO, dis_sched)):
         _run("distract-plan", "mb_distractor_clips.py", dis_argv + ["--dump-schedules", dis_sched])
@@ -191,7 +199,8 @@ def main() -> int:
         if pending:
             _run("segments", "mb_terrain_segments.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank,
-                "--requests", os.path.join(work, "requests.json"), "--work-dir", work],
+                "--requests", os.path.join(work, "requests.json"), "--work-dir", work,
+                "--pin-lead", str(args.pin_lead)],
                 conda_env=args.conda_env)
         else:
             print(f"\n===== [segments] all present, skipping")

@@ -87,7 +87,7 @@ def _round_key(*vals) -> str:
     return h.hexdigest()[:16]
 
 
-def _segment_keys(plan, approach_pin: str, exit_pin: str) -> tuple[str, str]:
+def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = "stand") -> tuple[str, str]:
     """``(approach_key, exit_key)`` -- identical keys iff Motion Bricks would see identical input.
 
     Keyed on exactly what ``mb_terrain_segments`` feeds the model, no more:
@@ -106,7 +106,9 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str) -> tuple[str, str]:
     rep, ef, xf = plan.terrain_qpos, plan.entry_frame, plan.exit_frame
     a_scalars = [plan.approach_vx, plan.entry_vx, plan.approach_s]
     x_scalars = [plan.exit_vx, plan.exit_speed, plan.exit_s]
-    a_parts = [f"{plan.skill}|{plan.approach_mode}|{approach_pin}|approach", a_scalars]
+    # ``approach_start`` is part of the key: a run-up from a stand and an arrival already at speed are
+    # different motions for the same command, so they must not share a generated segment.
+    a_parts = [f"{plan.skill}|{plan.approach_mode}|{approach_pin}|{approach_start}|approach", a_scalars]
     x_parts = [f"{plan.skill}|{plan.exit_mode}|{exit_pin}|exit", x_scalars]
     if approach_pin == "hard":
         a_win = rep[max(0, ef - 1):ef + _KEY_WINDOW].copy()
@@ -198,6 +200,9 @@ def main() -> int:
     p.add_argument("--tile-width-range", type=float, nargs=2, default=(0.8, 1.2), metavar=("MIN", "MAX"))
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
                    help="Fraction of stair tiles keeping a ground plane (rest are bare stairs).")
+    p.add_argument("--steady-approach-frac", type=float, default=0.5,
+                   help="Fraction of clips whose approach starts ALREADY AT SPEED (context-seeded from the "
+                        "matched stride) rather than from a stand. 0 = every clip runs up from rest.")
     p.add_argument("--approach-pin", default="hard", choices=["hard", "soft"])
     p.add_argument("--exit-pin", default="hard", choices=["hard", "soft"])
     p.add_argument("--entry-pick", default="first", choices=["first", "middle", "last"])
@@ -241,14 +246,19 @@ def main() -> int:
             a_s = _quantize(d_rng.uniform(*args.approach_s_range), args.duration_step)
             x_s = _quantize(d_rng.uniform(*args.exit_s_range), args.duration_step)
             v_rng = np.random.default_rng([args.seed + 2, tid])
+            s_rng = np.random.default_rng([args.seed + 3, tid])
             speeds = _clip_speeds(v_rng, kind, args, cpt)
+            # Mix of run-up-from-rest and arrive-at-speed approaches: the library wants both, so the RL
+            # sees terrain entered from a stand AND entered while already walking (the deployment case).
+            starts = ["steady" if s_rng.random() < args.steady_approach_frac else "stand"
+                      for _ in range(len(speeds))]
             # The tile's walking surfaces are sized for the FASTEST clip on it, and every clip authors the
             # geometry with that same speed -- otherwise a slow clip authors a short platform, the tile
             # meshes some other clip's geometry, and the slow clip stands metres away from the staircase.
             # (Platforms are long because the approach accelerates from a stand; see
             # TODO(steady-approach) in mb_terrain_segments.py -- a steady start would shorten both.)
             plat_vx = max(abs(v) for v in speeds) if speeds else 1.0
-            for ci, vx in enumerate(speeds):
+            for ci, (vx, a_start) in enumerate(zip(speeds, starts)):
                 job_args = SimpleNamespace(
                     skill=skill, source=args.source, library=args.library, hf_repo=args.hf_repo,
                     dt=args.dt, device=args.device, terrain_id=tid,
@@ -284,15 +294,17 @@ def main() -> int:
                         skip_reasons.get(f"{skill}:{type(e).__name__}", 0) + 1
                     continue
                 save_terrain_plan(os.path.join(work, rel), plan)
-                a_key, x_key = _segment_keys(plan, args.approach_pin, args.exit_pin)
+                a_key, x_key = _segment_keys(plan, args.approach_pin, args.exit_pin, a_start)
                 for key, side, pin in ((a_key, "approach", args.approach_pin),
                                        (x_key, "exit", args.exit_pin)):
                     requests.setdefault(key, {"key": key, "side": side, "pin": pin, "plan": rel,
                                               "out": os.path.join("segments", f"{key}.npz"),
+                                              "start": a_start if side == "approach" else "stand",
                                               "n_uses": 0})
                     requests[key]["n_uses"] += 1
                 jobs.append({"family": skill, "kind": kind, "terrain_id": tid, "clip": ci,
                              "plan": rel, "approach_key": a_key, "exit_key": x_key,
+                             "approach_start": a_start,
                              "vx": float(vx), "approach_s": a_s, "exit_s": x_s,
                              "approach_pin": args.approach_pin, "exit_pin": args.exit_pin,
                              "footprint_margin": float(args.footprint_margin)})

@@ -78,6 +78,15 @@ def test_segment_keys_split_on_what_mb_actually_sees():
     assert mb_plan_library._segment_keys(_plan(), "hard", "soft")[1] != base[1]
 
 
+def test_segment_keys_split_on_the_approach_start():
+    """A run-up from a stand and an arrival already at speed are different motions for one command."""
+    stand = mb_plan_library._segment_keys(_plan(), "hard", "hard", "stand")
+    steady = mb_plan_library._segment_keys(_plan(), "hard", "hard", "steady")
+    assert stand[0] != steady[0]          # the approach differs ...
+    assert stand[1] == steady[1]          # ... the exit does not depend on how the approach began
+    assert stand == mb_plan_library._segment_keys(_plan(), "hard", "hard")   # 'stand' is the default
+
+
 def test_soft_pin_key_ignores_the_replay():
     """With no pin the model never sees the terrain, so two different replays share one segment."""
     a = mb_plan_library._segment_keys(_plan(), "soft", "soft")
@@ -103,11 +112,18 @@ def test_skill_seed_is_process_stable():
 
 # --------------------------------------------------------------------------- tile re-datum
 
-def _rec(corner, size, n=10, px=0, py=1):
+# A stand-in y_des layout: TWO frames (a root and a foot), each with x/y/z, so a re-datum that moves only
+# the root instead of every position channel is visible.
+_X_CH, _Y_CH = [0, 3], [1, 4]          # root x,y = 0,1 ; foot x,y = 3,4
+
+
+def _rec(corner, size, n=10):
     """A stand-in clip record: only the fields the re-datum touches."""
-    y = np.zeros((n, 3), np.float32)
-    y[:, px] = np.linspace(0.5, 1.5, n)
-    y[:, py] = 0.25
+    y = np.zeros((n, 6), np.float32)
+    y[:, 0] = np.linspace(0.5, 1.5, n)          # root x
+    y[:, 1] = 0.25                              # root y
+    y[:, 3] = np.linspace(0.5, 1.5, n) + 0.1    # foot x (just behind the root)
+    y[:, 4] = 0.30                              # foot y
     import torch
     return {"y": torch.as_tensor(y), "corner": corner, "size_x": size[0], "size_y": size[1],
             "manifest": {"terrain_id": 3, "type": "transition", "size_x": size[0], "size_y": size[1],
@@ -118,10 +134,11 @@ def test_redatum_gives_every_clip_of_a_tile_one_origin_and_footprint():
     """The reuse invariant: one mesh per terrain_id, so identical size + overlays across the tile's clips."""
     margin = 1.0
     boxes = [{"pos": [2.0, 0.0, 0.1], "size": [1.0, 2.0, 0.2], "yaw": 0.0}]
-    mb_assemble_library._SHARED.update(px=0, py=1)
+    mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
     # two clips datumed differently: clip B reached further -x/-y, so it got a lower corner
     recs = [_rec((-1.0, -1.0), (6.0, 4.0)), _rec((-1.5, -1.2), (6.5, 4.1))]
-    y0_before = recs[0]["y"][:, 0].clone()
+    y0_before = recs[0]["y"].clone()
+    foot_gap_before = (recs[0]["y"][:, [0, 1]] - recs[0]["y"][:, [3, 4]]).clone()
     sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
 
     assert recs[0]["manifest"]["size_x"] == recs[1]["manifest"]["size_x"] == sx
@@ -131,15 +148,21 @@ def test_redatum_gives_every_clip_of_a_tile_one_origin_and_footprint():
     # The tile footprint covers the UNION, which is larger than either clip's own footprint: clip B starts
     # further back (-0.2 in y) while clip A reaches further forward (2.0), so y spans 2.2 + 2*margin.
     assert sx == pytest.approx(6.5) and sy == pytest.approx(4.2)
-    # the clip that was datumed further in gets shifted by exactly the datum difference; the other does not
-    assert recs[0]["y"][:, 0].numpy() == pytest.approx((y0_before + 0.5).numpy())
+    # the clip datumed further in shifts by exactly the datum difference -- on EVERY position channel
+    assert recs[0]["y"][:, 0].numpy() == pytest.approx((y0_before[:, 0] + 0.5).numpy())
+    assert recs[0]["y"][:, 3].numpy() == pytest.approx((y0_before[:, 3] + 0.5).numpy())   # foot x too
+    assert recs[0]["y"][:, 1].numpy() == pytest.approx((y0_before[:, 1] + 0.2).numpy())
+    assert recs[0]["y"][:, 4].numpy() == pytest.approx((y0_before[:, 4] + 0.2).numpy())   # foot y too
+    # ... so the root-to-foot offset is UNCHANGED: a re-datum is a rigid move of the whole skeleton
+    gap_after = recs[0]["y"][:, [0, 1]] - recs[0]["y"][:, [3, 4]]
+    assert gap_after.numpy() == pytest.approx(foot_gap_before.numpy(), abs=1e-5)   # float32 noise only
     assert recs[1]["y"][:, 0].numpy() == pytest.approx(_rec((-1.5, -1.2), (6.5, 4.1))["y"][:, 0].numpy())
 
 
 def test_redatum_is_a_noop_when_clips_already_share_a_datum():
     margin = 1.0
     boxes = [{"pos": [2.0, 0.0, 0.1], "size": [1.0, 2.0, 0.2], "yaw": 0.0}]
-    mb_assemble_library._SHARED.update(px=0, py=1)
+    mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
     recs = [_rec((-1.0, -1.0), (6.0, 4.0)), _rec((-1.0, -1.0), (6.0, 4.0))]
     before = [r["y"].clone() for r in recs]
     sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
@@ -153,7 +176,7 @@ def test_redatum_widens_stair_platforms_to_the_shared_footprint():
     margin = 1.0
     boxes = [{"pos": [0.5, 0.0, 0.1], "size": [0.25, 1.0, 0.2], "yaw": 0.0},    # narrow tread
              {"pos": [3.0, 0.0, 0.1], "size": [2.5, 1.0, 0.2], "yaw": 0.0}]     # wide platform
-    mb_assemble_library._SHARED.update(px=0, py=1)
+    mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
     recs = [_rec((-1.0, -1.0), (6.0, 4.0))]
     _sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
     ov = recs[0]["manifest"]["overlays"]
