@@ -9,9 +9,9 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
-from motion_gen.world_lift import (
+from ..commands.traj_tracking.world_lift_isaac import (
     lift_position,
-    _yaw_from_quat,
+    yaw_from_quat,
 )
 
 if TYPE_CHECKING:
@@ -366,7 +366,8 @@ def _commit_clip_reset(
         snap_mask = ego_mask
     state = cmd.reference_world_state_at(clip_id, start_step, world_pos, world_quat)
     nj = len(asset.joint_names)
-    base_pose = state[:, 0:7]          # [pos(3), quat wxyz(4)]
+    # xyzw: what ``write_root_pose_to_sim_index`` expects (see world_lift_isaac).
+    base_pose = state[:, 0:7]          # [pos(3), quat xyzw(4)]
     base_vel = state[:, 7:13]          # [lin(3), ang(3)]
     joint_pos = state[:, 13:13 + nj]
     joint_vel = state[:, 13 + nj:13 + 2 * nj]
@@ -380,7 +381,7 @@ def _commit_clip_reset(
     # FREE axes track the robot). For flat, world_pos.z is the env-origin ground, so
     # a FIXED-z clip keeps its natural height above the ground rather than the robot's.
     cmd._reset_world_pos[env_ids] = world_pos
-    cmd._reset_world_yaw[env_ids] = _yaw_from_quat(world_quat)
+    cmd._reset_world_yaw[env_ids] = yaw_from_quat(world_quat)
     cmd._ego_mask[env_ids] = ego_mask
     cmd._snap_mask[env_ids] = snap_mask
 
