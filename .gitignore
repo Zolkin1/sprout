@@ -116,5 +116,9 @@ claude_plans/
 # ignores the `clips` SYMLINK used in git worktrees (a dir-only rule would miss it).
 /clips
 
+# Motion Bricks intermediate artifacts: stride/stair banks, raw motions, terrain plans, MB
+# segments, viser logs.  All regenerable from the exporters + the Stage-1 drivers.
+/mb_raw
+
 # Diagnostic plot outputs (regenerable)
 /plots/

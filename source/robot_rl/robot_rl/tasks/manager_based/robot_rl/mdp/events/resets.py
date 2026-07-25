@@ -505,19 +505,13 @@ def reset_on_terrain_motion_sequence(
 
     # 2. Place each clip on its tile (identity heading -- clips are baked axis-aligned
     #    with the staircase, so alignment is a pure translation). Terrain / transition
-    #    clips sit on the tile centerline (clip_y_center = size_y/2); flat clips at the
-    #    corner (0), then re-centered below.
+    #    clips are baked in the tile-LOCAL corner frame, so they go straight on the
+    #    corner; flat clips land there too and are re-centered by bbox below.
     world_quat = torch.zeros(k, 4, device=device)
     world_quat[:, 3] = 1.0  # identity (xyzw, w last)
     is_flat = env_tid == -1
-    csize_y = torch.tensor(
-        [float(importer.clip_size_y.get(int(t), 0.0)) for t in env_tid.tolist()], device=device
-    )
-    clip_y_center = torch.where(is_flat, torch.zeros_like(csize_y), 0.5 * csize_y)
     world_pos = clip_frame_origin(
         importer.env_cell_corner[env_ids],
-        importer.env_cell_center[env_ids],
-        clip_y_center,
         importer.env_clip_x_offset[env_ids],
     )
 
