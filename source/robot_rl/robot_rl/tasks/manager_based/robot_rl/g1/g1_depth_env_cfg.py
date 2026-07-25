@@ -31,6 +31,7 @@ depth is additive until a retrain replaces it.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -54,10 +55,11 @@ from .g1_teacher_terrain_env_cfg import (
 # Camera geometry
 # ---------------------------------------------------------------------------
 
-# Pinhole intrinsics (3x3 K, flattened) and resolution, from the
-# legged_locomotion_rl reference.  Shared by both cameras.
-_DEPTH_K = [25.9928, 0.0, 14.9936, 0.0, 27.8703, 12.9966, 0.0, 0.0, 1.0]
 _DEPTH_W, _DEPTH_H = 30, 26
+
+# Sensor refresh rate.  The env control loop runs at 50 Hz (dt 0.02), so this updates
+# the depth every control step -- no decimation between the policy and its camera.
+_DEPTH_FPS = 50.0
 
 # Both cameras mount on torso_link -- a real physics body (child of waist_pitch_joint,
 # parent of the shoulder joints), so it can host a sensor view.  head_link CANNOT: it,
@@ -67,19 +69,79 @@ _DEPTH_W, _DEPTH_H = 30, 26
 # Xform is not even a reliable "head height" reference.
 _CAMERA_MOUNT = link_prim_path("torso_link")
 
-# PLACEHOLDER extrinsics, in the torso_link frame.  The intent is a near field
-# covering the ground about to be stepped on and a far field starting where the near
-# one ends; the exact offsets and pitches still need visual confirmation against a
-# rendered frame (see scripts note in the module docstring of g1_self_scan).
-_NEAR_POS = (0.10, 0.0, 0.05)
-_NEAR_PITCH_DEG = 75.0
-_FAR_POS = (0.06, 0.0, 0.38)
-_FAR_PITCH_DEG = 35.0
-
 # Depth normalisation, shared by the observation terms and the noise model (which
 # needs them to express its dropout value in normalised units).
 _DEPTH_OFFSET = 0.75
 _DEPTH_SCALE = 0.5
+
+# A ray that hits nothing reports exactly ``max_distance`` (depth_clipping_behavior
+# "max").  The observation must treat that sentinel as "no reading" rather than as a
+# real surface at max range, so its cut-off sits this far below the sensor's.
+_RANGE_SENTINEL_MARGIN_M = 0.1
+
+
+class _CameraSpec(NamedTuple):
+    """Mounting, optics and range for one depth camera.
+
+    ``focal_length_mm`` and the field of view come from the hardware datasheet.  The
+    ray pattern is built from an intrinsic matrix derived from the focal length and the
+    aperture, so only their RATIO matters -- the absolute unit cancels, and quoting the
+    datasheet's mm keeps the number traceable even though IsaacLab documents these
+    fields in cm.  The diagonal FOV is not set directly; it follows from H and V.
+    """
+
+    pos: tuple[float, float, float]
+    """Offset from ``torso_link``, in its frame."""
+    pitch_deg: float
+    """Downward pitch of the camera's view."""
+    focal_length_mm: float
+    """Lens focal length, from the datasheet."""
+    fov_h_deg: float
+    """Horizontal field of view."""
+    fov_v_deg: float
+    """Vertical field of view."""
+    min_distance_m: float
+    """Datasheet minimum range; nearer readings are treated as invalid."""
+    max_distance_m: float
+    """Range beyond which readings are clipped to the sentinel."""
+
+
+# PLACEHOLDER extrinsics (pos / pitch), in the torso_link frame.  The intent is a near
+# field covering the ground about to be stepped on and a far field starting where the
+# near one ends; the offsets and pitches still need visual confirmation against a
+# rendered frame (scripts/rsl_rl/verify_depth_self_scan.py --viz kit).  The OPTICS below
+# are datasheet values, not placeholders.
+_NEAR = _CameraSpec(
+    pos=(0.10, 0.0, 0.05),
+    pitch_deg=75.0,
+    focal_length_mm=2.2,
+    fov_h_deg=110.0,
+    fov_v_deg=80.0,      # -> 117.8 deg diagonal
+    min_distance_m=0.10,
+    max_distance_m=8.0,
+)
+_FAR = _CameraSpec(
+    pos=(0.06, 0.0, 0.38),
+    pitch_deg=35.0,
+    focal_length_mm=4.0,
+    fov_h_deg=80.0,
+    fov_v_deg=52.0,      # -> 88.3 deg diagonal
+    min_distance_m=0.15,
+    max_distance_m=12.0,
+)
+
+
+def _aperture(focal_length: float, fov_deg: float) -> float:
+    """Sensor aperture that yields ``fov_deg`` at ``focal_length``.
+
+    Args:
+        focal_length: Lens focal length, in any unit.
+        fov_deg: Desired full field of view for that axis.
+
+    Returns:
+        The aperture, in the same unit as ``focal_length``.
+    """
+    return 2.0 * focal_length * math.tan(math.radians(fov_deg) / 2.0)
 
 
 def _pitch_down_quat_xyzw(degrees: float) -> tuple[float, float, float, float]:
@@ -120,31 +182,30 @@ def _self_scan_targets() -> list[MultiMeshRayCasterCameraCfg.RaycastTargetCfg]:
     ]
 
 
-def _make_depth_camera(
-    pos: tuple[float, float, float], pitch_deg: float
-) -> MultiMeshRayCasterCameraCfg:
+def _make_depth_camera(spec: _CameraSpec) -> MultiMeshRayCasterCameraCfg:
     """Build one torso-mounted, self-scanning depth camera.
 
     Args:
-        pos: Offset from ``torso_link``, in its own frame.
-        pitch_deg: Downward pitch of the camera's view.
+        spec: Mounting, optics and range for this camera.
 
     Returns:
         The configured sensor.
     """
     return MultiMeshRayCasterCameraCfg(
         prim_path=_CAMERA_MOUNT,
-        update_period=1.0 / 30.0,
+        update_period=1.0 / _DEPTH_FPS,
         offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
-            pos=pos,
-            rot=_pitch_down_quat_xyzw(pitch_deg),
+            pos=spec.pos,
+            rot=_pitch_down_quat_xyzw(spec.pitch_deg),
             convention="world",
         ),
         data_types=["distance_to_image_plane"],
-        max_distance=10.0,
+        max_distance=spec.max_distance_m,
         depth_clipping_behavior="max",
-        pattern_cfg=patterns.PinholeCameraPatternCfg.from_intrinsic_matrix(
-            intrinsic_matrix=_DEPTH_K,
+        pattern_cfg=patterns.PinholeCameraPatternCfg(
+            focal_length=spec.focal_length_mm,
+            horizontal_aperture=_aperture(spec.focal_length_mm, spec.fov_h_deg),
+            vertical_aperture=_aperture(spec.focal_length_mm, spec.fov_v_deg),
             width=_DEPTH_W,
             height=_DEPTH_H,
         ),
@@ -153,6 +214,23 @@ def _make_depth_camera(
         mesh_prim_paths=["/World/ground"] + _self_scan_targets(),
         debug_vis=False,
     )
+
+
+def _depth_obs_params(spec: _CameraSpec) -> dict:
+    """Observation-term parameters matching one camera's range.
+
+    Args:
+        spec: The camera this observation reads.
+
+    Returns:
+        Keyword parameters for :func:`mdp.depth_image` / :func:`mdp.depth_image_4d`.
+    """
+    return {
+        "offset": _DEPTH_OFFSET,
+        "scale": _DEPTH_SCALE,
+        "min_dist": spec.min_distance_m,
+        "max_dist": spec.max_distance_m - _RANGE_SENTINEL_MARGIN_M,
+    }
 
 
 def _make_depth_noise() -> DepthNoiseCfg:
@@ -175,7 +253,6 @@ def _make_depth_noise() -> DepthNoiseCfg:
     )
 
 
-_DEPTH_OBS_PARAMS = {"offset": _DEPTH_OFFSET, "scale": _DEPTH_SCALE}
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +266,8 @@ class G1TeacherTerrainDepthSceneCfg(G1TeacherTerrainSceneCfg):
     The inherited ``height_scanner`` is untouched.
     """
 
-    depth_camera_near: MultiMeshRayCasterCameraCfg = _make_depth_camera(_NEAR_POS, _NEAR_PITCH_DEG)
-    depth_camera_far: MultiMeshRayCasterCameraCfg = _make_depth_camera(_FAR_POS, _FAR_PITCH_DEG)
+    depth_camera_near: MultiMeshRayCasterCameraCfg = _make_depth_camera(_NEAR)
+    depth_camera_far: MultiMeshRayCasterCameraCfg = _make_depth_camera(_FAR)
 
 
 @configclass
@@ -203,12 +280,12 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
         # event), NOT via the term's `noise` field -- see mdp/sensors/noise.py.
         depth_near = ObsTerm(
             func=mdp.depth_image,
-            params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), **_DEPTH_OBS_PARAMS},
+            params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), **_depth_obs_params(_NEAR)},
             clip=(-2.0, 2.0),
         )
         depth_far = ObsTerm(
             func=mdp.depth_image,
-            params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_DEPTH_OBS_PARAMS},
+            params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
             clip=(-2.0, 2.0),
         )
 
@@ -287,7 +364,7 @@ class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservation
                 "sensor_cfg": SceneEntityCfg("depth_camera_near"),
                 "height": _DEPTH_H,
                 "width": _DEPTH_W,
-                **_DEPTH_OBS_PARAMS,
+                **_depth_obs_params(_NEAR),
             },
             clip=(-2.0, 2.0),
         )
@@ -308,7 +385,7 @@ class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservation
                 "sensor_cfg": SceneEntityCfg("depth_camera_far"),
                 "height": _DEPTH_H,
                 "width": _DEPTH_W,
-                **_DEPTH_OBS_PARAMS,
+                **_depth_obs_params(_FAR),
             },
             clip=(-2.0, 2.0),
         )

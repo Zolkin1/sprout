@@ -126,10 +126,8 @@ from isaaclab.utils import configclass
 
 from robot_rl.assets.robots.g1_21j import G1_CFG
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-    _FAR_PITCH_DEG,
-    _FAR_POS,
-    _NEAR_PITCH_DEG,
-    _NEAR_POS,
+    _FAR,
+    _NEAR,
     _make_depth_camera,
 )
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
@@ -169,19 +167,18 @@ def _marker_cfg(name: str, color: tuple[float, float, float], radius: float = 0.
     return cfg
 
 
-def _probe_camera(pos, pitch_deg, name: str, color):
+def _probe_camera(spec, name: str, color):
     """Build a depth camera configured for provenance readout.
 
     Args:
-        pos: Mount offset passed through to the real factory.
-        pitch_deg: Downward pitch passed through to the real factory.
+        spec: Camera spec passed through to the real factory.
         name: Scene name, used for the marker prim path.
         color: Marker colour for this camera's ray hits.
 
     Returns:
         The camera cfg, with per-pixel mesh ids on and update decimation off.
     """
-    cam = _make_depth_camera(pos, pitch_deg)
+    cam = _make_depth_camera(spec)
     cam.update_mesh_ids = True   # per-pixel mesh provenance -- the point of this script
     cam.update_period = 0.0      # refresh every step so a pose change shows immediately
     # The markers landing on the legs ARE the self-scan, visually.
@@ -219,12 +216,8 @@ class DepthProbeSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DistantLightCfg(intensity=2000.0, angle=0.53),
     )
     robot = G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-    depth_camera_near = _probe_camera(
-        _NEAR_POS, _NEAR_PITCH_DEG, "depth_near", (0.1, 0.9, 0.2)   # green
-    )
-    depth_camera_far = _probe_camera(
-        _FAR_POS, _FAR_PITCH_DEG, "depth_far", (0.2, 0.4, 1.0)      # blue
-    )
+    depth_camera_near = _probe_camera(_NEAR, "depth_near", (0.1, 0.9, 0.2))   # green
+    depth_camera_far = _probe_camera(_FAR, "depth_far", (0.2, 0.4, 1.0))      # blue
 
     def __post_init__(self):
         # The teacher's own height scanner, for a side-by-side coverage comparison.
