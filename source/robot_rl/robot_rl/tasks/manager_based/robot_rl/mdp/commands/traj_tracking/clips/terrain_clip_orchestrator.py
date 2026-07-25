@@ -43,27 +43,17 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.composite import (
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.flat import FlatBlockCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.stair import StairBlockCfg
 
-from .offline_clip_generator import OfflineClipGenerator
+from motion_gen.clips.offline_clip_generator import OfflineClipGenerator
+from motion_gen.motion_matching.terrain_variants import resolve_stair_decor
+from motion_gen.motion_matching.terrain_sampler import (  # isaaclab-free sampling SoT
+    TerrainSpec,
+    sample_terrain_specs,
+    split_counts,
+)
 from .offline_stair_projector import make_offline_stair_projector, make_offline_multi_stair_projector
 
 # Small x-clearance placing the nav goal before the far edge (m).
 _GOAL_MARGIN = 0.3
-
-
-@dataclass
-class TerrainSpec:
-    """One uniform terrain (corridor of bands) to build clips on."""
-
-    terrain_id: int
-    ttype: str                     # "terrain" | "transition"
-    step_height: float
-    step_depth: float
-    width: float                   # stair tread width in y (< nav_width)
-    lead_in: float                 # first flat band length (x): base / walk lead-in
-    stair_steps: list[int]         # num steps per stair band (len == num_transitions)
-    flat_after: list[float]        # flat band length after each stair band (last = top platform)
-    nav_width: float               # corridor width in y (transition nav); == width for terrain-only
-    spawn_y_offset: float          # signed lateral spawn offset from centerline (transition turn)
 
 
 @dataclass
@@ -81,151 +71,6 @@ class BuiltTerrain:
     steer_to_goal: bool                       # transition nav
     nav_goal_xy: list[float] | None           # [2] fixed goal (local-corner), transition only
     manifest: dict = field(default_factory=dict)
-
-
-def split_counts(num_terrains: int, fracs: dict[str, float]) -> dict[str, int]:
-    """Split ``num_terrains`` into per-type counts from (normalized) fractions.
-
-    Rounds each type and assigns the rounding remainder to the largest type so
-    the counts sum exactly to ``num_terrains``.
-
-    Args:
-        num_terrains: Total number of terrains to allocate.
-        fracs: ``{"flat": f, "terrain": f, "transition": f}`` (need not sum to 1).
-
-    Returns:
-        ``{"flat": n, "terrain": n, "transition": n}`` summing to ``num_terrains``.
-    """
-    total = sum(fracs.values())
-    if total <= 0:
-        raise ValueError(f"terrain fractions must be positive; got {fracs}")
-    counts = {k: int(round(num_terrains * v / total)) for k, v in fracs.items()}
-    drift = num_terrains - sum(counts.values())
-    if drift != 0:
-        biggest = max(fracs, key=lambda k: fracs[k])
-        counts[biggest] += drift
-    return counts
-
-
-def sample_terrain_specs(
-    rng: np.random.Generator,
-    n_terrain: int,
-    n_transition: int,
-    hd_grid: list[tuple[float, float]],
-    width_range: tuple[float, float],
-    num_steps_range: tuple[int, int],
-    lead_in_range: tuple[float, float],
-    end_platform: float,
-    num_transitions_range: tuple[int, int],
-    inter_flat_range: tuple[float, float],
-    nav_width_range: tuple[float, float],
-    flat_width_margin: float,
-    transition_length: float,
-) -> list[TerrainSpec]:
-    """Sample per-terrain band chains for the terrain + transition sets.
-
-    No stair start-platform is used (the first riser sits at each stair block's
-    left edge, so an approaching foot snapped to ``span_xmin - depth/2`` is one
-    step short of tread 0); a flat lead-in / inter-stair flat provides the
-    ground before each staircase.  ``terrain`` uses a short base + single
-    staircase and NOTHING else -- no flat base or top platform, just the stairs;
-    the robot spawns on the ambient ground right before the first riser and
-    climbs).  ``transition`` uses >= 2 staircases separated by
-    flat bands and is built to a FIXED total length ``transition_length``: the
-    staircases are sampled freely (varied step count) and the flat bands (lead-in
-    + inter-stair + top) absorb the remaining length, so every transition terrain
-    is the same size_x while the stairs still vary.  ``lead_in_range[0]`` /
-    ``inter_flat_range[0]`` / ``end_platform`` are the per-band flat FLOORS.
-    The lead-in (start platform) is additionally CLAMPED to ``lead_in_range``
-    ``[min, max]``: if the fixed-length fill would grow it past the max, the
-    excess is redistributed onto the other flat bands (inter-stair flats + top
-    platform) so the total stays ``transition_length``.  ``inter_flat_range[1]``
-    is still unused (inter-stair flats have no max).
-
-    ``width_range`` is the stair tread width ``(lo, hi)``: a fixed-width library
-    has ``lo == hi`` (every terrain uses that width), a range library (a stair
-    trajectory declaring ``terrain_width`` as a ``{min, max}`` range) is sampled
-    per terrain so terrains vary in stair width.  For a ``transition`` the tread
-    width is additionally capped at that terrain's corridor width ``nav_width``
-    so the stairs never grow wider than the flat corridor leading to them.
-    """
-    specs: list[TerrainSpec] = []
-    tid = 0
-    w_lo, w_hi = float(width_range[0]), float(width_range[1])
-
-    def _sample_width(cap: float | None = None) -> float:
-        """Uniform tread width in the range (fixed when lo == hi), capped."""
-        hi = w_hi if cap is None else min(w_hi, cap)
-        hi = max(hi, w_lo)
-        return float(rng.uniform(w_lo, hi)) if hi > w_lo else w_lo
-
-    for _ in range(n_terrain):
-        h, d = hd_grid[int(rng.integers(len(hd_grid)))]
-        w = _sample_width()
-        # One big staircase spanning ~transition_length (so terrain-only terrains
-        # are the same length as transitions and the robot climbs for the whole
-        # clip); just the staircase, no flat base / top.
-        ns = max(2, int(round(transition_length / d)))
-        specs.append(TerrainSpec(
-            terrain_id=tid, ttype="terrain", step_height=float(h), step_depth=float(d),
-            width=w, lead_in=0.0, stair_steps=[ns], flat_after=[0.0],
-            nav_width=w, spawn_y_offset=0.0,
-        ))
-        tid += 1
-
-    min_lead, max_lead = lead_in_range
-    min_inter, min_end = inter_flat_range[0], end_platform
-    if max_lead < min_lead:
-        raise ValueError(f"lead_in_range max {max_lead} < min {min_lead}")
-    nt_lo = max(2, num_transitions_range[0])                 # >= 2 staircases per transition
-    nt_hi = max(nt_lo, num_transitions_range[1])
-    for _ in range(n_transition):
-        h, d = hd_grid[int(rng.integers(len(hd_grid)))]
-        n = int(rng.integers(nt_lo, nt_hi + 1))
-        # Flat floors: lead-in + (n-1) inter-stair + top platform.
-        min_flat_total = min_lead + (n - 1) * min_inter + min_end
-        max_total_steps = int((transition_length - min_flat_total) / d)
-        if max_total_steps < n * num_steps_range[0]:
-            raise ValueError(
-                f"--transition-length {transition_length:.2f}m too short for {n} staircases of "
-                f">= {num_steps_range[0]} steps at depth {d:.3f}m + flat floors ({min_flat_total:.2f}m)."
-            )
-        # Sample per-band step counts, then trim (from bands above the min) so the
-        # stairs + minimum flats fit the fixed length.
-        steps = [int(rng.integers(num_steps_range[0], num_steps_range[1] + 1)) for _ in range(n)]
-        while sum(steps) > max_total_steps:
-            above = [i for i, s in enumerate(steps) if s > num_steps_range[0]]
-            steps[above[int(rng.integers(len(above)))]] -= 1
-        # Distribute the leftover length across the n+1 flat bands (floors + slack).
-        flat_total = transition_length - sum(steps) * d
-        slack = flat_total - min_flat_total
-        w = rng.uniform(size=n + 1); w = w / w.sum()
-        extra = w * slack
-        lead_in = min_lead + extra[0]
-        # Clamp the lead-in (start platform) to [min_lead, max_lead]; push any
-        # excess onto the other flat bands (inter-stair + top) so the total stays
-        # == transition_length.  (min_lead is already the floor via `extra >= 0`.)
-        if lead_in > max_lead:
-            excess = lead_in - max_lead
-            lead_in = max_lead
-            rw = w[1:]
-            rw = rw / rw.sum() if rw.sum() > 0 else np.full(n, 1.0 / n)
-            extra[1:] = extra[1:] + excess * rw
-        lead_in = float(lead_in)
-        flat_after = [float(min_inter + extra[1 + i]) for i in range(n - 1)] + [float(min_end + extra[n])]
-
-        nav_width = float(rng.uniform(*nav_width_range))
-        off_max = max(0.0, nav_width / 2.0 - flat_width_margin)
-        # Tread width sampled in the range, capped at this corridor so the
-        # stairs stay within the flat corridor leading up to them.
-        tread_w = _sample_width(cap=nav_width)
-        specs.append(TerrainSpec(
-            terrain_id=tid, ttype="transition", step_height=float(h), step_depth=float(d),
-            width=tread_w, lead_in=lead_in, stair_steps=steps, flat_after=flat_after,
-            nav_width=nav_width, spawn_y_offset=float(rng.uniform(-off_max, off_max)),
-        ))
-        tid += 1
-    return specs
 
 
 def build_terrain(spec: TerrainSpec, geom_seed: int, device, size_y_floor: float = 0.0) -> BuiltTerrain:
@@ -317,12 +162,19 @@ def build_terrain(spec: TerrainSpec, geom_seed: int, device, size_y_floor: float
     # Manifest: all bands (for viser meshes) + nav goal; legacy band-0 stair
     # keys kept for backward-compatible readers (plots / old viz).
     band_meta = []
+    stair_band_i = 0
     for b in meta["blocks"]:
         entry = {"block_type": b["block_type"], "aabb": list(b["aabb"]),
                  "entry_z": float(b["entry_z"]), "exit_z": float(b["exit_z"])}
         if b["extras"].get("is_stair"):
             entry["stair_top_centers"] = b["extras"]["stair_top_centers"].cpu().tolist()
             entry["num_steps"] = int(b["extras"]["num_steps"])
+            # Resolved decoration for this stair band (deterministic; rebuilt by the
+            # importer + viewers).  Aligned with ``spec.stair_steps`` order; absent
+            # when decoration is disabled (=> bare solid stairs).
+            if stair_band_i < len(spec.stair_decor):
+                entry["decor"] = spec.stair_decor[stair_band_i]
+            stair_band_i += 1
         band_meta.append(entry)
     sb0 = spans[0]
     manifest = {

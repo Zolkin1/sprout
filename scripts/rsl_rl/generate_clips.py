@@ -31,22 +31,22 @@ from pathlib import Path
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+from motion_gen.multiskill_manager import (
     MultiSkillManager,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+from motion_gen.clips.offline_velocity_sampler import (
     OfflineVelocitySampler,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.scheduled_velocity_sampler import (
+from motion_gen.clips.scheduled_velocity_sampler import (
     ScheduledVelocitySampler,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+from motion_gen.clips.offline_clip_generator import (
     OfflineClipGenerator,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     ClipLibraryWriter,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_fingerprint import (
+from motion_gen.clips.clip_fingerprint import (
     fingerprint_clip_config,
 )
 

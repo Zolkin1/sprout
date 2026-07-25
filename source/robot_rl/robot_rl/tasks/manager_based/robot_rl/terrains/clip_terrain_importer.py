@@ -27,7 +27,7 @@ from typing_extensions import override
 import isaaclab.sim as sim_utils
 from isaaclab.terrains.terrain_importer import TerrainImporter
 
-from ..mdp.commands.traj_tracking.clips.clip_io import load_clip_library
+from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
 
 

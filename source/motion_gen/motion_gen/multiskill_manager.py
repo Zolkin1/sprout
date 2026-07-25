@@ -372,15 +372,16 @@ class MultiSkillManager(ManagerBase):
 
         local_folder = os.path.join(cache_dir, hf_path)
 
-        # Check if already cached
+        # Check if already cached.  A YAML library (MultiSkillManager format) has *.yaml; an npz
+        # library (clean / terrain, e.g. library_v2) has a manifest.csv instead -- accept either.
         if os.path.isdir(local_folder):
-            # Check for YAMLs in subdirectories or directly
-            has_yamls = (
+            has_content = (
                 list(Path(local_folder).glob("*.yaml"))
                 + list(Path(local_folder).glob("*.yml"))
                 + list(Path(local_folder).glob("**/*.yaml"))
+                + list(Path(local_folder).glob("manifest.csv"))
             )
-            if len(has_yamls) > 0:
+            if len(has_content) > 0:
                 print(f"Using cached trajectories from {local_folder}")
                 return Path(local_folder)
 
@@ -388,13 +389,16 @@ class MultiSkillManager(ManagerBase):
             from huggingface_hub import snapshot_download
 
             print(f"Downloading {hf_path} from {hf_repo}...")
-            # Use multiple patterns: fnmatch doesn't support **
-            # Match flat YAMLs and one level of skill subdirectories
+            # fnmatch's ``*`` does NOT cross ``/``, so one glob per directory depth.  npz terrain
+            # libraries (e.g. library_v2) nest clips several levels deep
+            # (skill/param/variant/solved.npz), so match through 4 levels, not just 2.
             snapshot_download(
                 repo_id=hf_repo,
                 allow_patterns=[
-                    f"{hf_path}/*",      # flat files
-                    f"{hf_path}/*/*",    # files in skill subdirectories
+                    f"{hf_path}/*",          # flat files (manifest.csv)
+                    f"{hf_path}/*/*",        # skill/clip.npz (flat locomotion)
+                    f"{hf_path}/*/*/*",      # skill/param/clip.npz
+                    f"{hf_path}/*/*/*/*",    # skill/param/variant/solved.npz (retarget grids)
                 ],
                 local_dir=cache_dir,
             )

@@ -12,17 +12,17 @@ import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, yaw_quat
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
-from .clips.step_length_table import traj_step_length_table
-from .manager_base import ManagerBase
-from .multiskill_manager import MultiSkillManager
+from motion_gen.clips.step_length_table import traj_step_length_table
+from motion_gen.manager_base import ManagerBase
+from motion_gen.multiskill_manager import MultiSkillManager
 from .terrain_aware_ref import _TERRAIN_AWARE_SKILLS
-from .skill_bucket import (
+from motion_gen.skill_bucket import (
     bucket_for_velocity,
     commit_pending_at_fire,
     step_skill_pending,
 )
 from .skill_state import CrossfadeState, ForcedTrajLatch, PendingSkillChange
-from .skill_transition import blend_outputs
+from motion_gen.skill_transition import blend_outputs
 from .terrain_transition import (
     ApproachContext,
     get_approach_planner,

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.transition_strategy import (
+from motion_gen.clips.transition_strategy import (
     LinearInterpolationTransition,
     QuadraticInterpolationTransition,
     RawStitchTransition,

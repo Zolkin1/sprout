@@ -15,7 +15,7 @@ torch.set_printoptions(precision=10, linewidth=200, sci_mode=False)
 sys.path.insert(0, str(Path(__file__).parent))
 from conftest import STANDING_YAML, WALKING_YAML, RUNNING_YAML, DEVICE
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_manager import TrajectoryManager
+from motion_gen.trajectory_manager import TrajectoryManager
 
 
 def generate_for(name: str, yaml_path: str, test_times: list[float]):

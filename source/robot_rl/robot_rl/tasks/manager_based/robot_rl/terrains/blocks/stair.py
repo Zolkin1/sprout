@@ -14,6 +14,7 @@ from isaaclab.terrains.trimesh.utils import make_plane
 from isaaclab.utils import configclass
 
 from ..trimesh.stair import _build_stair_steps
+from ..trimesh.stair_decor_cfg import StairDecorCfg, StairSideDecorCfg  # noqa: F401
 from .base import BlockOutput, TerrainBlock, TerrainBlockCfg, validate_skill_probs
 from .composite import _LAYOUT_TOL
 
@@ -293,6 +294,15 @@ class StairBlockCfg(TerrainBlockCfg):
 
     pole_height: float = 1.5
     """Height of poles above the highest tread."""
+
+    decor: StairDecorCfg | None = None
+    """Fully resolved, deterministic decoration (floating / walls / posts / nosing).
+
+    ``None`` (default) => sample decoration from the ``float_prob`` / ``wall_prob`` /
+    ``pole_prob`` fields above (the online / legacy random path).  When set, the
+    tread builder renders exactly this spec and draws no random numbers -- used by
+    the offline clip pipeline, where the variant is resolved once and recorded in
+    the manifest so the importer and viewers rebuild identical geometry."""
 
     start_z_zero: bool = True
     """If ``True`` (default), the lowest tread top sits at z=0. If ``False``

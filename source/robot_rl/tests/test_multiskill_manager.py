@@ -11,15 +11,15 @@ import math
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+from motion_gen.multiskill_manager import (
     MultiSkillManager,
     ConditionerData,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_manager import (
+from motion_gen.trajectory_manager import (
     TrajectoryManager,
     TrajectoryType,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_manager import (
+from motion_gen.library_manager import (
     LibraryManager,
 )
 from conftest import MERGED_LIBRARY_DIR, STANDING_YAML, WALKING_YAML, RUNNING_YAML, DEVICE, TEST_DATA

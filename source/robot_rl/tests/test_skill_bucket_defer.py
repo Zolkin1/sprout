@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.skill_bucket import (
+from motion_gen.skill_bucket import (
     bucket_for_velocity,
     clamp_pd_channels_to_buckets,
     commit_pending_at_fire,

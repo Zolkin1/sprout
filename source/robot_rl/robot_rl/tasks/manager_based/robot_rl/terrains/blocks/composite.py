@@ -13,6 +13,7 @@ from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.utils import configclass
 
 from .base import TerrainBlockCfg, validate_skill_probs
+from .overlay import OverlayVolumeCfg, build_overlay
 
 if TYPE_CHECKING:
     pass
@@ -38,7 +39,9 @@ def composite_terrain(
         Tuple ``(meshes, origin, meta_data)`` in sub-terrain-local
         coordinates. ``meta_data["blocks"]`` is a list of per-block dicts:
         ``{"aabb", "skill_probs", "needs_projection", "needs_directional_cmd",
-        "extras"}``.
+        "extras"}``. ``meta_data["overlays"]`` is a list of per-overlay dicts
+        ``{"kind", "aabb", "pos_xy", "size_xyz", "base_z", "walkable_top",
+        "top_z"}`` (empty when the sub-terrain has no overlays).
 
     Raises:
         ValueError: If ``cfg.blocks`` is empty, the block ``size_x`` values
@@ -121,9 +124,34 @@ def composite_terrain(
 
     assert origin is not None  # set inside the loop on origin_block_index iteration.
 
+    # Overlay collision volumes (boxes / obstacles / overhead bars) sit ON TOP of
+    # the ground blocks at their own ``pos_xy`` -- they overlap the blocks in x
+    # rather than partitioning it, so they're built after the left-to-right block
+    # loop and merged into the same mesh list.
+    overlay_metadata: list[dict] = []
+    for ov_cfg in cfg.overlays:
+        ov = build_overlay(ov_cfg)
+        all_meshes.append(ov.mesh)
+        overlay_metadata.append({
+            "kind": ov.kind,
+            "aabb": tuple(float(v) for v in ov.aabb),
+            "pos_xy": (float(ov_cfg.pos_xy[0]), float(ov_cfg.pos_xy[1])),
+            "size_xyz": tuple(float(v) for v in ov_cfg.size_xyz),
+            "base_z": float(ov_cfg.base_z),
+            "walkable_top": bool(ov.walkable_top),
+            "top_z": float(ov.top_z),
+            # Support-structure variant + its geometry, so downstream renderers
+            # (colored overlay redraw, reset placement) can rebuild the sub-boxes.
+            "variant": str(ov_cfg.variant),
+            "slab_thickness": float(ov_cfg.slab_thickness),
+            "leg_size": (float(ov_cfg.leg_size[0]), float(ov_cfg.leg_size[1])),
+            "leg_inset": float(ov_cfg.leg_inset),
+        })
+
     meta_data = {
         "is_border": False,
         "blocks": block_metadata,
+        "overlays": overlay_metadata,
     }
     # Pass through an optional per-cell terrain id (used by the clip-terrain
     # importer to map each grid cell -> the offline clip terrain it rebuilds, so
@@ -147,6 +175,11 @@ class CompositeSubTerrainCfg(SubTerrainBaseCfg):
 
     blocks: list[TerrainBlockCfg] = field(default_factory=list)
     """Ordered list of block configurations, placed left-to-right along x."""
+
+    overlays: list[OverlayVolumeCfg] = field(default_factory=list)
+    """Finite collision volumes (boxes / obstacles / overhead bars) placed on top
+    of the ground blocks at their own ``pos_xy``. Unlike :attr:`blocks` these do
+    not partition the x-axis -- they overlap it. Empty (default) = plain terrain."""
 
     origin_block_index: int = 0
     """Index of the block whose spawn origin is used for the sub-terrain.

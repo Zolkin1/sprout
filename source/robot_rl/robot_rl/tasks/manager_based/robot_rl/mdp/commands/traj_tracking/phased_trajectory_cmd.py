@@ -22,7 +22,7 @@ from abc import abstractmethod
 import torch
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
-from .manager_base import ManagerBase
+from motion_gen.manager_base import ManagerBase
 
 
 class PhasedTrajectoryCommand(BaseTrajectoryCommand):

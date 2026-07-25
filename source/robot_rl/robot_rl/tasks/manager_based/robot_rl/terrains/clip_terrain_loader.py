@@ -28,14 +28,22 @@ centerline (:func:`clip_frame_origin`).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import trimesh
 
-from .blocks import CompositeSubTerrainCfg, FlatBlockCfg, StairBlockCfg
+from .blocks import (
+    CompositeSubTerrainCfg,
+    FlatBlockCfg,
+    OverlayVolumeCfg,
+    SlopeBlockCfg,
+    StairBlockCfg,
+    build_overlay,
+)
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
+from .trimesh.stair_decor_cfg import StairDecorCfg, StairSideDecorCfg
 
 _TRIVIAL_SKILL = "standing"          # blocks need a valid skill; unused for baked clips
 _FLAT_TERRAIN_ID = -1
@@ -58,7 +66,39 @@ class ClipTerrainLayout:
     tile_footprint: torch.Tensor           # [num_rows, num_tiles, 2] (fx, fy) per tile
     tile_clip_x_offset: torch.Tensor       # [num_rows, num_tiles] x-shift of the clip within the tile
     clip_size_y: dict[int, float]          # terrain id -> ORIGINAL corridor width (flat: footprint y)
-    terrain_type_code: dict[int, int]      # terrain id -> {0 flat, 1 terrain, 2 transition}
+    terrain_type_code: dict[int, int]      # terrain id -> {0 flat, 1 terrain, 2 transition, 3 slope, 4 box}
+    # terrain id -> overlay volumes (boxes) in the tile's local-corner frame, as
+    # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
+    # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
+    terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
+
+
+def _stair_decor_from_manifest(decor: dict | None) -> StairDecorCfg | None:
+    """Rebuild a :class:`StairDecorCfg` from a manifest band's ``decor`` dict.
+
+    Returns ``None`` when the band carries no ``decor`` key (pre-decor manifests
+    and undecorated stairs), which makes the tread builder render solid, square,
+    bare stairs -- exactly the legacy behaviour.
+    """
+    if not decor:
+        return None
+
+    def _side(d: dict | None) -> StairSideDecorCfg:
+        d = d or {}
+        return StairSideDecorCfg(
+            kind=str(d.get("kind", "none")),
+            thickness=float(d.get("thickness", 0.1)),
+            height=float(d.get("height", 1.5)),
+            spacing=float(d.get("spacing", 0.5)),
+        )
+
+    return StairDecorCfg(
+        float_thickness=float(decor.get("float_thickness", 0.0)),
+        nosing_radius=float(decor.get("nosing_radius", 0.0)),
+        nosing_segments=int(decor.get("nosing_segments", 6)),
+        left=_side(decor.get("left")),
+        right=_side(decor.get("right")),
+    )
 
 
 def _blocks_from_manifest(entry: dict, footprint_x: float, front_pad: float = 0.0) -> list[TerrainBlockCfg]:
@@ -73,7 +113,7 @@ def _blocks_from_manifest(entry: dict, footprint_x: float, front_pad: float = 0.
     :func:`assemble_clip_terrain`).
     """
     dims = entry["dims"]
-    h, d, w = float(dims["h"]), float(dims["d"]), float(dims["w"])
+    w = float(dims["w"])
     blocks: list[TerrainBlockCfg] = []
     total = 0.0
     if front_pad > _PAD_TOL:
@@ -82,12 +122,24 @@ def _blocks_from_manifest(entry: dict, footprint_x: float, front_pad: float = 0.
     for band in entry["bands"]:
         length = float(band["aabb"][1]) - float(band["aabb"][0])
         total += length
-        if band["block_type"] == "StairBlock":
+        bt = band["block_type"]
+        if bt == "StairBlock":
+            h, d = float(dims["h"]), float(dims["d"])
             blocks.append(StairBlockCfg(
                 size_x=length, direction="up",
                 step_dim_options=[(h, d)], stair_width_range=(w, w),
                 start_platform_length=0.0, end_platform_length=0.0,
                 origin_distance_from_back=0.0, skill_probs={_TRIVIAL_SKILL: 1.0},
+                decor=_stair_decor_from_manifest(band.get("decor")),
+            ))
+        elif bt == "SlopeBlock":
+            # Uniform ramp: fixed total rise over this band's span (a rotated flat clip).
+            rise = float(band.get("rise", dims.get("rise", 0.0)))
+            blocks.append(SlopeBlockCfg(
+                size_x=length, direction="up",
+                rise_range=(rise, rise), slope_width_range=(w, w),
+                start_platform_length=0.0, end_platform_length=0.0,
+                skill_probs={_TRIVIAL_SKILL: 1.0},
             ))
         else:
             blocks.append(FlatBlockCfg(size_x=length, skill_probs={_TRIVIAL_SKILL: 1.0}))
@@ -114,13 +166,72 @@ def _flat_clip_travel(lib) -> tuple[float, float]:
     return x_span, y_span
 
 
-def _tile_mesh(footprint: tuple[float, float], blocks: list[TerrainBlockCfg]) -> trimesh.Trimesh:
-    """Concatenated mesh of one tile (composite blocks) in local-corner coords."""
+def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
+    """Rebuild the overlay volumes (boxes) an ``entry`` carries (empty if none).
+
+    Mirrors the ``overlays`` list the box-clip generator writes into the manifest
+    (each ``{kind, pos_xy, size_xyz, base_z, walkable_top}`` in the clip's
+    local-corner frame).
+    """
+    out: list[OverlayVolumeCfg] = []
+    for ov in entry.get("overlays", []):
+        leg_size = ov.get("leg_size", (0.1, 0.1))
+        out.append(OverlayVolumeCfg(
+            kind=str(ov.get("kind", "box")),
+            size_xyz=tuple(float(v) for v in ov["size_xyz"]),
+            pos_xy=tuple(float(v) for v in ov["pos_xy"]),
+            base_z=float(ov.get("base_z", 0.0)),
+            walkable_top=bool(ov.get("walkable_top", True)),
+            variant=str(ov.get("variant", "solid")),
+            slab_thickness=float(ov.get("slab_thickness", 0.1)),
+            leg_size=(float(leg_size[0]), float(leg_size[1])),
+            leg_inset=float(ov.get("leg_inset", 0.05)),
+        ))
+    return out
+
+
+def _tile_mesh(
+    footprint: tuple[float, float],
+    blocks: list[TerrainBlockCfg],
+    overlays: list[OverlayVolumeCfg] | None = None,
+) -> tuple[trimesh.Trimesh, list[dict]]:
+    """Concatenated mesh of one tile (composite blocks + overlays) in local coords.
+
+    Returns the mesh plus the per-overlay metadata list emitted by
+    :func:`composite_terrain` (empty when the tile has no overlays).
+
+    An empty ``blocks`` builds a NO-GROUND tile: only the overlay volumes are meshed (a
+    self-supporting structure such as a floating staircase), with no flat ground plane filling the
+    footprint. ``composite_terrain`` requires a base block, so that path is built directly here; the
+    per-overlay metadata mirrors ``composite_terrain``'s so downstream consumers are unaffected.
+    """
+    overlays = list(overlays or [])
+    if not blocks:
+        meshes: list[trimesh.Trimesh] = []
+        ov_meta: list[dict] = []
+        for ov_cfg in overlays:
+            ov = build_overlay(ov_cfg)
+            meshes.append(ov.mesh)
+            ov_meta.append({
+                "kind": ov.kind,
+                "aabb": tuple(float(v) for v in ov.aabb),
+                "pos_xy": (float(ov_cfg.pos_xy[0]), float(ov_cfg.pos_xy[1])),
+                "size_xyz": tuple(float(v) for v in ov_cfg.size_xyz),
+                "base_z": float(ov_cfg.base_z),
+                "walkable_top": bool(ov.walkable_top),
+                "top_z": float(ov.top_z),
+                "variant": str(ov_cfg.variant),
+                "slab_thickness": float(ov_cfg.slab_thickness),
+                "leg_size": (float(ov_cfg.leg_size[0]), float(ov_cfg.leg_size[1])),
+                "leg_inset": float(ov_cfg.leg_inset),
+            })
+        return trimesh.util.concatenate(meshes), ov_meta
     sub = CompositeSubTerrainCfg(
-        size=footprint, blocks=blocks, origin_block_index=0, start_z=0.0,
+        size=footprint, blocks=blocks, overlays=overlays,
+        origin_block_index=0, start_z=0.0,
     )
-    meshes, _origin, _meta = composite_terrain(0.0, sub)
-    return trimesh.util.concatenate(meshes)
+    meshes, _origin, meta = composite_terrain(0.0, sub)
+    return trimesh.util.concatenate(meshes), meta.get("overlays", [])
 
 
 def default_num_flat_tiles(lib) -> int:
@@ -196,6 +307,8 @@ def assemble_clip_terrain(
     manifest = sorted(manifest, key=lambda m: int(m["terrain_id"]))
     terr = [m for m in manifest if m["type"] == "terrain"]
     trans = [m for m in manifest if m["type"] == "transition"]
+    slope = [m for m in manifest if m["type"] == "slope"]
+    box = [m for m in manifest if m["type"] == "box"]
 
     def _class_fp(ms: list[dict]) -> tuple[float, float]:
         if not ms:
@@ -207,27 +320,61 @@ def assemble_clip_terrain(
     trans_fp0 = _class_fp(trans)
     # Transition tiles get a flat buffer BEHIND the spawn -> footprint x grows by it.
     trans_fp = (trans_fp0[0] + transition_back_buffer, trans_fp0[1])
+    slope_fp = _class_fp(slope)
+    box_fp = _class_fp(box)
     fx, fy = _flat_clip_travel(lib)
     flat_fp = (fx + 2.0 * flat_buffer, fy + 2.0 * flat_buffer)   # buffer on each side
     n_flat = default_num_flat_tiles(lib) if num_flat_tiles is None else int(num_flat_tiles)
 
-    # Ordered tile specs: (terrain_id, type_code, footprint, blocks, clip_x_offset).
+    # Ordered tile specs: (terrain_id, type_code, footprint, blocks, clip_x_offset,
+    # overlays).  ``overlays`` is the list of overlay volumes (boxes) for the tile,
+    # empty for the surface-only terrain classes.
     clip_size_y: dict[int, float] = {}
     type_code: dict[int, int] = {}
-    specs: list[tuple[int, int, tuple[float, float], list[TerrainBlockCfg], float]] = []
+    terrain_overlays: dict[int, list[dict]] = {}
+    specs: list[tuple[int, int, tuple[float, float], list[TerrainBlockCfg], float, list[OverlayVolumeCfg]]] = []
     for m in terr:
+        # NEW tiles-then-clips schema: the generator emits the staircase as explicit walkable
+        # tread overlay boxes (source of truth) -- flat ground + those overlays, exactly like a box
+        # tile. ``has_floor=False`` drops the ground plane (isolated staircase). LEGACY schema
+        # (``dims``/``bands``) recomputes StairBlock geometry.
         tid = int(m["terrain_id"])
-        specs.append((tid, 1, terr_fp, _blocks_from_manifest(m, terr_fp[0]), 0.0))
+        if "overlays" in m:
+            ground = ([FlatBlockCfg(size_x=terr_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
+                      if m.get("has_floor", True) else [])
+            specs.append((tid, 1, terr_fp, ground, 0.0, _overlays_from_manifest(m)))
+        else:
+            specs.append((tid, 1, terr_fp, _blocks_from_manifest(m, terr_fp[0]), 0.0, []))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 1
     for m in trans:
+        # NEW schema: explicit overlays, and the clip is already in the tile-local frame (recentered
+        # by the tile corner at generation), so no front-pad shift. LEGACY: front-padded StairBlock.
+        # ``has_floor=False`` (per-tile) drops the flat ground plane: the stairs+platforms stand as an
+        # isolated structure (empty ``blocks`` -> overlays only), so the scan sees a drop-off beside it.
         tid = int(m["terrain_id"])
-        specs.append((tid, 2, trans_fp,
-                      _blocks_from_manifest(m, trans_fp[0], front_pad=transition_back_buffer),
-                      transition_back_buffer))
+        if "overlays" in m:
+            ground = ([FlatBlockCfg(size_x=trans_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
+                      if m.get("has_floor", True) else [])
+            specs.append((tid, 2, trans_fp, ground, 0.0, _overlays_from_manifest(m)))
+        else:
+            specs.append((tid, 2, trans_fp,
+                          _blocks_from_manifest(m, trans_fp[0], front_pad=transition_back_buffer),
+                          transition_back_buffer, []))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 2
+    for m in slope:
+        tid = int(m["terrain_id"])
+        specs.append((tid, 3, slope_fp, _blocks_from_manifest(m, slope_fp[0]), 0.0, []))
+        clip_size_y[tid], type_code[tid] = float(m["size_y"]), 3
+    for m in box:
+        # A box tile is flat ground (padded to the box class footprint) carrying
+        # standalone overlay volume(s) the clip jumps onto / off / over.
+        tid = int(m["terrain_id"])
+        ground = [FlatBlockCfg(size_x=box_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
+        specs.append((tid, 4, box_fp, ground, 0.0, _overlays_from_manifest(m)))
+        clip_size_y[tid], type_code[tid] = float(m["size_y"]), 4
     for _ in range(n_flat):
         specs.append((_FLAT_TERRAIN_ID, 0, flat_fp,
-                      [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0))
+                      [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0, []))
     clip_size_y[_FLAT_TERRAIN_ID], type_code[_FLAT_TERRAIN_ID] = flat_fp[1], 0
 
     num_tiles = len(specs)
@@ -264,15 +411,17 @@ def assemble_clip_terrain(
     tile_cxoff = torch.zeros(num_rows, num_tiles)
     for r in range(num_rows):
         xoff = r * rep_w                                    # replicas side-by-side in x
-        for c, (tid, _tc, fp, blocks, cxoff) in enumerate(specs):
+        for c, (tid, _tc, fp, blocks, cxoff, overlays) in enumerate(specs):
             x, y = xoff + base_xy[c][0], base_xy[c][1]
-            m = _tile_mesh(fp, blocks)
+            m, ov_meta = _tile_mesh(fp, blocks, overlays)
             m.apply_translation((x, y, 0.0))
             meshes.append(m)
             tile_corner[r, c] = torch.tensor([x, y, 0.0])
             tile_fp[r, c] = torch.tensor(list(fp))
             tile_tid[r, c] = tid
             tile_cxoff[r, c] = cxoff
+            if ov_meta:
+                terrain_overlays[tid] = ov_meta
 
     mesh = trimesh.util.concatenate(meshes)
     # Center the whole layout at the world origin (xy only; keep z ground at 0).
@@ -292,39 +441,37 @@ def assemble_clip_terrain(
         num_rows=num_rows, num_tiles=num_tiles, tile_terrain_id=tile_tid,
         tile_corner=tile_corner, tile_footprint=tile_fp, tile_clip_x_offset=tile_cxoff,
         clip_size_y=clip_size_y, terrain_type_code=type_code,
+        terrain_overlays=terrain_overlays,
     )
     return mesh, origins, layout
 
 
 def clip_frame_origin(
     cell_corner: torch.Tensor,
-    cell_center: torch.Tensor,
-    clip_y_center: torch.Tensor,
     clip_x_offset: torch.Tensor | float = 0.0,
 ) -> torch.Tensor:
     """World position to place a clip's local-corner (0,0,0) frame on its tile.
 
-    The clip is baked in the terrain's local-corner frame, so aligning it to the
-    tile is a pure translation (identity heading): x-corner on the tile corner
-    (plus ``clip_x_offset`` -- the flat back-buffer prepended to transition tiles,
-    so the clip's geometry sits AFTER the buffer), and the clip's centerline
-    (``clip_y_center`` = ``size_y/2`` for terrain clips, ``~0`` for flat clips) on
-    the tile centerline (absorbs the stair re-centering to the tile's footprint
-    width).  z = tile ground (0); the clip's own baked z rides the treads with no
-    double-count.
+    A terrain clip is baked in the TILE-LOCAL corner frame: every generator recentres its clips onto the
+    tile's own datum (``terrain_splice.footprint_recenter`` / ``_size_stair_tile_to_motion`` /
+    ``generate_distractor_clips``), so the tile's geometry AND motion span ``[0, size]`` with the footprint
+    margin on each side.  The tile's mesh is likewise emitted in that frame and translated to
+    ``cell_corner``.  So placement is a pure translation onto the corner, in BOTH axes (identity heading);
+    ``clip_x_offset`` adds the flat back-buffer prepended to LEGACY transition tiles, so their clip geometry
+    sits after the buffer.  z = tile ground (0); the clip's baked z rides the treads with no double-count.
+
+    Do NOT centre the clip in the cell: a cell is sized to the LARGEST tile of its class (plus
+    ``size_margin``), while each tile's mesh sits at the corner, so centring shifts the clip off its own
+    geometry by half the class-vs-tile size difference -- metres for a class whose tiles vary in width.
 
     Args:
         cell_corner: ``[N, 3]`` world position of each tile's local (0,0) corner.
-        cell_center: ``[N, 3]`` world position of each tile's center.
-        clip_y_center: ``[N]`` the clip frame y that lands on the tile centerline.
         clip_x_offset: ``[N]`` (or scalar) x-shift of the clip within the tile
-            (the transition back-buffer; 0 for terrain / flat).
+            (the legacy transition back-buffer; 0 otherwise).
 
     Returns:
         ``[N, 3]`` world placement for each clip's local-corner frame.
     """
-    out = torch.zeros_like(cell_corner)
+    out = cell_corner.clone()
     out[:, 0] = cell_corner[:, 0] + clip_x_offset
-    out[:, 1] = cell_center[:, 1] - clip_y_center
-    out[:, 2] = cell_corner[:, 2]
     return out

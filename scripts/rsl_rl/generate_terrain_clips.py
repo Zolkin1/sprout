@@ -34,19 +34,19 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+from motion_gen.multiskill_manager import (
     MultiSkillManager,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+from motion_gen.clips.offline_velocity_sampler import (
     OfflineVelocitySampler,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+from motion_gen.clips.offline_clip_generator import (
     OfflineClipGenerator,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     ClipLibraryWriter,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_fingerprint import (
+from motion_gen.clips.clip_fingerprint import (
     fingerprint_clip_config,
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.terrain_clip_orchestrator import (
@@ -123,8 +123,8 @@ def main() -> int:
                         "skill. Only the flat batch has a free mix; terrain/transition are stairs / stairs+standing.")
     p.add_argument("--stair-skill", default=None, help="Stair skill subfolder name for the step-dim scan (default: the auto-detected terrain-aware skill).")
     p.add_argument("--stair-width-max", type=float, default=3.0, help="Upper bound (m) when the stair library declares terrain_width as an open range (e.g. {min: 1.0}); tread widths are sampled per terrain in [range_min, this].")
-    p.add_argument("--num-steps-min", type=int, default=4)
-    p.add_argument("--num-steps-max", type=int, default=8)
+    p.add_argument("--num-steps-min", type=int, default=2)
+    p.add_argument("--num-steps-max", type=int, default=7)
     p.add_argument("--lead-in-min", type=float, default=1.5, help="[transition] flat lead-in (start platform) FLOOR (m).")
     p.add_argument("--lead-in-max", type=float, default=4.0, help="[transition] flat lead-in (start platform) CAP (m); excess slack is redistributed to the other flat bands.")
     p.add_argument("--end-platform", type=float, default=1.0, help="[transition] top-platform FLOOR after the last staircase (m), at exit_z.")
@@ -133,8 +133,22 @@ def main() -> int:
     p.add_argument("--transition-length", type=float, default=16.0, help="[transition] FIXED total length (m) of every transition terrain; flats absorb the slack.")
     p.add_argument("--num-transitions-min", type=int, default=2, help="[transition] min staircases per terrain (floored at 2).")
     p.add_argument("--num-transitions-max", type=int, default=3, help="[transition] max staircases per terrain.")
-    p.add_argument("--inter-flat-min", type=float, default=3.0, help="[transition] inter-stair flat FLOOR (m); absorbs slack to hit --transition-length.")
-    p.add_argument("--inter-flat-max", type=float, default=5.0, help="[transition] ignored — inter-stair flats are set by the fixed-length fill.")
+    p.add_argument("--inter-flat-min", type=float, default=3.0, help="[transition] inter-stair flat MIN (m); each inter-stair flat is sampled in [min, max].")
+    p.add_argument("--inter-flat-max", type=float, default=5.0, help="[transition] inter-stair flat MAX (m); the TOP platform (not the inter-flats) absorbs the fixed-length slack.")
+    p.add_argument("--single-step-frac", type=float, default=0.1, help="[transition] fraction built as a SINGLE-STEP curb (one riser + long platform) for curb-height step-ups.")
+    # -- stair decoration knobs (per stair band; all default 0 => bare solid stairs, byte-for-byte reproducible) --
+    p.add_argument("--stair-float-frac", type=float, default=0.0, help="[decor] fraction of stair bands built with FLOATING (riser-less) thin treads.")
+    p.add_argument("--stair-side-wall-frac", type=float, default=0.0, help="[decor] PER-SIDE probability of a solid sidewall (each side drawn independently).")
+    p.add_argument("--stair-side-posts-frac", type=float, default=0.0, help="[decor] PER-SIDE probability of vertical railing posts (each side drawn independently; combined with --stair-side-wall-frac must be <= 1).")
+    p.add_argument("--stair-nosing-frac", type=float, default=0.0, help="[decor] fraction of stair bands with a rounded leading NOSING on each tread (stretch).")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06), metavar=("MIN", "MAX"), help="[decor] floating-tread thickness range (m).")
+    p.add_argument("--stair-wall-thickness", type=float, default=0.1, help="[decor] sidewall thickness (m).")
+    p.add_argument("--stair-wall-height", type=float, default=1.0, help="[decor] sidewall height above the top tread (m).")
+    p.add_argument("--stair-post-thickness", type=float, default=0.06, help="[decor] railing-post cross-section side length (m).")
+    p.add_argument("--stair-post-spacing", type=float, default=0.4, help="[decor] gap between consecutive railing posts (m).")
+    p.add_argument("--stair-post-height", type=float, default=1.0, help="[decor] railing-post height above the top tread (m).")
+    p.add_argument("--stair-nosing-radius-range", type=float, nargs=2, default=(0.02, 0.05), metavar=("MIN", "MAX"), help="[decor] rounded-nosing radius range (m).")
+    p.add_argument("--stair-nosing-segments", type=int, default=6, help="[decor] rounded-nosing arc tessellation.")
     p.add_argument("--nav-width-min", type=float, default=1.5, help="[transition] min corridor width (m); the flat bands span this, stairs are centered narrower.")
     p.add_argument("--nav-width-max", type=float, default=3.0, help="[transition] max corridor width (m).")
     p.add_argument("--flat-width-margin", type=float, default=0.5, help="[transition] keep the spawn corner this far (m) from the corridor y-edge.")
@@ -289,6 +303,21 @@ def main() -> int:
             nav_width_range=(args.nav_width_min, args.nav_width_max),
             flat_width_margin=args.flat_width_margin,
             transition_length=args.transition_length,
+            single_step_frac=args.single_step_frac,
+            decor_params={
+                "float_frac": args.stair_float_frac,
+                "side_wall_frac": args.stair_side_wall_frac,
+                "side_posts_frac": args.stair_side_posts_frac,
+                "nosing_frac": args.stair_nosing_frac,
+                "float_thick_range": tuple(args.stair_float_thick_range),
+                "wall_thickness": args.stair_wall_thickness,
+                "wall_height": args.stair_wall_height,
+                "post_thickness": args.stair_post_thickness,
+                "post_spacing": args.stair_post_spacing,
+                "post_height": args.stair_post_height,
+                "nosing_radius_range": tuple(args.stair_nosing_radius_range),
+                "nosing_segments": args.stair_nosing_segments,
+            },
         )
 
     # One generator; its sampler is swapped per batch and terrain context bound

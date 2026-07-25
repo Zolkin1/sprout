@@ -45,6 +45,16 @@ WALKING_Q_weights["joint:right_shoulder_pitch_joint"] = [3.0, 0.1]
 WALKING_Q_weights["joint:right_shoulder_roll_joint"] = [3.0, 0.1]
 WALKING_Q_weights["joint:right_shoulder_yaw_joint"] = [3.0, 0.1]
 
+# Newly-unlocked DOFs (waist roll/pitch + the 6 wrists): tracked like the other arm/waist joints.
+WALKING_Q_weights["joint:waist_roll_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:waist_pitch_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:left_wrist_roll_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:left_wrist_pitch_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:left_wrist_yaw_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:right_wrist_roll_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:right_wrist_pitch_joint"] = [3.0, 0.1]
+WALKING_Q_weights["joint:right_wrist_yaw_joint"] = [3.0, 0.1]
+
 WALKING_Q_weights["pelvis_link:pos_x"] = [1.0, 10.0]
 WALKING_Q_weights["pelvis_link:pos_y"] = [1.0, 10.0]
 WALKING_Q_weights["pelvis_link:pos_z"] = [1.0, 1.0]
@@ -114,6 +124,16 @@ WALKING_R_weights["joint:right_elbow_joint"] = [0.05]
 WALKING_R_weights["joint:right_shoulder_pitch_joint"] = [0.05]
 WALKING_R_weights["joint:right_shoulder_roll_joint"] = [0.05]
 WALKING_R_weights["joint:right_shoulder_yaw_joint"] = [0.05]
+
+# Newly-unlocked DOFs (waist roll/pitch + the 6 wrists): same control weight as the other arm/waist joints.
+WALKING_R_weights["joint:waist_roll_joint"] = [0.05]
+WALKING_R_weights["joint:waist_pitch_joint"] = [0.05]
+WALKING_R_weights["joint:left_wrist_roll_joint"] = [0.05]
+WALKING_R_weights["joint:left_wrist_pitch_joint"] = [0.05]
+WALKING_R_weights["joint:left_wrist_yaw_joint"] = [0.05]
+WALKING_R_weights["joint:right_wrist_roll_joint"] = [0.05]
+WALKING_R_weights["joint:right_wrist_pitch_joint"] = [0.05]
+WALKING_R_weights["joint:right_wrist_yaw_joint"] = [0.05]
 
 WALKING_R_weights["right_wrist_yaw_link:pos_x"] = [0.05]
 WALKING_R_weights["right_wrist_yaw_link:pos_y"] = [0.05]

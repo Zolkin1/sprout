@@ -195,7 +195,7 @@ class SymmetricMoEPPORunnerCfg(PPORunnerCfg):
 class RslRlCausalTransformerModelCfg(RslRlMLPModelCfg):
     """Configuration for the Causal Transformer model."""
     class_name: str = "robot_rl.network.transformer_network:CausalTransformerModel"
-    single_obs_dim: int = 72
+    single_obs_dim: int = 96   # 72 (21-DOF) + 3*8 for the unlocked joints (joint_pos+joint_vel+action); verify at smoke
     history_length: int = 50
     d_model: int = 128
     nhead: int = 4

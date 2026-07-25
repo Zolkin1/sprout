@@ -32,10 +32,11 @@ import numpy as np
 import viser
 from viser.extras import ViserUrdf
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     load_clip_library,
 )
 from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
+from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 
 # Distinct colours (RGB 0-1) cycled across reference frames.
 _FRAME_COLORS = [
@@ -50,7 +51,35 @@ _FRAME_COLORS = [
 _SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot
 _GHOST_COLOR = (0.45, 0.55, 0.70)       # translucent steel-blue ghosts
 _GHOST_ALPHA_NEAR, _GHOST_ALPHA_FAR = 0.7, 0.18
+_KEYFRAME_COLOR = (0.95, 0.80, 0.15)    # gold -- pinned target keyframes (Phase-2 mb_encode overlay)
+_KEYFRAME_ALPHA = 0.55
 _DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j.urdf"
+
+
+def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
+    """Load an ``mb_encode.py`` ``_keyframes.npz`` sidecar -> per-clip posed-keyframe arrays.
+
+    Returns ``{clip_idx: {"pos": [K,3], "wxyz": [K,4], "cfg": [K,nj], "t": [K]}}`` where ``cfg`` is
+    already permuted into the URDF joint order. Keyframe qpos is MuJoCo layout
+    ``[root_pos(3), root_quat_wxyz(4), joints(29)]`` with joints in the sidecar's ``joint_names`` order.
+    """
+    import json as _json
+
+    d = np.load(path, allow_pickle=False)
+    clip_idx, qpos = d["clip_idx"], d["qpos"]
+    tks = d["t"] if "t" in d else np.zeros(len(qpos), np.float32)
+    joint_names = _json.loads(str(d["joint_names"]))
+    perm = recording_to_urdf_perm(joint_names, urdf)
+    out: dict[int, dict] = {}
+    for ci in np.unique(clip_idx):
+        m = clip_idx == ci
+        out[int(ci)] = {
+            "pos": qpos[m, 0:3].astype(np.float32),
+            "wxyz": qpos[m, 3:7].astype(np.float32),
+            "cfg": qpos[m, 7:][:, perm].astype(np.float32),
+            "t": tks[m].astype(np.float32),
+        }
+    return out
 
 
 def _frame_pos_indices(pos_names: list[str]) -> dict[str, list[int]]:
@@ -150,20 +179,70 @@ def _box(xmin, xmax, ymin, ymax, zmin, zmax) -> tuple[np.ndarray, np.ndarray]:
     return v, f
 
 
+def _ramp(xmin, xmax, ymin, ymax, base_z, z_at_xmin, z_at_xmax) -> tuple[np.ndarray, np.ndarray]:
+    """Prism with a flat bottom (``base_z``) and a top tilted in x (a uniform slope)."""
+    v = np.array([
+        [xmin, ymin, base_z], [xmax, ymin, base_z], [xmax, ymax, base_z], [xmin, ymax, base_z],
+        [xmin, ymin, z_at_xmin], [xmax, ymin, z_at_xmax], [xmax, ymax, z_at_xmax], [xmin, ymax, z_at_xmin],
+    ], dtype=np.float32)
+    f = np.array([
+        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+        [2, 3, 7], [2, 7, 6], [1, 2, 6], [1, 6, 5], [3, 0, 4], [3, 4, 7],
+    ], dtype=np.uint32)
+    return v, f
+
+
+def _stair_decor_boxes(b: dict, dims: dict, symin: float, symax: float) -> list[tuple]:
+    """Axis-aligned boxes for one stair band's decoration (walls / posts).
+
+    Mirrors the shared builder ``trimesh/stair.py`` (``_add_wall_one_side`` /
+    ``_add_posts_one_side``) so the viser view matches the sim collider: walls / posts
+    span ``[min_top - h, max_top + side.height]`` in z, sit just outside the tread
+    edge (``symin`` / ``symax``) in y, and posts march uniformly along x.
+    """
+    decor = b.get("decor") or {}
+    centers = np.array(b["stair_top_centers"], dtype=float)
+    if centers.size == 0:
+        return []
+    x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
+    h = float(dims["h"])
+    z_bot = float(centers[:, 2].min()) - h
+    boxes: list[tuple] = []
+    for side_key, is_left in (("left", True), ("right", False)):
+        side = decor.get(side_key) or {}
+        kind = side.get("kind", "none")
+        if kind == "none":
+            continue
+        th = float(side.get("thickness", 0.0))
+        z_top = float(centers[:, 2].max()) + float(side.get("height", 0.0))
+        y_lo, y_hi = (symin - th, symin) if is_left else (symax, symax + th)
+        if kind == "wall":
+            boxes.append((x0, x1, y_lo, y_hi, z_bot, z_top))
+        elif kind == "posts" and th > 1e-5:
+            sp = float(side.get("spacing", 0.0))
+            cur = 0.0
+            while cur + th <= (x1 - x0) + 1e-5:
+                boxes.append((x0 + cur, x0 + cur + th, y_lo, y_hi, z_bot, z_top))
+                cur += th + sp
+    return boxes
+
+
 def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     """Build a solid multi-band terrain mesh (verts, faces) from a manifest entry.
 
     Flat bands render as a full-corridor-width slab at their level; stair bands
-    render as solid tread pillars spanning the (narrower, centered) stair width.
-    All in the clip-world (local-corner) frame the clip is stored in.  Falls back
-    to the legacy single-stair keys for pre-multi-band manifests.
+    render as solid tread pillars (or thin floating slabs when ``decor.float_thickness
+    > 0``) spanning the (narrower, centered) stair width, plus any per-side wall / post
+    decoration; slope bands render as a tilted ramp (0 -> ``rise`` over the band span).
+    All in the clip-world (local-corner) frame the clip is stored in.  Falls back to the
+    legacy single-stair keys for pre-multi-band manifests.
     """
     size_y = float(m.get("size_y", 1.2))
-    w = float(m["dims"]["w"]); d = float(m["dims"]["d"])
+    w = float(m["dims"]["w"])
     cy = size_y / 2.0
     symin, symax = cy - w / 2.0, cy + w / 2.0
     base_z = -0.08
-    boxes = []
+    boxes, ramps, noses = [], [], []
     bands = m.get("bands")
     if bands is None:  # legacy single-stair manifest
         bands = [{"block_type": "StairBlock", "aabb": [m["span_xmin"], m["span_xmax"], 0.0, size_y],
@@ -171,16 +250,118 @@ def _stair_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     for b in bands:
         x0, x1 = float(b["aabb"][0]), float(b["aabb"][1])
         if b["block_type"] == "StairBlock":
-            for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # tread pillars
-                boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, base_z, float(cz)))
+            d, h = float(m["dims"]["d"]), float(m["dims"]["h"])
+            decor = b.get("decor") or {}
+            ft = float(decor.get("float_thickness", 0.0))
+            nr = min(float(decor.get("nosing_radius", 0.0)), 0.5 * min(h, d))
+            nseg = int(decor.get("nosing_segments", 6))
+            for cx, _cy, cz in np.array(b["stair_top_centers"], dtype=float):  # treads
+                ztop = float(cz)
+                zbot = (ztop - ft) if ft > 0.0 else base_z   # thin floating slab vs solid pillar
+                boxes.append((cx - d / 2.0, cx + d / 2.0, symin, symax, zbot, ztop))
+                if nr > 1e-5:  # rounded lip over the (up-stair) leading -x edge
+                    noses.append((cx - d / 2.0, symin, symax, ztop - nr, nr, nseg))
+            boxes.extend(_stair_decor_boxes(b, m["dims"], symin, symax))
+        elif b["block_type"] == "SlopeBlock":  # tilted ramp, full width, 0 -> rise over the span
+            rise = float(b.get("rise", m["dims"].get("rise", 0.0)))
+            ramps.append((x0, x1, symin, symax, base_z, 0.0, rise))
         else:  # flat slab, full corridor width, at the band's level
             boxes.append((x0, x1, 0.0, size_y, base_z, float(b["exit_z"])))
 
+    # Accumulate every piece generically (boxes/ramps are 8-vert, nosing tubes vary).
+    pieces = [_box(*b) for b in boxes] + [_ramp(*r) for r in ramps]
+    for front_x, y_lo, y_hi, cz, rad, seg in noses:
+        path = np.array([[front_x, y_lo, cz], [front_x, y_hi, cz]], dtype=float)
+        pieces.append(_tube_mesh(path, rad, max(6, 2 * seg)))
+    verts, faces, off = [], [], 0
+    for v, f in pieces:
+        verts.append(v); faces.append(f + off); off += len(v)
+    return np.concatenate(verts), np.concatenate(faces)
+
+
+def _box_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Flat ground slab + overlay volume(s) for a ``box`` manifest entry -> (verts, faces).
+
+    The clip is baked in its local-corner frame, so the ground spans ``[0,size_x] x [0,size_y]``
+    and each overlay sits at its ``pos_xy`` (local) -- the same frame the clip's world base path
+    is drawn in, so the box lines up under the jump.  Support-structure variants (floating top,
+    center / corner legs) are expanded via the shared :func:`overlay_sub_boxes` so the viser view
+    matches the sim collider.
+    """
+    size_x, size_y = float(m["size_x"]), float(m["size_y"])
+    ovs = m.get("overlays", [])
+    # A stair/descent tile has treads going BELOW z=0; the treads are the ground, so skip the flat
+    # z=0 slab (it would slice through the descent). Flat-based tiles (box jump) keep their slab.
+    below = any(float(ov.get("base_z", 0.0)) < -0.05 for ov in ovs)
+    boxes = [] if below else [(0.0, size_x, 0.0, size_y, -0.08, 0.0)]    # ground slab (flat-based only)
+    for ov in ovs:
+        for cx, cy2, cz, sx, sy, sz in overlay_sub_boxes(
+            str(ov.get("variant", "solid")),
+            tuple(float(v) for v in ov["size_xyz"]),
+            (float(ov["pos_xy"][0]), float(ov["pos_xy"][1])),
+            float(ov.get("base_z", 0.0)),
+            float(ov.get("slab_thickness", 0.1)),
+            tuple(ov.get("leg_size", (0.1, 0.1))),
+            float(ov.get("leg_inset", 0.05)),
+        ):
+            boxes.append((cx - sx / 2.0, cx + sx / 2.0, cy2 - sy / 2.0, cy2 + sy / 2.0,
+                          cz - sz / 2.0, cz + sz / 2.0))
     verts, faces, off = [], [], 0
     for b in boxes:
         v, f = _box(*b)
         verts.append(v); faces.append(f + off); off += 8
     return np.concatenate(verts), np.concatenate(faces)
+
+
+def _central_diff(a: np.ndarray, dt: float) -> np.ndarray:
+    d = np.zeros_like(a)
+    if a.shape[0] > 2:
+        d[1:-1] = (a[2:] - a[:-2]) / (2.0 * dt)
+        d[0] = (a[1] - a[0]) / dt
+        d[-1] = (a[-1] - a[-2]) / dt
+    return d
+
+
+def _tracking_image(base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
+                    target_vel: np.ndarray, dt: float):
+    """Render a body-frame root-velocity-vs-target tracking plot to an RGB array.
+
+    Actual: world pelvis velocity rotated into the yaw (body) frame -> (vx fwd, vy left),
+    plus yaw rate.  Target: the stored command ``target_vel`` (vx, vy, wz).  Returns
+    ``None`` if matplotlib is unavailable.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    w, x, y, z = base_quat_wxyz[:, 0], base_quat_wxyz[:, 1], base_quat_wxyz[:, 2], base_quat_wxyz[:, 3]
+    yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    vw = _central_diff(base_pos[:, :2], dt)                      # world xy velocity
+    c, s = np.cos(yaw), np.sin(yaw)
+    vx_b = c * vw[:, 0] + s * vw[:, 1]                           # forward
+    vy_b = -s * vw[:, 0] + c * vw[:, 1]                          # left
+    wz = _central_diff(np.unwrap(yaw)[:, None], dt)[:, 0]        # yaw rate
+    T = base_pos.shape[0]
+    t = np.arange(T) * dt
+    fig, axs = plt.subplots(3, 1, figsize=(5.2, 4.4), dpi=100, sharex=True)
+    rows = [(axs[0], vx_b, target_vel[:, 0], "vx fwd"),
+            (axs[1], vy_b, target_vel[:, 1], "vy left"),
+            (axs[2], wz, target_vel[:, 2], "wz yaw")]
+    for ax, act, tgt, lab in rows:
+        ax.plot(t, act, "k", lw=1.3, label="actual")
+        ax.plot(t, tgt, "--", color="#d62728", lw=1.2, label="target")
+        ax.set_ylabel(lab, fontsize=8); ax.tick_params(labelsize=7); ax.grid(alpha=0.3)
+    axs[0].set_title("body-frame root velocity vs target", fontsize=9)
+    axs[0].legend(fontsize=7, loc="upper right", ncol=2)
+    axs[2].set_xlabel("t (s)", fontsize=8)
+    fig.tight_layout()
+    fig.canvas.draw()
+    h, wd = fig.canvas.get_width_height()[::-1]
+    img = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, wd, 4)[..., :3].copy()
+    plt.close(fig)
+    return img
 
 
 class ClipScene:
@@ -235,6 +416,13 @@ class ClipScene:
             )
             self._ghosts.append((fr, gh))
 
+        # Pinned-keyframe ghost pool (gold) -- the Phase-2 target poses fed to Motion Bricks' predict().
+        # Populated only when a --keyframes sidecar is supplied; sized on first set_keyframes.
+        self._keyframes: dict[int, dict] | None = None
+        self._kf_ghosts: list[tuple[viser.FrameHandle, ViserUrdf]] = []
+        self._kf_markers: viser.SceneNodeHandle | None = None
+        self.show_keyframes = False   # default off -- many robot meshes can hang the browser; toggle via GUI
+
         # Termination-distance corridor tube around the base path (hidden by default).
         self._tube_handle: viser.SceneNodeHandle | None = None
 
@@ -245,6 +433,10 @@ class ClipScene:
         self._target_vel = None       # [T, 3] sampled (vx, vy, wz), or None if absent
         self.show_tracks = True
         self.show_tube = False
+        self.show_command = True
+        self._cmd_handle = None       # command-reference path polyline
+        self.show_plot = True
+        self._plot_handle = None      # body-frame velocity-tracking plot (GUI image)
         self.num_ghosts = min(max_ghosts, max_ghosts)
         self.clip_idx = -1
 
@@ -260,9 +452,17 @@ class ClipScene:
     def load_clip(self, clip_idx: int) -> None:
         """Reconstruct world tracks + robot poses for ``clip_idx`` and redraw."""
         self.clip_idx = clip_idx
-        y = self.lib.y_des[clip_idx]                 # [T, P] clip-world
-        skill = self.lib.skill_id[clip_idx].cpu().numpy()
-        contact = self.lib.contact[clip_idx].cpu().numpy()
+        # Respect the clip's OWN length: clips are stored padded to the library's max T (a rectangular
+        # h5 array), the tail being held-static frames.  The RL uses clip_len (reset samples within it,
+        # termination cuts at clip_len-1), so the pad is inert there; the viewer must likewise stop at
+        # clip_len or it shows a long frozen tail after the real motion.
+        cl = self.lib.clip_len
+        y = self.lib.y_des[clip_idx]                 # [T, P] clip-world (padded)
+        n = int(cl[clip_idx]) if (cl is not None and cl.numel()) else y.shape[0]
+        self.num_steps = max(1, min(n, y.shape[0]))  # per-clip real length (drives slider / play / ghosts)
+        y = y[: self.num_steps]
+        skill = self.lib.skill_id[clip_idx].cpu().numpy()[: self.num_steps]
+        contact = self.lib.contact[clip_idx].cpu().numpy()[: self.num_steps]
 
         # Robot base world pose + joint config for every step.  The stored
         # quaternion is xyzw (Isaac Lab); viser frames want wxyz.
@@ -272,7 +472,7 @@ class ClipScene:
 
         # Sampled (target) velocity per step, if the library stored it.
         tv = self.lib.target_vel
-        self._target_vel = tv[clip_idx].cpu().numpy() if tv.numel() > 0 else None
+        self._target_vel = tv[clip_idx].cpu().numpy()[: self.num_steps] if tv.numel() > 0 else None
 
         # Terrain mesh for this clip (flat clips keep the bare grid).
         for h in (self._terrain_handle, self._grid_handle, self._spawngoal_handle):
@@ -282,15 +482,19 @@ class ClipScene:
         tid = int(self.clip_terrain_id[clip_idx]) if self.clip_terrain_id.numel() else -1
         if tid in self.terrain_manifest:
             mm = self.terrain_manifest[tid]
-            tv_v, tv_f = _stair_terrain_mesh(mm)
+            tv_v, tv_f = (_box_terrain_mesh(mm) if (mm.get("type") == "box" or "overlays" in mm)
+                          else _stair_terrain_mesh(mm))
             self._terrain_handle = self.server.scene.add_mesh_simple(
                 "/terrain", vertices=tv_v, faces=tv_f,
                 color=(0.62, 0.62, 0.66), opacity=1.0, side="double", flat_shading=True,
             )
-            # Ground grid sized to the terrain chunk, centered on it.
+            # Ground grid sized to the terrain chunk. For a stair/descent tile (treads below z=0),
+            # drop the grid to the geometry floor instead of drawing a misleading z=0 plane.
             sx, sy = float(mm["size_x"]), float(mm["size_y"])
+            _bzs = [float(ov.get("base_z", 0.0)) for ov in mm.get("overlays", [])]
+            gz = min(_bzs) if (_bzs and min(_bzs) < -0.05) else 0.0
             self._grid_handle = self.server.scene.add_grid(
-                "/grid", width=sx, height=sy, cell_size=1.0, position=(sx / 2.0, sy / 2.0, 0.0),
+                "/grid", width=sx, height=sy, cell_size=1.0, position=(sx / 2.0, sy / 2.0, gz),
             )
             # Spawn (green) + nav goal (red) markers.
             pts, cols = [], []
@@ -341,6 +545,45 @@ class ClipScene:
                     visible=self.show_tracks,
                 )
 
+        # Command reference path: integrate the stored target_vel (vx, vy, wz) in the
+        # world frame from the clip's start pose -- where the base "should" go if it
+        # followed the velocity command open-loop.  Drawn at pelvis height so the gap to
+        # the base track (orange) IS the motion-matching tracking error.
+        if self._cmd_handle is not None:
+            self._cmd_handle.remove()
+            self._cmd_handle = None
+        if self._target_vel is not None:
+            dt = float(self.lib.meta["dt"])
+            bp = self._world_base_pos
+            q0 = self._world_base_quat[0]                       # wxyz
+            yaw = float(np.arctan2(2 * (q0[0] * q0[3] + q0[1] * q0[2]),
+                                   1 - 2 * (q0[2] ** 2 + q0[3] ** 2)))
+            T = bp.shape[0]
+            ref = np.zeros((T, 3), np.float32)
+            x, yy = float(bp[0, 0]), float(bp[0, 1])
+            for t in range(T):
+                ref[t] = (x, yy, float(bp[t, 2]))
+                vx, vy, wz = (float(v) for v in self._target_vel[t])
+                x += (np.cos(yaw) * vx - np.sin(yaw) * vy) * dt
+                yy += (np.sin(yaw) * vx + np.cos(yaw) * vy) * dt
+                yaw += wz * dt
+            csegs = np.stack([ref[:-1], ref[1:]], axis=1).astype(np.float32)
+            self._cmd_handle = self.server.scene.add_line_segments(
+                "/command_path", points=csegs, colors=(0.1, 0.95, 0.2),
+                line_width=6.0, visible=self.show_command,
+            )
+
+        # Body-frame root-velocity-vs-target tracking plot, embedded in the GUI panel.
+        if self._plot_handle is not None:
+            self._plot_handle.remove()
+            self._plot_handle = None
+        if self._target_vel is not None:
+            img = _tracking_image(self._world_base_pos, self._world_base_quat,
+                                  self._target_vel, float(self.lib.meta["dt"]))
+            if img is not None:
+                self._plot_handle = self.server.gui.add_image(
+                    img, label="tracking: body vel vs target", visible=self.show_plot)
+
         # Foot touchdown markers (contact rising edges per contact frame).
         for h in self._touchdown_handles:
             h.remove()
@@ -362,7 +605,43 @@ class ClipScene:
             self._touchdown_handles.append(h)
 
         self.refresh_ghosts()
+        self._refresh_keyframes()
         self.set_frame(0)
+
+    def set_keyframes(self, kf_by_clip: dict[int, dict]) -> None:
+        """Attach pinned-keyframe data and build the gold ghost pool sized to the busiest clip."""
+        self._keyframes = kf_by_clip
+        pool = max((len(v["pos"]) for v in kf_by_clip.values()), default=0)
+        for s in range(pool):
+            fr = self.server.scene.add_frame(f"/keyframes/{s}", show_axes=False, visible=False)
+            gh = ViserUrdf(self.server, self.urdf, root_node_name=f"/keyframes/{s}",
+                           mesh_color_override=(*_KEYFRAME_COLOR, _KEYFRAME_ALPHA))
+            self._kf_ghosts.append((fr, gh))
+
+    def _refresh_keyframes(self) -> None:
+        """Pose the gold keyframe ghosts (+ root markers) for the current clip; hide the rest."""
+        kf = (self._keyframes or {}).get(self.clip_idx)
+        if self._kf_markers is not None:
+            self._kf_markers.remove()
+            self._kf_markers = None
+        for s, (fr, gh) in enumerate(self._kf_ghosts):
+            if kf is not None and self.show_keyframes and s < len(kf["pos"]):
+                fr.position = kf["pos"][s]
+                fr.wxyz = kf["wxyz"][s]
+                gh.update_cfg(kf["cfg"][s])
+                fr.visible = True
+            else:
+                fr.visible = False
+        if kf is not None and self.show_keyframes and len(kf["pos"]):
+            self._kf_markers = self.server.scene.add_point_cloud(
+                "/keyframe_roots", points=kf["pos"].astype(np.float32),
+                colors=np.tile(np.array(_KEYFRAME_COLOR, np.float32), (len(kf["pos"]), 1)),
+                point_size=0.05, point_shape="circle",
+            )
+
+    def set_show_keyframes(self, show: bool) -> None:
+        self.show_keyframes = show
+        self._refresh_keyframes()
 
     def refresh_ghosts(self) -> None:
         """Pose the active ghost robots at evenly-spaced steps along the clip."""
@@ -407,6 +686,16 @@ class ClipScene:
         if self._tube_handle is not None:
             self._tube_handle.visible = show
 
+    def set_show_command(self, show: bool) -> None:
+        self.show_command = show
+        if self._cmd_handle is not None:
+            self._cmd_handle.visible = show
+
+    def set_show_plot(self, show: bool) -> None:
+        self.show_plot = show
+        if self._plot_handle is not None:
+            self._plot_handle.visible = show
+
     def target_vel_at(self, step: int) -> np.ndarray | None:
         """Sampled (vx, vy, wz) command at ``step``, or None if not stored."""
         if self._target_vel is None:
@@ -422,9 +711,13 @@ def main() -> int:
     p.add_argument("--urdf", default=_DEFAULT_URDF, help="G1 URDF path.")
     p.add_argument("--port", type=int, default=8080, help="Viser server port.")
     p.add_argument("--max-ghosts", type=int, default=10, help="Ghost robot pool size.")
-    p.add_argument("--ghosts", type=int, default=8, help="Initial ghost count.")
+    p.add_argument("--ghosts", type=int, default=0,
+                   help="Initial trajectory-ghost count (default 0 -- many robot meshes can hang the browser; "
+                        "raise via the GUI slider as needed).")
     p.add_argument("--term-dist", type=float, default=0.25,
                    help="Base-pose-error termination distance (m); radius of the corridor tube.")
+    p.add_argument("--keyframes", default=None,
+                   help="Optional mb_encode.py _keyframes.npz sidecar: overlay the pinned target poses (gold).")
     args = p.parse_args()
 
     lib = load_clip_library(args.lib, "cpu")
@@ -436,6 +729,11 @@ def main() -> int:
 
     scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist)
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
+    keyframes = _load_keyframe_sidecar(args.keyframes, urdf) if args.keyframes else None
+    if keyframes is not None:
+        scene.set_keyframes(keyframes)
+        nkf = sum(len(v["pos"]) for v in keyframes.values())
+        print(f"[view_clip_viser] loaded {nkf} pinned keyframes over {len(keyframes)} clips from {args.keyframes}")
 
     # ---- GUI ----
     gui_clip = server.gui.add_slider("clip", 0, lib.num_clips - 1, 1, args.clip)
@@ -443,7 +741,11 @@ def main() -> int:
     gui_play = server.gui.add_checkbox("play", True)
     gui_ghosts = server.gui.add_slider("ghosts", 0, args.max_ghosts, 1, scene.num_ghosts)
     gui_tracks = server.gui.add_checkbox("show trajectories", True)
+    gui_command = server.gui.add_checkbox("command path (green)", True)
+    gui_plot = server.gui.add_checkbox("tracking plot", True)
     gui_tube = server.gui.add_checkbox(f"termination tube ({args.term_dist:.2f} m)", False)
+    if keyframes is not None:
+        gui_keyframes = server.gui.add_checkbox("pinned keyframes (gold)", scene.show_keyframes)
     gui_vel = server.gui.add_text("target vel (vx,vy,wz)", "", disabled=True)
     gui_info = server.gui.add_text("info", "", disabled=True)
 
@@ -460,7 +762,7 @@ def main() -> int:
         tid = int(lib.terrain_id[ci]) if lib.terrain_id.numel() else -1
         tinfo = f"{ttype}" + (f" (terrain {tid})" if tid >= 0 else "")
         gui_info.value = (
-            f"clip {ci} [{tinfo}] | step {step}/{lib.num_steps - 1} | now: {cur_skill} | "
+            f"clip {ci} [{tinfo}] | step {step}/{scene.num_steps - 1} | now: {cur_skill} | "
             f"clip skills: {', '.join(skills)}"
         )
         tv = scene.target_vel_at(step)
@@ -472,6 +774,7 @@ def main() -> int:
     @gui_clip.on_update
     def _(_=None):
         scene.load_clip(int(gui_clip.value))
+        gui_frame.max = scene.num_steps - 1          # clip's real length (no padding tail)
         gui_frame.value = 0
         _update_info()
 
@@ -488,11 +791,25 @@ def main() -> int:
     def _(_=None):
         scene.set_show_tracks(bool(gui_tracks.value))
 
+    @gui_command.on_update
+    def _(_=None):
+        scene.set_show_command(bool(gui_command.value))
+
+    @gui_plot.on_update
+    def _(_=None):
+        scene.set_show_plot(bool(gui_plot.value))
+
     @gui_tube.on_update
     def _(_=None):
         scene.set_show_tube(bool(gui_tube.value))
 
+    if keyframes is not None:
+        @gui_keyframes.on_update
+        def _(_=None):
+            scene.set_show_keyframes(bool(gui_keyframes.value))
+
     scene.load_clip(args.clip)
+    gui_frame.max = scene.num_steps - 1              # clip's real length (no padding tail)
     _update_info()
     print(f"[view_clip_viser] serving on http://localhost:{args.port}  (Ctrl-C to stop)")
 
@@ -500,7 +817,7 @@ def main() -> int:
     try:
         while True:
             if gui_play.value:
-                nxt = (int(gui_frame.value) + 1) % lib.num_steps
+                nxt = (int(gui_frame.value) + 1) % scene.num_steps
                 scene.set_frame(nxt)       # pose the scrubber directly
                 gui_frame.value = nxt       # reflect in the slider / info
                 _update_info()

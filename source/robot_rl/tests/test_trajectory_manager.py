@@ -14,7 +14,7 @@ go once :class:`MultiSkillManager` is the only runtime path.
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_manager import (
+from motion_gen.trajectory_manager import (
     TrajectoryManager,
     TrajectoryType,
 )

@@ -18,10 +18,10 @@ from dataclasses import dataclass
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+from motion_gen.clips.offline_velocity_sampler import (
     OfflineVelocitySampler,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.skill_bucket import (
+from motion_gen.skill_bucket import (
     clamp_pd_channels_to_buckets,
 )
 

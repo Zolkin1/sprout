@@ -35,11 +35,27 @@ class MotionClipManager(ManagerBase):
         self.vel_output_names: list[str] = list(lib.meta["vel_output_names"])
         self.num_pos_outputs = len(self.pos_output_names)
         self.num_vel_outputs = len(self.vel_output_names)
+        # TODO(foot-ref-frame removal / "scope 2"): ``ref_frame`` is a vestige of the foot-stance
+        # paradigm.  Teacher/tracker clips are world/ego(mask)-anchored and set it to the base frame
+        # (pelvis_link), not a stance foot; it (and get_reference_frames below) can be dropped once
+        # the foot-stance paradigm + online CLF commands are removed. See base_trajectory_cmd.py.
         self.ref_frame: str = lib.meta["ref_frame"]
         self.contact_frames: list[str] = list(lib.meta["contact_frames"])
         self.dt: float = float(lib.meta["dt"])
         self.num_steps: int = int(lib.meta["num_steps"])
         self.num_clips: int = lib.num_clips
+
+        # Per-clip root-DOF anchor bitmask (bit SET = FREE). A pre-mask library
+        # resolves to the legacy mask for every clip here (single interpretation
+        # point), so downstream re-anchoring never special-cases missing masks.
+        self.anchor_mask: torch.Tensor = lib.anchor_mask_or_legacy(self.device)  # [num_clips] uint8
+        # Per-clip REAL length (valid frames before padding); full ``num_steps`` for legacy libs.
+        self.clip_len: torch.Tensor = lib.clip_len_or_full(self.device)          # [num_clips] long
+        # Per-STEP root-DOF anchor bitmask [num_clips, T] for clips whose anchoring varies
+        # WITHIN the clip (box clips: y-free-pinned approach/jump, then ego recovery). For
+        # clips without a per-step schedule this broadcasts the per-clip mask across T, so
+        # re-anchoring reads one uniform [N, T] regardless of clip type.
+        self.anchor_mask_t: torch.Tensor = lib.anchor_mask_per_step(self.device)  # [num_clips, T] uint8
 
         # Per-env phase carrier (set by the owning command each step so the
         # base ``_update_command`` can read ``manager.phase``).  Allocated by
@@ -140,6 +156,25 @@ class MotionClipManager(ManagerBase):
     def has_target_vel(self) -> bool:
         """Whether the loaded library carries a per-step commanded velocity."""
         return self.lib.target_vel.numel() > 0
+
+    def gather_anchor_mask(self, clip_id: torch.Tensor) -> torch.Tensor:
+        """Return the per-clip root-DOF anchor bitmask ``[N]`` uint8 for each env's clip.
+
+        Step-invariant (a clip's mask is constant over its length), so this takes
+        only ``clip_id``.  Follows the same CPU-lib / CUDA-env device shuttle as
+        :meth:`gather`.
+        """
+        return self.anchor_mask[clip_id.to(self.anchor_mask.device)].to(clip_id.device)
+
+    def gather_anchor_mask_at_step(self, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
+        """Return the CURRENT-frame root-DOF anchor bitmask ``[N]`` uint8 per env.
+
+        Indexes the per-step schedule ``anchor_mask_t[clip_id, step]`` so re-anchoring can
+        vary WITHIN a clip (a box clip's y-free-pinned approach/jump vs. its ego recovery).
+        For clips without a per-step schedule this equals :meth:`gather_anchor_mask` (the
+        per-clip mask broadcast across the clip length).
+        """
+        return self.gather(self.anchor_mask_t, clip_id, step)
 
     # ------------------------------------------------------------------
     # ManagerBase abstract methods (trivial for fixed clips; the command's

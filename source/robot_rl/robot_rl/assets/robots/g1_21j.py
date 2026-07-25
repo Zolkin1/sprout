@@ -41,7 +41,7 @@ ROBOT_ASSETS = str(_find_project_root() / "robot_assets" / "g1")
 G1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged/g1_21j_box_merged.usda",
-        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_v2/g1_21j_box_merged_v2.usda",
+        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_29j/g1_21j_box_merged_29j.usda",   # 29 DOF (waist roll/pitch + wrists unlocked)
         # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_merged/g1_21j_merged.usda",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
@@ -175,6 +175,29 @@ G1_CFG = ArticulationCfg(
                 ".*_shoulder_yaw_joint": ARMATURE_5020,
                 ".*_elbow_joint": ARMATURE_5020,
             },
+        ),
+        # Newly-unlocked DOFs.  waist roll/pitch: waist_yaw's 7520_14 class at the URDF's 50 N*m effort.
+        # wrists: the arms' 5020 class (roll 25 N*m, pitch/yaw 5 N*m per the model).  Sensible defaults
+        # from the sibling joints -- expected to be tuned before the real run.
+        "waist_rp": ImplicitActuatorCfg(
+            joint_names_expr=["waist_roll_joint", "waist_pitch_joint"],
+            effort_limit_sim=50.0,
+            velocity_limit_sim=37.0,
+            stiffness=STIFFNESS_7520_14,
+            damping=DAMPING_7520_14,
+            armature=ARMATURE_7520_14,
+        ),
+        "wrists": ImplicitActuatorCfg(
+            joint_names_expr=[".*_wrist_roll_joint", ".*_wrist_pitch_joint", ".*_wrist_yaw_joint"],
+            effort_limit_sim={
+                ".*_wrist_roll_joint": 25.0,
+                ".*_wrist_pitch_joint": 5.0,
+                ".*_wrist_yaw_joint": 5.0,
+            },
+            velocity_limit_sim=37.0,
+            stiffness=STIFFNESS_5020,
+            damping=DAMPING_5020,
+            armature=ARMATURE_5020,
         ),
     },
 )

@@ -20,10 +20,10 @@ from dataclasses import dataclass
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.scheduled_velocity_sampler import (
+from motion_gen.clips.scheduled_velocity_sampler import (
     ScheduledVelocitySampler,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.skill_bucket import (
+from motion_gen.skill_bucket import (
     bucket_for_velocity,
 )
 

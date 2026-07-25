@@ -80,7 +80,12 @@ def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
         Boolean ``[num_envs]`` -- True for envs at/after the clip's last step.
     """
     cmd = env.command_manager.get_term(command_name)
-    last_step = cmd.manager.num_steps - 1
+    # Each clip's OWN last real frame (clip_len - 1), so a short clip padded into a longer library
+    # truncates at its real end instead of playing the held padding tail to num_steps - 1.  clip_len
+    # lives on the clip-library device (may be CPU via --clip_device), so index it with clip_id on
+    # THAT device before moving to the env device (device-safe gather).
+    clip_len = cmd.manager.clip_len
+    last_step = clip_len[cmd.clip_id.to(clip_len.device)].to(cmd.start_step.device) - 1
     return (cmd.start_step + env.episode_length_buf) >= last_step
 
 def no_progress(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:

@@ -27,12 +27,12 @@ import warp as wp
 from isaaclab.utils.math import quat_from_angle_axis
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
-from .sagittal_reflector import NamedReflector, SagittalReflectionConfig
-from .clips.clip_io import load_clip_library
-from .clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
-from .clips.clip_manager import MotionClipManager
-from .world_lift import (
-    ego_placement,
+from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
+from motion_gen.clips.clip_io import load_clip_library
+from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
+from motion_gen.clips.clip_manager import MotionClipManager
+from motion_gen.world_lift import (
+    ego_placement_masked,
     lift_base_world_state,
     lift_orientation,
     lift_orientation_batched,
@@ -80,12 +80,16 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         return MotionClipManager(self._clip_lib)
 
     def _verify_contact_frames(self) -> None:
-        """The clip's stance reference frame must be a tracked contact body."""
-        ref = self.manager.ref_frame
-        if ref not in self.contact_bodies:
-            raise ValueError(
-                f"Clip reference frame '{ref}' is not in contact_bodies {self.contact_bodies}."
-            )
+        """No stance reference frame to verify: teacher clips are world/ego(mask)-anchored.
+
+        The teacher never runs the foot-stance path (it overrides ``_update_command`` and anchors
+        via the per-DOF anchor mask), so the clip's ``ref_frame`` need not be a contact body -- it
+        is just the clip's base/world frame (e.g. ``pelvis_link``).
+
+        TODO(foot-ref-frame removal / "scope 2"): once the foot-stance paradigm is deleted (see the
+        TODO in base_trajectory_cmd.py), the clip ``ref_frame`` meta and this hook go away entirely.
+        """
+        return
 
     def _post_init(self) -> None:
         """Allocate clip state, validate dt, map contacts, record fingerprint."""
@@ -108,6 +112,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.clip_world_pos = torch.zeros(n, 3, device=dev)
         self.clip_world_quat = torch.zeros(n, 4, device=dev)
         self.clip_world_quat[:, 3] = 1.0  # identity (xyzw, w last -- Isaac Lab convention)
+        # Reset-time placement (the clip's terrain-cell anchor), set in
+        # ``_commit_clip_reset``. FIXED anchor-mask DOFs pin to this on the ego
+        # re-anchor cadence so terrain-fixed axes never drift onto the robot.
+        self._reset_world_pos = torch.zeros(n, 3, device=dev)
+        self._reset_world_yaw = torch.zeros(n, device=dev)
         # Per-env ego-centric re-anchor assignment (re-rolled per reset in
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
@@ -265,13 +274,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
           snap. On flat ``_snap_mask == _ego_mask``; on terrain it also covers the
           world-anchored stair/transition envs, so the FM gets stair windows too (the
           dataset ego-anchors the recorded clip future to the robot base at each snap).
-        * **Clip re-placement** (``_reanchor_clip_ids``): applied ONLY to ``_ego_mask``
-          envs on the tick -- recompute the placement (yaw + xy + z) so the clip's
-          current-step base coincides with the robot's measured root, keeping only the
-          clip's natural tilt (a receding-horizon reference). Snapping z matches the FM
-          deploy anchor (:meth:`FmTrackingCommand._run_fm`). Stair clips are NEVER in
-          ``_ego_mask`` (a re-placed stair clip would detach from its physical treads),
-          so they stay world-locked while still emitting a snap.
+        * **Clip re-placement** (``_reanchor_clip_ids``): applied to ``_ego_mask`` envs on
+          the tick -- recompute the placement so the FREE root DOFs of the clip's
+          CURRENT-STEP anchor mask coincide with the robot's measured root, while FIXED
+          DOFs stay pinned to the reset-time terrain-cell anchor. Because the re-placement
+          is per-DOF MASKED, terrain envs can be ego too: a stair clip re-places only its
+          free y onto the robot, keeping x/z/yaw locked to the treads (it no longer
+          detaches), and a box clip's mask varies per step (y-free-pinned approach/jump,
+          then ego recovery). So all envs may be partial-ego; the mask governs which axes
+          float. Snapping matches the FM deploy anchor (:meth:`FmTrackingCommand._run_fm`).
 
         Naturally idempotent across Isaac Lab's twice-per-step compute (same tick, masks,
         robot pose + clip step -> same flag + placement), so no once-per-step guard.
@@ -283,13 +294,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
-        """Re-place the clip's current-step base onto the robot root for env ``ids``.
+        """Re-place the clip for env ``ids`` per each clip's root-DOF anchor mask.
 
         The placement update shared by the cadence-based ego re-anchor
         (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
         re-anchor on a different schedule (e.g. the generator command re-anchoring
-        the clip on the FM's re-plan steps). Yaw + xy + z onto the robot root,
-        keeping only the clip's natural tilt. No-op for empty ``ids``.
+        the clip on the FM's re-plan steps). Each clip's CURRENT-STEP anchor mask decides
+        which root DOFs re-anchor onto the robot root (FREE) vs stay pinned to the
+        clip's reset-time terrain-cell placement (FIXED); roll/pitch are always the
+        clip's natural tilt. With the legacy mask (flat libraries pre-dating the mask)
+        this is yaw + xy + z onto the robot, i.e. the old behavior. No-op for empty
+        ``ids``.
         """
         if ids.numel() == 0:
             return
@@ -297,11 +312,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         y, _ = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
         base_pos_cf = y[:, self._base_idx["pos"]]   # [k, 3]
         base_ori_cf = y[:, self._base_idx["ori"]]   # [k, 4] xyzw
-        # Target = robot root link (planar position + heading + HEIGHT); keep tilt.
+        # Target = robot root link (planar position + heading + HEIGHT for FREE DOFs).
         target_pos_w = wp.to_torch(self.robot.data.root_pos_w)[ids]
         target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
-        world_pos, world_quat = ego_placement(
-            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w
+        world_pos, world_quat = ego_placement_masked(
+            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
+            anchor_mask=self.manager.gather_anchor_mask_at_step(self.clip_id[ids], self._step[ids]),
+            cell_anchor_pos=self._reset_world_pos[ids],
+            cell_anchor_yaw=self._reset_world_yaw[ids],
         )
         self.clip_world_pos[ids] = world_pos
         self.clip_world_quat[ids] = world_quat

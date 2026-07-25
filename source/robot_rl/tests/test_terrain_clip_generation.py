@@ -50,13 +50,13 @@ def combined_lib(tmp_path_factory):
 def built(combined_lib):
     from dataclasses import dataclass
 
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.multiskill_manager import (
+    from motion_gen.multiskill_manager import (
         MultiSkillManager,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_clip_generator import (
+    from motion_gen.clips.offline_clip_generator import (
         OfflineClipGenerator,
     )
     from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.terrain_clip_orchestrator import (
@@ -383,7 +383,7 @@ def test_straight_only_zeros_anchor_yaw_and_records_diag(built):
 
 def test_flat_rollout_still_flat(built):
     m, gen, sampler, stair = built
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.offline_velocity_sampler import (
+    from motion_gen.clips.offline_velocity_sampler import (
         OfflineVelocitySampler,
     )
     from dataclasses import dataclass

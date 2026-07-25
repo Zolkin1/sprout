@@ -24,6 +24,12 @@ import h5py
 import numpy as np
 import torch
 
+from motion_gen.world_lift import _ANCHOR_MASK_LEGACY
+
+# Sentinel in the per-step ``anchor_mask_t`` dataset meaning "no per-step value here -> use the
+# clip's per-clip ``anchor_mask``".  Valid masks are 6-bit (0..63), so 255 is unambiguous.
+_ANCHOR_MASK_T_UNSET = 255
+
 # Per-step dense datasets, with their on-disk dtype.
 _DENSE_DTYPES: dict[str, str] = {
     "y_des": "float32",
@@ -44,18 +50,30 @@ _DEBUG_DTYPES: dict[str, str] = {
     "blend_new": "float32",     # [N, T, P] pre-blend NEW nominal (NaN off-blend)
 }
 
-# Per-clip (1-D, shape [N]) terrain tags.  ``terrain_id`` indexes the embedded
+# Per-clip (1-D, shape [N]) tags.  ``terrain_id`` indexes the embedded
 # ``terrain_manifest`` root attr (-1 for flat clips, which have no manifest
-# entry); ``terrain_type_code`` indexes ``_TERRAIN_TYPE_NAMES``.
+# entry); ``terrain_type_code`` indexes ``_TERRAIN_TYPE_NAMES``.  ``anchor_mask``
+# is the per-clip root-DOF FREE/FIXED bitmask (see :mod:`motion_gen.world_lift`);
+# it tells the RL which root DOFs re-anchor to the robot vs stay clip/terrain-fixed.
 _PERCLIP_DTYPES: dict[str, str] = {
     "terrain_id": "int32",
     "terrain_type_code": "uint8",
+    "anchor_mask": "uint8",
+    # Real length (valid frames) before padding.  Clips are stored padded to a common ``T``
+    # (repeat-last-frame); ``clip_len`` marks where the actual motion ends so the RL can end
+    # the episode at the clip's own last frame instead of playing the held padding tail.
+    "clip_len": "int32",
 }
 
-# Canonical terrain-type ordering (code = index).  ``flat`` is the original
-# no-terrain clip; ``terrain`` is terrain-only (e.g. a staircase); ``transition``
-# is a flat lead-in that approaches and climbs the terrain.
-_TERRAIN_TYPE_NAMES: list[str] = ["flat", "terrain", "transition"]
+# Canonical terrain-type ordering (code = index; APPEND only -- codes are stored
+# per-clip so existing values must stay put).  ``flat`` is the original no-terrain
+# clip; ``terrain`` is terrain-only (e.g. a staircase); ``transition`` is a flat
+# lead-in that approaches and climbs the terrain; ``slope`` is a uniform tilted plane
+# (a flat clip rigidly rotated to the slope pitch, see ``motion_matching.slope_rotate``);
+# ``box`` is flat ground carrying a standalone overlay volume the clip jumps onto /
+# off / over (the manifest entry carries an ``overlays`` list; see the terrain blocks'
+# ``OverlayVolumeCfg``).
+_TERRAIN_TYPE_NAMES: list[str] = ["flat", "terrain", "transition", "slope", "box"]
 _TERRAIN_TYPE_CODE: dict[str, int] = {n: i for i, n in enumerate(_TERRAIN_TYPE_NAMES)}
 
 
@@ -77,6 +95,7 @@ class ClipLibraryWriter:
         self.num_clips = int(num_clips)
         self.meta = dict(meta)
         T = int(meta["num_steps"])
+        self._T = T
         P = len(meta["pos_output_names"])
         V = len(meta["vel_output_names"])
         C = len(meta["contact_frames"])
@@ -101,6 +120,14 @@ class ClipLibraryWriter:
         self._f.create_dataset("terrain_id", shape=(num_clips,), dtype="int32")
         self._f["terrain_id"][...] = -1
         self._f.create_dataset("terrain_type_code", shape=(num_clips,), dtype="uint8")
+        # Per-clip root-DOF anchor mask (1-D). Default legacy (x,y,z,yaw FREE) so a
+        # writer that sets nothing reproduces today's re-anchoring behavior.
+        self._f.create_dataset("anchor_mask", shape=(num_clips,), dtype="uint8")
+        self._f["anchor_mask"][...] = _ANCHOR_MASK_LEGACY
+        # Per-clip real length (valid frames before padding); default = full T so a writer that sets
+        # nothing => the whole clip is real (no early clip-end, i.e. today's behavior).
+        self._f.create_dataset("clip_len", shape=(num_clips,), dtype="int32")
+        self._f["clip_len"][...] = T
         self._f.attrs["terrain_type_names"] = json.dumps(_TERRAIN_TYPE_NAMES)
         # Store layout metadata as JSON attrs.
         for k, v in self.meta.items():
@@ -128,6 +155,28 @@ class ClipLibraryWriter:
         if ttype not in _TERRAIN_TYPE_CODE:
             raise ValueError(f"unknown terrain_type '{ttype}'; expected one of {_TERRAIN_TYPE_NAMES}")
         self._f["terrain_type_code"][start_idx:end] = _TERRAIN_TYPE_CODE[ttype]
+        # Per-clip anchor mask (optional; leave the legacy default if the batch omits it).
+        if "anchor_mask" in batch:
+            am = batch["anchor_mask"].detach().to("cpu").numpy()
+            self._f["anchor_mask"][start_idx:end] = am.astype("uint8", copy=False)
+        # Per-clip real length (optional; leave the full-T default if the batch omits it), clamped to T.
+        if "clip_len" in batch:
+            cl = batch["clip_len"].detach().to("cpu").numpy()
+            self._f["clip_len"][start_idx:end] = np.clip(cl, 1, self._T).astype("int32", copy=False)
+        # Optional per-STEP anchor mask [N, T] -- box clips vary anchoring by segment (jump-on
+        # world-pinned, approach / on-top walk / recovery ego), so a single per-clip mask can't
+        # express them.  Lazily created; absent -> the per-clip ``anchor_mask`` applies to every
+        # step (see :meth:`ClipLibraryData.anchor_mask_per_step`).
+        if "anchor_mask_t" in batch:
+            amt = batch["anchor_mask_t"].detach().to("cpu").numpy()
+            if "anchor_mask_t" not in self._f:
+                ds = self._f.create_dataset(
+                    "anchor_mask_t", shape=(self.num_clips,) + amt.shape[1:], dtype="uint8",
+                    chunks=(1,) + amt.shape[1:], compression=self._compression)
+                # Sentinel 255 = "unset" so clips NOT carrying a per-step mask fall back to their
+                # per-clip ``anchor_mask`` (0 is a VALID mask -- fully pinned -- so we can't 0-fill).
+                ds[...] = _ANCHOR_MASK_T_UNSET
+            self._f["anchor_mask_t"][start_idx:end] = amt.astype("uint8", copy=False)
         # Optional debug datasets (only when the generator logged them); create
         # lazily on the first batch that carries them.
         for key, dt in _DEBUG_DTYPES.items():
@@ -170,6 +219,9 @@ class ClipLibraryData:
     target_vel: torch.Tensor     # [N, T, 3] ramped (vx, vy, wz) command; empty if absent
     terrain_id: torch.Tensor     # [N] int32 manifest id (-1 flat); empty if absent
     terrain_type_code: torch.Tensor  # [N] uint8 index into terrain_type_names; empty if absent
+    anchor_mask: torch.Tensor    # [N] uint8 root-DOF FREE/FIXED bitmask; empty (=> legacy) if absent
+    clip_len: torch.Tensor       # [N] int32 real length before padding; empty (=> full T) if absent
+    anchor_mask_t: torch.Tensor  # [N, T] uint8 per-STEP anchor mask (box clips); empty if absent
     meta: dict
     attrs: dict
 
@@ -180,6 +232,48 @@ class ClipLibraryData:
     @property
     def num_steps(self) -> int:
         return self.y_des.shape[1]
+
+    def anchor_mask_or_legacy(self, device: str | torch.device | None = None) -> torch.Tensor:
+        """Per-clip anchor bitmask ``[N]`` uint8; a full legacy-filled tensor if absent.
+
+        A pre-mask library carries no ``anchor_mask`` dataset (loaded as an empty
+        tensor); such clips re-anchor exactly as before, so they map to
+        ``_ANCHOR_MASK_LEGACY``.  This is the single place that interpretation lives.
+        """
+        dev = device if device is not None else self.anchor_mask.device
+        if self.anchor_mask.numel() == 0:
+            return torch.full((self.num_clips,), _ANCHOR_MASK_LEGACY, dtype=torch.uint8, device=dev)
+        return self.anchor_mask.to(dev)
+
+    def clip_len_or_full(self, device: str | torch.device | None = None) -> torch.Tensor:
+        """Per-clip real length ``[N]`` (long); a full ``num_steps`` tensor if the dataset is absent.
+
+        A library written before ``clip_len`` existed loads it empty; those clips are treated as
+        full-length (no early clip-end), i.e. exactly the previous behavior.  Single interpretation
+        point so consumers always get a valid per-clip length.
+        """
+        dev = device if device is not None else self.clip_len.device
+        if self.clip_len.numel() == 0:
+            return torch.full((self.num_clips,), self.num_steps, dtype=torch.long, device=dev)
+        return self.clip_len.to(dev).long()
+
+    def anchor_mask_per_step(self, device: str | torch.device | None = None) -> torch.Tensor:
+        """Per-clip-per-step anchor mask ``[N, T]`` uint8.
+
+        Uses the per-step ``anchor_mask_t`` dataset if present (box clips that vary
+        anchoring by segment); otherwise broadcasts the per-clip mask
+        (:meth:`anchor_mask_or_legacy`) across all ``T`` steps.  Even when the dataset is
+        present, any ``255`` sentinel (clips that carried no per-step mask) falls back to
+        that clip's per-clip mask -- so a MIXED library (some box, some flat) is correct.
+        Single interpretation point so the RL always sees a per-step mask.
+        """
+        dev = device if device is not None else self.anchor_mask.device
+        per_clip = self.anchor_mask_or_legacy(dev)                     # [N]
+        if self.anchor_mask_t.numel() == 0:
+            return per_clip[:, None].expand(self.num_clips, self.num_steps).contiguous()
+        amt = self.anchor_mask_t.to(dev)                               # [N, T]
+        unset = amt == _ANCHOR_MASK_T_UNSET
+        return torch.where(unset, per_clip[:, None].expand_as(amt), amt).contiguous()
 
 
 def load_clip_library(
@@ -213,6 +307,9 @@ def load_clip_library(
                 tensors[key] = torch.from_numpy(f[key][...]).to(device)
             else:
                 tensors[key] = torch.empty(0, device=device)
+        # Optional per-step anchor mask [N, T] (empty for libraries without it).
+        tensors["anchor_mask_t"] = (torch.from_numpy(f["anchor_mask_t"][...]).to(device)
+                                    if "anchor_mask_t" in f else torch.empty(0, device=device))
         attrs = {}
         meta = {}
         meta_keys = {

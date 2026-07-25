@@ -25,8 +25,8 @@ import yaml
 from dataclasses import dataclass
 import math
 import numpy as np
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.manager_base import ManagerBase
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.sagittal_reflector import (
+from motion_gen.manager_base import ManagerBase
+from motion_gen.sagittal_reflector import (
     NamedReflector,
     SagittalReflectionConfig,
 )

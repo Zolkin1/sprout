@@ -68,7 +68,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg  # no
 from isaaclab.sim import SimulationCfg, SimulationContext  # noqa: E402
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR  # noqa: E402
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (  # noqa: E402
+from motion_gen.clips.clip_io import (  # noqa: E402
     group_clips_by_terrain,
     load_clip_library,
 )
@@ -125,6 +125,25 @@ def _print_summary(lib, importer, env_tid) -> None:
     """Per-terrain table + loud flags for id mismatches between clips and tiles."""
     manifest = {int(m["terrain_id"]): m for m in lib.attrs["terrain_manifest"]}
     groups = group_clips_by_terrain(lib)
+
+    def _step_hd(m: dict) -> str:
+        """``riser/tread`` for a stair tile, whichever manifest schema it uses.
+
+        LEGACY tiles carry ``dims`` (the generator re-derived the geometry RL-side); tiles-then-clips tiles
+        carry explicit ``overlays`` instead, so the step size is measured off the narrow tread boxes -- the
+        same width test (``size_x <= 1.5 * min``) the rest of the pipeline uses to tell treads from platforms.
+        """
+        if "dims" in m:
+            return f"{m['dims']['h']:.2f}/{m['dims']['d']:.2f}"
+        ov = m.get("overlays") or []
+        if not ov:
+            return "-"
+        sx = [o["size_xyz"][0] for o in ov]
+        treads = [o for o in ov if o["size_xyz"][0] <= 1.5 * min(sx)]
+        tops = sorted({round(o["base_z"] + o["size_xyz"][2], 4) for o in treads})
+        if len(tops) < 2:
+            return f"box h={max(o['base_z'] + o['size_xyz'][2] for o in ov):.2f}"
+        return f"{tops[1] - tops[0]:.2f}/{min(o['size_xyz'][0] for o in treads):.2f}"
     layout = importer._layout
     cell_ids = set(int(t) for t in torch.unique(layout.tile_terrain_id).tolist())
     clip_ids = set(int(t) for t in groups)
@@ -144,7 +163,7 @@ def _print_summary(lib, importer, env_tid) -> None:
         else:
             m = manifest[tid]
             print(f"{tid:>8} {m['type']:>11} {nclip:>7} {nenv:>6} {m['size_x']:>7.2f} {m['size_y']:>7.2f} "
-                  f"{m['dims']['h']:.2f}/{m['dims']['d']:.2f}".rjust(12))
+                  f"{_step_hd(m):>12}")
 
     no_clip = sorted(cell_ids - clip_ids)
     no_cell = sorted(clip_ids - cell_ids)
@@ -211,10 +230,7 @@ def main() -> None:
     tid_list = env_tid.tolist()
     names = lib.meta["pos_output_names"]
     type_code = torch.tensor([importer.terrain_type_code.get(t, 1) for t in tid_list], device=device)
-    csize_y = torch.tensor([importer.clip_size_y.get(t, 0.0) for t in tid_list], device=device)
-    clip_y_center = torch.where(type_code == 0, torch.zeros_like(csize_y), 0.5 * csize_y)   # flat -> 0
-    world_pos = clip_frame_origin(importer.env_cell_corner, importer.env_cell_center,
-                                  clip_y_center, importer.env_clip_x_offset)               # [E,3]
+    world_pos = clip_frame_origin(importer.env_cell_corner, importer.env_clip_x_offset)    # [E,3]
 
     # Flat clips (terrain_id -1) WANDER (they sample lateral/yaw -> turning walks
     # up to tens of metres), and their bbox is not centered on the clip's local

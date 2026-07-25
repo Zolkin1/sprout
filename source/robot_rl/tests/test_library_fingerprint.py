@@ -7,7 +7,7 @@ The fingerprint must be: deterministic, independent of the absolute path
 layout change, and report accurate per-skill counts.
 """
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_fingerprint import (
+from motion_gen.library_fingerprint import (
     discover_skill_folders,
     fingerprint_library,
     fingerprint_skill_folders,

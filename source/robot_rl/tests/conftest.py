@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_manager import TrajectoryManager
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.library_manager import LibraryManager
+from motion_gen.trajectory_manager import TrajectoryManager
+from motion_gen.library_manager import LibraryManager
 
 TEST_DATA = Path(__file__).parent / "test_data"
 STANDING_YAML = str(TEST_DATA / "standing.yaml")

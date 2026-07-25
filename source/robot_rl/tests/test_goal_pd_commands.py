@@ -13,7 +13,7 @@ import math
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.guidance import (
+from motion_gen.guidance_math import (
     goal_pd_commands,
     guidance_pd_commands,
 )

@@ -24,9 +24,16 @@ import math
 
 import torch
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
+from motion_gen.world_lift import (
     ego_placement,
+    ego_placement_masked,
+    anchor_mask_from_free,
+    anchor_mask_free_names,
     _yaw_from_quat,
+    _ANCHOR_MASK_LEGACY,
+    _ANCHOR_MASK_FLAT,
+    _ANCHOR_MASK_STAIRS,
+    _ANCHOR_MASK_SLOPE,
 )
 
 DEVICE = "cpu"
@@ -191,3 +198,120 @@ def test_reanchor_roundtrip_is_planar_noop():
     assert torch.allclose(lifted_pos, target_pos, atol=1e-5)
     assert torch.allclose(_wrap(_yaw_from_quat(lifted_quat) - _yaw_from_quat(target_quat)),
                           torch.zeros(n), atol=1e-5)
+
+
+# ----------------------------------------------------------------------
+# Per-clip anchor mask (ego_placement_masked).
+# ----------------------------------------------------------------------
+
+def _random_inputs(n, seed):
+    torch.manual_seed(seed)
+    base_pos_cf = torch.randn(n, 3, device=DEVICE) * 2.0
+    base_ori_cf = _quat_from_euler(
+        torch.empty(n).uniform_(-0.4, 0.4),
+        torch.empty(n).uniform_(-0.4, 0.4),
+        torch.empty(n).uniform_(-math.pi, math.pi),
+    )
+    target_pos = torch.randn(n, 3, device=DEVICE) * 5.0
+    target_quat = _quat_from_euler(
+        torch.empty(n).uniform_(-0.4, 0.4),
+        torch.empty(n).uniform_(-0.4, 0.4),
+        torch.empty(n).uniform_(-math.pi, math.pi),
+    )
+    return base_pos_cf, base_ori_cf, target_pos, target_quat
+
+
+def test_mask_named_constants_bit_patterns():
+    """The named masks encode exactly the intended FREE DOF sets."""
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_LEGACY)) == {"x", "y", "z", "yaw"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_FLAT)) == {"x", "y", "yaw"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_STAIRS)) == {"y"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_SLOPE)) == {"x", "y"}
+    assert (_ANCHOR_MASK_LEGACY, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_SLOPE) == (39, 35, 2, 3)
+
+
+def test_masked_legacy_equivalence():
+    """Legacy mask + zero cell anchor reproduces ego_placement exactly (z-change guard)."""
+    n = 32
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=10)
+    ref_pos, ref_quat = ego_placement(base_pos_cf, base_ori_cf, target_pos, target_quat)
+    m_pos, m_quat = ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=torch.full((n,), _ANCHOR_MASK_LEGACY, dtype=torch.uint8),
+        cell_anchor_pos=torch.zeros(n, 3),
+    )
+    assert torch.allclose(m_pos, ref_pos, atol=1e-6)
+    assert torch.allclose(m_quat, ref_quat, atol=1e-6)
+    # And a scalar-int mask broadcasts identically.
+    s_pos, s_quat = ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=_ANCHOR_MASK_LEGACY, cell_anchor_pos=torch.zeros(n, 3),
+    )
+    assert torch.allclose(s_pos, ref_pos, atol=1e-6) and torch.allclose(s_quat, ref_quat, atol=1e-6)
+
+
+def test_flat_mask_fixes_z_to_clip():
+    """FLAT mask: xy/yaw hit the robot, but z is the clip's own base z (not robot z)."""
+    n = 24
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=11)
+    world_pos, world_quat = ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=_ANCHOR_MASK_FLAT, cell_anchor_pos=torch.zeros(n, 3),
+    )
+    lifted_pos, lifted_quat = _lift_base(world_pos, world_quat, base_pos_cf, base_ori_cf)
+    # FREE x, y, yaw -> reproduce the robot's planar pose + heading.
+    assert torch.allclose(lifted_pos[:, :2], target_pos[:, :2], atol=1e-5)
+    assert torch.allclose(_wrap(_yaw_from_quat(lifted_quat) - _yaw_from_quat(target_quat)),
+                          torch.zeros(n), atol=1e-5)
+    # FIXED z (cell z = 0) -> lifted z is the clip's absolute base z, not the robot z.
+    assert torch.allclose(lifted_pos[:, 2], base_pos_cf[:, 2], atol=1e-5)
+
+
+def test_stairs_mask_pins_to_cell_except_y():
+    """STAIRS mask: only y re-anchors to the robot; x/z/yaw pinned to the terrain cell."""
+    n = 20
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=12)
+    cell_pos = torch.randn(n, 3, device=DEVICE) * 3.0
+    cell_yaw = torch.empty(n).uniform_(-math.pi, math.pi)
+    world_pos, world_quat = ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=_ANCHOR_MASK_STAIRS, cell_anchor_pos=cell_pos, cell_anchor_yaw=cell_yaw,
+    )
+    lifted_pos, _ = _lift_base(world_pos, world_quat, base_pos_cf, base_ori_cf)
+    # Placement heading is the fixed cell yaw; x/z origin is the cell anchor.
+    assert torch.allclose(_wrap(_yaw_from_quat(world_quat) - cell_yaw), torch.zeros(n), atol=1e-5)
+    assert torch.allclose(world_pos[:, 0], cell_pos[:, 0], atol=1e-6)
+    assert torch.allclose(world_pos[:, 2], cell_pos[:, 2], atol=1e-6)
+    # FREE y still lands on the robot y; x/z ride the clip motion off the cell.
+    assert torch.allclose(lifted_pos[:, 1], target_pos[:, 1], atol=1e-5)
+    assert torch.allclose(lifted_pos[:, 2], cell_pos[:, 2] + base_pos_cf[:, 2], atol=1e-5)
+
+
+def test_masked_placement_is_pure_yaw_for_every_mask():
+    """The returned quaternion is a ground frame (x==y==0) regardless of the mask."""
+    n = 12
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=13)
+    for mask in (_ANCHOR_MASK_LEGACY, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_SLOPE):
+        _, world_quat = ego_placement_masked(
+            base_pos_cf, base_ori_cf, target_pos, target_quat,
+            anchor_mask=mask, cell_anchor_pos=torch.randn(n, 3),
+            cell_anchor_yaw=torch.empty(n).uniform_(-math.pi, math.pi),
+        )
+        assert torch.allclose(world_quat[:, :2], torch.zeros(n, 2), atol=1e-6)
+        assert torch.allclose(torch.linalg.norm(world_quat, dim=-1), torch.ones(n), atol=1e-6)
+
+
+def test_free_roll_pitch_rejected():
+    """Free roll/pitch is reserved (breaks the pure-yaw invariant) and must raise."""
+    n = 4
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=14)
+    for bad in ("roll", "pitch"):
+        mask = anchor_mask_from_free({"x", "y", "yaw", bad})
+        try:
+            ego_placement_masked(
+                base_pos_cf, base_ori_cf, target_pos, target_quat,
+                anchor_mask=mask, cell_anchor_pos=torch.zeros(n, 3),
+            )
+            assert False, f"expected free '{bad}' to raise"
+        except ValueError:
+            pass

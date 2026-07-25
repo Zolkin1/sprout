@@ -15,7 +15,7 @@ from .dataset import (
     resolve_term_slice,
     snap_windows,
 )
-from .fk import FKChain
+from motion_gen.fk import FKChain
 from .flow import (
     fk_consistency_terms,
     flow_matching_loss,

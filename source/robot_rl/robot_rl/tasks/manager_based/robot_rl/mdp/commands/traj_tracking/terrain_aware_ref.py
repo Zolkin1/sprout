@@ -2,6 +2,11 @@
 
 """Terrain-aware override for trajectory reference-frame snaps.
 
+TODO(foot-ref-frame removal / "scope 2"): this whole module is part of the foot-stance
+reference-frame paradigm that is slated for deletion (clips should be world- or ego/mask-anchored
+only).  It is used ONLY by the online CLF commands via base_trajectory_cmd.get_measured_outputs;
+delete it together with them.  See the TODO in base_trajectory_cmd.py __init__.
+
 The base trajectory command keeps a per-env reference-frame pose
 (``cmd.ref_poses``) and re-anchors it to the current body-frame pose at
 every domain transition where the new ref frame is in contact.  On flat

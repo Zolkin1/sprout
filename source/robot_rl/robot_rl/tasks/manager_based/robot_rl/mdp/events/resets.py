@@ -9,8 +9,9 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_from_euler_xyz, quat_apply, quat_inv
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift import (
+from motion_gen.world_lift import (
     lift_position,
+    _yaw_from_quat,
 )
 
 if TYPE_CHECKING:
@@ -286,8 +287,13 @@ def reset_on_motion_sequence(
     if cmd.cfg.random_start_phase:
         # Leave at least random_start_min_remaining_s of clip after the start.
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        hi = max(1, num_steps - margin)
-        start_step = torch.randint(0, hi, (k,), device=device)
+        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
+        # so a short clip's random start doesn't land in (or past) its padding tail.  clip_len lives on
+        # the clip-library device (may be CPU via --clip_device), so index it with clip_id on THAT
+        # device, then move the result to the env device (device-safe gather; cf. flat_ids below).
+        clip_len = cmd.manager.clip_len
+        hi = (clip_len[clip_id.to(clip_len.device)].to(device) - margin).clamp(min=1)
+        start_step = (torch.rand(k, device=device) * hi.float()).long()
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
@@ -369,6 +375,12 @@ def _commit_clip_reset(
     cmd.start_step[env_ids] = start_step
     cmd.clip_world_pos[env_ids] = world_pos
     cmd.clip_world_quat[env_ids] = world_quat
+    # Reset-time placement = the clip's terrain-cell anchor. FIXED anchor-mask DOFs
+    # pin to this on the ego re-anchor cadence (so terrain-fixed axes stay put while
+    # FREE axes track the robot). For flat, world_pos.z is the env-origin ground, so
+    # a FIXED-z clip keeps its natural height above the ground rather than the robot's.
+    cmd._reset_world_pos[env_ids] = world_pos
+    cmd._reset_world_yaw[env_ids] = _yaw_from_quat(world_quat)
     cmd._ego_mask[env_ids] = ego_mask
     cmd._snap_mask[env_ids] = snap_mask
 
@@ -448,7 +460,7 @@ def reset_on_terrain_motion_sequence(
         base_frame_name: Trajectory base frame (must match the command cfg).
         asset_cfg: Robot asset config.
     """
-    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+    from motion_gen.clips.clip_io import (
         group_clips_by_terrain,
     )
     from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
@@ -481,26 +493,25 @@ def reset_on_terrain_motion_sequence(
     clip_id = sample_terrain_clips(env_tid, groups)
     if cmd.cfg.random_start_phase:
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        hi = max(1, num_steps - margin)
-        start_step = torch.randint(0, hi, (k,), device=device)
+        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
+        # so a short clip's random start doesn't land in (or past) its padding tail.  clip_len lives on
+        # the clip-library device (may be CPU via --clip_device), so index it with clip_id on THAT
+        # device, then move the result to the env device (device-safe gather; cf. flat_ids below).
+        clip_len = cmd.manager.clip_len
+        hi = (clip_len[clip_id.to(clip_len.device)].to(device) - margin).clamp(min=1)
+        start_step = (torch.rand(k, device=device) * hi.float()).long()
     else:
         start_step = torch.zeros(k, dtype=torch.long, device=device)
 
     # 2. Place each clip on its tile (identity heading -- clips are baked axis-aligned
     #    with the staircase, so alignment is a pure translation). Terrain / transition
-    #    clips sit on the tile centerline (clip_y_center = size_y/2); flat clips at the
-    #    corner (0), then re-centered below.
+    #    clips are baked in the tile-LOCAL corner frame, so they go straight on the
+    #    corner; flat clips land there too and are re-centered by bbox below.
     world_quat = torch.zeros(k, 4, device=device)
     world_quat[:, 3] = 1.0  # identity (xyzw, w last)
     is_flat = env_tid == -1
-    csize_y = torch.tensor(
-        [float(importer.clip_size_y.get(int(t), 0.0)) for t in env_tid.tolist()], device=device
-    )
-    clip_y_center = torch.where(is_flat, torch.zeros_like(csize_y), 0.5 * csize_y)
     world_pos = clip_frame_origin(
         importer.env_cell_corner[env_ids],
-        importer.env_cell_center[env_ids],
-        clip_y_center,
         importer.env_clip_x_offset[env_ids],
     )
 
@@ -519,15 +530,17 @@ def reset_on_terrain_motion_sequence(
         world_pos[is_flat, 0] = cell_center_flat[:, 0] - bbox_center[:, 0]
         world_pos[is_flat, 1] = cell_center_flat[:, 1] - bbox_center[:, 1]
 
-    # 3-5. Ego re-anchor (clip re-placement) is flat-only -- a terrain clip re-anchored
-    #      onto the robot root would decouple from the physical staircase. But the FM
-    #      SNAP (re-inference) event is emitted on ALL non-flat envs too (snap_mask), so
-    #      the FM still gets a training window on stairs: the stair clip stays
-    #      world-locked while the recorder marks the snap and the dataset ego-anchors the
-    #      recorded clip future to the robot base. Then compute + write the spawn.
+    # 3-5. Ego re-anchor (clip re-placement) applies to ALL envs -- the re-placement is
+    #      per-DOF MASKED (see MotionSequenceCommand._reanchor_clip_ids), so a terrain env
+    #      re-anchors only its FREE axes onto the robot while FIXED axes stay pinned to the
+    #      terrain cell: a stair clip snaps only y (keeping x/z/yaw on the treads), a box
+    #      clip follows its per-step mask (y-free-pinned approach/jump, ego recovery). So
+    #      terrain no longer detaches, and every env is partial-ego with probability
+    #      ego_frac. The FM snap still fires on ALL non-flat envs regardless (snap_mask), so
+    #      even a non-ego terrain env gets an FM training window. Then compute + write the spawn.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
-    ego_mask = is_flat & (torch.rand(k, device=device) < ego_frac)
-    snap_mask = ego_mask | ~is_flat  # flat: ego only; stair/transition: always snap
+    ego_mask = torch.rand(k, device=device) < ego_frac
+    snap_mask = ego_mask | ~is_flat  # non-flat: always snap (even when not ego this episode)
     _commit_clip_reset(
         cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask, snap_mask
     )

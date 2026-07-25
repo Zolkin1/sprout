@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clips.clip_io import (
+from motion_gen.clips.clip_io import (
     load_clip_library,
 )
 
