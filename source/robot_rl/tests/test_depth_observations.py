@@ -11,10 +11,14 @@ play task instead.
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from isaaclab.managers import SceneEntityCfg
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.events.depth import randomize_camera_extrinsics
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import normalize_depth
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import DepthNoiseCfg, DepthNoiser
 
@@ -204,6 +208,90 @@ def test_envs_are_blurred_independently():
     data[1] = 1.0
     out = noiser(data).reshape(2, H, W)
     assert out[0].abs().max().item() == pytest.approx(0.0, abs=1e-6)
+
+
+##
+# Extrinsics randomization
+##
+
+class _FakeSensor:
+    """Minimal stand-in exposing the offset buffers the extrinsics event writes."""
+
+    def __init__(self, num_envs: int, device: str = "cpu"):
+        self._offset_pos = torch.zeros(num_envs, 3, device=device)
+        # Identity rotation in (x, y, z, w).
+        self._offset_quat = torch.tensor([[0.0, 0.0, 0.0, 1.0]], device=device).repeat(num_envs, 1)
+        self.device = device
+        self._view = SimpleNamespace(count=num_envs)
+
+
+def _fake_env(sensor, name="cam"):
+    """Env stand-in whose ``scene`` resolves the sensor by name."""
+    return SimpleNamespace(scene={name: sensor})
+
+
+def test_extrinsics_perturbs_within_bounds():
+    """Uniform sampling stays inside the per-axis position and rotation bounds."""
+    sensor = _FakeSensor(256)
+    randomize_camera_extrinsics(
+        _fake_env(sensor), None, SceneEntityCfg("cam"),
+        pos_range=(0.01, 0.02, 0.03), rot_range=(0.03, 0.03, 0.03),
+    )
+    bound = torch.tensor([0.01, 0.02, 0.03])
+    assert (sensor._offset_pos.abs() <= bound + 1e-6).all()
+    # A +-0.03 rad rotation about any axis keeps the quaternion's w near 1.
+    assert (sensor._offset_quat[:, 3] > math.cos(0.03 * 1.5)).all()
+    torch.testing.assert_close(
+        sensor._offset_quat.norm(dim=-1), torch.ones(256), atol=1e-5, rtol=0
+    )
+
+
+def test_extrinsics_varies_per_environment():
+    """Each env gets its own mount error, not one shared draw."""
+    sensor = _FakeSensor(64)
+    randomize_camera_extrinsics(_fake_env(sensor), None, SceneEntityCfg("cam"))
+    assert sensor._offset_pos.std(dim=0).min() > 0.0
+    assert sensor._offset_quat[:, :3].std(dim=0).min() > 0.0
+
+
+def test_extrinsics_does_not_compound_across_resets():
+    """Successive resets perturb around the NOMINAL pose, not the last sample.
+
+    Without the snapshot the mount would random-walk away over an episode's worth of
+    resets, which is how the intrinsics event is written too.
+    """
+    sensor = _FakeSensor(128)
+    cfg = SceneEntityCfg("cam")
+    for _ in range(40):
+        randomize_camera_extrinsics(
+            _fake_env(sensor), None, cfg, pos_range=(0.01, 0.01, 0.01)
+        )
+    assert (sensor._offset_pos.abs() <= 0.01 + 1e-6).all()
+    torch.testing.assert_close(sensor._nominal_offset_pos, torch.zeros(128, 3))
+
+
+def test_extrinsics_scoped_to_given_envs():
+    """Resetting a subset leaves the other envs' mount pose untouched."""
+    sensor = _FakeSensor(4)
+    randomize_camera_extrinsics(
+        _fake_env(sensor), torch.tensor([0, 2]), SceneEntityCfg("cam")
+    )
+    assert sensor._offset_pos[0].abs().sum() > 0.0
+    assert sensor._offset_pos[2].abs().sum() > 0.0
+    torch.testing.assert_close(sensor._offset_pos[1], torch.zeros(3))
+    torch.testing.assert_close(sensor._offset_pos[3], torch.zeros(3))
+
+
+def test_extrinsics_zero_range_is_a_no_op():
+    """Zero bounds leave the nominal pose exactly in place."""
+    sensor = _FakeSensor(8)
+    randomize_camera_extrinsics(
+        _fake_env(sensor), None, SceneEntityCfg("cam"),
+        pos_range=(0.0, 0.0, 0.0), rot_range=(0.0, 0.0, 0.0),
+    )
+    torch.testing.assert_close(sensor._offset_pos, torch.zeros(8, 3))
+    expected = torch.tensor([[0.0, 0.0, 0.0, 1.0]]).repeat(8, 1)
+    torch.testing.assert_close(sensor._offset_quat, expected)
 
 
 ##

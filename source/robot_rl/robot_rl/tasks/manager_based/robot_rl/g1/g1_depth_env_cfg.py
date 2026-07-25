@@ -88,6 +88,10 @@ class _CameraSpec(NamedTuple):
     aperture, so only their RATIO matters -- the absolute unit cancels, and quoting the
     datasheet's mm keeps the number traceable even though IsaacLab documents these
     fields in cm.  The diagonal FOV is not set directly; it follows from H and V.
+
+    The datasheet FOV is the PHYSICAL cone.  Rays are cast over the smaller
+    :attr:`effective_fov_h_deg` / :attr:`effective_fov_v_deg`, since depth quality
+    falls off towards the frame edge -- see :attr:`fov_crop_deg`.
     """
 
     pos: tuple[float, float, float]
@@ -97,13 +101,31 @@ class _CameraSpec(NamedTuple):
     focal_length_mm: float
     """Lens focal length, from the datasheet."""
     fov_h_deg: float
-    """Horizontal field of view."""
+    """Horizontal field of view of the physical lens."""
     fov_v_deg: float
-    """Vertical field of view."""
+    """Vertical field of view of the physical lens."""
+    fov_crop_deg: float
+    """Degrees discarded from EACH edge, so an axis loses twice this.
+
+    Real depth modules degrade towards the frame border (falling illumination, worse
+    calibration, more stereo/ToF dropout), so the outer band is not worth handing to
+    the policy.  Cropping keeps the pixel count and redistributes the same rays over
+    the trustworthy cone, which also sharpens the angular resolution.
+    """
     min_distance_m: float
     """Datasheet minimum range; nearer readings are treated as invalid."""
     max_distance_m: float
     """Range beyond which readings are clipped to the sentinel."""
+
+    @property
+    def effective_fov_h_deg(self) -> float:
+        """Horizontal FOV actually sampled, after cropping both edges."""
+        return self.fov_h_deg - 2.0 * self.fov_crop_deg
+
+    @property
+    def effective_fov_v_deg(self) -> float:
+        """Vertical FOV actually sampled, after cropping both edges."""
+        return self.fov_v_deg - 2.0 * self.fov_crop_deg
 
 
 # PLACEHOLDER extrinsics (pos / pitch), in the torso_link frame.  The intent is a near
@@ -115,8 +137,9 @@ _NEAR = _CameraSpec(
     pos=(0.10, 0.0, 0.05),
     pitch_deg=75.0,
     focal_length_mm=2.2,
-    fov_h_deg=110.0,
-    fov_v_deg=80.0,      # -> 117.8 deg diagonal
+    fov_h_deg=110.0,     # physical 110 x 80 -> 117.8 deg diagonal
+    fov_v_deg=80.0,
+    fov_crop_deg=5.0,    # sampled 100 x 70 -> 108.2 deg diagonal
     min_distance_m=0.10,
     max_distance_m=8.0,
 )
@@ -124,8 +147,9 @@ _FAR = _CameraSpec(
     pos=(0.06, 0.0, 0.38),
     pitch_deg=35.0,
     focal_length_mm=4.0,
-    fov_h_deg=80.0,
-    fov_v_deg=52.0,      # -> 88.3 deg diagonal
+    fov_h_deg=80.0,      # physical 80 x 52 -> 88.3 deg diagonal
+    fov_v_deg=52.0,
+    fov_crop_deg=5.0,    # sampled 70 x 42 -> 77.2 deg diagonal
     min_distance_m=0.15,
     max_distance_m=12.0,
 )
@@ -202,10 +226,12 @@ def _make_depth_camera(spec: _CameraSpec) -> MultiMeshRayCasterCameraCfg:
         data_types=["distance_to_image_plane"],
         max_distance=spec.max_distance_m,
         depth_clipping_behavior="max",
+        # Apertures come from the EFFECTIVE (cropped) FOV: the same 30x26 rays are
+        # spread over the trustworthy cone instead of out to the degraded border.
         pattern_cfg=patterns.PinholeCameraPatternCfg(
             focal_length=spec.focal_length_mm,
-            horizontal_aperture=_aperture(spec.focal_length_mm, spec.fov_h_deg),
-            vertical_aperture=_aperture(spec.focal_length_mm, spec.fov_v_deg),
+            horizontal_aperture=_aperture(spec.focal_length_mm, spec.effective_fov_h_deg),
+            vertical_aperture=_aperture(spec.focal_length_mm, spec.effective_fov_v_deg),
             width=_DEPTH_W,
             height=_DEPTH_H,
         ),
@@ -292,9 +318,36 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
     policy: PolicyCfg = PolicyCfg()
 
 
+# Mount tolerance and calibration error, from legged_locomotion_rl's PoseErrorCfg:
+# +-1 cm per axis on position, +-0.03 rad (~1.7 deg) per axis on orientation.
+_EXTRINSICS_POS_RANGE = (0.01, 0.01, 0.01)
+_EXTRINSICS_ROT_RANGE = (0.03, 0.03, 0.03)
+
+
 @configclass
 class G1TeacherTerrainDepthEventsCfg(G1TeacherEventsCfg):
-    """Teacher events + per-camera intrinsics and noise randomisation on reset."""
+    """Teacher events + per-camera extrinsics, intrinsics and noise DR on reset."""
+
+    randomize_camera_extrinsics_near = EventTerm(
+        func=mdp.randomize_camera_extrinsics,
+        mode="reset",
+        params={
+            "sensor_cfg": SceneEntityCfg("depth_camera_near"),
+            "pos_range": _EXTRINSICS_POS_RANGE,
+            "rot_range": _EXTRINSICS_ROT_RANGE,
+            "distribution": "uniform",
+        },
+    )
+    randomize_camera_extrinsics_far = EventTerm(
+        func=mdp.randomize_camera_extrinsics,
+        mode="reset",
+        params={
+            "sensor_cfg": SceneEntityCfg("depth_camera_far"),
+            "pos_range": _EXTRINSICS_POS_RANGE,
+            "rot_range": _EXTRINSICS_ROT_RANGE,
+            "distribution": "uniform",
+        },
+    )
 
     resample_depth_noise_near = EventTerm(
         func=mdp.resample_depth_noise,
@@ -422,6 +475,8 @@ def _apply_depth_play_trims(cfg) -> None:
     cfg.events.resample_depth_noise_far = None
     cfg.events.randomize_camera_intrinsics_near = None
     cfg.events.randomize_camera_intrinsics_far = None
+    cfg.events.randomize_camera_extrinsics_near = None
+    cfg.events.randomize_camera_extrinsics_far = None
     cfg.scene.depth_camera_near.debug_vis = True
     cfg.scene.depth_camera_far.debug_vis = True
 

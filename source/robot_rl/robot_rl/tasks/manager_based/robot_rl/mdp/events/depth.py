@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils import math as math_utils
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import (
     DepthNoiseCfg,
@@ -104,6 +105,60 @@ def randomize_camera_intrinsics(
     # ``RayCasterCamera.set_intrinsic_matrices(matrices, focal_length=1.0, env_ids=None)``.
     # Passing it positionally binds it to ``focal_length`` instead.
     sensor.set_intrinsic_matrices(K, env_ids=env_ids)
+
+
+def randomize_camera_extrinsics(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    sensor_cfg: SceneEntityCfg,
+    pos_range: tuple[float, float, float] = (0.01, 0.01, 0.01),
+    rot_range: tuple[float, float, float] = (0.03, 0.03, 0.03),
+    distribution: Literal["uniform", "gaussian"] = "uniform",
+):
+    """Perturb a camera's MOUNT pose on reset -- bracket tolerance and calibration error.
+
+    Usually the dominant sim-to-real gap for a body-mounted camera: the lens is never
+    exactly where the CAD says, and the frame it is calibrated in is never exactly the
+    link frame.  Restores the equivalent of ``legged_locomotion_rl``'s
+    ``SelfIntersectionRayCasterCfg.PoseErrorCfg``, which has no counterpart in
+    IsaacLab's :class:`MultiMeshRayCasterCamera`.
+
+    Writes the sensor's per-environment offset buffers directly, since the offset in the
+    config is a single nominal pose shared by every env.  The nominal is snapshotted on
+    first use so successive resets perturb around it rather than compounding.
+
+    Args:
+        env: The environment instance.
+        env_ids: Environment indices to randomize. If ``None``, all envs.
+        sensor_cfg: Scene entity pointing at the depth camera.
+        pos_range: Per-axis translation bound (m) in the MOUNT link's frame. Uniform
+            treats it as a symmetric bound; gaussian treats it as one standard deviation.
+        rot_range: Per-axis rotation bound (rad) about the CAMERA's own axes, as XYZ
+            Euler angles, interpreted as for ``pos_range``.
+        distribution: ``"uniform"`` or ``"gaussian"``.
+    """
+    sensor = env.scene[sensor_cfg.name]
+
+    if env_ids is None:
+        env_ids = torch.arange(sensor._view.count, device=sensor.device)
+    n = len(env_ids)
+
+    if not hasattr(sensor, "_nominal_offset_pos"):
+        sensor._nominal_offset_pos = sensor._offset_pos.clone()
+        sensor._nominal_offset_quat = sensor._offset_quat.clone()
+
+    # Sample in [-1, 1] (or N(0, 1)) then scale per axis, so each axis gets its own bound.
+    unit_pos = _sample_noise(n, 3, -1.0, 1.0, distribution, sensor.device)
+    delta_pos = unit_pos * torch.tensor(pos_range, device=sensor.device)
+    sensor._offset_pos[env_ids] = sensor._nominal_offset_pos[env_ids] + delta_pos
+
+    unit_rot = _sample_noise(n, 3, -1.0, 1.0, distribution, sensor.device)
+    euler = unit_rot * torch.tensor(rot_range, device=sensor.device)
+    # (x, y, z, w) in IsaacLab 3.0, matching OffsetCfg.rot and quat_mul.
+    delta_quat = math_utils.quat_from_euler_xyz(euler[:, 0], euler[:, 1], euler[:, 2])
+    sensor._offset_quat[env_ids] = math_utils.quat_mul(
+        sensor._nominal_offset_quat[env_ids], delta_quat
+    )
 
 
 def _sample_noise(n: int, dim: int, low: float, high: float, distribution: str, device) -> torch.Tensor:

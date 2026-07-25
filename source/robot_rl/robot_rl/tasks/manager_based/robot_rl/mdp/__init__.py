@@ -21,7 +21,11 @@ from .commands import *  # noqa: F401, F403
 from .events.init_config import *  # noqa: F401, F403
 from .events.physical_randomization import *  # noqa: F401, F403
 from .events.resets import *  # noqa: F401, F403
-from .events.depth import randomize_camera_intrinsics, resample_depth_noise  # noqa: F401
+from .events.depth import (  # noqa: F401
+    randomize_camera_extrinsics,
+    randomize_camera_intrinsics,
+    resample_depth_noise,
+)
 
 
 def __getattr__(name):
