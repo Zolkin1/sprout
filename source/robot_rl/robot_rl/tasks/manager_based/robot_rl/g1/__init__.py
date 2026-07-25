@@ -80,49 +80,6 @@ if not _registered:
     )
 
     ## =========================================
-    # Walking + Depth Camera (flat scan / image)
-    ## =========================================
-    gym.register(
-        id="G1-walking-clf-depth-scan",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-image",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-scan-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-image-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    ## =========================================
     # Running Trajectory Optimization
     ## =========================================
     gym.register(
@@ -546,6 +503,51 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    ## =========================================
+    # Teacher on TERRAIN + two self-scanning depth cameras (torso-mounted).
+    # Same terrain / clip tracking as above, plus near- and far-field depth that
+    # sees the robot's own limbs.  The pelvis height scan is kept alongside.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain-depth",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-image",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthImageEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-image-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthImageEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )

@@ -1,31 +1,36 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 walking-CLF env variants with a forward-facing depth camera.
+"""Terrain teacher variants with two self-scanning depth cameras.
 
-Two flavours:
+Both cameras hang off ``torso_link`` and look forward-and-down:
 
-- :class:`G1WalkingCLFDepthScanEnvCfg` adds a flattened ``depth_scan`` term to
-  the policy observation group.
-- :class:`G1WalkingCLFDepthImageEnvCfg` removes the flattened term and instead
-  exposes the depth as an image-shape observation in its own ``depth_image``
-  group, suitable for CNN backbones.
+- ``depth_camera_near`` -- mid-torso, pitched steeply down, to see the terrain the
+  robot is about to step on.
+- ``depth_camera_far`` -- at head height, pitched shallowly, to pick up where the
+  near camera's field ends.
 
-Migration notes (vs. legged_locomotion_rl):
+Both are :class:`MultiMeshRayCasterCameraCfg` sensors that ray-cast against the
+terrain **and** against the robot's own limb meshes, so the robot occludes itself
+the way a real depth camera would see it.  See
+:mod:`~robot_rl.tasks.manager_based.robot_rl.g1.g1_self_scan` for why every limb
+needs its own ray-cast target pointed at an inner visual Xform.
 
-- The custom ``SelfIntersectionRayCasterCfg`` is replaced by IsaacLab v3.0.0-beta's
-  :class:`MultiMeshRayCasterCameraCfg`. ``RaycastTargetCfg(track_mesh_transforms=True)``
-  on the per-leg-link entries gives self-occlusion against the dynamic robot meshes.
-- ``mdp.depth_image`` no longer projects ray hits onto the forward axis manually;
-  the camera reports ``distance_to_image_plane`` natively. Our wrapper just clips
-  and applies the ``(d - offset) * scale`` normalisation.
-- ``DepthNoiseCfg`` (plane tilt + per-pixel noise + Gaussian blur + dropout) is
-  ported verbatim under ``robot_rl.tasks.manager_based.robot_rl.mdp.sensors``.
-- ``randomize_camera_intrinsics`` is ported under
-  ``robot_rl.tasks.manager_based.robot_rl.mdp.events.depth``, adapted to the
-  new :meth:`RayCasterCamera.set_intrinsic_matrices` API.
+Two flavours, mirroring the height-scan teacher's observation layout:
+
+- :class:`G1TeacherTerrainDepthEnvCfg` adds flattened ``depth_near`` / ``depth_far``
+  terms to the policy group.
+- :class:`G1TeacherTerrainDepthImageEnvCfg` instead exposes each camera as an
+  image-shaped observation in its own group, for CNN backbones.
+
+The inherited pelvis ``height_scanner`` is deliberately left in place: it still
+feeds the policy, the critic, the flow-matching conditioning
+(:mod:`robot_rl.flow_matching.dataset` requires it) and the MuJoCo sim2sim path, so
+depth is additive until a retrain replaces it.
 """
 
 from __future__ import annotations
+
+import math
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -37,41 +42,102 @@ from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
 
-from .g1_clf_tracking_base import (
-    G1ClfTrackingEventsCfg,
-    G1ClfTrackingObservationsCfg,
-    G1ClfTrackingSceneCfg,
+from .g1_self_scan import link_prim_path, self_scan_prim_paths
+from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
+from .g1_teacher_terrain_env_cfg import (
+    G1TeacherTerrainEnvCfg,
+    G1TeacherTerrainEnvCfgPlay,
+    G1TeacherTerrainSceneCfg,
 )
-from .g1_walking_clf_env_cfg import G1WalkingCLFEnvCfg
-
 
 # ---------------------------------------------------------------------------
-# Depth camera sensor
+# Camera geometry
 # ---------------------------------------------------------------------------
 
-# Pinhole intrinsics (3x3 K, flattened) — matches the legged_locomotion_rl reference.
+# Pinhole intrinsics (3x3 K, flattened) and resolution, from the
+# legged_locomotion_rl reference.  Shared by both cameras.
 _DEPTH_K = [25.9928, 0.0, 14.9936, 0.0, 27.8703, 12.9966, 0.0, 0.0, 1.0]
 _DEPTH_W, _DEPTH_H = 30, 26
-# 65° pitch-down. Reference quat in (w, x, y, z) was (0.843391, 0, 0.537300, 0);
-# IsaacLab beta's OffsetCfg.rot expects (x, y, z, w).
-_DEPTH_ROT_XYZW = (0.0, 0.537300, 0.0, 0.843391)
-_DEPTH_OFFSET = (0.153246, 0.0, 0.106799)
+
+# Both cameras mount on torso_link -- a real physics body (child of waist_pitch_joint,
+# parent of the shoulder joints), so it can host a sensor view.  head_link CANNOT: it,
+# logo_link and waist_support_link are instanceable visual-only leaves welded under
+# torso_link with no joints of their own, and all three carry the same
+# (0.0039635, 0, -0.054) translate -- a URDF-conversion artifact -- so head_link's
+# Xform is not even a reliable "head height" reference.
+_CAMERA_MOUNT = link_prim_path("torso_link")
+
+# PLACEHOLDER extrinsics, in the torso_link frame.  The intent is a near field
+# covering the ground about to be stepped on and a far field starting where the near
+# one ends; the exact offsets and pitches still need visual confirmation against a
+# rendered frame (see scripts note in the module docstring of g1_self_scan).
+_NEAR_POS = (0.10, 0.0, 0.05)
+_NEAR_PITCH_DEG = 75.0
+_FAR_POS = (0.06, 0.0, 0.38)
+_FAR_PITCH_DEG = 35.0
+
+# Depth normalisation, shared by the observation terms and the noise model (which
+# needs them to express its dropout value in normalised units).
+_DEPTH_OFFSET = 0.75
+_DEPTH_SCALE = 0.5
 
 
-def _make_depth_camera() -> MultiMeshRayCasterCameraCfg:
-    # G1's USD nests links under /Geometry/pelvis_link/<chain>. find_matching_prims
-    # matches each `/`-separated token as a standalone regex against the prim name,
-    # so `.*` does not cross hierarchy boundaries — we have to spell out the chain.
-    _LEG_PARENT = (
-        "{ENV_REGEX_NS}/Robot/Geometry/pelvis_link"
-        "/.*_hip_pitch_link/.*_hip_roll_link/.*_hip_yaw_link"
-    )
+def _pitch_down_quat_xyzw(degrees: float) -> tuple[float, float, float, float]:
+    """Rotation about the mount's y-axis, as ``(x, y, z, w)``.
+
+    ``OffsetCfg.rot`` takes ``(x, y, z, w)``, unlike the ``(w, x, y, z)`` used
+    elsewhere in IsaacLab.  Positive ``degrees`` pitches the camera's view downwards,
+    matching the legged_locomotion_rl reference (whose 65 deg pitch was
+    ``(0, 0.537300, 0, 0.843391)``).
+
+    Args:
+        degrees: Downward pitch angle.
+
+    Returns:
+        The quaternion as ``(x, y, z, w)``.
+    """
+    half = math.radians(degrees) / 2.0
+    return (0.0, math.sin(half), 0.0, math.cos(half))
+
+
+def _self_scan_targets() -> list[MultiMeshRayCasterCameraCfg.RaycastTargetCfg]:
+    """Ray-cast targets for the robot's own body -- one per moving rigid body.
+
+    ``track_mesh_transforms`` makes the sensor re-read each link's pose every update,
+    so the limbs move in the depth image.  ``is_shared`` lets the parser read each
+    mesh once and reference it across environments, which matters at 4096 envs.
+
+    Returns:
+        One target per self-scan prim path.
+    """
+    return [
+        MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
+            prim_expr=path,
+            track_mesh_transforms=True,
+            is_shared=True,
+        )
+        for path in self_scan_prim_paths()
+    ]
+
+
+def _make_depth_camera(
+    pos: tuple[float, float, float], pitch_deg: float
+) -> MultiMeshRayCasterCameraCfg:
+    """Build one torso-mounted, self-scanning depth camera.
+
+    Args:
+        pos: Offset from ``torso_link``, in its own frame.
+        pitch_deg: Downward pitch of the camera's view.
+
+    Returns:
+        The configured sensor.
+    """
     return MultiMeshRayCasterCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link",
+        prim_path=_CAMERA_MOUNT,
         update_period=1.0 / 30.0,
         offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
-            pos=_DEPTH_OFFSET,
-            rot=_DEPTH_ROT_XYZW,
+            pos=pos,
+            rot=_pitch_down_quat_xyzw(pitch_deg),
             convention="world",
         ),
         data_types=["distance_to_image_plane"],
@@ -82,42 +148,21 @@ def _make_depth_camera() -> MultiMeshRayCasterCameraCfg:
             width=_DEPTH_W,
             height=_DEPTH_H,
         ),
-        mesh_prim_paths=[
-            "/World/ground",
-            # hip_roll
-            MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
-                prim_expr="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/.*_hip_pitch_link/.*_hip_roll_link",
-                track_mesh_transforms=True,
-            ),
-            # hip_yaw
-            MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
-                prim_expr=f"{_LEG_PARENT}",
-                track_mesh_transforms=True,
-            ),
-            # knee
-            MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
-                prim_expr=f"{_LEG_PARENT}/.*_knee_link",
-                track_mesh_transforms=True,
-            ),
-            # ankle_roll
-            MultiMeshRayCasterCameraCfg.RaycastTargetCfg(
-                prim_expr=f"{_LEG_PARENT}/.*_knee_link/.*_ankle_pitch_link/.*_ankle_roll_link",
-                track_mesh_transforms=True,
-            ),
-        ],
-        debug_vis=True,
+        # A plain string entry becomes a target with track_mesh_transforms disabled,
+        # which is what we want for the static terrain mesh.
+        mesh_prim_paths=["/World/ground"] + _self_scan_targets(),
+        debug_vis=False,
     )
 
 
 def _make_depth_noise() -> DepthNoiseCfg:
-    """Factory for the ported `DepthNoiseCfg` (plane + uniform + blur + dropout).
+    """Noise parameters shared by both cameras.
 
-    Currently unused — see the explanatory note in
-    `G1WalkingCLFDepthScanObservationsCfg.PolicyCfg.depth_scan` about why
-    ``noise=None`` is set for the depth obs terms. This factory is kept ready
-    so noise can be re-enabled after the IsaacLab beta `obs_manager.py:626`
-    `ResolvableString` issue is resolved (either upstream or via a local
-    Modifier-based wrapper).
+    ``offset`` / ``scale`` must match the observation terms so the dropout value
+    lands in the same normalised units as the rest of the image.
+
+    Returns:
+        The noise configuration.
     """
     return DepthNoiseCfg(
         max_plane_deviation=0.05,
@@ -125,7 +170,12 @@ def _make_depth_noise() -> DepthNoiseCfg:
         dropout_val=0.0,
         height=_DEPTH_H,
         width=_DEPTH_W,
+        offset=_DEPTH_OFFSET,
+        scale=_DEPTH_SCALE,
     )
+
+
+_DEPTH_OBS_PARAMS = {"offset": _DEPTH_OFFSET, "scale": _DEPTH_SCALE}
 
 
 # ---------------------------------------------------------------------------
@@ -133,35 +183,32 @@ def _make_depth_noise() -> DepthNoiseCfg:
 # ---------------------------------------------------------------------------
 
 @configclass
-class G1WalkingCLFDepthScanScene(G1ClfTrackingSceneCfg):
-    """Walking scene + depth camera attached to the waist link."""
+class G1TeacherTerrainDepthSceneCfg(G1TeacherTerrainSceneCfg):
+    """Clip-library terrain scene + two self-scanning depth cameras.
 
-    depth_camera: MultiMeshRayCasterCameraCfg = _make_depth_camera()
+    The inherited ``height_scanner`` is untouched.
+    """
+
+    depth_camera_near: MultiMeshRayCasterCameraCfg = _make_depth_camera(_NEAR_POS, _NEAR_PITCH_DEG)
+    depth_camera_far: MultiMeshRayCasterCameraCfg = _make_depth_camera(_FAR_POS, _FAR_PITCH_DEG)
 
 
 @configclass
-class G1WalkingCLFDepthScanObservationsCfg(G1ClfTrackingObservationsCfg):
-    """Adds a flattened ``depth_scan`` term to the policy group."""
+class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
+    """Teacher observations + flattened depth scans in the policy group."""
 
     @configclass
-    class PolicyCfg(G1ClfTrackingObservationsCfg.PolicyCfg):
-        # NOTE: `noise=DepthNoiseCfg(...)` would normally go here. Temporarily
-        # left as `None` because IsaacLab v3.0.0-beta's `class_to_dict` /
-        # `update_class_from_dict` round-trip converts a custom `class_type`
-        # field into a `ResolvableString` (str subclass), and
-        # `observation_manager.py:626` then does
-        # ``issubclass(class_type, NoiseModel)`` without resolving — which
-        # raises ``TypeError: issubclass() arg 1 must be a class``.
-        # See `mdp/sensors/noise.py` for the ported `DepthNoiseCfg` (kept
-        # ready for re-enable) and `_make_depth_noise()` below.
-        depth_scan = ObsTerm(
+    class PolicyCfg(G1TeacherObservationsCfg.PolicyCfg):
+        # Noise is applied inside mdp.depth_image (driven by the resample_depth_noise
+        # event), NOT via the term's `noise` field -- see mdp/sensors/noise.py.
+        depth_near = ObsTerm(
             func=mdp.depth_image,
-            params={
-                "sensor_cfg": SceneEntityCfg("depth_camera"),
-                "offset": 0.75,
-                "scale": 0.5,
-            },
-            noise=None,
+            params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), **_DEPTH_OBS_PARAMS},
+            clip=(-2.0, 2.0),
+        )
+        depth_far = ObsTerm(
+            func=mdp.depth_image,
+            params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_DEPTH_OBS_PARAMS},
             clip=(-2.0, 2.0),
         )
 
@@ -169,14 +216,35 @@ class G1WalkingCLFDepthScanObservationsCfg(G1ClfTrackingObservationsCfg):
 
 
 @configclass
-class G1WalkingCLFDepthEventCfg(G1ClfTrackingEventsCfg):
-    """Walking events + camera-intrinsics randomisation on reset."""
+class G1TeacherTerrainDepthEventsCfg(G1TeacherEventsCfg):
+    """Teacher events + per-camera intrinsics and noise randomisation on reset."""
 
-    randomize_camera_intrinsics = EventTerm(
+    resample_depth_noise_near = EventTerm(
+        func=mdp.resample_depth_noise,
+        mode="reset",
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), "noise_cfg": _make_depth_noise()},
+    )
+    resample_depth_noise_far = EventTerm(
+        func=mdp.resample_depth_noise,
+        mode="reset",
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), "noise_cfg": _make_depth_noise()},
+    )
+    randomize_camera_intrinsics_near = EventTerm(
         func=mdp.randomize_camera_intrinsics,
         mode="reset",
         params={
-            "sensor_cfg": SceneEntityCfg("depth_camera"),
+            "sensor_cfg": SceneEntityCfg("depth_camera_near"),
+            "focal_length_distribution_params": (0.98, 1.02),
+            "principal_point_distribution_params": (0.98, 1.02),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+    randomize_camera_intrinsics_far = EventTerm(
+        func=mdp.randomize_camera_intrinsics,
+        mode="reset",
+        params={
+            "sensor_cfg": SceneEntityCfg("depth_camera_far"),
             "focal_length_distribution_params": (0.98, 1.02),
             "principal_point_distribution_params": (0.98, 1.02),
             "operation": "scale",
@@ -190,96 +258,116 @@ class G1WalkingCLFDepthEventCfg(G1ClfTrackingEventsCfg):
 # ---------------------------------------------------------------------------
 
 @configclass
-class G1WalkingCLFDepthScanEnvCfg(G1WalkingCLFEnvCfg):
-    """Walking + flattened depth scan in the policy observation group."""
+class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainEnvCfg):
+    """Terrain teacher + two self-scanning depth cameras, flattened into the policy."""
 
-    scene: G1WalkingCLFDepthScanScene = G1WalkingCLFDepthScanScene(num_envs=4096, env_spacing=2.5)
-    observations: G1WalkingCLFDepthScanObservationsCfg = G1WalkingCLFDepthScanObservationsCfg()
-    events: G1WalkingCLFDepthEventCfg = G1WalkingCLFDepthEventCfg()
+    scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
+        num_envs=4096, env_spacing=2.5
+    )
+    observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
+    events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
 
 
 @configclass
-class G1WalkingCLFDepthImageObservationsCfg(G1WalkingCLFDepthScanObservationsCfg):
-    """Replaces the flattened scan with an image-shape obs in its own group."""
+class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
+    """Moves the depth out of the policy group into per-camera image groups."""
 
     @configclass
-    class PolicyCfg(G1WalkingCLFDepthScanObservationsCfg.PolicyCfg):
+    class PolicyCfg(G1TeacherTerrainDepthObservationsCfg.PolicyCfg):
         def __post_init__(self):
             super().__post_init__()
-            # Flat scan moves out of the policy group; image is its own group.
-            self.depth_scan = None
+            self.depth_near = None
+            self.depth_far = None
 
     @configclass
-    class DepthImageCfg(ObsGroup):
-        # See note on `depth_scan` in the parent cfg about `noise=None`.
-        depth_image = ObsTerm(
+    class DepthNearImageCfg(ObsGroup):
+        depth_near_image = ObsTerm(
             func=mdp.depth_image_4d,
             params={
-                "sensor_cfg": SceneEntityCfg("depth_camera"),
-                "offset": 0.75,
-                "scale": 0.5,
+                "sensor_cfg": SceneEntityCfg("depth_camera_near"),
                 "height": _DEPTH_H,
                 "width": _DEPTH_W,
+                **_DEPTH_OBS_PARAMS,
             },
-            noise=None,
             clip=(-2.0, 2.0),
         )
 
         def __post_init__(self):
             super().__post_init__()
             self.enable_corruption = True
-            # Single-term group: concat=True is a no-op (cat of one tensor),
-            # so the (B, 1, H, W) shape is preserved. Setting concat=False
-            # would yield a TensorDict, which rsl_rl's `check_nan` and our
-            # train.py debug print don't dispatch on.
+            # Single-term group: concatenate_terms=True is a no-op (a cat of one
+            # tensor) and preserves the (B, 1, H, W) shape.  concatenate_terms=False
+            # would hand back a TensorDict, which rsl_rl's NaN check and our
+            # train.py debug print do not dispatch on.
+
+    @configclass
+    class DepthFarImageCfg(ObsGroup):
+        depth_far_image = ObsTerm(
+            func=mdp.depth_image_4d,
+            params={
+                "sensor_cfg": SceneEntityCfg("depth_camera_far"),
+                "height": _DEPTH_H,
+                "width": _DEPTH_W,
+                **_DEPTH_OBS_PARAMS,
+            },
+            clip=(-2.0, 2.0),
+        )
+
+        def __post_init__(self):
+            super().__post_init__()
+            self.enable_corruption = True
 
     policy: PolicyCfg = PolicyCfg()
-    depth_image: DepthImageCfg = DepthImageCfg()
+    depth_near_image: DepthNearImageCfg = DepthNearImageCfg()
+    depth_far_image: DepthFarImageCfg = DepthFarImageCfg()
 
 
 @configclass
-class G1WalkingCLFDepthImageEnvCfg(G1WalkingCLFDepthScanEnvCfg):
-    """Walking + image-shape depth in its own ``depth_image`` group."""
+class G1TeacherTerrainDepthImageEnvCfg(G1TeacherTerrainDepthEnvCfg):
+    """Terrain teacher + depth as image-shaped observations in their own groups."""
 
-    observations: G1WalkingCLFDepthImageObservationsCfg = G1WalkingCLFDepthImageObservationsCfg()
+    observations: G1TeacherTerrainDepthImageObservationsCfg = (
+        G1TeacherTerrainDepthImageObservationsCfg()
+    )
 
 
 # ---------------------------------------------------------------------------
-# PLAY variants — mirror the trims in G1WalkingCLFEnvCfg_PLAY.
+# PLAY variants -- inherit the terrain teacher's play trims, then add depth ones.
 # ---------------------------------------------------------------------------
 
-def _apply_play_trims(cfg) -> None:
-    cfg.scene.num_envs = 2
-    cfg.scene.env_spacing = 2.5
-    cfg.observations.policy.enable_corruption = False
-    cfg.scene.terrain.size = (3, 3)
-    cfg.scene.terrain.border_width = 0.0
-    cfg.scene.terrain.num_rows = 3
-    cfg.scene.terrain.num_cols = 2
+def _apply_depth_play_trims(cfg) -> None:
+    """Disable depth randomisation and draw both cameras' rays.
 
-    cfg.episode_length_s = 8.0
-
-    cfg.events.randomize_ground_contact_friction = None
-    cfg.events.add_base_mass = None
-    cfg.events.base_com = None
-    cfg.events.base_external_force_torque = None
-    cfg.events.push_robot = None
-    cfg.events.gain_randomization = None
-    cfg.events.randomize_camera_intrinsics = None
-
-    cfg.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.4)
-    cfg.commands.base_velocity.debug_vis = False
+    Args:
+        cfg: The play env cfg to trim, modified in place.
+    """
+    cfg.events.resample_depth_noise_near = None
+    cfg.events.resample_depth_noise_far = None
+    cfg.events.randomize_camera_intrinsics_near = None
+    cfg.events.randomize_camera_intrinsics_far = None
+    cfg.scene.depth_camera_near.debug_vis = True
+    cfg.scene.depth_camera_far.debug_vis = True
 
 
 @configclass
-class G1WalkingCLFDepthScanEnvCfg_PLAY(G1WalkingCLFDepthScanEnvCfg):
+class G1TeacherTerrainDepthEnvCfgPlay(G1TeacherTerrainEnvCfgPlay):
+    """Play variant of :class:`G1TeacherTerrainDepthEnvCfg`."""
+
+    scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
+        num_envs=4096, env_spacing=2.5
+    )
+    observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
+    events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
+
     def __post_init__(self):
         super().__post_init__()
-        _apply_play_trims(self)
+        _apply_depth_play_trims(self)
 
 
 @configclass
-class G1WalkingCLFDepthImageEnvCfg_PLAY(G1WalkingCLFDepthImageEnvCfg):
-    def __post_init__(self):
-        super().__post_init__()
-        _apply_play_trims(self)
+class G1TeacherTerrainDepthImageEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
+    """Play variant of :class:`G1TeacherTerrainDepthImageEnvCfg`."""
+
+    observations: G1TeacherTerrainDepthImageObservationsCfg = (
+        G1TeacherTerrainDepthImageObservationsCfg()
+    )

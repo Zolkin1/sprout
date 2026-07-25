@@ -15,8 +15,37 @@ import torch
 
 from isaaclab.managers import SceneEntityCfg
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import (
+    DepthNoiseCfg,
+    ensure_depth_noiser,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
+
+
+def resample_depth_noise(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    sensor_cfg: SceneEntityCfg,
+    noise_cfg: DepthNoiseCfg,
+):
+    """Re-sample a depth camera's per-episode noise state on reset.
+
+    Registers the noiser for ``sensor_cfg.name`` on first call, so the matching
+    :func:`~robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth.depth_image`
+    term picks it up; omit this event term and that sensor's observation stays
+    noise-free.
+
+    Args:
+        env: The environment instance.
+        env_ids: Environments being reset. ``None`` re-samples all.
+        sensor_cfg: Scene entity pointing at the depth camera.
+        noise_cfg: Noise parameters; ``height``/``width``/``offset``/``scale`` must
+            match the camera and its observation term.
+    """
+    noiser = ensure_depth_noiser(env, sensor_cfg.name, noise_cfg)
+    noiser.reset(env_ids)
 
 
 def randomize_camera_intrinsics(
