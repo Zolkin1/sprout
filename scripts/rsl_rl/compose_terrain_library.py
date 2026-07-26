@@ -111,9 +111,14 @@ def _validate_meta(paths: list[str]) -> None:
                          + "\n[compose] regenerate the odd source with the same --source / --dt, or drop it.")
 
 
-def _load_source(path: str):
+def _load_source(path: str, types: set[str] | None = None):
     """-> (is_flat, tiles). ``tiles`` = list of (manifest_entry|None, [clip_idx]) grouped by
-    terrain_id (one 'tile' each); a source of only terrain_id -1 clips is flat (one pseudo-tile)."""
+    terrain_id (one 'tile' each); a source of only terrain_id -1 clips is flat (one pseudo-tile).
+
+    ``types`` keeps only tiles whose manifest ``type`` is listed -- so a single ALREADY-COMPOSED
+    library (stairs + transitions + boxes in one file) can be narrowed to one family without
+    regenerating anything.  That keeps a single-family experiment otherwise identical to the mixed
+    run: same clips, same motion, only the terrain distribution changes."""
     lib = _get_lib(path)
     tid = lib.terrain_id
     if bool((tid == -1).all()):
@@ -121,6 +126,13 @@ def _load_source(path: str):
     man = {int(m["terrain_id"]): m for m in lib.attrs["terrain_manifest"]}
     tiles = [(man[t], (tid == t).nonzero().flatten().tolist())
              for t in sorted({int(v) for v in tid.tolist()} - {-1})]
+    if types is not None:
+        available = sorted({str(m.get("type")) for m, _ in tiles})
+        tiles = [(m, idx) for m, idx in tiles if str(m.get("type")) in types]
+        if not tiles:
+            raise SystemExit(
+                f"[compose] no tiles of type(s) {sorted(types)} in {path}; it has {available}"
+            )
     return False, tiles
 
 
@@ -163,16 +175,22 @@ def main() -> int:
     p.add_argument("--max-clips-per-tile", type=int, default=0,
                    help="Cap clips carried per TERRAIN tile (0 = all). Use a small cap for a lightweight "
                         "dry-run/viz library; use 0 for a real training library.")
+    p.add_argument("--types", default=None,
+                   help="Comma-separated tile types to KEEP from each terrain source, e.g. 'terrain' for "
+                        "pure stairs only, or 'terrain,transition'. Names come from the library's "
+                        "terrain_type_names (flat/terrain/transition/slope/box). Default = keep all. Use "
+                        "with --flat-tiles 0 to build a single-family library from an already-composed one.")
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
     dev = args.device
+    keep_types = {t.strip() for t in args.types.split(",")} if args.types else None
 
     specs = []
     for e in args.mix.split(","):
         path, tiles = e.strip().rsplit(":", 1)
         specs.append((path.strip(), int(tiles)))
 
-    loaded = [(_load_source(path), path, n) for path, n in specs]
+    loaded = [(_load_source(path, keep_types), path, n) for path, n in specs]
     paths_for_T = [path for _, path, _ in loaded] + ([args.flat_from] if args.flat_from else [])
     _validate_meta(paths_for_T)                                      # before any clip is copied
     T = args.num_steps or max(int(_get_lib(path).num_steps) for path in paths_for_T)
