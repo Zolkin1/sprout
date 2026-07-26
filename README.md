@@ -70,17 +70,20 @@ stored with **Git LFS**, so clone with LFS enabled.
     (cd ../IsaacLab && ./isaaclab.sh -i)
     ```
 
-6. Install this project in editable mode:
+6. Install this project's two packages in editable mode. `robot_rl` is the IsaacLab side; `motion_gen` is
+   the IsaacLab-free offline clip generation that `robot_rl` imports (so both are required). `--no-deps`
+   on `motion_gen` keeps `uv` from re-resolving the pinned Isaac Sim / CUDA `torch` stack:
 
     ```bash
     uv pip install -e source/robot_rl
+    uv pip install -e source/motion_gen --no-deps
     ```
 
 7. Verify the install by listing tasks and running a short headless training:
 
     ```bash
     python scripts/list_envs.py --keyword G1
-    python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=64
+    python scripts/rsl_rl/train.py --task=<TASK_NAME> --num_envs=64
     ```
 
 ## Running Tasks
@@ -92,8 +95,12 @@ or you could use `G1` as the keyword.
 
 To train a policy run:
 ```bash
-python scripts/rsl_rl/train_policy.py --env_type=<ENV_NAME> --viz none
+python scripts/rsl_rl/train.py --task=<TASK_NAME>
 ```
+
+Runs are headless by default. Pass `--viz kit` to train or play with a viewer (`--visualizer`/`--viz` takes a
+CSV of backends: `kit,newton,rerun,viser`), or `--viz none` to force-disable visualizers. `--headless` is
+deprecated as of IsaacLab v3.0.
 
 To add a run name add `--run_name=my_run_name`. This will add the name after the date on the folder with the run name.
 
@@ -101,8 +108,12 @@ Note that right now the only RL library that is tested in `RSL_RL`.
 
 To play the most recently trained policy for a given task run:
 ```bash
-python scripts/rsl_rl/play_policy.py --env_type=<ENV_NAME> --log_data --export_policy --viz none
+python scripts/rsl_rl/play.py --task=<TASK_NAME>-play
 ```
+
+Play always exports the policy to JIT and ONNX (into `exported/` next to the checkpoint) — there is no flag
+for it. Add `--dump_play_data` to log the rollout, `--plots` for the per-run plots, and `--episode_stats`
+for a summary.
 
 for a specific run you can pass in additional config such as `--load_run=<run_dir>`
 If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<checkpoint>` (`<checkpoint>` is something like "model_1800").
@@ -113,11 +124,12 @@ For both `train` and `play` you can also specify a number of envs with `--num_en
 We suggest uploading the policy to hugging face when you are ready to run it on hardware so that this repo (the code repo) is kept clean.
 You can upload to hugging face automatically with
 ```bash
-python scripts/rsl_rl/export_to_hardware.py --env_type=<env-type> --load_run=<run_dir> --hf_repo_id=<username/repo> --policy_name=<policy_name>
+python scripts/rsl_rl/export_to_hardware.py --hf_repo_id=<username/repo> --folder_name=<name> \
+    --log_dir=<experiment_log_dir> --load_run=<run_dir>
 ```
 This will load a already exported run and upload the exported policy to hugging face in the specified repo with the specified name.
 
-NOTE: The policy must already be exported (see `play_policy` above).
+NOTE: The policy must already be exported (see `play.py` above).
 
 For now we are uploading the policies to the hugging face repo [here](https://huggingface.co/zolkin/robot_rl/tree/main).
 
@@ -135,7 +147,7 @@ trajectory-command internals. It is zero-cost when off. Use it to find where tim
 
 Training — run a short, bounded profile (use a small `--max_iterations`):
 ```bash
-python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=4096 \
+python scripts/rsl_rl/train.py --task=<TASK_NAME> --num_envs=4096 \
     --max_iterations=5 --profile
 ```
 
@@ -261,13 +273,14 @@ This code base has a built in sim2sim transfer (i.e. the policy is trained in Is
 Currently, we only support the G1 (as that is the only policy we have right now), but the code is easily extended to other robots.
 To run the sim2sim transfer, go to the `transfer/sim/` directory. From this directory run
 ```
-python g1_runner.py --env_type=<ENV_NAME>
+python g1_runner.py --experiment=<EXPERIMENT_NAME>
 ```
-where `ENV_NAME` is the same as above: it is an entry into the table. The arguments here follow the same structure as the `play_policy.py` script.
+where `EXPERIMENT_NAME` is the experiment log directory the policy was trained into.
 Optionally you can also add `--load_run=<run_dir>` to run a specific policy, otherwise the newest one will be run.
 `--log` enables logging to the same directory. You can choose the logging directory with `--log_dir`.
+`--scene` selects the MuJoCo scene (e.g. a generated staircase) and `--robot_name` the robot model.
 
-This uses information that must have been exported from the `play_policy.py` script.
+This uses information that must have been exported from the `play.py` script.
 
 Then we can generate plots for the mujoco simulation. We can run
 ```
