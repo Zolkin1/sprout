@@ -29,7 +29,7 @@ from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import (
     relative_state as _relative_state,
-    sanitize_height_scan,
+    sanitize_extero,
     state_to_absolute,
     target_state_dim,
 )
@@ -131,6 +131,13 @@ class FmOnlineContext:
     joint_names: list[str]
     target_frame_names: list[str]
     device: torch.device
+    extero_source: str = "height_scan"
+    """Which sensor the checkpoint was TRAINED on ("height_scan" or "depth").
+
+    Carried on the context so a consumer feeds the right reading based on the
+    checkpoint rather than on whatever the task config happens to say.  Defaults to the
+    height scan, which is also what a checkpoint predating the selector resolves to.
+    """
 
     @property
     def frame_names(self) -> list[str]:
@@ -190,7 +197,7 @@ def load_fm_context(
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=cfg.future_len,
         num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim,
+        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(dev)
@@ -215,6 +222,7 @@ def load_fm_context(
         cmd_dim=cfg.cmd_dim, cmd_steps=cmd_steps,
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
+        extero_source=str(cfg.extero_source),
     )
 
 
@@ -272,23 +280,38 @@ def build_history_tokens(
     return ctx.state_norm.normalize(rel)
 
 
-def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch.Tensor:
-    """Build the normalized height-scan token ``(V, height_dim)`` from a raw scan.
+def build_extero_tokens(ctx: FmOnlineContext, values: torch.Tensor) -> torch.Tensor:
+    """Build the normalized exteroception tokens from a raw sensor reading.
 
-    The height scan is a vector of ray-cast ground-clearance values (body-relative,
-    yaw-aligned -- already in the FM's xyz+yaw ego frame, so no re-anchoring), embedded
-    downstream through one MLP into a single token. It replaces the old root-z scalar.
+    Source-agnostic: the FM's context knows which sensor it was trained on
+    (``ctx.extero_source``), so callers pass whichever reading that names and the
+    clip band and normalizer follow from it.  Both sources are body-relative and
+    yaw-aligned already -- in the FM's xyz+yaw ego frame -- so there is no re-anchoring.
 
     Args:
         ctx: The loaded context.
-        height_scan: Raw height scan at the anchor step, shape ``(V, height_dim)``. At
-            deployment this is the live ``mdp.height_scan`` reading; in the test bench it
-            is the recorded scan at the snap row.
+        values: Raw reading at the anchor step, shape ``(V, T*dim)`` or ``(V, T, dim)``.
+            At deployment this is the live ``mdp.height_scan`` or ``mdp.depth_image``
+            reading; in the test bench it is the recorded array at the snap row.
 
     Returns:
-        Normalized height-scan token ``(V, height_dim)``.
+        Normalized tokens, flattened to ``(V, T*dim)`` -- the model reshapes internally.
     """
-    return ctx.height_norm.normalize(sanitize_height_scan(height_scan))
+    flat = values.reshape(values.shape[0], -1)
+    return ctx.height_norm.normalize(sanitize_extero(flat, ctx.extero_source))
+
+
+def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch.Tensor:
+    """Backwards-compatible wrapper for :func:`build_extero_tokens`.
+
+    Args:
+        ctx: The loaded context.
+        height_scan: Raw reading at the anchor step.
+
+    Returns:
+        Normalized exteroception tokens.
+    """
+    return build_extero_tokens(ctx, height_scan)
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:

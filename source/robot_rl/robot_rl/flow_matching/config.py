@@ -9,6 +9,11 @@ from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 
+#: Recognised :attr:`FlowMatchingConfig.extero_source` values.  These are also the keys
+#: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
+EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
+
+
 @dataclass
 class FlowMatchingConfig:
     """Hyperparameters for the flow-matching model, data pipeline, and training.
@@ -73,10 +78,19 @@ class FlowMatchingConfig:
     state_dim: int = 73        # 2*nj + 15 = 2*29 + 15 (nj=29); resolved from the dataset at build time
     # Per-step history-token width (= state_dim; resolved at build time).
     history_dim: int = 73
-    # Width of the height conditioning token: the number of ray-cast ground-clearance
-    # values in the height scan (embedded through one MLP into a single token). Resolved
-    # from the recorded ``height_scan`` at dataset build time.
+    # Which recorded signal feeds the exteroception conditioning tokens.
+    #   "height_scan" -- the pelvis ray-cast grid (176 rays) as ONE token. Default; the
+    #                    validated path.
+    #   "depth"       -- the two torso depth cameras, ONE token each (T=2), from
+    #                    ``G1-teacher-clf-terrain-depth*`` recordings. This is the
+    #                    deployable signal: the hardware has cameras, not a heightmap.
+    # ``record_data.py`` stores BOTH arrays when the task has the cameras, so one
+    # recording session can train either FM and this is a train-time choice.
+    extero_source: str = "height_scan"
+    # Width of ONE exteroception token, and how many there are. Both resolved from the
+    # recorded array at dataset build time (176x1 for the scan, 780x2 for the cameras).
     height_dim: int = 176
+    extero_tokens: int = 1
     # World floor height for the TERRAIN-PENETRATION LOSS only (flat ground -> 0.0). It no
     # longer feeds any FM conditioning token (the height scan replaced the root-z scalar).
     # TODO: the terrain loss's flat-``ground_z`` floor is wrong on non-flat terrain; move it
@@ -115,10 +129,16 @@ class FlowMatchingConfig:
     noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
     noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
     noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
-    # Per-ray height-scan noise (m). The height token is a real sensor at deploy (noisy
-    # depth/lidar/estimated heightmap), so noise it in training too -- matches the RL
-    # policy's height_scan Unoise(±0.1). Applied per ray (independent), train split only.
-    noise_height_scan: float = 0.1  # m          (RL match)
+    # Per-element exteroception noise. The token is a real sensor at deploy, so noise it
+    # in training too. Applied independently per element, train split only.
+    # ``noise_height_scan`` is metres of ground clearance and matches the RL policy's
+    # height_scan Unoise(±0.1). ``noise_depth`` is in the depth obs's NORMALISED units
+    # -- ``mdp.depth_image`` already applies ``(d - 0.75) * 0.5``, so 0.05 here is 0.1 m
+    # of range, matching the scan. The depth cameras additionally carry their own sensor
+    # DR (plane tilt, blur, dropout, extrinsics/intrinsics jitter) from the RL env, which
+    # is baked into the recording -- this term is on top of that.
+    noise_height_scan: float = 0.1   # m                (RL match)
+    noise_depth: float = 0.05        # normalised units (= 0.1 m)
 
     # -- flow --
     num_sampling_steps: int = 8
@@ -157,7 +177,14 @@ class FlowMatchingConfig:
     # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
     # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
     # all the signal. Set True only to restrict it to the high-τ regime.
-    terrain_penetration_weight: float = 200.0 #200.0 #1.0 #0.1 #0.0
+    # DISABLED (was 200.0). ``terrain`` here is a single flat ``ground_z`` floor, which is
+    # simply wrong on stairs/boxes -- see the TODO on ``flow.terrain_penetration_term``.
+    # On a staircase the auto-calibrated floor lands near the LOWEST step, so the term is
+    # mostly inert and occasionally penalises correct predictions. ``do_terrain`` in
+    # ``flow.py`` is gated on ``> 0.0``, so 0.0 skips the term entirely (no compute, no
+    # ``ground_z`` dependency). Re-enable only with a real SDF / local-floor terrain, and
+    # watch for predicted feet crossing the floor on flat ground if you leave it off.
+    terrain_penetration_weight: float = 0.0  # was 200.0 (flat-floor loss, wrong on terrain)
     terrain_penetration_mode: str = "ankle"
     terrain_ground_z: float | None = None
     terrain_contact_grid: tuple[int, int] = (3, 2)
@@ -192,6 +219,27 @@ class FlowMatchingConfig:
         if self.cmd_dim <= 0:
             return 0
         return math.ceil(self.future_len / self.cmd_stride)
+
+    @property
+    def noise_extero(self) -> float:
+        """Per-element train-time noise for the selected exteroception source.
+
+        Returns:
+            ``noise_height_scan`` (metres) or ``noise_depth`` (normalised units).
+        """
+        self.check_extero_source()
+        return self.noise_height_scan if self.extero_source == "height_scan" else self.noise_depth
+
+    def check_extero_source(self) -> None:
+        """Raise if :attr:`extero_source` is not a recognised source.
+
+        Raises:
+            ValueError: On an unknown source name.
+        """
+        if self.extero_source not in EXTERO_SOURCES:
+            raise ValueError(
+                f"extero_source={self.extero_source!r} is not one of {list(EXTERO_SOURCES)}."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict copy of the config (for checkpointing)."""

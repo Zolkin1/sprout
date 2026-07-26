@@ -355,6 +355,7 @@ _WINDOW_DTYPES: dict[str, str] = {
     "history_state": "float32",
     "ref_future": "float32",
     "height_scan": "float32",
+    "depth": "float32",
     "cmd_future": "float32",
     "episode_id": "int64",
 }
@@ -397,6 +398,8 @@ class RecordedWindowWriter:
         node_dim: Per-row raw state width (== ref_future node width).
         future_len: ``F``, future nodes per window.
         height_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
+        depth_shape: ``(num_cameras, H*W)`` for the depth dataset, or ``None`` to omit it.
+            Recorded alongside the height scan so one recording can train either FM.
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
         meta: Provenance/layout metadata (stored as JSON attrs).
         compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
@@ -405,7 +408,7 @@ class RecordedWindowWriter:
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
-        compression: str | None = "lzf",
+        compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
     ) -> None:
         import h5py
 
@@ -418,6 +421,8 @@ class RecordedWindowWriter:
         }
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
+        if depth_shape is not None:
+            shapes["depth"] = (num_windows, int(depth_shape[0]), int(depth_shape[1]))
         if cmd_dim > 0:
             shapes["cmd_future"] = (num_windows, future_len, cmd_dim)
         self._keys = list(shapes)

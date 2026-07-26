@@ -124,3 +124,42 @@ def test_optional_arrays_omitted():
             wr.write_batch(batch)
         data, _ = load_recorded_windows(p)
         assert set(data) == {"history_state", "ref_future", "episode_id"}
+
+
+def test_depth_roundtrips_alongside_the_height_scan():
+    """Both exteroception arrays survive one recording, so either FM can train from it.
+
+    Recording BOTH is what makes ``cfg.extero_source`` a train-time choice instead of a
+    re-record; the depth array keeps its ``(W, num_cameras, per_camera)`` token axis so
+    the dataset can resolve the token count from the shape.
+    """
+    W, H, F, node, K, cmd = 6, 4, 8, 22, 5, 3
+    cams, per_cam = 2, 15
+    arrs = _rand(W, H, F, node, K, cmd)
+    rng = np.random.default_rng(1)
+    arrs["depth"] = rng.standard_normal((W, cams, per_cam)).astype(np.float32)
+    meta = _meta(W, H, F, K)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "recorded_depth.h5")
+        with RecordedWindowWriter(
+            p, W, H, node, F, K, cmd, meta, depth_shape=(cams, per_cam)
+        ) as wr:
+            wr.write_batch(arrs)
+        data, _ = load_recorded_windows(p)
+        assert np.array_equal(data["depth"], arrs["depth"])
+        assert data["depth"].shape == (W, cams, per_cam)
+        assert np.array_equal(data["height_scan"], arrs["height_scan"])
+
+
+def test_depth_dataset_is_omitted_when_not_recorded():
+    """A scan-only recording must not gain an empty depth dataset."""
+    W, H, F, node, K, cmd = 4, 3, 5, 22, 5, 3
+    arrs = _rand(W, H, F, node, K, cmd)
+    meta = _meta(W, H, F, K)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "recorded_nodepth.h5")
+        with RecordedWindowWriter(p, W, H, node, F, K, cmd, meta) as wr:
+            wr.write_batch(arrs)
+        data, _ = load_recorded_windows(p)
+        assert "depth" not in data
+        assert "height_scan" in data

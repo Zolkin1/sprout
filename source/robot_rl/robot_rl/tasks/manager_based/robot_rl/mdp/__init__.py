@@ -14,7 +14,13 @@ from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # Inherit fr
 
 from .rewards.rewards import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
-from .observations.depth import depth_image, depth_image_4d, normalize_depth  # noqa: F401
+from .observations.depth import (  # noqa: F401
+    depth_image,
+    depth_image_4d,
+    depth_obs_stack,
+    find_depth_obs_terms,
+    normalize_depth,
+)
 from .curriculums.curriculums import *  # noqa: F401, F403
 from .terminations.terminations import *  # noqa: F401, F403
 from .commands import *  # noqa: F401, F403

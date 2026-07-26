@@ -2,6 +2,17 @@
 
 """Convert a clean motion-clip library into flow-matching training data.
 
+.. deprecated::
+    MARKED FOR DELETION.  Clips contain no exteroception -- no height scan and no depth,
+    since those are sensor readings -- so this converter cannot produce data for either
+    FM variant.  It survives only because ``scripts/flow_matching/fm_test_bench.py`` is
+    clean-clip-only and reads its ``.npz`` as its sole input.
+
+    To remove it: give ``fm_test_bench.py`` a loader for sim recordings
+    (``record_data.py`` output), which it needs anyway to bench a depth-conditioned FM,
+    then delete this script and ``source/robot_rl/tests/test_clip_to_fm_data.py``.
+
+
 The clip-conditioned FM (history = past clip, target = future clip, conditioned on
 the velocity command, no robot state) trains on the **clips themselves** -- nothing
 recorded from sim. The clip already stores every channel the FM state needs -- base

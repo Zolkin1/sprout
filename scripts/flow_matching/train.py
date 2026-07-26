@@ -458,7 +458,7 @@ def main() -> None:
     num_joints = train_ds.num_joints
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
-          f"height_dim={cfg.height_dim} (height-scan rays), "
+          f"extero={cfg.extero_source} ({cfg.extero_tokens}x{cfg.height_dim}), "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
@@ -513,7 +513,7 @@ def main() -> None:
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=cfg.future_len,
         num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim,
+        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(device)

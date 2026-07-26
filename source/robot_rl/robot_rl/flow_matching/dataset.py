@@ -13,7 +13,8 @@ sampled at a **snap (re-anchor) event** of a recorded teacher rollout. It pairs
 
 * ``history``: the ``N`` most-recent REAL robot-state steps ending at the snap, in
   the xyz+yaw ground frame anchored on the robot base at the snap (phase only);
-* ``height``: the robot root z above ground at the snap (a heightmap stand-in);
+* ``height``: the exteroception tokens at the snap -- the pelvis height scan (one
+  token) or the two depth cameras (one token each), per ``cfg.extero_source``;
 * ``cmd_tokens``: the strided FUTURE velocity command over the F-step window;
 * ``state`` (the target): the ``F``-node clip future **ego-anchored onto the robot**
   at the snap (recorded ``ref_future``), re-expressed in the SAME robot xyz+yaw
@@ -39,7 +40,7 @@ from .transforms import (
     frame_block_start,
     orientation_slices,
     relative_state,
-    sanitize_height_scan,
+    sanitize_extero,
     target_state_dim,
 )
 
@@ -189,10 +190,18 @@ class FutureStateDataset(Dataset):
                 "target_source='ego_anchored_clip_future' requires a 'ref_future' array; "
                 "re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
             )
-        if data.get("height_scan") is None:
+        cfg.check_extero_source()
+        if data.get(cfg.extero_source) is None:
+            hint = (
+                "a height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)"
+                if cfg.extero_source == "height_scan"
+                else "the depth cameras active (--task G1-teacher-clf-terrain-depth-play); "
+                     "note record_data.py stores 'depth' only when the task has them"
+            )
             raise ValueError(
-                "the height-scan FM requires a 'height_scan' array; re-record with a "
-                "height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)."
+                f"extero_source={cfg.extero_source!r} requires a '{cfg.extero_source}' array "
+                f"in the recording; re-record with {hint}. "
+                f"Present keys: {sorted(k for k in data if data.get(k) is not None)}"
             )
         if len(windows) == 0:
             raise ValueError("No valid snap windows; check reanchor_active vs num_history_states.")
@@ -303,15 +312,25 @@ class FutureStateDataset(Dataset):
             print(f"[fm-data][WARN] target node-0 root offset mean={node0_off:.3f} m (> 0.15); "
                   "the recorded ref_future may not be ego-anchored onto the robot at the snap.")
 
-        # Height token = the recorded height scan at the snap row (per-ray ground
-        # clearance, body-relative). Replaces the old root-z scalar. K resolved here.
-        hs = torch.from_numpy(np.ascontiguousarray(data["height_scan"])).float()  # (P|W, K)
-        # Missed ray-cast rays are recorded as -inf; sanitize before the normalizer
-        # fit so they don't produce a NaN loss (matches the deploy token builder).
-        hs = sanitize_height_scan(hs)
-        self.height = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, K)
-        self.height_dim = self.height.shape[1]
-        cfg.height_dim = self.height_dim
+        # Exteroception tokens at the snap row. The recording carries either
+        # ``height_scan`` (P|W, K) -- one token -- or ``depth`` (P|W, T, K) with one token
+        # per camera, so the token count and per-token width both come from the array's
+        # shape rather than being configured.
+        hs = torch.from_numpy(np.ascontiguousarray(data[cfg.extero_source])).float()
+        if hs.ndim == 2:
+            hs = hs.unsqueeze(1)                                   # (P|W, 1, K)
+        n_tokens, token_dim = int(hs.shape[1]), int(hs.shape[2])
+        # Sanitize before the normalizer fit so a non-finite entry cannot poison the
+        # per-dimension mean and yield a NaN loss (matches the deploy token builder).
+        hs = sanitize_extero(hs, cfg.extero_source)
+        # Flattened to (rows, T*K): the normalizer, the noise and __getitem__ all work on
+        # the flat width, and the model reshapes back to (B, T, K) internally.
+        hs = hs.reshape(hs.shape[0], n_tokens * token_dim)
+        self.height = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, T*K)
+        self.height_dim = token_dim
+        self.extero_tokens = n_tokens
+        cfg.height_dim = token_dim
+        cfg.extero_tokens = n_tokens
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
@@ -335,7 +354,7 @@ class FutureStateDataset(Dataset):
 
         if height_normalizer is None:
             height_normalizer = Normalizer.fit(
-                self.height, torch.ones(self.height_dim, dtype=torch.bool),
+                self.height, torch.ones(self.height.shape[1], dtype=torch.bool),
                 eps=float(cfg.height_norm_eps),
             )
         self.height_normalizer = height_normalizer
@@ -354,7 +373,7 @@ class FutureStateDataset(Dataset):
         # Pre-normalize once.
         self.state = state_normalizer.normalize(target)           # (Nw, F, D) target
         self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
-        self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, 1)
+        self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, T*K)
 
         # -- observation noise (train-time augmentation; conditioning tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
@@ -364,7 +383,7 @@ class FutureStateDataset(Dataset):
         # Height-scan noise (normalized space = raw m / std), per ray. The height token is a
         # real (noisy) sensor at deploy, so it is noised in training like the history tokens.
         self.height_noise = (
-            (float(cfg.noise_height_scan) * float(cfg.noise_scale)) / height_normalizer.std
+            (float(cfg.noise_extero) * float(cfg.noise_scale)) / height_normalizer.std
             if self.add_noise else None
         )
 
@@ -397,7 +416,7 @@ class FutureStateDataset(Dataset):
         height = self.height_norm_tokens[i]
         if self.add_noise:
             history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            height = height + (torch.rand(self.height_dim) * 2.0 - 1.0) * self.height_noise
+            height = height + (torch.rand(self.height.shape[1]) * 2.0 - 1.0) * self.height_noise
         item = {
             "state": self.state[i],          # (F, D) ego-anchored clip future target
             "history": history,              # (N, D) real-robot phase conditioning

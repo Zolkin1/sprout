@@ -104,6 +104,70 @@ def depth_image(
     return d
 
 
+def find_depth_obs_terms(env: "ManagerBasedRLEnv") -> list[tuple[str, dict]]:
+    """Discover every depth observation term, as ``(sensor_name, params)`` in obs order.
+
+    The FM's depth conditioning must be normalised EXACTLY as the recorded training data
+    was, and the observation terms are the single source of truth for that (each camera
+    has its own ``min_dist`` / ``max_dist``).  Discovering them here -- rather than
+    duplicating the constants -- means the recorder, the FM dataset and the deployed
+    tracker agree by construction.
+
+    Args:
+        env: The environment instance.
+
+    Returns:
+        ``[(sensor_name, params), ...]``, deduplicated, in observation-group order.
+    """
+    manager = env.observation_manager
+    found: list[tuple[str, dict]] = []
+    seen: set[str] = set()
+    for group in manager.active_terms:
+        names = manager.active_terms.get(group, [])
+        cfgs = manager._group_obs_term_cfgs.get(group, [])
+        for name, cfg in zip(names, cfgs):
+            if getattr(cfg.func, "__name__", "") not in ("depth_image", "depth_image_4d"):
+                continue
+            params = dict(cfg.params or {})
+            sensor_cfg = params.pop("sensor_cfg", None)
+            if sensor_cfg is None or sensor_cfg.name in seen:
+                continue
+            # height/width are reshape-only args for the 4d variant; drop them so the
+            # stacked reading is always flat per camera.
+            params.pop("height", None)
+            params.pop("width", None)
+            seen.add(sensor_cfg.name)
+            found.append((sensor_cfg.name, params))
+    return found
+
+
+def depth_obs_stack(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """All depth cameras' observations stacked on a token axis, ``(B, T, H*W)``.
+
+    One row per camera, each normalised with that camera's own observation-term
+    parameters.  This is the array recorded for the flow-matching generator and the one
+    the deployed tracker rebuilds, so the two cannot drift apart.
+
+    Args:
+        env: The environment instance.
+
+    Returns:
+        Stacked depth, shape ``(num_envs, num_cameras, H*W)``.
+
+    Raises:
+        RuntimeError: If the environment has no depth observation terms.
+    """
+    terms = find_depth_obs_terms(env)
+    if not terms:
+        raise RuntimeError(
+            "no depth observation terms found; run a depth task (e.g. "
+            "G1-teacher-clf-terrain-depth) so mdp.depth_image terms exist to read."
+        )
+    return torch.stack(
+        [depth_image(env, SceneEntityCfg(name), **params) for name, params in terms], dim=1
+    )
+
+
 def depth_image_4d(
     env: "ManagerBasedRLEnv",
     sensor_cfg: SceneEntityCfg,

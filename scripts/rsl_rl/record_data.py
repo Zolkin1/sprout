@@ -399,6 +399,10 @@ def collect_pairs(
     # has a height_scanner sensor active (e.g. G1-teacher-clf-record). Same mdp.height_scan
     # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
     has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
+    # whenever the task has depth observation terms, so ONE recording can train either FM
+    # and the choice is made at FM-train time via cfg.extero_source.
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
 
     # Body indices for the extra frames appended to the state vector (in order).
     state_frames = list(state_frames or [])
@@ -441,6 +445,8 @@ def collect_pairs(
         buf["reanchor_active"] = []
     if has_scan:
         buf["height_scan"] = []
+    if has_depth:
+        buf["depth"] = []
     # Per-step perturbation flag (1 while a perturbation window was active for that env).
     if scheduler is not None:
         buf["perturb_active"] = []
@@ -481,6 +487,10 @@ def collect_pairs(
             buf["height_scan"].append(
                 mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).detach().cpu().clone()
             )
+        # Depth at the same pre-step moment, one token row per camera ([N, T, H*W]),
+        # normalised by each camera's own obs-term params.
+        if has_depth:
+            buf["depth"].append(mdp.depth_obs_stack(env.unwrapped).detach().cpu().clone())
         # Desired reference at the same timestep, reconstructed to the world-frame
         # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
         # obs (last computed during the previous env.step), so this stays aligned
@@ -605,6 +615,7 @@ def collect_windows(
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
     has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
 
     state_frames = list(state_frames or [])
     frame_body_idx = None
@@ -664,6 +675,9 @@ def collect_windows(
             if has_scan:
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
+            if has_depth:
+                dep = mdp.depth_obs_stack(env.unwrapped)                    # [N, T, H*W]
+                batch["depth"] = dep[idx].detach().cpu().numpy()
             written += writer.write_batch(batch)
             if written >= num_windows:
                 break
@@ -869,6 +883,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     torch.arange(1, device=env.unwrapped.device)
                 ).shape[-1]
             )
+            # Depth (the deployable FM signal) is recorded alongside the scan whenever the
+            # task exposes depth obs terms, so one session can train either FM.
+            depth_shape = None
+            if mdp.find_depth_obs_terms(env.unwrapped):
+                dep = mdp.depth_obs_stack(env.unwrapped)          # [N, T, H*W]
+                depth_shape = (int(dep.shape[1]), int(dep.shape[2]))
+                print(f"[INFO] recording depth alongside the height scan: {depth_shape} per window")
             meta.format = "windowed_h5"
             meta.history_len = H
             meta.height_scan_dim = K
@@ -877,6 +898,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             out_path = unique_output_path(out_dir, prefix="recorded", ext=".h5")
             with RecordedWindowWriter(
                 out_path, num_records, H, node_dim, rf_len, K, cmd_dim, meta,
+                depth_shape=depth_shape,
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
