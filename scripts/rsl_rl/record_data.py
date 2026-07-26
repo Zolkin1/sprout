@@ -307,6 +307,10 @@ def _build_recording_meta(
         state_joint_names=action_joint_names,
         state_vel_frame="link",
         state_frame_names=list(state_frames),
+        # Contract of the cameras behind the recorded ``depth`` array (None without them).
+        # The same producer the tracker export uses, so an FM trained on this recording
+        # and the tracker deployed beside it describe one physical camera pair.
+        depth_camera_spec=mdp.depth_camera_specs(env.unwrapped) or None,
     )
 
 

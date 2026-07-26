@@ -49,6 +49,9 @@ class TrackerSession:
         self.default_joint_angles = np.asarray(self.params["default_joint_angles"], dtype=np.float64)
         self.action_scale = self._resolve_action_scale()
         self.action_isaac = np.zeros(self.get_num_actions())
+        # The term table is immutable after load and read every control step, so resolve it
+        # once here rather than re-materialising ~16 dicts per step in the hot path.
+        self._obs_terms = self._resolve_obs_terms()
 
     def _resolve_action_scale(self) -> np.ndarray:
         """Expand the per-joint action-scale patterns into joint order."""
@@ -82,23 +85,51 @@ class TrackerSession:
     def get_joint_names(self) -> list[str]:
         return self.joint_names_isaac
 
+    def _resolve_obs_terms(self) -> list[dict]:
+        """Parse the embedded policy obs terms into ``{name, shape, scale, history_length, clip}``.
+
+        ``shape`` is the term's FLAT width: multi-dimensional terms (the per-camera image
+        groups export ``[1, H, W]``) are flattened, matching how the observation manager
+        concatenates them into the policy vector. ``clip`` is the training clip magnitude
+        (``None`` when the term is unclipped), so the deploy saturates exactly as training
+        did without a hardcoded per-term table.
+        """
+        out = []
+        for name, term in self.params["observation_terms"]["policy"].items():
+            clip = term.get("clip")
+            out.append({
+                "name": name,
+                "shape": _flat_dim(term["shape"]),
+                "scale": term.get("scale", 1.0),
+                "history_length": int(term.get("history_length", 0)),
+                "clip": None if clip is None else max(abs(float(clip[0])), abs(float(clip[1]))),
+            })
+        return out
+
     def get_obs_terms(self) -> list[dict]:
-        """Ordered policy obs terms: list of ``{name, shape, scale, history_length}``."""
-        terms = self.params["observation_terms"]["policy"]
-        return [
-            {"name": n, "shape": int(t["shape"]), "scale": t.get("scale", 1.0),
-             "history_length": int(t.get("history_length", 0))}
-            for n, t in terms.items()
-        ]
+        """The ordered policy obs terms (see :meth:`_resolve_obs_terms`)."""
+        return self._obs_terms
 
     def get_height_scan_spec(self) -> dict | None:
         """Height-scanner geometry (resolution, size, offset_pos, ray_alignment,
-        sensor_offset, clip) embedded at export time, or None if the task has no scanner.
+        sensor_offset, clip) embedded at export time, or None if the exported policy
+        group has no ``height_scan`` term.
 
         Lets the MuJoCo / hardware deploy replicate the exact grid the policy + FM were
         trained on. See ``scripts/rsl_rl/export_parameters.py``.
         """
         return self.params.get("height_scan_spec")
+
+    def get_depth_camera_spec(self) -> list[dict] | None:
+        """Depth-camera contract, one entry per camera in observation order, or None.
+
+        Mount body + offset, pinhole intrinsics, range and the ``(d - offset) * scale``
+        normalisation -- everything needed to reproduce the depth observation off-sim.
+        Produced by ``mdp.depth_camera_specs`` at export time; see
+        ``transfer/deploy/depth_obs.py`` for the consumer side.
+        """
+        spec = self.params.get("depth_camera_spec")
+        return list(spec) if spec else None
 
     def get_valid_ic_pos(self) -> np.ndarray | None:
         """Valid initial pose [base_pos(3), base_quat(4), joint_pos(N)] or None."""
@@ -145,6 +176,13 @@ class TrackerSession:
         self.action_isaac = self.infer(obs).squeeze()
         target = self.action_isaac * self.action_scale + self.default_joint_angles
         return convert_joint_order(target, self.joint_names_isaac, joint_names_out)
+
+
+def _flat_dim(shape) -> int:
+    """Flat width of an exported obs-term shape (a scalar, or a list to multiply out)."""
+    if isinstance(shape, (list, tuple)):
+        return int(np.prod([int(s) for s in shape]))
+    return int(shape)
 
 
 def convert_joint_order(values: np.ndarray, names_in: list[str], names_out: list[str]) -> np.ndarray:

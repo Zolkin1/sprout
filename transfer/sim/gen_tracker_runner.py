@@ -2,7 +2,8 @@
 
 """Sim2sim entry point for the flow-matching generator + RL tracker pair.
 
-Drives the ``GeneratorTrackerPolicy`` in MuJoCo with two command sources:
+Drives the torch-free ``GenTrackerPolicy`` (``transfer/deploy``) in MuJoCo with two
+command sources:
 
 * ``--mode joystick``: drive the velocity command ``(vx, vy, wz)`` by hand with a
   gamepad (left stick = vx/vy, right stick x = wz), scaled by ``--max_*``.
@@ -41,6 +42,7 @@ from deploy.tracker_session import convert_joint_order  # noqa: E402
 
 from robot import Robot  # noqa: E402
 from clip_reference import ClipReference  # noqa: E402
+from depth_camera import MujocoDepthCameras  # noqa: E402
 import experiments.velocity_commands as vc  # noqa: E402
 
 
@@ -119,16 +121,22 @@ class RealtimePacer:
             time.sleep(slack)
 
 
-def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> dict:
+def build_state(
+    robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
+    depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
+) -> dict:
     """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
 
     Reads only base pose + base world-frame velocity + joints + command (and, when
-    the loaded generator's history needs them, the extra-frame world states).
+    the loaded generator's history needs them, the extra-frame world states), plus
+    whichever exteroception the loaded artifacts actually use.
 
     Args:
         robot: The MuJoCo robot wrapper.
         policy: The loaded generator + tracker policy (for joint order + ctx).
         command: Velocity command ``(vx, vy, wz)``.
+        depth_cams: The depth cameras to cast, or ``None`` when the policy has none.
+        want_depth_hits: Also collect the depth rays' world hit points (viewer only).
 
     Returns:
         State dict (numpy, FM/isaac joint order, world frame, xyzw quats).
@@ -153,10 +161,14 @@ def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> 
         state.update(frame_pos=fr[:, 0:3], frame_quat=fr[:, 3:7], frame_lin=fr[:, 7:10], frame_ang=fr[:, 10:13])
     # Height scan (per-ray ground clearance): raycast a yaw-aligned grid under the pelvis
     # against the MuJoCo terrain, replicating IsaacLab mdp.height_scan. Computed when the
-    # tracker uses a height_scan obs (spec present) or the FM conditions on a scan
-    # (height_dim>1). Feeds the tracker obs + FM height token; also drawn in the viewer.
+    # tracker observes a scan (spec present) or the FM conditions on one -- NOT merely
+    # because the FM has wide exteroception tokens, which a depth FM also has.
     spec = policy._trk.get_height_scan_spec() if hasattr(policy._trk, "get_height_scan_spec") else None
-    if spec is not None or getattr(policy.ctx, "height_dim", 1) > 1:
+    fm_uses_scan = (
+        getattr(policy.ctx, "extero_source", "height_scan") == "height_scan"
+        and getattr(policy.ctx, "height_dim", 1) > 1
+    )
+    if spec is not None or fm_uses_scan:
         s = spec or {}
         off = s.get("offset_pos", [0.75, 0.0, 20.0])
         clr, hits = robot.compute_height_scan(
@@ -167,6 +179,18 @@ def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> 
         )
         state["height_scan"] = np.nan_to_num(clr, nan=0.0)  # misses -> 0 (flat never misses)
         state["height_scan_hits"] = hits
+    # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
+    # robot's visual meshes, normalised exactly as the observation term does. One cast
+    # feeds BOTH consumers -- the tracker's depth obs terms (keyed by term name) and the
+    # FM's exteroception tokens (stacked, matching mdp.depth_obs_stack) -- because there
+    # is one physical camera pair -- the policy keys the rows by obs term itself, from the
+    # contract it loaded. Both cameras run at the control rate, so a single cast per step
+    # is exact: no staleness to model.
+    if depth_cams is not None:
+        if want_depth_hits:
+            state["depth"], state["depth_hits"] = depth_cams.compute(robot.mj_data, want_hits=True)
+        else:
+            state["depth"] = depth_cams.compute(robot.mj_data)
     return state
 
 
@@ -243,7 +267,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
         hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int,
-        clip: ClipReference | None = None, clip_handoff_time: float = -1.0) -> bool:
+        clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
+        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
@@ -286,6 +311,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip_handoff_time: In clip mode, sim time (s) at which to hand the reference off
             from the clip to the FM generator (the FM history is kept warm during the
             clip phase). ``< 0`` never hands off (clip-only playback).
+        depth_cams: Depth cameras to cast each control step, or ``None`` when the loaded
+            policy has none. Feeds the tracker's depth obs terms and the FM's
+            exteroception tokens from one cast.
+        depth_viz_stride: Draw every Nth depth pixel's hit point in the viewer. The two
+            cameras produce 1560 hits per step, well past ``user_scn.maxgeom``, so the
+            cloud is subsampled.
     """
     dt = policy.get_dt()
     decim = int(round(dt / robot.mj_model.opt.timestep))
@@ -336,7 +367,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
         if warmup_steps == 0:
             # No hold: fall back to a static warm-start fill so the FM is valid at step 0.
-            policy.warm_start(build_state(robot, policy, np.zeros(3)))
+            policy.warm_start(build_state(robot, policy, np.zeros(3), depth_cams))
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
@@ -395,7 +426,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             vel_cmd = np.clip(desired, vel_cmd - lim, vel_cmd + lim)
         else:
             vel_cmd = desired
-        state = build_state(robot, policy, vel_cmd)
+        state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
@@ -442,7 +473,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                          *torques, *jp_vals, *ee_vals])
 
     def draw_viz(viewer, state: dict) -> None:
-        """Populate ``user_scn`` with the height-scan hits + FM root/feet spheres + velocity arrows."""
+        """Populate ``user_scn`` with the sensor hits + FM root/feet spheres + velocity arrows."""
         if viewer is None or not viz:
             return
         scn = viewer.user_scn
@@ -454,6 +485,17 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             for p in np.asarray(hits, dtype=np.float64):
                 if np.isfinite(p).all():
                     _add_sphere(scn, p, (1.0, 0.0, 1.0, 0.9), 0.015)
+        # Depth-camera hits, one colour per camera (near yellow, far cyan-green). Drawn
+        # every Nth pixel: 1560 hits per step would blow past user_scn.maxgeom and stall
+        # the viewer, and a subsampled cloud still shows where each camera is looking.
+        depth_hits = state.get("depth_hits")
+        if depth_hits is not None:
+            colours = ((1.0, 0.85, 0.1, 0.8), (0.1, 0.9, 0.6, 0.8))
+            for cam_i, cam_hits in enumerate(np.asarray(depth_hits, dtype=np.float64)):
+                rgba = colours[cam_i % len(colours)]
+                sub = cam_hits[::max(1, depth_viz_stride)]
+                for p in sub[np.isfinite(sub).all(axis=1)]:
+                    _add_sphere(scn, p, rgba, 0.012)
         # FM prediction spheres (only once the generator has a valid prediction).
         if policy._pred_valid:
             if fm_traj_points <= 0:
@@ -526,7 +568,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
-            state = build_state(robot, policy, np.zeros(3))
+            state = build_state(robot, policy, np.zeros(3), depth_cams)
             policy.observe(state)
             robot.apply_action(hold_target)
             draw_viz(viewer, state)
@@ -575,7 +617,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
             s = min(clip_step, clip.num_steps - 1)
-            state = build_state(robot, policy, clip.command_at(s))
+            state = build_state(robot, policy, clip.command_at(s), depth_cams,
+                                want_depth_hits=viz)
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
                     handoff_time = robot.mj_data.time
@@ -682,6 +725,15 @@ def main() -> None:
     parser.add_argument("--fm_traj_points", type=int, default=0,
                         help="Number of spheres drawn along the FM predicted root/feet trajectory; "
                              "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
+    parser.add_argument("--depth_noise", action="store_true", default=False,
+                        help="Corrupt the depth images with the TRAINING noise (plane bias, "
+                             "per-pixel noise, blur, dropout) and jitter the camera mounts. Off by "
+                             "default, matching the -play task the policy was exported from.")
+    parser.add_argument("--depth_noise_seed", type=int, default=0,
+                        help="Seed for --depth_noise.")
+    parser.add_argument("--depth_viz_stride", type=int, default=8,
+                        help="Draw every Nth depth pixel's hit point in the viewer (1560 hits per "
+                             "step would exceed the scene's geom capacity).")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--max_vx", type=float, default=1.0)
     parser.add_argument("--max_vy", type=float, default=0.5)
@@ -801,11 +853,26 @@ def main() -> None:
               f"anchor={f'ego/every {args.clip_ego_anchor_every}' if args.clip_ego_anchor else 'world'}; "
               f"total_time={total_time:.2f}s")
 
+    # Depth cameras, if the loaded artifacts use them. The contract comes from the ONNX
+    # metadata (checked for tracker/generator agreement inside policy.load()), so the
+    # cameras cast here are exactly the ones the networks were trained on.
+    depth_cams = None
+    depth_spec = policy.get_depth_camera_spec()
+    if depth_spec:
+        depth_cams = MujocoDepthCameras(robot.mj_model, depth_spec)
+        if args.depth_noise:
+            rng = np.random.default_rng(args.depth_noise_seed)
+            depth_cams.enable_noise(rng)
+            depth_cams.jitter_extrinsics(rng)
+            print("[INFO] Depth sensor noise ON (plane bias, per-pixel noise, blur, dropout) "
+                  "plus mount jitter -- the training distribution, not the play config.")
+
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
                   args.warmup_time, args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
                   args.hold_kv_scale, args.spawn_z_offset, args.cmd_max_acc, args.fm_traj_points,
-                  clip=clip, clip_handoff_time=clip_handoff_time)
+                  clip=clip, clip_handoff_time=clip_handoff_time,
+                  depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)
     print(f"[INFO] Run finished. Survived: {success}")
 
     if log_path:

@@ -138,6 +138,14 @@ class FmOnlineContext:
     checkpoint rather than on whatever the task config happens to say.  Defaults to the
     height scan, which is also what a checkpoint predating the selector resolves to.
     """
+    extero_spec: list[dict] | None = None
+    """Camera contract behind the exteroception tokens, when :attr:`extero_source` is depth.
+
+    Mount, intrinsics, range and normalisation per camera (``mdp.depth_camera_specs``),
+    carried from the recording through the checkpoint.  A deployment can therefore check
+    this generator against the tracker sharing the same physical cameras.  ``None`` for
+    the height scan, whose grid travels in the tracker's ``height_scan_spec`` instead.
+    """
 
     @property
     def frame_names(self) -> list[str]:
@@ -223,6 +231,7 @@ def load_fm_context(
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
         extero_source=str(cfg.extero_source),
+        extero_spec=(meta.get("extero_spec") or None),
     )
 
 

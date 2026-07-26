@@ -2,8 +2,9 @@
 
 """Torch-free deployment runtime (numpy + onnxruntime) for the generator+tracker pair.
 
-Shared by the MuJoCo sim2sim runner and the hardware (obelisk) controller. Imports
-**no** torch / isaaclab / robot_rl: quaternion + transform math live in
+The ONLY runtime for the MuJoCo sim2sim runner and the hardware (obelisk) controller.
+Imports **no** torch / isaaclab / robot_rl: quaternion + transform math live in
 :mod:`quat_math_np` / :mod:`transforms_np` (parity-tested against the torch
-``transfer/fm`` oracle), and the two networks run via onnxruntime.
+``transfer/fm`` oracle), depth-camera geometry in :mod:`depth_obs`, and the two
+networks run via onnxruntime.
 """

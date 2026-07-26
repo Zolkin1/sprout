@@ -15,6 +15,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # Inherit fr
 from .rewards.rewards import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
 from .observations.depth import (  # noqa: F401
+    DEPTH_OBS_FUNCS,
+    depth_camera_specs,
     depth_image,
     depth_image_4d,
     depth_obs_stack,

@@ -1,15 +1,18 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Benchmark the torch-free ONNX deploy path vs the torch path (CPU latency).
+"""Benchmark the torch-free ONNX deploy path (CPU latency).
 
-Times three things and reports mean per-call latency + speedup:
-  1. Tracker net      : onnxruntime tracker.onnx  vs  torch.jit policy.pt
-  2. FM sampler        : onnxruntime fm.onnx        vs  torch model.encode + Euler loop
-  3. End-to-end step   : numpy GenTrackerPolicy     vs  torch GeneratorTrackerPolicy
-                         (create_obs + get_action; FM fires every fm_update_every)
+Times two things and reports mean per-call latency:
+  1. Tracker net     : onnxruntime tracker.onnx  vs  torch.jit policy.pt (the same
+                       network either way, so this is the runtime comparison)
+  2. End-to-end step : numpy GenTrackerPolicy (create_obs + get_action; the FM fires
+                       every fm_update_every control steps)
+
+The torch end-to-end leg is gone with ``transfer/sim/gen_tracker_policy.py``: sim2sim is
+ONNX-only, so there is no second implementation to race.
 
 Run from ``transfer/sim``:
-    python ../deploy/benchmark.py --run_dir <abs run dir> --fm_pt <abs fm .pt>
+    python ../deploy/benchmark.py --run_dir <abs run dir>
 """
 
 from __future__ import annotations
@@ -55,13 +58,11 @@ def main() -> None:
     """Run the three benchmarks and print a comparison table."""
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", required=True, help="Absolute tracker run dir.")
-    p.add_argument("--fm_pt", required=True, help="Absolute FM .pt checkpoint (for the torch path).")
     p.add_argument("--iters", type=int, default=300)
     args = p.parse_args()
 
     import torch
     from deploy.gen_tracker import GenTrackerPolicy
-    from gen_tracker_policy import GeneratorTrackerPolicy
 
     exp = os.path.join(args.run_dir, "exported")
     rng = np.random.default_rng(0)
@@ -85,27 +86,16 @@ def main() -> None:
     state = _synthetic_state(nj, K, rng)
     npd.warm_start(state)
 
-    pt = GeneratorTrackerPolicy(os.path.join(exp, "policy_parameters.yaml"),
-                                os.path.join(exp, "policy.pt"), args.fm_pt, device="cpu")
-    pt.load()
-    pt.warm_start(state)
-
     def np_step():
         npd.get_action(npd.create_obs(state), npd.get_joint_names())
 
-    def torch_step():
-        pt.get_action(pt.create_obs(state), pt.get_joint_names())
-
     ort_e2e = _time(np_step, args.iters)
-    torch_e2e = _time(torch_step, args.iters)
-
-    def row(name, ort_ms, torch_ms):
-        sp = torch_ms / ort_ms if ort_ms > 0 else float("nan")
-        print(f"  {name:22s} ORT {ort_ms:7.3f} ms   torch {torch_ms:7.3f} ms   speedup x{sp:.2f}")
 
     print(f"\n=== CPU latency (mean over {args.iters}+ calls) ===")
-    row("tracker net", ort_trk, torch_trk)
-    row("end-to-end step", ort_e2e, torch_e2e)
+    speedup = torch_trk / ort_trk if ort_trk > 0 else float("nan")
+    print(f"  {'tracker net':22s} ORT {ort_trk:7.3f} ms   torch {torch_trk:7.3f} ms   "
+          f"speedup x{speedup:.2f}")
+    print(f"  {'end-to-end step':22s} ORT {ort_e2e:7.3f} ms")
     print("  (end-to-end fires the FM every fm_update_every control steps)")
 
 

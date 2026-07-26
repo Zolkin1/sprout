@@ -766,6 +766,10 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
     meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
+    # The contract of the sensor this model ACTUALLY conditions on (None for the height
+    # scan). Distinct from the recording's ``depth_camera_spec``, which is present
+    # whenever the cameras were recorded even if this model trained on the scan instead.
+    meta_dict["extero_spec"] = train_ds.extero_spec
     ckpt = {
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),

@@ -314,3 +314,113 @@ def test_pitch_quaternion_is_identity_at_zero():
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import _pitch_down_quat_xyzw
 
     assert _pitch_down_quat_xyzw(0.0) == (0.0, 0.0, 0.0, 1.0)
+
+
+##
+# Deployment contract (depth_camera_specs)
+##
+
+def _specs():
+    """The depth contract for the real ``G1-teacher-clf-terrain-depth`` cfgs.
+
+    Goes through the same simulator-free entry point the sim2sim verification tools use,
+    so this checks the contract the task actually declares rather than a restatement of it.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        depth_camera_specs_from_cfg,
+    )
+
+    return depth_camera_specs_from_cfg()
+
+
+def test_camera_spec_order_and_identity():
+    """The contract lists both cameras in observation order, keyed to their obs terms."""
+    specs = _specs()
+    assert [s["obs_term"] for s in specs] == ["depth_near", "depth_far"]
+    assert [s["sensor"] for s in specs] == ["depth_camera_near", "depth_camera_far"]
+    assert all(s["mount_body"] == "torso_link" for s in specs)
+
+
+def test_camera_spec_intrinsics_match_the_effective_fov():
+    """fx / fy follow from the CROPPED field of view, and the centre is the image middle.
+
+    The apertures are derived from the effective FOV, so this is the check that the
+    exported intrinsics describe the rays actually cast rather than the physical lens.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
+
+    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+        width, height = spec["width"], spec["height"]
+        assert (width, height) == (dcfg._DEPTH_W, dcfg._DEPTH_H)
+        expect_fx = width / (2.0 * math.tan(math.radians(cam.effective_fov_h_deg) / 2.0))
+        expect_fy = height / (2.0 * math.tan(math.radians(cam.effective_fov_v_deg) / 2.0))
+        assert spec["fx"] == pytest.approx(expect_fx)
+        assert spec["fy"] == pytest.approx(expect_fy)
+        assert (spec["cx"], spec["cy"]) == (width / 2.0, height / 2.0)
+
+
+def test_camera_spec_carries_the_normalisation_and_range():
+    """Range, sentinel margin, normalisation and obs clip all reach the contract.
+
+    A deploy that reproduces the rays but not this arithmetic would feed the policy a
+    differently-scaled image, so every argument ``normalize_depth`` takes is exported --
+    including the ones the term leaves at their default.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
+
+    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+        assert spec["max_distance"] == cam.max_distance_m
+        assert spec["min_dist"] == cam.min_distance_m
+        assert spec["max_dist"] == pytest.approx(cam.max_distance_m - dcfg._RANGE_SENTINEL_MARGIN_M)
+        assert spec["offset"] == dcfg._DEPTH_OFFSET
+        assert spec["scale"] == dcfg._DEPTH_SCALE
+        assert spec["min_clip_val"] == 0.0 and spec["max_clip_val"] == 0.0
+        assert spec["clip"] == [-2.0, 2.0]
+        assert spec["update_period"] == pytest.approx(1.0 / dcfg._DEPTH_FPS)
+        assert spec["data_type"] == "distance_to_image_plane"
+
+
+def test_camera_spec_mount_pose_is_the_nominal_offset():
+    """The exported mount pose is the cfg offset, in the mount body's frame."""
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
+
+    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+        assert spec["offset_pos"] == pytest.approx(list(cam.pos))
+        assert spec["offset_quat_xyzw"] == pytest.approx(
+            list(dcfg._pitch_down_quat_xyzw(cam.pitch_deg))
+        )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [("data_types", ["distance_to_camera"]), ("depth_clipping_behavior", "zero")],
+)
+def test_camera_spec_rejects_unreproducible_cfgs(field, value):
+    """A camera the off-sim port cannot reproduce fails at export, not at deploy."""
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        G1TeacherTerrainDepthSceneCfg,
+        depth_camera_specs_from_cfg,
+    )
+
+    scene = G1TeacherTerrainDepthSceneCfg(num_envs=1, env_spacing=2.5)
+    setattr(scene.depth_camera_near, field, value)
+    with pytest.raises(ValueError, match="depth_camera_near"):
+        depth_camera_specs_from_cfg(scene=scene)
+
+
+def test_camera_spec_is_empty_without_depth_terms():
+    """A task with no depth observation in the exported group exports no contract.
+
+    The scan-only teacher's own group, so this is the real "no cameras" case rather than
+    a hand-emptied one -- and it pins that the contract follows the OBSERVED terms, not
+    the cameras the scene happens to hold.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        G1TeacherTerrainDepthObservationsCfg,
+        depth_camera_specs_from_cfg,
+    )
+
+    observations = G1TeacherTerrainDepthObservationsCfg()
+    observations.policy.depth_near = None
+    observations.policy.depth_far = None
+    assert depth_camera_specs_from_cfg(observations=observations) == []

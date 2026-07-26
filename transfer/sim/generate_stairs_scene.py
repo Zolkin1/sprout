@@ -218,9 +218,16 @@ def main() -> None:
                         help="Flat top-platform depth (m) past the last tread.")
     parser.add_argument("--lane", action="append", dest="lanes", type=str, default=None,
                         help="Add a staircase 'width:steps[:y]' (repeatable). Omit for the default 3 lanes.")
+    parser.add_argument("--flat", action="store_true", default=False,
+                        help="Emit a FLOOR-ONLY scene (no staircases) -- the basic_scene counterpart, "
+                             "for a robot model that has no hand-written one.")
     args = parser.parse_args()
 
-    if args.lanes:
+    if args.flat:
+        if args.lanes:
+            parser.error("--flat builds a floor-only scene; drop --lane.")
+        lanes = ()
+    elif args.lanes:
         lanes = tuple(_parse_lane(spec, i) for i, spec in enumerate(args.lanes))
     else:
         lanes = DEFAULT_LANES

@@ -34,6 +34,7 @@ conditioning by default and the MuJoCo sim2sim path, which are separate entry po
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import NamedTuple
 
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -522,3 +523,51 @@ class G1TeacherTerrainDepthImageEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
     observations: G1TeacherTerrainDepthImageObservationsCfg = (
         G1TeacherTerrainDepthImageObservationsCfg()
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract, without a simulator
+# ---------------------------------------------------------------------------
+
+def depth_camera_specs_from_cfg(
+    observations: G1TeacherTerrainDepthObservationsCfg | None = None,
+    scene: G1TeacherTerrainDepthSceneCfg | None = None,
+    group: str = "policy",
+) -> list[dict]:
+    """The depth contract for THIS task's real cfgs, with no simulator running.
+
+    Instantiates the actual observation and scene configurations and runs the production
+    producer (:func:`mdp.depth_camera_specs`) over them, so an off-sim tool sees the same
+    camera numbers, term names and clips the training task declares -- rather than a
+    restatement of them that can silently go stale.  Used by the sim2sim verification
+    tools and the contract tests; the deployment path reads the contract out of the ONNX
+    metadata instead.
+
+    Args:
+        observations: Observation cfg to read the depth terms from (defaults to this
+            task's).
+        scene: Scene cfg to read the camera sensors from (defaults to this task's).
+        group: Observation group whose depth terms to describe.
+
+    Returns:
+        One dict per camera, in observation order.
+    """
+    if observations is None:
+        observations = G1TeacherTerrainDepthObservationsCfg()
+    if scene is None:
+        scene = G1TeacherTerrainDepthSceneCfg(num_envs=1, env_spacing=2.5)
+    # Same iteration order the ObservationManager uses (dataclass field order, skipping
+    # terms set to None), so the resulting contract is ordered like the real obs vector.
+    terms = {n: t for n, t in vars(getattr(observations, group)).items() if isinstance(t, ObsTerm)}
+    sensors = {
+        n: SimpleNamespace(cfg=s)
+        for n, s in vars(scene).items()
+        if isinstance(s, MultiMeshRayCasterCameraCfg)
+    }
+    env = SimpleNamespace(
+        observation_manager=SimpleNamespace(
+            active_terms={group: list(terms)}, _group_obs_term_cfgs={group: list(terms.values())}
+        ),
+        scene=SimpleNamespace(sensors=sensors),
+    )
+    return mdp.depth_camera_specs(env, [group])

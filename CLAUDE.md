@@ -35,6 +35,32 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
 - The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 
+## The camera contract (how depth reaches MuJoCo / hardware)
+`mdp.depth_camera_specs(env)` derives ONE contract per camera — mount body + offset, pinhole
+intrinsics, range, and the `(d - offset) * scale` normalization — from the sensor cfgs and obs terms.
+It is the single producer for all consumers, so nothing off-sim restates a camera number:
+- `tracker.onnx` metadata `policy_parameters.depth_camera_spec` (via `export_parameters.py`);
+- `fm.onnx` metadata `fm_meta.extero_spec` (+ `extero_source`, `extero_tokens`), plumbed env cfg ->
+  `RecordingMeta.depth_camera_spec` -> FM dataset -> checkpoint -> export;
+- `GenTrackerPolicy.load()` requires the two to AGREE (`transfer/deploy/depth_obs.py`) — there is one
+  physical camera pair, so a tracker and generator running together cannot describe different ones.
+Relatedly, `export_parameters.py` now emits each obs term's `clip`, so `_assemble` saturates every
+term the way training did instead of consulting a hardcoded table (kept only as a legacy fallback).
+
+## sim2sim (MuJoCo)
+- `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).
+  Casts geom groups {1 = per-link visual meshes, 2 = terrain}: self-occlusion comes from group 1, and
+  group 0 (collision) stays out because the foot there is a box, not the visual foot.
+- `transfer/deploy/depth_obs.py` — the torch-free normalization port + spec parse/agreement, shared
+  with hardware. `transfer/sim/verify_depth_cameras.py` checks geometry/coverage/self-occlusion,
+  `scripts/rsl_rl/compare_depth_sim2sim.py` diffs IsaacLab vs MuJoCo pixel-by-pixel (they agree
+  exactly except for the hand delta below).
+- KNOWN DELTA: MuJoCo group 1 includes the HAND meshes, which `SELF_SCAN_LINKS` excludes (~60/780
+  near-camera px). Kept deliberately until the hardware camera's occlusion geometry is known; TODOs
+  in `g1_self_scan.py` and `transfer/sim/depth_camera.py`.
+- sim2sim is ONNX-ONLY (the torch `gen_tracker_policy.py` is gone). `transfer/fm/` remains as the
+  torch oracle for the numpy ports + `fm_test_bench.py`, and is height-scan-only.
+
 # General Guidelines
 - Don't care for backwards compatibility.
 - Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`.

@@ -331,6 +331,11 @@ class FutureStateDataset(Dataset):
         self.extero_tokens = n_tokens
         cfg.height_dim = token_dim
         cfg.extero_tokens = n_tokens
+        # Contract of the sensor behind those tokens, carried from the recording so the
+        # trained checkpoint (and the ONNX exported from it) states which cameras it
+        # conditions on. Only depth has one; the height scan's geometry travels in the
+        # tracker's ``height_scan_spec``.
+        self.extero_spec = self._resolve_extero_spec(cfg, meta, n_tokens, token_dim)
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
@@ -386,6 +391,52 @@ class FutureStateDataset(Dataset):
             (float(cfg.noise_extero) * float(cfg.noise_scale)) / height_normalizer.std
             if self.add_noise else None
         )
+
+    @staticmethod
+    def _resolve_extero_spec(
+        cfg: FlowMatchingConfig, meta: Any, n_tokens: int, token_dim: int
+    ) -> list[dict] | None:
+        """The sensor contract behind the exteroception tokens, validated against them.
+
+        Only the depth source has one: it is the deployable signal, and reproducing it
+        off-sim needs the camera geometry, whereas the height scan's grid already travels
+        in the tracker's ``height_scan_spec``.
+
+        Args:
+            cfg: The training config (its ``extero_source`` selects the sensor).
+            meta: Recording layout metadata.
+            n_tokens: Token count found in the recorded array.
+            token_dim: Per-token width found in the recorded array.
+
+        Returns:
+            The per-camera contract, or ``None`` for the height scan.
+
+        Raises:
+            ValueError: If a depth recording carries no camera contract, or if the
+                contract disagrees with the shape of the recorded array.
+        """
+        if cfg.extero_source != "depth":
+            return None
+        spec = getattr(meta, "depth_camera_spec", None)
+        if not spec:
+            raise ValueError(
+                "extero_source='depth' requires the recording's 'depth_camera_spec' "
+                "(the camera geometry the FM must state at deploy); this recording has "
+                "none. Re-record with scripts/rsl_rl/record_data.py on a depth task."
+            )
+        if len(spec) != n_tokens:
+            raise ValueError(
+                f"depth_camera_spec lists {len(spec)} cameras but the recorded depth has "
+                f"{n_tokens} token(s)."
+            )
+        for cam in spec:
+            if int(cam["width"]) * int(cam["height"]) != token_dim:
+                raise ValueError(
+                    f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
+                    f"= {int(cam['width']) * int(cam['height'])} pixels but the recorded "
+                    f"depth token is {token_dim} wide."
+                )
+        return [dict(cam) for cam in spec]
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
         """Per-channel uniform noise half-width (normalized space) for a history token.
