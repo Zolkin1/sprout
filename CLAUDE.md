@@ -19,6 +19,22 @@ Training and playing is logged to log.
 
 transfer holds code to transfer the RL code to mujoco (in transfer/sim) and to the hardware (transfer/obelisk).
 
+# Depth Cameras (this branch)
+Two self-scanning depth cameras on the terrain teacher, as an alternative exteroception to the height scan.
+- `g1/g1_depth_env_cfg.py` + `g1/g1_self_scan.py` - camera cfgs and the generated `MultiMeshRayCaster`
+  target prim paths. For the robot to appear in its own depth image every moving link must be its OWN
+  target with `track_mesh_transforms=True`, aimed at the INNER same-named Xform: a target on the OUTER
+  link Xform welds the whole downstream limb into one rigid body frozen at its spawn pose (so e.g. knee
+  flexion would be invisible).
+- `mdp/observations/depth.py`, `mdp/events/depth.py`, `mdp/sensors/noise.py` - the observation terms,
+  mount-pose randomization + FOV edge-crop, and datasheet optics/range/rate.
+- Tasks: `G1-teacher-clf-terrain-depth{,-image}` (+ each `-play`). Depth REPLACES the height scan in
+  the POLICY obs (the hardware has cameras, not a heightmap); the CRITIC keeps the scan, since it is
+  privileged and never deployed. The `-image` variant differs only in obs SHAPE (per-camera image
+  groups for a CNN) — it is untested in training and `PPORunnerCfg` is an MLP.
+- The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
+- `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
+
 # General Guidelines
 - Don't care for backwards compatibility.
 - Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`.

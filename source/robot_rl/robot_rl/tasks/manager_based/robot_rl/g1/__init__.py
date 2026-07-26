@@ -509,8 +509,9 @@ if not _registered:
 
     ## =========================================
     # Teacher on TERRAIN + two self-scanning depth cameras (torso-mounted).
-    # Same terrain / clip tracking as above, plus near- and far-field depth that
-    # sees the robot's own limbs.  The pelvis height scan is kept alongside.
+    # Same terrain / clip tracking as above, but the policy sees the ground ONLY
+    # through the cameras -- depth REPLACES the height scan, which is what the
+    # hardware can actually deploy.  The critic keeps the scan (privileged).
     ## =========================================
     gym.register(
         id="G1-teacher-clf-terrain-depth",
@@ -528,26 +529,6 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-teacher-clf-terrain-depth-only",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthOnlyEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-teacher-clf-terrain-depth-only-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthOnlyEnvCfgPlay",
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )

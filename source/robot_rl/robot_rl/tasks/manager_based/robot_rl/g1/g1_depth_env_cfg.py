@@ -15,17 +15,20 @@ the way a real depth camera would see it.  See
 :mod:`~robot_rl.tasks.manager_based.robot_rl.g1.g1_self_scan` for why every limb
 needs its own ray-cast target pointed at an inner visual Xform.
 
-Two flavours, mirroring the height-scan teacher's observation layout:
+Depth REPLACES the height scan in the policy group: the hardware has cameras, not a
+heightmap, so a policy that leans on the scan is not deployable.  Two flavours differing
+only in the observation SHAPE:
 
-- :class:`G1TeacherTerrainDepthEnvCfg` adds flattened ``depth_near`` / ``depth_far``
-  terms to the policy group.
-- :class:`G1TeacherTerrainDepthImageEnvCfg` instead exposes each camera as an
-  image-shaped observation in its own group, for CNN backbones.
+- :class:`G1TeacherTerrainDepthEnvCfg` -- flattened ``depth_near`` / ``depth_far`` terms
+  in the policy group.
+- :class:`G1TeacherTerrainDepthImageEnvCfg` -- each camera as an image-shaped
+  observation in its own group, for CNN backbones.
 
-The inherited pelvis ``height_scanner`` is deliberately left in place: it still
-feeds the policy, the critic, the flow-matching conditioning
-(:mod:`robot_rl.flow_matching.dataset` requires it) and the MuJoCo sim2sim path, so
-depth is additive until a retrain replaces it.
+The CRITIC keeps its height scan, and the pelvis ``height_scanner`` therefore stays in
+the scene.  The critic is privileged and never deployed, so a complete terrain
+description there is free and stabilises the value function while the policy works the
+harder problem from depth alone.  The scan also still feeds the flow-matching
+conditioning by default and the MuJoCo sim2sim path, which are separate entry points.
 """
 
 from __future__ import annotations
@@ -298,7 +301,19 @@ class G1TeacherTerrainDepthSceneCfg(G1TeacherTerrainSceneCfg):
 
 @configclass
 class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
-    """Teacher observations + flattened depth scans in the policy group."""
+    """Teacher observations where DEPTH REPLACES the height scan in the policy group.
+
+    The policy sees terrain only through the cameras -- that is the point, since the
+    hardware has cameras and not a heightmap.  The critic keeps its height scan: it is
+    privileged, never deployed, so a complete terrain description there is free and gives
+    the value function a stable target while the policy works the harder problem.  The
+    ``height_scanner`` sensor therefore stays in the scene to feed it.
+
+    To strip the scan entirely, also set ``observations.critic.height_scan`` and
+    ``scene.height_scanner`` to None -- and drop the inherited
+    ``scene.height_scanner.debug_vis = True`` in the play variant, which would otherwise
+    raise on None.
+    """
 
     @configclass
     class PolicyCfg(G1TeacherObservationsCfg.PolicyCfg):
@@ -314,6 +329,10 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
             params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
             clip=(-2.0, 2.0),
         )
+
+        def __post_init__(self):
+            super().__post_init__()
+            self.height_scan = None
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -396,39 +415,6 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainEnvCfg):
     )
     observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
     events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
-
-
-@configclass
-class G1TeacherTerrainDepthOnlyObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
-    """Depth REPLACES the height scan in the policy group.
-
-    The critic keeps its height scan on purpose.  The critic is privileged and never
-    deployed, so leaving it a clean, complete terrain description is free and gives the
-    value function a stable target while the policy has to work the harder problem from
-    depth alone -- the usual asymmetric actor-critic arrangement.
-
-    To strip the scan entirely instead, also set ``observations.critic.height_scan`` and
-    ``scene.height_scanner`` to None -- and drop the inherited
-    ``scene.height_scanner.debug_vis = True`` in the play variant, which would otherwise
-    raise on None.
-    """
-
-    @configclass
-    class PolicyCfg(G1TeacherTerrainDepthObservationsCfg.PolicyCfg):
-        def __post_init__(self):
-            super().__post_init__()
-            self.height_scan = None
-
-    policy: PolicyCfg = PolicyCfg()
-
-
-@configclass
-class G1TeacherTerrainDepthOnlyEnvCfg(G1TeacherTerrainDepthEnvCfg):
-    """Terrain teacher seeing the ground ONLY through the two depth cameras."""
-
-    observations: G1TeacherTerrainDepthOnlyObservationsCfg = (
-        G1TeacherTerrainDepthOnlyObservationsCfg()
-    )
 
 
 @configclass
@@ -535,13 +521,4 @@ class G1TeacherTerrainDepthImageEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
 
     observations: G1TeacherTerrainDepthImageObservationsCfg = (
         G1TeacherTerrainDepthImageObservationsCfg()
-    )
-
-
-@configclass
-class G1TeacherTerrainDepthOnlyEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
-    """Play variant of :class:`G1TeacherTerrainDepthOnlyEnvCfg`."""
-
-    observations: G1TeacherTerrainDepthOnlyObservationsCfg = (
-        G1TeacherTerrainDepthOnlyObservationsCfg()
     )
