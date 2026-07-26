@@ -399,6 +399,39 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainEnvCfg):
 
 
 @configclass
+class G1TeacherTerrainDepthOnlyObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
+    """Depth REPLACES the height scan in the policy group.
+
+    The critic keeps its height scan on purpose.  The critic is privileged and never
+    deployed, so leaving it a clean, complete terrain description is free and gives the
+    value function a stable target while the policy has to work the harder problem from
+    depth alone -- the usual asymmetric actor-critic arrangement.
+
+    To strip the scan entirely instead, also set ``observations.critic.height_scan`` and
+    ``scene.height_scanner`` to None -- and drop the inherited
+    ``scene.height_scanner.debug_vis = True`` in the play variant, which would otherwise
+    raise on None.
+    """
+
+    @configclass
+    class PolicyCfg(G1TeacherTerrainDepthObservationsCfg.PolicyCfg):
+        def __post_init__(self):
+            super().__post_init__()
+            self.height_scan = None
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class G1TeacherTerrainDepthOnlyEnvCfg(G1TeacherTerrainDepthEnvCfg):
+    """Terrain teacher seeing the ground ONLY through the two depth cameras."""
+
+    observations: G1TeacherTerrainDepthOnlyObservationsCfg = (
+        G1TeacherTerrainDepthOnlyObservationsCfg()
+    )
+
+
+@configclass
 class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
     """Moves the depth out of the policy group into per-camera image groups."""
 
@@ -502,4 +535,13 @@ class G1TeacherTerrainDepthImageEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
 
     observations: G1TeacherTerrainDepthImageObservationsCfg = (
         G1TeacherTerrainDepthImageObservationsCfg()
+    )
+
+
+@configclass
+class G1TeacherTerrainDepthOnlyEnvCfgPlay(G1TeacherTerrainDepthEnvCfgPlay):
+    """Play variant of :class:`G1TeacherTerrainDepthOnlyEnvCfg`."""
+
+    observations: G1TeacherTerrainDepthOnlyObservationsCfg = (
+        G1TeacherTerrainDepthOnlyObservationsCfg()
     )
