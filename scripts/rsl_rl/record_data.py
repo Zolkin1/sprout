@@ -634,6 +634,24 @@ def collect_windows(
           f"on {n_envs} envs; max_steps={max_steps}...")
     written = 0
     step = 0
+    # Gate: does this env's whole future window still fall inside the clip's real frames?
+    # ``clip_len`` lives on the clip-library device (CPU under --clip_device cpu), so gather
+    # there and move the verdict back. None when the command exposes no clip step / length
+    # (e.g. an FM-generated reference), in which case no gating is possible.
+    max_off = int(future_offsets.max().item())
+    clip_len_all = getattr(getattr(ref_cmd, "manager", None), "clip_len", None)
+    have_step = hasattr(ref_cmd, "_step") and hasattr(ref_cmd, "clip_id")
+    fut_ok_fn = None
+    if clip_len_all is not None and have_step:
+        def fut_ok_fn():
+            """True per env when ``step + max_offset`` is still a real (unpadded) clip frame."""
+            cid = ref_cmd.clip_id.to(clip_len_all.device)
+            cl = clip_len_all[cid].to(ref_cmd._step.device)
+            return (ref_cmd._step + max_off) <= (cl - 1)
+    else:
+        print("[WARN] cannot gate on clip length (no clip step/len on the command); "
+              "windows near a clip end may carry a partly frozen future.")
+    n_short = 0
     while written < num_windows and step < max_steps:
         with torch.inference_mode():
             actions = policy(obs, stochastic_output=stochastic)
@@ -649,8 +667,20 @@ def collect_windows(
         hist[:, H - 1] = state_t
         valid = torch.clamp(valid + 1, max=H)
 
-        # Emit a window for each env that snaps AND has a full valid ring.
+        # Emit a window for each env that snaps AND has a full valid ring AND whose whole
+        # future window still lies inside the clip's REAL frames.
+        #
+        # Short clips are padded into the library by repeating their last frame, and the
+        # future-window gather clamps to the library length, so a window opened within F steps
+        # of ``clip_len - 1`` has a partly FROZEN target. Training on those teaches "the
+        # reference stops moving" for conditioning that otherwise means "keep going", and
+        # because the FM is multi-modal it would then sample that frozen mode occasionally at
+        # deploy. Cheaper to drop those windows than to un-learn the mode.
         emit = reanchor_t & (valid >= H)
+        if fut_ok_fn is not None:
+            fits = fut_ok_fn()
+            n_short += int((emit & ~fits).sum().item())
+            emit = emit & fits
         if bool(emit.any()):
             idx = emit.nonzero(as_tuple=False).flatten()
             ref_future_t = _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs)
@@ -695,6 +725,11 @@ def collect_windows(
     if written < num_windows:
         print(f"[WARN] Reached max_steps={max_steps} with {written}/{num_windows} windows "
               f"(snaps sparser than expected); saving what was collected.")
+    if n_short:
+        print(f"[INFO] Dropped {n_short} snap window(s) whose {max_off}-step future would have "
+              f"crossed the clip end ({100.0 * n_short / max(n_short + written, 1):.1f}% of "
+              f"otherwise-eligible snaps): those targets are partly the clip's frozen last "
+              f"frame, which the FM would learn as a stop-moving mode.")
     return written
 
 
@@ -746,6 +781,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 raise ValueError("--clip given but the task has no commands.traj_ref.path to override.")
             print(f"[INFO] Overriding clip library: {traj_ref.path} -> {args_cli.clip}")
             traj_ref.path = args_cli.clip
+            # A ClipTerrainImporter builds its terrain MESH from the same library the command
+            # tracks, so repoint it too (mirrors play.py). Missing this silently records the
+            # robot tracking library A's clips on library B's tiles: the stairs are not where
+            # the clip expects, so the robot never climbs, and the height scan faithfully
+            # reports geometry metres overhead (measured: a mesh reaching +20.25 m for a
+            # library whose tallest authored surface is +5.44 m, and 30-37% of recorded scan
+            # entries <= -1 m where a matched scene produces none).
+            terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+            if terrain is not None and hasattr(terrain, "clip_library_path"):
+                print(f"[INFO] Overriding terrain importer mesh library: "
+                      f"{terrain.clip_library_path} -> {args_cli.clip}")
+                terrain.clip_library_path = args_cli.clip
 
         # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
         # OOM a small card at scene init). Explicit --clip_device overrides.
