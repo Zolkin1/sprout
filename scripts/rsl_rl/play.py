@@ -42,6 +42,14 @@ from data_logger import DataLogger  # isort: skip
 from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
+# The FM exporter lives in scripts/flow_matching; put it on the path like
+# export_deploy_onnx.py does so play.py can write both deploy artifacts itself.
+_FM_SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              os.pardir, "flow_matching"))
+if _FM_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _FM_SCRIPT_DIR)
+from export_tracker_onnx import export_tracker_onnx  # isort: skip
+from export_fm_onnx import export_fm_onnx  # isort: skip
 from robot_rl.network.moe_network import MixtureOfExperts  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
@@ -129,6 +137,12 @@ parser.add_argument(
          "clip/FM references + the FM prediction window) to play_data.npz in the plots "
          "dir, for offline analysis. "
          "Pair with --plots fm_predictions to include the full FM prediction window.",
+)
+parser.add_argument(
+    "--no_deploy_onnx", action="store_true", default=False,
+    help="Skip writing the two deploy ONNX artifacts (exported/tracker.onnx and, with "
+         "--fm_checkpoint, exported/fm.onnx). They are written by default because they must "
+         "stay in sync with the policy.pt + policy_parameters.yaml this run exports.",
 )
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
@@ -526,6 +540,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             actions = policy(obs)
         export_policy_parameters(env, obs, actions, log_dir)
+
+        # Deploy artifacts for the MuJoCo / hardware runners: exactly two ONNX files, the RL
+        # tracker and (when an FM is loaded) the FM generator. Both carry their metadata
+        # embedded, so the runner needs no YAML. Done here rather than in a separate step
+        # because tracker.onnx needs the policy.pt + policy_parameters.yaml this run just
+        # wrote -- exporting them together is what keeps the three in sync.
+        if not args_cli.no_deploy_onnx:
+            try:
+                export_tracker_onnx(export_model_dir)
+                _trk = os.path.join(export_model_dir, "tracker.onnx")
+                print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
+                if args_cli.fm_checkpoint is not None:
+                    fm_out = os.path.join(export_model_dir, "fm.onnx")
+                    export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                    print(f"[INFO] wrote {fm_out}")
+                else:
+                    print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
+            except Exception as exc:                                        # noqa: BLE001
+                print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
+                      f"Re-run scripts/rsl_rl/export_deploy_onnx.py by hand if needed.")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""
