@@ -47,6 +47,11 @@ import cli_args  # isort: skip  (same dir; import-safe before the app launches)
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("--task", required=True, help="Play task id (clip teacher or FM tracker).")
 parser.add_argument("--fm_checkpoint", default=None, help="FM checkpoint (FM-tracker tasks).")
+parser.add_argument("--fm_zero_noise", action="store_true",
+                    help="Integrate the FM flow from x0=0 so its prediction is deterministic "
+                         "given the conditioning. Off by default (training-matched Gaussian). "
+                         "Use it to A-B against a MuJoCo run, whose runner defaults zero-noise "
+                         "ON -- otherwise the two differ by an RNG draw before any dynamics.")
 parser.add_argument("--clip", default=None, help="Clip library .h5 (also repoints the terrain mesh).")
 parser.add_argument("--clip_device", default=None, help="Hold the clip library here, e.g. 'cpu'.")
 parser.add_argument("--num_envs", type=int, default=16, help="Envs to simulate.")
@@ -187,6 +192,11 @@ def main(env_cfg, agent_cfg) -> int:
             if hasattr(term, "fm_checkpoint"):
                 term.fm_checkpoint = args_cli.fm_checkpoint
                 print(f"[INFO] fm_checkpoint -> commands.{name}")
+    if args_cli.fm_zero_noise:
+        for name, term in vars(env_cfg.commands).items():
+            if hasattr(term, "fm_zero_noise"):
+                term.fm_zero_noise = True
+                print(f"[INFO] fm_zero_noise=True -> commands.{name}")
 
     # Mirror play.py: apply the CLI overrides + the rsl-rl deprecation shim before building
     # the runner, else the agent cfg carries fields the installed rsl-rl no longer accepts.
@@ -219,7 +229,7 @@ def main(env_cfg, agent_cfg) -> int:
     buf: dict[str, list] = {k: [] for k in
                             ("cmd_vel", "ach_vel", "scan_obs", "scan_raw", "scan_hits",
                              "root_pos", "root_quat", "joint_pos", "body_pos", "ref_pos",
-                             "done", "fm_pred")}
+                             "done", "fm_pred", "fm_pred_frames", "fm_pred_idx")}
     obs = env.get_observations()
     if isinstance(obs, tuple):          # rsl-rl returns (obs, extras) in some versions
         obs = obs[0]
@@ -255,9 +265,20 @@ def main(env_cfg, agent_cfg) -> int:
         y = _np(cmd.y_des)[:ncap]
         buf["ref_pos"].append(np.stack([y[:, ref_idx[f]] for f in frames if f in ref_idx], axis=1))
         if is_fm:
+            # The generator's whole predicted WINDOW at this step, root and extra frames, plus
+            # the index within it that is currently being applied. Recorded per step (not per
+            # re-plan) so a viewer can show exactly what the FM emitted at any step; the window
+            # is only refreshed every ``fm_update_every`` steps, so consecutive steps repeat it
+            # while ``fm_pred_idx`` walks forward through it.
             pred = getattr(cmd, "_pred_root_pos", None)
+            predf = getattr(cmd, "_pred_frame_pos", None)
+            pidx = getattr(cmd, "_pred_idx", None)
             buf["fm_pred"].append(_np(pred)[:ncap] if pred is not None
                                   else np.zeros((ncap, 1, 3), "float32"))
+            buf["fm_pred_frames"].append(_np(predf)[:ncap] if predf is not None
+                                         else np.zeros((ncap, 1, 0, 3), "float32"))
+            buf["fm_pred_idx"].append(_np(pidx)[:ncap].astype("int32") if pidx is not None
+                                      else np.zeros((ncap,), "int32"))
 
         with torch.inference_mode():
             obs, _, dones, _ = env.step(act)
@@ -277,10 +298,21 @@ def main(env_cfg, agent_cfg) -> int:
         "dt": float(u.step_dt), "frames": frames, "joint_names": list(robot.joint_names),
         "task": args_cli.task, "is_fm": bool(is_fm), "checkpoint": args_cli.checkpoint,
         "fm_checkpoint": args_cli.fm_checkpoint, "clip": args_cli.clip,
+        "fm_zero_noise": bool(args_cli.fm_zero_noise),
         "terrain_manifest": lib_manifest, "num_captured": int(ncap),
+        # Order of the K extra frames in ``fm_pred_frames`` (the FM's predicted ee frames).
+        "fm_frame_names": (list(cmd.ctx.frame_names) if is_fm and hasattr(cmd, "ctx") else []),
     }
     out["terrain_id"] = tid
     out["cell_corner"] = corner
+    # Where the clip itself was placed in the world. This -- not ``cell_corner`` -- is the datum
+    # that maps a world trace back into clip coordinates: for a terrain clip it IS the tile
+    # corner, but for a flat clip the tile has no corner (``cell_corner`` stays zero) and the
+    # placement is the env origin, tens of metres out in the tile grid. Consumers comparing
+    # against clip-authored coordinates (e.g. a MuJoCo scene) must subtract this.
+    cwp = getattr(cmd, "clip_world_pos", None)
+    out["clip_world_pos"] = (_np(cwp)[:ncap].astype("float32") if cwp is not None
+                             else np.zeros((ncap, 3), "float32"))
     out["meta_json"] = np.asarray(json.dumps(meta))
     os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)) or ".", exist_ok=True)
     np.savez_compressed(args_cli.out, **out)

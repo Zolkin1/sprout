@@ -473,18 +473,37 @@ class Robot:
         print("[INFO] Set initial condition from policy YAML.")
 
     def set_base_and_joints(self, base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
-                            joint_pos_mujoco: np.ndarray) -> None:
-        """Set the floating-base pose + joint positions (MuJoCo order) and zero velocities.
+                            joint_pos_mujoco: np.ndarray,
+                            base_lin_vel_w: np.ndarray | None = None,
+                            base_ang_vel_w: np.ndarray | None = None,
+                            joint_vel_mujoco: np.ndarray | None = None) -> None:
+        """Set the floating-base pose + joint positions (MuJoCo order), and velocities.
+
+        Any velocity left as ``None`` is zeroed (the standing-spawn behaviour). Both velocity
+        arguments are taken in the WORLD frame, matching IsaacLab's
+        ``write_root_link_velocity_to_sim``; the angular one is rotated into the body frame on
+        the way in, because a MuJoCo free joint stores ``qvel[:3]`` in the world frame but
+        ``qvel[3:6]`` in the body frame.
 
         Args:
             base_pos: Base (pelvis) world position ``[x, y, z]``.
             base_quat_wxyz: Base orientation quaternion in MuJoCo ``(w, x, y, z)`` order.
             joint_pos_mujoco: Joint positions in MuJoCo joint order (``qpos[7:]``).
+            base_lin_vel_w: World-frame base linear velocity ``[vx, vy, vz]``, or ``None``.
+            base_ang_vel_w: World-frame base angular velocity ``[wx, wy, wz]``, or ``None``.
+            joint_vel_mujoco: Joint velocities in MuJoCo joint order (``qvel[6:]``), or ``None``.
         """
         self.mj_data.qpos[:3] = base_pos
         self.mj_data.qpos[3:7] = base_quat_wxyz
         self.mj_data.qpos[7:] = joint_pos_mujoco
         self.mj_data.qvel[:] = 0.0
+        if base_lin_vel_w is not None:
+            self.mj_data.qvel[:3] = base_lin_vel_w
+        if base_ang_vel_w is not None:
+            rot = Rotation.from_quat(np.asarray(base_quat_wxyz)[[1, 2, 3, 0]])  # -> xyzw
+            self.mj_data.qvel[3:6] = rot.inv().apply(np.asarray(base_ang_vel_w))
+        if joint_vel_mujoco is not None:
+            self.mj_data.qvel[6:] = joint_vel_mujoco
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
     def scale_gains(self, kp_mult: float, kv_mult: float, name_filter: list[str] | None = None) -> None:

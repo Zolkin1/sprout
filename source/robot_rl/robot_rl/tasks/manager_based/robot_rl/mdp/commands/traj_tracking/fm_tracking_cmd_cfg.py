@@ -39,6 +39,28 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""
 
+    fm_null_history_warmup: bool = True
+    """Sample the FM from control step 0 using the model's learned ``null_history`` embedding
+    while the N-step history window is still filling, instead of falling back to the clip.
+
+    The generator was trained with ``null_cond_prob`` of its samples history-nulled precisely so
+    it can be conditioned without a history, so this is the in-distribution way to cover the
+    post-reset steps. With it off, the reference falls back to the clip for the first ``N-1``
+    steps (the previous behaviour), which makes the RL and deploy paths disagree: the deployed
+    generator has no clip to fall back on and instead fabricates a repeated static standing
+    history. Keep it on so IsaacLab, MuJoCo and hardware share one flow."""
+
+    fm_zero_noise: bool = False
+    """Integrate the flow from ``x0 = 0`` instead of Gaussian noise, so the prediction is a
+    deterministic function of the conditioning.
+
+    Default ``False`` = training-matched stochastic sampling; leave it there for training and
+    for any run meant to represent real behaviour. Set it only for A-B diagnostics where the
+    per-call noise draw would mask the effect being measured -- notably sim2sim, whose MuJoCo
+    counterpart (``GenTrackerPolicy(zero_noise=...)``, exposed as ``--zero_noise`` /
+    ``--gaussian_noise``) defaults it ON, so a default Isaac run and a default MuJoCo run are
+    NOT comparing like with like. ``x0 = 0`` is off the training distribution."""
+
     # --- Debug visualization (augments the inherited clip-ribbon viz) ---
     debug_vis_show_fm_prediction: bool = True
     """Draw the FM's predicted world-frame trajectory as a ribbon of spheres (one color per

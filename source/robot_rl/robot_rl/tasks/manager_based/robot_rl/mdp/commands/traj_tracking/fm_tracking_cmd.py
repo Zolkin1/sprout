@@ -72,7 +72,12 @@ class FmTrackingCommand(MotionSequenceCommand):
         self.ctx = load_fm_context(
             self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
             num_sampling_steps=self.cfg.fm_num_sampling_steps,
+            zero_noise=self.cfg.fm_zero_noise,
         )
+        if self.cfg.fm_zero_noise:
+            print("[INFO FmTrackingCommand] fm_zero_noise=True: the flow integrates from x0=0, "
+                  "so predictions are deterministic given the conditioning (diagnostic mode, "
+                  "off the training distribution).")
         if self.ctx.cmd_dim <= 0:
             raise ValueError("FmTrackingCommand expects a command-conditioned FM checkpoint (cmd_dim>0).")
 
@@ -226,29 +231,45 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._history.append(self._robot_snapshot())
 
         valid = self._history.valid()
-        self._pred_valid = self._pred_valid & valid
+        # Envs whose window has not filled yet (post-reset). With fm_null_history_warmup the FM
+        # is still sampled for them, conditioned on the learned null-history embedding it was
+        # trained with, so the generator drives from step 0 and no clip fallback is needed.
+        null_hist = self._history.null_mask()
+        if self.cfg.fm_null_history_warmup:
+            gate = torch.ones_like(valid)
+        else:
+            gate = valid
+            self._pred_valid = self._pred_valid & valid
         reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
         exhausted = self._pred_idx >= (self.ctx.F - 1)
-        infer_mask = valid & (reinfer | ~self._pred_valid | exhausted)
+        infer_mask = gate & (reinfer | ~self._pred_valid | exhausted)
         self._fm_reinfer_mask = infer_mask
-        advance = valid & ~infer_mask
+        # Advance the applied index on steps that did not re-plan (only meaningful once a
+        # prediction exists; ``_pred_valid`` implies a filled window in the non-null mode).
+        advance = self._pred_valid & ~infer_mask
         self._pred_idx = torch.where(
             advance, torch.clamp(self._pred_idx + 1, max=self.ctx.F - 1), self._pred_idx
         )
         if bool(infer_mask.any()):
-            self._run_fm(infer_mask)
+            self._run_fm(infer_mask, null_hist)
 
     @torch.no_grad()
-    def _run_fm(self, mask: torch.Tensor) -> None:
-        """Run batched FM inference for the masked envs (robot-state history) and store predictions."""
+    def _run_fm(self, mask: torch.Tensor, null_hist: torch.Tensor | None = None) -> None:
+        """Run batched FM inference for the masked envs (robot-state history) and store predictions.
+
+        ``null_hist`` is the per-env "history not yet complete" mask; those envs are sampled with
+        the model's learned ``null_history`` embedding instead of their (incomplete, possibly
+        pre-reset) window. ``stack_padded`` is used so the window is always N long even on the
+        first steps of a run -- its content is discarded wherever ``null_hist`` is set.
+        """
         ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-        rp = self._history.stack("root_pos")[ids]    # [V,N,3] live robot history
-        rq = self._history.stack("root_quat")[ids]
-        rl = self._history.stack("root_lin")[ids]
-        ra = self._history.stack("root_ang")[ids]
-        jp = self._history.stack("jp")[ids]          # [V,N,nj] FM order
-        jv = self._history.stack("jv")[ids]
-        frames = self._history.stack("frames")[ids] if self.ctx.num_extra_frames > 0 else None
+        rp = self._history.stack_padded("root_pos")[ids]    # [V,N,3] live robot history
+        rq = self._history.stack_padded("root_quat")[ids]
+        rl = self._history.stack_padded("root_lin")[ids]
+        ra = self._history.stack_padded("root_ang")[ids]
+        jp = self._history.stack_padded("jp")[ids]          # [V,N,nj] FM order
+        jv = self._history.stack_padded("jv")[ids]
+        frames = self._history.stack_padded("frames")[ids] if self.ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         # Height token = the live height scan at "now" (per-ray ground clearance from the
@@ -260,7 +281,8 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Anchor = the robot NOW (the most-recent history step IS the live robot); the FM
         # predicts in this xyz+yaw frame, so no re-centering is needed.
         p_ref, q_ref = rp[:, -1].clone(), rq[:, -1].clone()
-        world = sample_world(self.ctx, history, height, cmd_tokens, p_ref, q_ref)
+        world = sample_world(self.ctx, history, height, cmd_tokens, p_ref, q_ref,
+                             history_null_mask=(None if null_hist is None else null_hist[ids]))
 
         self._pred_root_pos[ids] = world["root_pos_w"]
         self._pred_root_quat[ids] = world["root_quat_w"]

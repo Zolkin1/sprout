@@ -69,18 +69,26 @@ class _FmSamplerOnnx(nn.Module):
         height: torch.Tensor,
         cmd_tokens: torch.Tensor,
         noise: torch.Tensor,
+        history_null: torch.Tensor,
     ) -> torch.Tensor:
-        """Normalize the conditioning, Euler-sample the F future from ``noise``, denormalize."""
+        """Normalize the conditioning, Euler-sample the F future from ``noise``, denormalize.
+
+        ``history_null`` is a ``(V, 1)`` float flag (>0.5 = null) rather than a bool, because a
+        bool graph input is awkward across runtimes; it selects the model's learned
+        ``null_history`` embedding in place of the history content. That is what lets the
+        deployed generator sample before its history window has filled, matching the RL side.
+        """
         hist_n = (history - self.s_mean) / self.s_std        # (V, N, D)
         height_n = (height - self.h_mean) / self.h_std       # (V, 1)
         cmd_n = (cmd_tokens - self.c_mean) / self.c_std      # (V, n_cmd, cmd)
+        null_m = (history_null.reshape(-1) > 0.5)            # (V,) bool
 
         x = noise                                            # (V, F, D) -- all F denoised
         dt = 1.0 / self.num_steps
         for i in range(self.num_steps):
             # Batch-derived tau (V,) so the graph stays dynamic in the batch axis.
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
-            v = self.model(x, tau, hist_n, height_n, cmd_n)
+            v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
             x = x + dt * v
         return x * self.s_std + self.s_mean
 
@@ -93,6 +101,10 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
         "ground_z": float(ctx.ground_z), "height_dim": int(ctx.model.height_dim),
+        # Signals to the deploy side that the graph accepts the history_null input, so it can
+        # sample with the learned null embedding before its history fills. Absent in graphs
+        # exported before that input existed.
+        "has_history_null": True,
     }
 
 
@@ -105,7 +117,8 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
     hdim = int(ctx.model.height_dim)  # height-scan width (176), not 1
-    dummy = (torch.randn(v, n, d), torch.randn(v, hdim), torch.randn(v, n_cmd, cmd), torch.randn(v, f, d))
+    dummy = (torch.randn(v, n, d), torch.randn(v, hdim), torch.randn(v, n_cmd, cmd),
+             torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
     # dim on TransformerEncoder, whereas the newer dynamo path baked a static batch
@@ -113,8 +126,10 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     torch.onnx.export(
         wrapper, dummy, out_path,
         export_params=True, opset_version=opset, dynamo=False,
-        input_names=["history", "height", "cmd_tokens", "noise"], output_names=["trajectory"],
-        dynamic_axes={k: {0: "V"} for k in ("history", "height", "cmd_tokens", "noise", "trajectory")},
+        input_names=["history", "height", "cmd_tokens", "noise", "history_null"],
+        output_names=["trajectory"],
+        dynamic_axes={k: {0: "V"} for k in ("history", "height", "cmd_tokens", "noise",
+                                            "history_null", "trajectory")},
     )
 
     meta = _fm_meta(ctx)

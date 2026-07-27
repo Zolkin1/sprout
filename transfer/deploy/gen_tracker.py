@@ -81,11 +81,24 @@ class GenTrackerPolicy:
         base_frame_name: str = "pelvis_link",
         num_threads: int = 0,
         seed: int | None = 0,
+        zero_noise: bool = False,
+        null_history_warmup: bool = True,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
         ``fm_onnx`` may be ``None`` for tracker-only (no-FM) clip playback: the
         clip reference then drives the tracker directly (see :class:`_TrackerOnlyCtx`).
+
+        ``null_history_warmup=True`` (default) samples the generator from control step 0 using
+        the model's learned ``null_history`` embedding while the N-step history window fills,
+        matching ``FmTrackingCommandCfg.fm_null_history_warmup`` on the RL side. It needs an
+        ``fm.onnx`` exported with the ``history_null`` input; without one the policy falls back to
+        withholding the generator until the window is full (and warns once).
+
+        ``zero_noise=True`` replaces the Gaussian ``x0`` with zeros (see
+        :meth:`_sample_noise`). It defaults to False here -- the training-matched
+        stochastic sampling -- so hardware keeps that behaviour; the MuJoCo sim2sim
+        runner opts in and defaults it on.
         """
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
@@ -94,6 +107,8 @@ class GenTrackerPolicy:
         self.future_stride = future_stride
         self.base_frame_name = base_frame_name
         self.num_threads = num_threads
+        self.zero_noise = bool(zero_noise)
+        self.null_history_warmup = bool(null_history_warmup)
         self._rng = np.random.default_rng(seed)
         self._loaded = False
 
@@ -116,6 +131,10 @@ class GenTrackerPolicy:
             self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+            if self.zero_noise:
+                print("[INFO GenTrackerPolicy] zero_noise=True: the flow is integrated from "
+                      "x0 = 0 instead of x0 ~ N(0, I) -- one deterministic trajectory per "
+                      "conditioning, not the stochastic sampling the FM was trained for.")
         else:
             # Tracker-only (no FM): a clip reference drives the tracker directly. Build a
             # lightweight ctx from the tracker metadata so the shared obs assembly + the
@@ -214,9 +233,16 @@ class GenTrackerPolicy:
         robot's isaac order into the FM joint order; measured ee frames are already in
         the FM frame order.
         """
-        a = lambda x: np.asarray(x, dtype=np.float64)[None]
-        jp = np.asarray(state["joint_pos"], dtype=np.float64)
-        jv = np.asarray(state["joint_vel"], dtype=np.float64)
+        # COPY, never view. ``np.asarray`` on an already-float64 array returns a VIEW, and
+        # callers legitimately hand us slices of live simulator/robot state (e.g. the MuJoCo
+        # runner's ``np.asarray(qpos[:3])``). Storing such a view in the rolling history makes
+        # every slot alias the same buffer, so the whole window reads as the LATEST state and the
+        # positional delta between history steps collapses to zero -- the FM then sees a robot
+        # that never translated, which never occurs in training. Velocities happened to be safe
+        # (they are computed, so allocated), which is what made this hard to see.
+        a = lambda x: np.array(x, dtype=np.float64, copy=True)[None]
+        jp = np.array(state["joint_pos"], dtype=np.float64, copy=True)
+        jv = np.array(state["joint_vel"], dtype=np.float64, copy=True)
         if self._isaac_to_fm is not None:
             jp, jv = jp[self._isaac_to_fm], jv[self._isaac_to_fm]
         snap = {
@@ -225,15 +251,25 @@ class GenTrackerPolicy:
             "jp": jp[None], "jv": jv[None], "cmd": a(state["command"]),
         }
         if self.ctx.num_extra_frames > 0:
-            frames = np.concatenate(
+            frames = np.concatenate(          # concatenate allocates, so this is already a copy
                 [state["frame_pos"], state["frame_quat"], state["frame_lin"], state["frame_ang"]], axis=-1
             )
             snap["frames"] = frames[None]
         return snap
 
     def warm_start(self, state: dict) -> None:
-        """Pre-fill the history window with a (standing) snapshot so the FM is valid at step 0."""
-        self._history.fill(self._make_snapshot(state))
+        """Make the generator usable at step 0.
+
+        With ``null_history_warmup`` and a graph that accepts ``history_null`` this is a no-op
+        beyond resetting the cadence: the first steps are sampled with the learned null-history
+        embedding, which is what the model was trained for. Only the legacy path fabricates a
+        history by repeating this snapshot into all N slots -- a static window that never occurs
+        in training (real history always has motion between its steps).
+        """
+        if self.null_history_warmup and getattr(self.ctx, "has_history_null", False):
+            self._history.invalidate(np.ones(1, dtype=bool))
+        else:
+            self._history.fill(self._make_snapshot(state))
         self._pred_valid = False
         self._pred_idx = 0
 
@@ -263,15 +299,20 @@ class GenTrackerPolicy:
         """
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
-        valid = bool(self._history.valid()[0])
+        null_hist = bool(self._history.null_mask()[0])
+        use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
+        # Gate: normally "history complete", but with the null-history warmup the generator runs
+        # from step 0 and the incomplete window is replaced by the learned embedding -- the same
+        # flow as FmTrackingCommand, so RL and deploy agree on the first N-1 steps.
+        gate = (not null_hist) or use_null
         exhausted = self._pred_idx >= (self.ctx.F - 1)
         due = (self._ctrl_step % self.fm_update_every) == 0
-        if valid and (due or not self._pred_valid or exhausted):
-            self._run_fm(state)
+        if gate and (due or not self._pred_valid or exhausted):
+            self._run_fm(state, history_null=(null_hist and use_null))
         elif self._pred_valid:
             self._pred_idx = min(self._pred_idx + 1, self.ctx.F - 1)
 
-    def _run_fm(self, state: dict) -> None:
+    def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample an F-step world trajectory anchored on the robot's current base pose.
 
         Conditions the FM on the N most-recent MEASURED robot states (phase history),
@@ -281,14 +322,16 @@ class GenTrackerPolicy:
         ``FmTrackingCommand._run_fm``.
         """
         ctx = self.ctx
-        rp = self._history.stack("root_pos")
-        rq = self._history.stack("root_quat")
-        rl = self._history.stack("root_lin")
-        ra = self._history.stack("root_ang")
-        jp = self._history.stack("jp")
-        jv = self._history.stack("jv")
-        cmd = self._history.stack("cmd")
-        frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
+        # Padded so the window is N long even on the first control steps; where ``history_null``
+        # is set the graph discards its content for the learned null-history embedding.
+        rp = self._history.stack_padded("root_pos")
+        rq = self._history.stack_padded("root_quat")
+        rl = self._history.stack_padded("root_lin")
+        ra = self._history.stack_padded("root_ang")
+        jp = self._history.stack_padded("jp")
+        jv = self._history.stack_padded("jv")
+        cmd = self._history.stack_padded("cmd")
+        frames = self._history.stack_padded("frames") if ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         # Height token: the live per-ray height scan at "now" (the runner computes it and
@@ -307,14 +350,15 @@ class GenTrackerPolicy:
         else:
             fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
-        noise = self._rng.standard_normal((1, ctx.F, ctx.D))
+        noise = self._sample_noise()
 
         # The robot NOW is the anchor: the most-recent history step IS the live robot
         # state, so its base pose is the xyz+yaw ground frame the FM was trained on.
         p_ref = rp[:, -1].copy()
         q_ref = rq[:, -1].copy()
         t0 = time.perf_counter()
-        world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref, noise)
+        world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref, noise,
+                             history_null=np.array([bool(history_null)]))
         self._fm_infer_s += time.perf_counter() - t0
         self._fm_infer_n += 1
 
@@ -332,6 +376,28 @@ class GenTrackerPolicy:
         # Node 0 = "now" (base offset ~= 0); the applied index advances from here.
         self._pred_idx = 0
         self._pred_valid = True
+
+    def _sample_noise(self) -> np.ndarray:
+        """Draw the sampler's initial point ``x0``, shape ``(1, F, D)``.
+
+        Normally ``x0 ~ N(0, I)``, which is what the rectified flow was trained to
+        transport: the ``fm.onnx`` graph Euler-integrates from this point to a sample
+        of the future-window distribution.
+
+        With ``zero_noise=True`` it returns exactly zeros -- the flow is integrated
+        from the origin (the mode of the source Gaussian) instead of a random draw,
+        giving one fixed, fully deterministic trajectory per conditioning. That removes
+        sample-to-sample variability, so re-plan discontinuities can be attributed to the
+        changing conditioning/anchor rather than to fresh noise, and it empirically tracks
+        better in MuJoCo sim2sim (which is why ``gen_tracker_runner.py`` defaults to it).
+
+        Be aware of what it is NOT: the integrated path is off-distribution for the
+        sampler and is *not* the mean of the conditional distribution (the flow ODE is
+        nonlinear, so the image of the source mode is not the target mean). The library
+        default stays Gaussian for hardware and the torch/numpy parity tests.
+        """
+        shape = (1, self.ctx.F, self.ctx.D)
+        return np.zeros(shape) if self.zero_noise else self._rng.standard_normal(shape)
 
     def _pred_at(self, idx: int) -> dict[str, np.ndarray]:
         """Gather the generator prediction at horizon index ``idx`` (squeezed to 1 env)."""

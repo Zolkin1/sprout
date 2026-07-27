@@ -85,6 +85,34 @@ class BatchedHistory:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
         return torch.stack([s[key] for s in self._steps], dim=1)
 
+    def null_mask(self) -> torch.Tensor:
+        """Per-env ``(N,)`` bool: True where the history window is NOT yet complete.
+
+        This is the mask to hand the model as ``history_null_mask``: the generator was trained
+        with ``null_cond_prob`` of its samples history-nulled, so a learned ``null_history``
+        embedding covers exactly this case and the FM can be sampled from step 0 -- no clip
+        warmup, and no fabricated static history.
+        """
+        if len(self._steps) < self.maxlen:
+            return torch.ones_like(self._steps_since_reset, dtype=torch.bool)
+        return self._steps_since_reset < self.maxlen
+
+    def stack_padded(self, key: str) -> torch.Tensor:
+        """Like :meth:`stack`, but always ``maxlen`` long -- front-padded by repeating the oldest.
+
+        Only the global deque underfill (the first steps of a run) is padded here. Per-env
+        staleness -- an env that just reset, whose slots still hold pre-reset states -- is NOT
+        repaired, because it does not need to be: those envs are exactly the ones
+        :meth:`null_mask` flags, and the model discards their history content in favour of the
+        learned null embedding. The newest step stays at index ``-1``, so the caller's anchor
+        (``stack(...)[:, -1]``) is always the live state.
+        """
+        if not self._steps:
+            raise RuntimeError("stack_padded on an empty history: append at least one step first.")
+        steps = list(self._steps)
+        pad = [steps[0]] * (self.maxlen - len(steps))
+        return torch.stack([s[key] for s in (pad + steps)], dim=1)
+
 
 # ----------------------------------------------------------------------
 # Loaded-checkpoint context.
@@ -106,6 +134,11 @@ class FmOnlineContext:
         target_num_extra_frames: Extra body frames the generator predicts (and that
             the history carries).
         num_steps: Euler sampling steps.
+        zero_noise: Integrate the flow from ``x0 = 0`` rather than Gaussian noise, making
+            sampling deterministic given the conditioning (see
+            :func:`~robot_rl.flow_matching.flow.sample_trajectory`). Default False =
+            training-matched stochastic sampling. Intended for sim2sim / A-B diagnostics,
+            where the deploy-side ``GenTrackerPolicy`` exposes the same switch.
         cmd_dim: Per-step command width (0 if not command-conditioned).
         cmd_steps: Strided window indices that become command tokens.
         num_cmd_tokens: Number of command tokens (``len(cmd_steps)`` or 0).
@@ -131,6 +164,7 @@ class FmOnlineContext:
     joint_names: list[str]
     target_frame_names: list[str]
     device: torch.device
+    zero_noise: bool = False
 
     @property
     def frame_names(self) -> list[str]:
@@ -148,6 +182,7 @@ def load_fm_context(
     device: torch.device | str,
     num_sampling_steps: int | None = None,
     map_location: str = "cpu",
+    zero_noise: bool = False,
 ) -> FmOnlineContext:
     """Load a flow-matching checkpoint into an inference-ready context.
 
@@ -160,6 +195,7 @@ def load_fm_context(
         device: Device to place the model and normalizers on.
         num_sampling_steps: Override the checkpoint's Euler step count (or ``None``).
         map_location: ``torch.load`` map location when ``checkpoint`` is a path.
+        zero_noise: Sample deterministically from ``x0 = 0`` (see :class:`FmOnlineContext`).
 
     Returns:
         A populated :class:`FmOnlineContext`.
@@ -215,6 +251,7 @@ def load_fm_context(
         cmd_dim=cfg.cmd_dim, cmd_steps=cmd_steps,
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
+        zero_noise=bool(zero_noise),
     )
 
 
@@ -317,6 +354,7 @@ def sample_world(
     cmd_tokens: torch.Tensor | None,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
+    history_null_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Sample the ``F``-step future window and lift it to the world frame.
 
@@ -332,6 +370,10 @@ def sample_world(
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
         p_ref: World reference position ``(V, 3)`` (the current robot base position).
         q_ref: World reference quaternion ``(V, 4, xyzw)``.
+        history_null_mask: Optional ``(V,)`` bool; where True the history content is replaced by
+            the model's learned ``null_history`` embedding. Pass
+            :meth:`BatchedHistory.null_mask` to sample before the window has filled instead of
+            falling back to a clip or a fabricated static history.
 
     Returns:
         World-frame prediction dict with ``root_pos_w (V,F,3)``,
@@ -346,7 +388,9 @@ def sample_world(
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
 
-    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps)
+    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps,
+                                 history_null_mask=history_null_mask,
+                                 zero_noise=ctx.zero_noise)
     pred = ctx.state_norm.denormalize(pred_std)  # (V, F, D)
 
     p_ref_f = p_ref[:, None, :].expand(v, f, 3).reshape(v * f, 3)
