@@ -84,10 +84,10 @@ class G1FmTrackerCommandsCfg:
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
         fm_checkpoint=DEFAULT_FM_ROBOT_CKPT,
-        fm_update_every=10,
+        fm_update_every=12,          # 0.24 s -- MUST match the recording's ego_anchor_every
         # Warmup clip is robot-anchored on the FM re-plan cadence (matches the deploy regime).
         ego_anchor_fraction=1.0,
-        ego_anchor_every=10,
+        ego_anchor_every=12,         # 0.24 s -- same cadence as the FM re-plan above
         # The clip library only supplies the reset spawn pose + velocity command here, so
         # keep it on CPU by default -- loading the multi-GB library onto a 12GB GPU next to
         # the sim + FM + teacher OOMs (override with --clip_device).

@@ -358,9 +358,10 @@ def _commit_clip_reset(
         ego_mask: ``[k]`` bool, which envs are ego-anchored (clip re-placed onto the
             robot root on the cadence) this episode.
         snap_mask: ``[k]`` bool, which envs emit an FM snap (re-inference) event on the
-            cadence. Defaults to ``ego_mask`` (flat: only ego envs snap). On terrain the
-            caller passes ``ego_mask | ~is_flat`` so world-anchored stair/transition envs
-            also snap (giving the FM a stair training window) without being re-placed.
+            cadence. Defaults to ``ego_mask`` -- a window is recorded exactly when the clip
+            is RE-ANCHORED, on whatever axes that clip's per-step mask frees. Flat and
+            terrain use identical logic; the parameter stays for callers that want to
+            decouple the two, but nothing does today.
     """
     if snap_mask is None:
         snap_mask = ego_mask
@@ -537,14 +538,19 @@ def reset_on_terrain_motion_sequence(
     #      terrain cell: a stair clip snaps only y (keeping x/z/yaw on the treads), a box
     #      clip follows its per-step mask (y-free-pinned approach/jump, ego recovery). So
     #      terrain no longer detaches, and every env is partial-ego with probability
-    #      ego_frac. The FM snap still fires on ALL non-flat envs regardless (snap_mask), so
-    #      even a non-ego terrain env gets an FM training window. Then compute + write the spawn.
+    #      ego_frac.
+    #
+    #      Snap logic is IDENTICAL to flat: ``snap_mask`` defaults to ``ego_mask``, so an FM
+    #      training window is emitted exactly when the clip is actually RE-ANCHORED, on
+    #      whatever axes that clip's mask frees.  (Before the per-DOF mask existed, terrain
+    #      clips could only be world-pinned or fully detached, so this passed
+    #      ``ego_mask | ~is_flat`` to force a window on every non-flat env -- otherwise the
+    #      FM saw no terrain at all.  With masks, a non-ego terrain env is genuinely NOT
+    #      re-anchored, and recording it hands the FM accumulated tracking drift instead of a
+    #      placement decision.)  Then compute + write the spawn.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
     ego_mask = torch.rand(k, device=device) < ego_frac
-    snap_mask = ego_mask | ~is_flat  # non-flat: always snap (even when not ego this episode)
-    _commit_clip_reset(
-        cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask, snap_mask
-    )
+    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
 
 
 def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:

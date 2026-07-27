@@ -273,9 +273,10 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
 
         * **FM snap flag** (``_reanchor_active``): set for the ``_snap_mask`` envs on the
           tick. The recorder logs it and the FM dataset builds one training window per
-          snap. On flat ``_snap_mask == _ego_mask``; on terrain it also covers the
-          world-anchored stair/transition envs, so the FM gets stair windows too (the
-          dataset ego-anchors the recorded clip future to the robot base at each snap).
+          snap. ``_snap_mask == _ego_mask`` on flat AND terrain alike: a window is emitted
+          exactly when the clip is re-anchored, on whatever axes its per-step mask frees
+          (the dataset ego-anchors the recorded clip future to the robot base at each snap,
+          so the FM learns to place the non-free axes from the history + height scan).
         * **Clip re-placement** (``_reanchor_clip_ids``): applied to ``_ego_mask`` envs on
           the tick -- recompute the placement so the FREE root DOFs of the clip's
           CURRENT-STEP anchor mask coincide with the robot's measured root, while FIXED

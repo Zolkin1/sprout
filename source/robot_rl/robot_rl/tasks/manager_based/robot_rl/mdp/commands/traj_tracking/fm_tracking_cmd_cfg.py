@@ -28,7 +28,7 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     """Path to the trained robot-state-conditioned flow-matching ``.pt`` checkpoint
     (``target_source=ego_anchored_clip_future``). Required."""
 
-    fm_update_every: int = 10
+    fm_update_every: int = 12
     """Re-run flow-matching inference every ``K`` control steps (the receding-horizon
     re-plan cadence = a snap); the applied index advances through the F-step window in
     between. Should match the recording's ``ego_anchor_every``. Must be ``>= 1``."""

@@ -47,6 +47,16 @@ from motion_gen.world_lift import anchor_mask_from_free                      # n
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _PINNED = int(anchor_mask_from_free(set()))       # world-pinned, exactly as the DP distractors are
+# TODO(distractor-ego-mask): distractors are FLAT walking that merely happens to route around
+# obstacle boxes, so their anchor mask should be the FLAT one (x, y, yaw FREE; z clip-fixed) --
+# NOT fully world-pinned. Pinned means no root DOF ever re-anchors onto the robot, so a
+# distractor env is never a re-anchor event: with the snap mask now tied to ego re-anchoring
+# (resets.py), these clips emit no FM windows at all, and under the old
+# ``ego_mask | ~is_flat`` they emitted windows that were pure tracking drift. The boxes are
+# obstacles to avoid, not surfaces to land on, so nothing needs world-pinning here.
+# Fix = use ``anchor_mask_from_free({"x", "y", "yaw"})`` (== _ANCHOR_MASK_FLAT) here and in
+# generate_distractor_clips.py, then regenerate the distractor family.
+# Until then, EXCLUDE the distractor family from FM recording libraries.
 _SHARED: dict = {}
 
 

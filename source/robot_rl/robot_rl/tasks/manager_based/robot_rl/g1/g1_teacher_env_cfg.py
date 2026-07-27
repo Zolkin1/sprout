@@ -103,7 +103,7 @@ class G1TeacherCommandsCfg:
         # the reference looks like an MPC plan that re-plans every few steps. The
         # rest keep the fixed world-frame clip. Set ego_anchor_fraction=0 to disable.
         ego_anchor_fraction=0.5,
-        ego_anchor_every=10,  # re-plan every 10 control steps (~0.2 s at dt=0.02)
+        ego_anchor_every=12,  # re-plan every 12 control steps (0.24 s at dt=0.02)
     )
 
 

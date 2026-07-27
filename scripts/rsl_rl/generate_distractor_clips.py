@@ -58,6 +58,10 @@ from motion_gen.world_lift import anchor_mask_from_free
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _PINNED = anchor_mask_from_free(set())               # world-pinned: no root DOF re-anchors to the robot
+# TODO(distractor-ego-mask): should be the FLAT mask ({"x", "y", "yaw"} FREE, z clip-fixed) --
+# distractors are flat walking around obstacles, not motion that must land on geometry, so
+# world-pinning them means they are never a re-anchor event and contribute no usable FM
+# windows. See the longer note in mb_distractor_clips.py; fix both and regenerate.
 
 
 # ---- velocity profiles ------------------------------------------------------------------------------
