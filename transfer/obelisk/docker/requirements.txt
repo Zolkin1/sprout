@@ -1,7 +1,12 @@
-torch==2.5.1  # legacy velocity-walking path only; the ONNX gen+tracker path is torch-free (drop once retired)
-onnxruntime  # torch-free generator+tracker deploy (transfer/deploy)
-huggingface_hub
+# Deployment runtime. Deliberately NO torch: the on-robot path is transfer/deploy, which is
+# numpy + onnxruntime only and is tested to keep torch out of sys.modules
+# (test_hardware_offline.py). The legacy TorchScript controller that needed it is gone, and
+# torch is ~2-3 GB of image for code that would never be imported. casadi went with the MPC.
+onnxruntime          # the generator + tracker ONNX pair (transfer/deploy)
+huggingface_hub      # policy artifact fetch, offline-first (deploy.hardware)
+numpy
+
+# Log plotting (plot_utils/); dev-box tooling, harmless on the robot.
 matplotlib
 scipy
 pandas
-casadi
