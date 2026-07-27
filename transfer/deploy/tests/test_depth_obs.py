@@ -26,6 +26,7 @@ from deploy.depth_obs import (  # noqa: E402
     assert_depth_specs_agree,
     denormalize_depth_np,
     invalid_depth_value,
+    normalize_camera_images,
     normalize_depth_np,
     parse_depth_spec,
     sanitize_extero_np,
@@ -237,6 +238,90 @@ def test_float_noise_within_tolerance_agrees():
     a = parse_depth_spec([_cam()])
     b = parse_depth_spec([_cam(fx=12.586494 + 1e-12)])
     assert_depth_specs_agree(a, b)
+
+
+##
+# normalize_camera_images -- the hardware ingestion path
+##
+
+FAR = dict(offset=0.75, scale=0.5, min_dist=0.15, max_dist=11.9)
+
+
+def _far_cam(**overrides) -> dict:
+    """The second camera: same resolution as the near one, different optics and range."""
+    cam = _cam(obs_term="depth_far", sensor="depth_camera_far", max_distance=12.0, **FAR)
+    cam.update(overrides)
+    return cam
+
+
+def test_ingestion_matches_per_camera_normalisation():
+    """Each reading is normalised with its OWN parameters, stacked in contract order."""
+    spec = parse_depth_spec([_cam(), _far_cam()])
+    near = np.full(30 * 26, 1.5)
+    far = np.full(30 * 26, 11.95)   # beyond the NEAR range, inside nothing for FAR either
+    out = normalize_camera_images(spec, [near, far])
+    assert out.shape == (2, 780)
+    np.testing.assert_allclose(out[0], normalize_depth_np(near, **NEAR))
+    np.testing.assert_allclose(out[1], normalize_depth_np(far, **FAR))
+    # The far reading is out of range for BOTH, but only the far camera's own max_dist
+    # decides that -- applying the near camera's parameters would be indistinguishable
+    # here, so pin a range where the two genuinely differ.
+    mid = np.full(30 * 26, 9.0)     # valid for FAR (max 11.9), invalid for NEAR (max 7.9)
+    both = normalize_camera_images(spec, [mid, mid])
+    assert both[0][0] == invalid_depth_value(spec[0])
+    np.testing.assert_allclose(both[1][0], (9.0 - 0.75) * 0.5)
+
+
+def test_ingestion_accepts_a_2d_image():
+    """A ``(H, W)`` frame is equivalent to its row-major flattening."""
+    spec = parse_depth_spec([_cam()])
+    img = np.linspace(0.2, 7.0, 26 * 30).reshape(26, 30)
+    np.testing.assert_allclose(
+        normalize_camera_images(spec, [img])[0],
+        normalize_camera_images(spec, [img.reshape(-1)])[0],
+    )
+
+
+def test_ingestion_handles_camera_dropouts():
+    """NaN / inf / out-of-range all land on the camera's invalid value, as in sim."""
+    spec = parse_depth_spec([_cam()])
+    raw = np.full(30 * 26, 1.0)
+    raw[:3] = [np.nan, np.inf, 99.0]
+    out = normalize_camera_images(spec, [raw])[0]
+    np.testing.assert_allclose(out[:3], invalid_depth_value(spec[0]))
+
+
+def test_ingestion_rejects_a_wrong_sized_reading():
+    """A resolution mismatch is caught here, not as a garbled observation."""
+    spec = parse_depth_spec([_cam()])
+    with pytest.raises(ValueError, match="pixel"):
+        normalize_camera_images(spec, [np.zeros(100)])
+
+
+def test_ingestion_rejects_a_missing_frame():
+    """A camera that has never delivered is an error, not a silent blank image."""
+    spec = parse_depth_spec([_cam()])
+    with pytest.raises(ValueError, match="No depth reading"):
+        normalize_camera_images(spec, [None])
+
+
+def test_ingestion_rejects_a_camera_count_mismatch():
+    """One reading per camera, in contract order -- a short list is a wiring bug."""
+    spec = parse_depth_spec([_cam(), _far_cam()])
+    with pytest.raises(ValueError, match="1 depth reading"):
+        normalize_camera_images(spec, [np.zeros(30 * 26)])
+
+
+def test_ingestion_rejects_differing_resolutions():
+    """The images share one array, so mismatched cameras fail like they do in sim."""
+    spec = parse_depth_spec([_cam(), _far_cam(width=10, height=6)])
+    with pytest.raises(ValueError, match="differing pixel counts"):
+        normalize_camera_images(spec, [np.zeros(30 * 26), np.zeros(60)])
+
+
+def test_ingestion_of_no_cameras_is_empty():
+    """A height-scan policy resolves an empty contract and ingests nothing."""
+    assert normalize_camera_images([], []).size == 0
 
 
 if __name__ == "__main__":

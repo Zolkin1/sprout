@@ -215,6 +215,24 @@ class GenTrackerPolicy:
         """
         return list(self._depth_spec)
 
+    def get_obs_terms(self) -> list[dict]:
+        """The tracker's ordered observation terms, from its embedded metadata.
+
+        Lets a consumer ask what the policy actually reads -- e.g. whether it wants a
+        height scan -- without reaching into the tracker session.
+        """
+        return self._trk.get_obs_terms()
+
+    def needs_height_scan(self) -> bool:
+        """Whether this deployment must supply ``state["height_scan"]``.
+
+        True if the tracker has the observation term, or the generator conditions on a
+        multi-ray scan.  Either consumer alone is enough to make the reading mandatory.
+        """
+        if any(term["name"] == "height_scan" for term in self.get_obs_terms()):
+            return True
+        return self.ctx.extero_source == "height_scan" and self.ctx.height_dim > 1
+
     def _tracker_only_ctx(self) -> _TrackerOnlyCtx:
         """Build a minimal FM-context stand-in from the tracker metadata (no generator).
 

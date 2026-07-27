@@ -84,6 +84,89 @@ def parse_depth_spec(raw, source: str = "spec") -> list[dict]:
     return out
 
 
+#: The :func:`normalize_depth_np` arguments a contract entry carries.
+_NORM_FIELDS: tuple[str, ...] = (
+    "offset", "scale", "min_dist", "max_dist", "min_clip_val", "max_clip_val",
+)
+
+
+def depth_norm_kwargs(cam: dict) -> dict[str, float]:
+    """The :func:`normalize_depth_np` keyword arguments for one camera.
+
+    Args:
+        cam: One parsed camera contract entry.
+
+    Returns:
+        The normalisation arguments, so a caller never spells the field list itself.
+    """
+    return {key: float(cam[key]) for key in _NORM_FIELDS}
+
+
+def normalize_camera_images(spec: list[dict], images) -> np.ndarray:
+    """Turn one raw metre reading per camera into the stacked ``state["depth"]``.
+
+    The hardware sibling of ``transfer/sim/depth_camera.MujocoDepthCameras.compute``: the
+    sim casts rays and this reads a camera, but both end at the same stacked, normalised
+    array in contract order, so :class:`~deploy.gen_tracker.GenTrackerPolicy` cannot tell
+    them apart.  Lives here rather than in the ROS node so it stays torch-free and
+    testable without ROS.
+
+    The reading must be **distance along the camera's optical axis** in metres --
+    ``distance_to_image_plane``, which is what the training sensor produces and what the
+    ZED SDK's depth measure already is.  A ray-length reading would need the per-pixel
+    ``cos`` correction the MuJoCo caster applies, and passing one here is a silent
+    sim2real error, worst at the frame edges where the cameras are widest.
+
+    Invalid pixels need no special handling: NaN, ``±inf`` and out-of-range readings all
+    land on :func:`invalid_depth_value` inside :func:`normalize_depth_np`, exactly as a
+    missed ray does in sim.
+
+    Args:
+        spec: The resolved camera contract, from
+            :meth:`~deploy.gen_tracker.GenTrackerPolicy.get_depth_camera_spec`.
+        images: One reading per camera, in contract order.  Each is row-major with
+            ``v = 0`` the top row, either flat ``(H*W,)`` or ``(H, W)``.
+
+    Returns:
+        ``(T, H*W)`` normalised images, ready for ``state["depth"]``.
+
+    Raises:
+        ValueError: On a camera-count mismatch, a missing reading, a reading whose size
+            does not match that camera's resolution, or cameras of differing resolution
+            (the images share one array, as in
+            ``MujocoDepthCameras``).
+    """
+    images = list(images)
+    if len(images) != len(spec):
+        raise ValueError(
+            f"Got {len(images)} depth reading(s) for {len(spec)} camera(s) in the "
+            "contract; the policy needs one per camera, in contract order."
+        )
+    sizes = [int(cam["width"]) * int(cam["height"]) for cam in spec]
+    if len(set(sizes)) > 1:
+        raise ValueError(
+            f"depth cameras have differing pixel counts ({sizes}); they are returned as "
+            "one array (and the FM stacks them on one token axis), so they must match."
+        )
+    rows: list[np.ndarray] = []
+    for i, (cam, image) in enumerate(zip(spec, images)):
+        label = cam.get("sensor") or cam.get("obs_term") or f"camera {i}"
+        if image is None:
+            raise ValueError(
+                f"No depth reading for '{label}'. The controller must hold a frame from "
+                "every camera before stepping the policy."
+            )
+        flat = np.asarray(image, dtype=np.float64).reshape(-1)
+        expected = int(cam["width"]) * int(cam["height"])
+        if flat.size != expected:
+            raise ValueError(
+                f"Depth reading for '{label}' has {flat.size} pixel(s) but the contract "
+                f"says {cam['width']}x{cam['height']} = {expected}."
+            )
+        rows.append(normalize_depth_np(flat, **depth_norm_kwargs(cam)))
+    return np.stack(rows) if rows else np.zeros((0, 0), dtype=np.float64)
+
+
 def denormalize_depth_np(image: np.ndarray, offset: float, scale: float) -> np.ndarray:
     """Recover metres from a normalised image -- the inverse of :func:`normalize_depth_np`.
 
