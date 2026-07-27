@@ -170,15 +170,23 @@ def build_state(robot: Robot, policy: GenTrackerPolicy, command: np.ndarray) -> 
     return state
 
 
-def load_standing_pose(path: str, isaac_joint_names: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_standing_pose(path: str, isaac_joint_names: list[str],
+                       fallback: dict[str, float] | None = None,
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Parse a ``*_config_solution.yaml`` standing config into a robot spawn state.
 
     Reads the solved standing pose from ``bezier_coeffs`` (joint angles keyed by name
     and the ``pelvis_link`` frame pose), using the first control point of each spline.
 
+    The solved configs predate the 29-DOF unlock, so they cover only the 21 original joints.
+    Any joint the file lacks is filled from ``fallback`` (the policy's own
+    ``default_joint_angles``, which IS the rest value it expects for those DOFs) rather than
+    raising -- otherwise a 29-DOF policy cannot spawn from a 21-joint standing solution.
+
     Args:
         path: Path to the standing ``config_solution.yaml``.
         isaac_joint_names: Joint order to return joint positions in (the FM/tracker order).
+        fallback: Per-joint angle for names absent from the file; missing -> 0.0.
 
     Returns:
         ``(joint_pos_isaac, base_pos, base_quat_wxyz)`` -- joints in ``isaac_joint_names``
@@ -189,7 +197,13 @@ def load_standing_pose(path: str, isaac_joint_names: list[str]) -> tuple[np.ndar
     domain = cfg["domain_sequence"][0]  # e.g. "double_support"
     bz = cfg[domain]["bezier_coeffs"]
     joints = bz["joints"]
-    jp = np.array([float(joints[n][0]) for n in isaac_joint_names], dtype=np.float64)
+    fallback = fallback or {}
+    filled = [n for n in isaac_joint_names if n not in joints]
+    if filled:
+        print(f"[INFO] standing config has no {len(filled)} joint(s) {filled}; "
+              f"using the policy's default angles for them.")
+    jp = np.array([float(joints[n][0]) if n in joints else float(fallback.get(n, 0.0))
+                   for n in isaac_joint_names], dtype=np.float64)
     pelvis = bz["frames"]["pelvis_link"]
     base_pos = np.array([0.0, 0.0, float(pelvis["pos_z"][0])], dtype=np.float64)  # re-zero x, y
     quat = np.array([float(pelvis["ori_w"][0]), float(pelvis["ori_x"][0]),
@@ -238,11 +252,36 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
+    """Centre + top height of a named box geom in the loaded scene.
+
+    Reads the geometry from the MJCF rather than re-deriving it, so it stays correct for any
+    scene ``generate_stairs_scene.py`` emits (or a hand-edited one).
+
+    Args:
+        robot: The MuJoCo robot wrapper (its model holds the scene).
+        spec: Box geom name (``box2``) or a bare index (``2`` -> ``box2``).
+
+    Returns:
+        ``(x, y, top_z)`` in world metres, or None when no such geom exists.
+    """
+    name = f"box{spec}" if spec.strip().isdigit() else spec.strip()
+    gid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_GEOM, name)
+    if gid < 0:
+        avail = [mujoco.mj_id2name(robot.mj_model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
+                 for i in range(robot.mj_model.ngeom)]
+        print(f"[WARN] no geom named {name!r}; boxes in this scene: "
+              f"{[a for a in avail if a.startswith('box')]}")
+        return None
+    pos, half = robot.mj_model.geom_pos[gid], robot.mj_model.geom_size[gid]
+    return float(pos[0]), float(pos[1]), float(pos[2] + half[2])
+
+
 def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
         hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
-        cmd_max_acc: float, fm_traj_points: int,
+        cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
@@ -317,8 +356,23 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} pose "
               f"(t={clip.start_step * clip.dt:.2f}s, z+{spawn_z_offset}); RL gains set.")
     elif standing_config and os.path.exists(standing_config):
-        jp_isaac, base_pos, base_quat = load_standing_pose(standing_config, isaac)
+        jp_isaac, base_pos, base_quat = load_standing_pose(
+            standing_config, isaac,
+            fallback=dict(zip(isaac, np.asarray(policy._trk.default_joint_angles).ravel())),
+        )
         base_pos[2] += spawn_z_offset  # lift feet clear of the floor (optimizer frame offset)
+        # Optionally stand ON a box instead of the floor: keep the solved standing JOINTS and
+        # just translate the base to the box top, so the pose is unchanged and only the
+        # support height moves (what a jump-off / dismount test needs as its start state).
+        if spawn_on_box is not None:
+            top = box_top(robot, spawn_on_box)
+            if top is not None:
+                bx, by, bz = top
+                base_pos = np.array([bx, by, base_pos[2] + bz], dtype=np.float64)
+                print(f"[INFO] Spawning ON box {spawn_on_box!r}: top z={bz:.3f} m at "
+                      f"(x={bx:.2f}, y={by:.2f}) -> pelvis z={base_pos[2]:.3f} m")
+            else:
+                print("[WARN] --spawn_on_box ignored (box not found); spawning on the floor.")
         hold_target = convert_joint_order(jp_isaac, isaac, robot.joint_names)
         robot.set_base_and_joints(base_pos, base_quat, hold_target)
         print(f"[INFO] Standing pose spawned + held from {standing_config}")
@@ -328,10 +382,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         hold_target = convert_joint_order(policy._trk.default_joint_angles, isaac, robot.joint_names)
     # Stiffen the legs for the hold: fixed-joint PD at the XML gains tips over (the ankles
     # alone can't balance the inverted pendulum), so a stiff, well-damped leg holds a stand.
-    if clip is None and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
+    if clip is None and warmup_time > 0 and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
         robot.scale_gains(hold_kp_scale, hold_kv_scale, name_filter=["hip", "knee", "ankle"])
         print(f"[INFO] Hold gains: leg kp x{hold_kp_scale}, kv x{hold_kv_scale} "
               "(reverts to RL gains at handoff).")
+    elif clip is None and warmup_time <= 0:
+        print("[INFO] warmup_time<=0: spawning straight into FM+tracker control "
+              "(no standing hold, no stiffened hold gains, no start-button gate).")
     if clip is None:
         warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
         if warmup_steps == 0:
@@ -346,7 +403,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
 
     # Manual handoff gate: in interactive (joystick) viewer runs, hold the stand until the
     # operator presses the start button, so standing can be verified before going live.
-    gate = (not headless) and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None
+    # ``warmup_time <= 0`` is an explicit request to spawn straight into FM control, so it
+    # disables the gate too -- otherwise a joystick run would still wait for a button press
+    # and "no warmup" would silently mean "hold forever until pressed".
+    gate = ((not headless) and warmup_time > 0
+            and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None)
     min_hold = max(warmup_steps, policy.ctx.N) if gate else warmup_steps
 
     # Velocity-command rate limit, matching training. Prefer the value embedded in the
@@ -651,9 +712,17 @@ def main() -> None:
                         help="Generator re-inference cadence (control steps). Fallback only: "
                              "overridden by 'fm_update_every' in the tracker metadata if present.")
     parser.add_argument("--total_time", type=float, default=-1.0)
+    parser.add_argument("--spawn_on_box", type=str, default=None, metavar="NAME_OR_INDEX",
+                        help="Spawn standing on top of a scene box instead of the floor, e.g. "
+                             "'--spawn_on_box 2' or '--spawn_on_box box2' (the generated "
+                             "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
+                             "standing joint pose is kept; only the support height changes. "
+                             "Pair with --warmup_time 0 to hand straight to the FM on the box.")
     parser.add_argument("--warmup_time", type=float, default=1.0,
-                        help="Seconds to PD-hold a stand before live control (0 disables; "
-                             "always at least the FM history window).")
+                        help="Seconds to PD-hold a stand before live control. Pass 0 to spawn "
+                             "DIRECTLY into FM+tracker control: the FM history is warm-started "
+                             "from the spawn state, the leg hold-gain stiffening is skipped, and "
+                             "the joystick start-button gate is disabled.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
     parser.add_argument("--headless", action="store_true", default=False)
@@ -707,6 +776,10 @@ def main() -> None:
                              "periodically re-place the clip onto the robot's current root (planar "
                              "pos + heading), matching the teacher's ego-anchored training. Default "
                              "(off) is the world-anchored fixed-placement clip.")
+    parser.add_argument("--keep_xml_gains", action="store_true", default=False,
+                        help="Keep the MJCF's hand-written actuator kp/kv instead of the gains "
+                             "the policy exported. Default OFF: the trained gains win, so a "
+                             "retune in training reaches sim2sim without editing the XML.")
     parser.add_argument("--clip_ego_anchor_every", type=int, default=10,
                         help="Re-anchor cadence (control steps) for --clip_ego_anchor; should match "
                              "the teacher's ego_anchor_every (default 10, ~0.2s at dt=0.02).")
@@ -745,6 +818,11 @@ def main() -> None:
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
+    # Drive the MuJoCo servos with the gains the policy actually TRAINED with (exported in
+    # policy_parameters.yaml) rather than the MJCF's hand-written ones, so retuning gains in
+    # training propagates to sim2sim with no XML edit. Skip with --keep_xml_gains.
+    if not args.keep_xml_gains:
+        robot.apply_policy_gains(policy.get_kp(), policy.get_kd(), policy.get_joint_names())
     if args.use_ic:
         robot.set_initial_condition(policy._trk)
 
@@ -805,6 +883,7 @@ def main() -> None:
                   args.warmup_time, args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
                   args.hold_kv_scale, args.spawn_z_offset, args.cmd_max_acc, args.fm_traj_points,
+                  spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time)
     print(f"[INFO] Run finished. Survived: {success}")
 

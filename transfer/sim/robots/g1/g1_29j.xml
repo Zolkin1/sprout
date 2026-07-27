@@ -19,34 +19,34 @@ Position and velocity actuators added. -->
     <!-- ############## -->
     <!-- Hip Pitch -->
     <default class="hip_pitch_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="40.18" kv="2.56" ctrllimited="false"/>
     </default>
   
 
     <!-- Hip Roll -->
     <default class="hip_roll_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="99.1" kv="6.31" ctrllimited="false"/>
     </default>
  
     <!-- Hip Yaw -->
     <default class="hip_yaw_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="40.18" kv="2.56" ctrllimited="false"/>
     </default>
     <!-- Knee -->
     <default class="knee_pos">
-       <position kp="150" kv="4" ctrllimited="false"/>
+       <position kp="99.1" kv="6.31" ctrllimited="false"/>
     </default>
 
     <!-- Ankle Pitch -->
     <default class="ankle_pitch_pos">
-       <position kp="40" kv="2" ctrllimited="false"/>
+       <position kp="28.5" kv="1.81" ctrllimited="false"/>
     </default>
 
 
 
     <!-- Ankle Roll -->
     <default class="ankle_roll_pos">
-       <position kp="40" kv="2" ctrllimited="false"/>
+       <position kp="28.5" kv="1.81" ctrllimited="false"/>
     </default>
 
     <!-- ############## -->
@@ -54,7 +54,7 @@ Position and velocity actuators added. -->
     <!-- ############## -->
     <!-- Waist Yaw -->
     <default class="waist_yaw_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="40.18" kv="2.56" ctrllimited="false"/>
     </default>
 
 
@@ -63,37 +63,50 @@ Position and velocity actuators added. -->
     <!-- ############## -->
     <!-- Shoulder Pitch -->
     <default class="shoulder_pitch_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Shoulder Roll -->
     <default class="shoulder_roll_pos">
-       <position kp="100" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Shoulder Yaw -->
     <default class="shoulder_yaw_pos">
-       <position kp="50" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Elbow -->
     <default class="elbow_pos">
-       <position kp="50" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Roll -->
     <default class="wrist_roll_pos">
-       <position kp="50" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+    </default>
+
+    <!-- Waist Roll / Pitch (unlocked for the 29-DOF policy). Mirrors waist_yaw's class, which
+         is what the Isaac side does too: waist_roll/pitch use waist_yaw's 7520_14 gain class
+         (see g1_21j.py "waist_rp"). NOTE the MJCF gain scale differs from Isaac throughout --
+         waist_yaw is kp=100 here vs stiffness 40.18 in the asset -- so these follow the MJCF's
+         own convention, not the asset's. Revisit if sim2sim tracking looks stiff/soft. -->
+    <default class="waist_roll_pos">
+       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+    </default>
+
+    <default class="waist_pitch_pos">
+       <position kp="40.18" kv="2.56" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Pitch -->
     <default class="wrist_pitch_pos">
-       <position kp="50" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Yaw -->
     <default class="wrist_yaw_pos">
-       <position kp="50" kv="2" ctrllimited="false"/>
+       <position kp="14.25" kv="0.91" ctrllimited="false"/>
     </default>
 
     <!-- Foot Contact Parameters -->
@@ -548,21 +561,30 @@ Position and velocity actuators added. -->
 
     <!-- Waist -->
     <position name="waist_yaw_joint_pos" class="waist_yaw_pos" joint="waist_yaw_joint"/>
+    <!-- Waist roll/pitch: unlocked for the 29-DOF policy. ORDER MATTERS -- transfer/sim/robot.py
+         writes ``mj_data.ctrl[:len(action)] = action`` positionally against targets already
+         permuted into MuJoCo JOINT order, so actuator k must drive hinge joint k. These two sit
+         between waist_yaw (12) and left_shoulder_pitch (15). -->
+    <position name="waist_roll_joint_pos" class="waist_roll_pos" joint="waist_roll_joint"/>
+    <position name="waist_pitch_joint_pos" class="waist_pitch_pos" joint="waist_pitch_joint"/>
 
     <!-- Left Arm -->
     <position name="left_shoulder_pitch_joint_pos" class="shoulder_pitch_pos" joint="left_shoulder_pitch_joint"/>
     <position name="left_shoulder_roll_joint_pos" class="shoulder_roll_pos" joint="left_shoulder_roll_joint"/>
     <position name="left_shoulder_yaw_joint_pos" class="shoulder_yaw_pos" joint="left_shoulder_yaw_joint"/>
     <position name="left_elbow_joint_pos" class="elbow_pos" joint="left_elbow_joint"/>
-<!--    <position name="left_wrist_roll_joint_pos" class="wrist_roll_pos" joint="left_wrist_roll_joint"/>-->
-<!--    <position name="left_wrist_pitch_joint_pos" class="wrist_pitch_pos" joint="left_wrist_pitch_joint"/>-->
-<!--    <position name="left_wrist_yaw_joint_pos" class="wrist_yaw_pos" joint="left_wrist_yaw_joint"/>-->
+    <position name="left_wrist_roll_joint_pos" class="wrist_roll_pos" joint="left_wrist_roll_joint"/>
+    <position name="left_wrist_pitch_joint_pos" class="wrist_pitch_pos" joint="left_wrist_pitch_joint"/>
+    <position name="left_wrist_yaw_joint_pos" class="wrist_yaw_pos" joint="left_wrist_yaw_joint"/>
 
     <!-- Right Arm -->
     <position name="right_shoulder_pitch_joint_pos" class="shoulder_pitch_pos" joint="right_shoulder_pitch_joint"/>
     <position name="right_shoulder_roll_joint_pos" class="shoulder_roll_pos" joint="right_shoulder_roll_joint"/>
     <position name="right_shoulder_yaw_joint_pos" class="shoulder_yaw_pos" joint="right_shoulder_yaw_joint"/>
     <position name="right_elbow_joint_pos" class="elbow_pos" joint="right_elbow_joint"/>
+    <position name="right_wrist_roll_joint_pos" class="wrist_roll_pos" joint="right_wrist_roll_joint"/>
+    <position name="right_wrist_pitch_joint_pos" class="wrist_pitch_pos" joint="right_wrist_pitch_joint"/>
+    <position name="right_wrist_yaw_joint_pos" class="wrist_yaw_pos" joint="right_wrist_yaw_joint"/>
 
   </actuator>
 

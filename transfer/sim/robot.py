@@ -17,8 +17,13 @@ class Robot:
     def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
                  input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
         """Initialize the robot with its model and data."""
-        if robot_name != "g1_21j" and robot_name != "g1_21j_M4" and robot_name != "g1_21j_compute":
-            raise ValueError("Invalid robot name! Only support g1_21j for now.")
+        # ``g1_29j`` is the 29-DOF robot (waist roll/pitch + 6 wrists unlocked); its scenes
+        # are ``g1_29j_{basic,terrain}_scene.xml``.
+        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j"):
+            raise ValueError(
+                f"Invalid robot name {robot_name!r}! Supported: g1_21j, g1_21j_M4, "
+                f"g1_21j_compute, g1_29j."
+            )
 
         self.robot_name = robot_name
         self.scene_name = scene_name
@@ -36,6 +41,7 @@ class Robot:
         self.torso_ipos = self.mj_model.body_ipos[body_id]
 
         self.use_pd = use_pd
+        self._policy_gains: tuple | None = None   # set by apply_policy_gains
 
         if self.input_function is None:
             # Initialize joystick
@@ -64,8 +70,10 @@ class Robot:
         return mj_model, mj_data
 
     def reset_robot(self):
-        """Resets the robot."""
+        """Resets the robot (re-applying any policy gains, since the model is rebuilt)."""
         self.mj_model, self.mj_data = self._get_model_data()
+        if self._policy_gains is not None:
+            self.apply_policy_gains(*self._policy_gains)
 
     def add_base_mass(self, added_mass):
         """Add mass to the robot base."""
@@ -353,6 +361,54 @@ class Robot:
         self.commanded_vel[2] = angular_vel
 
         # print(f"Commanded velocity: {self.commanded_vel}, y pos: {qpos[1]}, y vel: {qvel[1]}, yaw: {yaw}")
+
+    def apply_policy_gains(self, kp, kd, joint_names) -> int:
+        """Overwrite the MJCF position-servo gains with the POLICY's trained kp/kd.
+
+        The policy trains against Isaac Lab actuator gains and exports them in
+        ``policy_parameters.yaml``; the MJCF carries its own hand-written numbers, which drift
+        from the asset as soon as anyone retunes training (measured on g1_29j: hips 100 vs a
+        trained 40.18, shoulders 100 vs 14.25, knees 150 vs 99.10 -- 2-7x too stiff). Applying
+        the exported values makes the deployed impedance follow the policy automatically, so
+        changing gains in training propagates here with no XML edit.
+
+        For a MuJoCo ``position`` actuator the servo is ``gainprm[0] = kp``,
+        ``biasprm[1] = -kp``, ``biasprm[2] = -kv``; all three must move together.
+
+        Args:
+            kp: Per-joint stiffness in ``joint_names`` order.
+            kd: Per-joint damping in ``joint_names`` order.
+            joint_names: Joint order the gains are given in (the policy's Isaac order).
+
+        Returns:
+            Number of actuators updated.
+        """
+        if kp is None or kd is None:
+            print("[WARN] policy exposes no kp/kd; keeping the MJCF gains.")
+            return 0
+        # Remembered so ``reset_robot`` (which rebuilds the model from XML) re-applies them
+        # instead of silently reverting to the hand-written values.
+        self._policy_gains = (kp, kd, joint_names)
+        kp_by = dict(zip(joint_names, np.asarray(kp, dtype=float).ravel()))
+        kd_by = dict(zip(joint_names, np.asarray(kd, dtype=float).ravel()))
+        n, missing = 0, []
+        for a in range(self.mj_model.nu):
+            if self.mj_model.actuator_trntype[a] != mujoco.mjtTrn.mjTRN_JOINT:
+                continue
+            jid = int(self.mj_model.actuator_trnid[a, 0])
+            jname = mujoco.mj_id2name(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, jid)
+            if jname not in kp_by:
+                missing.append(jname)
+                continue
+            self.mj_model.actuator_gainprm[a, 0] = kp_by[jname]
+            self.mj_model.actuator_biasprm[a, 1] = -kp_by[jname]
+            self.mj_model.actuator_biasprm[a, 2] = -kd_by[jname]
+            n += 1
+        if missing:
+            print(f"[WARN] no policy gains for {len(missing)} actuator(s) {missing[:6]}; "
+                  f"those keep their MJCF values.")
+        print(f"[INFO] applied policy kp/kd to {n}/{self.mj_model.nu} actuators.")
+        return n
 
     def apply_action(self, action):
         """Apply control action to the robot."""
