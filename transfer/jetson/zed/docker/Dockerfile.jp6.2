@@ -1,0 +1,141 @@
+# syntax=docker/dockerfile:1
+#
+# Jetson Orin (JetPack 6.2 / L4T r36, Ubuntu 22.04) container for ONE node:
+#
+#   * zed_depth_node  (zed_depth_publisher, github.com/wdc3iii/zed-interface)
+#
+# The onboard minipc has no GPU and the ZED SDK needs one, so the camera lives here and
+# reaches the control stack over the shared DDS graph (host networking, same ROS_DOMAIN_ID).
+#
+# It publishes a downsampled, FOV-clipped depth image on /depth/image_processed -- the SAME
+# topic and the SAME 32FC1 flat float32 layout the obelisk MuJoCo ray-caster publishes in
+# sim. That is what lets the controller run unchanged in both: it never learns which one it
+# is talking to. The target resolution/FOV/range come from the trained policy's own contract
+# via scripts/rsl_rl/export_sensor_configs.py -- see config/scan/zed_targets.yml.
+#
+# ROS 2 Humble (native apt on jammy), matching the rest of the stack so there is no
+# cross-distro DDS boundary. Nothing else is installed: no PCL, no MuJoCo, no obelisk
+# python, no policy runtime. The policy runs on the minipc; this box only makes pixels.
+#
+# Build (ON THE JETSON):
+#   cd transfer/jetson/zed/docker
+#   cp .env_example .env && $EDITOR .env
+#   docker compose build && docker compose up -d
+
+# ZED SDK + CUDA devel on an L4T r36 (jammy) base. CONFIRM this tag against the SDK version
+# and JetPack actually on the device (`cat /etc/nv_tegra_release` for the L4T rev) -- a
+# mismatch here fails at camera open, not at build.
+ARG ZED_IMAGE=stereolabs/zed:4.2-devel-jetson-jp6.2
+FROM ${ZED_IMAGE} AS base
+SHELL ["/bin/bash", "-c"]
+
+ARG USER=user
+ARG UID=1000
+ARG GID=1000
+ENV USER=$USER UID=$UID GID=$GID
+ENV TZ=America/Los_Angeles
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl gnupg2 lsb-release ca-certificates \
+        build-essential cmake git sudo vim tmux iputils-ping locales \
+        libeigen3-dev python3-pip python3-dev && \
+    locale-gen en_US.UTF-8 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ROS 2 Humble (ros-base) plus the message packages the node needs.
+RUN curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+        -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+        http://packages.ros.org/ros2/ubuntu jammy main" \
+        > /etc/apt/sources.list.d/ros2.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-ros-base \
+        ros-humble-rmw-cyclonedds-cpp \
+        ros-humble-sensor-msgs \
+        ros-humble-std-msgs \
+        ros-humble-geometry-msgs \
+        ros-humble-rosidl-default-generators \
+        python3-colcon-common-extensions \
+        python3-rosdep && \
+    rm -rf /var/lib/apt/lists/*
+ENV ROS_DISTRO=humble
+
+# Non-root user with passwordless sudo. Create-OR-ADOPT: the Stereolabs base already ships a
+# UID/GID 1000 user, so if the id is taken, rename the existing group/user (relocating its
+# home) rather than failing.
+RUN set -eu; \
+    grp="$(getent group "$GID" | cut -d: -f1 || true)"; \
+    if [ -n "$grp" ]; then [ "$grp" = "$USER" ] || groupmod -n "$USER" "$grp"; \
+    else groupadd --gid "$GID" "$USER"; fi; \
+    usr="$(getent passwd "$UID" | cut -d: -f1 || true)"; \
+    if [ -n "$usr" ]; then \
+        [ "$usr" = "$USER" ] || usermod -l "$USER" "$usr"; \
+        usermod -g "$GID" -s /usr/bin/bash "$USER"; \
+        [ -d "/home/$USER" ] || usermod -d "/home/$USER" -m "$USER"; \
+    else \
+        useradd --uid "$UID" --gid "$GID" -m -d "/home/$USER" -s /usr/bin/bash "$USER"; \
+    fi; \
+    echo "$USER:password" | chpasswd; \
+    usermod -aG sudo "$USER"; \
+    echo "%$USER ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+USER ${UID}
+WORKDIR /home/${USER}
+
+# The camera node, baked in. Public repo, so a plain HTTPS clone -- no ssh key at build.
+# Pinned by SHA: the depth geometry this produces has to match what the policy trained on,
+# and a moving ref is a silent way to change it.
+ARG ZED_REF=23ef4fa709652614d385daa355e917c2ca9ea34f
+RUN git clone https://github.com/wdc3iii/zed-interface.git /home/${USER}/zed-interface_src && \
+    cd /home/${USER}/zed-interface_src && git checkout ${ZED_REF}
+
+# obelisk_control_msgs, sparse-checked-out. Kept because the reference deployment of this
+# node builds against it and the dependency cannot be checked from here; it is one small
+# message package, and a missing dependency is far more expensive to debug on a remote
+# Jetson than it is to carry. Drop it if zed_depth_publisher's package.xml turns out not to
+# reference it. NOTE: obelisk's setup.sh is deliberately NOT run -- we build this one
+# package, nothing else.
+ARG OBELISK_REF=9f52216a6b91c44b67f53f48343dea74d5dbee79
+RUN git clone --filter=blob:none --no-checkout \
+        https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk_src && \
+    cd /home/${USER}/obelisk_src && \
+    git sparse-checkout init --cone && \
+    git sparse-checkout set obelisk_ws/src/obelisk_msgs/obelisk_control_msgs && \
+    git checkout ${OBELISK_REF}
+
+# The Stereolabs base pip-installs into /usr/local/lib/python3.10/dist-packages root-only;
+# colcon (non-root) scans every *.dist-info and dies with PermissionError on the unreadable
+# ones. This adds read + directory-exec only, and removes nothing.
+RUN sudo chmod -R a+rX /usr/local/lib/python3.10/dist-packages
+
+# Two build-time-only linking problems, both because the real libraries are injected at
+# RUNTIME by the nvidia container runtime:
+#   * zed_depth_publisher links the CUDA driver API, so FindCUDA sets CUDA_CUDA_LIBRARY to
+#     NOTFOUND at build -> point it at the toolkit's driver STUB (soname libcuda.so.1
+#     resolves to the real driver at runtime; the stub dir stays off the runtime path).
+#   * libsl_zed.so DT_NEEDEDs Jetson multimedia libs (libnvargus, libnvbufsurface, ...)
+#     that live only in the host L4T -> --allow-shlib-undefined so they bind at runtime.
+RUN mkdir -p /home/${USER}/ws_zed/src && \
+    ln -s /home/${USER}/obelisk_src/obelisk_ws/src/obelisk_msgs/obelisk_control_msgs \
+          /home/${USER}/ws_zed/src/obelisk_control_msgs && \
+    ln -s /home/${USER}/zed-interface_src/zed_depth_publisher \
+          /home/${USER}/ws_zed/src/zed_depth_publisher && \
+    cd /home/${USER}/ws_zed && \
+    source /opt/ros/humble/setup.bash && \
+    CUDA_STUB="$(find /usr/local/cuda* -name libcuda.so 2>/dev/null | head -1)" && \
+    echo "[ws_zed] CUDA driver stub: ${CUDA_STUB:-NONE FOUND}" && \
+    colcon build --symlink-install \
+      --cmake-args -DCMAKE_BUILD_TYPE=Release -DCUDA_CUDA_LIBRARY="$CUDA_STUB" \
+        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined" && \
+    echo "[image] verifying the node built..." && \
+    source install/setup.bash && ros2 pkg executables zed_depth_publisher
+
+# Launch helpers, on PATH so `docker exec <container> run_node.sh zed` needs no shell.
+COPY --chown=${UID}:${GID} run_node.sh /usr/local/bin/run_node.sh
+COPY --chown=${UID}:${GID} optimize_ai_models.sh /usr/local/bin/optimize_ai_models.sh
+RUN sudo chmod +x /usr/local/bin/run_node.sh /usr/local/bin/optimize_ai_models.sh
+
+RUN echo "source /opt/ros/humble/setup.bash" >> /home/${USER}/.bashrc && \
+    echo "source /home/${USER}/ws_zed/install/setup.bash" >> /home/${USER}/.bashrc
