@@ -1,0 +1,35 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Simulated Livox MID360, so the REAL FAST-LIO runs unmodified against the MuJoCo world.
+# Referenced by g1_world.yml as the scan_config of a PointCloud2 sensor published on
+# /livox/lidar -- the same topic the physical driver publishes, which is what makes the
+# localisation stack identical in sim and on hardware.
+#
+# Hand-written, unlike the depth configs: this describes the LIDAR, which no policy reads,
+# so there is no trained contract to generate it from. It only has to be close enough that
+# FAST-LIO behaves like it does on the robot.
+#
+# geom_groups: [2] is terrain ONLY -- the robot must not appear in its own scan or it walks
+# inside a wall of its own returns. (The depth cameras deliberately do the opposite: they
+# include group 1 so the robot self-occludes exactly as it did in training.)
+
+site_name: "head_lidar_site"
+geom_groups: [2]
+viz_decimation: 15
+frame: "body"
+# Beyond this a return is dropped rather than reported, matching the real unit's usable
+# range and keeping the cloud from stretching across an unbounded sim floor.
+max_distance: 40.0
+
+pattern:
+  type: "lidar_scan"
+  # ~MID360 coverage: 360 deg horizontal, and a vertical band from just below the horizon
+  # up over the top. 60 channels x 360 deg at 1 deg = 21600 rays/scan, ~216k points/s at
+  # 10 Hz, which is the order the real unit produces.
+  vertical_fov_range: [-7.0, 52.0]
+  horizontal_fov_range: [-180.0, 180.0]
+  channels: 60
+  horizontal_res: 1.0
+  offset:
+    pos: [0.0, 0.0, 0.0]
+    rot: [1.0, 0.0, 0.0, 0.0]

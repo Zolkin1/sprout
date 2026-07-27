@@ -1,0 +1,48 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# FAST-LIO mapping on the Livox MID360. Publishes /Odometry (the estimator's ONLY source of
+# base position and world linear velocity, which the flow-matching generator's history is
+# built from) and /cloud_registered{,_body}, and the odom->imu TF.
+#
+# It does NOT publish map->odom -- that comes from scan_lock, or from a static identity
+# transform when running without relocalisation. See launch/localization_*.launch.py.
+#
+# Used unmodified in SIM: g1_world.yml publishes simulated /livox/lidar + /livox/imu on the
+# same topics the real driver uses, so the localisation stack cannot tell the difference.
+
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  odom_frame: "odom"
+  time_sync_en: false
+
+gravity_alignment:
+  enable_gravity_alignment: true
+  g_base: [0.0, 0.0, -1.0]
+  imu_collection_duration: 1.0
+  heading_lidar: [1.0, 0.0, 0.0]
+
+preprocess:
+  lidar_type: 1        # Livox
+  scan_line: 4
+  blind: 0.3           # ignore returns closer than this (the robot's own body)
+  timestamp_unit: 3
+  scan_rate: 10
+
+mapping:
+  fov_degree: 360.0
+  det_range: 100.0
+  extrinsic_est_en: true
+  # Lidar-to-IMU extrinsic of the MID360's internal IMU. VERIFY against the physical mount
+  # before trusting the odometry -- a wrong extrinsic shows up as slow drift, not an error.
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
+  extrinsic_R: [1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+
+publish:
+  path_en: true
+  scan_publish_en: true
+  dense_publish_en: true
+  # /cloud_registered_body, in the body frame. Kept on because scan_lock's ICP consumes it.
+  scan_bodyframe_pub_en: true

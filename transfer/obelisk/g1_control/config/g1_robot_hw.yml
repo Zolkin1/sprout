@@ -1,0 +1,129 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The REAL G1 driver, and nothing else -- the hardware counterpart of g1_world.yml. Launched
+# as its own obk-launch alongside the robot-less brain (g1.yml) on the same ROS graph, so the
+# brain can be restarted without cycling the robot interface (and vice versa).
+#
+# Launch:
+#   obk-launch config=${ROBOT_RL_ROOT}/g1_control/config/g1_robot_hw.yml
+#
+# Bring-up, once this and g1.yml are both up (joystick execution FSM):
+#
+#     init --[LT]--> damping --[RB + DPad Left]--> user_pose --[RB + DPad Down]--> low_level
+#
+# The robot snaps to `user_pose` below and holds it; the RL controller publishes NOTHING and
+# stays disarmed until the FSM actually reports LOW_LEVEL_CONTROL. E-stop is RT.
+# NOTE (obelisk 9f52216): low_level_control -> user_pose was REMOVED from the FSM. From
+# low-level control the only exits are DAMPING and ESTOP -- you cannot step back to the held
+# pose, so plan aborts around damping.
+config: g1_robot_hw
+
+robot:
+  - name: g1_hw
+    is_simulated: False
+    pkg: obelisk_unitree_cpp
+    executable: obelisk_unitree_g1_hardware
+    params:
+      # Set to the interface facing the robot (192.168.123.161); find it with `ifconfig`.
+      # network_interface_name: enx6c1ff724e92e
+
+      # 29 DoF: the 27-DoF set plus waist roll and pitch. Our clips and the trained policy
+      # use the full 29 (see the 29-DoF migration), and the G1 interface only exposes the two
+      # extra waist motors when fixed_waist is false -- leaving it true silently drops them
+      # and the arrays below would then be the wrong length.
+      fixed_waist: false
+      use_hands: false
+
+      # ORDER MATTERS: every array below is indexed by position in this list, and the
+      # interface builds its own joint_names_ as [27-DoF set..., waist_roll, waist_pitch] --
+      # so the two extra waist joints go LAST here, not in anatomical order.
+      # VERIFY on first bring-up against the published ObkJointEncoders.joint_names.
+      default_joint_names: [
+        "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+        "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+        "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+        "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+        "waist_yaw_joint",
+        "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint", "left_elbow_joint",
+        "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+        "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint", "right_elbow_joint",
+        "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+        "waist_roll_joint", "waist_pitch_joint",
+      ]
+      # These are the interface's own PD gains, used while it drives user_pose and damping.
+      # They are NOT the policy's gains: in low-level control the controller sends kp/kd read
+      # out of the tracker metadata with every command, so the trained values always win.
+      default_kp: [
+        100., 100., 100.,       # L hip
+        150., 100., 100.,       # L knee, ankle
+        100., 100., 100.,       # R hip
+        150., 100., 100.,       # R knee, ankle
+        100.,                   # waist yaw
+        50., 50., 40., 40.,     # L shoulder, elbow
+        30., 30., 30.,          # L wrist
+        50., 50., 40., 40.,     # R shoulder, elbow
+        30., 30., 30.,          # R wrist
+        100., 100.,             # waist roll, pitch
+      ]
+      default_kd: [
+        2., 2., 2.,       # L hip
+        4., 2., 2.,       # L knee, ankle
+        2., 2., 2.,       # R hip
+        4., 2., 2.,       # R knee, ankle
+        2.,               # waist yaw
+        2., 2., 2., 2.,   # L shoulder, elbow
+        2., 2., 2.,       # L wrist
+        2., 2., 2., 2.,   # R shoulder, elbow
+        2., 2., 2.,       # R wrist
+        2., 2.,           # waist roll, pitch
+      ]
+      default_kd_damping: [
+        10., 10., 10.,        # L hip
+        10., 10., 10.,        # L knee, ankle
+        10., 10., 10.,        # R hip
+        10., 10., 10.,        # R knee, ankle
+        10.,                  # waist yaw
+        10., 10., 10., 10.,   # L shoulder, elbow
+        10., 10., 10.,        # L wrist
+        10., 10., 10., 10.,   # R shoulder, elbow
+        10., 10., 10.,        # R wrist
+        10., 10.,             # waist roll, pitch
+      ]
+      # The pose the robot snaps to and holds before low-level control. Carried over from the
+      # tuned hardware config, with the two new waist joints at zero (upright torso).
+      user_pose: [
+        -0.25,  0.01, -0.005, 0.45, -0.25, 0.0,
+        -0.25, -0.01, -0.005, 0.45, -0.25, 0.0,
+        0.0,
+        0.47,  0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
+        0.47, -0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
+        0.0, 0.0,
+      ]
+    publishers:
+      - ros_parameter: pub_sensor_setting
+        topic: /obelisk/g1/joint_encoders
+        history_depth: 10
+      - ros_parameter: pub_imu_setting
+        topic: /obelisk/g1/pelvis_imu
+        history_depth: 10
+      - ros_parameter: pub_odom_setting
+        topic: /obelisk/g1/odom
+        history_depth: 10
+      # The robot's ACTUAL execution-FSM state, on every transition plus a heartbeat. This is
+      # what arms the controller; nothing else may.
+      - ros_parameter: pub_fsm_state_setting
+        topic: /obelisk/g1/fsm_state
+        history_depth: 10
+    subscribers:
+      - ros_parameter: sub_ctrl_setting
+        topic: /obelisk/g1/ctrl
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_fsm_setting
+        topic: /obelisk/g1/exec_fsm
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_vel_cmd_setting
+        topic: /obelisk/g1/vel_cmd
+        history_depth: 10
+        callback_group: None

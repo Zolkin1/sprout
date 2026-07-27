@@ -1,0 +1,215 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Shared LOW-LEVEL control base -- the single source of truth for everything that drives
+# the G1 low level: the generator+tracker RL controller, the joint/IMU/odom estimator, the
+# joystick execution FSM, and the joy_node.  Included by:
+#   * config/g1.yml       -- standalone controller, launched IDENTICALLY on hardware and
+#                            in sim; only the separately-launched robot config differs.
+#
+# This is a FRAGMENT: it has no top-level `config:`, so it cannot be launched on its own --
+# the including file owns that (and with it the obelisk global_state identity).
+#
+# Merge rules (obelisk core/utils/launch_utils.load_config_file): list entries KEYED-MERGE
+# by the first of name/id/key/ros_parameter/topic, so an includer redeclaring
+# `- name: low_level` merges INTO this entry rather than adding a second node; mappings
+# (joystick, viz) deep-merge; scalars go to the outermost file.  `${VAR}` expands in string
+# values.  The `name:` also becomes the ROS node name (obelisk_control_low_level), so it is
+# both the merge identity and what you see in `ros2 node list`.
+
+# --------------------------------- #
+# ----------- Controller ---------- #
+# --------------------------------- #
+control:
+# ----- Low-level RL controller (generator + tracker) ----- #
+  - name: low_level
+    pkg: g1_control
+    executable: g1_controller
+    params:
+      # ---- Policy artifacts ----
+      # The robot pulls tracker.onnx + fm.onnx from HuggingFace and reads EVERY deployment
+      # parameter out of their metadata: joint order, gains, observation terms and clips,
+      # and the depth-camera contract. There is no policy_parameters.yaml any more -- if
+      # you find yourself wanting to add one here, the value belongs in the export instead.
+      hf_repo_id: "zolkin/robot-rl-policies"
+      hf_policy_folder: "REPLACE_ME"
+      # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
+      # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by
+      # `fm_update_every` in the tracker metadata when the export carries it.
+      fm_update_every: 2
+      # onnxruntime execution provider. false = CPU (the onboard minipc has no GPU);
+      # true requests CUDA and falls back to CPU if the installed runtime has no CUDA build.
+      use_cuda: false
+      onnx_threads: 2
+
+      # ---- Exteroception ----
+      # One topic per depth camera, in the artifact's CONTRACT ORDER. The controller
+      # cross-checks the count against tracker.onnx's depth_camera_spec and refuses to arm
+      # on a mismatch, so a policy trained on two cameras cannot be run on one by accident.
+      # Leave empty for a height-scan or blind policy.
+      depth_topics: ["/depth/image_processed"]
+      # Zero the velocity command if no depth frame arrives within this many seconds
+      # (<=0 disables). Judged on LOCAL RECEIPT time, not the header stamp: the camera
+      # clock is not synchronised to this machine.
+      depth_timeout: 0.25
+      # Likewise if no velocity command arrives -- a dead high level must not leave the
+      # robot walking at the last commanded speed.
+      vel_cmd_timeout: 1.0
+
+      # ---- Bring-up ----
+      # The flow-matching generator conditions on a history of MEASURED robot state, so it
+      # must be primed before its first prediction means anything. On entering low-level
+      # control the controller holds the standing pose on stiffened gains for this long,
+      # feeding the history, then hands over to the policy.
+      warmup_time: 1.0
+      hold_kp_scale: 2.0
+      hold_kd_scale: 1.5
+
+      # ---- Logging ----
+      log: true
+      log_decimation: 1
+      config_name: "g1.yml"
+      verbose: false
+    publishers:
+      - ros_parameter: pub_ctrl_setting
+        topic: /obelisk/g1/ctrl
+        history_depth: 10
+        callback_group: None
+    subscribers:
+      - ros_parameter: sub_est_setting
+        topic: /obelisk/g1/est_state
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_vel_cmd_setting
+        topic: /obelisk/g1/vel_cmd
+        history_depth: 10
+        callback_group: None
+      # ----- Arming: the robot's ACTUAL execution-FSM state ----- #
+      # The controller arms only while this reads LOW_LEVEL_CONTROL (USER_CTRL = 3), never
+      # on a button press -- a latched button can disagree with the robot. On hardware the
+      # G1 interface publishes it; in sim the echo node in g1_world.yml does, on the same
+      # topic, so this subscription is identical either way.
+      - ros_parameter: sub_fsm_state_setting
+        topic: /obelisk/g1/fsm_state
+        history_depth: 10
+        callback_group: None
+    timers:
+      - ros_parameter: timer_ctrl_setting
+        timer_period_sec: 0.02    # 50 Hz; the tracker's own dt is asserted against this
+        callback_group: None
+
+# ----- Execution FSM + teleop (joystick) ----- #
+  # Obelisk's stock unitree joystick node: it drives the robot's execution FSM (damping /
+  # user_pose / low_level_control / estop) and turns the sticks into a velocity command.
+  # Default pub_ctrl topic is the direct one; a stack with a high-level node in the loop
+  # keyed-merges `- name: joystick_fsm` to relay it somewhere else instead.
+  - name: joystick_fsm
+    pkg: obelisk_unitree_cpp
+    executable: obelisk_unitree_joystick
+    params:
+      v_x_scale: 1.0
+      v_y_scale: 0.25
+      w_z_scale: 1.0
+    publishers:
+      - ros_parameter: pub_exec_fsm_setting
+        topic: /obelisk/g1/exec_fsm
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: pub_ctrl_setting
+        topic: /obelisk/g1/vel_cmd
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: pub_joy_passthrough_setting
+        topic: /obelisk/g1/joy_passthrough
+        history_depth: 10
+        callback_group: None
+    subscribers:
+      - ros_parameter: sub_est_setting
+        topic: /obelisk/g1/joy
+    timers:
+      - ros_parameter: timer_ctrl_setting
+        timer_period_sec: 0.1
+        callback_group: None
+
+# --------------------------------- #
+# ----------- Estimator ----------- #
+# --------------------------------- #
+estimation:
+  - name: g1_estimator
+    pkg: g1_control
+    executable: g1_estimator
+    params:
+      # The FM history tokens need the base's WORLD-frame linear velocity. nav_msgs/Odometry
+      # carries pose in the header frame but twist in the CHILD frame, so FAST-LIO's twist is
+      # body-frame and is rotated by the base quaternion before publishing. Set false only if
+      # the odometry source is already publishing a world-frame twist.
+      odom_twist_is_body_frame: true
+      # How stale odometry may be before the estimator flags it. Losing localisation does not
+      # stop the robot on its own -- it makes the FM history wrong, which is worse -- so the
+      # controller treats a flagged estimate the same as a sensor dropout.
+      odom_timeout: 0.5
+    publishers:
+      - ros_parameter: pub_est_setting
+        topic: /obelisk/g1/est_state
+        msg_type: EstimatedState
+        history_depth: 10
+        callback_group: None
+    subscribers:
+      - ros_parameter: sub_joint_encoders
+        topic: /obelisk/g1/joint_encoders
+        msg_type: ObkJointEncoders
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_pelvis_imu
+        topic: /obelisk/g1/pelvis_imu
+        msg_type: Imu
+        history_depth: 10
+        callback_group: None
+      # FAST-LIO odometry: the only source of base POSITION and world linear velocity.
+      # Unlike a blind proprioceptive policy, the generator cannot run without it.
+      - ros_parameter: sub_odom
+        topic: /Odometry
+        msg_type: Odometry
+        history_depth: 10
+        callback_group: None
+    timers:
+      - ros_parameter: timer_est_setting
+        timer_period_sec: 0.001
+        callback_group: None
+
+# --------------------------------- #
+# ----------- Joystick ------------ #
+# --------------------------------- #
+# The stock joy_node, identical in every stack. Deep-merges, so an includer can override a
+# single field (device_id is host-specific) without redeclaring the block.
+joystick:
+  on: True
+  device_id: 0
+  pub_topic: /obelisk/g1/joy
+  sub_topic: /obelisk/g1/joy_feedback
+
+# --------------------------------- #
+# -------------- Viz -------------- #
+# --------------------------------- #
+# Robot-state visualisation, off by default; an includer flips it on with `viz: {on: True}`.
+viz:
+  on: False
+  viz_nodes:
+    - pkg: obelisk_viz_cpp
+      executable: default_robot_viz
+      robot_pkg: g1_model
+      urdf: g1_29j.urdf
+      robot_topic: robot_description
+      subscribers:
+        - ros_parameter: sub_viz_est_setting
+          topic: /obelisk/g1/est_state
+          history_depth: 10
+          callback_group: None
+      publishers:
+        - ros_parameter: pub_viz_joint_setting
+          topic: joint_states
+          history_depth: 10
+          callback_group: None
+      timers:
+        - ros_parameter: timer_viz_joint_setting
+          timer_period_sec: 0.01
+          callback_group: None

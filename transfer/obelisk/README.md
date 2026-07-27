@@ -1,5 +1,38 @@
+# Quick start
+
+```bash
+cd transfer/obelisk/docker && cp .env_example .env && $EDITOR .env   # once, per machine
+cd ..
+scripts/build.sh                 # once, after a clone or image rebuild
+scripts/run_sim_low.sh           # brain + MuJoCo world + FSM echo, in tmux
+scripts/stop.sh                  # tear it all down
+```
+
+On the robot, the only change is which robot config comes up alongside the same brain:
+
+```bash
+python3 scripts/prefetch_policy.py --hf_policy_folder <name>   # while it still has internet
+scripts/run_hardware_low.sh
+```
+
+Every launcher runs on the host, brings the container up, and re-execs itself inside it, so
+you never `docker exec` by hand. Each tmux pane comes up fully sourced with its command one
+Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
+
+| script | what it launches |
+|---|---|
+| `run_sim_low.sh` | brain + MuJoCo world + FSM echo (session `simlow`) |
+| `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
+| `run_world.sh` | the MuJoCo world alone, for the split-machine test (session `world`) |
+| `build.sh` | colcon build inside the container |
+| `stop.sh` | kill the tmux server, reap orphaned launches (`--zed`, `--stop`, `--down`) |
+
+`stop.sh` reaps orphaned `ros2 launch` trees, not just the panes. This matters: the configs
+reuse node names, so one surviving launch re-emits lifecycle transitions at the *next*
+session's nodes and kills them.
+
 # Running the Docker
-For now, we suggest bringing the docker up in a `devcontainer` within VSCode.
+For manual/devcontainer use. The launch scripts above do this for you.
 
 ## Prerequisites
 - Docker and Docker Compose plugin installed
@@ -13,13 +46,13 @@ export ROBOT_RL_ROOT=/your/path/to/robot_rl/transfer/obelisk
 ```
 
 ## Creating a `.env`
-In the `docker` folder you must make a `.env` file that looks like:
-```
-USER=${USER:-$(id -un)}
-UID=1000
-GID=1000
-```
-But you may need to switch the numbers depending on your user.
+`cp docker/.env_example docker/.env` and edit it -- it documents every variable. Beyond
+user/uid/gid you must set `REPO_ROOT` (the repo root is what gets mounted, so the container
+can see `transfer/deploy` and `transfer/sim`), and `INPUT_GID` / `DIALOUT_GID` from your own
+host (`getent group input | cut -d: -f3`).
+
+Compose reads `.env` only when it CREATES a container; after editing it,
+`docker compose up -d --force-recreate`.
 
 ## Running in Docker
 We recommend using VSCode's devcontainer feature to run the Docker environment.
@@ -85,51 +118,59 @@ Then we can source this package:
 source install/setup.bash
 ```
 
-Then finally we can run the stack in sim:
+## The config tree
+
+The stack is **two** `obk-launch`es on one ROS graph, not one: the brain is robot-less, and
+the robot comes from its own config. Distinct top-level `config:` names give each its own
+obelisk `global_state`, so either can be restarted without cycling the other.
+
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/sim_config_baseline.yaml device=onboard bag=false
+g1_control/config/
+  common/low_level.yml   fragment: controller + estimator + joystick FSM (no `config:`)
+  g1.yml                 THE BRAIN -- launched identically in sim and on hardware
+  g1_robot_hw.yml        the real Unitree driver, alone
+  g1_world.yml           the MuJoCo world, alone
+  scan/                  ray-caster configs (the depth ones are GENERATED -- see below)
 ```
 
-## Different Configs/Policies
-LIP:
+Sim (two terminals, or use the launch scripts):
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_clf.yaml device=onboard bag=false
-```
-
-HZD:
-```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl.yaml device=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_world.yml
 ```
 
-Baseline:
+Hardware -- identical brain, different robot:
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device=onboard bag=false
-```
-
-Running:
-```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_running.yaml device=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
-Bow Forward:
-```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/bow_forward/bow_forward_config.yaml device=onboard bag=false
-```
+Note there is no `device=` argument any more, and `bag` now defaults to off.
 
-Multi-behavior:
-```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/multi-behavior/sim_multi-behavior_config.yaml device=onboard bag=false
-```
+### Selecting a policy
 
-CBF-Sim
-```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/configs/running/cbf_sim_running_config.yaml device=onboard bag=false
-```
+There is no per-policy config file. The controller pulls `tracker.onnx` + `fm.onnx` from
+HuggingFace and reads every deployment parameter -- joint order, gains, observation terms and
+their clips, the depth-camera geometry -- out of their embedded metadata. To run a different
+policy, change `hf_policy_folder` in `config/common/low_level.yml` (or keyed-merge-override it
+from a launch script); there is no `policy_parameters.yaml` and no rebuild.
 
-<!-- HZD with optitrack logging:
+Upload a policy with:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config_hzd_gl_optitrack.yaml device_name=onboard bag=false
-``` -->
+python scripts/rsl_rl/export_to_hardware.py --run_dir logs/rsl_rl/g1/<run> \
+    --hf_repo_id <user/repo> --folder_name <name>
+```
+which refuses to upload a tracker/generator pair that disagrees about the cameras.
+
+### Generated sensor configs
+
+`config/scan/depth_*.yml` and `config/scan/zed_targets.yml` are **generated** from the
+policy artifact so the sim, the real camera and training cannot drift apart:
+```
+python scripts/rsl_rl/export_sensor_configs.py --run_dir logs/rsl_rl/g1/<run>
+```
+Re-run it whenever the camera configuration changes, and re-export the policy with it.
+`config/scan/mid360.yml` is hand-written -- no policy reads the lidar.
 
 # Run the Lidar
 May need to run
@@ -148,11 +189,13 @@ ros2 launch lidar_scan fastlio_launch.py
 Follow the above steps to make sure everything work in simulation.
 
 When connected to the robot, attempt to ping the IP address at `192.168.123.161`.
-Then, update the `network_interface_name` parameter in the robot section of `hardware_config.yaml` to match the name of your network interface (can be seen via `ifconfig`).
+Then, update the `network_interface_name` parameter in the robot section of
+`config/g1_robot_hw.yml` to match the name of your network interface (can be seen via `ifconfig`).
 
-Now we can launch the hardware stack:
+Now we can launch the hardware stack -- the brain and the robot, as two separate launches:
 ```
-obk-launch config_file_path=$ROBOT_RL_ROOT/g1_control/configs/hardware_config.yaml device_name=onboard bag=false
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
 The robot interface in Obelisk has a statemachine that we need to "navigate" to enter into low level control mode.
@@ -162,11 +205,22 @@ For the G1, we will follow this diagram (can get to L1 by holding down Left Bump
     Left Trigger        L1 DPAD Left       L1 DPAD down
 init ----------> damping -------> user_pose ---------> low_level_ctrl
 ```
-At `user_pose`, the robot will snap to the default position specified by `user_pose` in `hardware_config.yaml` and hold that.
+At `user_pose`, the robot will snap to the default position specified by `user_pose` in
+`config/g1_robot_hw.yml` and hold that.
 
 At `low_level_ctrl`, the output from the controller node will be applied to robot.
 
+**The controller arms itself off this FSM, not off a button.** Until the robot actually
+reports `LOW_LEVEL_CONTROL` it publishes nothing at all and the interface's passive-hold
+timer drives the robot; on entering it, the controller first spends `warmup_time` holding
+the standing pose on stiffened gains to prime the flow-matching generator's state history,
+then hands over to the policy.
+
 E-STOP is right trigger.
+
+> **Changed in obelisk `9f52216`:** the `low_level_ctrl -> user_pose` transition was removed.
+> From low-level control the only exits are DAMPING and E-STOP -- you can no longer step back
+> to the held pose, so plan aborts around damping.
 
 # Setting up the Xbox remote
 You can now run the script:

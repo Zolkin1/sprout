@@ -19,27 +19,12 @@ find_package(std_msgs REQUIRED)
 find_package(obelisk_sensor_msgs REQUIRED)
 
 # --------------------
-# Include directories
-# --------------------
-include_directories(include)
-
-# --------------------
-# Executable
-# --------------------
-# add_executable(lidar_scan_node src/lidar_scan.cpp)
-# ament_target_dependencies(lidar_scan_node
-#   rclcpp
-#   sensor_msgs
-#   std_msgs
-#   obelisk_sensor_msgs
-# )
-
-# --------------------
 # Install
 # --------------------
-# install(TARGETS lidar_scan_node
-#   DESTINATION lib/${PROJECT_NAME}
-# )
+# Launch/config/rviz ONLY -- this package builds no node. The lidar driver comes from
+# livox_ros_driver2 and the localisation from LIO-Localization (both built into the image);
+# this is the thin wrapper that points them at OUR configs. The former src/lidar_scan.cpp
+# stub was never implemented and has been removed.
 
 install(
   DIRECTORY launch/

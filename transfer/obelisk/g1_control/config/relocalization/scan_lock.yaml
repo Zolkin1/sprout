@@ -1,0 +1,54 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# scan_lock: ICP of the live registered cloud against a prior PCD map, publishing map->odom.
+# FAST-LIO gives odom->imu but never anchors it, so without this the robot is localised in a
+# frame that starts wherever it booted.
+#
+# Copy this per experiment (one file per prior map) and select it with
+# `--map <name>`; the launcher reads pcd_file_name out of the resolved config so the
+# pose_prompt preview always shows the map ICP is actually running against.
+#
+# ${ROBOT_RL_ROOT} is expanded by scan_lock itself (it accepts ${ENV} in pcd_file_name at
+# the pinned LIO_LOC_REF), so maps live in the bind-mounted, gitignored resources/pcd/ and
+# survive an image rebuild with no push step.
+
+/**:
+  ros__parameters:
+    pose_prompt:
+      coarse_voxel_size: 1.0
+      fine_voxel_size: 0.1
+      fine_region_radius: 10.0
+      fine_point_cap: 3000000
+
+    scan_lock:
+      pcd_file_name: "${ROBOT_RL_ROOT}/resources/pcd/lab.pcd"
+      register_period_s: 5.0
+      map_viz_voxel_size: 0.25
+      scan_max_range: 20.0
+      local_map_radius: 30.0
+      submap_half_extent: 50.0
+      submap_rebuild_threshold: 20.0
+      # Correct roll/pitch as well as yaw. The policy reads base HEIGHT through the
+      # estimate, so a map->odom that only fixes yaw lets a tilted prior bias it.
+      correct_roll_pitch: true
+
+    frames:
+      map_frame: "map"
+      odom_frame: "odom"
+      body_frame: "body"
+      imu_frame: "imu"
+
+    topics:
+      lidar_topic: "cloud_registered"
+
+    initial_guess:
+      # false = wait for an /initialpose (rviz "2D Pose Estimate", or pose_prompt). ICP has
+      # a small basin of convergence, so guessing wrong is worse than waiting: it locks onto
+      # the wrong part of the map and reports high confidence about it.
+      use_default: false
+      x: 0.0
+      y: 0.0
+      z: 0.72          # body height above the ground when use_default is false
+      ground_search_radius_x: 5.0
+      ground_search_radius_y: 5.0
+      ground_percentile: 0.05
