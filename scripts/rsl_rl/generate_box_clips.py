@@ -57,7 +57,7 @@ from motion_gen.ingest.terrain_ingest import ingest_terrain_library
 from motion_gen.terrain.terrain_place import place_episodic_on_tile, place_periodic_on_tile
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles
 from motion_gen.terrain.terrain_variants import resolve_box_variant
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -1122,8 +1122,8 @@ def main() -> int:
     matcher = _build_matcher(args, dev) if need_matcher else None
     if matcher is None:
         print("[box] no approach DP needed: skipping candidate-graph build")
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
 
     print(f"[box] ingesting terrain library {args.terrain_lib} ...")
@@ -1283,7 +1283,7 @@ def main() -> int:
             "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
             "vel_output_names": list(builder.vel_names),
             "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
-            "skill_list": [s.name for s in manager.skills]}
+            "skill_list": lib_meta.skill_list}
     writer = ClipLibraryWriter(args.out, len(records), meta)
     writer.set_attr("generator", "box_clip_splice")
     writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))

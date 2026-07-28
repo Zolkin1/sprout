@@ -28,7 +28,7 @@ from isaaclab.utils.math import (
 from .clf import CLF
 from motion_gen.manager_base import ManagerBase
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
-from motion_gen.trajectory_manager import TrajectoryType
+from motion_gen.manager_base import TrajectoryType
 from .world_lift_isaac import lift_base_world_state
 
 

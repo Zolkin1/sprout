@@ -42,7 +42,7 @@ from motion_gen.clip_output import ClipOutputBuilder        # noqa: E402
 from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_raw_motion, raw_to_world           # noqa: E402
 from motion_gen.motionbricks.distractor_plan import profile_segs, request_key  # noqa: E402
-from motion_gen.multiskill_manager import MultiSkillManager                 # noqa: E402
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free                      # noqa: E402
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -114,8 +114,8 @@ def _tile_worker(tid: int):
 
 def _assemble(args) -> int:
     """Pass 2: fit boxes to the generated motions and write the distractor family."""
-    manager = MultiSkillManager(args.source, args.device, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=args.device)
     tiles = _pool(args)
     _SHARED.update(args=args, builder=builder, dev=args.device, tiles=tiles)

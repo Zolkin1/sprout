@@ -38,7 +38,7 @@ from motion_gen.motion_matching.locomotion_db import (
     build_locomotion_matcher,
     clean_library_fingerprint,
 )
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -146,13 +146,13 @@ def main() -> int:
     args = p.parse_args()
 
     dev = args.device
-    manager = MultiSkillManager(args.source, dev, env=None)   # robot output-names + skill_list only
+    lib_meta = read_library_metadata(args.source)   # robot output-names + skill_list only
     print(f"[mm] building shared locomotion DB (flat/clean; no lead-ins) ...")
     matcher = build_locomotion_matcher(
         bones_cache=args.bones_cache, clean_source=args.clean_source, clean_hf_repo=args.clean_hf_repo,
         bones_limit=args.bones_limit, include_leadins=False, dt=args.dt, device=dev,
         cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0, log=lambda m: print(m.replace("[locomotion_db]", "[mm]")))
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT_FRAMES, device=dev)
     anchor = int(anchor_mask_from_free([x.strip() for x in args.flat_anchor.split(",") if x.strip()]))
     T = max(1, int(round(args.clip_length / args.dt)))
@@ -170,7 +170,7 @@ def main() -> int:
         "vel_output_names": list(builder.vel_names),
         "contact_frames": _CONTACT_FRAMES,
         "ref_frame": "pelvis_link",
-        "skill_list": [s.name for s in manager.skills],
+        "skill_list": lib_meta.skill_list,
     }
     writer = ClipLibraryWriter(args.out, N, meta)
     writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))

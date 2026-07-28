@@ -3,7 +3,29 @@
 from abc import ABC, abstractmethod
 
 import torch
+from enum import Enum
 
+
+
+
+class TrajectoryType(Enum):
+    """How a reference trajectory repeats.
+
+    Lives here rather than with the (deleted) trajectory manager because it is part of the
+    clip/manager interface: ``clips.clip_manager`` and the RL command term both read it.
+    """
+
+    HALF_PERIODIC = "half_periodic"
+    FULL_PERIODIC = "full_periodic"
+    EPISODIC = "episodic"
+    PERPETUAL = "perpetual"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Accept the legacy ``"periodic"`` spelling for full-periodic trajs."""
+        if value == "periodic":
+            return cls.FULL_PERIODIC
+        return None
 
 class ManagerBase(ABC):
     """Abstract base class for trajectory and skill managers.

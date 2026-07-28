@@ -14,9 +14,12 @@ kept so the MB clips can be compared against a matcher baseline in an ablation.
 | `dp.py` | exact backward dynamic program — the strongest of the three |
 | `locomotion_db.py` | assembles the flat bones + clean-stride + jump-lead-in DB the matchers search |
 | `features.py` | the matching feature space (trajectory + pose features) and its FK |
-| `mm_clip_generator.py` | clip assembly around a matcher result |
 | `slope_rotate.py` | rotates flat clips onto a slope — shelved (works only straight up/down-slope; cross-slope and turning clips lean sideways) |
-| `trajopt_ingest.py` | trajopt/Bezier motion source, an alternative to the bones seed |
+
+`trajopt_ingest.py` and `mm_clip_generator.py` were removed when the trajectory-manager stack
+was deleted: the former needed the manager's full Bezier evaluation, and the latter was only
+reachable through it. Neither was on any runnable path (no CLI imported them) — the ablation
+drivers below all seed from the bones cache or the clean stride library.
 
 ## Running it
 

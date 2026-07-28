@@ -71,7 +71,7 @@ from motion_gen.motionbricks import (
     sole_heights,
     splice_terrain,
 )
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
 _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -235,8 +235,8 @@ def make_builder(args, dev) -> ClipOutputBuilder:
     Split out because constructing it loads the whole traj-opt library (1470 trajectories), so a batch
     driver building many clips must make ONE and pass it in rather than paying that per clip.
     """
-    manager = MultiSkillManager(args.source, dev, env=None)
-    return ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    return ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                              contact_frames=_CONTACT_FRAMES, device=dev)
 
 

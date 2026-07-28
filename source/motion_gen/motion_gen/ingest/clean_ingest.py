@@ -44,13 +44,11 @@ _QPOS = 36  # root_pos(3) + root_quat(4) + 29 joints
 def _resolve_dir(path: str, hf_repo: str | None) -> Path:
     """Return the local library directory, downloading from HuggingFace if ``hf_repo`` is set.
 
-    Reuses :meth:`MultiSkillManager._download_from_hf` (caches under ``./hf/<path>``).
+    Caches under ``./hf/<path>`` (see :mod:`motion_gen.hf_cache`).
     """
-    if hf_repo is None:
-        return Path(path)
-    from ..multiskill_manager import MultiSkillManager
+    from ..hf_cache import resolve_library_path
 
-    return MultiSkillManager._download_from_hf(hf_repo, path)
+    return resolve_library_path(path, hf_repo)
 
 
 def _read_manifest(lib_dir: Path) -> list[dict]:

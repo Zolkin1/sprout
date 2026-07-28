@@ -51,7 +51,7 @@ from motion_gen.motion_matching.graph import (                            # noqa
     STEADY, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_key, graph_cache_path)
 from motion_gen.playback import play_frame_path           # noqa: E402
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig  # noqa: E402
-from motion_gen.multiskill_manager import MultiSkillManager               # noqa: E402
+from motion_gen.library_metadata import read_library_metadata
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _FILTERS = {"package": "Locomotion",
@@ -253,12 +253,12 @@ def main() -> int:
     print("[exp] building DP matcher (shares the same graph) ...")
     dm = DPMatcher(sources, vcfg, DPConfig(dt=args.dt, **tier_kw), graph=graph, device=dev)
 
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
-    base_meta = {"dt": args.dt, "pos_output_names": list(manager.pos_output_names),
-                 "vel_output_names": list(manager.vel_output_names), "contact_frames": _CONTACT,
-                 "ref_frame": "pelvis_link", "skill_list": [s.name for s in manager.skills]}
+    base_meta = {"dt": args.dt, "pos_output_names": list(lib_meta.pos_output_names),
+                 "vel_output_names": list(lib_meta.vel_output_names), "contact_frames": _CONTACT,
+                 "ref_frame": "pelvis_link", "skill_list": lib_meta.skill_list}
 
     rows = []
     for name, sched in scheds:

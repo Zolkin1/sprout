@@ -128,39 +128,3 @@ def test_does_not_mutate_inputs():
     rotate_clip_to_slope(y, dy, POS_NAMES, VEL_NAMES, 0.15, pivot_xy=(0.0, 0.0))
     assert torch.equal(y, y0) and torch.equal(dy, dy0)
 
-
-# ---- upright_slope_clip (needs the G1 FK / MJCF) ----
-_FIX = os.path.join(os.path.dirname(__file__), "..", "..", "robot_rl", "tests",
-                    "test_data", "merged_library")
-
-
-@pytest.mark.skipif(not (os.path.isfile(F.DEFAULT_MJCF) and os.path.isdir(_FIX)),
-                    reason="G1 MJCF or library fixture not found")
-def test_upright_slope_keeps_pelvis_vertical_and_climbs(tmp_path):
-    """Upright mode preserves the pelvis orientation, climbs, and flexes the hips."""
-    from motion_gen.clip_output import ClipOutputBuilder
-    from motion_gen.multiskill_manager import MultiSkillManager
-    os.environ["ROBOT_RL_TRAJ_CACHE_DIR"] = str(tmp_path / "cache")
-    m = MultiSkillManager(_FIX, "cpu", env=None)
-    pn, vn = list(m.pos_output_names), list(m.vel_output_names)
-    builder = ClipOutputBuilder(pn, vn, device="cpu")
-    pn, vn = list(builder.pos_names), list(builder.vel_names)   # builder rebuilds joints to the full 29-DoF layout
-
-    T = 20
-    root_pos = torch.zeros(T, 3); root_pos[:, 0] = torch.linspace(0.0, 1.0, T); root_pos[:, 2] = 0.75
-    root_quat = torch.zeros(T, 4); root_quat[:, 0] = 1.0            # wxyz identity (upright)
-    joints = torch.zeros(T, len(F.G1_JOINT_NAMES))
-    hip = (F.G1_JOINT_NAMES.index("left_hip_pitch_joint"), F.G1_JOINT_NAMES.index("right_hip_pitch_joint"))
-    pitch = slope_pitch_for_climb(math.radians(10.0))
-
-    y, _dy = upright_slope_clip(builder, root_pos, root_quat, joints, hip, pitch, (0.0, 0.0), 0.02)
-    # pelvis orientation is untouched (world-vertical), NOT tilted with the ramp.
-    ori = y[:, [pn.index(f"pelvis_link:ori_{a}") for a in ("w", "x", "y", "z")]]
-    assert torch.allclose(ori, root_quat, atol=1e-5)
-    # pelvis climbs with forward x.
-    pz = y[:, pn.index("pelvis_link:pos_z")]
-    assert float(pz[-1]) > float(pz[0])
-    # both hip-pitch joints carry the ramp-pitch compensation.
-    for side in ("left", "right"):
-        jj = y[:, pn.index(f"joint:{side}_hip_pitch_joint")]
-        assert torch.allclose(jj, torch.full((T,), float(pitch)), atol=1e-5)

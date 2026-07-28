@@ -42,7 +42,7 @@ from motion_gen.motion_matching.graph import (
     graph_cache_path,
 )
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -320,8 +320,8 @@ def main() -> int:
             print(f"  {t0:8.2f}  {t1:7.2f}  {t1 - t0:5.2f}   [{s['l0']:>4}-{s['l1']:<4}] {matcher.src_names[s['o']]}")
         print()
 
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
     y, dy, contact = builder.build(root_pos, root_quat, joints, args.dt)
     tvel = torch.tensor([[*command(i * args.dt)] for i in range(T)], dtype=torch.float32, device=dev)
@@ -338,7 +338,7 @@ def main() -> int:
         "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
         "vel_output_names": list(builder.vel_names),
         "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
-        "skill_list": [s.name for s in manager.skills],
+        "skill_list": lib_meta.skill_list,
     }
     writer = ClipLibraryWriter(args.out, 1, meta)
     writer.set_attr("generator", generator_name)
