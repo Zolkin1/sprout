@@ -77,10 +77,9 @@ class FlowMatchingConfig:
     # values in the height scan (embedded through one MLP into a single token). Resolved
     # from the recorded ``height_scan`` at dataset build time.
     height_dim: int = 176
-    # World floor height for the TERRAIN-PENETRATION LOSS only (flat ground -> 0.0). It no
-    # longer feeds any FM conditioning token (the height scan replaced the root-z scalar).
-    # TODO: the terrain loss's flat-``ground_z`` floor is wrong on non-flat terrain; move it
-    # to an SDF (or a height-scan-derived local floor) before training on complex terrain.
+    # World floor height (flat ground -> 0.0). VESTIGIAL: it feeds no conditioning token and
+    # its last real consumer (the terrain-penetration loss) is deleted; nothing reads it back
+    # out of ``FMContext`` / the exported ``fm_meta``.
     ground_z: float = 0.0
     # Std floor for the height-scan normalizer. On flat ground the per-ray scan is nearly
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
@@ -145,38 +144,10 @@ class FlowMatchingConfig:
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
 
-    # -- terrain penetration (penalize predicted feet going below the ground) --
-    # ``terrain_penetration_mode``: "ankle" (penalize the ankle-frame origin) or
-    # "contact" (sample a grid on the foot box sole and penalize each point, using the
-    # predicted foot orientation). ``terrain_ground_z``: world ground height; ``None``
-    # auto-calibrates the floor from the recording at train time (a low percentile of
-    # the lifted recorded foot z, so clean data has ~0 penetration). ``terrain_contact_grid``
-    # is the (nx, ny) sole-grid for contact mode.
-    # ``terrain_tau_gated`` (default False) keeps the penalty on ALL flow-times. Unlike the
-    # accel/FK terms, the low-τ predicted endpoint penetrates ~as much as the deployed
-    # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
-    # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
-    # all the signal. Set True only to restrict it to the high-τ regime.
-    terrain_penetration_weight: float = 200.0 #200.0 #1.0 #0.1 #0.0
-    terrain_penetration_mode: str = "ankle"
-    terrain_ground_z: float | None = None
-    terrain_contact_grid: tuple[int, int] = (3, 2)
-    terrain_floor_percentile: float = 1.0
-    terrain_tau_gated: bool = False
-
-    # -- sampled-rollout terrain penalty (penalize the actual multi-step sample) --
-    # The ``terrain_penetration_weight`` term acts on the teacher-forced endpoint
-    # ``x1_hat``; measured, that suppresses ``x1_hat`` penetration ~40x while the deployed
-    # multi-step sample barely improves (the penalty never sees the sampler's real path).
-    # This term penalizes ``sample_trajectory`` directly. ``terrain_sample_weight`` (>0
-    # enables it; same m² units as the x1_hat term so a similar ~1e2 scale is expected).
-    # To bound cost it samples a ``terrain_sample_size`` sub-batch with
-    # ``terrain_sample_steps`` Euler steps and truncated backprop through only the last
-    # ``terrain_sample_grad_steps`` steps (the rest run under no_grad).
-    terrain_sample_weight: float = 0.0
-    terrain_sample_size: int = 64
-    terrain_sample_steps: int = 8
-    terrain_sample_grad_steps: int = 1
+    # NOTE: the terrain-penetration losses were DELETED (they assumed a single flat
+    # ``ground_z`` floor, wrong on the stairs/boxes the clip library trains on). This copy
+    # never had the ``FlatTerrain`` module to run them with in the first place. Mirrors
+    # ``robot_rl.flow_matching.config``.
 
     # -- training --
     batch_size: int = 256
