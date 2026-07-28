@@ -19,11 +19,9 @@ import torch
 
 from .transforms import (
     frame_block_start,
-    matrix_from_quat,
     ori6d_orthonormality_penalty,
     rot6d_to_matrix,
     so3_log,
-    yaw_quat,
 )
 
 
@@ -180,58 +178,6 @@ def fk_consistency_terms(
     return pose_ps / max(k, 1), vel_ps / max(k, 1)
 
 
-def terrain_penetration_term(
-    pred_phys: torch.Tensor,
-    p_ref: torch.Tensor,
-    q_ref: torch.Tensor,
-    num_joints: int,
-    foot_idxs: list[int],
-    contact_pts: torch.Tensor | None,
-    terrain: object,
-) -> torch.Tensor:
-    """Per-sample squared terrain penetration of the predicted feet (world frame).
-
-    Lifts each foot frame from the xyz+yaw anchor frame to the world via the per-window
-    anchor pose ``(p_ref, yaw_quat(q_ref))`` -- matching the relative-state frame -- and
-    asks the terrain how far it is below the surface. ``contact_pts=None`` -> the
-    ankle-frame origin (ankle mode); otherwise the box-sole points ``(P, 3)`` in the foot
-    frame are placed with the predicted foot orientation (contact mode). Operates on the
-    pure F-step prediction.
-
-    TODO: ``terrain`` here is a flat floor (a single ``ground_z`` height) -- the last use of
-    the height scalar in the FM. This is wrong on non-flat terrain. Replace it with an SDF
-    (or a local floor derived from the recorded height scan) before training on complex
-    terrain, so the penetration query uses the true local ground height per foot.
-
-    Args:
-        pred_phys: Predicted endpoint / sample (denormalized), ``(B, F, D)``.
-        p_ref: World anchor position ``(B, 3)``; q_ref: anchor quat ``(B, 4 xyzw)``.
-        num_joints: ``nj``.
-        foot_idxs: Indices (into the extra frames) of the foot frames.
-        contact_pts: Box-sole points in the foot frame ``(P, 3)``, or ``None`` (ankle mode).
-        terrain: Object with ``penetration(world_xyz) -> depth`` (e.g. :class:`FlatTerrain`).
-
-    Returns:
-        Per-sample penetration ``(B,)`` (mean of depth² over feet, [points], frames).
-    """
-    x = pred_phys
-    r_ref = matrix_from_quat(yaw_quat(q_ref))  # (B, 3, 3) yaw-ground->world (matches the rel frame)
-    pen = x.new_zeros(x.shape[0])
-    cpts = None if contact_pts is None else contact_pts.to(x)
-    for fi in foot_idxs:
-        eb = frame_block_start(num_joints, 1 + fi)
-        p_foot_world = torch.einsum("bij,bfj->bfi", r_ref, x[..., eb:eb + 3]) + p_ref[:, None, :]
-        if cpts is None:
-            depth = terrain.penetration(p_foot_world)            # (B, F)
-            pen = pen + (depth ** 2).mean(dim=1)
-        else:
-            r_foot = torch.einsum("bij,bfjk->bfik", r_ref, rot6d_to_matrix(x[..., eb + 6:eb + 12]))
-            pc = p_foot_world[:, :, None, :] + torch.einsum("bfik,pk->bfpi", r_foot, cpts)  # (B,F,P,3)
-            depth = terrain.penetration(pc)                       # (B, F, P)
-            pen = pen + (depth ** 2).mean(dim=(1, 2))
-    return pen / max(len(foot_idxs), 1)
-
-
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
@@ -252,25 +198,13 @@ def flow_matching_loss(
     fk_pose_weight: float = 0.0,
     fk_vel_weight: float = 0.0,
     tau_min: float = 0.0,
-    p_ref: torch.Tensor | None = None,
-    q_ref: torch.Tensor | None = None,
-    terrain: object | None = None,
-    foot_idxs: list[int] | None = None,
-    contact_pts: torch.Tensor | None = None,
-    terrain_weight: float = 0.0,
-    terrain_tau_gated: bool = False,
-    terrain_sample_weight: float = 0.0,
-    terrain_sample_size: int = 64,
-    terrain_sample_steps: int = 8,
-    terrain_sample_grad_steps: int = 1,
 ) -> dict[str, torch.Tensor]:
-    """Compute the flow-matching loss (+ optional consistency / FK / terrain terms).
+    """Compute the flow-matching loss (+ optional consistency / FK terms).
 
     The flow MSE is over ALL F future tokens (the conditioning is separate tokens, not
     part of the window). All auxiliary terms act on the predicted endpoint ``x1_hat``
     (denormalized). Velocity + joint-velocity consistency are ungated; the acceleration
-    and FK terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``). The
-    terrain term is **ungated by default**.
+    and FK terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``).
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
@@ -283,23 +217,18 @@ def flow_matching_loss(
         ori_slice: ``(start, end)`` of the root 6D orientation block, for the aux loss.
         aux_weight: Weight of the orientation orthonormality penalty (0 disables).
         state_norm: State :class:`Normalizer` (needed to denormalize); ``None`` disables
-            all consistency/FK/terrain terms.
+            all consistency/FK terms.
         dt: Control step period (seconds) for the finite differences.
         num_joints: ``nj``; num_extra_frames: ``K``.
         vel_weight / accel_weight / joint_vel_weight: consistency weights.
         fk: An :class:`~robot_rl.flow_matching.fk.FKChain` (or ``None``).
         fk_pose_weight / fk_vel_weight: FK consistency weights.
         tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
-        terrain / foot_idxs / contact_pts / terrain_weight: terrain-penetration pieces.
-        terrain_tau_gated: if True, restrict the terrain term to ``tau >= tau_min``.
-        terrain_sample_weight: weight on the *sampled-rollout* terrain penalty; 0 disables.
-        terrain_sample_size / terrain_sample_steps / terrain_sample_grad_steps: sub-batch
-            size, Euler steps, and truncated-backprop depth for that rollout.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
         ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` /
-        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel`` / ``terrain_penetration``.
+        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
     v = model(x_tau, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
@@ -308,9 +237,7 @@ def flow_matching_loss(
 
     do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
     do_fk = fk is not None and state_norm is not None and (fk_pose_weight > 0.0 or fk_vel_weight > 0.0)
-    do_terrain = (terrain is not None and state_norm is not None and terrain_weight > 0.0
-                  and foot_idxs and p_ref is not None and q_ref is not None)
-    if (aux_weight > 0.0 and ori_slice is not None) or do_frame or do_fk or do_terrain:
+    if (aux_weight > 0.0 and ori_slice is not None) or do_frame or do_fk:
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
         if aux_weight > 0.0 and ori_slice is not None:
@@ -318,10 +245,10 @@ def flow_matching_loss(
             aux = ori6d_orthonormality_penalty(ori)
             out["ori_aux"] = aux.detach()
             out["loss"] = out["loss"] + aux_weight * aux
-        if do_frame or do_fk or do_terrain:
+        if do_frame or do_fk:
             pred_phys = state_norm.denormalize(x1_hat)
             data_phys = state_norm.denormalize(x1)
-            gate = tau >= tau_min  # (B,) bool; gates the accel + FK + terrain terms
+            gate = tau >= tau_min  # (B,) bool; gates the accel + FK terms
         if do_frame:
             vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, dt, num_joints, num_extra_frames)
             jvel_ps = joint_vel_consistency_term(pred_phys, dt, num_joints)
@@ -344,33 +271,6 @@ def flow_matching_loss(
             out["fk_pose"] = fkp.detach()
             out["fk_vel"] = fkv.detach()
             out["loss"] = out["loss"] + fk_pose_weight * fkp + fk_vel_weight * fkv
-        if do_terrain:
-            pen_ps = terrain_penetration_term(
-                pred_phys, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain
-            )
-            pen = _masked_mean(pen_ps, gate) if terrain_tau_gated else pen_ps.mean()
-            out["terrain_penetration"] = pen.detach()
-            out["loss"] = out["loss"] + terrain_weight * pen
-
-    # Sampled-rollout terrain penalty: penalize the actual multi-step sample (the deployed
-    # output) instead of the teacher-forced x1_hat. Differentiable rollout with truncated
-    # backprop on a sub-batch.
-    do_terrain_sample = (terrain is not None and state_norm is not None and terrain_sample_weight > 0.0
-                         and foot_idxs and p_ref is not None and q_ref is not None)
-    if do_terrain_sample:
-        s = x1.shape[0] if terrain_sample_size <= 0 else min(terrain_sample_size, x1.shape[0])
-        cmd_s = None if cmd_tokens is None else cmd_tokens[:s]
-        nm_s = None if history_null_mask is None else history_null_mask[:s]
-        samp = sample_trajectory_grad(
-            model, history[:s], height[:s], cmd_s, x1.shape[1], x1.shape[2],
-            terrain_sample_steps, terrain_sample_grad_steps, history_null_mask=nm_s,
-        )
-        samp_phys = state_norm.denormalize(samp)
-        pen_s = terrain_penetration_term(
-            samp_phys, p_ref[:s], q_ref[:s], num_joints, foot_idxs, contact_pts, terrain,
-        ).mean()
-        out["terrain_penetration_sample"] = pen_s.detach()
-        out["loss"] = out["loss"] + terrain_sample_weight * pen_s
     return out
 
 

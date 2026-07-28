@@ -22,11 +22,9 @@ import torch
 
 from robot_rl.flow_matching import (
     FKChain,
-    FlatTerrain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
     Normalizer,
-    box_sole_points,
     build_train_val,
     fk_consistency_terms,
     flow_matching_loss,
@@ -49,7 +47,6 @@ from robot_rl.flow_matching import (
     so3_log,
     state_to_absolute,
     target_state_dim,
-    terrain_penetration_term,
     yaw_quat,
 )
 from robot_rl.flow_matching.online import (
@@ -448,68 +445,6 @@ def test_flow_loss_fk_terms_and_tau_gate():
     out_g = flow_matching_loss(model, x1, hist, height, None, tau_min=2.0, **ckw)
     assert out_g["accel_consistency"].item() == 0.0
     assert out_g["fk_pose"].item() == 0.0 and out_g["fk_vel"].item() == 0.0
-
-
-# ---------------------------------------------------------------------------
-# 9. Terrain-penetration loss (new signature: no known mask, yaw-anchor lift)
-# ---------------------------------------------------------------------------
-_IDENT_QUAT = torch.tensor([0.0, 0.0, 0.0, 1.0])
-_IDENT_ORI6D = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-
-
-def _foot_state(nj, k, nf, foot_pos, foot_R=None):
-    d = target_state_dim(nj, k)
-    x = torch.zeros(1, nf, d, dtype=torch.float64)
-    rb = frame_block_start(nj, 0)
-    x[..., rb + 6:rb + 12] = _IDENT_ORI6D.to(torch.float64)
-    eb = frame_block_start(nj, 1)
-    x[..., eb:eb + 3] = foot_pos.to(torch.float64)
-    x[..., eb + 6:eb + 12] = (_IDENT_ORI6D if foot_R is None else matrix_to_rot6d(foot_R)).to(torch.float64)
-    return x
-
-
-def test_box_sole_points():
-    pts = box_sole_points(grid=(3, 2))
-    assert pts.shape == (6, 3)
-    assert torch.allclose(pts[:, 2], torch.full((6,), -0.02517 - 0.009255), atol=1e-6)
-
-
-def test_flat_terrain_penetration():
-    d = FlatTerrain(0.0).penetration(torch.tensor([[0.0, 0.0, -0.05], [0.0, 0.0, 0.1]]))
-    assert torch.allclose(d, torch.tensor([0.05, 0.0]))
-
-
-def test_terrain_ankle_mode_identity_anchor():
-    nj, k, nf = 2, 1, 3
-    p_ref, q_ref, terrain = torch.zeros(1, 3, dtype=torch.float64), _IDENT_QUAT.to(torch.float64)[None], FlatTerrain(0.0)
-    x_lo = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, -0.05]))
-    assert abs(terrain_penetration_term(x_lo, p_ref, q_ref, nj, [0], None, terrain).item() - 0.05 ** 2) < 1e-9
-    x_hi = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.05]))
-    assert terrain_penetration_term(x_hi, p_ref, q_ref, nj, [0], None, terrain).item() < 1e-12
-
-
-def test_terrain_contact_mode_and_tilt():
-    nj, k, nf = 2, 1, 2
-    p_ref, q_ref, terrain = torch.zeros(1, 3, dtype=torch.float64), _IDENT_QUAT.to(torch.float64)[None], FlatTerrain(0.0)
-    cpts = box_sole_points(grid=(3, 2)).to(torch.float64)
-    sole_z = -0.02517 - 0.009255
-    x0 = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, -sole_z]))
-    assert terrain_penetration_term(x0, p_ref, q_ref, nj, [0], cpts, terrain).item() < 1e-12
-    th = torch.tensor(0.5, dtype=torch.float64)
-    R_pitch = torch.tensor([[torch.cos(th), 0, torch.sin(th)], [0.0, 1.0, 0.0], [-torch.sin(th), 0, torch.cos(th)]],
-                           dtype=torch.float64)
-    x_tilt = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.04]), foot_R=R_pitch)
-    assert terrain_penetration_term(x_tilt, p_ref, q_ref, nj, [0], None, terrain).item() < 1e-12  # ankle above
-    assert terrain_penetration_term(x_tilt, p_ref, q_ref, nj, [0], cpts, terrain).item() > 1e-4   # toe dips
-
-
-def test_terrain_anchor_height_shifts_world_z():
-    nj, k, nf = 2, 1, 2
-    q_ref, terrain = _IDENT_QUAT.to(torch.float64)[None], FlatTerrain(0.0)
-    x = _foot_state(nj, k, nf, torch.tensor([0.0, 0.0, 0.10]))  # foot 10 cm above the anchor
-    hi = terrain_penetration_term(x, torch.tensor([[0.0, 0.0, 0.2]], dtype=torch.float64), q_ref, nj, [0], None, terrain)
-    lo = terrain_penetration_term(x, torch.tensor([[0.0, 0.0, -0.2]], dtype=torch.float64), q_ref, nj, [0], None, terrain)
-    assert hi.item() < 1e-12 and lo.item() > 1e-4  # anchor z shifts the foot world z
 
 
 # ---------------------------------------------------------------------------
