@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import glob
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -28,6 +29,12 @@ sys.path.insert(0, os.path.join(ROOT, "transfer"))
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.hardware import build_hardware_state  # noqa: E402
+
+#: True only when this file is executed directly, which is the one context where
+#: ``"torch" not in sys.modules`` says anything about the DEPLOY path rather than about
+#: whatever else the interpreter has already imported.  See
+#: :func:`test_deploy_path_is_torch_free`.
+_STANDALONE = __name__ == "__main__"
 
 
 def _latest_export() -> str | None:
@@ -123,11 +130,38 @@ def test_hardware_offline() -> None:
         assert last.shape == (nj,)
         assert np.isfinite(obs).all() and np.isfinite(last).all()
 
-    assert "torch" not in sys.modules, "deploy path must be torch-free"
+    # Only meaningful in a fresh interpreter. Under pytest, sibling tests have imported
+    # torch long before this file runs, so sys.modules describes the session rather than
+    # the deploy path -- asserting here would fail for a reason that has nothing to do with
+    # deploy. test_deploy_path_is_torch_free re-runs this file standalone, where it holds.
+    if _STANDALONE:
+        assert "torch" not in sys.modules, "deploy path must be torch-free"
     print(f"obs {policy.get_num_obs()}  action {last.shape}  finite=True  "
           f"depth_cameras={len(depth_spec)}  height_scan={scan_dim}  "
           f"pred_valid={policy._pred_valid}")
     print("HARDWARE OFFLINE SMOKE PASSED (torch-free)")
+
+
+def test_deploy_path_is_torch_free() -> None:
+    """The deploy runtime must never import torch -- checked in a FRESH interpreter.
+
+    The invariant is real (``transfer/deploy`` is numpy + onnxruntime only, so it can run
+    on hardware without a torch install), but it is unobservable from inside the pytest
+    session: by the time this file is collected, sibling tests have already imported torch.
+    Re-running the module standalone isolates it, and its in-process assertion then applies.
+
+    Skips silently when nothing is exported -- the child prints ``[SKIP]`` and exits 0, same
+    as :func:`test_hardware_offline`.
+    """
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__)],
+                          capture_output=True, text=True, cwd=ROOT)
+    assert proc.returncode == 0, (
+        f"standalone run failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+    )
+    if "[SKIP]" not in proc.stdout:
+        assert "PASSED (torch-free)" in proc.stdout, (
+            f"standalone run did not reach the torch-free check:\n{proc.stdout}"
+        )
 
 
 def _clip_like_reference(policy, state, rng) -> dict:

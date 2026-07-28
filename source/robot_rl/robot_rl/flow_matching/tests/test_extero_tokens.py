@@ -25,6 +25,56 @@ from robot_rl.flow_matching.transforms import (
 )
 
 
+def _camera_spec(n_cameras: int, token_dim: int) -> list[dict]:
+    """A minimal depth-camera contract matching a ``(n_cameras, token_dim)`` depth array.
+
+    Field set and values mirror :func:`mdp.depth_camera_specs` (the real producer) closely
+    enough to satisfy both the dataset's validation and
+    ``deploy.depth_obs.parse_depth_spec``, so a spec built here would survive the real
+    export -> deploy path.
+
+    The GEOMETRY is a placeholder: ``token_dim x 1`` pixels with unit intrinsics, chosen
+    only so ``width * height == token_dim`` for any ``token_dim`` these tests pick.  They
+    exercise token plumbing (counts, widths, source selection, sanitising), not camera
+    reproduction -- nothing here asserts the numbers describe a real camera.
+
+    Args:
+        n_cameras: Number of cameras, one per depth token.
+        token_dim: Per-camera token width (pixels).
+
+    Returns:
+        One contract dict per camera, in token order.
+    """
+    return [
+        {
+            "obs_term": f"depth_cam{i}",
+            "sensor": f"cam{i}",
+            "mount_body": "torso_link",
+            "offset_pos": [0.0, 0.0, 0.0],
+            "offset_quat_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "width": token_dim,
+            "height": 1,
+            "fx": 1.0,
+            "fy": 1.0,
+            "cx": token_dim / 2.0,
+            "cy": 0.5,
+            "max_distance": 9.0,
+            "update_period": 0.0,
+            "data_type": "distance_to_image_plane",
+            "depth_clipping_behavior": "max",
+            "clip": None,
+            # normalize_depth's defaults, as _normalization_params would resolve them.
+            "offset": 0.75,
+            "scale": 0.5,
+            "min_dist": 0.2,
+            "max_dist": 9.0,
+            "min_clip_val": 0.0,
+            "max_clip_val": 0.0,
+        }
+        for i in range(n_cameras)
+    ]
+
+
 def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=None, seed=0):
     """Synthetic recording with a height scan and optionally a depth array.
 
@@ -67,7 +117,12 @@ def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=Non
         stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
         std += [3, 4, 3, 3]
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
-                           state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F)
+                           state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F,
+                           # Present only alongside a depth array, exactly as the recorder
+                           # behaves -- so the depth=None case still fails on the MISSING
+                           # ARRAY (what test_missing_array_names_the_task_to_record_with
+                           # pins) rather than on the missing contract.
+                           depth_camera_spec=_camera_spec(depth[0], depth[1]) if depth else None)
     return data, meta, nj, K, F, node
 
 
