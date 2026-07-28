@@ -38,8 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from generate_distractor_clips import _box_pool, _make_tile        # noqa: E402
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library   # noqa: E402
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder        # noqa: E402
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool  # noqa: E402
+from motion_gen.clip_output import ClipOutputBuilder        # noqa: E402
+from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_raw_motion, raw_to_world           # noqa: E402
 from motion_gen.motionbricks.distractor_plan import profile_segs, request_key  # noqa: E402
 from motion_gen.multiskill_manager import MultiSkillManager                 # noqa: E402

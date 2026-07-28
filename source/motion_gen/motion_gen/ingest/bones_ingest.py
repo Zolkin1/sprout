@@ -27,7 +27,7 @@ import h5py
 import numpy as np
 import torch
 
-from . import features as F
+from .. import features as F
 from . import ingest_common as IC
 from .motion_db import BONES, MotionSource
 

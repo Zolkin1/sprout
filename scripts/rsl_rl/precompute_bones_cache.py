@@ -38,9 +38,9 @@ import h5py
 import numpy as np
 import torch
 
-from motion_gen.motion_matching import features as F
-from motion_gen.motion_matching import ingest_common as IC
-from motion_gen.motion_matching.bones_ingest import clip_to_state, filter_rows, load_metadata
+from motion_gen import features as F
+from motion_gen.ingest import ingest_common as IC
+from motion_gen.ingest.bones_ingest import clip_to_state, filter_rows, load_metadata
 
 _STATE = ["joint_pos", "root_pos", "root_quat", "root_lin_vel", "root_ang_vel"]
 _META_COLS = {

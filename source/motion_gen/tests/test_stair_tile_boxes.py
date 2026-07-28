@@ -10,7 +10,7 @@ the downstream pipeline distinguishes them).
 
 from __future__ import annotations
 
-from motion_gen.motion_matching.box_clip import stair_tile_boxes
+from motion_gen.terrain.box_clip import stair_tile_boxes
 
 
 def _steps_and_platforms(boxes):

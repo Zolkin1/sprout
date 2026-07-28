@@ -31,8 +31,8 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,

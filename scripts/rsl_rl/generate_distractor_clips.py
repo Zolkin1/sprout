@@ -1,9 +1,13 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
-only -- superseded by mb_distractor_clips.py, which still imports _box_pool / _make_tile from here.  Not on the live pipeline; see
-``source/motion_gen/motion_gen/motion_matching/README.md``.
+"""PARTLY DEPRECATED -- read before deleting.
+
+The CLI here (DP-matched distractor clips) is deprecated: the live pipeline generates this
+family with ``mb_distractor_clips.py``.  But ``_box_pool`` and ``_make_tile`` are NOT
+deprecated -- ``mb_distractor_clips.py`` imports both from this module as a sibling, so the
+tile geometry / footprint / manifest is byte-identical between the two motion sources.  Keep
+this file (or move those two functions into ``motion_gen``) as long as that import exists.
 
 Generate DISTRACTOR box clips: a box the robot sees but does NOT jump on.
 
@@ -46,10 +50,10 @@ import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, se2z_align
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.distractor import occupancy_grid
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.terrain.box_clip import _quat_yaw_wxyz, se2z_align
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.terrain.distractor import occupancy_grid
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,

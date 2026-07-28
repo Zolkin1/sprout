@@ -17,8 +17,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from motion_gen.motion_matching.box_clip import box_tile_box, box_tile_boxes
-from motion_gen.motion_matching.terrain_sampler import BoxTileSpec, sample_box_tiles
+from motion_gen.terrain.box_clip import box_tile_box, box_tile_boxes
+from motion_gen.terrain.terrain_sampler import BoxTileSpec, sample_box_tiles
 
 
 def test_ids_contiguous_and_count():
@@ -182,14 +182,14 @@ def test_episodic_box_extents_swap_when_the_source_walks_along_y():
     Authoring the tile from the raw solved ``size`` would lay the box out 90 degrees to the motion: the
     robot would cross the lateral width and have the depth to either side of it.
     """
-    from motion_gen.motion_matching.terrain_place import episodic_box_extents
+    from motion_gen.terrain.terrain_place import episodic_box_extents
     src = _FakeSource(-90.0, (0.80, 0.45, 0.47))
     assert episodic_box_extents(src, align="box") == pytest.approx([0.80, 0.45, 0.47])
     assert episodic_box_extents(src, align="facing") == pytest.approx([0.45, 0.80, 0.47])
 
 
 def test_episodic_box_extents_are_the_aabb_of_the_rotated_footprint():
-    from motion_gen.motion_matching.terrain_place import episodic_box_extents
+    from motion_gen.terrain.terrain_place import episodic_box_extents
     # Facing +x already: nothing to rotate, so the travel frame IS the source frame.
     assert episodic_box_extents(_FakeSource(0.0, (0.80, 0.45, 0.47)), align="facing") \
         == pytest.approx([0.80, 0.45, 0.47])

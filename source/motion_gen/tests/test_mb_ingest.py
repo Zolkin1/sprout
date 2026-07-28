@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from motion_gen.motion_matching.features import G1_JOINT_NAMES
+from motion_gen.features import G1_JOINT_NAMES
 from motion_gen.motionbricks.mb_ingest import (
     fit_to_length,
     raw_to_world,

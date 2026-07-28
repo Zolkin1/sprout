@@ -52,6 +52,18 @@ if not _registered:
     # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips are full
     # episodic motions with no gait-phase obs, so the Episodic runner is the correct
     # choice (phase negation would be a no-op here).
+    #
+    # !! CURRENTLY BROKEN -- these two raise at the first PPO update:
+    #      ValueError: Symmetry augmentation has no handler for obs term 'base_vel_ref'
+    #    The teacher's reference observations (base_vel_ref, ee_ref, future_base_pose,
+    #    future_base_vel, ...) were added without registering reflection rules in
+    #    motion_gen.sagittal_reflector.SagittalReflectionConfig, and the augmentation
+    #    deliberately refuses to run rather than silently identity-copying the mirrored half
+    #    of the batch (which would poison training). Pre-dates the repo slim-down: the same
+    #    error reproduces on the old G1-teacher-clf-sym at 681a624.
+    #    To revive: add each unhandled term to SagittalReflectionConfig with the correct
+    #    reflection (e.g. base_vel_ref negates vy + wz; ee_ref must swap the left/right
+    #    frames AND negate y), extend tests/test_sagittal_reflector.py, then smoke-train.
     gym.register(
         id="G1-teacher-clf-terrain-sym",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",

@@ -32,7 +32,7 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.box_clip import (
+from motion_gen.terrain.box_clip import (
     align_and_concat,
     box_tile_box,
     build_anchor_mask_t,
@@ -45,18 +45,18 @@ from motion_gen.motion_matching.box_clip import (
     yaw_normalize,
 )
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
     clean_library_fingerprint,
 )
-from motion_gen.motion_matching.playback import inertialize_seam
-from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
-from motion_gen.motion_matching.terrain_place import place_episodic_on_tile, place_periodic_on_tile
-from motion_gen.motion_matching.terrain_sampler import sample_box_tiles, sample_stair_tiles
-from motion_gen.motion_matching.terrain_variants import resolve_box_variant
+from motion_gen.playback import inertialize_seam
+from motion_gen.ingest.terrain_ingest import ingest_terrain_library
+from motion_gen.terrain.terrain_place import place_episodic_on_tile, place_periodic_on_tile
+from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles
+from motion_gen.terrain.terrain_variants import resolve_box_variant
 from motion_gen.multiskill_manager import MultiSkillManager
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
@@ -422,7 +422,7 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev, target_vx=0.0):
     Loops the source descent stride down a FIXED, sampled staircase ``tile`` (its own dims / #steps /
     width) and emits the tile's fixed geometry + the tile's shared ``terrain_id``.  Matcher-free (no
     approach): the long looped-descent clip for a pure-stair terrain tile.  Descent placement is the
-    SHARED :func:`~motion_gen.motion_matching.terrain_place.place_periodic_on_tile` (same code the
+    SHARED :func:`~motion_gen.terrain.terrain_place.place_periodic_on_tile` (same code the
     transition path uses).
 
     ``target_vx`` is the COMMANDED forward speed (m/s) written to the RL-visible ``target_vel`` -- the
@@ -528,7 +528,7 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     """TRANSITION stair TILE clip -> records dict (phase B, full path).
 
     approach (DP, ``approach_s`` long, ramps DOWN to the descent entry speed) on the top platform ->
-    descent (played, SHARED :func:`~motion_gen.motion_matching.terrain_place.place_periodic_on_tile`) ->
+    descent (played, SHARED :func:`~motion_gen.terrain.terrain_place.place_periodic_on_tile`) ->
     recovery (DP, ``recovery_s`` long, ramps
     UP from the descent exit speed back to ``approach_vx``) on the bottom platform, on a FIXED transition
     tile (flat -> single staircase -> flat).  Many approach speeds share the tile's geometry +
@@ -755,7 +755,7 @@ def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
 
     Many approach speeds SHARE the tile's FIXED box + ``terrain_id`` + manifest (the box-family analog of
     :func:`_make_transition_tile_clip`): DP(approach on flat, ``approach_s`` long) + PLAY(jump onto the fixed
-    box via :func:`~motion_gen.motion_matching.terrain_place.place_episodic_on_tile`) + hold-on-box
+    box via :func:`~motion_gen.terrain.terrain_place.place_episodic_on_tile`) + hold-on-box
     recovery, eased-spliced (jump-anchored `_splice_around`)
     and recentered by the tile's FIXED ``corner`` so every clip on the tile emits identical geometry.  The
     RL-visible ``target_vel`` is held FORWARD through approach+jump then 0 on the box (arrived).
@@ -801,7 +801,7 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
 
     The exit-side mirror of :func:`_make_box_tile_clip`: the robot SPAWNS on the box (the played source
     starts elevated), PLAYS the dismount off the fixed tile box
-    (:func:`~motion_gen.motion_matching.terrain_place.place_episodic_on_tile` anchors the
+    (:func:`~motion_gen.terrain.terrain_place.place_episodic_on_tile` anchors the
     source box -> the dismount lands at tile ground z=0), then a **DP-matched walk-away RECOVERY** on the
     flat (``generate_exit`` seeded from the dismount's exit window -- the exit analog of jump_on's DP
     approach), eased-spliced onto the landing.  No approach (spawn on box), so needs the matcher only for

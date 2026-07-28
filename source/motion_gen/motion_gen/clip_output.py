@@ -14,10 +14,10 @@ from __future__ import annotations
 
 import torch
 
-from ..fk import FKChain
-from ..math_utils import matrix_to_quat, quat_apply, quat_mul
+from .fk import FKChain
+from .math_utils import matrix_to_quat, quat_apply, quat_mul
 from . import features as F
-from . import ingest_common as IC
+from .ingest import ingest_common as IC
 
 _FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 

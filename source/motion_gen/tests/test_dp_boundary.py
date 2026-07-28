@@ -16,7 +16,7 @@ import os
 import numpy as np
 import pytest
 
-from motion_gen.motion_matching import features as F
+from motion_gen import features as F
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
 from motion_gen.motion_matching.graph import GraphConfig, build_candidate_graph
 from motion_gen.motion_matching.trajopt_ingest import ingest_trajopt

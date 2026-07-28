@@ -14,7 +14,7 @@ No skills, no handoff, no traj-opt -- one continuous loop:
    re-anchored (SE(2)+z) at each jump so the root stays continuous.
 
 Drive it with a scripted ``(vx, vy, omega)`` command to synthesize a toy clip.  Output is
-built by :class:`~motion_gen.motion_matching.clip_output.ClipOutputBuilder`.
+built by :class:`~motion_gen.clip_output.ClipOutputBuilder`.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ import torch
 
 from ..fk import FKChain
 from ..math_utils import quat_mul
-from . import features as F
-from . import ingest_common as IC
+from .. import features as F
+from ..ingest import ingest_common as IC
 from .graph import STEADY, VARIED
-from .playback import play_frame_path
+from ..playback import play_frame_path
 
 _FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _HAND = ["left_palm_link", "right_palm_link"]
@@ -413,7 +413,7 @@ class VanillaMatcher:
 
         Selection reads only DB-frame state (``feat_raw``/``_norm``/the KD-tree) + the
         dwell/inertia bookkeeping -- never the inertialized playback output -- so it is a
-        clean input to :func:`~motion_gen.motion_matching.playback.play_frame_path`.
+        clean input to :func:`~motion_gen.playback.play_frame_path`.
         """
         cfg = self.cfg
         stride = max(1, int(round(cfg.search_interval_s / cfg.dt)))

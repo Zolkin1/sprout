@@ -15,7 +15,7 @@ import os
 import pytest
 import torch
 
-from motion_gen.motion_matching import features as F
+from motion_gen import features as F
 from motion_gen.motion_matching.slope_rotate import (
     rotate_clip_to_slope,
     slope_pitch_for_climb,
@@ -138,7 +138,7 @@ _FIX = os.path.join(os.path.dirname(__file__), "..", "..", "robot_rl", "tests",
                     reason="G1 MJCF or library fixture not found")
 def test_upright_slope_keeps_pelvis_vertical_and_climbs(tmp_path):
     """Upright mode preserves the pelvis orientation, climbs, and flexes the hips."""
-    from motion_gen.motion_matching.clip_output import ClipOutputBuilder
+    from motion_gen.clip_output import ClipOutputBuilder
     from motion_gen.multiskill_manager import MultiSkillManager
     os.environ["ROBOT_RL_TRAJ_CACHE_DIR"] = str(tmp_path / "cache")
     m = MultiSkillManager(_FIX, "cpu", env=None)

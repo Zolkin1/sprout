@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import trimesh
 
-from motion_gen.motion_matching.stair_geom import stair_tread_layout
+from motion_gen.terrain.stair_geom import stair_tread_layout
 from robot_rl.tasks.manager_based.robot_rl.terrains.trimesh.stair_decor_cfg import (
     StairDecorCfg,
     StairSideDecorCfg,

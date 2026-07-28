@@ -35,8 +35,8 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motionbricks import fit_to_length, load_raw_motion, raw_to_world, resample_rows
 from motion_gen.multiskill_manager import MultiSkillManager
 from motion_gen.world_lift import anchor_mask_from_free

@@ -253,7 +253,7 @@ def box_tile_boxes(*, box_size, approach_len: float, platform_len: float = 0.0,
     the mount is no easier than it was.
 
     Returns ``[jump_box, top_platform]`` -- the jump box is ALWAYS index 0, because
-    :func:`~motion_gen.motion_matching.terrain_place.place_episodic_on_tile` anchors the played
+    :func:`~motion_gen.terrain.terrain_place.place_episodic_on_tile` anchors the played
     interaction onto ``boxes[0]``.  With ``platform_len <= 0`` only the jump box is returned, which is
     :func:`box_tile_box`'s geometry.
 

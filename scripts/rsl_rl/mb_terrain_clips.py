@@ -10,7 +10,7 @@ in two passes because the middle segment must be planned before Motion Bricks (a
 generate the two ends:
 
 **Pass 1 --** ``--dump-plan plan.npz``: select the reference nearest the requested geometry + speed, author
-the tile, place the replay on it (:mod:`motion_gen.motion_matching.terrain_place`), FILTER the entry / exit
+the tile, place the replay on it (:mod:`motion_gen.terrain.terrain_place`), FILTER the entry / exit
 frames, and write the :class:`~motion_gen.motionbricks.terrain_plan.TerrainPlan`.
 
 **Pass 2 --** ``--plan plan.npz --approach-raw ... --exit-raw ...``: splice the Motion Bricks segments onto
@@ -45,16 +45,16 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
-from motion_gen.motion_matching.terrain_place import (
+from motion_gen.terrain.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.ingest.terrain_ingest import ingest_terrain_library
+from motion_gen.terrain.terrain_place import (
     episodic_box_extents,
     place_episodic_on_tile,
     place_periodic_on_tile,
     select_terrain_reference,
 )
-from motion_gen.motion_matching.terrain_sampler import TerrainSpec
+from motion_gen.terrain.terrain_sampler import TerrainSpec
 from motion_gen.motionbricks import (
     TerrainPlan,
     boundary_candidates,
@@ -125,7 +125,7 @@ def _author_tile(family, ts, args):
     was solved for.  A box tile mirrors that shape: the walkable box at the source's solved extents (a
     center-align placement is only valid while depth + height match the source) PLUS a top platform flush
     with it, on the side away from the jump face, so the elevated end of the clip can walk instead of
-    standing still (:func:`~motion_gen.motion_matching.box_clip.box_tile_boxes`).  Only the platform is new
+    standing still (:func:`~motion_gen.terrain.box_clip.box_tile_boxes`).  Only the platform is new
     geometry -- the takeoff / landing footprint is untouched.
 
     ``lower_z`` / ``upper_z`` are the two walkable levels the family's approach / exit run on: bottom and

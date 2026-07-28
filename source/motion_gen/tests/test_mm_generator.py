@@ -14,9 +14,9 @@ import os
 import pytest
 import torch
 
-from motion_gen.motion_matching import features as F
+from motion_gen import features as F
 from motion_gen.motion_matching.mm_clip_generator import MotionMatchClipGenerator
-from motion_gen.motion_matching.motion_db import MotionDB
+from motion_gen.ingest.motion_db import MotionDB
 from motion_gen.motion_matching.trajopt_ingest import ingest_trajopt
 
 _FIX = os.path.join(os.path.dirname(__file__), "..", "..", "robot_rl", "tests",

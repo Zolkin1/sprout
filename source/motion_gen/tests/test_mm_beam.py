@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
-from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
+from motion_gen.features import G1_JOINT_NAMES as _G1_JN
 from motion_gen.motion_matching.graph import (
     VARIED,
     CandidateGraph,

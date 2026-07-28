@@ -44,12 +44,12 @@ from scipy.spatial import cKDTree  # noqa: E402
 from motion_gen.clips.clip_io import ClipLibraryWriter                     # noqa: E402
 from motion_gen.world_lift import _ANCHOR_MASK_FLAT                        # noqa: E402
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher        # noqa: E402
-from motion_gen.motion_matching.bones_ingest import load_cache            # noqa: E402
+from motion_gen.ingest.bones_ingest import load_cache            # noqa: E402
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher             # noqa: E402
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder      # noqa: E402
+from motion_gen.clip_output import ClipOutputBuilder      # noqa: E402
 from motion_gen.motion_matching.graph import (                            # noqa: E402
     STEADY, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_key, graph_cache_path)
-from motion_gen.motion_matching.playback import play_frame_path           # noqa: E402
+from motion_gen.playback import play_frame_path           # noqa: E402
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig  # noqa: E402
 from motion_gen.multiskill_manager import MultiSkillManager               # noqa: E402
 
@@ -220,7 +220,7 @@ def main() -> int:
     sources, _ = load_cache(args.bones_cache, filters=_FILTERS, exclude_name_substrings=_EXCLUDE, device=dev)
     clean_paths = None
     if args.include_clean:
-        from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+        from motion_gen.ingest.clean_ingest import ingest_clean_library
         clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt, device=dev)
         print(f"[exp] + {len(clean)} clean STEADY clips")
         sources = sources + clean

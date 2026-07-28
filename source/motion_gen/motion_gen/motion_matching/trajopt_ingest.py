@@ -19,9 +19,9 @@ import torch
 
 from ..multiskill_manager import _TRAJ_TYPE_TO_INT
 from ..trajectory_manager import TrajectoryType
-from . import features as F
-from . import ingest_common as IC
-from .motion_db import TRAJOPT, MotionSource
+from .. import features as F
+from ..ingest import ingest_common as IC
+from ..ingest.motion_db import TRAJOPT, MotionSource
 
 _EPISODIC_INT = _TRAJ_TYPE_TO_INT[TrajectoryType.EPISODIC]
 

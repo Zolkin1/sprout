@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from motion_gen.motion_matching.terrain_variants import normalize_box_variant_fracs, resolve_stair_decor
+from motion_gen.terrain.terrain_variants import normalize_box_variant_fracs, resolve_stair_decor
 
 
 @dataclass

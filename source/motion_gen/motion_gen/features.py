@@ -28,33 +28,30 @@ ingest code converts to wxyz before calling in.
 from __future__ import annotations
 
 import os
+import pathlib
 from dataclasses import dataclass, field
 
 import torch
 
-from ..fk import FKChain
-from ..math_utils import quat_apply, quat_inv, yaw_quat
+from .fk import FKChain
+from .math_utils import quat_apply, quat_inv, yaw_quat
 
-# Canonical G1 29-joint order (matches the MJCF joint names + the FM/clip joint set).  This is the
-# FULL Unitree G1 body-DOF order -- identical to ``bones_ingest.CSV_JOINT_NAMES`` so the seed-CSV /
-# clean / terrain ingests map straight through (their 29->this reindex is the identity).  Was the
-# 21-DOF subset (waist_yaw + shoulders/elbow only); widened to unlock waist roll/pitch + the 6 wrists.
-G1_JOINT_NAMES: list[str] = (
-    [f"{s}_{j}_joint" for s in ("left", "right")
-     for j in ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")]
-    + ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
-    + [f"{s}_{j}_joint" for s in ("left", "right")
-       for j in ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
-                 "wrist_roll", "wrist_pitch", "wrist_yaw")]
-)
+# The canonical joint order lives in its own module so the motionbricks ingest can read it
+# without importing this (torch + FK) module.
+from .joint_names import G1_JOINT_NAMES  # noqa: F401  (re-exported for callers)
 
 FOOT_FRAMES: list[str] = ["left_ankle_roll_link", "right_ankle_roll_link"]
 HAND_FRAMES: list[str] = ["left_palm_link", "right_palm_link"]
 
 # Default location of the FK MJCF within the repo (transfer/ ships the isaaclab-free model).
-DEFAULT_MJCF = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..",
-    "transfer", "sim", "robots", "g1", "g1_29j.xml",   # 29-DOF FK model (waist roll/pitch + wrists)
+# Anchored on the repo root derived from THIS package's location rather than a hard-coded
+# number of ``..`` hops, so moving this module between packages cannot silently break the
+# path (which is exactly what happened when it moved up out of ``motion_matching/``).
+# <repo>/source/motion_gen/motion_gen/features.py -> parents[3] == <repo>.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+DEFAULT_MJCF = str(
+    # 29-DOF FK model (waist roll/pitch + wrists)
+    _REPO_ROOT / "transfer" / "sim" / "robots" / "g1" / "g1_29j.xml"
 )
 
 

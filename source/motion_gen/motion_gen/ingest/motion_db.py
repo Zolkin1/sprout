@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from . import features as F
+from .. import features as F
 
 # source_kind codes
 BONES = 0

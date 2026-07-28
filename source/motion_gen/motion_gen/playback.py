@@ -22,7 +22,7 @@ import math
 
 import torch
 
-from ..math_utils import quat_inv, quat_mul
+from .math_utils import quat_inv, quat_mul
 
 
 def smoothstep(x: float) -> float:

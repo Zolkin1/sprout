@@ -13,7 +13,7 @@ around it, and there are two ways to do that -- the comparison this module exist
   ``*_surface_err``.
 * ``"ease"`` (the soft pin) -- **ground** the MB segment to its walkable surface (feet keep sitting on the
   platform / ground, exactly as z=0 does for a flat clip) and let
-  :func:`~motion_gen.motion_matching.playback.inertialize_seam` decay the seam discontinuity over a blend
+  :func:`~motion_gen.playback.inertialize_seam` decay the seam discontinuity over a blend
   window, the same inertialization the motion matcher applies at a cut.
 
 Both keep the terrain segment pristine and yaw+xy align the MB segment onto its boundary frame, so the only
@@ -28,8 +28,8 @@ from __future__ import annotations
 import torch
 
 from ..math_utils import quat_apply, quat_mul
-from ..motion_matching.box_clip import se2z_align  # noqa: F401  (also re-exported for keyframe transforms)
-from ..motion_matching.playback import inertialize_seam
+from ..terrain.box_clip import se2z_align  # noqa: F401  (also re-exported for keyframe transforms)
+from ..playback import inertialize_seam
 
 Segment = tuple[torch.Tensor, torch.Tensor, torch.Tensor]   # (root_pos[T,3], root_quat[T,4], joints[T,29])
 
