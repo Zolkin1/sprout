@@ -17,28 +17,25 @@ differ (the per-skill manifest shows where).
 This is the manual counterpart to the automatic check baked into training /
 play: new runs record the fingerprint in ``params/env.yaml`` and ``play.py``
 warns on a mismatch.  This script exists for older runs whose ``env.yaml``
-predates that feature.  It imports only the dependency-free fingerprint module,
-so it runs under a bare ``python3`` (no IsaacLab environment needed).
+predates that feature.  It imports only the dependency-free fingerprint module, so it runs
+under a bare ``python3`` (no IsaacLab environment needed) as long as ``source/motion_gen``
+is importable -- e.g. ``PYTHONPATH=source/motion_gen python3 scripts/rsl_rl/...``.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import os
 import sys
 from pathlib import Path
 
-# Load the canonical (stdlib-only) fingerprint module directly by file path so
-# this script does not drag in torch / IsaacLab via the package import chain.
-_FP_MODULE_PATH = (
-    Path(__file__).resolve().parent.parent.parent
-    / "source/robot_rl/robot_rl/tasks/manager_based/robot_rl"
-    / "mdp/commands/traj_tracking/library_fingerprint.py"
-)
-_spec = importlib.util.spec_from_file_location("traj_library_fingerprint_impl", _FP_MODULE_PATH)
-_fp = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_fp)
+# The canonical (stdlib-only) fingerprint module. It used to be loaded by file path, from
+# a location under robot_rl/.../traj_tracking/, to avoid dragging torch / IsaacLab in via
+# the package import chain. It moved to the IsaacLab-free ``motion_gen`` package in 6b3aae3
+# and that hard-coded path was never updated, so this script had been dying on
+# FileNotFoundError ever since. ``motion_gen`` imports no IsaacLab, so a plain import both
+# fixes it and cannot silently rot the same way.
+from motion_gen import library_fingerprint as _fp  # noqa: E402
 
 
 def _resolve(path: str) -> Path:

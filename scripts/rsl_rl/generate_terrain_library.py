@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Top-level driver: generate every terrain-clip FAMILY, then compose ONE RL training library.
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- the live top-level driver is generate_mb_library.py.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Top-level driver: generate every terrain-clip FAMILY, then compose ONE RL training library.
 
 Each family has its own generator (they build their own motion-matching DB and emit an ``.h5`` with
 an embedded terrain manifest); this driver runs them in sequence as subprocesses, then merges the

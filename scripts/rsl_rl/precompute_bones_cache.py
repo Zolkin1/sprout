@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Precompute the bones-seed motion-matching feature cache (once).
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- the bones feature cache only the deprecated matchers consume.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Precompute the bones-seed motion-matching feature cache (once).
 
 Filters a broad scope of the bones-seed dataset (default: all ``Locomotion``, any
 style), and for every clip parses -> resamples to ``dt`` (50 Hz) -> finite-difference

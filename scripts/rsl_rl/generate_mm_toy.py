@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Motion-matching toy clip (bones-seed only; no skills / traj-opt / handoff).
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- a matcher research one-off.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Motion-matching toy clip (bones-seed only; no skills / traj-opt / handoff).
 
 Drives a scripted ``(vx, vy, omega)`` command through motion matching over the bones-seed
 database and writes a standard ``.h5`` clip.  Runs with NO IsaacLab.  Two algorithms,

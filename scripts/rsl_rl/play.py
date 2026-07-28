@@ -43,7 +43,7 @@ from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 # The FM exporter lives in scripts/flow_matching; put it on the path like
-# export_deploy_onnx.py does so play.py can write both deploy artifacts itself.
+# the FM script dir on the path so play.py can write both deploy artifacts itself.
 _FM_SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               os.pardir, "flow_matching"))
 if _FM_SCRIPT_DIR not in sys.path:
@@ -546,7 +546,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
             except Exception as exc:                                        # noqa: BLE001
                 print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
-                      f"Re-run scripts/rsl_rl/export_deploy_onnx.py by hand if needed.")
+                      f"Re-run export_tracker_onnx.py / export_fm_onnx.py by hand if needed.")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""

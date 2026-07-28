@@ -3,7 +3,7 @@
 
 """Stage 2 driver: ingest Motion Bricks raw motions into a flat clip library (drop-in beside the DP).
 
-Reads the raw ``.npz`` files written by ``scripts/rsl_rl/mb_encode.py`` / ``mb_generate.py`` (Stage 1,
+Reads the raw ``.npz`` files written by ``scripts/rsl_rl/mb_encode.py`` (Stage 1,
 Motion Bricks env), resamples each to the RL control dt + reindexes joints
 (``motion_gen.motionbricks.mb_ingest``), and writes them through the SAME ``MultiSkillManager``
 output-name layout + ``ClipOutputBuilder`` + ``ClipLibraryWriter`` that ``generate_mm_clips.py`` uses --
@@ -51,7 +51,7 @@ def _convert(raw, dt: float, T: int, builder, rl_vels: str, dev):
     """One raw motion -> the per-clip arrays the writer wants, plus the snap error for reporting.
 
     Returns ``(y, dy, contact, target_vel, clip_len, snap_err[T,3], pelvis_z_mean)``. ``target_vel`` is the
-    channel selected by ``rl_vels``; a raw motion with no snapped channel (e.g. ``mb_generate.py`` output,
+    channel selected by ``rl_vels``; a raw motion with no snapped channel (e.g. a free-run capture,
     which never snapped) reports zero error and uses its single command for both.
     """
     Wp, Wq, Wj, tvel_raw = raw_to_world(raw, dt, device=dev)

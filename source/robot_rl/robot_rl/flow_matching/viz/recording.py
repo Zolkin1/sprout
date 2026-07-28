@@ -3,7 +3,7 @@
 """Serialization for flow-matching visualization recordings.
 
 This module only depends on ``numpy`` and the standard library so the viser
-viewer (``scripts/flow_matching/visualize.py``) can load recordings without
+viewer (``scripts/rsl_rl/view_debug_episodes.py``) can load recordings without
 pulling in Isaac Sim.
 
 A recording is a single compressed ``.npz`` file holding, for ``T`` recorded

@@ -765,7 +765,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     out_dir = args_cli.output_dir or os.path.join(log_dir, "recorded_data")
 
     with launch_simulation(env_cfg, args_cli):
-        # Recursive contact sensor patch (matches play.py / analyze_distillation.py).
+        # Recursive contact sensor patch (matches play.py / train.py).
         import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401
 
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs

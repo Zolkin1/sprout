@@ -464,8 +464,7 @@ class DataLogger:
             data["_timeout_mask"] = _build_timeout_mask(dones, time_outs)
 
         # Note: per-trajectory CLF/tracking + termination summaries now live in
-        # the dedicated headless eval (scripts/rsl_rl/eval_per_trajectory.py /
-        # per_traj_stats.py), which has far better trajectory coverage than an
+        # a dedicated headless eval, which would have far better clip coverage than an
         # interactive play rollout. This logger only collects the per-step
         # ``traj_idx``/``v`` series used by the play plots.
 

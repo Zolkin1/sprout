@@ -3,7 +3,7 @@
 
 """Stage-1 harness: the Motion Bricks agent plus the pinning hooks every MB driver installs.
 
-Everything the Motion-Bricks-side drivers (``mb_generate.py`` free-run, ``mb_encode.py`` flat, and
+Everything the Motion-Bricks-side drivers (``mb_encode.py`` flat and
 ``mb_terrain_segments.py`` terrain approach/exit) share lives here, so a driver is only its schedule:
 
 * :func:`build_demo_args` / :class:`MBAgent` -- construct the live ``full_navigation_agent`` and install

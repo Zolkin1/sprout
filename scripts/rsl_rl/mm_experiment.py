@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Batch motion-matching experiment for investigating solutions.
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- a matcher research one-off (vanilla vs beam vs DP).  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Batch motion-matching experiment for investigating solutions.
 
 Runs BOTH matchers (``vanilla`` greedy + ``beam`` offline global, sharing the cached v2
 candidate graph) on several velocity-command schedules -- a simple forward proof-of-concept

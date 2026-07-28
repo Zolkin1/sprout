@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Generate DISTRACTOR box clips: a box the robot sees but does NOT jump on.
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- superseded by mb_distractor_clips.py, which still imports _box_pool / _make_tile from here.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Generate DISTRACTOR box clips: a box the robot sees but does NOT jump on.
 
 Coherence-first design (each clip's box is placed so the motion's relationship to it is valid --
 never "walk into a box"): generate SHORT flat motions by TYPE, then fit a box/wall per type so the
