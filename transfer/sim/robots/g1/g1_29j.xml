@@ -88,8 +88,8 @@ Position and velocity actuators added. -->
 
     <!-- Waist Roll / Pitch (unlocked for the 29-DOF policy). Mirrors waist_yaw's class, which
          is what the Isaac side does too: waist_roll/pitch use waist_yaw's 7520_14 gain class
-         (see g1_21j.py "waist_rp"). NOTE the MJCF gain scale differs from Isaac throughout --
-         waist_yaw is kp=100 here vs stiffness 40.18 in the asset -- so these follow the MJCF's
+         (see g1_21j.py "waist_rp"). NOTE the MJCF gain scale differs from Isaac throughout
+         (waist_yaw is kp=100 here vs stiffness 40.18 in the asset), so these follow the MJCF's
          own convention, not the asset's. Revisit if sim2sim tracking looks stiff/soft. -->
     <default class="waist_roll_pos">
        <position kp="40.18" kv="2.56" ctrllimited="false"/>
@@ -561,7 +561,7 @@ Position and velocity actuators added. -->
 
     <!-- Waist -->
     <position name="waist_yaw_joint_pos" class="waist_yaw_pos" joint="waist_yaw_joint"/>
-    <!-- Waist roll/pitch: unlocked for the 29-DOF policy. ORDER MATTERS -- transfer/sim/robot.py
+    <!-- Waist roll/pitch: unlocked for the 29-DOF policy. ORDER MATTERS: transfer/sim/robot.py
          writes ``mj_data.ctrl[:len(action)] = action`` positionally against targets already
          permuted into MuJoCo JOINT order, so actuator k must drive hinge joint k. These two sit
          between waist_yaw (12) and left_shoulder_pitch (15). -->
