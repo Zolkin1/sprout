@@ -57,6 +57,9 @@ from motion_gen.world_lift import (
     ego_placement_masked as _ego_placement_masked_xyzw,
 )
 from motion_gen.world_lift import (
+    ego_placement_masked_window as _ego_placement_masked_window_xyzw,
+)
+from motion_gen.world_lift import (
     lift_base_world_state as _lift_base_world_state_wxyz,
 )
 from motion_gen.world_lift import (
@@ -82,6 +85,7 @@ __all__ = [
     "anchor_inv_yaw",
     "ego_placement",
     "ego_placement_masked",
+    "ego_placement_masked_window",
     "lift_base_world_state",
     "lift_orientation",
     "lift_orientation_batched",
@@ -123,6 +127,14 @@ def ego_placement_masked(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
     re-exported here so Isaac Lab code has one import site for the lift.
     """
     return _ego_placement_masked_xyzw(*args, **kwargs)
+
+
+def ego_placement_masked_window(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-FRAME placements for ``K`` masks per env from one snapshot (all quats xyzw).
+
+    See :func:`motion_gen.world_lift.ego_placement_masked_window`. Already scalar-last.
+    """
+    return _ego_placement_masked_window_xyzw(*args, **kwargs)
 
 
 def ego_placement(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:

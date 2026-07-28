@@ -169,6 +169,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         # the fallback is robot-anchored like the FM. Inert when ego_anchor_fraction == 0.
         if self.cfg.ego_anchor_fraction > 0.0:
             self._reanchor_clip_ids(torch.nonzero(self._fm_reinfer_mask, as_tuple=False).squeeze(-1))
+        # Resolve the placement for THIS step's anchor-mask segment (the base class does this in its
+        # own _update_command, which this override replaces). Inert for a non-ego env: its snapshot
+        # still carries zero correction, so every segment resolves to the terrain-cell anchor.
+        self._refresh_current_placement()
 
         self.get_desired_outputs()                                   # clip joints (frame-invariant)
         clip_frames = self._clip_world_frames()                      # [N, nf, 13] warmup fallback

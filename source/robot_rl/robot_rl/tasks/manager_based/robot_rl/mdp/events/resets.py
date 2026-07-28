@@ -337,6 +337,7 @@ def _commit_clip_reset(
     world_quat: torch.Tensor,
     ego_mask: torch.Tensor,
     snap_mask: torch.Tensor | None = None,
+    mask_frame_yaw: torch.Tensor | None = None,
 ) -> None:
     """Shared tail of the clip resets: reference world state -> sim + command state.
 
@@ -362,6 +363,9 @@ def _commit_clip_reset(
             is RE-ANCHORED, on whatever axes that clip's per-step mask frees. Flat and
             terrain use identical logic; the parameter stays for callers that want to
             decouple the two, but nothing does today.
+        mask_frame_yaw: ``[k]`` heading (rad) of each env's TERRAIN frame, which the anchor
+            mask's downrange / lateral bits resolve in. ``None`` -> 0 (world-axis masking),
+            correct for flat ground and for the axis-aligned terrain tiles built today.
     """
     if snap_mask is None:
         snap_mask = ego_mask
@@ -385,6 +389,14 @@ def _commit_clip_reset(
     cmd._reset_world_yaw[env_ids] = yaw_from_quat(world_quat)
     cmd._ego_mask[env_ids] = ego_mask
     cmd._snap_mask[env_ids] = snap_mask
+    # Terrain frame the anchor mask's downrange / lateral bits resolve in (0 = world axes).
+    cmd._mask_frame_yaw[env_ids] = (
+        torch.zeros_like(cmd._reset_world_yaw[env_ids]) if mask_frame_yaw is None
+        else mask_frame_yaw.to(cmd._mask_frame_yaw.dtype)
+    )
+    # Seed the re-anchor snapshot from the pose actually written to the sim, so every segment's
+    # placement resolves to the terrain-cell anchor until the first ego re-anchor fires.
+    cmd.seed_reanchor_snapshot(env_ids, clip_id, start_step, base_pose)
 
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
@@ -487,6 +499,17 @@ def reset_on_terrain_motion_sequence(
     # Cache the terrain -> clip-indices grouping on the command (built once, on device).
     groups = getattr(cmd, "_terrain_groups", None)
     if groups is None:
+        # One-time single-source-of-truth check. The env cfg cannot do this (its __post_init__
+        # runs BEFORE the --clip override), and a mismatch is silent-but-fatal: the tiles carry
+        # one library's terrain ids while the clips carry another's.
+        importer_path = getattr(importer.cfg, "clip_library_path", None)
+        if importer_path != cmd.cfg.path:
+            raise ValueError(
+                "terrain clip library mismatch: the ClipTerrainImporter built its mesh from "
+                f"'{importer_path}' but the tracking command reads '{cmd.cfg.path}'. Both must "
+                "be the SAME file (tile terrain ids come from the mesh, clip terrain ids from "
+                "the library). Pass one --clip <lib.h5>, which sets both."
+            )
         groups = {t: idx.to(device) for t, idx in group_clips_by_terrain(cmd.manager.lib).items()}
         cmd._terrain_groups = groups
 
@@ -550,7 +573,12 @@ def reset_on_terrain_motion_sequence(
     #      placement decision.)  Then compute + write the spawn.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
     ego_mask = torch.rand(k, device=device) < ego_frac
-    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
+    # The tile's AUTHORED terrain frame: the anchor mask's downrange / lateral bits resolve in it, so
+    # "free lateral" is across the staircase / box whatever heading the terrain carries -- rather than
+    # world y, which silently became the traversal axis for a family baked on a rotated heading.
+    frame_yaw = importer.env_terrain_yaw[env_ids].to(device)
+    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask,
+                       mask_frame_yaw=frame_yaw)
 
 
 def _find_output_indices(ordered_names: list[str], frame_name: str, suffix_pattern: str) -> list[int]:

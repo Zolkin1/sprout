@@ -98,10 +98,10 @@ def test_anchor_mask_roundtrip(tmp_path):
 
 def test_box_type_code_and_anchor_mask_roundtrip(tmp_path):
     """The ``box`` terrain type + box mount anchor mask survive round-trip."""
-    # Box clips use per-frame masks; the mount (jump-on) phase is y-free (lateral follows
-    # the robot) with x/z/yaw world-pinned so the jump lands on the box -- same DOF pattern
-    # as stairs.
-    assert anchor_mask_free_names(_ANCHOR_MASK_BOX) == ["y"]
+    # Box clips use per-frame masks; the mount (jump-on) phase is LATERAL-free (the landing follows
+    # the robot) with downrange/height/yaw pinned to the terrain so the jump lands on the box --
+    # same DOF pattern as stairs.
+    assert anchor_mask_free_names(_ANCHOR_MASK_BOX) == ["lateral"]
     assert _ANCHOR_MASK_BOX == _ANCHOR_MASK_STAIRS
     path = tmp_path / "box.h5"
     manifest = [{

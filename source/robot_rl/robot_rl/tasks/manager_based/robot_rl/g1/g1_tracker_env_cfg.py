@@ -36,10 +36,7 @@ from .g1_teacher_env_cfg import (
     G1TeacherTerminationCfg,
     G1TeacherEnvCfg,
 )
-from .g1_teacher_terrain_env_cfg import (
-    DEFAULT_TERRAIN_CLIP_PATH,
-    G1TeacherTerrainSceneCfg,
-)
+from .g1_teacher_terrain_env_cfg import G1TeacherTerrainSceneCfg
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
 # Default robot-state-conditioned FM checkpoint (override per-run via --fm_checkpoint).
@@ -151,15 +148,13 @@ class G1FmTrackerTerrainEnvCfg(G1FmTrackerEnvCfg):
         self.scene.terrain.terrain_generator = None
         # Terrain-aware reset: each env spawns on a clip matching its tile's terrain_id.
         self.events.reset_on_clip.func = mdp.reset_on_terrain_motion_sequence
-        # Single clip-library source of truth: importer (mesh + per-env terrain_id) and the
-        # FM command's seed/velocity clips MUST read the same file, or tile terrain ids won't
-        # line up with the clips' terrain ids.
-        self.commands.traj_ref.path = DEFAULT_TERRAIN_CLIP_PATH
-        self.scene.terrain.clip_library_path = DEFAULT_TERRAIN_CLIP_PATH
-        assert self.commands.traj_ref.path == self.scene.terrain.clip_library_path, (
-            "terrain clip library (scene.terrain.clip_library_path) and command clip "
-            "library (commands.traj_ref.path) must be the same file."
-        )
+        # Drop the parent's FLAT clip library; the terrain library is REQUIRED from the CLI
+        # (``--clip``), which sets this and scene.terrain.clip_library_path together. The
+        # importer (mesh + per-env terrain_id) and the FM command's seed/velocity clips MUST
+        # read the same file, or tile terrain ids won't line up with the clips' terrain ids.
+        # See the note in g1_teacher_terrain_env_cfg (no default: a stale one trains on the
+        # wrong terrain). Verified non-empty + identical at env build.
+        self.commands.traj_ref.path = ""
         # Clips are baked axis-aligned with their staircase -> placement is a pure translation.
         self.commands.traj_ref.randomize_heading = False
 

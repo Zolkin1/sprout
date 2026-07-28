@@ -33,6 +33,7 @@ from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_cl
 from motion_gen.clips.clip_manager import MotionClipManager
 from .world_lift_isaac import (
     ego_placement_masked,
+    ego_placement_masked_window,
     lift_base_world_state,
     lift_orientation,
     lift_orientation_batched,
@@ -75,6 +76,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
 
     def _create_manager(self, cfg: MotionSequenceCommandCfg, env) -> MotionClipManager:
         """Load the dense clip library and wrap it in a gather manager."""
+        if not cfg.path:
+            raise ValueError(
+                "MotionSequenceCommand has no clip library path. The terrain tasks carry no "
+                "default (a stale default trains against the wrong terrain); pass it with "
+                "--clip <lib.h5>, which also points the ClipTerrainImporter at the same file."
+            )
         device = cfg.clip_device or env.device
         self._clip_lib = load_clip_library(cfg.path, device)
         return MotionClipManager(self._clip_lib)
@@ -117,6 +124,24 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # re-anchor cadence so terrain-fixed axes never drift onto the robot.
         self._reset_world_pos = torch.zeros(n, 3, device=dev)
         self._reset_world_yaw = torch.zeros(n, device=dev)
+        # Heading (rad) of the TERRAIN's own frame, which the anchor mask's downrange / lateral
+        # bits are resolved in (see world_lift.ego_placement_masked). Authored with the terrain and
+        # served per env by the ClipTerrainImporter; 0 for flat ground and for any library whose
+        # manifest predates the field, which reproduces world-axis masking exactly.
+        self._mask_frame_yaw = torch.zeros(n, device=dev)
+        # --- Re-anchor SNAPSHOT (the per-segment placement's single source) ---
+        # A placement is a pure function of (terrain-cell anchor, mask, snapshot), so instead of
+        # storing one solved placement we store the pose pair captured at the last re-anchor and
+        # solve per FRAME against that frame's own mask. That is what lets a clip's terrain-pinned
+        # segment stay welded to the terrain while its flat approach rides the robot: both are
+        # derived from the same snapshot through different mask bits. Seeded at reset so the derived
+        # placement is exactly the terrain-cell anchor (zero correction).
+        self._snap_base_pos = torch.zeros(n, 3, device=dev)      # clip-world base pos at the snapshot step
+        self._snap_base_quat = torch.zeros(n, 4, device=dev)     # clip-world base ori (xyzw)
+        self._snap_base_quat[:, 3] = 1.0
+        self._snap_target_pos = torch.zeros(n, 3, device=dev)    # robot root world pos at the snapshot
+        self._snap_target_quat = torch.zeros(n, 4, device=dev)   # robot root world ori (xyzw)
+        self._snap_target_quat[:, 3] = 1.0
         # Per-env ego-centric re-anchor assignment (re-rolled per reset in
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
@@ -245,7 +270,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def _update_command(self) -> None:
         """Advance the step, build world-frame desired + measured, update CLF."""
         self._advance_step()
-        self._reanchor_ego_envs()                  # ego-centric re-placement (subset of envs)
+        self._reanchor_ego_envs()                  # ego-centric re-anchor snapshot (subset of envs)
+        self._refresh_current_placement()          # placement for THIS step's segment mask
         self.get_desired_outputs()                 # clip-world y_des/dy_des
         frames = self._clip_world_frames()         # lift through the placement
         self._write_world_des(frames)              # base+ee Cartesian -> world
@@ -297,38 +323,98 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
-        """Re-place the clip for env ``ids`` per each clip's root-DOF anchor mask.
+        """Capture the re-anchor SNAPSHOT for env ``ids`` (the clip base + robot root right now).
 
-        The placement update shared by the cadence-based ego re-anchor
-        (:meth:`_reanchor_ego_envs`) and any caller that wants to trigger the
-        re-anchor on a different schedule (e.g. the generator command re-anchoring
-        the clip on the FM's re-plan steps). Each clip's CURRENT-STEP anchor mask decides
-        which root DOFs re-anchor onto the robot root (FREE) vs stay pinned to the
-        clip's reset-time terrain-cell placement (FIXED); roll/pitch are always the
-        clip's natural tilt. With the legacy mask (flat libraries pre-dating the mask)
-        this is yaw + xy + z onto the robot, i.e. the old behavior. No-op for empty
-        ``ids``.
+        Shared by the cadence-based ego re-anchor (:meth:`_reanchor_ego_envs`) and any caller that
+        re-anchors on a different schedule (e.g. the generator command re-anchoring on the FM's
+        re-plan steps). This no longer writes a placement: a placement is a pure function of
+        ``(terrain-cell anchor, mask, snapshot)``, and the mask varies ALONG the clip, so the
+        placement is solved per frame from this snapshot in :meth:`_segment_placement` /
+        :meth:`_window_placement`. Storing the snapshot rather than one solved transform is what
+        keeps a clip's terrain-pinned frames welded to the terrain while its flat approach rides the
+        robot. No-op for empty ``ids``.
         """
         if ids.numel() == 0:
             return
         # Clip-world base pose at each env's current step.
         y, _ = self.manager.gather_desired(self.clip_id[ids], self._step[ids])
-        base_pos_cf = y[:, self._base_idx["pos"]]   # [k, 3]
-        base_ori_cf = y[:, self._base_idx["ori"]]   # [k, 4] xyzw
+        self._snap_base_pos[ids] = y[:, self._base_idx["pos"]]   # [k, 3]
+        self._snap_base_quat[ids] = y[:, self._base_idx["ori"]]  # [k, 4] xyzw
         # Target = robot root link (planar position + heading + HEIGHT for FREE DOFs).
-        target_pos_w = wp.to_torch(self.robot.data.root_pos_w)[ids]
-        target_quat_w = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
-        world_pos, world_quat = ego_placement_masked(
-            base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
-            anchor_mask=self.manager.gather_anchor_mask_at_step(self.clip_id[ids], self._step[ids]),
-            cell_anchor_pos=self._reset_world_pos[ids],
-            cell_anchor_yaw=self._reset_world_yaw[ids],
+        self._snap_target_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids]
+        self._snap_target_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids]   # xyzw
+
+    def seed_reanchor_snapshot(
+        self, env_ids: torch.Tensor, clip_id: torch.Tensor, step: torch.Tensor, spawn_pose: torch.Tensor,
+    ) -> None:
+        """Seed the re-anchor snapshot so the derived placement IS the terrain-cell anchor.
+
+        Called from the clip reset with the pose it wrote to the sim. The robot spawns exactly on the
+        cell-anchored reference, so this snapshot carries zero correction and every segment's
+        placement resolves to the cell anchor -- reproducing the old reset behavior, where
+        ``clip_world_pos`` was simply the reset placement.
+
+        Args:
+            env_ids: ``[k]`` env indices being reset.
+            clip_id: ``[k]`` clip index per resetting env.
+            step: ``[k]`` start step within the clip.
+            spawn_pose: ``[k, 7]`` world spawn pose written to the sim ``[pos(3), quat(4) xyzw]``.
+        """
+        y, _ = self.manager.gather_desired(clip_id, step)
+        self._snap_base_pos[env_ids] = y[:, self._base_idx["pos"]]
+        self._snap_base_quat[env_ids] = y[:, self._base_idx["ori"]]
+        self._snap_target_pos[env_ids] = spawn_pose[:, 0:3]
+        self._snap_target_quat[env_ids] = spawn_pose[:, 3:7]
+
+    def _segment_placement(self, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Placement ``([N, 3], [N, 4])`` for one anchor ``mask`` per env, from the stored snapshot."""
+        return ego_placement_masked(
+            self._snap_base_pos, self._snap_base_quat, self._snap_target_pos, self._snap_target_quat,
+            anchor_mask=mask,
+            cell_anchor_pos=self._reset_world_pos,
+            cell_anchor_yaw=self._reset_world_yaw,
+            mask_frame_yaw=self._mask_frame_yaw,
         )
-        self.clip_world_pos[ids] = world_pos
-        self.clip_world_quat[ids] = world_quat
+
+    def _window_placement(
+        self, clip_id: torch.Tensor, steps: torch.Tensor, env_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-FRAME placement ``([N, K, 3], [N, K, 4])`` for the window ``steps``.
+
+        Each frame is placed through ITS OWN segment's mask, so a window that reaches from the flat
+        approach into the terrain-pinned interaction shows the interaction on the terrain rather than
+        dragged along with the ego-anchored approach. This is the fix for the reference ribbon / the
+        teacher's future-window observation / the recorder.
+
+        Args:
+            clip_id: ``[N, K]`` (or ``[N]``-broadcastable) clip index per window frame.
+            steps: ``[N, K]`` step index per window frame.
+            env_ids: optional ``[N]`` env subset ``clip_id`` / ``steps`` were gathered for; the
+                per-env snapshot + cell anchor are subselected to match.
+        """
+        sl = slice(None) if env_ids is None else env_ids
+        return ego_placement_masked_window(
+            self._snap_base_pos[sl], self._snap_base_quat[sl],
+            self._snap_target_pos[sl], self._snap_target_quat[sl],
+            anchor_mask=self.manager.gather(self.manager.anchor_mask_t, clip_id, steps),
+            cell_anchor_pos=self._reset_world_pos[sl],
+            cell_anchor_yaw=self._reset_world_yaw[sl],
+            mask_frame_yaw=self._mask_frame_yaw[sl],
+        )
+
+    def _refresh_current_placement(self) -> None:
+        """Recompute ``clip_world_pos/quat`` for the CURRENT step's anchor mask.
+
+        Runs every step, not just on the re-anchor cadence: the mask changes at segment boundaries,
+        and the placement must follow it immediately. Previously the placement was only rewritten on
+        the cadence tick, so for up to ``ego_anchor_every - 1`` frames after a boundary the terrain
+        segment was still played through the approach's ego-drifted placement.
+        """
+        mask = self.manager.gather_anchor_mask_at_step(self.clip_id, self._step)
+        self.clip_world_pos, self.clip_world_quat = self._segment_placement(mask)
 
     def _placement(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-env world placement of the clip (yaw-only ground frame, fixed at reset)."""
+        """Per-env world placement of the clip at the current step (its segment's mask)."""
         return self.clip_world_pos, self.clip_world_quat
 
     def _lift_ee_world(
@@ -489,10 +575,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         bi = self._base_idx
         y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P] clip-world
         dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)  # [N, K, V]
-        pos_w = lift_position_batched(self.clip_world_pos, self.clip_world_quat, y[:, :, bi["pos"]])
-        quat_w = lift_orientation_batched(self.clip_world_quat, y[:, :, bi["ori"]])
-        lin_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["lin_vel"]])
-        ang_w = lift_vector_batched(self.clip_world_quat, dy[:, :, bi["ang_vel"]])
+        wpos, wquat = self._window_placement(cid, steps)               # per-FRAME placement
+        pos_w = lift_position_batched(wpos, wquat, y[:, :, bi["pos"]])
+        quat_w = lift_orientation_batched(wquat, y[:, :, bi["ori"]])
+        lin_w = lift_vector_batched(wquat, dy[:, :, bi["lin_vel"]])
+        ang_w = lift_vector_batched(wquat, dy[:, :, bi["ang_vel"]])
         return pos_w, quat_w, lin_w, ang_w
 
     def get_future_joint_state(
@@ -534,7 +621,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         cid, steps = self._future_step_indices(offsets)
         y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P]
         dy = self.manager.gather(self.manager.lib.dy_des, cid, steps)  # [N, K, V]
-        wpos, wquat = self.clip_world_pos, self.clip_world_quat
+        wpos, wquat = self._window_placement(cid, steps)               # per-FRAME placement
         out = []
         for f in frame_names:
             fi = self._frame_output_indices(f)
@@ -823,10 +910,9 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 return
             self._debug_markers.set_visibility(True)
             step, clip_id = self._step[env_ids], self.clip_id[env_ids]
-            clip_world_pos, clip_world_quat = self.clip_world_pos[env_ids], self.clip_world_quat[env_ids]
         else:
+            env_ids = None
             step, clip_id = self._step, self.clip_id
-            clip_world_pos, clip_world_quat = self.clip_world_pos, self.clip_world_quat
 
         n = step.shape[0]
         T = self.manager.num_steps
@@ -837,12 +923,18 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             return
         cid = clip_id[:, None].expand(n, ns)                                            # [n, Ns]
 
-        # Per-frame clip-world positions over the window, lifted to sim-world by
-        # the per-env placement (a single yaw+xy transform; no per-step anchor).
+        # Per-frame clip-world positions over the window, lifted to sim-world by that FRAME's
+        # segment placement -- so the ribbon draws a terrain-pinned segment on its terrain even while
+        # the robot is still on the ego-anchored approach (it used to drag the whole window along
+        # with the approach, which is what made the reference look detached from the stairs / box).
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
         rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3] clip-world
+        wpos, wquat = self._window_placement(cid, steps, env_ids=env_ids)                 # [n, Ns, .]
+        # One placement per (frame), shared by that frame's F reference bodies.
+        wpos_f = wpos.unsqueeze(2).expand(n, ns, F, 3).reshape(n, ns * F, 3)
+        wquat_f = wquat.unsqueeze(2).expand(n, ns, F, 4).reshape(n, ns * F, 4)
         world_pos = lift_position_batched(
-            clip_world_pos, clip_world_quat, rel.reshape(n, ns * F, 3),
+            wpos_f, wquat_f, rel.reshape(n, ns * F, 3),
         ).reshape(n, ns, F, 3)
 
         # Per-segment midpoint, direction, length (one cylinder per segment per frame).

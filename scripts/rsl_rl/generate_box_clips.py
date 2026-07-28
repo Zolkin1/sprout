@@ -368,6 +368,17 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         overlays[0].update(vp)
     size_x = float(hi[0] - lo[0]) + 2 * m       # margin on BOTH sides (was one-sided)
     size_y = float(hi[1] - lo[1]) + 2 * m
+    # TODO(dp-box-frame-yaw): this tile carries NO ``frame_yaw``, so the loader defaults it to 0 and the
+    # RL anchor mask resolves downrange / lateral on the TILE's axes -- which is wrong for this path and
+    # is the bug the terrain frame exists to fix.  ``yaw_normalize`` here cancels the BOX's yaw (the
+    # box ends axis-aligned) but NOT the traversal heading, so the robot crosses the box at ~-91 deg and
+    # "free lateral" gets handed the traversal axis: a slow robot drags the reference off the box along
+    # the direction of travel.  The value cannot be derived from the geometry (a box has four
+    # approachable faces) nor from ``ts`` alone (it depends on the post-splice transform ``gq_t``), so
+    # it is deliberately NOT guessed here -- omitting the key preserves today's behavior exactly rather
+    # than inventing a number.  Fix = measure the traversal heading over the box segment of the
+    # NORMALIZED clip and author it, or switch this path to ``align="facing"`` as the MB path did
+    # (``mb_terrain_clips._place``), which puts the traversal on +x and makes 0 correct.
     manifest_entry = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y,
                       "overlays": overlays}
     # TWO-VELOCITY SPLIT (the RL command != the DP generation command). The DP RAMPS the command
@@ -431,8 +442,11 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev, target_vx=0.0):
                  "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
+    # frame_yaw: the terrain frame the RL anchor mask resolves downrange / lateral in. 0 is CORRECT
+    # here -- ``place_periodic_on_tile`` yaw-normalizes a stair traversal onto the tile's +x.
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "terrain",
                       "size_x": size_x, "size_y": size_y, "overlays": overlays,
+                      "frame_yaw": 0.0,
                       "has_floor": bool(tile.has_floor)}      # False => no flat ground plane in the loader
     tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)
     tvel[:, 0] = float(target_vx)                                  # commanded forward speed (best-effort track)
@@ -660,8 +674,10 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
                  "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
+    # frame_yaw 0: ``place_periodic_on_tile`` yaw-normalizes the descent onto the tile's +x (see above).
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "transition",
                       "size_x": size_x, "size_y": size_y, "overlays": overlays,
+                      "frame_yaw": 0.0,
                       "has_floor": bool(tile.has_floor)}       # False => no flat ground plane in the loader
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
     tvel[:, 0] = float(approach_vx)                               # hold forward down the stairs + off
@@ -745,6 +761,9 @@ def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
         contact[a:b] = terr_contact[:b - a].to(contact.dtype)
     T = Wp.shape[0]
     amt = build_anchor_mask_t(T, bounds, seg_masks, device=dev)
+    # NOTE(dp-box-frame-yaw): no ``frame_yaw`` authored -- see the long note on the first box
+    # manifest in ``_make_box_clip``. Omitting it keeps today's (tile-axis) masking rather than
+    # guessing a heading this path does not normalize away.
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
                       "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
@@ -798,6 +817,9 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
         contact[a:b] = terr_contact[:b - a].to(contact.dtype)
     T = Wp.shape[0]
     amt = build_anchor_mask_t(T, keep, seg_masks, device=dev)
+    # NOTE(dp-box-frame-yaw): no ``frame_yaw`` authored -- see the long note on the first box
+    # manifest in ``_make_box_clip``. Omitting it keeps today's (tile-axis) masking rather than
+    # guessing a heading this path does not normalize away.
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
                       "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
