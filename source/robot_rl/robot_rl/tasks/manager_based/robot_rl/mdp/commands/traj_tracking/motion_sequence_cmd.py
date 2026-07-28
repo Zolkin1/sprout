@@ -22,6 +22,8 @@ online command is gone.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import warp as wp
 from isaaclab.utils.math import quat_from_angle_axis
@@ -82,9 +84,54 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 "default (a stale default trains against the wrong terrain); pass it with "
                 "--clip <lib.h5>, which also points the ClipTerrainImporter at the same file."
             )
+        self._verify_terrain_library_matches(cfg, env)
         device = cfg.clip_device or env.device
         self._clip_lib = load_clip_library(cfg.path, device)
         return MotionClipManager(self._clip_lib)
+
+    @staticmethod
+    def _verify_terrain_library_matches(cfg: MotionSequenceCommandCfg, env) -> None:
+        """Fail if the terrain importer meshes a DIFFERENT library than this command tracks.
+
+        The clip ``.h5`` carries both the reference motions and the terrain they were generated
+        on, so the importer's ``clip_library_path`` and this command's ``path`` must be the same
+        file -- otherwise each env spawns on a tile whose ``terrain_id`` means nothing to its
+        clip, and training proceeds quietly against terrain the reference does not belong to.
+
+        The CLI cannot produce a mismatch, and this is deliberately NOT relied on to fix one:
+        ``--clip`` sets both fields and runs after hydra (so overriding only
+        ``commands.traj_ref.path`` is simply overwritten), and overriding
+        ``scene.terrain.clip_library_path`` is rejected outright because its cfg default is
+        ``MISSING`` and hydra type-checks the override.  What this guards is the
+        *programmatic* path: a new env cfg, task variant or tool that sets one field and
+        forgets the other.  That failure is silent and expensive, hence a hard raise here
+        rather than trust.  Compared as real paths so absolute and relative spellings of the
+        same file agree.
+
+        No-op for a terrain with no ``clip_library_path`` (i.e. not a ClipTerrainImporter).
+
+        Args:
+            cfg: This command term's configuration.
+            env: The IsaacLab environment (its ``cfg.scene.terrain`` holds the importer cfg).
+
+        Raises:
+            ValueError: If both paths are set and refer to different files.
+        """
+        terrain = getattr(getattr(getattr(env, "cfg", None), "scene", None), "terrain", None)
+        terrain_path = getattr(terrain, "clip_library_path", None)
+        if not terrain_path:
+            return
+        if os.path.realpath(terrain_path) != os.path.realpath(cfg.path):
+            raise ValueError(
+                "clip library mismatch: the ClipTerrainImporter meshes\n"
+                f"    scene.terrain.clip_library_path = {terrain_path}\n"
+                "but the tracking command follows\n"
+                f"    commands.traj_ref.path          = {cfg.path}\n"
+                "These MUST be the same file -- the tiles' terrain_ids come from the importer's "
+                "library and the clips' terrain_ids from the command's, so a mismatch spawns every "
+                "env on terrain its reference was not generated for. Pass the library once with "
+                "--clip <lib.h5>, which sets both; do not override either path on its own."
+            )
 
     def _verify_contact_frames(self) -> None:
         """No stance reference frame to verify: teacher clips are world/ego(mask)-anchored.
