@@ -247,11 +247,10 @@ def frame_deviation_from_reference(
             termination is suppressed.  Fresh episode resets are NOT granted
             grace — the reset spawns the robot on the reference, so there is no
             transition transient and the termination arms immediately.  Reads
-            ``cmd.time_since_traj_change_s`` (populated by
-            ``BatchedMultiSkillCommand._pre_update_phase``).  Default 0
-            disables the grace.  Silently no-ops if the command term does
-            not expose ``time_since_traj_change_s`` (e.g. single-skill
-            commands).
+            ``cmd.time_since_traj_change_s`` (populated by the trajectory
+            command's per-step update).  Default 0 disables the grace.
+            Silently no-ops if the command term does not expose
+            ``time_since_traj_change_s``.
         debug: If True, print per-frame ``(err_x, err_y, err_z, ||err||,
             threshold)`` for every env that terminates this step.  Off by
             default — enable from the cfg via ``params={"debug": True}``.
@@ -295,11 +294,10 @@ def frame_deviation_from_reference(
     err_norm = torch.linalg.norm(err, dim=-1)                                  # (N, F)
 
     # Current-target chord per frame.  Prefer the cmd's accessor when it
-    # exists — for ``BatchedMultiSkillCommand`` that returns an
-    # alpha-blended chord during a cross-fade transition, keeping the
-    # scale consistent with the (likewise blended) ``y_des`` the numerator
-    # is measured against.  Fallback (single-skill commands without the
-    # accessor) computes the raw current-domain chord on the new traj.
+    # exists — it can return an alpha-blended chord during a transition,
+    # keeping the scale consistent with the (likewise blended) ``y_des`` the
+    # numerator is measured against.  Fallback (commands without the accessor)
+    # computes the raw current-domain chord on the new traj.
     if hasattr(cmd, "current_chord_per_frame"):
         chord_len = cmd.current_chord_per_frame(pos_idx_t)                     # (N, F)
     else:

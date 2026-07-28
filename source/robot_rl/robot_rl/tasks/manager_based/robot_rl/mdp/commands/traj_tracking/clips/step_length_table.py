@@ -1,17 +1,15 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Per-trajectory forward swing-reach table (shared by online + offline).
+"""Per-trajectory forward swing-reach table (for the offline clip generator).
 
 The terrain-approach planner picks the walk trajectory whose step lands the
 swing foot at the stair stance reference; that decision needs, per trajectory,
 the forward (local +x) distance the swing foot travels over one stride.  The
-online command (:class:`BatchedMultiSkillCommand`) and the offline clip
-generator (:class:`OfflineClipGenerator`) both need this identical quantity,
-so it lives here as one function rather than being duplicated.
+offline clip generator (:class:`OfflineClipGenerator`) uses this when stitching
+a flat approach onto a staircase.
 
 The table is built from Bezier evaluation just before the first contact gate,
-matching the runtime next-gate prediction (before the world transform), so the
-prediction and the table stay consistent.
+so the swing reach matches the trajectory's actual per-stride step length.
 """
 
 from __future__ import annotations

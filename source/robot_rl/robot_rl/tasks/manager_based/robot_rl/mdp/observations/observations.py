@@ -43,7 +43,7 @@ def grace_period_active(
     """Indicator for whether the post-trajectory-change grace period is active.
 
     Reads ``time_since_traj_change_s`` from the named command term (populated
-    by :class:`BatchedMultiSkillCommand._pre_update_phase`) and compares it
+    by the trajectory command's per-step update) and compares it
     against the configured grace window. The flag is True while
     ``time_since_traj_change_s < grace_period_s``.
 
@@ -80,7 +80,7 @@ def grace_period_active(
 def skill_one_hot(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
     """One-hot encoding of the trajectory cmd's active skill for each env.
 
-    Reads ``skill_id`` from a :class:`BatchedMultiSkillCommand` term and
+    Reads ``skill_id`` from a multi-skill trajectory command term and
     converts it into a one-hot vector of length
     ``len(cfg.velocity_buckets)``.  The active skill is bucket-derived
     from the live ``vel_target_b`` and lags the velocity cmd's sampled

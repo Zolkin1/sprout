@@ -323,11 +323,10 @@ class DataLogger:
         except Exception as exc:
             self._warn("robot_data", f"Could not read robot articulation data: {exc}")
 
-        # 5. Skill + terrain row/col (only for envs that use the
-        # multiskill stack: ``MultiskillVelocityTrackingCommand`` for the
-        # informational sampled bucket, ``BatchedMultiSkillCommand`` for
-        # the active skill + pending state, ``MetaTerrainImporter`` for
-        # cell coordinates).
+        # 5. Skill + terrain row/col (only for envs whose command exposes a
+        # sampled skill bucket / active skill, and whose terrain importer
+        # exposes cell coordinates; skipped otherwise via the hasattr guards
+        # below).
         try:
             vel_cmd = unwrapped.command_manager.get_term("base_velocity")
             if hasattr(vel_cmd, "sampled_skill_id"):

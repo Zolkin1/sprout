@@ -128,7 +128,7 @@ def reset_on_reference(
 
     # Sample a phase per ref env.  The manager caches its trajectory
     # assignments across steps and only invalidates inside
-    # ``BatchedMultiSkillCommand._pre_update_phase``.  Reset events fire
+    # the trajectory command's per-step phase update.  Reset events fire
     # between steps, so by default the cache here holds the *previous*
     # step's traj_idx — built from the pre-resample conditioner.
     # Invalidate so the read below picks the trajectory matching the

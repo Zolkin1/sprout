@@ -244,11 +244,6 @@ class MultiSkillManager(ManagerBase):
         # term is still used as the ``command`` source via
         # ``conditioner_generator_name``.
         self._skill_owner: Any = None
-        # Optional per-env :class:`ForcedTrajLatch` overlaying the velocity
-        # selection (terrain-approach "slow-down" steps).  Registered by the
-        # owning command via :meth:`set_forced_traj_latch`; ``None`` means no
-        # override is ever applied.
-        self._forced_traj_latch: Any = None
         # Optional terrain lookup ``fn(xy_w) -> (dims[N, 3], valid[N])``
         # returning the (width, height, length) of the terrain feature at
         # each world xy (NaN = dimension unconstrained).  Registered via
@@ -1120,16 +1115,6 @@ class MultiSkillManager(ManagerBase):
         """
         self._skill_owner = owner
 
-    def set_forced_traj_latch(self, latch: Any) -> None:
-        """Register the per-env :class:`ForcedTrajLatch` for this manager.
-
-        While a row of the latch is ``active``, :meth:`_select_trajectories`
-        overrides its velocity-nearest pick with the latched trajectory
-        index.  The owner must guarantee the latched index belongs to the
-        env's current skill (the override is applied *after* the skill mask).
-        """
-        self._forced_traj_latch = latch
-
     def set_terrain_dim_lookup(self, fn: Any) -> None:
         """Register the terrain's per-point terrain-dimension query.
 
@@ -1262,8 +1247,7 @@ class MultiSkillManager(ManagerBase):
         The optional terrain-dim filter (the legacy
         :meth:`_terrain_dim_allowed` / :meth:`_apply_terrain_dim_filter` pair)
         is folded in per group, materializing only ``[N_s, T_s, 3]`` instead
-        of ``[N, T, 3]``.  The forced-traj latch is intentionally *not* applied
-        here — callers that need it overlay it on the returned indices.
+        of ``[N, T, 3]``.
 
         Args:
             vel_cmd: ``[N, 3]`` per-env velocity conditioner (vx, vy, vyaw).
@@ -1394,24 +1378,6 @@ class MultiSkillManager(ManagerBase):
         selected = self._select_within_skills(
             conditioner[:, :3], env_traj_skill_ids, anchor_xy,
         )
-
-        # NOTE: the forced-latch overlay below is intentionally applied to
-        # the live per-env selection only — :meth:`nearest_traj_in_skill`
-        # (used by the terrain-approach planner to peek at the *candidate*
-        # terrain trajectory) deliberately skips it.
-
-        # Terrain-approach override: a "slow-down" step pins selected envs to
-        # a specific (shorter) trajectory regardless of velocity.  The latch
-        # is owned by the command's choke point; here we only read it.  The
-        # override wins *after* the skill mask, so the caller must guarantee
-        # the forced index lives in the env's current skill (asserted by the
-        # approach planner that sets the latch).
-        latch = self._forced_traj_latch
-        if latch is not None:
-            active = latch.active if env_ids is None else latch.active[env_ids]
-            forced = latch.traj_idx if env_ids is None else latch.traj_idx[env_ids]
-            selected = torch.where(active, forced, selected)
-
         return selected
 
     def _select_trajectories_reference(
@@ -1453,13 +1419,6 @@ class MultiSkillManager(ManagerBase):
             )
         vel_dists = vel_dists.masked_fill(~allowed, float("inf"))
         selected = vel_dists.argmin(dim=1)
-
-        latch = self._forced_traj_latch
-        if latch is not None:
-            active = latch.active if env_ids is None else latch.active[env_ids]
-            forced = latch.traj_idx if env_ids is None else latch.traj_idx[env_ids]
-            selected = torch.where(active, forced, selected)
-
         return selected
 
     def nearest_traj_in_skill(
@@ -1469,9 +1428,8 @@ class MultiSkillManager(ManagerBase):
         """Nearest trajectory (by velocity) within an *arbitrary* skill.
 
         Unlike :meth:`_select_trajectories` (which picks within each env's
-        *current* owner skill and applies the forced-traj latch), this
-        resolves the nearest trajectory in a caller-supplied skill,
-        ignoring the latch.  Used by the terrain-approach planner to peek
+        *current* owner skill), this resolves the nearest trajectory in a
+        caller-supplied skill.  Used by the terrain-approach planner to peek
         at the stair trajectory an env *would* commit to, so it can predict
         that trajectory's snapped stance reference.
 
@@ -1494,9 +1452,8 @@ class MultiSkillManager(ManagerBase):
         traj_skill_ids = self._vel_skill_to_traj_skill[owner_skill_ids]  # (K,)
         if self._terrain_dims_at is not None and anchor_xy is None:
             anchor_xy = self._selection_anchor_xy(env_ids)
-        # Shares the per-skill segmented selection; differs from
-        # ``_select_trajectories`` only in that it never applies the
-        # forced-traj latch (the caller peeks at the un-latched candidate).
+        # Shares the per-skill segmented selection with
+        # ``_select_trajectories``, but for a caller-supplied skill.
         return self._select_within_skills(
             conditioner[:, :3],
             traj_skill_ids,
