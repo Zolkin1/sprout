@@ -217,7 +217,11 @@ def _cases(out_dir: str) -> dict:
 def stage_isaac(args) -> int:
     """Record the Isaac Lab rollout by delegating to debug_episodes.py."""
     case = _cases(args.out_dir)[args.case]
-    task = "G1-tracker-clf-fm-play" if args.case == "flat" else "G1-tracker-clf-fm-terrain-play"
+    # Both cases run the SAME task: the ClipTerrainImporter builds its mesh from whatever
+    # single-clip library ``prep`` wrote, so the flat case gets a flat mesh and the stair
+    # case a staircase. Using one task also means the Isaac and MuJoCo sides differ only in
+    # geometry, never in env wiring.
+    task = "G1-tracker-clf-fm-terrain-play"
     cmd = [sys.executable, os.path.join(_REPO, "scripts", "rsl_rl", "debug_episodes.py"),
            "--task", task, "--checkpoint", args.checkpoint,
            "--clip", os.path.abspath(case["path"]), "--clip_device", "cpu",

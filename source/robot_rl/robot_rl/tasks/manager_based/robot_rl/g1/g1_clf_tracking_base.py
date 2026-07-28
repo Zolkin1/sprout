@@ -1,6 +1,15 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-import math
+"""Shared G1 CLF-tracking scaffolding: actions, scene, contact sensors, dynamics
+randomization, and the CLF / penalty rewards.
+
+This is an abstract base -- it declares no observations, commands or terminations,
+because the concrete env (:mod:`g1_teacher_env_cfg`) supplies all three.  It exists to
+hold the parts that are genuinely independent of *what* is being tracked: the joint
+position action, the robot + contact-sensor + light scene, the domain randomization
+event set, and the CLF reward terms.
+"""
+
 from dataclasses import MISSING
 
 ##
@@ -10,9 +19,6 @@ from isaaclab.utils import configclass
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.utils.noise import UniformNoiseCfg as Unoise
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab_physx.physics import PhysxCfg
 from isaaclab.terrains import TerrainImporterCfg
@@ -23,23 +29,15 @@ from isaaclab_tasks.utils import PresetCfg
 from isaaclab_newton.sensors import ContactSensorCfg as NewtonContactSensorCfg
 from isaaclab_physx.sensors import ContactSensorCfg as PhysXContactSensorCfg
 
-from robot_rl.sensors import RecursiveContactSensorCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-
-from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
-
 
 ##
 # Robot RL
 ##
-from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.trajectory_cmd_cfg import TrajectoryCommandCfg
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.assets.robots import G1_ACTION_SCALE
 from robot_rl.assets.robots.g1_21j import G1_CFG  # isort: skip
 
-from .clf_weights import WALKING_Q_weights, WALKING_R_weights
-from ..mdp.commands.velocity_commands_cfg import VelocityTrackingCommandCfg
 
 ##
 # Actions
@@ -65,12 +63,14 @@ class ClfTrackingBaseEnvContactSensorCfg(PresetCfg):
 class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
     """Configuration for the terrain scene with a legged robot."""
 
-    # # ground terrain
+    # Ground terrain. A placeholder: every concrete scene replaces this outright -- the
+    # teacher swaps in a ClipTerrainImporterCfg that meshes the clip library itself (see
+    # g1_teacher_terrain_env_cfg.G1TeacherTerrainSceneCfg). Only the physics material is
+    # read from here (G1ClfTrackingEnvCfg.__post_init__ copies it onto sim).
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=ROUGH_TERRAINS_CFG,
-        max_init_terrain_level=5,
+        terrain_generator=None,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -88,16 +88,6 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
 
     # robots
     robot: ArticulationCfg = MISSING
-
-    # # sensors
-    # height_scanner = RayCasterCfg(
-    #     prim_path="{ENV_REGEX_NS}/Robot/base",
-    #     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
-    #     ray_alignment="yaw",
-    #     pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
-    #     debug_vis=False,
-    #     mesh_prim_paths=["/World/ground"],
-    # )
 
     left_thigh_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/left_hip_pitch_link/.*")
     right_thigh_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/right_hip_pitch_link/.*")
@@ -118,8 +108,6 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
     left_shin_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/left_hip_pitch_link/left_hip_roll_link/left_hip_yaw_link/left_knee_link")
     right_shin_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/right_hip_pitch_link/right_hip_roll_link/right_hip_yaw_link/right_knee_link")
 
-    #RecursiveContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/Geometry/.*", history_length=3, track_air_time=True)
-
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
@@ -129,131 +117,10 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-##
-# Commands
-##
-@configclass
-class G1ClfTrackingCommandCfg:
-    # TODO: Migrate to BatchedMultiSkillCommandCfg.  Single-skill
-    # TrajectoryCommandCfg is slated for deletion; see
-    # ``g1_clf_multiskill_base.G1MultiSkillCommandsCfg`` for the
-    # equivalent multi-skill setup (folder of skill subfolders + skill
-    # conditioner instead of ``manager_type="library"``).  Sin/cos phase
-    # observations need a multi-skill replacement as well — see
-    # ``observations._phased_cmd``.
-    traj_ref = TrajectoryCommandCfg(
-        contact_bodies = [".*_ankle_roll_link"],
-
-        manager_type="library",
-        hf_repo = "zolkin/robot_rl",
-        path = "trajectories/walking",
-
-        conditioner_generator_name = "base_velocity",
-        Q_weights = WALKING_Q_weights,
-        R_weights = WALKING_R_weights,
-        hold_phi_threshold = 0.1,
-        heuristic_func=None,
-        phasing_boundaries=4,
-    )
-
-    base_velocity = VelocityTrackingCommandCfg(
-        asset_name="robot",
-        resampling_time_range=(7.0, 10.0), #(10.0, 10.0),
-        rel_standing_envs=0.05, #0.05, #0.02,
-        rel_closed_loop=0.5, #0.55,
-        rel_closed_loop_yaw=0.25,
-        rel_open_loop=0.2,
-        debug_vis=False,
-        ranges=VelocityTrackingCommandCfg.VelRanges(
-            lin_vel_x=(-1.0, 1.0),
-            lin_vel_y=(-1.0, 1.0),
-            ang_vel_z=(-1.0, 1.0),
-            heading=(-math.pi, math.pi),
-            y_pos_offset=(-0.5, 0.5),
-            y_kp=(1.2, 1.8),
-            y_kd=(0.2, 0.4),
-        ))
-
-
-##
-# Observations
-##
-@configclass
-class G1ClfTrackingObservationsCfg:
-    """Observation specifications for the G1 Flat environment."""
-
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-            noise=Unoise(n_min=-0.05, n_max=0.05),
-        )
-
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05)
-        actions = ObsTerm(func=mdp.last_action, clip=(-20.0,20.0))
-
-        # TODO: Move everything to the multiskill phase as its general and can even work for single skills
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
-
-
-        def __post_init__(self):
-            self.enable_corruption = True
-            self.concatenate_terms = True
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Observations for critic group."""
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
-        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
-        projected_gravity = ObsTerm(
-            func=mdp.projected_gravity,
-        )
-
-        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"},
-                                    scale=(2.0, 2.0, 2.0))
-
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel,)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
-        actions = ObsTerm(func=mdp.last_action, clip=(-20.0,20.0))
-
-        # Phase clock
-        sin_phase = ObsTerm(func=mdp.ref_sin_phase, params={"command_name": "traj_ref"})
-        cos_phase = ObsTerm(func=mdp.ref_cos_phase, params={"command_name": "traj_ref"})
-
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0,))
-
-        height_scan = None  # Removed - not supported yet
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
 
 @configclass
 class G1ClfTrackingEventsCfg:
-    # pass
-    reset_on_ref = EventTerm(
-        func=mdp.reset_on_reference,
-        mode="reset",
-        params={"command_name": "traj_ref",
-                "base_frame_name": "pelvis_link",
-                "conditioner_command_name": "base_velocity",
-                "special_val": 0.0,     # Sometimes start on the running traj
-                "rel_envs_on_special": 0.0,
-                "rel_envs_on_ref": 1.0, #0.5,
-                "joint_add_range": [0.0, 0.0]} #[-0.1, 0.1]}
-    )
+    """Domain randomization. The reference reset is added by the concrete env."""
 
     # As of Isaac v3.0.0 beta there is no way to randomize dynamic and viscous friction that I can see.
     # Randomize joint friction
@@ -352,8 +219,12 @@ class G1ClfTrackingEventsCfg:
         params={"velocity_range": {"x": (-0.75, 0.75), "y": (-0.75, 0.75)}},
     )
 
+
 @configclass
 class G1ClfTrackingRewardCfg:
+    """CLF tracking + regularization penalties. Task-specific tracking rewards (e.g.
+    commanded-velocity terms) are added by the concrete env, which knows the command."""
+
     ##
     # Joint limits
     ##
@@ -420,56 +291,26 @@ class G1ClfTrackingRewardCfg:
         }
     )
 
-    ##
-    # Goal conditioned rewards
-    ##
-    xy_vel = RewTerm(
-        func=mdp.track_lin_vel_xy_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity",
-                "std": 0.5, }
-    )
-
-    yaw_vel = RewTerm(
-        func=mdp.track_ang_vel_z_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity",
-                "std": 0.5, }
-    )
-
-@configclass
-class G1ClfTrackingTerminationCfg:
-    """Handle the terminations."""
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    base_contact = None
-    base_height = DoneTerm(
-        func=mdp.root_height_below_minimum,
-        params={
-            "minimum_height": 0.25,
-        }
-    )
 
 ##
 # Normal Config
 ##
 @configclass
 class G1ClfTrackingEnvCfg(ManagerBasedRLEnvCfg):
+    """Abstract base: scene / actions / events / rewards only.
+
+    ``observations``, ``commands`` and ``terminations`` are deliberately left to the
+    concrete env, and no curriculum manager is created (no task here uses one).
+    """
+
     # Scene settings
     scene: G1ClfTrackingSceneCfg = G1ClfTrackingSceneCfg(num_envs=4096, env_spacing=2.5)
 
-    observations: G1ClfTrackingObservationsCfg = G1ClfTrackingObservationsCfg()
-
     actions: G1ClfTrackingActionsCfg = G1ClfTrackingActionsCfg()
-
-    commands: G1ClfTrackingCommandCfg = G1ClfTrackingCommandCfg()
 
     rewards: G1ClfTrackingRewardCfg = G1ClfTrackingRewardCfg()
 
     events: G1ClfTrackingEventsCfg = G1ClfTrackingEventsCfg()
-
-    terminations: G1ClfTrackingTerminationCfg = G1ClfTrackingTerminationCfg()
-
-    curriculum: None
 
     def __post_init__(self):
         # Post init of parent
@@ -489,55 +330,3 @@ class G1ClfTrackingEnvCfg(ManagerBasedRLEnvCfg):
             gpu_max_rigid_patch_count=10 * 2**15,
             gpu_total_aggregate_pairs_capacity=2**22,
         )
-
-
-##
-#
-##
-@configclass
-class G1ClfTrackingEcEnvCfg(G1ClfTrackingEnvCfg):
-    """Configuration for the G1 environment with gait library."""
-    def __post_init__(self):
-        # Post init of parent
-        super().__post_init__()
-        #both front and back 1.14
-        #just front: 0.616
-        self.events.add_plate_mass = EventTerm(
-            func=mdp.randomize_rigid_body_mass,
-            mode="startup",
-            params={
-                "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),   # 29-DOF: torso is its own link now
-                "mass_distribution_params": (0.616,0.616),
-                "operation": "add",
-            }
-        )
-
-
-# @configclass
-# class G1ClfTrackingEnvCfg_PLAY(G1ClfTrackingEnvCfg):
-#     """Configuration for the G1 environment with gait library."""
-#
-#     def __post_init__(self):
-#         # Post init of parent
-#         super().__post_init__()
-#
-#         self.scene.num_envs = 2
-#         self.scene.env_spacing = 2.5
-#         self.observations.policy.enable_corruption = False
-#         self.scene.terrain.size = (3, 3)
-#         self.scene.terrain.border_width = 0.0
-#         self.scene.terrain.num_rows = 3
-#         self.scene.terrain.num_cols = 2
-#
-#         self.episode_length_s = 8.0
-#
-#         self.events.randomize_ground_contact_friction = None
-#         self.events.add_base_mass = None
-#         self.events.base_com = None
-#         self.events.base_external_force_torque = None
-#         self.events.push_robot = None
-#         self.events.gain_randomization = None
-#
-#         self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-#         self.commands.base_velocity.ranges.lin_vel_y = (-0.5, 0.5)
-#         self.commands.base_velocity.ranges.ang_vel_z = (-0.75, 0.75)

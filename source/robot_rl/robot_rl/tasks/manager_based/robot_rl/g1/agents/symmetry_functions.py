@@ -5,7 +5,8 @@
 Provides two entry points consumed by ``RslRlSymmetryCfg``:
 
 * :func:`symmetric_data_augmentation_episodic` — phase obs unchanged.
-* :func:`symmetric_data_augmentation_half_periodic` — phase obs negated.
+(A ``half_periodic`` variant that negated the phase obs existed for the gait-library
+envs; those are gone, and the clip teacher has no phase clock.)
 
 Internally both delegate to :func:`_symmetric_data_augmentation` which
 uses :class:`SagittalReflectionConfig` for config-driven dispatch rather
@@ -285,7 +286,7 @@ def _symmetric_data_augmentation(
 
 
 # ---------------------------------------------------------------------------
-# Public entry points (signature unchanged for rsl_rl_ppo_cfg.py)
+# Public entry point (signature unchanged for rsl_rl_ppo_cfg.py)
 # ---------------------------------------------------------------------------
 
 def symmetric_data_augmentation_episodic(
@@ -295,12 +296,3 @@ def symmetric_data_augmentation_episodic(
 ) -> Tuple[tensordict.TensorDict, torch.Tensor]:
     """Augment data for episodic trajectories (phase obs unchanged)."""
     return _symmetric_data_augmentation(env, obs, actions, is_half_periodic=False)
-
-
-def symmetric_data_augmentation_half_periodic(
-    env,
-    obs: tensordict.TensorDict,
-    actions: torch.Tensor,
-) -> Tuple[tensordict.TensorDict, torch.Tensor]:
-    """Augment data for half-periodic trajectories (phase obs negated)."""
-    return _symmetric_data_augmentation(env, obs, actions, is_half_periodic=True)
