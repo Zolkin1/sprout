@@ -48,3 +48,28 @@ class BatchedHistory:
     def stack(self, key: str) -> np.ndarray:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
         return np.stack([s[key] for s in self._steps], axis=1)
+
+    def null_mask(self) -> np.ndarray:
+        """Per-env ``(N,)`` bool: True where the history window is NOT yet complete.
+
+        Hand this to the FM as ``history_null``: training nulled ``null_cond_prob`` of its
+        samples, so the learned ``null_history`` embedding covers exactly this case and the
+        generator can be sampled from step 0 -- no clip warmup, no fabricated static history.
+        """
+        if len(self._steps) < self.maxlen:
+            return np.ones_like(self._steps_since_reset, dtype=bool)
+        return self._steps_since_reset < self.maxlen
+
+    def stack_padded(self, key: str) -> np.ndarray:
+        """Like :meth:`stack`, but always ``maxlen`` long -- front-padded by repeating the oldest.
+
+        Only the global deque underfill (the first steps of a run) is padded. Per-env staleness
+        is not repaired: those envs are the ones :meth:`null_mask` flags, whose history content
+        the model replaces with the learned null embedding. The newest step stays at index -1,
+        so the caller's anchor is always the live state.
+        """
+        if not self._steps:
+            raise RuntimeError("stack_padded on an empty history: append at least one step first.")
+        steps = list(self._steps)
+        pad = [steps[0]] * (self.maxlen - len(steps))
+        return np.stack([s[key] for s in (pad + steps)], axis=1)

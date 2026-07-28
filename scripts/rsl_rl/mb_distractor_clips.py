@@ -38,15 +38,25 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from generate_distractor_clips import _box_pool, _make_tile        # noqa: E402
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library   # noqa: E402
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder        # noqa: E402
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool  # noqa: E402
+from motion_gen.clip_output import ClipOutputBuilder        # noqa: E402
+from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_raw_motion, raw_to_world           # noqa: E402
 from motion_gen.motionbricks.distractor_plan import profile_segs, request_key  # noqa: E402
-from motion_gen.multiskill_manager import MultiSkillManager                 # noqa: E402
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free                      # noqa: E402
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _PINNED = int(anchor_mask_from_free(set()))       # world-pinned, exactly as the DP distractors are
+# TODO(distractor-ego-mask): distractors are FLAT walking that merely happens to route around
+# obstacle boxes, so their anchor mask should be the FLAT one (x, y, yaw FREE; z clip-fixed) --
+# NOT fully world-pinned. Pinned means no root DOF ever re-anchors onto the robot, so a
+# distractor env is never a re-anchor event: with the snap mask now tied to ego re-anchoring
+# (resets.py), these clips emit no FM windows at all, and under the old
+# ``ego_mask | ~is_flat`` they emitted windows that were pure tracking drift. The boxes are
+# obstacles to avoid, not surfaces to land on, so nothing needs world-pinning here.
+# Fix = use ``anchor_mask_from_free({"x", "y", "yaw"})`` (== _ANCHOR_MASK_FLAT) here and in
+# generate_distractor_clips.py, then regenerate the distractor family.
+# Until then, EXCLUDE the distractor family from FM recording libraries.
 _SHARED: dict = {}
 
 
@@ -104,8 +114,8 @@ def _tile_worker(tid: int):
 
 def _assemble(args) -> int:
     """Pass 2: fit boxes to the generated motions and write the distractor family."""
-    manager = MultiSkillManager(args.source, args.device, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=args.device)
     tiles = _pool(args)
     _SHARED.update(args=args, builder=builder, dev=args.device, tiles=tiles)

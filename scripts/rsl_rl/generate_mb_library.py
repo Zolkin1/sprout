@@ -131,15 +131,46 @@ def main() -> int:
                    help="Flat clip duration (s). 20 s matches the teacher's episode_length_s, so one clip "
                         "is one episode; it is passed to BOTH the MB generation and the Stage-2 ingest.")
     p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
-    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"))
+    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
+                   help="GROUND-level speed band for the box families (the run-up / walk-away).")
+    p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
+                   metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's LEAD-IN (the segment before the interaction). Keyed by "
+                        "ORDER, not level: jump_on leads in on the ground, the dismounts along the box top.")
+    p.add_argument("--box-exit-s-range", type=float, nargs=2, default=(2.5, 6.0), metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's TRAIL-AWAY (the segment after the interaction).")
+    p.add_argument("--box-top-vx-range", type=float, nargs=2, default=(0.3, 0.7), metavar=("MIN", "MAX"),
+                   help="Speed band (m/s) of a box clip's ELEVATED segment (see --box-top-s-range); "
+                        "platform length is roughly their product.")
+    p.add_argument("--box-two-sided-frac", type=float, default=0.5,
+                   help="Fraction of box tiles with the top platform + an elevated segment; the rest are "
+                        "the bare box with the ground side only.")
+    p.add_argument("--box-platform-buffer", type=float, default=1.0,
+                   help="Extra metres of top platform beyond the elevated segment's nominal travel, so the "
+                        "reference cannot walk off the far edge (the ground side needs none -- the tile "
+                        "keeps its floor there).")
+    p.add_argument("--box-nav-width", type=float, default=-1.0,
+                   help="y-width (m) the box + its top platform are widened to; -1 = the tile's corridor "
+                        "width, 0 = the reference box's own narrow extents.")
+    p.add_argument("--backward-vx-max", type=float, default=1.0,
+                   help="Cap (m/s) on any BACKWARD command (the jump_off dismount), where the clean "
+                        "library's walk_backwards strides stop.")
     p.add_argument("--stair-floor-frac", type=float, default=0.5)
+    p.add_argument("--stair-float-frac", type=float, default=0.0,
+                   help="Fraction of stair TILES with FLOATING (riser-less) treads -- thin slabs with an "
+                        "open gap beneath. Same tread tops, so the same references are reused.")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
+                   metavar=("MIN", "MAX"), help="Floating-tread slab thickness band (m), per tile.")
     p.add_argument("--steady-approach-frac", type=float, default=0.5,
                    help="Fraction of terrain clips whose approach starts ALREADY AT SPEED rather than from "
                         "a stand (see mb_terrain_segments --approach-start).")
-    p.add_argument("--pin-lead", type=float, default=2.0,
-                   help="Seconds before the arrival that the terrain pose pin engages on the approach. The "
-                        "model's planning horizon is ~1 s, so a longer lead gives it several replans under "
-                        "the pin to in-between into the entry pose instead of one.")
+    p.add_argument("--pin-lead", type=float, default=1.0,
+                   help="FLOOR (s) on when the terrain pose pin engages. The primary trigger is now "
+                        "proximity (mb_terrain_segments --pin-dist), so this is only the safety net for a "
+                        "robot that never closes the distance. It used to be 2.0, which combined with "
+                        "--approach-s-range (1.5,3.5) meant the pin was on from frame ONE on most clips -- "
+                        "no stride keyframes at all, and the model holding a standing pre-jump crouch as "
+                        "its target through the whole run-up.")
     p.add_argument("--rl-vels", default="raw", choices=["raw", "snapped"],
                    help="Which command channel the flat clips expose to the RL (see generate_mb_clips.py).")
     p.add_argument("--extra-mix", default="",
@@ -182,7 +213,16 @@ def main() -> int:
             "--clips-per-tile", str(cpt), "--seed", str(args.seed), "--device", args.device,
             "--stair-vel-range", *(str(v) for v in args.stair_vel_range),
             "--box-vel-range", *(str(v) for v in args.box_vel_range),
+            "--box-approach-s-range", *(str(v) for v in args.box_approach_s_range),
+            "--box-exit-s-range", *(str(v) for v in args.box_exit_s_range),
+            "--box-top-vx-range", *(str(v) for v in args.box_top_vx_range),
+            "--box-two-sided-frac", str(args.box_two_sided_frac),
+            "--box-platform-buffer", str(args.box_platform_buffer),
+            "--box-nav-width", str(args.box_nav_width),
+            "--backward-vx-max", str(args.backward_vx_max),
             "--stair-floor-frac", str(args.stair_floor_frac),
+            "--stair-float-frac", str(args.stair_float_frac),
+            "--stair-float-thick-range", *(str(v) for v in args.stair_float_thick_range),
             "--steady-approach-frac", str(args.steady_approach_frac)])
     if stage in ("all", "a") and args.distractor_tiles > 0 \
             and not os.path.exists(os.path.join(_REPO, dis_sched)):

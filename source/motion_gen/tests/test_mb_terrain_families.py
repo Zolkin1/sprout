@@ -11,6 +11,7 @@ from motion_gen.motionbricks.terrain_families import (
     FAMILIES,
     SOLE_Z,
     boundary_candidates,
+    box_platform_sign,
     episodic_boundaries,
     family_for,
     pick_boundary,
@@ -40,18 +41,39 @@ def test_registry_covers_the_five_terrain_skills_with_consistent_levels():
         assert fam.approach_level in ("lower", "upper") and fam.exit_level in ("lower", "upper")
         # Every family CHANGES level (that is what the terrain is for) and knows how to leave it.
         assert fam.approach_level != fam.exit_level
-        assert fam.approach_mode in ("walk", "stand") and fam.exit_mode in ("walk", "stand")
-        assert fam.exit_sign in (-1.0, 1.0)
-        assert fam.terrain_tvel in ("steady", "hold_approach", "exit_walk")
+        # BOTH ends locomote, on every family: a box's elevated end used to be a standing hold, which the
+        # ego anchor mask re-anchored onto the robot -- so missing the jump cost nothing.
+        assert fam.approach_mode == "walk" and fam.exit_mode == "walk"
+        assert fam.approach_sign in (-1.0, 1.0) and fam.exit_sign in (-1.0, 1.0)
+        # No "what does the RL see over the replay" knob: the RL command is ONE steady terrain-agnostic
+        # value for the whole clip, so there is nothing per-family to choose.
+        assert not hasattr(fam, "terrain_tvel")
     assert FAMILIES["stairs_up"].going_up and not FAMILIES["stairs_down"].going_up
     # Only an ASCENT pins the replay's future (measured: it halves the boundary-pose error there, and
     # doubles it on a descent, whose future drops below the platform the approach is still walking on).
     assert FAMILIES["stairs_up"].pin_future
     assert not any(f.pin_future for k, f in FAMILIES.items() if k != "stairs_up")
-    assert FAMILIES["jump_off"].exit_sign == -1.0            # backward dismount walks away backwards
-    assert FAMILIES["jump_off_front"].exit_sign == 1.0
+    # A backward dismount walks backwards on BOTH sides -- in along the box top toward the edge it drops
+    # off, and away from the box after it -- so it never walks forward into the box it just left.
+    assert FAMILIES["jump_off"].approach_sign == -1.0 and FAMILIES["jump_off"].exit_sign == -1.0
+    assert FAMILIES["jump_off_front"].approach_sign == 1.0 and FAMILIES["jump_off_front"].exit_sign == 1.0
+    assert all(f.approach_sign == 1.0 for k, f in FAMILIES.items() if k != "jump_off")
     # Only the stair families loop; the box interactions are played once.
     assert [f.periodic for f in FAMILIES.values()].count(True) == 2
+
+
+def test_box_platform_sign_is_opposite_the_jump_face():
+    # A mount lands and walks ON along +x, so its platform is ahead of the landing; a dismount walked in
+    # along the box top and drops off the far end, so its platform is behind it.  Either way the platform
+    # is on the opposite side from the face the jump uses, leaving the takeoff footprint as solved.
+    assert box_platform_sign(FAMILIES["jump_on"]) == 1.0
+    assert box_platform_sign(FAMILIES["jump_off"]) == 1.0
+    assert box_platform_sign(FAMILIES["jump_off_front"]) == -1.0
+
+
+def test_box_platform_sign_rejects_the_stair_families():
+    with pytest.raises(ValueError, match="stair_tile_boxes"):
+        box_platform_sign(FAMILIES["stairs_up"])
 
 
 def test_family_for_unknown_skill_lists_the_options():

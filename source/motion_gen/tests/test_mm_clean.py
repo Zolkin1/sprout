@@ -17,8 +17,8 @@ import json
 import numpy as np
 import torch
 
-from motion_gen.motion_matching.bones_ingest import _G1_FROM_CSV
-from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+from motion_gen.ingest.bones_ingest import _G1_FROM_CSV
+from motion_gen.ingest.clean_ingest import ingest_clean_library
 
 _SIM_DT = 0.005
 _Z = 0.78
@@ -102,7 +102,7 @@ def test_joint_map_and_velocity(tmp_path):
     expect = torch.tensor(_G1_FROM_CSV, dtype=torch.float32) * 0.01
     assert torch.allclose(wf.joint_pos[wf.n // 2], expect, atol=1e-5)
     # finite-difference body velocity (yaw-planar) matches the manifest label (0.8, 0, 0)
-    from motion_gen.motion_matching.motion_db import _yaw_planar_vel
+    from motion_gen.ingest.motion_db import _yaw_planar_vel
     pv = _yaw_planar_vel(wf.root_quat, wf.root_lin_vel, wf.root_ang_vel)
     interior = pv[2:-2].mean(0)                            # drop FD edge frames
     assert torch.allclose(interior, torch.tensor([0.8, 0.0, 0.0]), atol=2e-2)

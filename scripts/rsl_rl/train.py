@@ -155,8 +155,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
             # The ClipTerrainImporter builds its terrain mesh + per-env terrain_id from
             # its OWN clip_library_path, which must stay identical to the command's clip
-            # path (the env cfg asserts this -- tile terrain ids must line up with the
-            # clips' terrain ids). Re-point it too so --clip is a single source of truth.
+            # path -- tile terrain ids must line up with the clips' terrain ids. Re-point it
+            # too so --clip is a single source of truth. NOTE: nothing asserts the two match;
+            # setting only one (e.g. a bare hydra override of commands.traj_ref.path) trains
+            # on a terrain the clips do not belong to. Go through --clip.
             terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
             if terrain is not None and hasattr(terrain, "clip_library_path"):
                 terrain.clip_library_path = args_cli.clip

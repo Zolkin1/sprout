@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from motion_gen.motion_matching.stair_geom import stair_tread_layout
+from motion_gen.terrain.stair_geom import stair_tread_layout
 
 
 def test_depth_tiles_span_and_count():

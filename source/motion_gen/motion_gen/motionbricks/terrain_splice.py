@@ -13,7 +13,7 @@ around it, and there are two ways to do that -- the comparison this module exist
   ``*_surface_err``.
 * ``"ease"`` (the soft pin) -- **ground** the MB segment to its walkable surface (feet keep sitting on the
   platform / ground, exactly as z=0 does for a flat clip) and let
-  :func:`~motion_gen.motion_matching.playback.inertialize_seam` decay the seam discontinuity over a blend
+  :func:`~motion_gen.playback.inertialize_seam` decay the seam discontinuity over a blend
   window, the same inertialization the motion matcher applies at a cut.
 
 Both keep the terrain segment pristine and yaw+xy align the MB segment onto its boundary frame, so the only
@@ -28,8 +28,8 @@ from __future__ import annotations
 import torch
 
 from ..math_utils import quat_apply, quat_mul
-from ..motion_matching.box_clip import se2z_align
-from ..motion_matching.playback import inertialize_seam
+from ..terrain.box_clip import se2z_align  # noqa: F401  (also re-exported for keyframe transforms)
+from ..playback import inertialize_seam
 
 Segment = tuple[torch.Tensor, torch.Tensor, torch.Tensor]   # (root_pos[T,3], root_quat[T,4], joints[T,29])
 
@@ -178,6 +178,13 @@ def splice_terrain(terrain: Segment, approach: Segment | None, exit_seg: Segment
             b = match_arrival(aseg, tJ[0], z_ref, search=arrival_search)
             diag["approach_arrival_cut"] = aseg[0].shape[0] - 1 - b   # frames dropped after the arrival
             aseg = (aseg[0][:b + 1], aseg[1][:b + 1], aseg[2][:b + 1])
+        gq_a, t_a = se2z_align(aseg[0][-1], aseg[1][-1], tP[0], tQ[0])
+        # The rigid placement this side was given, kept so a caller can move things that ride ALONG with
+        # the segment but are not part of it -- the pinned keyframes the viser overlay draws, above all.
+        diag["approach_xform"] = (gq_a.tolist(), [float(t_a[0]), float(t_a[1]),
+                                                  float(t_a[2]) if approach_seam == "weld"
+                                                  else (0.0 if approach_frame == "tile"
+                                                        else float(approach_surf_z))])
         (aP, aQ, aJ), weld_z = align_boundary(
             aseg, -1, tP[0], tQ[0], ground_z=_ground(approach_seam, approach_frame, approach_surf_z))
         diag["approach_surface_err"] = _surface_err(approach_seam, approach_frame, weld_z, approach_surf_z)
@@ -201,6 +208,12 @@ def splice_terrain(terrain: Segment, approach: Segment | None, exit_seg: Segment
             j = match_overlap(eseg, tgt_p, tQ[-1], tJ[-1], search=weld_search)
         diag["exit_overlap_skip"] = j
         eseg = (eseg[0][j:], eseg[1][j:], eseg[2][j:])
+        gq_e, t_e = se2z_align(eseg[0][0], eseg[1][0], tP[-1], tQ[-1])
+        # As ``approach_xform``: the rigid placement, so things that ride ALONG with the segment (the
+        # pinned keyframes the viser overlay draws) can be moved with it.
+        diag["exit_xform"] = (gq_e.tolist(), [float(t_e[0]), float(t_e[1]),
+                                              float(t_e[2]) if exit_seam == "weld"
+                                              else (0.0 if exit_frame == "tile" else float(exit_surf_z))])
         (eP, eQ, eJ), weld_z = align_boundary(
             eseg, 0, tP[-1], tQ[-1], ground_z=_ground(exit_seam, exit_frame, exit_surf_z))
         diag["exit_surface_err"] = _surface_err(exit_seam, exit_frame, weld_z, exit_surf_z)
@@ -245,10 +258,18 @@ def footprint_recenter(Wp: torch.Tensor, boxes: list[dict], margin: float):
         float(hi[0] - lo[0]) + 2.0 * margin, float(hi[1] - lo[1]) + 2.0 * margin
 
 
+#: Optional support-structure keys an authored box may carry (``stair_tile_boxes(float_thickness=...)``,
+#: ``resolve_box_variant``).  Copied VERBATIM into the manifest overlay so the RL importer and the viewers
+#: rebuild the same sub-boxes; absent keys leave the loader on its "solid" defaults, which keeps an
+#: undecorated tile byte-identical to prior libraries.
+_VARIANT_KEYS = ("variant", "slab_thickness", "leg_size", "leg_inset")
+
+
 def overlays_for(boxes: list[dict], corner: tuple[float, float]) -> list[dict]:
     """Terrain-manifest overlay dicts for ``boxes``, shifted into the tile-local frame of ``corner``."""
     return [{"kind": "box",
              "pos_xy": [float(b["pos"][0]) - corner[0], float(b["pos"][1]) - corner[1]],
              "size_xyz": [float(v) for v in b["size"]],
              "base_z": float(b["pos"][2]) - float(b["size"][2]) / 2.0,
-             "walkable_top": True, "yaw": float(b.get("yaw", 0.0))} for b in boxes]
+             "walkable_top": True, "yaw": float(b.get("yaw", 0.0)),
+             **{k: b[k] for k in _VARIANT_KEYS if k in b}} for b in boxes]

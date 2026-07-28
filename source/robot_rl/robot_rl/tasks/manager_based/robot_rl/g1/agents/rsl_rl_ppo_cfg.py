@@ -2,8 +2,12 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-from dataclasses import MISSING
-from typing import Literal
+"""RSL-RL runner configs for the G1 offline-clip teacher.
+
+Two runners: a plain MLP PPO and a sagittal-symmetry-augmented variant.  The clips are
+full episodic motions with no gait-phase observation, so the *episodic* augmentation is
+the correct one -- there is no phase clock to negate under reflection.
+"""
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
@@ -11,25 +15,37 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoAlgorithmCfg,
     RslRlSymmetryCfg,
 )
-from .symmetry_functions import (
-    symmetric_data_augmentation_episodic,
-    symmetric_data_augmentation_half_periodic
+
+from .symmetry_functions import symmetric_data_augmentation_episodic
+
+# Shared PPO hyperparameters. Declared once so the symmetric variant differs from the
+# baseline in exactly one field (``symmetry_cfg``) rather than by a copied literal.
+_PPO_KWARGS = dict(
+    value_loss_coef=1.0,
+    use_clipped_value_loss=True,
+    clip_param=0.2,
+    entropy_coef=0.008,
+    num_learning_epochs=5,
+    num_mini_batches=4,
+    learning_rate=1.0e-3,
+    schedule="adaptive",
+    gamma=0.99,
+    lam=0.95,
+    desired_kl=0.01,
+    max_grad_norm=1.0,
 )
 
-###################################################
-# MLP
-###################################################
-##
-# Default MLP Runner
-##
+
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """Default MLP PPO runner -- what the teacher is trained with."""
+
     num_steps_per_env = 24
     max_iterations = 10000
     save_interval = 200
     experiment_name = "g1"
     empirical_normalization = False
-    logger="wandb"
+    logger = "wandb"
     wandb_project = "robot_rl"
     actor = RslRlMLPModelCfg(
         hidden_dims=[1024, 512, 256, 128],
@@ -42,20 +58,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation="elu",
         obs_normalization=False,
     )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-    )
+    algorithm = RslRlPpoAlgorithmCfg(**_PPO_KWARGS)
     resume = False
     resume_path = None
     obs_groups = {
@@ -63,186 +66,15 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         "critic": ["critic"],
     }
 
-##
-# Symmetric MLP Runner
-##
+
 @configclass
 class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
-        )
-    )
-
-##
-# Symmetric MLP Runner for Half Periodic
-##
-@configclass
-class SymmetricHalfPeriodicPPORunnerCfg(PPORunnerCfg):
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_half_periodic
-        )
-    )
-
-# Multiskill
-@configclass
-class MultiSkillSymmetricHalfPeriodicPPORunnerCfg(PPORunnerCfg):
-    actor = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
-        activation="elu",
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
-        obs_normalization=False,
-    )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_half_periodic
-        )
-    )
-
-###################################################
-# MoE
-###################################################
-##
-# Symmetric MoE Runner
-##
-@configclass
-class SymmetricMoEPPORunnerCfg(PPORunnerCfg):
-    """PPO runner config using the custom MLP model (placeholder for future MoE)."""
-    experiment_name = "g1_multiskill_arch"
-    actor = RslRlMLPModelCfg(
-        class_name="robot_rl.network.moe_network:MoEModel",
-        hidden_dims=[256, 128],
-        activation="elu",
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
-        obs_normalization=False,
-    )
-    # TODO: Try just making the critic an MLP only
-    critic = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
-        activation="elu",
-        obs_normalization=False,
-    )
-    # critic = RslRlMLPModelCfg(
-    #     class_name="robot_rl.network.moe_network:MoEModel",
-    #     hidden_dims=[256, 128],
-    #     activation="elu",
-    #     obs_normalization=False,
-    # )
+    """As :class:`PPORunnerCfg`, plus sagittal-reflection data augmentation."""
 
     algorithm = RslRlPpoAlgorithmCfg(
-        class_name="robot_rl.network.moe_ppo.MoEPPO",
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
+        **_PPO_KWARGS,
         symmetry_cfg=RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
-        )
-    )
-
-###################################################
-# Transformer
-###################################################
-##
-# Symmetric Causal Transformer Model
-##
-@configclass
-class RslRlCausalTransformerModelCfg(RslRlMLPModelCfg):
-    """Configuration for the Causal Transformer model."""
-    class_name: str = "robot_rl.network.transformer_network:CausalTransformerModel"
-    single_obs_dim: int = 96   # 72 (21-DOF) + 3*8 for the unlocked joints (joint_pos+joint_vel+action); verify at smoke
-    history_length: int = 50
-    d_model: int = 128
-    nhead: int = 4
-    num_layers: int = 4
-    dim_feedforward: int = 256
-    dropout: float = 0.0
-    # Indices below are tied to PolicyCfg declaration order in g1_clf_tracking_base.py
-    use_velocity_embedding: bool = False
-    velocity_command_start: int = 6
-    velocity_command_dim: int = 3
-
-##
-# Symmetric Causal Transformer Runner
-##
-@configclass
-class CausalTransformerPPORunnerCfg(PPORunnerCfg):
-    """PPO runner config using a causal transformer actor."""
-    experiment_name = "g1_causal_transformer"
-    obs_groups = {
-        "actor": ["unpriv_policy"],
-        "critic": ["critic"],
-    }
-    actor = RslRlCausalTransformerModelCfg(
-        hidden_dims=[256, 128],
-        activation="elu",
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
-        obs_normalization=False,
-    )
-    critic = RslRlMLPModelCfg(
-        hidden_dims=[512, 256, 128],
-        activation="elu",
-        obs_normalization=False,
-    )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.008,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-        symmetry_cfg=RslRlSymmetryCfg(
-            use_data_augmentation=True, data_augmentation_func=symmetric_data_augmentation_episodic
-        )
+            use_data_augmentation=True,
+            data_augmentation_func=symmetric_data_augmentation_episodic,
+        ),
     )

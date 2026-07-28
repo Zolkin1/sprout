@@ -149,3 +149,13 @@ def test_footprint_recenter_uses_the_geometry_as_the_datum():
     ov = overlays_for(boxes, corner)
     assert ov[0]["pos_xy"] == pytest.approx([2.0, 1.7])
     assert ov[0]["base_z"] == pytest.approx(0.0) and ov[0]["walkable_top"]
+
+
+def test_overlays_for_passes_support_variant_through():
+    """Support-structure keys authored on a box reach the manifest verbatim; absent keys stay absent."""
+    boxes = [{"pos": [2.0, 0.0, 0.1], "size": [1.0, 1.4, 0.2], "yaw": 0.0,
+              "variant": "floating", "slab_thickness": 0.05},
+             {"pos": [4.0, 0.0, 0.1], "size": [1.0, 1.4, 0.2], "yaw": 0.0}]
+    ov = overlays_for(boxes, (0.0, 0.0))
+    assert ov[0]["variant"] == "floating" and ov[0]["slab_thickness"] == pytest.approx(0.05)
+    assert "variant" not in ov[1] and "slab_thickness" not in ov[1]

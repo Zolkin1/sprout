@@ -67,6 +67,13 @@ class ClipTerrainLayout:
     tile_clip_x_offset: torch.Tensor       # [num_rows, num_tiles] x-shift of the clip within the tile
     clip_size_y: dict[int, float]          # terrain id -> ORIGINAL corridor width (flat: footprint y)
     terrain_type_code: dict[int, int]      # terrain id -> {0 flat, 1 terrain, 2 transition, 3 slope, 4 box}
+    # terrain id -> heading (rad) of the terrain's OWN frame within its tile, i.e. the direction the
+    # traversal crosses it ("downrange").  The runtime anchor mask resolves its downrange / lateral
+    # bits in this frame (see ``motion_gen.world_lift.ego_placement_masked``), so it must be AUTHORED
+    # with the terrain rather than inferred from the motion.  0.0 for every tile built today (all
+    # generators author geometry travel-along-tile-+x) and for any manifest predating the field, which
+    # reproduces world-axis masking exactly.
+    terrain_frame_yaw: dict[int, float] = field(default_factory=dict)
     # terrain id -> overlay volumes (boxes) in the tile's local-corner frame, as
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
@@ -377,6 +384,14 @@ def assemble_clip_terrain(
                       [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0, []))
     clip_size_y[_FLAT_TERRAIN_ID], type_code[_FLAT_TERRAIN_ID] = flat_fp[1], 0
 
+    # Terrain frame per terrain id (see ClipTerrainLayout.terrain_frame_yaw): AUTHORED in the
+    # manifest, defaulting to the tile's own +x so every manifest predating the field keeps the
+    # world-axis masking it was generated under.  Flat ground has no traversal axis -> 0.
+    terrain_frame_yaw: dict[int, float] = {
+        int(m["terrain_id"]): float(m.get("frame_yaw", 0.0)) for m in manifest
+    }
+    terrain_frame_yaw[_FLAT_TERRAIN_ID] = 0.0
+
     num_tiles = len(specs)
     if num_tiles == 0:
         raise ValueError("clip library manifest produced no tiles.")
@@ -441,6 +456,7 @@ def assemble_clip_terrain(
         num_rows=num_rows, num_tiles=num_tiles, tile_terrain_id=tile_tid,
         tile_corner=tile_corner, tile_footprint=tile_fp, tile_clip_x_offset=tile_cxoff,
         clip_size_y=clip_size_y, terrain_type_code=type_code,
+        terrain_frame_yaw=terrain_frame_yaw,
         terrain_overlays=terrain_overlays,
     )
     return mesh, origins, layout

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from motion_gen.motion_matching.distractor import (
+from motion_gen.terrain.distractor import (
     distractor_layout,
     occupancy_grid,
     place_boxes,

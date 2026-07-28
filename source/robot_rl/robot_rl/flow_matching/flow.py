@@ -385,6 +385,7 @@ def sample_trajectory(
     num_steps: int = 8,
     history_null_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
+    zero_noise: bool = False,
 ) -> torch.Tensor:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
@@ -402,13 +403,22 @@ def sample_trajectory(
         num_steps: Number of Euler integration steps.
         history_null_mask: Optional ``(B,)`` bool to null the history (guidance).
         generator: Optional RNG for the initial noise.
+        zero_noise: Integrate from ``x0 = 0`` instead of Gaussian noise, making the sample a
+            deterministic function of the conditioning. Off by default (Gaussian is what
+            training matches). Set it to compare two runs of the same conditioning without the
+            per-call draw masking the difference -- e.g. sim2sim, where the deploy-side
+            ``GenTrackerPolicy`` exposes the same switch. Note this is OFF the training
+            distribution: ``x0 = 0`` is not a typical draw, so treat the output as a diagnostic
+            trace rather than a representative rollout.
 
     Returns:
         Generated future window (standardized), shape ``(B, F, D)`` -- all F are novel.
     """
     b = history.shape[0]
     device = history.device
-    x = torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype, generator=generator)
+    x = (torch.zeros(b, future_len, state_dim, device=device, dtype=history.dtype) if zero_noise
+         else torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype,
+                          generator=generator))
     dt = 1.0 / num_steps
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)

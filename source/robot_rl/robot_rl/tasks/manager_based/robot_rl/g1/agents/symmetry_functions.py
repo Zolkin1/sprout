@@ -5,7 +5,8 @@
 Provides two entry points consumed by ``RslRlSymmetryCfg``:
 
 * :func:`symmetric_data_augmentation_episodic` — phase obs unchanged.
-* :func:`symmetric_data_augmentation_half_periodic` — phase obs negated.
+(A ``half_periodic`` variant that negated the phase obs existed for the gait-library
+envs; those are gone, and the clip teacher has no phase clock.)
 
 Internally both delegate to :func:`_symmetric_data_augmentation` which
 uses :class:`SagittalReflectionConfig` for config-driven dispatch rather
@@ -135,7 +136,6 @@ def _symmetric_data_augmentation(
     env,
     obs: tensordict.TensorDict,
     actions: torch.Tensor,
-    is_half_periodic: bool,
 ) -> Tuple[tensordict.TensorDict, torch.Tensor]:
     """Augment observations and actions via sagittal-plane reflection.
 
@@ -143,9 +143,6 @@ def _symmetric_data_augmentation(
         env: Isaac Lab RL vec env.
         obs: TensorDict of shape ``[batch, num_obs]``.
         actions: Tensor of shape ``[batch, num_actions]``.
-        is_half_periodic: When *True*, phase observations are negated
-            (half-periodic gait symmetry).  When *False*, they are
-            copied unchanged (episodic symmetry).
 
     Returns:
         Tuple of (augmented obs, augmented actions) each with batch
@@ -239,14 +236,13 @@ def _symmetric_data_augmentation(
                     )
 
                 elif name in cfg.phase_obs_terms:
-                    if is_half_periodic:
-                        obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                            -1 * obs[group][:, obs_idx:obs_idx + obs_size]
-                        )
-                    else:
-                        obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                            obs[group][:, obs_idx:obs_idx + obs_size]
-                        )
+                    # A gait phase clock is invariant under sagittal reflection, so it copies
+                    # through unchanged.  (The half-periodic variant negated it; that lived with
+                    # the gait-library envs and the clip teacher has no phase clock at all, so
+                    # in practice no surviving env declares a term here.)
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size]
+                    )
 
                 elif name in cfg.height_scan_obs_terms:
                     # Heightmap is a scalar field over a sensor-fixed grid that
@@ -285,7 +281,7 @@ def _symmetric_data_augmentation(
 
 
 # ---------------------------------------------------------------------------
-# Public entry points (signature unchanged for rsl_rl_ppo_cfg.py)
+# Public entry point (signature unchanged for rsl_rl_ppo_cfg.py)
 # ---------------------------------------------------------------------------
 
 def symmetric_data_augmentation_episodic(
@@ -294,13 +290,4 @@ def symmetric_data_augmentation_episodic(
     actions: torch.Tensor,
 ) -> Tuple[tensordict.TensorDict, torch.Tensor]:
     """Augment data for episodic trajectories (phase obs unchanged)."""
-    return _symmetric_data_augmentation(env, obs, actions, is_half_periodic=False)
-
-
-def symmetric_data_augmentation_half_periodic(
-    env,
-    obs: tensordict.TensorDict,
-    actions: torch.Tensor,
-) -> Tuple[tensordict.TensorDict, torch.Tensor]:
-    """Augment data for half-periodic trajectories (phase obs negated)."""
-    return _symmetric_data_augmentation(env, obs, actions, is_half_periodic=True)
+    return _symmetric_data_augmentation(env, obs, actions)

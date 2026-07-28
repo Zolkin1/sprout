@@ -60,7 +60,7 @@ class RecordingMeta:
         height_scan_dim: Number of rays ``K`` in the per-step ``height_scan`` array (0 if
             absent). The height scan is the FM's height-conditioning token (per-ray ground
             clearance from the ``height_scanner`` sensor), captured when the recording task
-            has one active (e.g. ``G1-teacher-clf-record``).
+            has one active (e.g. ``G1-teacher-clf-terrain-play``).
         depth_camera_spec: Deployment contract of the cameras that produced the ``depth``
             array -- mount, intrinsics, range and normalisation, one entry per camera in
             token order (``mdp.depth_camera_specs``). ``None`` when the recording task had

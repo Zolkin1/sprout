@@ -147,11 +147,14 @@ def build_state(
     jp = convert_joint_order(np.asarray(qpos[7:]), robot.joint_names, isaac)
     jv = convert_joint_order(np.asarray(qvel[6:]), robot.joint_names, isaac)
     state = {
-        "root_pos": np.asarray(qpos[:3], dtype=np.float64),
+        # Copies, not views: ``np.asarray`` on a float64 slice of mj_data aliases live physics,
+        # so a consumer that keeps the array (the FM history, the CSV log) would silently see the
+        # state as of whenever it reads, not as of now.
+        "root_pos": np.array(qpos[:3], dtype=np.float64, copy=True),
         "root_quat": wxyz_to_xyzw(qpos[3:7]),
         "root_lin_vel_w": lin_w,
         "root_ang_vel_w": ang_w,
-        "base_ang_vel": np.asarray(qvel[3:6], dtype=np.float64),  # body-local = Isaac base_ang_vel
+        "base_ang_vel": np.array(qvel[3:6], dtype=np.float64, copy=True),  # body-local = Isaac base_ang_vel
         "joint_pos": jp,
         "joint_vel": jv,
         "command": np.asarray(command, dtype=np.float64),
@@ -177,7 +180,14 @@ def build_state(
             offset_fwd=float(off[0]), ray_start_h=float(off[2]),
             sensor_offset=float(s.get("sensor_offset", 0.5)),
         )
-        state["height_scan"] = np.nan_to_num(clr, nan=0.0)  # misses -> 0 (flat never misses)
+        # Missed rays must match IsaacLab's encoding, NOT 0.0. Isaac's miss is ``pos_z - inf -
+        # offset`` = -inf, which sanitize_height_scan maps to -HEIGHT_SCAN_CLIP = -1.0; that is
+        # what both the teacher obs and the FM height token were trained on. Mapping a miss to
+        # 0.0 instead reads as "ground exactly at the nominal sensor plane" -- plausible flat
+        # ground where Isaac reports the band edge. Flat terrain never misses, so this was
+        # invisible until isolated (has_floor=False) stair/box tiles, where rays overshoot the
+        # tile edge and ~2-3% of them miss right at the stair transition.
+        state["height_scan"] = np.nan_to_num(clr, nan=-1.0)
         state["height_scan_hits"] = hits
     # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
     # robot's visual meshes, normalised exactly as the observation term does. One cast
@@ -194,15 +204,23 @@ def build_state(
     return state
 
 
-def load_standing_pose(path: str, isaac_joint_names: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_standing_pose(path: str, isaac_joint_names: list[str],
+                       fallback: dict[str, float] | None = None,
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Parse a ``*_config_solution.yaml`` standing config into a robot spawn state.
 
     Reads the solved standing pose from ``bezier_coeffs`` (joint angles keyed by name
     and the ``pelvis_link`` frame pose), using the first control point of each spline.
 
+    The solved configs predate the 29-DOF unlock, so they cover only the 21 original joints.
+    Any joint the file lacks is filled from ``fallback`` (the policy's own
+    ``default_joint_angles``, which IS the rest value it expects for those DOFs) rather than
+    raising -- otherwise a 29-DOF policy cannot spawn from a 21-joint standing solution.
+
     Args:
         path: Path to the standing ``config_solution.yaml``.
         isaac_joint_names: Joint order to return joint positions in (the FM/tracker order).
+        fallback: Per-joint angle for names absent from the file; missing -> 0.0.
 
     Returns:
         ``(joint_pos_isaac, base_pos, base_quat_wxyz)`` -- joints in ``isaac_joint_names``
@@ -213,7 +231,13 @@ def load_standing_pose(path: str, isaac_joint_names: list[str]) -> tuple[np.ndar
     domain = cfg["domain_sequence"][0]  # e.g. "double_support"
     bz = cfg[domain]["bezier_coeffs"]
     joints = bz["joints"]
-    jp = np.array([float(joints[n][0]) for n in isaac_joint_names], dtype=np.float64)
+    fallback = fallback or {}
+    filled = [n for n in isaac_joint_names if n not in joints]
+    if filled:
+        print(f"[INFO] standing config has no {len(filled)} joint(s) {filled}; "
+              f"using the policy's default angles for them.")
+    jp = np.array([float(joints[n][0]) if n in joints else float(fallback.get(n, 0.0))
+                   for n in isaac_joint_names], dtype=np.float64)
     pelvis = bz["frames"]["pelvis_link"]
     base_pos = np.array([0.0, 0.0, float(pelvis["pos_z"][0])], dtype=np.float64)  # re-zero x, y
     quat = np.array([float(pelvis["ori_w"][0]), float(pelvis["ori_x"][0]),
@@ -262,6 +286,31 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
+    """Centre + top height of a named box geom in the loaded scene.
+
+    Reads the geometry from the MJCF rather than re-deriving it, so it stays correct for any
+    scene ``generate_stairs_scene.py`` emits (or a hand-edited one).
+
+    Args:
+        robot: The MuJoCo robot wrapper (its model holds the scene).
+        spec: Box geom name (``box2``) or a bare index (``2`` -> ``box2``).
+
+    Returns:
+        ``(x, y, top_z)`` in world metres, or None when no such geom exists.
+    """
+    name = f"box{spec}" if spec.strip().isdigit() else spec.strip()
+    gid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_GEOM, name)
+    if gid < 0:
+        avail = [mujoco.mj_id2name(robot.mj_model, mujoco.mjtObj.mjOBJ_GEOM, i) or ""
+                 for i in range(robot.mj_model.ngeom)]
+        print(f"[WARN] no geom named {name!r}; boxes in this scene: "
+              f"{[a for a in avail if a.startswith('box')]}")
+        return None
+    pos, half = robot.mj_model.geom_pos[gid], robot.mj_model.geom_size[gid]
+    return float(pos[0]), float(pos[1]), float(pos[2] + half[2])
+
+
 def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
@@ -269,6 +318,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         cmd_max_acc: float, fm_traj_points: int,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
+        clip_spawn_z_offset: float,
+        cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
+        clip: ClipReference | None = None, clip_handoff_time: float = -1.0) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
@@ -296,12 +348,19 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             at the XML gains cannot balance the robot; a stiff, well-damped hold keeps it
             standing while the buffer fills. Wiped by the RL gains at handoff.
         hold_kv_scale: Leg kv (damping) multiplier during the hold.
+        clip_spawn_z_offset: Metres to raise the pelvis in CLIP mode. Default 0: a clip frame is
+            authored with the feet already on the terrain, and IsaacLab's reset spawns it
+            verbatim, so any lift here is a pure sim2sim mismatch -- and an expensive one. It
+            shifts the root AND every height-scan ray uniformly, and the FM's height token is
+            sensitive enough that 3 cm of lift moved its predicted window by 0.17 m. The
+            standing-spawn lift below is a different thing (it clears the solved standing pose
+            off the floor) and keeps its own default.
         spawn_z_offset: Metres to raise the spawn pelvis height above the standing-config
             value (the optimizer's pelvis frame sits ~3 cm below the MuJoCo foot-contact
             height, so without this the feet penetrate the floor and pop up).
         cmd_max_acc: Velocity-command rate limit (m/s^2, rad/s^2) applied to the live
-            command to match training. Overridden by ``max_acc`` in the tracker metadata
-            when present; ``<= 0`` disables ramping.
+            command; ``<= 0`` disables ramping (the runner's default -- see ``--cmd_max_acc``).
+            Overridden by ``max_acc`` in the tracker metadata when present.
         fm_traj_points: Number of evenly-spaced spheres drawn along the FM predicted root
             (and feet) trajectory in the viewer; ``<= 0`` draws every predicted node (a
             dense ribbon, matching the IsaacLab debug viz).
@@ -338,18 +397,40 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         # tracker immediately (no standing warmup), RL gains from the start -- matching
         # the IsaacLab reset_on_motion_sequence spawn. The FM history is filled live by
         # the clip loop's per-step observe() so a later clip->FM handoff is seamless.
-        c_pos, c_quat_wxyz, c_jp = clip.spawn_state()
+        c_pos, c_quat_wxyz, c_jp, c_vel_w, c_jv = clip.spawn_state()
         c_pos = c_pos.copy()
-        c_pos[2] += spawn_z_offset  # lift feet clear of the floor (optimizer frame offset)
+        c_pos[2] += clip_spawn_z_offset   # 0 by default: spawn EXACTLY where IsaacLab does
         hold_target = convert_joint_order(c_jp, isaac, robot.joint_names)
-        robot.set_base_and_joints(c_pos, c_quat_wxyz, hold_target)
+        # Velocities too, not just the pose: clips start mid-stride, and Isaac's reset writes
+        # root + joint velocity from ``dy_des``. Spawning at rest starts the robot a whole
+        # stride-speed behind its reference and stalls the FM history (see spawn_state).
+        robot.set_base_and_joints(c_pos, c_quat_wxyz, hold_target,
+                                  base_lin_vel_w=c_vel_w[:3], base_ang_vel_w=c_vel_w[3:6],
+                                  joint_vel_mujoco=convert_joint_order(c_jv, isaac,
+                                                                       robot.joint_names))
         robot.set_pd_gains_from_policy(policy)
         warmup_steps = 0
-        print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} pose "
-              f"(t={clip.start_step * clip.dt:.2f}s, z+{spawn_z_offset}); RL gains set.")
+        print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} state "
+              f"(t={clip.start_step * clip.dt:.2f}s, z+{clip_spawn_z_offset}, "
+              f"|v|={np.linalg.norm(c_vel_w[:3]):.2f} m/s); RL gains set.")
     elif standing_config and os.path.exists(standing_config):
-        jp_isaac, base_pos, base_quat = load_standing_pose(standing_config, isaac)
+        jp_isaac, base_pos, base_quat = load_standing_pose(
+            standing_config, isaac,
+            fallback=dict(zip(isaac, np.asarray(policy._trk.default_joint_angles).ravel())),
+        )
         base_pos[2] += spawn_z_offset  # lift feet clear of the floor (optimizer frame offset)
+        # Optionally stand ON a box instead of the floor: keep the solved standing JOINTS and
+        # just translate the base to the box top, so the pose is unchanged and only the
+        # support height moves (what a jump-off / dismount test needs as its start state).
+        if spawn_on_box is not None:
+            top = box_top(robot, spawn_on_box)
+            if top is not None:
+                bx, by, bz = top
+                base_pos = np.array([bx, by, base_pos[2] + bz], dtype=np.float64)
+                print(f"[INFO] Spawning ON box {spawn_on_box!r}: top z={bz:.3f} m at "
+                      f"(x={bx:.2f}, y={by:.2f}) -> pelvis z={base_pos[2]:.3f} m")
+            else:
+                print("[WARN] --spawn_on_box ignored (box not found); spawning on the floor.")
         hold_target = convert_joint_order(jp_isaac, isaac, robot.joint_names)
         robot.set_base_and_joints(base_pos, base_quat, hold_target)
         print(f"[INFO] Standing pose spawned + held from {standing_config}")
@@ -359,10 +440,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         hold_target = convert_joint_order(policy._trk.default_joint_angles, isaac, robot.joint_names)
     # Stiffen the legs for the hold: fixed-joint PD at the XML gains tips over (the ankles
     # alone can't balance the inverted pendulum), so a stiff, well-damped leg holds a stand.
-    if clip is None and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
+    if clip is None and warmup_time > 0 and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
         robot.scale_gains(hold_kp_scale, hold_kv_scale, name_filter=["hip", "knee", "ankle"])
         print(f"[INFO] Hold gains: leg kp x{hold_kp_scale}, kv x{hold_kv_scale} "
               "(reverts to RL gains at handoff).")
+    elif clip is None and warmup_time <= 0:
+        print("[INFO] warmup_time<=0: spawning straight into FM+tracker control "
+              "(no standing hold, no stiffened hold gains, no start-button gate).")
     if clip is None:
         warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
         if warmup_steps == 0:
@@ -377,16 +461,21 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
 
     # Manual handoff gate: in interactive (joystick) viewer runs, hold the stand until the
     # operator presses the start button, so standing can be verified before going live.
-    gate = (not headless) and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None
+    # ``warmup_time <= 0`` is an explicit request to spawn straight into FM control, so it
+    # disables the gate too -- otherwise a joystick run would still wait for a button press
+    # and "no warmup" would silently mean "hold forever until pressed".
+    gate = ((not headless) and warmup_time > 0
+            and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None)
     min_hold = max(warmup_steps, policy.ctx.N) if gate else warmup_steps
 
-    # Velocity-command rate limit, matching training. Prefer the value embedded in the
-    # tracker metadata; otherwise fall back to --cmd_max_acc (the clip-library ramp rate).
+    # Velocity-command rate limit. Prefer the value embedded in the tracker metadata (the rate
+    # the policy trained with, so sim2sim can't silently drift from training); otherwise use
+    # --cmd_max_acc, which defaults to 0 = disabled.
     meta_max_acc = policy._trk.params.get("max_acc")
     eff_max_acc = meta_max_acc if meta_max_acc is not None else cmd_max_acc
     print(f"[INFO] Command rate limit: {eff_max_acc} "
-          f"({'from tracker metadata' if meta_max_acc is not None else 'from --cmd_max_acc default'})"
-          + ("" if eff_max_acc and eff_max_acc > 0 else " (disabled)"))
+          f"({'from tracker metadata' if meta_max_acc is not None else 'from --cmd_max_acc'})"
+          + ("" if eff_max_acc and eff_max_acc > 0 else " -- DISABLED, raw command passes through"))
 
     ee_names = list(policy.ctx.target_frame_names)
     jp_cols = [c for jn in isaac for c in (f"jpref_{jn}", f"jpact_{jn}")]
@@ -402,6 +491,14 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     if log_path:
         log_file = open(log_path, "w", newline="")
         writer = csv.writer(log_file)
+        # Height scan is a 176-vector per step: too wide for the CSV, so it streams to a
+        # sibling .npy (<log>.scan.npy) that the sim2sim comparison loads alongside.
+        scan_rows: list[np.ndarray] = []
+        # Per-step FM predicted WINDOW (root + extra frames), so a viewer can replay what the
+        # generator actually emitted at each step rather than only the one frame that was
+        # applied. Padded with NaN before the generator has a valid prediction.
+        pred_rows: list[np.ndarray] = []
+        predf_rows: list[np.ndarray] = []
         writer.writerow(["time", "cmd_vx", "cmd_vy", "cmd_wz", "vx_b", "vy_b", "wz_b",
                          "pos_err", "ori_err", "joint_pos_err",
                          "ref_pos_x", "ref_pos_y", "ref_pos_z", "act_pos_x", "act_pos_y", "act_pos_z",
@@ -411,7 +508,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         # Sidecar metadata for the metrics module (joint order + effort limits + EE frames).
         log_meta = {"joint_names_isaac": isaac, "effort_limits": effort_limits,
                     "ee_frame_names": ee_names, "dt": policy.get_dt(),
-                    "fm_update_every": policy.fm_update_every}
+                    "fm_update_every": policy.fm_update_every,
+                    "zero_noise": bool(getattr(policy, "zero_noise", False)),
+                    "cmd_max_acc": float(eff_max_acc or 0.0)}
         log_meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
         with open(log_meta_path, "w") as mf:
             yaml.dump(log_meta, mf, default_flow_style=False, sort_keys=False)
@@ -462,6 +561,15 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 rb = quat_apply(inv_root, ref_fp[k] - root_pos)
                 ab = quat_apply(inv_root, act_fp[k] - root_pos)
                 ee_vals += [rb[0], rb[1], rb[2], ab[0], ab[1], ab[2]]
+        if "height_scan" in state:
+            scan_rows.append(np.asarray(state["height_scan"], dtype=np.float32).ravel())
+        f_len, k_fr = int(policy.ctx.F), len(ee_names)
+        if policy._pred_valid:
+            pred_rows.append(np.asarray(policy._pred["root_pos"][0], dtype=np.float32))
+            predf_rows.append(np.asarray(policy._pred["frame_pos"][0], dtype=np.float32))
+        else:
+            pred_rows.append(np.full((f_len, 3), np.nan, dtype=np.float32))
+            predf_rows.append(np.full((f_len, k_fr, 3), np.nan, dtype=np.float32))
         writer.writerow([robot.mj_data.time, *state["command"].tolist(),
                          float(lin_b[0]), float(lin_b[1]), float(state["base_ang_vel"][2]),
                          pos_err, ori_err, jp_err,
@@ -668,6 +776,15 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     if log_file:
         log_file.close()
         print(f"[INFO] Wrote metrics log to {log_path}")
+        if scan_rows:
+            scan_path = f"{log_path}.scan.npy"
+            np.save(scan_path, np.stack(scan_rows))
+            print(f"[INFO] Wrote {len(scan_rows)} height-scan rows to {scan_path}")
+        if pred_rows:
+            np.save(f"{log_path}.pred.npy", np.stack(pred_rows))
+            np.save(f"{log_path}.predf.npy", np.stack(predf_rows))
+            print(f"[INFO] Wrote {len(pred_rows)} FM predicted windows (root + "
+                  f"{len(ee_names)} frames) to {log_path}.pred.npy / .predf.npy")
     if log_meta is not None:
         # Re-dump now that the actual FM-handoff time is known (None if the FM never
         # took over, e.g. clip-only playback) so the metrics plots can mark the transition.
@@ -693,10 +810,31 @@ def main() -> None:
     parser.add_argument("--fm_update_every", type=int, default=2,
                         help="Generator re-inference cadence (control steps). Fallback only: "
                              "overridden by 'fm_update_every' in the tracker metadata if present.")
+    # FM sampler noise. Zero noise is the sim2sim DEFAULT because it visibly tracks better in
+    # MuJoCo than drawing x0 ~ N(0, I); the deploy library default stays Gaussian, so hardware
+    # keeps the training-matched stochastic sampling unless it opts in too.
+    noise_group = parser.add_mutually_exclusive_group()
+    noise_group.add_argument("--zero_noise", dest="zero_noise", action="store_true", default=True,
+                             help="Integrate the flow from x0 = 0 instead of x0 ~ N(0, I): one "
+                                  "fixed, fully deterministic FM trajectory per conditioning. "
+                                  "DEFAULT in this runner (chosen empirically -- it looks better "
+                                  "in MuJoCo); pass --gaussian_noise for the trained behaviour.")
+    noise_group.add_argument("--gaussian_noise", dest="zero_noise", action="store_false",
+                             help="Draw the sampler's x0 ~ N(0, I) -- the stochastic sampling the "
+                                  "FM was trained for and what transfer/deploy uses on hardware. "
+                                  "Turns off the zero-noise default.")
     parser.add_argument("--total_time", type=float, default=-1.0)
+    parser.add_argument("--spawn_on_box", type=str, default=None, metavar="NAME_OR_INDEX",
+                        help="Spawn standing on top of a scene box instead of the floor, e.g. "
+                             "'--spawn_on_box 2' or '--spawn_on_box box2' (the generated "
+                             "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
+                             "standing joint pose is kept; only the support height changes. "
+                             "Pair with --warmup_time 0 to hand straight to the FM on the box.")
     parser.add_argument("--warmup_time", type=float, default=1.0,
-                        help="Seconds to PD-hold a stand before live control (0 disables; "
-                             "always at least the FM history window).")
+                        help="Seconds to PD-hold a stand before live control. Pass 0 to spawn "
+                             "DIRECTLY into FM+tracker control: the FM history is warm-started "
+                             "from the spawn state, the leg hold-gain stiffening is skipped, and "
+                             "the joystick start-button gate is disabled.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
     parser.add_argument("--headless", action="store_true", default=False)
@@ -715,13 +853,30 @@ def main() -> None:
                              "balance the robot); reverts to RL gains at handoff.")
     parser.add_argument("--hold_kv_scale", type=float, default=8.0,
                         help="Leg kv (damping) multiplier during the standing hold.")
+    parser.add_argument("--clip_spawn_z_offset", type=float, default=0.0,
+                        help="Pelvis lift in clip mode (default 0 = spawn exactly on the clip "
+                             "frame, matching IsaacLab). Non-zero desynchronises the two sims' "
+                             "root height AND their whole height scan.")
     parser.add_argument("--spawn_z_offset", type=float, default=0.03,
                         help="Metres to raise the spawn pelvis above the standing-config height "
                              "(optimizer frame sits ~3 cm below the MuJoCo foot-contact height).")
-    parser.add_argument("--cmd_max_acc", type=float, default=2.0,
-                        help="Velocity-command rate limit (m/s^2, rad/s^2) to match training; "
-                             "the clip library ramps at 2.0. Overridden by tracker metadata "
-                             "'max_acc' if present; <=0 disables.")
+    parser.add_argument("--cmd_max_acc", type=float, default=0.0,
+                        help="Velocity-command rate limit (m/s^2, rad/s^2) on the live command. "
+                             "DEFAULT 0 = DISABLED: the raw joystick/profile command passes "
+                             "straight through (chosen empirically -- it looks better in MuJoCo). "
+                             "Pass 2.0 to match the clip library's training ramp rate. Overridden "
+                             "by tracker metadata 'max_acc' when that key is present.")
+    nh = parser.add_mutually_exclusive_group()
+    nh.add_argument("--null_history_warmup", dest="null_history_warmup", action="store_true",
+                    default=True,
+                    help="Sample the FM from step 0 using its learned null-history embedding "
+                         "while the N-step window fills (default; matches the RL side's "
+                         "fm_null_history_warmup). Needs an fm.onnx exported with the "
+                         "history_null input.")
+    nh.add_argument("--no_null_history_warmup", dest="null_history_warmup",
+                    action="store_false",
+                    help="Legacy: withhold the FM until the history window is full, fabricating "
+                         "a repeated static history at spawn.")
     parser.add_argument("--fm_traj_points", type=int, default=0,
                         help="Number of spheres drawn along the FM predicted root/feet trajectory; "
                              "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
@@ -749,6 +904,9 @@ def main() -> None:
                         help="In --clip mode, sim time (s) to hand the reference off from the clip "
                              "to the FM generator. Omit (default) for clip-only playback; pass a "
                              "value inside the clip (e.g. 8.0) for a clip->FM handoff run.")
+    parser.add_argument("--clip_id", type=int, default=0,
+                        help="In --clip mode, which clip of the library to play (default 0). Must "
+                             "match the Isaac side for a like-for-like sim2sim comparison.")
     parser.add_argument("--clip_start_time", type=float, default=0.0,
                         help="In --clip mode, seconds into the clip to begin playback (default 0). "
                              "The robot spawns on the clip pose at this time and the reference is "
@@ -759,6 +917,10 @@ def main() -> None:
                              "periodically re-place the clip onto the robot's current root (planar "
                              "pos + heading), matching the teacher's ego-anchored training. Default "
                              "(off) is the world-anchored fixed-placement clip.")
+    parser.add_argument("--keep_xml_gains", action="store_true", default=False,
+                        help="Keep the MJCF's hand-written actuator kp/kv instead of the gains "
+                             "the policy exported. Default OFF: the trained gains win, so a "
+                             "retune in training reaches sim2sim without editing the XML.")
     parser.add_argument("--clip_ego_anchor_every", type=int, default=10,
                         help="Re-anchor cadence (control steps) for --clip_ego_anchor; should match "
                              "the teacher's ego_anchor_every (default 10, ~0.2s at dt=0.02).")
@@ -792,11 +954,18 @@ def main() -> None:
 
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
+        zero_noise=args.zero_noise,
+        null_history_warmup=args.null_history_warmup,
     )
     policy.load()
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
+    # Drive the MuJoCo servos with the gains the policy actually TRAINED with (exported in
+    # policy_parameters.yaml) rather than the MJCF's hand-written ones, so retuning gains in
+    # training propagates to sim2sim with no XML edit. Skip with --keep_xml_gains.
+    if not args.keep_xml_gains:
+        robot.apply_policy_gains(policy.get_kp(), policy.get_kd(), policy.get_joint_names())
     if args.use_ic:
         robot.set_initial_condition(policy._trk)
 
@@ -835,6 +1004,7 @@ def main() -> None:
         clip_path = args.clip if os.path.isabs(args.clip) else os.path.join(root_dir, args.clip)
         clip = ClipReference(clip_path, policy.get_joint_names(),
                              list(policy.ctx.target_frame_names), policy.base_frame_name,
+                             clip_id=args.clip_id,
                              start_time=args.clip_start_time,
                              ego_anchor=args.clip_ego_anchor,
                              ego_anchor_every=args.clip_ego_anchor_every)
@@ -870,6 +1040,10 @@ def main() -> None:
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
                   args.warmup_time, args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
+                  args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
+                  args.cmd_max_acc, args.fm_traj_points,
+                  spawn_on_box=args.spawn_on_box,
+                  clip=clip, clip_handoff_time=clip_handoff_time)
                   args.hold_kv_scale, args.spawn_z_offset, args.cmd_max_acc, args.fm_traj_points,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)

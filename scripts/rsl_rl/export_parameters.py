@@ -258,11 +258,6 @@ def export_policy_parameters(env, obs, actions, save_dir):
             if getattr(term_cfg, 'clip', None) is not None:
                 term_info["clip"] = [float(term_cfg.clip[0]), float(term_cfg.clip[1])]
 
-            # Export frequency_list for multiskill_phase terms
-            term_params = getattr(term_cfg, 'params', None)
-            if term_params and 'frequency_list' in term_params:
-                term_info["frequency_list"] = term_params['frequency_list']
-
             obs_info["policy"][term_name] = term_info
 
     params["observation_terms"] = obs_info
@@ -343,11 +338,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
             if isinstance(cam.get(key), list):
                 cam[key] = FlowStyleList(cam[key])
 
-    # Convert all scale and frequency_list lists in observation_terms to flow style
+    # Convert scale / clip / shape lists in observation_terms to flow style
     if 'observation_terms' in params:
         for group_name, group_terms in params['observation_terms'].items():
             for term_name, term_info in group_terms.items():
-                for key in ('scale', 'frequency_list', 'clip', 'shape'):
+                for key in ('scale', 'clip', 'shape'):
                     if isinstance(term_info.get(key), list):
                         term_info[key] = FlowStyleList(term_info[key])
 

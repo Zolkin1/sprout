@@ -9,8 +9,8 @@ import os
 import pytest
 import torch
 
-from motion_gen.motion_matching import features as F
-from motion_gen.motion_matching.motion_db import BONES, TRAJOPT, MotionDB, MotionSource
+from motion_gen import features as F
+from motion_gen.ingest.motion_db import BONES, TRAJOPT, MotionDB, MotionSource
 
 _HAVE_MJCF = os.path.isfile(F.DEFAULT_MJCF)
 pytestmark = pytest.mark.skipif(not _HAVE_MJCF, reason="G1 MJCF not found")

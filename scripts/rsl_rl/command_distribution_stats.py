@@ -76,8 +76,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from recorded_data_io import load_recorded_data  # noqa: E402
 
 # Default velocity buckets for skill inference on recorded data (no stored
-# skill labels). Mirrors ``g1_walk_run_env_cfg`` / ``g1_clf_multiskill_base``:
-# only lin_vel_x is partitioned; lin_vel_y / ang_vel_z default to (0, 0). Order
+# skill labels). Mirrors the walk/run bucket split the retired online multi-skill
+# command used: only lin_vel_x is partitioned; lin_vel_y / ang_vel_z default to (0, 0). Order
 # defines the integer skill ids and the lowest-index tie-break. Override with
 # ``--buckets-json`` for other tasks (e.g. terrain skills, lateral/yaw ranges).
 DEFAULT_BUCKETS: dict[str, dict[str, tuple[float, float]]] = {

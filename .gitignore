@@ -127,3 +127,9 @@ claude_plans/
 
 # Diagnostic plot outputs (regenerable)
 /plots/
+
+# Per-case sim2sim scenes emitted by compare_sim2sim.py --stage prep. The geometry is the
+# exact overlay boxes of whichever clip tile that run picked, so the contents depend on the
+# library passed in -- regenerate them, don't track them. (The hand-authored scenes next to
+# them, e.g. g1_29j_terrain_scene.xml, ARE tracked.)
+transfer/sim/robots/g1/*_s2s_*_scene.xml

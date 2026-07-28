@@ -12,7 +12,7 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Config for :class:`MotionSequenceCommand`.
 
     ``path`` points at a dense clip-library ``.h5`` (produced by
-    ``scripts/rsl_rl/generate_clips.py``), not a stride-library folder.
+    ``scripts/rsl_rl/generate_mb_library.py``), not a stride-library folder.
     The conditioner / gate / skill-bucket fields of the multi-skill command
     do not apply -- a clip is tracked open-loop by a step index.
     """
@@ -55,7 +55,7 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     per reset (like the tracker's FM bucket).  ``0.0`` (default) keeps every env on
     the fixed world placement chosen at reset."""
 
-    ego_anchor_every: int = 25
+    ego_anchor_every: int = 12
     """Re-anchor cadence in control steps for ego-anchored envs: the clip is
     re-placed on the robot's root every this many steps (a receding-horizon
     re-plan).  Smaller = more frequent, smaller per-step reference jumps.  Only

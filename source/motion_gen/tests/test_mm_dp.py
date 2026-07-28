@@ -19,7 +19,7 @@ import torch
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
 from motion_gen.motion_matching.graph import VARIED, GraphConfig, build_candidate_graph
-from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
+from motion_gen.features import G1_JOINT_NAMES as _G1_JN
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
 
 _NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width

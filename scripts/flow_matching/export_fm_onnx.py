@@ -72,18 +72,26 @@ class _FmSamplerOnnx(nn.Module):
         extero: torch.Tensor,
         cmd_tokens: torch.Tensor,
         noise: torch.Tensor,
+        history_null: torch.Tensor,
     ) -> torch.Tensor:
-        """Normalize the conditioning, Euler-sample the F future from ``noise``, denormalize."""
+        """Normalize the conditioning, Euler-sample the F future from ``noise``, denormalize.
+
+        ``history_null`` is a ``(V, 1)`` float flag (>0.5 = null) rather than a bool, because a
+        bool graph input is awkward across runtimes; it selects the model's learned
+        ``null_history`` embedding in place of the history content. That is what lets the
+        deployed generator sample before its history window has filled, matching the RL side.
+        """
         hist_n = (history - self.s_mean) / self.s_std        # (V, N, D)
         height_n = (extero - self.h_mean) / self.h_std       # (V, T*extero_dim)
         cmd_n = (cmd_tokens - self.c_mean) / self.c_std      # (V, n_cmd, cmd)
+        null_m = (history_null.reshape(-1) > 0.5)            # (V,) bool
 
         x = noise                                            # (V, F, D) -- all F denoised
         dt = 1.0 / self.num_steps
         for i in range(self.num_steps):
             # Batch-derived tau (V,) so the graph stays dynamic in the batch axis.
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
-            v = self.model(x, tau, hist_n, height_n, cmd_n)
+            v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
             x = x + dt * v
         return x * self.s_std + self.s_mean
 
@@ -102,6 +110,10 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "extero_source": str(ctx.extero_source),
         "extero_tokens": int(ctx.model.extero_tokens),
         "extero_spec": ctx.extero_spec,
+        # Signals to the deploy side that the graph accepts the history_null input, so it can
+        # sample with the learned null embedding before its history fills. Absent in graphs
+        # exported before that input existed.
+        "has_history_null": True,
     }
 
 
@@ -117,6 +129,9 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     # (2 x 780 depth). The model reshapes to (B, T, height_dim) internally.
     edim = int(ctx.model.extero_tokens) * int(ctx.model.height_dim)
     dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd), torch.randn(v, f, d))
+    hdim = int(ctx.model.height_dim)  # height-scan width (176), not 1
+    dummy = (torch.randn(v, n, d), torch.randn(v, hdim), torch.randn(v, n_cmd, cmd),
+             torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
     # dim on TransformerEncoder, whereas the newer dynamo path baked a static batch
@@ -124,8 +139,9 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     torch.onnx.export(
         wrapper, dummy, out_path,
         export_params=True, opset_version=opset, dynamo=False,
-        input_names=["history", "extero", "cmd_tokens", "noise"], output_names=["trajectory"],
-        dynamic_axes={k: {0: "V"} for k in ("history", "extero", "cmd_tokens", "noise", "trajectory")},
+        input_names=["history", "extero", "cmd_tokens", "noise", "history_null"], output_names=["trajectory"],
+        dynamic_axes={k: {0: "V"} for k in ("history", "extero", "cmd_tokens", "noise", "trajectory", "history_null")},
+        output_names=["trajectory"],
     )
 
     meta = _fm_meta(ctx)

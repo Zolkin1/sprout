@@ -1,18 +1,19 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 teacher on terrain: terrain-aware open-loop motion-clip tracking (stairs).
+"""G1 teacher on terrain: the concrete open-loop motion-clip tracking env.
 
-Terrain counterpart to :mod:`g1_teacher_env_cfg`.  The scene ground is a
-:class:`ClipTerrainImporter` assembled from the SAME clip library the command
-tracks (one tile per staircase / transition terrain + flat patches), so every env
-is pinned to a tile with a known ``terrain_id``.  At reset,
+Supplies the ground for the abstract :mod:`g1_teacher_env_cfg`.  The scene ground is a
+:class:`ClipTerrainImporter` assembled from the SAME clip library the command tracks (one
+tile per staircase / box / transition terrain + flat patches), so every env is pinned to a
+tile with a known ``terrain_id``.  At reset,
 :func:`mdp.reset_on_terrain_motion_sequence` gives each env a clip whose per-clip
 ``terrain_id`` matches its tile and places it so the reference feet ride the treads.
 
-Everything else is inherited from the flat teacher unchanged: the open-loop
-clip-tracking command, the CLF rewards, the base-relative / heading-invariant policy
-observations, and the pelvis height scan -- which now rides the staircase mesh and
-gives the policy its terrain shape.
+A flat run is simply a library whose tiles are flat -- there is no separate flat env.
+
+Everything else is inherited unchanged: the open-loop clip-tracking command, the CLF
+rewards, the base-relative / heading-invariant policy observations, and the pelvis height
+scan -- which rides the staircase mesh and gives the policy its terrain shape.
 
 Envs are spread uniformly across all terrains from step 0 (no difficulty
 curriculum): the base importer's ``terrain_types`` assignment already gives every
@@ -33,10 +34,11 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer_cfg im
 
 from .g1_teacher_env_cfg import G1TeacherEnvCfg, G1TeacherSceneCfg
 
-# Default terrain clip library (staircases + transitions + flat patches), generated
-# with scripts/rsl_rl/generate_terrain_clips.py at the env control dt (0.02).  The
-# terrain mesh AND the tracked clips both come from this one file.
-DEFAULT_TERRAIN_CLIP_PATH = "clips/g1_terrain_v3.h5"
+# There is deliberately NO default terrain clip library: the terrain mesh AND the tracked
+# clips both come from one ``.h5``, and a stale default silently trains on the wrong terrain
+# (the old ``clips/g1_terrain_v2.h5`` also predates the per-clip anchor mask, so every clip
+# resolved to the LEGACY x/y/z/yaw-free mask and the reference detached from its staircase).
+# Pass the library explicitly with ``--clip <lib.h5>``; it sets both fields at once.
 
 
 ##
@@ -50,13 +52,12 @@ class G1TeacherTerrainSceneCfg(G1TeacherSceneCfg):
     :class:`ClipTerrainImporterCfg` that assembles one tile per terrain from the clip
     library's manifest.  The inherited ``height_scanner`` already targets
     ``/World/ground`` -- where the importer imports its mesh -- so it raycasts the
-    staircases with no change.  ``clip_library_path`` is re-pinned to the command's
-    library in :meth:`G1TeacherTerrainEnvCfg.__post_init__` (single source of truth).
+    staircases with no change.  ``clip_library_path`` is left MISSING: ``--clip`` sets it
+    (and the command's ``path``) to the one library both must read.
     """
 
     terrain = ClipTerrainImporterCfg(
         prim_path="/World/ground",
-        clip_library_path=DEFAULT_TERRAIN_CLIP_PATH,
         # num_flat_tiles left as None -> derived from the library's generation metadata
         # (generator_config.counts.flat), so flat/terrain/transition tile counts match
         # the split you generated with (total tiles == num_terrains) and envs are spread
@@ -95,21 +96,15 @@ class G1TeacherTerrainEnvCfg(G1TeacherEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # The ClipTerrainImporter builds its mesh from clip_library_path and IGNORES
-        # terrain_type / terrain_generator; the parent set the flat mesh on them, so
-        # clear the flat generator to avoid confusion.
-        self.scene.terrain.terrain_generator = None
         # Terrain-aware clip sampling: each env gets a clip matching its tile terrain.
+        # The library is REQUIRED from the CLI (``--clip``), which sets the command's
+        # ``path`` and ``scene.terrain.clip_library_path`` together -- the importer
+        # (terrain mesh + per-env terrain_id) and the command (clip tracking) MUST read
+        # the same file, or the tile terrain ids won't line up with the clips'. Both are
+        # verified non-empty and identical at env build (ClipTerrainImporter /
+        # MotionSequenceCommand / reset_on_terrain_motion_sequence); this cfg hook runs
+        # BEFORE the CLI override, so it cannot check them itself.
         self.events.reset_on_clip.func = mdp.reset_on_terrain_motion_sequence
-        # Single clip-library source of truth: the importer (terrain mesh + per-env
-        # terrain_id) and the command (clip tracking) MUST read the same file, or the
-        # tile terrain ids won't line up with the clips' terrain ids.
-        self.commands.traj_ref.path = DEFAULT_TERRAIN_CLIP_PATH
-        self.scene.terrain.clip_library_path = DEFAULT_TERRAIN_CLIP_PATH
-        assert self.commands.traj_ref.path == self.scene.terrain.clip_library_path, (
-            "terrain clip library (scene.terrain.clip_library_path) and command clip "
-            "library (commands.traj_ref.path) must be the same file."
-        )
         # Clips are baked axis-aligned with their staircase, so placement is a pure
         # translation onto the tile -- no reset heading randomization.
         self.commands.traj_ref.randomize_heading = False

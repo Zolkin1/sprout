@@ -19,8 +19,8 @@ sideways / diagonal command, not just forward.
 
 from __future__ import annotations
 
-from .bones_ingest import load_cache
-from .clean_ingest import _resolve_dir, ingest_clean_library
+from ..ingest.bones_ingest import load_cache
+from ..ingest.clean_ingest import _resolve_dir, ingest_clean_library
 from .dp import DPConfig, DPMatcher
 from .graph import _GRAPH_CACHE_VERSION, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_path
 from .vanilla import POSE_POSTURAL_IDX, VanillaConfig

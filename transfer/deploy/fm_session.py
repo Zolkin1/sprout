@@ -54,6 +54,12 @@ class FmContext:
     def extero_dim(self) -> int:
         """Flat width of the exteroception input, ``extero_tokens * height_dim``."""
         return self.extero_tokens * self.height_dim
+    has_history_null: bool = False
+    """Whether the graph accepts the ``history_null`` input (learned null-history embedding).
+
+    False for an ``fm.onnx`` exported before that input existed; the caller must then fall back
+    to withholding the generator until its history window fills, and cannot match the RL side's
+    step-0 behaviour. Re-export with ``export_fm_onnx.py`` to enable it."""
 
     @property
     def frame_names(self) -> list[str]:
@@ -64,6 +70,9 @@ class FmContext:
     def num_extra_frames(self) -> int:
         """Alias for the predicted (target) extra-frame count."""
         return self.target_num_extra_frames
+
+
+_WARNED_NO_NULL = False
 
 
 def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
@@ -83,6 +92,8 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         ground_z=float(m.get("ground_z", 0.0)), height_dim=int(m.get("height_dim", 1)),
         extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
         extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
+        # Trust the graph itself over the metadata flag: an input either exists or it does not.
+        has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
     )
 
 
@@ -168,7 +179,7 @@ def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
     return future_cmd[:, ctx.cmd_steps, :]
 
 
-def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, noise) -> dict:
+def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, noise, history_null=None) -> dict:
     """Run the ONNX sampler and lift the predicted F-step future to the world frame.
 
     All F frames are predicted FUTURE (node 0 = the current step, base offset ~= 0),
@@ -184,6 +195,10 @@ def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, nois
         p_ref: World anchor position ``(V, 3)`` (the current robot base position).
         q_ref: World anchor quaternion ``(V, 4, xyzw)``.
         noise: Sampling noise ``(V, F, D)`` (caller-supplied for determinism).
+        history_null: Optional ``(V,)`` bool/float; where set, the graph swaps the history
+            content for the learned ``null_history`` embedding, so the generator can be sampled
+            before its history window has filled. Silently ignored (with a one-time warning) on
+            a graph exported without the ``history_null`` input.
 
     Returns:
         World-frame prediction dict (same keys as ``transfer/fm`` ``sample_world``).
@@ -194,6 +209,17 @@ def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, nois
         "cmd_tokens": cmd_tokens.astype(np.float32),
         "noise": noise.astype(np.float32),
     }
+    if ctx.has_history_null:
+        nz = (np.zeros((history.shape[0], 1), dtype=np.float32) if history_null is None
+              else np.asarray(history_null, dtype=np.float32).reshape(-1, 1))
+        feed["history_null"] = nz
+    elif history_null is not None and np.any(history_null):
+        global _WARNED_NO_NULL
+        if not _WARNED_NO_NULL:
+            print("[WARN fm_session] This fm.onnx has no 'history_null' input, so the learned "
+                  "null-history embedding cannot be used; the generator will condition on a "
+                  "not-yet-full history window. Re-export with export_fm_onnx.py.")
+            _WARNED_NO_NULL = True
     pred = ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D) denormalized rel-state
 
     v, f, k = pred.shape[0], ctx.F, ctx.target_num_extra_frames
