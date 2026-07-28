@@ -136,7 +136,6 @@ def _symmetric_data_augmentation(
     env,
     obs: tensordict.TensorDict,
     actions: torch.Tensor,
-    is_half_periodic: bool,
 ) -> Tuple[tensordict.TensorDict, torch.Tensor]:
     """Augment observations and actions via sagittal-plane reflection.
 
@@ -144,9 +143,6 @@ def _symmetric_data_augmentation(
         env: Isaac Lab RL vec env.
         obs: TensorDict of shape ``[batch, num_obs]``.
         actions: Tensor of shape ``[batch, num_actions]``.
-        is_half_periodic: When *True*, phase observations are negated
-            (half-periodic gait symmetry).  When *False*, they are
-            copied unchanged (episodic symmetry).
 
     Returns:
         Tuple of (augmented obs, augmented actions) each with batch
@@ -240,14 +236,13 @@ def _symmetric_data_augmentation(
                     )
 
                 elif name in cfg.phase_obs_terms:
-                    if is_half_periodic:
-                        obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                            -1 * obs[group][:, obs_idx:obs_idx + obs_size]
-                        )
-                    else:
-                        obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
-                            obs[group][:, obs_idx:obs_idx + obs_size]
-                        )
+                    # A gait phase clock is invariant under sagittal reflection, so it copies
+                    # through unchanged.  (The half-periodic variant negated it; that lived with
+                    # the gait-library envs and the clip teacher has no phase clock at all, so
+                    # in practice no surviving env declares a term here.)
+                    obs_aug[group][batch_size:, obs_idx:obs_idx + obs_size] = (
+                        obs[group][:, obs_idx:obs_idx + obs_size]
+                    )
 
                 elif name in cfg.height_scan_obs_terms:
                     # Heightmap is a scalar field over a sensor-fixed grid that
@@ -295,4 +290,4 @@ def symmetric_data_augmentation_episodic(
     actions: torch.Tensor,
 ) -> Tuple[tensordict.TensorDict, torch.Tensor]:
     """Augment data for episodic trajectories (phase obs unchanged)."""
-    return _symmetric_data_augmentation(env, obs, actions, is_half_periodic=False)
+    return _symmetric_data_augmentation(env, obs, actions)

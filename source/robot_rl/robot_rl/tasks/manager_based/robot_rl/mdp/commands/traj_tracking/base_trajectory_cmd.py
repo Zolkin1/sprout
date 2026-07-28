@@ -28,7 +28,6 @@ from isaaclab.utils.math import (
 from .clf import CLF
 from motion_gen.manager_base import ManagerBase
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
-from .terrain_aware_ref import apply_terrain_aware_ref
 from motion_gen.trajectory_manager import TrajectoryType
 from .world_lift_isaac import lift_base_world_state
 
@@ -201,33 +200,20 @@ class BaseTrajectoryCommand(CommandTerm):
                 raise ValueError(f"Velocity output name '{vel_name}' not found in position output names.")
 
         # --- Reference frames ---------------------------------------------
-        # The foot STANCE reference-frame path (``get_measured_outputs``) re-anchors a clip to a
-        # planted foot and is used ONLY by the online CLF commands, whose reference frames ARE
-        # contact bodies.  The teacher / FM tracker anchor via the per-DOF anchor mask (world or
-        # periodic ego re-anchoring) and declare a NON-contact reference frame (e.g. pelvis_link);
-        # for those the stance bookkeeping is skipped -- ``uses_stance_ref`` gates it.
+        # The foot-STANCE reference-frame paradigm is gone: it re-anchored a clip to a planted
+        # foot and belonged to the online CLF commands, whose reference frames WERE contact
+        # bodies.  Clips are now world-anchored or periodically ego-anchored through the per-DOF
+        # anchor mask, and declare a NON-contact reference frame (e.g. pelvis_link).  What is
+        # left here is just the name -> output-index resolution the reference frames need.
         #
-        # TODO(foot-ref-frame removal / "scope 2"): the whole foot-stance paradigm is slated for
-        # deletion -- clips should be world-anchored OR periodically ego-anchored via the anchor
-        # mask, nothing else.  This ``uses_stance_ref`` guard is the interim decouple (scope 1) so
-        # the teacher/tracker work now.  Scope 2 = delete ``get_measured_outputs`` +
-        # ``terrain_aware_ref.py`` + this stance bookkeeping + manager ``ref_frame`` + the clip-io
-        # ``ref_frame`` meta, which requires removing the online CLF commands
-        # (TrajectoryCommand / BatchedMultiSkillCommand) that still use it -- see the
-        # remove-online-multiskill effort.
+        # (This completes the "foot-ref-frame removal / scope 2" TODO: ``get_measured_outputs``,
+        # ``terrain_aware_ref.py`` and the ``uses_stance_ref`` / ``ref_to_contact_idx``
+        # bookkeeping are all deleted.  The manager ``ref_frame`` and the clip-io ``ref_frame``
+        # metadata do survive -- they still name the frame a clip's poses are expressed
+        # relative to, which is independent of how the clip is anchored.)
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(
             self.manager.get_reference_frames()
         )
-        self.uses_stance_ref = all(rf in self.contact_bodies for rf in self.ref_frames)
-        if self.uses_stance_ref:
-            # Mapping from ref_frames to contact_bodies indices (needed by get_symmetric_contacts).
-            self.ref_to_contact_idx = torch.zeros(len(self.ref_frames), dtype=torch.long, device=self.device)
-            for i, ref_frame in enumerate(self.ref_frames):
-                self.ref_to_contact_idx[i] = self.contact_bodies.index(ref_frame)
-        else:
-            # World / ego (anchor-mask) anchoring only: no stance-frame contact tracking.
-            self.ref_to_contact_idx = torch.zeros(0, dtype=torch.long, device=self.device)
-
         # Current reference frame poses — [N, 7] = [pos_x, pos_y, pos_z, qx, qy, qz, qw].
         # Always allocated: the teacher / tracker reuse this as the clip WORLD-placement scratch
         # (see motion_sequence_cmd._clip_world_frames), independent of the stance path.
@@ -292,85 +278,6 @@ class BaseTrajectoryCommand(CommandTerm):
     # ------------------------------------------------------------------
     # Measured outputs
     # ------------------------------------------------------------------
-
-    # TODO(foot-ref-frame removal / "scope 2"): this method IS the foot-stance re-anchoring
-    # paradigm (planted-foot refresh gate + apply_terrain_aware_ref).  Only the online CLF
-    # commands call it; the teacher/tracker use world/ego(mask) anchoring instead.  Delete this
-    # (and terrain_aware_ref.py) when the online commands are removed.  See base __init__ TODO.
-    def get_measured_outputs(self, phase: torch.Tensor, env_ids: torch.Tensor = None) -> None:
-        """Compute measured outputs from the robot state.
-
-        Args:
-            phase: phase in [0, 1] tensor of shape ``[N]``.
-            env_ids: Optional environment indices.
-        """
-        # Get poses for all reference-frame bodies: [N, num_ref_frames, 7]
-        ref_poses = torch.zeros(self.num_envs, len(self.ref_frame_indices), 7, device=self.device)
-        ref_poses[:, :, :3] = wp.to_torch(self.robot.data.body_pos_w)[:, self.ref_frame_indices]
-        ref_poses[:, :, 3:] = wp.to_torch(self.robot.data.body_quat_w)[:, self.ref_frame_indices]
-
-        # Look up the new domain and active ref-frame identity *before*
-        # computing the refresh gate — the gate triggers on a change in
-        # either the domain index or the active ref frame (see
-        # ``prev_ref_frame_idx`` docstring in ``__init__``).
-        # ``prev_ref_frame_idx`` is the LAST anchored ref frame and is
-        # only updated when the anchor itself is refreshed below — that
-        # way a deferred refresh (gate fired but the new frame isn't yet
-        # in-contact per the trajectory table) keeps the trigger live
-        # across steps.
-        new_domains = self.manager.get_current_domains(phase, env_ids)
-        if env_ids is None:
-            ref_frame_indices = self.manager.get_ref_frames_in_use(phase, self.ref_frames)
-            changed = (
-                (new_domains != self.current_domain)
-                | (ref_frame_indices != self.prev_ref_frame_idx)
-            )
-            self.current_domain = new_domains
-            self.cur_ref_frame_idx = ref_frame_indices
-        else:
-            ref_frame_indices = self.manager.get_ref_frames_in_use(phase, self.ref_frames, env_ids)
-            changed = (
-                (new_domains != self.current_domain[env_ids])
-                | (ref_frame_indices != self.prev_ref_frame_idx[env_ids])
-            )
-            self.current_domain[env_ids] = new_domains
-            self.cur_ref_frame_idx[env_ids] = ref_frame_indices
-
-        contact_state = self.get_contact_state(phase, env_ids)
-        contact_frame_indices = self.ref_to_contact_idx[ref_frame_indices]
-        ref_in_contact = torch.gather(
-            contact_state, 1, contact_frame_indices.unsqueeze(1)
-        ).squeeze(1)
-        changed_and_contact = changed & (ref_in_contact > 0)
-
-        if env_ids is None:
-            if torch.any(changed_and_contact):
-                env_indices = torch.where(changed_and_contact)[0]
-                default_new = ref_poses[env_indices, ref_frame_indices[env_indices], :]
-                self.ref_poses[env_indices, :] = apply_terrain_aware_ref(
-                    cmd=self,
-                    env_indices=env_indices,
-                    default_new_ref=default_new,
-                    new_domain=new_domains[env_indices],
-                )
-                self.prev_ref_frame_idx[env_indices] = ref_frame_indices[env_indices]
-        else:
-            if torch.any(changed_and_contact):
-                subset_indices = torch.where(changed_and_contact)[0]
-                global_env_indices = env_ids[subset_indices]
-                default_new = ref_poses[
-                    global_env_indices, ref_frame_indices[subset_indices], :
-                ]
-                self.ref_poses[global_env_indices, :] = apply_terrain_aware_ref(
-                    cmd=self,
-                    env_indices=global_env_indices,
-                    default_new_ref=default_new,
-                    new_domain=new_domains[subset_indices],
-                )
-                self.prev_ref_frame_idx[global_env_indices] = ref_frame_indices[subset_indices]
-
-        # Compute measured outputs using current ref_poses
-        self.compute_measured_output(self.ref_poses[:, :3], self.ref_poses[:, 3:])
 
     def compute_measured_output(self, ref_frame_pos_w: torch.Tensor, ref_frame_quat: torch.Tensor) -> None:
         """Extract measured positions and velocities from the robot.
@@ -660,20 +567,6 @@ class BaseTrajectoryCommand(CommandTerm):
         after their mutations.
         """
         self.manager.invalidate_cache()
-
-    def _update_command(self):
-        """Main per-step update: measured outputs, desired outputs, CLF."""
-        self._pre_update_phase()
-
-        phi = self.manager.phase
-
-        self.get_measured_outputs(phi)
-        self.get_desired_outputs(phi)
-
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
-
-        self.vdot = vdot
-        self.v = vcur
 
     def _update_metrics(self):
         """Log tracking errors and CLF values."""
