@@ -9,6 +9,8 @@ import torch
 import warp as wp
 import numpy as np
 
+from robot_rl.tasks.manager_based.robot_rl import mdp
+
 
 def convert_to_serializable(obj):
     """Convert torch tensors and numpy arrays to Python native types for YAML serialization."""
@@ -103,7 +105,7 @@ def export_policy_parameters(env, obs, actions, save_dir):
     # CLF output joint order (the joint:* channels of the trajectory command's
     # ordered_pos_output_names). The joint_pos_ref / joint_vel_ref observations are
     # in THIS order, which differs from joint_names_isaac, so sim2sim / hardware
-    # deployment (transfer/sim/gen_tracker_policy.py) needs it to place those terms.
+    # deployment (transfer/deploy/gen_tracker.py) needs it to place those terms.
     try:
         traj_cmd = unwrapped_env.command_manager.get_term("traj_ref")
         params["joint_out_names"] = [
@@ -250,6 +252,12 @@ def export_policy_parameters(env, obs, actions, save_dir):
             if history_len > 0:
                 term_info["history_length"] = history_len
 
+            # The term's clip bounds, so the deploy applies the SAME saturation the policy
+            # trained under instead of a hardcoded per-term table (which silently left any
+            # clipped term missing from it unclipped).
+            if getattr(term_cfg, 'clip', None) is not None:
+                term_info["clip"] = [float(term_cfg.clip[0]), float(term_cfg.clip[1])]
+
             obs_info["policy"][term_name] = term_info
 
     params["observation_terms"] = obs_info
@@ -261,25 +269,37 @@ def export_policy_parameters(env, obs, actions, save_dir):
     hs_spec = None
     scene = unwrapped_env.scene
     scanner = scene.sensors.get("height_scanner") if hasattr(scene, "sensors") else None
-    if scanner is not None:
+    term_cfgs = obs_manager._group_obs_term_cfgs.get(obs_group_name, [])
+    term_names = obs_manager.active_terms.get(obs_group_name, [])
+    hs_cfg = next((c for n, c in zip(term_names, term_cfgs) if n == "height_scan"), None)
+    # Only when the EXPORTED group actually observes the scan. A depth task keeps the
+    # scanner in the scene for its (privileged, never-deployed) critic, and emitting a
+    # spec for that would both invent default values here and make the deploy raycast a
+    # grid the policy never reads.
+    if scanner is not None and hs_cfg is not None:
         rc = scanner.cfg  # RayCasterCfg
         pat = rc.pattern_cfg
-        term_cfgs = obs_manager._group_obs_term_cfgs.get(obs_group_name, [])
-        term_names = obs_manager.active_terms.get(obs_group_name, [])
-        hs_cfg = next((c for n, c in zip(term_names, term_cfgs) if n == "height_scan"), None)
-        mdp_offset, clip = 0.5, None
-        if hs_cfg is not None:
-            mdp_offset = float((hs_cfg.params or {}).get("offset", 0.5))
-            clip = list(hs_cfg.clip) if getattr(hs_cfg, "clip", None) is not None else None
         hs_spec = {
             "resolution": float(pat.resolution),
             "size": [float(pat.size[0]), float(pat.size[1])],
             "offset_pos": [float(rc.offset.pos[0]), float(rc.offset.pos[1]), float(rc.offset.pos[2])],
             "ray_alignment": str(getattr(rc, "ray_alignment", "yaw")),
-            "sensor_offset": mdp_offset,   # mdp.height_scan subtracts this
-            "clip": clip,                  # obs-term clip (apply in deploy to match training)
+            # mdp.height_scan subtracts this
+            "sensor_offset": float((hs_cfg.params or {}).get("offset", 0.5)),
+            # obs-term clip (apply in deploy to match training)
+            "clip": list(hs_cfg.clip) if getattr(hs_cfg, "clip", None) is not None else None,
         }
     params["height_scan_spec"] = hs_spec
+
+    # Depth-camera geometry, optics, range and normalisation, so the MuJoCo / hardware
+    # deploy can REPLICATE the depth images the policy obs consumes. Derived from the
+    # sensor cfgs + observation terms by mdp.depth_camera_specs -- the same producer the
+    # recorder uses, so the FM's copy of this contract cannot drift from the tracker's.
+    # None when the exported group has no depth cameras. Scoped to that group for the same
+    # reason height_scan_spec is: describing a camera whose obs term the deployed policy
+    # never reads would have the deploy cast it every step and silently discard the result
+    # (which is exactly what the `-depth-image` variant's separate obs groups would do).
+    params["depth_camera_spec"] = mdp.depth_camera_specs(unwrapped_env, [obs_group_name]) or None
 
     # Convert to serializable format
     params = convert_to_serializable(params)
@@ -312,12 +332,19 @@ def export_policy_parameters(env, obs, actions, save_dir):
     if 'valid_ic_vel' in params:
         params['valid_ic_vel'] = FlowStyleList(params['valid_ic_vel'])
 
-    # Convert all scale lists in observation_terms to flow style
+    # Keep each camera's short numeric lists on one line
+    for cam in (params.get('depth_camera_spec') or []):
+        for key in ('offset_pos', 'offset_quat_xyzw', 'clip'):
+            if isinstance(cam.get(key), list):
+                cam[key] = FlowStyleList(cam[key])
+
+    # Convert scale / clip / shape lists in observation_terms to flow style
     if 'observation_terms' in params:
         for group_name, group_terms in params['observation_terms'].items():
             for term_name, term_info in group_terms.items():
-                if 'scale' in term_info and isinstance(term_info['scale'], list):
-                    term_info['scale'] = FlowStyleList(term_info['scale'])
+                for key in ('scale', 'clip', 'shape'):
+                    if isinstance(term_info.get(key), list):
+                        term_info[key] = FlowStyleList(term_info[key])
 
     # Save to YAML file
     yaml_path = os.path.join(export_dir, "policy_parameters.yaml")

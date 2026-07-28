@@ -27,10 +27,12 @@ import warp as wp
 from isaaclab.envs.mdp import height_scan as mdp_height_scan
 from isaaclab.managers import SceneEntityCfg
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import depth_obs_stack
+
 from robot_rl.flow_matching.online import (
     BatchedHistory,
     build_cmd_tokens,
-    build_height_token,
+    build_extero_tokens,
     build_history_tokens,
     load_fm_context,
     sample_world,
@@ -218,6 +220,27 @@ class FmTrackingCommand(MotionSequenceCommand):
             snap["frames"] = torch.cat([fp, fq, fl[..., :3], fl[..., 3:]], dim=-1).clone()  # [.,K,13]
         return snap
 
+    def _read_extero(self) -> torch.Tensor:
+        """Live exteroception reading for the sensor this FM checkpoint was trained on.
+
+        The source comes from the CHECKPOINT (``ctx.extero_source``), not the task config,
+        so a depth-trained FM cannot silently be fed a height scan (or vice versa) just
+        because the env happens to have both sensors.
+
+        Returns:
+            ``(num_envs, K)`` for the height scan, or ``(num_envs, T, K)`` for depth --
+            :func:`build_extero_tokens` flattens either.
+
+        Raises:
+            RuntimeError: If the scene lacks the sensor the checkpoint needs.
+        """
+        src = self.ctx.extero_source
+        if src == "height_scan":
+            return mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))
+        if src == "depth":
+            return depth_obs_stack(self.env)
+        raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+
     def _snapshot_and_infer(self) -> None:
         """Append the live robot state to history and (re-)run FM inference once per step."""
         step = int(getattr(self.env, "common_step_counter", self._last_step_seen + 1))
@@ -276,10 +299,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         frames = self._history.stack_padded("frames")[ids] if self.ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
-        # Height token = the live height scan at "now" (per-ray ground clearance from the
-        # pelvis scanner), matching training; the same mdp.height_scan the teacher obs uses.
-        scan = mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))[ids]  # [V,K]
-        height = build_height_token(self.ctx, scan)
+        # Exteroception tokens = the live reading at "now", from whichever sensor this FM
+        # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
+        # deployment conditions on exactly the training signal.
+        height = build_extero_tokens(self.ctx, self._read_extero()[ids])
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
         # Anchor = the robot NOW (the most-recent history step IS the live robot); the FM

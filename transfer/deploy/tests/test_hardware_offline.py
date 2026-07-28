@@ -7,12 +7,19 @@ No robot / ROS2 / HF needed: loads the local ONNX artifacts, builds the
 order to exercise the joint-order conversion), warm-starts, and steps the policy
 for a few cycles. Asserts finite PD targets and that **torch is never imported**.
 
+Runs against the most recently exported run that has a ``tracker.onnx``, and skips when
+nothing is exported. Whichever exteroception the run trained on is fed a synthetic
+reading through the same ``build_hardware_state`` arguments the robot uses -- depth in
+METRES (the camera's own frame), or a per-ray height scan.
+
 Run: ``python transfer/deploy/tests/test_hardware_offline.py``
 """
 
 from __future__ import annotations
 
+import glob
 import os
+import subprocess
 import sys
 
 import numpy as np
@@ -23,15 +30,48 @@ sys.path.insert(0, os.path.join(ROOT, "transfer"))
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.hardware import build_hardware_state  # noqa: E402
 
-EXP = os.path.join(ROOT, "logs/rsl_rl/g1/2026-06-29_19-58-38_teacher_ego_z_anchor/exported")
+#: True only when this file is executed directly, which is the one context where
+#: ``"torch" not in sys.modules`` says anything about the DEPLOY path rather than about
+#: whatever else the interpreter has already imported.  See
+#: :func:`test_deploy_path_is_torch_free`.
+_STANDALONE = __name__ == "__main__"
+
+
+def _latest_export() -> str | None:
+    """The ``exported`` dir to test against.
+
+    ``DEPLOY_EXPORT_DIR`` picks one explicitly -- the artifacts under ``logs/`` are
+    whatever was last exported there, which may predate the current exporter; point this
+    at a fresh ``export_deploy_onnx.py`` output to test the artifacts you actually mean.
+    Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx``.
+    """
+    override = os.environ.get("DEPLOY_EXPORT_DIR")
+    if override:
+        return override
+    hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
+    return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
 
 
 def test_hardware_offline() -> None:
     """Synthetic estimator readings -> finite PD targets, torch-free."""
-    policy = GenTrackerPolicy(os.path.join(EXP, "tracker.onnx"), os.path.join(EXP, "fm.onnx"))
+    exp = _latest_export()
+    if exp is None:
+        print("[SKIP] No exported tracker.onnx under logs/rsl_rl/*/*/exported/.")
+        return
+    fm = os.path.join(exp, "fm.onnx")
+    print(f"[INFO] artifacts: {exp} (fm.onnx: {'yes' if os.path.exists(fm) else 'no'})")
+    policy = GenTrackerPolicy(os.path.join(exp, "tracker.onnx"),
+                              fm if os.path.exists(fm) else None)
     policy.load()
     isaac = policy.get_joint_names()
     nj = len(isaac)
+    depth_spec = policy.get_depth_camera_spec()
+    # Width of the height scan to synthesise, 0 when this policy does not read one. The
+    # tracker's own term is authoritative (a tracker-only ctx has no real height_dim).
+    scan_dim = 0
+    if policy.needs_height_scan():
+        terms = {t["name"]: t["shape"] for t in policy.get_obs_terms()}
+        scan_dim = int(terms.get("height_scan", policy.ctx.height_dim))
 
     # Estimator joint order != isaac order (reversed) -> exercises convert_joint_order.
     enc_names = list(reversed(isaac))
@@ -47,6 +87,19 @@ def test_hardware_offline() -> None:
             q = rng.standard_normal((khist, 4)); q /= np.linalg.norm(q, axis=-1, keepdims=True)
             frames = np.concatenate([rng.standard_normal((khist, 3)) * 0.1, q,
                                      rng.standard_normal((khist, 6)) * 0.05], axis=-1)
+        # Exteroception goes in RAW, exactly as the robot supplies it: metres along each
+        # camera's optical axis (with a few invalid pixels, which every camera produces),
+        # or metres of ground clearance. build_hardware_state owns the normalisation, so
+        # this exercises the path the controller actually takes.
+        depth_raw = None
+        if depth_spec:
+            depth_raw = []
+            for cam in depth_spec:
+                px = rng.uniform(float(cam["min_dist"]), float(cam["max_dist"]),
+                                 int(cam["width"]) * int(cam["height"]))
+                px[rng.random(px.size) < 0.05] = np.nan       # dropouts
+                depth_raw.append(px)
+        height_scan = rng.uniform(-0.3, 0.3, scan_dim) if scan_dim else None
         return build_hardware_state(
             policy,
             root_pos=np.array([0.0, 0.0, 0.78]),
@@ -58,20 +111,72 @@ def test_hardware_offline() -> None:
             joint_names=enc_names,
             command=np.asarray(cmd, dtype=np.float64),
             frames=frames,
+            depth_raw=depth_raw,
+            height_scan=height_scan,
         )
 
     policy.warm_start(reading(np.zeros(3)))
     last = None
     for _ in range(8):
-        obs = policy.create_obs(reading(np.array([0.4, 0.0, 0.1])))
+        state = reading(np.array([0.4, 0.0, 0.1]))
+        # Without a generator the clip reference drives the tracker, so the obs must be
+        # built directly rather than via create_obs (which samples the FM).
+        if policy.fm_enabled:
+            obs = policy.create_obs(state)
+        else:
+            obs = policy._build_obs(state, _clip_like_reference(policy, state, rng))
         last = policy.get_action(obs, isaac)
         assert obs.shape == (1, policy.get_num_obs())
         assert last.shape == (nj,)
         assert np.isfinite(obs).all() and np.isfinite(last).all()
 
-    assert "torch" not in sys.modules, "deploy path must be torch-free"
-    print(f"obs {policy.get_num_obs()}  action {last.shape}  finite=True  pred_valid={policy._pred_valid}")
+    # Only meaningful in a fresh interpreter. Under pytest, sibling tests have imported
+    # torch long before this file runs, so sys.modules describes the session rather than
+    # the deploy path -- asserting here would fail for a reason that has nothing to do with
+    # deploy. test_deploy_path_is_torch_free re-runs this file standalone, where it holds.
+    if _STANDALONE:
+        assert "torch" not in sys.modules, "deploy path must be torch-free"
+    print(f"obs {policy.get_num_obs()}  action {last.shape}  finite=True  "
+          f"depth_cameras={len(depth_spec)}  height_scan={scan_dim}  "
+          f"pred_valid={policy._pred_valid}")
     print("HARDWARE OFFLINE SMOKE PASSED (torch-free)")
+
+
+def test_deploy_path_is_torch_free() -> None:
+    """The deploy runtime must never import torch -- checked in a FRESH interpreter.
+
+    The invariant is real (``transfer/deploy`` is numpy + onnxruntime only, so it can run
+    on hardware without a torch install), but it is unobservable from inside the pytest
+    session: by the time this file is collected, sibling tests have already imported torch.
+    Re-running the module standalone isolates it, and its in-process assertion then applies.
+
+    Skips silently when nothing is exported -- the child prints ``[SKIP]`` and exits 0, same
+    as :func:`test_hardware_offline`.
+    """
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__)],
+                          capture_output=True, text=True, cwd=ROOT)
+    assert proc.returncode == 0, (
+        f"standalone run failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
+    )
+    if "[SKIP]" not in proc.stdout:
+        assert "PASSED (torch-free)" in proc.stdout, (
+            f"standalone run did not reach the torch-free check:\n{proc.stdout}"
+        )
+
+
+def _clip_like_reference(policy, state, rng) -> dict:
+    """A synthetic reference in the shape the clip source supplies (tracker-only mode)."""
+    nj, k = policy.ctx.nj, policy.ctx.target_num_extra_frames
+    node = lambda: {
+        "root_pos": np.asarray(state["root_pos"]) + rng.standard_normal(3) * 0.01,
+        "root_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+        "root_lin": rng.standard_normal(3) * 0.05,
+        "root_ang": rng.standard_normal(3) * 0.05,
+        "jp": rng.standard_normal(nj) * 0.1,
+        "jv": rng.standard_normal(nj) * 0.1,
+        "frame_pos": rng.standard_normal((k, 3)) * 0.1,
+    }
+    return {"current": node(), "future": [node() for _ in range(len(policy.future_offsets))]}
 
 
 if __name__ == "__main__":

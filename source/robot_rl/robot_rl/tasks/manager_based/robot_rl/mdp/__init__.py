@@ -14,10 +14,24 @@ from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # Inherit fr
 
 from .rewards.rewards import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
+from .observations.depth import (  # noqa: F401
+    DEPTH_OBS_FUNCS,
+    depth_camera_specs,
+    depth_image,
+    depth_image_4d,
+    depth_obs_stack,
+    find_depth_obs_terms,
+    normalize_depth,
+)
 from .terminations.terminations import *  # noqa: F401, F403
 from .commands import *  # noqa: F401, F403
 from .events.physical_randomization import *  # noqa: F401, F403
 from .events.resets import *  # noqa: F401, F403
+from .events.depth import (  # noqa: F401
+    randomize_camera_extrinsics,
+    randomize_camera_intrinsics,
+    resample_depth_noise,
+)
 
 
 def __getattr__(name):

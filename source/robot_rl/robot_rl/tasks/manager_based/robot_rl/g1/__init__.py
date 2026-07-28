@@ -85,6 +85,52 @@ if not _registered:
     )
 
     ## =========================================
+    # Teacher on TERRAIN + two self-scanning depth cameras (torso-mounted).
+    # Same terrain / clip tracking as above, but the policy sees the ground ONLY
+    # through the cameras -- depth REPLACES the height scan, which is what the
+    # hardware can actually deploy.  The critic keeps the scan (privileged).
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain-depth",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-image",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthImageEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-image-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1TeacherTerrainDepthImageEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    ## =========================================
     # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
     ## =========================================
     # The teacher (--load_run) tracks the FM predicted from the LIVE robot-state history

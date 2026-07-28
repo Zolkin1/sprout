@@ -61,6 +61,11 @@ _build
 **/logs/*
 **/recordings/*
 
+# The `**/logs/*` rule above ignores a logs directory's CONTENTS, which misses the root
+# `logs` SYMLINK used in git worktrees (git does not descend into it).  No trailing slash,
+# for the same reason as `/clips` below.
+/logs
+
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 

@@ -1,570 +1,466 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
+"""G1 low-level controller: the flow-matching generator + RL tracker, on hardware.
+
+The policy itself is NOT implemented here. ``transfer/deploy.GenTrackerPolicy`` is the one
+runtime shared by the MuJoCo sim2sim runner and this node, so the observation assembly,
+the generator cadence and the action scaling are identical in sim and on the robot by
+construction rather than by two implementations agreeing. This file is the ROS half:
+sensors in, PD targets out, and the safety state machine around them.
+
+Everything about the policy comes from the artifacts' embedded metadata -- joint order,
+gains, observation terms and their clips, the depth-camera contract. There is no
+``policy_parameters.yaml``.
+
+The bits that matter for not breaking the robot:
+
+* **Arming follows the robot, not a button.** The controller publishes nothing at all
+  until the G1's own execution FSM reports ``LOW_LEVEL_CONTROL``; the interface's
+  passive-hold timer drives USER_POSE and DAMPING on its own.
+* **The generator is primed before it is trusted.** Its history tokens are measured robot
+  state, so on arming the controller holds the standing pose on stiffened gains for
+  ``warmup_time``, feeding the history, before letting the policy drive.
+* **Sensors are watchdogged.** A stale depth frame or velocity command zeroes the command
+  rather than letting the robot keep walking on old data.
+* **The joint sets must match exactly.** A policy that does not command every hardware
+  joint is refused, rather than the remainder being filled from a guess.
+"""
+
+from __future__ import annotations
+
 import os
-from abc import ABC
+import sys
+import time
 
 import numpy as np
-import torch
-from datetime import datetime
-import time
-import csv
-import shutil
-from collections import deque
-from ament_index_python.packages import get_package_share_directory
-
-from .behavior_manager import BehaviorManager
-from obelisk_control_msgs.msg import PDFeedForward, VelocityCommand
+from obelisk_control_msgs.msg import ExecutionFSM, PDFeedForward, VelocityCommand
 from obelisk_estimator_msgs.msg import EstimatedState
 from obelisk_py.core.control import ObeliskController
-from obelisk_py.core.obelisk_typing import ObeliskControlMsg, is_in_bound
 from obelisk_py.core.utils.ros import spin_obelisk
-from rclpy.executors import SingleThreadedExecutor
-from rclpy.lifecycle import LifecycleState, TransitionCallbackReturn
-from sensor_msgs.msg import Joy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image
 
-# Changes TODO:
-# - Take a list of hugging face policies
-# - Also need to make sure we get the associated config files with the policies
-# - Make the observations modular to be built based on config file
-# - Handle holding multiple policies
-# - Add a generic state machine for multiple skills that can be extended in the future
-# - 
+# The torch-free deploy runtime lives in the repo, not in this ROS package: it is shared
+# with the MuJoCo sim2sim runner and must not fork. This file sits at
+# <repo>/transfer/obelisk/g1_control/g1_control/, so <repo>/transfer is three levels up.
+_TRANSFER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _TRANSFER not in sys.path:
+    sys.path.insert(0, _TRANSFER)
+
+from deploy.hardware import build_hardware_state, load_gen_tracker_from_hf  # noqa: E402
+
+#: ExecFSMState::USER_CTRL. Mirrors obelisk's unitree_fsm.h, where it is named
+#: "LOW_LEVEL_CONTROL"; this is the ONLY state in which the policy may drive the robot.
+EXEC_FSM_LOW_LEVEL_CONTROL = 3
+
+#: Depth frames arrive on their own clock and are not part of the control graph; best
+#: effort matches how they are produced and keeps a slow subscriber from stalling the camera.
+SENSOR_QOS = QoSProfile(
+    depth=1,
+    history=HistoryPolicy.KEEP_LAST,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
 
 
-class VelocityTrackingController(ObeliskController, ABC):
-    """Locomotion controller to track a given velocity."""
+class G1Controller(ObeliskController):
+    """Drives the G1 from the generator+tracker ONNX pair at 50 Hz."""
 
-    def __init__(self, node_name: str = "velocity_tracking_controller") -> None:
-        """Initialize the example position setpoint controller."""
+    def __init__(self, node_name: str = "g1_controller") -> None:
+        """Load the policy, wire the sensors, and come up disarmed."""
         super().__init__(node_name, PDFeedForward, EstimatedState)
-        # Load policy
-        self.declare_parameter("hf_repo_ids", [""])
-        self.declare_parameter("hf_policy_folders", [""])
-        self.declare_parameter("behavior_names", [""])
-        self.declare_parameter("behavior_buttons", [-1])
-        self.declare_parameter("init_behavior", "")
-        self.declare_parameter("vel_thresholds", [0.0])
 
-        hf_repo_ids = self.get_parameter("hf_repo_ids").get_parameter_value().string_array_value
-        hf_policy_folders = self.get_parameter("hf_policy_folders").get_parameter_value().string_array_value
-        behavior_names = self.get_parameter("behavior_names").get_parameter_value().string_array_value
-        behavior_buttons = self.get_parameter("behavior_buttons").get_parameter_value().integer_array_value
-        init_behavior = self.get_parameter("init_behavior").get_parameter_value().string_value
-        vel_thresholds = self.get_parameter("vel_thresholds").get_parameter_value().double_array_value
+        self.register_obk_subscription("sub_vel_cmd", self.vel_cmd_callback, VelocityCommand)
+        self.register_obk_subscription("sub_fsm_state", self.fsm_state_callback, ExecutionFSM)
 
-        self.declare_parameter("START_IN_SIM", False)
-        self.activate_policy = self.get_parameter("START_IN_SIM").get_parameter_value().bool_value
+        self._declare_params()
+        self.policy = self._load_policy()
+        self._setup_depth()
 
-        if self.activate_policy:
-            self.get_logger().warn("STARTING IN POLICY - BEWARE!")
+        # Latest estimate.
+        self.q_base = np.array([0.0, 0.0, 0.78, 0.0, 0.0, 0.0, 1.0])
+        self.v_base = np.zeros(6)
+        self.joint_pos = np.zeros(0)
+        self.joint_vel = np.zeros(0)
+        self.hw_joint_names: list[str] = []
+        self.have_estimate = False
 
-        self.behavior_manager = BehaviorManager(
-            behavior_names=behavior_names,
-            behavior_buttons=behavior_buttons,
-            init_behavior=init_behavior,
-            vel_thresholds=vel_thresholds,
-            hf_repo_ids=hf_repo_ids,
-            hf_policy_folders=hf_policy_folders,
-        )
-        self.active_behavior = self.behavior_manager.active_behavior
+        # Command, and the watchdogs over it.
+        self.vel_cmd = np.zeros(3)
+        self.last_vel_cmd_time: float | None = None
+        self._vel_cmd_stale = False
+        self._depth_stale = False
 
-        for policy, behavior_name in zip(self.behavior_manager.policies, self.behavior_manager.behavior_names):
-            self.get_logger().info(f"Loaded behavior {behavior_name} at {policy.get_policy_path()}.")
+        # Arming / warm-up.
+        self.armed = False
+        self.arm_time: float | None = None
+        self.hold_pose: np.ndarray | None = None
+        self._policy_joint_idx: np.ndarray | None = None
 
+        # Degenerate-quaternion guard: a dropped IMU frame publishes a zero quaternion,
+        # which would otherwise yield a garbage gravity vector for that tick.
+        self._last_good_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        self._bad_quat_count = 0
+        self._quat_samples = 0
 
-        self.isaac_to_mujoco = {
-            0: 0,  # left_hip_pitch
-            1: 6,  # right_hip_pitch
-            2: 12,  # waist_yaw
-            3: 1,  # left_hip_roll
-            4: 7,  # right_hip_roll
-            5: 13,  # left_shoulder_pitch
-            6: 17,  # right_shoulder_pitch
-            7: 2,  # left_hip_yaw
-            8: 8,  # right_hip_yaw
-            9: 14,  # left_shoulder_roll
-            10: 18,  # right_shoulder_roll
-            11: 3,  # left_knee
-            12: 9,  # right_knee
-            13: 15,  # left_shoulder_yaw
-            14: 19,  # right_shoulder_yaw
-            15: 4,  # left_ankle_pitch
-            16: 10,  # right_ankle_pitch
-            17: 16,  # left_elbow
-            18: 20,  # right_elbow
-            19: 5,  # left_ankle_roll
-            20: 11,  # right_ankle_roll
-        }
-        self.isaac_joints = {
-            0: "left_hip_pitch_joint",
-            1: "right_hip_pitch_joint",
-            2: "waist_yaw_joint",
-            3: "left_hip_roll_joint",
-            4: "right_hip_roll_joint",
-            5: "left_shoulder_pitch_joint",
-            6: "right_shoulder_pitch_joint",
-            7: "left_hip_yaw_joint",
-            8: "right_hip_yaw_joint",
-            9: "left_shoulder_roll_joint",
-            10: "right_shoulder_roll_joint",
-            11: "left_knee_joint",
-            12: "right_knee_joint",
-            13: "left_shoulder_yaw_joint",
-            14: "right_shoulder_yaw_joint",
-            15: "left_ankle_pitch_joint",
-            16: "right_ankle_pitch_joint",
-            17: "left_elbow_joint",
-            18: "right_elbow_joint",
-            19: "left_ankle_roll_joint",
-            20: "right_ankle_roll_joint",
-        }
-        self.joint_names_mujoco = [
-            "left_hip_pitch_joint",
-            "left_hip_roll_joint",
-            "left_hip_yaw_joint",
-            "left_knee_joint",
-            "left_ankle_pitch_joint",
-            "left_ankle_roll_joint",
-            "right_hip_pitch_joint",
-            "right_hip_roll_joint",
-            "right_hip_yaw_joint",
-            "right_knee_joint",
-            "right_ankle_pitch_joint",
-            "right_ankle_roll_joint",
-            "waist_yaw_joint",
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-        ]
-        self.full_joint_names = [
-            "left_hip_pitch_joint",
-            "left_hip_roll_joint",
-            "left_hip_yaw_joint",
-            "left_knee_joint",
-            "left_ankle_pitch_joint",
-            "left_ankle_roll_joint",
-            "right_hip_pitch_joint",
-            "right_hip_roll_joint",
-            "right_hip_yaw_joint",
-            "right_knee_joint",
-            "right_ankle_pitch_joint",
-            "right_ankle_roll_joint",
-            "waist_yaw_joint",
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "left_wrist_roll_joint",
-            "left_wrist_pitch_joint",
-            "left_wrist_yaw_joint",
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-            "right_wrist_roll_joint",
-            "right_wrist_pitch_joint",
-            "right_wrist_yaw_joint",
-        ]
+        self._infer_ms: list[float] = []
+        self._last_report = 0.0
+        self.get_logger().info("g1_controller up, DISARMED (waiting for LOW_LEVEL_CONTROL).")
 
-        self.num_motors = 21
+    # ------------------------------------------------------------------ setup
 
-        # Logging information
-        self.declare_parameter("log", False)
-        self.declare_parameter("log_decimation", 1)
-        self.log = self.get_parameter("log").get_parameter_value().bool_value
-        self.log_decimation = self.get_parameter("log_decimation").get_parameter_value().integer_value
-        self.ctrl_count = 0
+    def _declare_params(self) -> None:
+        """Declare and read every ROS parameter this node uses."""
+        self.declare_parameter("hf_repo_id", "")
+        self.declare_parameter("hf_policy_folder", "")
+        self.declare_parameter("fm_update_every", 2)
+        self.declare_parameter("use_cuda", False)
+        self.declare_parameter("onnx_threads", 2)
+        self.declare_parameter("depth_topics", [""])
+        self.declare_parameter("depth_timeout", 0.25)
+        self.declare_parameter("vel_cmd_timeout", 1.0)
+        self.declare_parameter("warmup_time", 1.0)
+        self.declare_parameter("hold_kp_scale", 2.0)
+        self.declare_parameter("hold_kd_scale", 1.5)
+        self.declare_parameter("verbose", False)
 
-        self.start_time = self.get_clock().now().nanoseconds / 1e9
+        self.depth_timeout = float(self.get_parameter("depth_timeout").value)
+        self.vel_cmd_timeout = float(self.get_parameter("vel_cmd_timeout").value)
+        self.warmup_time = float(self.get_parameter("warmup_time").value)
+        self.hold_kp_scale = float(self.get_parameter("hold_kp_scale").value)
+        self.hold_kd_scale = float(self.get_parameter("hold_kd_scale").value)
+        self.verbose = bool(self.get_parameter("verbose").value)
 
-        if self.log:
-            self.get_logger().info(f"Logging enabled. Decimation: {self.log_decimation}.")
-
-            # Create log directory relative to $ROBOT_RL_ROOT
-            root = os.environ.get("ROBOT_RL_ROOT", "")
-
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            log_dir = os.path.join(root, "ctrl_logs", timestamp)
-            os.makedirs(log_dir, exist_ok=True)
-
-            self.log_file = os.path.join(log_dir, "g1_control.csv")
-            self.file = open(self.log_file, "w", buffering=8192)
-            self.writer = csv.writer(self.file)
-            self._lines_written = 0
-            self._file_index = 0
-
-            # Copy the config into the log directory
-            self.declare_parameter("config_name", "")
-            config_name = self.get_parameter("config_name").get_parameter_value().string_value
-            if config_name != "":
-                self.get_logger().info(f"Copying the config to the log directory ({config_name})...")
-                config_path = os.path.join(root, "g1_control", "configs", config_name)
-                shutil.copy2(config_path, log_dir)
-
-
-            # Copy the policy into the log directory
-            # self.get_logger().info("Copying the policy to the log directory...")
-            # shutil.copy2(self.policy_wrapper.get_policy_path(), log_dir)
-
-            # Copy the policy_parameters.yaml files to the log directory
-            for policy, behavior_name in zip(self.behavior_manager.policies, self.behavior_manager.behavior_names):
-                policy_params_path = policy.get_policy_params_path()
-                if os.path.exists(policy_params_path):
-                    dest_name = f"policy_parameters_{behavior_name}.yaml"
-                    shutil.copy2(policy_params_path, os.path.join(log_dir, dest_name))
-                    self.get_logger().info(f"Copied policy parameters for {behavior_name} to log directory.")
-
-            # Make a file with the log ordering (explicit column names for plotting)
-            # Note: pos/vel come from estimator (27 joints), action from policy (21 joints)
-            header_path = os.path.join(log_dir, "fields.csv")
-            with open(header_path, "w") as f:
-                columns = ["time"]
-                columns += ["quat_x", "quat_y", "quat_z", "quat_w"]
-                columns += ["ang_vel_x", "ang_vel_y", "ang_vel_z"]
-                columns += ["cmd_vx", "cmd_vy", "cmd_wz"]
-                columns += [f"pos_{name}" for name in self.full_joint_names]
-                columns += [f"vel_{name}" for name in self.full_joint_names]
-                columns += [f"act_{name}" for name in self.joint_names_mujoco]
-                f.write(",".join(columns) + "\n")
-
-        # # Set scales and defaults
-        # self.declare_parameter("action_scale", 0.25)
-        # self.action_scale = self.get_parameter("action_scale").get_parameter_value().double_value
-
-        # self.declare_parameter("cmd_scale", [2.0, 2.0, 0.25])
-        # self.cmd_scale = self.get_parameter("cmd_scale").get_parameter_value().double_array_value
-
-        # self.declare_parameter("period", 0.8)
-        # self.period = self.get_parameter("period").get_parameter_value().double_value
-
-        # self.declare_parameter("num_actions", 0)
-        # self.num_actions = self.get_parameter("num_actions").get_parameter_value().integer_value
-
-        # self.declare_parameter("default_angles", [0.0])
-        # self.declare_parameter("default_angles_names", [""])
-        # self.default_angles = self.get_parameter("default_angles").get_parameter_value().double_array_value
-        # self.default_angles_names = self.get_parameter("default_angles_names").get_parameter_value().string_array_value
-
-        # self.default_angles_isaac = self._convert_to_isaac(self.default_angles, self.default_angles_names)
-
-        # self.declare_parameter("qvel_scale", 1.0)
-        # self.qvel_scale = self.get_parameter("qvel_scale").get_parameter_value().double_value
-
-        # self.declare_parameter("ang_vel_scale", 1.0)
-        # self.ang_vel_scale = self.get_parameter("ang_vel_scale").get_parameter_value().double_value
-
-        # # Set PD gains
-        # self.declare_parameter("kps", [25.0] * self.num_motors)
-        # self.declare_parameter("kds", [0.5] * self.num_motors)
-        # self.kps = self.get_parameter("kps").get_parameter_value().double_array_value
-        # self.kds = self.get_parameter("kds").get_parameter_value().double_array_value
-
-        active_policy = self.behavior_manager.get_active_policy()
-        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(active_policy.get_kp(self.joint_names_mujoco).tolist(),
-                                                            active_policy.get_kd(self.joint_names_mujoco).tolist())
-
-
-        # Time logging info
-        N_log = 100
-        self.print_time_decimation = 100
-        self.loop_rate_time = self.get_clock().now().nanoseconds / 1e9
-        self.timing_dict = {"update_x_hat": deque(maxlen=N_log), 
-                            "create_obs": deque(maxlen=N_log),
-                            "get_action": deque(maxlen=N_log),
-                            "compute_control": deque(maxlen=N_log),
-                            "loop_period": deque(maxlen=N_log),}
-
-        # Declare subscriber to velocity commands
-        self.register_obk_subscription(
-            "sub_vel_cmd_setting",
-            self.vel_cmd_callback,  # type: ignore
-            key="sub_vel_cmd_key",  # key can be specified here or in the config file
-            msg_type=VelocityCommand,
-        )
-
-        # Need the joystick for the E-stop
-        self.register_obk_subscription(
-            "sub_joy_setting",
-            self.joy_callback,  # type: ignore
-            key="sub_joy_key",  # key can be specified here or in the config file
-            msg_type=Joy,
-        )
-
-        self.received_xhat = False
-
-
-    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
-        """Configure the controller."""
-        super().on_configure(state)
-
-        self.cmd_vel = np.zeros((3,))
-        # self.proj_g = np.zeros((3,))
-        # self.proj_g[2] = -1
-        # self.omega = np.zeros((3,))
-        # self.phase = np.zeros((2,))
-        self.zero_action = np.zeros((self.num_motors,))
-        self.action = np.zeros((self.num_motors,))
-        self.t_start = None
-
-        self.get_logger().info("RL Velocity Tracking node configuration complete.")
-
-        return TransitionCallbackReturn.SUCCESS
-
-    def update_x_hat(self, x_hat_msg: EstimatedState) -> None:
-        """Update the state estimate.
-
-        Parameters:
-            x_hat_msg: The Obelisk message containing the state estimate.
-        """
-        start_time = self.get_clock().now().nanoseconds / 1e9
-
-        self.joint_pos = np.array(x_hat_msg.q_joints)
-        self.joint_names = x_hat_msg.joint_names
-
-        self.joint_vel = np.array(x_hat_msg.v_joints)
-
-        # self.proj_g = self.project_gravity(x_hat_msg.q_base[3:7])
-        self.qfb = np.array(x_hat_msg.q_base[:7])
-        self.vfb_ang = np.array(x_hat_msg.v_base[3:6])
-
-        # self.omega = np.array(x_hat_msg.v_base[3:6])
-
-        self.time = x_hat_msg.header.stamp.sec + x_hat_msg.header.stamp.nanosec * 1e-9
-
-        self.received_xhat = True
-
-        end_time = self.get_clock().now().nanoseconds / 1e9
-
-        self.log_time("update_x_hat", end_time - start_time)
-
-
-    def vel_cmd_callback(self, cmd_msg: VelocityCommand):
-        """Callback for velocity command messages."""
-        self.cmd_vel[0] = cmd_msg.v_x
-        self.cmd_vel[1] = cmd_msg.v_y
-        self.cmd_vel[2] = cmd_msg.w_z
-    
-    def compute_control(self) -> PDFeedForward:
-        """Compute the control signal for the dummy 2-link robot.
+    def _load_policy(self):
+        """Fetch and load the ONNX pair.
 
         Returns:
-            obelisk_control_msg: The control message.
+            The loaded :class:`~deploy.gen_tracker.GenTrackerPolicy`.
+
+        Raises:
+            RuntimeError: If the repo/folder parameters are unset, or the artifacts are
+                neither cached nor reachable.
         """
-        # Generate input to RL model
-        start_time = self.get_clock().now().nanoseconds / 1e9
-        if self.received_xhat:
-            if self.activate_policy:
-                # self.get_logger().info(f"Time: {(self.time - self.start_time):.4f}")
-                start_obs_time = self.get_clock().now().nanoseconds / 1e9
-                obs = self.behavior_manager.create_obs(
-                    self.qfb,
-                    self.vfb_ang,
-                    self.joint_pos,
-                    self.joint_vel,
-                    self.time - self.start_time,
-                    self.cmd_vel,
-                    self.joint_names,
-                )
+        repo = str(self.get_parameter("hf_repo_id").value)
+        folder = str(self.get_parameter("hf_policy_folder").value)
+        if not repo or not folder or folder == "REPLACE_ME":
+            raise RuntimeError(
+                "hf_repo_id / hf_policy_folder must name the policy to run "
+                f"(got {repo!r} / {folder!r}); set them in the controller config."
+            )
+        cache = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resource", "hf_cache"))
+        policy = load_gen_tracker_from_hf(
+            repo, folder, cache,
+            fm_update_every=int(self.get_parameter("fm_update_every").value),
+            num_threads=int(self.get_parameter("onnx_threads").value),
+        )
+        self.get_logger().info(
+            f"Policy {repo}/{folder}: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
+            f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())}"
+        )
+        return policy
 
-                # Check if we should execute a pending behavior switch (phi-gated)
-                old_phi = self.behavior_manager.get_active_policy().get_phi()
-                switched = self.behavior_manager.try_execute_pending_switch(self.time - self.start_time)
-                if switched:
-                    new_behavior = self.behavior_manager.get_active_behavior()
-                    if new_behavior != self.active_behavior:
-                        self.active_behavior = new_behavior
-                        self.get_logger().info(f"[Controller] Switched to {self.active_behavior} at phi = {old_phi}!")
-                        active_policy = self.behavior_manager.get_active_policy()
-                        self.kps, self.kds = self._add_wrist_kp_kd_mujoco(
-                            active_policy.get_kp(self.joint_names_mujoco).tolist(),
-                            active_policy.get_kd(self.joint_names_mujoco).tolist()
-                        )
+    def _setup_depth(self) -> None:
+        """Subscribe one topic per camera in the artifact's contract.
 
-                end_obs_time = self.get_clock().now().nanoseconds / 1e9
+        Plain ROS subscriptions rather than obelisk-managed ones: the camera COUNT comes
+        from the policy metadata at runtime, which the static key registration cannot
+        express. The count is cross-checked against the contract, so a two-camera policy
+        cannot be run against one topic.
 
-                # Call RL model
-                start_action_time = self.get_clock().now().nanoseconds / 1e9
-                self.action = self.behavior_manager.get_action(obs, self.joint_names_mujoco)
-                end_action_time = self.get_clock().now().nanoseconds / 1e9
+        Raises:
+            RuntimeError: If the configured topics do not match the contract.
+        """
+        self.depth_spec = self.policy.get_depth_camera_spec()
+        topics = [t for t in self.get_parameter("depth_topics").value if t]
+        if len(topics) != len(self.depth_spec):
+            names = [c.get("sensor") or c["obs_term"] for c in self.depth_spec]
+            raise RuntimeError(
+                f"This policy reads {len(self.depth_spec)} depth camera(s) {names}, but "
+                f"{len(topics)} depth_topics are configured {topics}. They must correspond "
+                "one-to-one, in contract order."
+            )
+        self.depth_raw: list[np.ndarray | None] = [None] * len(self.depth_spec)
+        self.last_depth_time: list[float | None] = [None] * len(self.depth_spec)
+        self._depth_subs = []
+        for i, (topic, cam) in enumerate(zip(topics, self.depth_spec)):
+            self._depth_subs.append(self.create_subscription(
+                Image, topic, lambda msg, i=i: self.depth_callback(msg, i), SENSOR_QOS))
+            self.get_logger().info(
+                f"depth[{i}] '{cam.get('sensor') or cam['obs_term']}' "
+                f"{int(cam['width'])}x{int(cam['height'])} <- {topic}")
 
-            start_compute_time = self.get_clock().now().nanoseconds / 1e9
-            # setting the message
-            pd_ff_msg = PDFeedForward()
-            pd_ff_msg.header.stamp = self.get_clock().now().to_msg()
-            pos_targ = self.action #self._convert_to_mujoco(self.action)lo
-            pd_ff_msg.pos_target = self._add_wrist_mujoco(pos_targ.tolist())
-            pd_ff_msg.vel_target = self._add_wrist_mujoco(self.zero_action.tolist())
-            pd_ff_msg.feed_forward = self._add_wrist_mujoco(self.zero_action.tolist())
+    # -------------------------------------------------------------- callbacks
 
-            # Add in the wrist joints
-
-            pd_ff_msg.u_mujoco = np.concatenate([
-                self._add_wrist_mujoco(pos_targ.tolist()),
-                self._add_wrist_mujoco(self.zero_action.tolist()),
-                self._add_wrist_mujoco(self.zero_action.tolist()),
-            ]).tolist()
-            pd_ff_msg.joint_names = self.full_joint_names
-
-            pd_ff_msg.kp = self.kps
-            pd_ff_msg.kd = self.kds
-
-            self.obk_publishers["pub_ctrl"].publish(pd_ff_msg)
-
-            # Log data
-            if self.log and self.ctrl_count % self.log_decimation == 0:
-                self.log_data({
-                    "time": self.time - self.start_time,
-                    "quaternion": self.qfb[3:7].tolist(),
-                    "angular_velocity": self.vfb_ang.tolist(),
-                    "commanded_velocity": self.cmd_vel.tolist(),
-                    "joint_positions": self.joint_pos.tolist(),
-                    "joint_velocities": self.joint_vel.tolist(),
-                    "action": self.action.tolist(),
-                })
-
-
-            t = self.get_clock().now().nanoseconds / 1e9
-            self.log_time("loop_period", t - self.loop_rate_time)
-            # self.get_logger().info(f"loop time: {t - self.loop_rate_time} s.")
-            self.loop_rate_time = self.get_clock().now().nanoseconds / 1e9
-
-            end_time = self.get_clock().now().nanoseconds / 1e9
-
-            end_compute_time = self.get_clock().now().nanoseconds / 1e9
-            self.log_time("compute_control", end_compute_time - start_compute_time)
-            if self.activate_policy:
-                self.log_time("create_obs", end_obs_time - start_obs_time)
-                self.log_time("get_action", end_action_time - start_action_time)
-
-            # self.get_logger().info(f"total compute: {end_time - start_time} s.")
-
-            # if self.ctrl_count & self.print_time_decimation == 0:
-            #     avg_times = self.get_average_times()
-            #     self.get_logger().info(
-            #         f"[Timing] update_x_hat: {avg_times['update_x_hat']:.4f} s, "
-            #         f"create_obs: {avg_times['create_obs']:.4f} s, "
-            #         f"get_action: {avg_times['get_action']:.4f} s, "
-            #         f"compute_control: {avg_times['compute_control']:.4f} s, "
-            #         f"loop period: {avg_times['loop_period']:.4f}s, "
-            #         f"total: {(avg_times['update_x_hat'] + avg_times['create_obs'] + avg_times['get_action'] + avg_times['compute_control']):.4f} s"
-            #     )
-
-
-            self.ctrl_count += 1
-
-            assert is_in_bound(type(pd_ff_msg), ObeliskControlMsg)
-            return pd_ff_msg
-    
-    # def _convert_to_mujoco(self, vec):
-    #     mj_vec = np.zeros(21)
-    #     for isaac_index, mujoco_index in self.isaac_to_mujoco.items():
-    #         mj_vec[mujoco_index] = vec[isaac_index]
-
-    #     return mj_vec
-
-    # def _convert_to_isaac(self, joint_values, joint_names):
-    #     ordered_values = np.zeros(len(self.isaac_joints), dtype=np.float64)
-    #     name_to_index = {name: idx for idx, name in self.isaac_joints.items()}
-
-    #     for name, value in zip(joint_names, joint_values):
-    #         if name in name_to_index:
-    #             index = name_to_index[name]
-    #             ordered_values[index] = value
-    #         else:
-    #             self.get_logger().warning(f"Unknown joint name: {name}", once=True)
-    #             # raise ValueError(f"Unknown joint name: {name}")
-
-    #     return ordered_values
-
-    def _add_wrist_mujoco(self, joint_values):
-        """Add 0's to the wrist in mujoco ordering."""
-        joint_values.insert(17, 0.0)
-        joint_values.insert(18, 0.0)
-        joint_values.insert(19, 0.0)
-
-        joint_values.insert(24, 0.0)
-        joint_values.insert(25, 0.0)
-        joint_values.insert(26, 0.0)
-
-        return joint_values
-
-    def _add_wrist_kp_kd_mujoco(self, kp, kd):
-        """Add 0's to the wrist in mujoco ordering."""
-        kp.insert(17, 40.0)
-        kp.insert(18, 40.0)
-        kp.insert(19, 40.0)
-
-        kp.insert(24, 40.0)
-        kp.insert(25, 40.0)
-        kp.insert(26, 40.0)
-
-
-        kd.insert(17, 2.0)
-        kd.insert(18, 2.0)
-        kd.insert(19, 2.0)
-
-        kd.insert(24, 2.0)
-        kd.insert(25, 2.0)
-        kd.insert(26, 2.0)
-
-        return kp, kd
-
-    def log_data(self, data: dict):
-        """Log data to CSV file.
+    def update_x_hat(self, msg: EstimatedState) -> None:
+        """Latch the state estimate.
 
         Args:
-            data: Dictionary containing the following keys:
-                - time: Current time
-                - quaternion: Base quaternion (4 values)
-                - angular_velocity: Base angular velocity (3 values)
-                - commanded_velocity: Commanded velocity (3 values)
-                - joint_positions: Joint positions (21 values)
-                - joint_velocities: Joint velocities (21 values)
-                - action: Policy action output (21 values)
+            msg: Fused estimate from ``g1_estimator``.
         """
-        row = [
-            data["time"],
-            *data["quaternion"],
-            *data["angular_velocity"],
-            *data["commanded_velocity"],
-            *data["joint_positions"],
-            *data["joint_velocities"],
-            *data["action"],
-        ]
-        self.writer.writerow(row)
-    
-    def log_time(self, key: str, time: float):
-        """Log timing information."""
-        if key in self.timing_dict:
-            self.timing_dict[key].append(time)
-        else:
-            raise ValueError(f"Key {key} not in timing dictionary.")
+        self.q_base = np.asarray(msg.q_base, dtype=np.float64)
+        self.v_base = np.asarray(msg.v_base, dtype=np.float64)
+        self.joint_pos = np.asarray(msg.q_joints, dtype=np.float64)
+        self.joint_vel = np.asarray(msg.v_joints, dtype=np.float64)
+        if list(msg.joint_names) != self.hw_joint_names:
+            self.hw_joint_names = list(msg.joint_names)
+            self._resolve_joint_mapping()
+        self.have_estimate = True
 
-    def get_average_times(self) -> dict:
-        return {key: sum(times) / len(times) if times else 0 for key, times in self.timing_dict.items()}
+    def vel_cmd_callback(self, msg: VelocityCommand) -> None:
+        """Latch the commanded planar velocity.
 
-    def joy_callback(self, joy_msg: Joy):
-        """Callback to watch for E-stop from joystick."""
-        RIGHT_TRIGGER = 5
-        if joy_msg.axes[RIGHT_TRIGGER] <= 0.1:
-            raise RuntimeError("[Controller] Joystick emergency stop triggered!!")
+        Args:
+            msg: Velocity command from the joystick FSM (or a high-level node).
+        """
+        self.vel_cmd = np.array([msg.v_x, msg.v_y, msg.w_z], dtype=np.float64)
+        self.last_vel_cmd_time = self.t
 
-        time = self.get_clock().now().nanoseconds / 1e9 - self.start_time
-        self.behavior_manager.check_behavior_switch(joy_msg, self.cmd_vel, time)
+    def depth_callback(self, msg: Image, index: int) -> None:
+        """Latch one camera's raw depth frame.
 
-        A = 0
-        if joy_msg.buttons[A] >= 0.9 and not self.activate_policy:
-            self.activate_policy = True
-            self.get_logger().warn("Policy activated!")
+        Args:
+            msg: 32FC1 depth image, row-major, in METRES along the optical axis.
+            index: Which camera, in contract order.
+        """
+        self.depth_raw[index] = np.frombuffer(msg.data, dtype=np.float32).copy()
+        # Local receipt time on purpose: the camera's clock is not synchronised to this
+        # machine, so a header stamp cannot tell us whether the stream is still alive.
+        self.last_depth_time[index] = self.t
+
+    def fsm_state_callback(self, msg: ExecutionFSM) -> None:
+        """Arm or disarm from the robot's ACTUAL execution-FSM state.
+
+        Args:
+            msg: Execution FSM state, published on every transition plus a heartbeat.
+        """
+        in_low_level = msg.cmd_exec_fsm_state == EXEC_FSM_LOW_LEVEL_CONTROL
+        if in_low_level and not self.armed:
+            self._arm()
+        elif not in_low_level and self.armed:
+            self.armed = False
+            self.arm_time = None
+            self.get_logger().warn(
+                f"DISARMED: execution FSM left LOW_LEVEL_CONTROL (now {msg.cmd_exec_fsm_state}).")
+
+    # ------------------------------------------------------------------ arming
+
+    def _resolve_joint_mapping(self) -> None:
+        """Map the policy's joint order onto the hardware's, requiring an exact match.
+
+        Raises:
+            RuntimeError: If the two joint SETS differ at all. A policy that does not
+                command every motor leaves the rest to be filled from somewhere, and every
+                choice of "somewhere" is a way to move a joint nobody asked to move.
+        """
+        policy_joints = self.policy.get_joint_names()
+        missing = [j for j in self.hw_joint_names if j not in policy_joints]
+        extra = [j for j in policy_joints if j not in self.hw_joint_names]
+        if missing or extra:
+            raise RuntimeError(
+                "Policy and robot joint sets differ, so this policy cannot drive this "
+                f"robot.\n  commanded by the policy but absent on the robot: {extra}\n"
+                f"  present on the robot but not commanded: {missing}\n"
+                f"  ({len(policy_joints)} policy joints vs {len(self.hw_joint_names)} robot "
+                "joints -- a 29-DoF robot needs `fixed_waist: false` AND a 29-DoF policy.)"
+            )
+        # Position of each hardware joint within the policy's ordering.
+        self._policy_joint_idx = np.array([policy_joints.index(j) for j in self.hw_joint_names])
+        self.get_logger().info(f"Joint mapping resolved for {len(self.hw_joint_names)} joints.")
+
+    def _arm(self) -> None:
+        """Enter low-level control: reset the policy and begin the generator warm-up."""
+        if not self.have_estimate:
+            self.get_logger().error("Refusing to arm: no state estimate yet.")
+            return
+        if self._policy_joint_idx is None:
+            self.get_logger().error("Refusing to arm: joint mapping unresolved.")
+            return
+        self.policy.reset()
+        self.hold_pose = self.joint_pos.copy()
+        self.arm_time = self.t
+        self.armed = True
+        self.get_logger().info(
+            f"ARMED. Holding pose and priming the generator for {self.warmup_time:.2f}s.")
+
+    # --------------------------------------------------------------- watchdogs
+
+    def _depth_is_stale(self) -> bool:
+        """Whether any camera has stopped delivering.
+
+        Returns:
+            True while a camera is overdue. Inert before its first frame -- never having
+            arrived is handled by refusing to step, not by the watchdog.
+        """
+        if not self.depth_spec or self.depth_timeout <= 0.0:
+            return False
+        return any(t is not None and (self.t - t) > self.depth_timeout for t in self.last_depth_time)
+
+    def _vel_cmd_is_stale(self) -> bool:
+        """Whether the velocity command has gone quiet.
+
+        Returns:
+            True when nothing has arrived within ``vel_cmd_timeout``.
+        """
+        if self.vel_cmd_timeout <= 0.0 or self.last_vel_cmd_time is None:
+            return False
+        return (self.t - self.last_vel_cmd_time) > self.vel_cmd_timeout
+
+    def _effective_command(self) -> np.ndarray:
+        """The velocity command actually handed to the policy, after the watchdogs.
+
+        Returns:
+            The commanded velocity, or zeros while a sensor or the command is stale. The
+            policy keeps running either way -- it still has to balance -- it is just told
+            to stand still.
+        """
+        depth_stale, cmd_stale = self._depth_is_stale(), self._vel_cmd_is_stale()
+        if depth_stale != self._depth_stale:
+            self._depth_stale = depth_stale
+            log = self.get_logger().warn if depth_stale else self.get_logger().info
+            log("DEPTH DROPOUT: commanding zero velocity." if depth_stale else "Depth recovered.")
+        if cmd_stale != self._vel_cmd_stale:
+            self._vel_cmd_stale = cmd_stale
+            log = self.get_logger().warn if cmd_stale else self.get_logger().info
+            log("VELOCITY COMMAND DROPOUT: commanding zero." if cmd_stale else "Command recovered.")
+        return np.zeros(3) if (depth_stale or cmd_stale) else self.vel_cmd
+
+    def _base_quat(self) -> np.ndarray:
+        """The base orientation, guarded against a degenerate IMU reading.
+
+        Returns:
+            A unit quaternion (xyzw). A near-zero quaternion -- what a dropped IMU frame
+            looks like -- reuses the last good one rather than producing a garbage gravity
+            vector for that tick.
+        """
+        quat = self.q_base[3:7]
+        self._quat_samples += 1
+        if np.linalg.norm(quat) < 0.5:
+            self._bad_quat_count += 1
+            if self._bad_quat_count % 50 == 1:
+                pct = 100.0 * self._bad_quat_count / max(1, self._quat_samples)
+                self.get_logger().warn(
+                    f"Degenerate base quaternion ({pct:.1f}% of samples); reusing the last good one.")
+            return self._last_good_quat
+        self._last_good_quat = quat
+        return quat
+
+    # ------------------------------------------------------------ control loop
+
+    def _build_state(self) -> dict:
+        """Assemble the policy's state dict from the latest readings.
+
+        Returns:
+            The state dict for ``GenTrackerPolicy``.
+        """
+        return build_hardware_state(
+            self.policy,
+            root_pos=self.q_base[0:3],
+            base_quat_xyzw=self._base_quat(),
+            # Already rotated into the world frame by the estimator.
+            base_lin_vel_w=self.v_base[0:3],
+            base_ang_vel_b=self.v_base[3:6],
+            joint_pos=self.joint_pos,
+            joint_vel=self.joint_vel,
+            joint_names=self.hw_joint_names,
+            command=self._effective_command(),
+            depth_raw=self.depth_raw if self.depth_spec else None,
+        )
+
+    def compute_control(self) -> PDFeedForward | None:
+        """The 50 Hz control tick.
+
+        Returns:
+            The published command, or ``None`` when disarmed or not yet ready -- in which
+            case NOTHING is published and the robot interface keeps holding its pose.
+        """
+        if not self.armed or not self.have_estimate:
+            return None
+        if self.depth_spec and any(d is None for d in self.depth_raw):
+            self.get_logger().warn("Waiting for the first frame from every depth camera...",
+                                   throttle_duration_sec=2.0)
+            return None
+
+        state = self._build_state()
+        elapsed = self.t - (self.arm_time or self.t)
+        if elapsed < self.warmup_time:
+            # Warm-up: feed the generator's history with measured state but do NOT act on
+            # its prediction -- with a cold history it has no phase to work from.
+            self.policy.observe(state)
+            return self._publish(self.hold_pose, warmup=True)
+
+        t0 = time.perf_counter()
+        obs = self.policy.create_obs(state)
+        action = self.policy.get_action(obs, self.hw_joint_names)
+        self._record_latency((time.perf_counter() - t0) * 1e3)
+        return self._publish(action, warmup=False)
+
+    def _publish(self, joint_targets: np.ndarray, warmup: bool) -> PDFeedForward:
+        """Send PD position targets in the hardware's joint order.
+
+        Args:
+            joint_targets: Target joint positions, hardware order.
+            warmup: Whether this is the stiffened hold command or the policy's output.
+
+        Returns:
+            The published message.
+        """
+        kp = np.asarray(self.policy.get_kp(), dtype=np.float64)
+        kd = np.asarray(self.policy.get_kd(), dtype=np.float64)
+        # Metadata gains are in the POLICY's joint order; the robot wants its own.
+        kp, kd = kp[self._policy_joint_idx], kd[self._policy_joint_idx]
+        if warmup:
+            kp, kd = kp * self.hold_kp_scale, kd * self.hold_kd_scale
+
+        msg = PDFeedForward()
+        zeros = np.zeros_like(joint_targets)
+        msg.pos_target = joint_targets.tolist()
+        msg.vel_target = zeros.tolist()
+        msg.feed_forward = zeros.tolist()
+        msg.u_mujoco = np.concatenate([joint_targets, zeros, zeros]).tolist()
+        msg.joint_names = self.hw_joint_names
+        msg.kp = kp.tolist()
+        msg.kd = kd.tolist()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self.obk_publishers["pub_ctrl"].publish(msg)
+        return msg
+
+    def _record_latency(self, ms: float) -> None:
+        """Track inference latency and report percentiles periodically.
+
+        Two ONNX graphs run here and the generator's cadence makes the cost uneven tick to
+        tick, so a mean would hide exactly the spikes that break a 50 Hz loop.
+
+        Args:
+            ms: Wall time of this tick's policy call, in milliseconds.
+        """
+        self._infer_ms.append(ms)
+        if self.t - self._last_report < 5.0:
+            return
+        self._last_report = self.t
+        arr = np.asarray(self._infer_ms)
+        self._infer_ms.clear()
+        budget = self.policy.get_dt() * 1e3
+        p50, p95, p99 = np.percentile(arr, [50, 95, 99])
+        split = self.policy.pop_avg_infer_ms()
+        line = (f"policy latency p50={p50:.1f} p95={p95:.1f} p99={p99:.1f} ms "
+                f"(budget {budget:.1f}) fm={split.get('fm_ms', 0.0):.1f} "
+                f"trk={split.get('trk_ms', 0.0):.1f}")
+        if p99 > budget:
+            self.get_logger().warn(f"OVER BUDGET: {line}")
+        elif self.verbose:
+            self.get_logger().info(line)
+
 
 def main(args: list | None = None) -> None:
-    """Main entrypoint."""
-    spin_obelisk(args, VelocityTrackingController, SingleThreadedExecutor)
+    """Spin the controller.
+
+    A multi-threaded executor so the depth callbacks are not serialised behind the 50 Hz
+    control tick; every piece of shared state is latched as a whole array, never read
+    half-updated.
+    """
+    spin_obelisk(args, G1Controller, MultiThreadedExecutor)
 
 
 if __name__ == "__main__":

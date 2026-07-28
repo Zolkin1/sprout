@@ -6,7 +6,7 @@ Numpy + onnxruntime counterpart of ``transfer/fm/online.py`` (robot-state
 conditioned). The ONNX (``fm.onnx``, exported by
 ``scripts/flow_matching/export_fm_onnx.py``) folds in the normalizers and the
 unrolled Euler sampler, so this builds the **raw** N history (phase) tokens (numpy
-``relative_state``), the **raw** root-height token, and the raw strided command
+``relative_state``), the **raw** exteroception tokens, and the raw strided command
 tokens, runs one ``session.run`` for the whole sampler, and lifts the predicted
 F-step future to the world frame (numpy ``state_to_absolute``). There is no
 inpainting / known mask -- conditioning is separate tokens. No torch.
@@ -15,11 +15,12 @@ inpainting / known mask -- conditioning is separate tokens. No torch.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import onnxruntime as ort
 
+from .depth_obs import parse_depth_spec, sanitize_extero_np
 from .tracker_session import make_session
 from .transforms_np import relative_state, state_to_absolute
 
@@ -42,6 +43,17 @@ class FmContext:
     target_frame_names: list[str]
     ground_z: float
     height_dim: int
+    extero_source: str = "height_scan"
+    """Which sensor feeds the exteroception tokens ("height_scan" or "depth")."""
+    extero_tokens: int = 1
+    """Number of exteroception tokens: 1 for the scan, one per camera for depth."""
+    extero_spec: list[dict] = field(default_factory=list)
+    """Camera contract behind those tokens (depth only); see ``depth_obs.py``."""
+
+    @property
+    def extero_dim(self) -> int:
+        """Flat width of the exteroception input, ``extero_tokens * height_dim``."""
+        return self.extero_tokens * self.height_dim
     has_history_null: bool = False
     """Whether the graph accepts the ``history_null`` input (learned null-history embedding).
 
@@ -70,6 +82,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
     if "fm_meta" not in raw:
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
     m = json.loads(raw["fm_meta"])
+    source = str(m.get("extero_source", "height_scan"))
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         target_num_extra_frames=len(m["target_frame_names"]),
@@ -77,6 +90,8 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
         ground_z=float(m.get("ground_z", 0.0)), height_dim=int(m.get("height_dim", 1)),
+        extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
+        extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
     )
@@ -114,24 +129,40 @@ def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, j
     ).reshape(v, n, ctx.D)
 
 
-def build_height_token(ctx: FmContext, height_scan: np.ndarray) -> np.ndarray:
-    """Build the **raw** height-scan token ``(V, height_dim)`` from per-ray ground clearance.
+def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
+    """Build the **raw** exteroception tokens ``(V, extero_tokens * height_dim)``.
 
-    The ``fm.onnx`` graph folds in the height normalization, so this just shapes the raw
-    scan. ``height_scan`` is the live per-ray clearance from the height_scanner sensor
-    (body-relative / yaw-aligned), shape ``(V, height_dim)`` or ``(height_dim,)``.
+    Source-agnostic, mirroring ``flow_matching.online.build_extero_tokens``: the context
+    knows which sensor the checkpoint was trained on, so the caller passes whichever
+    reading that names -- the live per-ray height scan (body-relative, yaw-aligned) or the
+    per-camera normalised depth rows -- and the clip band follows from
+    ``ctx.extero_source``. Both are already in the FM's xyz+yaw ego frame, so there is no
+    re-anchoring. The ``fm.onnx`` graph folds in the normalization, so this only shapes
+    and sanitises.
+
+    Args:
+        ctx: Loaded FM context.
+        values: Raw reading, shape ``(V, T, dim)``, ``(V, T*dim)`` or ``(T*dim,)``.
+
+    Returns:
+        Raw tokens flattened to ``(V, T*dim)`` -- the graph reshapes internally.
+
+    Raises:
+        ValueError: If the flat width does not match the model's exteroception input.
     """
-    scan = np.asarray(height_scan, dtype=np.float64)
-    if scan.ndim == 1:
-        scan = scan[None, :]
-    if scan.shape[-1] != ctx.height_dim:
-        raise ValueError(f"height_scan width {scan.shape[-1]} != fm height_dim {ctx.height_dim}.")
-    # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds
-    # in the height normalization, so a non-finite value here would poison it. Clamp to
-    # the +/-1 m band the token is trained on (mirrors
-    # flow_matching.transforms.sanitize_height_scan, HEIGHT_SCAN_CLIP=1.0).
-    scan = np.clip(np.nan_to_num(scan, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0)
-    return scan
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    flat = arr.reshape(arr.shape[0], -1)
+    if flat.shape[-1] != ctx.extero_dim:
+        raise ValueError(
+            f"exteroception width {flat.shape[-1]} != fm extero_dim {ctx.extero_dim} "
+            f"({ctx.extero_tokens} x {ctx.height_dim}, source '{ctx.extero_source}')."
+        )
+    # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds in
+    # the normalization, so a non-finite value here would poison it. The band is
+    # per-source: metres for the scan, normalised units for depth.
+    return sanitize_extero_np(flat, ctx.extero_source)
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
@@ -148,8 +179,7 @@ def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
     return future_cmd[:, ctx.cmd_steps, :]
 
 
-def sample_world(ctx: FmContext, history, height, cmd_tokens, p_ref, q_ref, noise,
-                 history_null=None) -> dict:
+def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, noise, history_null=None) -> dict:
     """Run the ONNX sampler and lift the predicted F-step future to the world frame.
 
     All F frames are predicted FUTURE (node 0 = the current step, base offset ~= 0),
@@ -159,7 +189,8 @@ def sample_world(ctx: FmContext, history, height, cmd_tokens, p_ref, q_ref, nois
     Args:
         ctx: Loaded FM context.
         history: Raw N history (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        height: Raw root-height token ``(V, 1)`` (from :func:`build_height_token`).
+        extero: Raw exteroception tokens ``(V, T*height_dim)`` (from
+            :func:`build_extero_tokens`).
         cmd_tokens: Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)``.
         p_ref: World anchor position ``(V, 3)`` (the current robot base position).
         q_ref: World anchor quaternion ``(V, 4, xyzw)``.
@@ -174,7 +205,7 @@ def sample_world(ctx: FmContext, history, height, cmd_tokens, p_ref, q_ref, nois
     """
     feed = {
         "history": history.astype(np.float32),
-        "height": height.astype(np.float32),
+        "extero": extero.astype(np.float32),
         "cmd_tokens": cmd_tokens.astype(np.float32),
         "noise": noise.astype(np.float32),
     }

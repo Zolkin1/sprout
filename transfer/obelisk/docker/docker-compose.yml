@@ -10,18 +10,42 @@ x-common: &common
     GID: $GID
     QT_X11_NO_MITSHM: 1
     ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+    # Repo root, so the container can reach transfer/deploy and transfer/sim. The
+    # controller imports the shared deploy runtime from there rather than vendoring a copy.
+    REPO_ROOT: $REPO_ROOT
+    # ssh target for the Jetson depth node, read INSIDE the container by
+    # scripts/lib/obk_launch.sh. Set in docker/.env.
+    OBK_JETSON_HOST: $OBK_JETSON_HOST
+    OBK_JETSON_CONTAINER: ${OBK_JETSON_CONTAINER:-zed_depth}
   security_opt:
     - seccomp=unconfined
   cap_add:
     - NET_ADMIN
   volumes:
-    - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
+    # Mount the whole REPO, not just transfer/obelisk. The controller imports
+    # transfer/deploy (the runtime it shares with the MuJoCo sim2sim) and the world config
+    # loads transfer/sim/robots/g1/*.xml; with only $ROBOT_RL_ROOT mounted, neither exists
+    # inside the container.
+    - $REPO_ROOT:$REPO_ROOT
     - /tmp/.X11-unix:/tmp/.X11-unix
     - $HOME/.Xauthority:$HOME/.Xauthority:rw
     - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
+    # Joystick / input devices, so joy_node finds the controller at all.
     - /dev/input:/dev/input
+    # udev runtime dir, so SDL2's libudev hotplug monitor INSIDE the container sees the
+    # pad re-attach after it sleeps or is unplugged. Without this, joy_node misses the
+    # re-add and never picks the controller back up -- you have to restart the stack.
+    - /run/udev:/run/udev:ro
+  # Join the host 'input' group so the non-root container user can READ /dev/input/event*
+  # (root:input, mode 660) without the `sudo chmod 666` ritual. GIDs are HOST-SPECIFIC:
+  #     getent group input   | cut -d: -f3
+  #     getent group dialout | cut -d: -f3
+  # and go in docker/.env.
+  group_add:
+    - "${INPUT_GID:-107}"
+    - "${DIALOUT_GID:-20}"
   ports:
     - 7007:7007
     - 10000:10000
@@ -64,56 +88,3 @@ services:
         UID: $UID
         GID: $GID
         ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-    # Add device access for the lidar if needed:
-    # devices:
-    #   - /dev/ttyUSB0:/dev/ttyUSB0
-
-#services:
-#  robot_rl_obk:
-#    # image: ghcr.io/zolkin1/robot-rl-obk:gpu-latest - does not work due to user mismatch right now
-#    shm_size: '12gb'
-#    build:
-#      context: .
-#      args:
-#        USER: $USER
-#        UID: $UID
-#        GID: $GID
-#        ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-#      dockerfile: Dockerfile
-#    network_mode: host
-#    ipc: host
-#    environment:
-#      NVIDIA_DRIVER_CAPABILITIES: all
-#      DISPLAY: $DISPLAY
-#      USER: $USER
-#      UID: $UID
-#      GID: $GID
-#      QT_X11_NO_MITSHM: 1
-#      ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-#    security_opt:
-#      - seccomp=unconfined
-#    cap_add:
-#      - NET_ADMIN
-#    volumes:
-#      - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
-#      - /tmp/.X11-unix:/tmp/.X11-unix
-#      - $HOME/.Xauthority:$HOME/.Xauthority:rw
-#      - $HOME/.bashrc:$HOME/.bashrc
-#      - $HOME/.gitconfig:$HOME/.gitconfig
-#      - $HOME/.ssh:$HOME/.ssh
-#    ports:
-#      - 7007:7007
-#      - 10000:10000
-#    privileged: true
-#    runtime: nvidia
-#    deploy:
-#      resources:
-#        reservations:
-#          devices:
-#            - driver: nvidia
-#              count: 1
-#              capabilities: [ gpu ]
-#    working_dir: $ROBOT_RL_ROOT
-#    stdin_open: true
-#    tty: true
-#    command: /bin/bash

@@ -1,0 +1,25 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The G1 BRAIN: the low-level generator+tracker controller, its estimator, and the joystick
+# execution FSM. ROBOT-LESS on purpose -- the robot comes from a SEPARATELY launched config
+# on the same ROS graph:
+#
+#   hardware -> config/g1_robot_hw.yml   (the real Unitree driver;  run_hardware_low.sh)
+#   sim      -> config/g1_world.yml      (the MuJoCo world;         run_sim_low.sh)
+#
+# so THIS file is launched unchanged in both cases and there is no sim-vs-hardware fork in
+# the thing being tested. The split also means the world can be restarted without bringing
+# down a controller that took a careful bring-up to arm; distinct top-level `config:` names
+# give each its own obelisk global_state, which is what lets them coexist on one graph.
+#
+# Launch:
+#   obk-launch config=${ROBOT_RL_ROOT}/g1_control/config/g1.yml
+config: rl_policy
+
+include:
+  - common/low_level.yml
+
+# Everything -- controller, estimator, joystick FSM, joy_node -- comes from the shared
+# fragment. This stack has no high-level node, so the FSM's velocity command already goes
+# straight to /obelisk/g1/vel_cmd (the fragment's default) and there is nothing to override:
+# the joystick drives the robot directly.

@@ -1,0 +1,66 @@
+# Jetson Orin container holding the ZED depth node.
+#
+# ONE idle container (bash + tty); the node is launched into a detached container-side tmux
+# by run_node.sh, either by hand or -- normally -- by the onboard stack over ssh
+# (scripts/lib/obk_launch.sh's obk_jetson_zed_cmd). Running it in its own tmux is what lets
+# a flaky ssh link drop without taking the camera down.
+#
+# Usage (on the Jetson):
+#   # one-time: make the nvidia runtime the default in /etc/docker/daemon.json
+#   #   { "default-runtime": "nvidia", "runtimes": { "nvidia": { "path": "nvidia-container-runtime" } } }
+#   cp .env_example .env && $EDITOR .env
+#   docker compose build && docker compose up -d
+#   docker exec -it zed_depth run_node.sh zed        # or let the onboard launcher do it
+
+services:
+  zed_depth:
+    image: jetson_zed_depth:${IMAGE_TAG:-jp6.2}
+    build:
+      context: .
+      dockerfile: ${DOCKERFILE:-Dockerfile.jp6.2}
+      args:
+        USER: ${USER}
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+        ZED_IMAGE: ${ZED_IMAGE:-stereolabs/zed:4.2-devel-jetson-jp6.2}
+        ZED_REF: ${ZED_REF:-23ef4fa709652614d385daa355e917c2ca9ea34f}
+    container_name: zed_depth          # predictable `docker exec -it zed_depth ...`
+    runtime: nvidia                    # the ZED SDK needs the GPU
+    network_mode: host                 # DDS discovery across the jetson and the minipc
+    ipc: host
+    privileged: true                   # ZED USB + tegra device access
+    # Run as root: the Jetson GPU/nvmap device nodes are root:video 660, so a non-root user
+    # cannot initialise CUDA (NvRmMemInit / cuInit fail). HOME keeps ~ on the built workspace.
+    user: root
+    # ROS_DOMAIN_ID / RMW_IMPLEMENTATION come from .env via env_file -- read VERBATIM --
+    # NOT via ${} interpolation under `environment:`. Compose precedence is shell > .env, so
+    # with interpolation a stray `export ROS_DOMAIN_ID=0` in the Jetson login shell would
+    # silently put the camera on a different graph from the controller, and the only symptom
+    # would be a depth watchdog timeout on the robot. Keys listed under `environment:`
+    # override env_file, so ROS_DOMAIN_ID and RMW must NOT appear there.
+    env_file:
+      - .env
+    environment:
+      HOME: /home/${USER}
+    volumes:
+      - /dev:/dev                       # ZED USB enumeration
+      # GMSL ZED X only: the SDK opens the camera through Argus, which talks to the host's
+      # nvargus-daemon over this socket. Not needed for a USB ZED 2i / Mini.
+      - /tmp/argus_socket:/tmp/argus_socket
+      # Persist the SDK's optimised NEURAL engines, so they are not rebuilt (minutes) on
+      # every container start.
+      - zed_resources:/usr/local/zed/resources
+      # Persist the per-camera factory calibration (settings/SN<serial>.conf). SEPARATE from
+      # the models above and unique to the camera's serial. The SDK downloads it from
+      # stereolabs.com on first open -- but the robot LAN has no DNS, so without this volume
+      # it is wiped by any `down`/recreate and CANNOT be re-fetched: camera open then hangs
+      # ~20 s and fails. See seed_zed_calib.sh.
+      - zed_settings:/usr/local/zed/settings
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    restart: unless-stopped            # survives a reboot; bash+tty will not crash-loop
+
+volumes:
+  zed_resources:
+  zed_settings:

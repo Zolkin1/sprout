@@ -354,6 +354,20 @@ Position and velocity actuators added. -->
             <!-- TODO: Verify position -->
             <site name="tracking_camera_site" pos="0.085725 0 0.2413" euler="0.02 -0.08 0" rgba="0 0 1 0" size="0.01"/>
 
+            <!-- Depth-camera mount reference for the OBELISK sim's ray caster. Deliberately
+                 at the body ORIGIN with identity orientation: the camera's real offset and
+                 pitch live in the exported contract (policy_parameters.depth_camera_spec)
+                 and are emitted into the generated scan_config's pattern.offset, so moving
+                 a camera never means editing this file. transfer/sim/depth_camera.py needs
+                 no site at all (it reads the mount body directly), so this exists purely
+                 so the two simulators cast the same rays from the same place. -->
+            <site name="torso_link_origin_site" pos="0 0 0" euler="0 0 0" rgba="0 1 1 0" size="0.01"/>
+
+            <!-- Livox MID360 mount, matching the obelisk g1_27dof model: tilted forward and
+                 mounted inverted on top of the torso. Feeds the simulated /livox/lidar that
+                 the REAL FAST-LIO consumes; no policy reads it. -->
+            <site name="head_lidar_site" pos="0.0 0 0.42218" euler="3.14159 -0.3491 0" rgba="0 0 1 0" size="0.01"/>
+
             <!-- Left Arm -->
             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778" quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
               <inertial pos="0 0.035892 -0.011628" quat="0.654152 0.0130458 -0.326267 0.68225" mass="0.718" diaginertia="0.000465864 0.000432842 0.000406394"/>
@@ -693,22 +707,44 @@ Position and velocity actuators added. -->
     <gyro name="torso_camera_gyro" site="tracking_camera_site" noise="0.01"/>
     <velocimeter name="torso_camera_velocimeter" site="tracking_camera_site"/>
 
+    <!-- Ray-caster anchors for the OBELISK sim. Its scan sensors are declared with
+         `sensor_names: {<name>: framepos}`, so each ray-cast site needs a framepos sensor
+         to hang off. NOISELESS on purpose: these locate the sensor, and jittering that
+         would move the whole ray fan rather than perturb the readings; depth noise is
+         applied to the IMAGE (mdp.sensors.noise), which is where training put it.
+         transfer/sim/depth_camera.py does not use these; it reads the mount body directly. -->
+    <framepos name="depth_pos_sensor" objtype="site" objname="torso_link_origin_site"/>
+    <framequat name="depth_quat_sensor" objtype="site" objname="torso_link_origin_site"/>
+    <framepos name="head_lidar_pos_sensor" objtype="site" objname="head_lidar_site"/>
+    <framequat name="head_lidar_orientation_sensor" objtype="site" objname="head_lidar_site"/>
+
+    <!-- The MID360's own IMU, for FAST-LIO. It publishes /livox/imu on hardware, and the
+         sim must publish the same topic for the localisation stack to run unmodified. -->
+    <accelerometer name="head_lidar_acc_sensor" site="head_lidar_site" noise="0.01"/>
+    <gyro name="head_lidar_gyro_sensor" site="head_lidar_site" noise="0.01"/>
+
   </sensor>
 
   <keyframe>
+    <!-- 29-DOF standing pose. NOTE this was inherited from g1_21j.xml, whose array has
+         no waist_roll/waist_pitch and no wrists; copied verbatim its 21 arm values landed
+         two slots early, putting 0.31 rad of waist ROLL and 0.24 rad of waist PITCH on the
+         torso (and shifting both arms). Re-laid out here for the real 29-DOF order:
+         12 legs, waist yaw/roll/pitch, then 7 per arm (shoulder pitch/roll/yaw, elbow,
+         wrist roll/pitch/yaw). -->
     <key name="standing"
       qpos="0 0 0.79
             1 0 0 0
             -0.25 0 0 0.46 -0.25 0
             -0.25 0 0 0.46 -0.25 0
-            0
-            0.31 0.24 0 0.8
-            0.31 -0.24 0 0.8"
+            0 0 0
+            0.31 0.24 0 0.8 0 0 0
+            0.31 -0.24 0 0.8 0 0 0"
       ctrl="-0.25 0 0 0.46 -0.25 0
             -0.25 0 0 0.46 -0.25 0
-            0
-            0.31 0.24 0 0.8
-            0.31 -0.24 0 0.8
+            0 0 0
+            0.31 0.24 0 0.8 0 0 0
+            0.31 -0.24 0 0.8 0 0 0
             "/>
 <!--    <key name="bow_start"-->
 <!--      qpos="0 0 0.79-->

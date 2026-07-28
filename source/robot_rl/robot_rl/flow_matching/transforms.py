@@ -404,3 +404,37 @@ def sanitize_height_scan(height_scan: torch.Tensor, clip: float = HEIGHT_SCAN_CL
         Finite, clamped height scan with the same shape as the input.
     """
     return torch.nan_to_num(height_scan, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+
+
+DEPTH_CLIP = 2.0
+"""Symmetric clip band for the depth conditioning signal, in NORMALISED units.
+
+Matches the ``depth_near`` / ``depth_far`` RL observation terms' ``clip=(-2, 2)``.
+``mdp.depth_image`` already applies ``(d - 0.75) * 0.5``, so the recorded depth is in
+these normalised units, not metres -- which is why this band differs from
+:data:`HEIGHT_SCAN_CLIP`. Clamping depth at the scan's 1.0 would silently discard real
+readings.
+"""
+
+EXTERO_CLIP: dict[str, float] = {"height_scan": HEIGHT_SCAN_CLIP, "depth": DEPTH_CLIP}
+"""Clip band per :data:`~robot_rl.flow_matching.config.EXTERO_SOURCES` entry."""
+
+
+def sanitize_extero(values: torch.Tensor, source: str) -> torch.Tensor:
+    """Make an exteroception signal finite and clamp it to its source's band.
+
+    Both sources need the guard: the height scan records ``-inf`` for missed rays, and
+    while ``mdp.depth_image`` should already return finite values, a single non-finite
+    entry makes the normalizer's per-dimension mean non-finite and yields a NaN loss.
+
+    Args:
+        values: Raw exteroception values, shape ``(..., K)``.
+        source: One of :data:`EXTERO_CLIP`'s keys.
+
+    Returns:
+        Finite, clamped values with the same shape as the input.
+
+    Raises:
+        KeyError: On an unknown ``source``.
+    """
+    return sanitize_height_scan(values, clip=EXTERO_CLIP[source])

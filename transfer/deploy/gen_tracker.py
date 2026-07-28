@@ -2,19 +2,20 @@
 
 """Torch-free generator + tracker policy (numpy + onnxruntime).
 
-Shared deployment runtime for the MuJoCo sim2sim runner and the hardware
-controller. Numpy + onnxruntime port of ``transfer/sim/gen_tracker_policy.py``
-(the torch version, validated against Isaac to ~1e-7): runs the flow-matching
-generator (``fm.onnx``) online and feeds its world-frame prediction into the RL
-tracker (``tracker.onnx``), reproducing the ``FmTrackingCommand`` coupling.
+The single deployment runtime for the MuJoCo sim2sim runner and the hardware
+controller (the torch twin it was ported from is gone -- sim2sim is ONNX-only): runs
+the flow-matching generator (``fm.onnx``) online and feeds its world-frame prediction
+into the RL tracker (``tracker.onnx``), reproducing the ``FmTrackingCommand`` coupling.
 No torch / isaaclab / robot_rl imports.
 
 The generator is **robot-state-conditioned**, exactly like the in-loop
 ``FmTrackingCommand``: the ``N`` history tokens are the LIVE MEASURED robot state
 (phase), NOT the FM's own past output -- this fixes the autoregressive z-drift /
 exposure bias. Each freshly sampled trajectory is anchored on the robot's current
-base pose (xyz+yaw ground frame; node 0 = "now"), with a root-height token restoring
-ground clearance. The FM joint order need not equal the robot's isaac order (the FM
+base pose (xyz+yaw ground frame; node 0 = "now"), with exteroception token(s) -- the
+height scan or the depth cameras, per the checkpoint -- describing the terrain. Depth
+cameras additionally carry their geometry in the ONNX metadata, checked for agreement
+between the two artifacts at load. The FM joint order need not equal the robot's isaac order (the FM
 is trained in the clip-library order); measured joints are permuted isaac->FM for
 the history and the prediction is permuted FM->CLF-output for the joint reference terms.
 
@@ -29,13 +30,16 @@ import time
 
 import numpy as np
 
-from .fm_session import build_cmd_tokens, build_height_token, build_history_tokens, load_fm_context, sample_world
+from .depth_obs import assert_depth_specs_agree
+from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_world
 from .history import BatchedHistory
 from .quat_math_np import quat_apply, quat_box_minus, quat_inv
 from .tracker_session import TrackerSession
 
-# Obs-term clip bounds set in the env cfg but not carried in the metadata.
-_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0, "height_scan": 1.0}
+# Fallback clips for artifacts exported before the obs terms carried their own ``clip``
+# (``export_parameters.py`` now emits it per term, and the metadata value wins). Anything
+# clipped in the env cfg but absent here was silently unclipped on those older exports.
+_LEGACY_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0, "height_scan": 1.0}
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -52,7 +56,9 @@ class _TrackerOnlyCtx:
     and the MuJoCo runner read in that mode: the joint order and the ee/target
     frame names (for ``ee_ref`` and the clip reference).  ``num_extra_frames`` is
     0 so the runner skips FM history-frame bookkeeping; ``N``/``F``/``D``/
-    ``cmd_dim`` are inert placeholders (the generator is never sampled).
+    ``cmd_dim`` are inert placeholders (the generator is never sampled).  The
+    exteroception fields are inert too: without a generator, the tracker's own obs terms
+    (and hence its ``depth_camera_spec``) decide what the runner has to sense.
     """
 
     def __init__(self, joint_names: list[str], target_frame_names: list[str]):
@@ -66,6 +72,10 @@ class _TrackerOnlyCtx:
         self.F = 1                          # prediction horizon (unused without FM)
         self.D = 0
         self.cmd_dim = 0
+        self.height_dim = 1                 # exteroception conditioning (unused without FM)
+        self.extero_source = "height_scan"
+        self.extero_tokens = 1
+        self.extero_spec: list[dict] = []
 
 
 class GenTrackerPolicy:
@@ -110,6 +120,7 @@ class GenTrackerPolicy:
         self.zero_noise = bool(zero_noise)
         self.null_history_warmup = bool(null_history_warmup)
         self._rng = np.random.default_rng(seed)
+        self._depth_spec: list[dict] = []
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -142,6 +153,7 @@ class GenTrackerPolicy:
             self.ctx = self._tracker_only_ctx()
             print("[INFO GenTrackerPolicy] No fm.onnx -> tracker-only mode: the clip reference "
                   "drives the tracker; the generator is disabled.")
+        self._resolve_depth_cameras()
         self._build_orderings()
         self._build_future_offsets()
         F, nj, k = self.ctx.F, self.ctx.nj, self.ctx.target_num_extra_frames
@@ -166,6 +178,79 @@ class GenTrackerPolicy:
         self._fm_infer_n = 0
         self._trk_infer_s = 0.0
         self._trk_infer_n = 0
+
+    def _resolve_depth_cameras(self) -> None:
+        """Settle on ONE depth-camera contract for the whole deployment.
+
+        There is a single physical camera pair, so a depth tracker and a depth generator
+        running together must have trained on the same one.  Both artifacts carry their
+        own contract (``policy_parameters.depth_camera_spec`` /
+        ``fm_meta.extero_spec``); when both are present they must agree exactly, and the
+        resolved contract is what the runner casts with.
+
+        Raises:
+            ValueError: If the two artifacts disagree, or if a depth-conditioned
+                generator has no contract to check and none to fall back on.
+        """
+        tracker_spec = self._trk.get_depth_camera_spec() or []
+        fm_spec = list(self.ctx.extero_spec or [])
+        if tracker_spec and fm_spec:
+            assert_depth_specs_agree(tracker_spec, fm_spec, "tracker.onnx", "fm.onnx")
+        self._depth_spec = tracker_spec or fm_spec
+
+        if self.ctx.extero_source == "depth":
+            if not self._depth_spec:
+                raise ValueError(
+                    "fm.onnx conditions on depth but neither artifact carries a "
+                    "depth_camera_spec, so the deployment cannot reproduce its cameras. "
+                    "Re-export the FM (its recording must have one) or the tracker."
+                )
+            if len(self._depth_spec) != self.ctx.extero_tokens:
+                raise ValueError(
+                    f"fm.onnx expects {self.ctx.extero_tokens} depth token(s) but the "
+                    f"camera contract lists {len(self._depth_spec)} camera(s)."
+                )
+            for cam in self._depth_spec:
+                pixels = int(cam["width"]) * int(cam["height"])
+                if pixels != self.ctx.height_dim:
+                    raise ValueError(
+                        f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
+                        f"= {pixels} pixels but fm.onnx's token is "
+                        f"{self.ctx.height_dim} wide."
+                    )
+        if self._depth_spec:
+            where = "tracker.onnx" if tracker_spec else "fm.onnx"
+            print(f"[INFO GenTrackerPolicy] depth cameras (from {where}): "
+                  + ", ".join(
+                      f"{c.get('sensor', c['obs_term'])} {c['width']}x{c['height']} "
+                      f"on {c['mount_body']}" for c in self._depth_spec
+                  ))
+
+    def get_depth_camera_spec(self) -> list[dict]:
+        """The resolved depth-camera contract (empty when the policy has no cameras).
+
+        The runner reads this to build its ray caster, so sim and hardware cast exactly
+        the cameras the networks were trained on.
+        """
+        return list(self._depth_spec)
+
+    def get_obs_terms(self) -> list[dict]:
+        """The tracker's ordered observation terms, from its embedded metadata.
+
+        Lets a consumer ask what the policy actually reads -- e.g. whether it wants a
+        height scan -- without reaching into the tracker session.
+        """
+        return self._trk.get_obs_terms()
+
+    def needs_height_scan(self) -> bool:
+        """Whether this deployment must supply ``state["height_scan"]``.
+
+        True if the tracker has the observation term, or the generator conditions on a
+        multi-ray scan.  Either consumer alone is enough to make the reading mandatory.
+        """
+        if any(term["name"] == "height_scan" for term in self.get_obs_terms()):
+            return True
+        return self.ctx.extero_source == "height_scan" and self.ctx.height_dim > 1
 
     def _tracker_only_ctx(self) -> _TrackerOnlyCtx:
         """Build a minimal FM-context stand-in from the tracker metadata (no generator).
@@ -334,13 +419,17 @@ class GenTrackerPolicy:
         frames = self._history.stack_padded("frames") if ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
-        # Height token: the live per-ray height scan at "now" (the runner computes it and
-        # puts it in state["height_scan"]); legacy scalar-height FMs (height_dim==1) fall
-        # back to the root z. Matches how the scan is recorded + used in the RL obs.
-        if ctx.height_dim > 1:
-            height = build_height_token(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
+        # Exteroception token(s) at "now", from whichever sensor this checkpoint trained
+        # on -- the runner puts both readings in the state. Depth is one token per camera
+        # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
+        # of per-ray clearance; legacy scalar-height FMs (height_dim==1) fall back to the
+        # root z. Matches how each is recorded and used in the RL obs.
+        if ctx.extero_source == "depth":
+            height = build_extero_tokens(ctx, np.asarray(state["depth"], dtype=np.float64)[None])
+        elif ctx.height_dim > 1:
+            height = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
         else:
-            height = build_height_token(ctx, rp[:, -1, 2])
+            height = build_extero_tokens(ctx, rp[:, -1, 2])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip→FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -503,6 +592,11 @@ class GenTrackerPolicy:
         # the per-ray clearance in state["height_scan"]; _assemble clips it via _TERM_CLIP.
         if "height_scan" in state:
             values["height_scan"] = f64(state["height_scan"])
+        # Depth: one normalised row per camera, in contract order. Keyed here by the term
+        # name the export recorded, so their position in the vector stays _assemble's
+        # (metadata-driven) job; _assemble then applies the exported obs clip.
+        for cam, image in zip(self._depth_spec, state.get("depth", ())):
+            values[cam["obs_term"]] = f64(image)
         return self._assemble(values)
 
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:
@@ -512,12 +606,16 @@ class GenTrackerPolicy:
         for term in self._trk.get_obs_terms():
             name, shape, scale = term["name"], term["shape"], term["scale"]
             if name not in values:
-                raise NotImplementedError(f"Generator-tracker obs term '{name}' not implemented.")
+                raise NotImplementedError(
+                    f"Generator-tracker obs term '{name}' not implemented (a depth term "
+                    "means the caller supplied no state['depth'] rows)."
+                )
             v = np.atleast_1d(values[name].astype(np.float32))
             if v.shape[0] != shape:
                 raise ValueError(f"Term '{name}': built dim {v.shape[0]} != metadata dim {shape}.")
-            if name in _TERM_CLIP:
-                v = np.clip(v, -_TERM_CLIP[name], _TERM_CLIP[name])
+            clip = term["clip"] if term["clip"] is not None else _LEGACY_TERM_CLIP.get(name)
+            if clip is not None:
+                v = np.clip(v, -clip, clip)
             out[idx:idx + shape] = v * scale
             idx += shape
         return out[None]

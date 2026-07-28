@@ -61,6 +61,12 @@ class RecordingMeta:
             absent). The height scan is the FM's height-conditioning token (per-ray ground
             clearance from the ``height_scanner`` sensor), captured when the recording task
             has one active (e.g. ``G1-teacher-clf-terrain-play``).
+        depth_camera_spec: Deployment contract of the cameras that produced the ``depth``
+            array -- mount, intrinsics, range and normalisation, one entry per camera in
+            token order (``mdp.depth_camera_specs``). ``None`` when the recording task had
+            no depth cameras. Carried through the FM checkpoint into ``fm.onnx`` so a
+            deployed generator states which cameras it was trained on and can be checked
+            against the tracker driving the same physical pair.
         content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
             set after collection. Compression-robust dataset identity; empty for older files.
         format: Storage layout. "per_step_npz" (the legacy every-step ``.npz``) or
@@ -96,6 +102,7 @@ class RecordingMeta:
     ref_future_term_names: list[str] = field(default_factory=list)
     ref_future_term_dims: list[int] = field(default_factory=list)
     height_scan_dim: int = 0
+    depth_camera_spec: list[dict] | None = None
     content_sha256: str = ""
     format: str = "per_step_npz"
     history_len: int = 0
@@ -214,6 +221,12 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
     # height-conditioning token. Written only when a height_scanner sensor was active.
     if data.get("height_scan") is not None:
         optional_arrays["height_scan"] = data["height_scan"].astype(np.float32)
+    # Per-step depth ``[num_pairs, T, H*W]`` (normalised, one token row per camera) --
+    # the FM's other exteroception source. Written only when the recording task had
+    # depth observation terms; the geometry that produced it is in
+    # ``meta.depth_camera_spec``.
+    if data.get("depth") is not None:
+        optional_arrays["depth"] = data["depth"].astype(np.float32)
     np.savez_compressed(
         path,
         # per-pair arrays
@@ -255,6 +268,9 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         ref_future_term_names=np.array(meta.ref_future_term_names),
         ref_future_term_dims=np.array(meta.ref_future_term_dims, dtype=np.int64),
         height_scan_dim=np.int64(meta.height_scan_dim),
+        # Nested structure, so JSON rather than an array -- the file stays
+        # ``allow_pickle=False`` loadable.
+        depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -289,6 +305,8 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         "reanchor_active": z["reanchor_active"] if "reanchor_active" in z.files else None,
         # Present only when a height_scanner sensor was active during recording.
         "height_scan": z["height_scan"] if "height_scan" in z.files else None,
+        # Present only when the recording task had depth observation terms.
+        "depth": z["depth"] if "depth" in z.files else None,
         "terminated": z["terminated"],
         "done": z["done"],
         "time_out": z["time_out"],
@@ -328,6 +346,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
             [int(x) for x in z["ref_future_term_dims"]] if "ref_future_term_dims" in z.files else []
         ),
         height_scan_dim=int(z["height_scan_dim"]) if "height_scan_dim" in z.files else 0,
+        depth_camera_spec=(
+            json.loads(str(z["depth_camera_spec"])) if "depth_camera_spec" in z.files else None
+        ),
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
     return data, meta
@@ -355,6 +376,7 @@ _WINDOW_DTYPES: dict[str, str] = {
     "history_state": "float32",
     "ref_future": "float32",
     "height_scan": "float32",
+    "depth": "float32",
     "cmd_future": "float32",
     "episode_id": "int64",
 }
@@ -397,6 +419,8 @@ class RecordedWindowWriter:
         node_dim: Per-row raw state width (== ref_future node width).
         future_len: ``F``, future nodes per window.
         height_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
+        depth_shape: ``(num_cameras, H*W)`` for the depth dataset, or ``None`` to omit it.
+            Recorded alongside the height scan so one recording can train either FM.
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
         meta: Provenance/layout metadata (stored as JSON attrs).
         compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
@@ -405,7 +429,7 @@ class RecordedWindowWriter:
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
-        compression: str | None = "lzf",
+        compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
     ) -> None:
         import h5py
 
@@ -418,6 +442,8 @@ class RecordedWindowWriter:
         }
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
+        if depth_shape is not None:
+            shapes["depth"] = (num_windows, int(depth_shape[0]), int(depth_shape[1]))
         if cmd_dim > 0:
             shapes["cmd_future"] = (num_windows, future_len, cmd_dim)
         self._keys = list(shapes)

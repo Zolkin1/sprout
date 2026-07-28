@@ -1,3 +1,7 @@
+# Identical to docker-compose.yml minus `runtime: nvidia` and the GPU reservation, which
+# docker can only honour when the nvidia container runtime is registered. The launch
+# scripts auto-select this file when `docker info` shows no nvidia runtime -- the onboard
+# minipc has no GPU, and the deploy path is CPU onnxruntime anyway.
 x-common: &common
   shm_size: '12gb'
   network_mode: host
@@ -10,18 +14,28 @@ x-common: &common
     GID: $GID
     QT_X11_NO_MITSHM: 1
     ROBOT_RL_ROOT: $ROBOT_RL_ROOT
+    REPO_ROOT: $REPO_ROOT
+    OBK_JETSON_HOST: $OBK_JETSON_HOST
+    OBK_JETSON_CONTAINER: ${OBK_JETSON_CONTAINER:-zed_depth}
   security_opt:
     - seccomp=unconfined
   cap_add:
     - NET_ADMIN
   volumes:
-    - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
+    # The whole repo: the controller imports transfer/deploy and the world config loads
+    # transfer/sim/robots/g1/*.xml. See docker-compose.yml for the full rationale.
+    - $REPO_ROOT:$REPO_ROOT
     - /tmp/.X11-unix:/tmp/.X11-unix
     - $HOME/.Xauthority:$HOME/.Xauthority:rw
     - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
     - /dev/input:/dev/input
+    # Joystick hot-reconnect: without this, joy_node misses the re-add when the pad wakes.
+    - /run/udev:/run/udev:ro
+  group_add:
+    - "${INPUT_GID:-107}"
+    - "${DIALOUT_GID:-20}"
   ports:
     - 7007:7007
     - 10000:10000
@@ -33,6 +47,7 @@ x-common: &common
 services:
   sim:
     <<: *common
+    privileged: true
     build:
       context: .
       dockerfile: Dockerfile
@@ -55,48 +70,3 @@ services:
         UID: $UID
         GID: $GID
         ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-    # Add device access for the lidar if needed:
-    # devices:
-    #   - /dev/ttyUSB0:/dev/ttyUSB0
-
-#services:
-#  robot_rl_obk:
-#    # image: ghcr.io/zolkin1/robot-rl-obk:no-gpu-latest   - Does not work due to user mismatch right now
-#    shm_size: '12gb'
-#    build:
-#      context: .
-#      args:
-#        USER: $USER
-#        UID: $UID
-#        GID: $UID
-#        ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-#      dockerfile: Dockerfile
-#    network_mode: host
-#    ipc: host
-#    environment:
-#      NVIDIA_DRIVER_CAPABILITIES: all
-#      DISPLAY: $DISPLAY
-#      USER: $USER
-#      UID: $UID
-#      GID: $UID
-#      QT_X11_NO_MITSHM: 1
-#      ROBOT_RL_ROOT: $ROBOT_RL_ROOT
-#    security_opt:
-#      - seccomp=unconfined
-#    cap_add:
-#      - NET_ADMIN
-#    volumes:
-#      - $ROBOT_RL_ROOT:$ROBOT_RL_ROOT
-#      - /tmp/.X11-unix:/tmp/.X11-unix
-#      - $HOME/.Xauthority:$HOME/.Xauthority:rw
-#      - $HOME/.bashrc:$HOME/.bashrc
-#      - $HOME/.gitconfig:$HOME/.gitconfig
-#      - $HOME/.ssh:$HOME/.ssh
-#    ports:
-#      - 7007:7007
-#      - 10000:10000
-#    privileged: true
-#    working_dir: $ROBOT_RL_ROOT
-#    stdin_open: true
-#    tty: true
-#    command: /bin/bash

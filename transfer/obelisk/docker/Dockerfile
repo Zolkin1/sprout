@@ -54,8 +54,26 @@ USER ${UID}
 
 
 RUN echo "Pulling Obelisk..."
-# clone Obelisk into this docker image at the $OBELISK_ROOT path
-RUN git clone -b feb_hot_fix_scan https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk
+# Obelisk is pinned by SHA, not by branch: a branch clone silently changes the config
+# schema and the node API from one image build to the next, and this stack's configs are
+# written against one schema. Bumping OBELISK_REF busts this layer's cache (and so the
+# obelisk_ws build below); OBELISK_REFRESH is the manual bust for re-pulling the same ref:
+#     docker compose build --build-arg OBELISK_REFRESH=$(date +%s)
+#
+# Current pin: main. Relative to the old feb_hot_fix_scan pin this brings in the config
+# rewrite this stack now depends on -- no top-level `onboard:`, no `device=` launch arg,
+# one `obelisk_settings` YAML parameter per node, composable `include:` with KEYED merge
+# (list entries merged by `name:`), `name:`-derived node names, `${VAR}` expansion in
+# config values, inline `scan_config:`, ObkImu removed in favour of sensor_msgs/Imu, and
+# optional control/estimation/robot sections so a config can launch any subset.
+#
+# TODO(before hardware testing): replace this with an Obelisk RELEASE tag. Tracking a
+# moving ref is fine while developing against the sim; it is not fine on the robot.
+ARG OBELISK_REF=9f52216a6b91c44b67f53f48343dea74d5dbee79
+ARG OBELISK_REFRESH=0
+RUN echo "obelisk refresh token: ${OBELISK_REFRESH}" && \
+    git clone https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk && \
+    cd /home/${USER}/obelisk && git checkout ${OBELISK_REF}
 ENV OBELISK_ROOT=/home/${USER}/obelisk
 
 # Install other dependencies here...
@@ -64,6 +82,18 @@ ENV OBELISK_ROOT=/home/${USER}/obelisk
 # run docker setup script in Dockerfile
 WORKDIR /home/${USER}
 RUN source /home/${USER}/obelisk/setup.sh --downstream-setup --mujoco --unitree
+
+# Pre-build the Obelisk ROS workspace INTO THE IMAGE so it survives `docker compose
+# down/up` and a first launch does not pay for it. Build through `obk`, NOT a bare
+# build_obelisk.sh: obelisk_unitree_cpp's CMakeLists only compiles its executables when
+# OBELISK_BUILD_UNITREE=true is in the environment, which `obk` sets. Without it the image
+# ships an obelisk_ws with no unitree executables and the failure surfaces much later, as
+# "package 'obelisk_unitree_cpp' not found" at launch -- so assert it here instead.
+RUN source /opt/ros/humble/setup.bash && \
+    source /home/${USER}/.bash_aliases && \
+    obk && \
+    echo "[image] verifying the unitree interface built..." && \
+    ros2 pkg executables obelisk_unitree_cpp | grep -q obelisk_unitree_sim
 WORKDIR /home/${USER}
 
 COPY requirements.txt .
@@ -96,14 +126,34 @@ RUN git clone https://github.com/Livox-SDK/Livox-SDK2.git && \
  git clone https://github.com/Livox-SDK/livox_ros_driver2.git && cd livox_ros_driver2
 
 RUN cd /home/${USER}/livox_driver_ws/src/livox_ros_driver2 && \
-    source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh && \
-    cd /home/${USER} && mkdir -p lidar_odom_ws/src && cd lidar_odom_ws/src && \
-    git clone -b ROS2 https://github.com/hku-mars/FAST_LIO.git --recursive && cd .. && \
-    sudo rosdep init && \
-    rosdep update && \
+    source /opt/ros/humble/setup.sh && ./build.sh humble && source ../../install/setup.sh
+
+RUN sudo rosdep init || true
+RUN rosdep update
+
+# LIO-Localization: FAST-LIO mapping PLUS scan_lock (ICP relocalisation against a prior
+# map) and pose_prompt, in one workspace. This replaces the bare hku-mars/FAST_LIO clone:
+# FAST-LIO alone provides odom->imu but never map->odom, so the robot's pose drifts in an
+# unanchored frame. We need the map frame because the generator's history tokens are built
+# from base POSITION and world velocity -- localisation is load-bearing for the POLICY here,
+# not just for navigation.
+#
+# Pinned like OBELISK_REF: at this ref scan_lock/pose_prompt accept absolute and ${ENV}
+# pcd_file_name paths, so the relocalisation configs can point straight at the bind-mounted
+# resources/pcd/ instead of needing a push step after every image rebuild.
+ARG LIO_LOC_REF=39451d2d6c0fdaf9aa059775fabee250647d72d7
+RUN git clone https://github.com/wdc3iii/LIO-Localization.git /home/${USER}/LIO-Localization && \
+    cd /home/${USER}/LIO-Localization && git checkout ${LIO_LOC_REF} && \
+    git submodule update --init --recursive -j 8 && \
+    cd ws_lio_loc && \
     rosdep install --from-paths src --ignore-src -r -y && \
-    colcon build --symlink-install && \
-    echo "source /home/${USER}/lidar_odom_ws/install/setup.bash" >> /home/${USER}/.bashrc
+    source /opt/ros/humble/setup.sh && \
+    source /home/${USER}/livox_driver_ws/install/setup.bash && \
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+RUN echo "source /home/${USER}/livox_driver_ws/install/setup.bash" >> /home/${USER}/.bashrc && \
+    echo "export LD_LIBRARY_PATH=/home/${USER}/livox_driver_ws/install/livox_ros_driver2/lib:\$LD_LIBRARY_PATH" >> /home/${USER}/.bashrc && \
+    echo "source /home/${USER}/LIO-Localization/ws_lio_loc/install/setup.bash" >> /home/${USER}/.bashrc
 
 
 # cat > config/MID360_config.json << 'EOF'

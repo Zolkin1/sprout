@@ -458,7 +458,7 @@ def main() -> None:
     num_joints = train_ds.num_joints
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
-          f"height_dim={cfg.height_dim} (height-scan rays), "
+          f"extero={cfg.extero_source} ({cfg.extero_tokens}x{cfg.height_dim}), "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
@@ -513,7 +513,7 @@ def main() -> None:
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=cfg.future_len,
         num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim,
+        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(device)
@@ -766,6 +766,10 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
     meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
+    # The contract of the sensor this model ACTUALLY conditions on (None for the height
+    # scan). Distinct from the recording's ``depth_camera_spec``, which is present
+    # whenever the cameras were recorded even if this model trained on the scan instead.
+    meta_dict["extero_spec"] = train_ds.extero_spec
     ckpt = {
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),

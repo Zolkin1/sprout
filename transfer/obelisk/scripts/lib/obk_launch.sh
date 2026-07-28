@@ -1,0 +1,335 @@
+# shellcheck shell=bash
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Shared helpers for the obk launch scripts (run_sim_low.sh, run_world.sh,
+# run_hardware_low.sh, stop.sh). Source this from a variant script.
+#
+# Each variant runs in two halves:
+#
+#   HOST      -> obk_host_launch "$0": docker compose up -d, then re-exec THIS script
+#                inside the container with OBK_IN_CONTAINER=1 over a TTY.
+#   CONTAINER -> the variant builds a tmux session out of "seeded" panes and attaches.
+#
+# Pane model: every pane is an interactive `bash --rcfile <tmpfile>` whose rcfile does
+#   source ~/.bashrc     # ROS + defines obk / obk-launch
+#   obk                  # obelisk env (RMW, ROS_DOMAIN_ID) + sources obelisk_ws
+#   source $ROBOT_RL_ROOT/install/setup.bash   # this workspace
+#   history -s '<cmd>'   # the pane's target command, queued in history
+# so a pane comes up fully sourced at a clean [obk] prompt with its command one Up-arrow
+# away. A node that dies therefore leaves you somewhere useful instead of killing the pane.
+
+OBK_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"          # .../obelisk/scripts
+OBK_DOCKER_DIR="$(cd "$OBK_SCRIPTS_DIR/../docker" && pwd)"
+OBK_SERVICE="${OBK_SERVICE:-sim}"
+
+# Compose file selection. An explicit OBK_COMPOSE_FILE always wins. Otherwise auto-detect
+# on the HOST: the GPU compose file requests `runtime: nvidia`, which docker can only
+# honour with the nvidia container runtime registered; without it `docker compose up`
+# errors out, so fall back. In-container the value is unused (compose only runs host-side).
+if [ -z "${OBK_COMPOSE_FILE:-}" ]; then
+    if [ -n "${OBK_IN_CONTAINER:-}" ]; then
+        OBK_COMPOSE_FILE="docker-compose.yml"
+    elif docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
+        OBK_COMPOSE_FILE="docker-compose.yml"
+    else
+        OBK_COMPOSE_FILE="docker-compose-no-gpu.yml"
+        echo "[obk] no nvidia docker runtime detected -> using $OBK_COMPOSE_FILE" \
+             "(set OBK_COMPOSE_FILE to override)" >&2
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# HOST side
+# ---------------------------------------------------------------------------
+
+# obk_build [--clean]: bring the container up and build the colcon workspace inside it.
+# --clean removes build/ install/ log/ first.
+obk_build() {
+    cd "$OBK_DOCKER_DIR" || return 1   # so docker compose picks up docker/.env
+    local dc=(docker compose -f "$OBK_COMPOSE_FILE")
+    echo "[obk] bringing up container ($OBK_SERVICE)..."
+    "${dc[@]}" up -d
+    if [ "${1:-}" = --clean ]; then
+        echo "[obk] cleaning colcon workspace (rm build/ install/ log/)..."
+        "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'cd "$ROBOT_RL_ROOT" && rm -rf build install log'
+    fi
+    echo "[obk] building in container: obk + colcon build --symlink-install ..."
+    # `bash -c` (not -ic) avoids "no job control" warnings under exec -T; ~/.bash_aliases
+    # supplies `obk`, which sets the obelisk env and sources obelisk_ws so colcon finds
+    # the obelisk messages.
+    "${dc[@]}" exec -T "$OBK_SERVICE" bash -c '
+        set -e
+        source ~/.bash_aliases 2>/dev/null || true
+        obk
+        cd "$ROBOT_RL_ROOT"
+        colcon build --symlink-install
+    ' || { echo "[obk] build FAILED"; return 1; }
+}
+
+# obk_host_launch <abs path of the calling variant script> [args...]
+# Brings the container up, then re-execs the variant inside it (the repo is bind-mounted at
+# the same path), forwarding any extra args. Does NOT build; pass --build to the variant.
+obk_host_launch() {
+    local self name
+    self="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+    name="$(basename "$self")"
+    shift
+
+    cd "$OBK_DOCKER_DIR" || return 1
+    local dc=(docker compose -f "$OBK_COMPOSE_FILE")
+
+    echo "[obk] bringing up container ($OBK_SERVICE)..."
+    "${dc[@]}" up -d
+
+    # Re-attach fast path. OBK_RESTART=1 forces a fresh session.
+    if [ -n "${OBK_SESSION:-}" ] && [ -z "${OBK_RESTART:-}" ] \
+       && "${dc[@]}" exec -T "$OBK_SERVICE" bash -c "tmux has-session -t '$OBK_SESSION' 2>/dev/null"; then
+        echo "[obk] session '$OBK_SESSION' already running; attaching (OBK_RESTART=1 for a fresh one)."
+        "${dc[@]}" exec -it "$OBK_SERVICE" bash -c "tmux attach -t '$OBK_SESSION'"
+        return 0
+    fi
+
+    # Stale-launch guard. An ORPHANED obelisk bring-up from a previous session poisons the
+    # new one: every config reuses the same node names, so a surviving launch reacts to the
+    # new nodes' lifecycle events and re-emits configure/activate at them, which is an
+    # invalid transition on an already-active node and kills it. Only true orphans are
+    # flagged -- a launch whose pane died reparents to PID 1, while a legitimately
+    # coexisting session (a world next to a brain) keeps its pane shell as parent.
+    local stale
+    stale="$("${dc[@]}" exec -T "$OBK_SERVICE" bash -c '
+        for p in $(pgrep -f "obelisk_bringup[.]launch[.]py" 2>/dev/null); do
+            [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " ")" = "1" ] && ps -o pid=,cmd= -p "$p"
+        done' || true)"
+    if [ -n "$stale" ]; then
+        echo "[obk] WARNING: ORPHANED obelisk launch process(es) alive in the container:"
+        echo "$stale"
+        echo "[obk]          these WILL kill the new session's nodes. Run scripts/stop.sh"
+        echo "[obk]          first. Continuing in 5s (Ctrl-C to abort)..."
+        sleep 5
+    fi
+
+    echo "[obk] starting tmux session (attach; detach with Ctrl-b then d)..."
+    "${dc[@]}" exec -it "$OBK_SERVICE" \
+        env OBK_IN_CONTAINER=1 OBK_VARIANT="$name" \
+        bash -c 'bash "$ROBOT_RL_ROOT/scripts/$OBK_VARIANT" "$@"' _ "$@"
+}
+
+# ---------------------------------------------------------------------------
+# CONTAINER side (tmux pane construction)
+# ---------------------------------------------------------------------------
+
+# obk_mk_rcfile <name> <command> [mode]: write a per-pane rcfile that sources the full env
+# and, depending on <mode>:
+#   seed (default) -- queue <command> in history only (press Up then Enter).
+#   run            -- queue it AND run it on startup; when it exits or you Ctrl-C you land
+#                     at the [obk] prompt with the command one Up-arrow away.
+# Echoes the rcfile path.
+obk_mk_rcfile() {
+    local name="$1" cmd="${2:-}" mode="${3:-seed}"
+    local f="/tmp/obk_rc_$name"
+    {
+        echo 'source ~/.bashrc'
+        echo 'obk'
+        echo 'source "$ROBOT_RL_ROOT/install/setup.bash" 2>/dev/null \
+              || echo "[pane] workspace not built yet -- run: colcon build --symlink-install"'
+        if [ -n "$cmd" ]; then
+            # %q keeps the history entry intact (including literal ${ROBOT_RL_ROOT}) so
+            # Up-arrow shows exactly what you would have typed.
+            printf 'history -s %q\n' "$cmd"
+            if [ "$mode" = run ]; then
+                printf '%s\n' "$cmd"
+            fi
+        fi
+    } >"$f"
+    printf '%s' "$f"
+}
+
+# obk_pane <name> <command>: pane that SEEDS the command in history (Up then Enter to run).
+obk_pane() { printf 'bash --rcfile %q -i' "$(obk_mk_rcfile "$1" "$2" seed)"; }
+
+# obk_pane_run <name> <command>: like obk_pane but AUTO-RUNS on startup.
+obk_pane_run() { printf 'bash --rcfile %q -i' "$(obk_mk_rcfile "$1" "$2" run)"; }
+
+# obk_pane_shell <name>: a plain sourced shell for debugging (ros2 topic list, etc.).
+obk_pane_shell() { printf 'bash --rcfile %q -i' "$(obk_mk_rcfile "$1")"; }
+
+# obk_policy_config <base_abs_config> <hf_folder>: write a temp controller config that
+# `include`s <base> and keyed-merge-overrides ONLY the low-level controller's
+# hf_policy_folder. Lets --policy select a checkpoint without editing YAML. Obelisk merges
+# list entries by `name:`, so redeclaring `- name: low_level` merges into that entry rather
+# than adding a second controller. <base> must be ABSOLUTE (the temp lives in /tmp, and an
+# include resolves relative to the including file's directory). Echoes the temp path.
+obk_policy_config() {
+    local base="$1" folder="$2"
+    local f
+    f="/tmp/obk_policy_$(basename "$base")"
+    local cfgname
+    cfgname="$(grep -m1 '^config:' "$base" | awk '{print $2}')"
+    cfgname="${cfgname:-rl_policy}"
+    cat >"$f" <<EOF
+# Auto-generated by run_*.sh --policy ${folder}. Thin overlay: include the controller
+# config and keyed-merge-override ONLY the policy folder.
+config: ${cfgname}
+include:
+  - ${base}
+control:
+  - name: low_level
+    params:
+      hf_policy_folder: "${folder}"
+EOF
+    printf '%s' "$f"
+}
+
+# obk_scene_config <base_world_abs_config> <scene_name>: write a temp world config that
+# `include`s <base> and keyed-merge-overrides only the MuJoCo scene, so any
+# transfer/sim/robots/g1/<scene>.xml can be launched without a per-scene config file.
+obk_scene_config() {
+    local base="$1" scene="$2"
+    local f="/tmp/obk_world_${scene}.yml"
+    local xml="$ROBOT_RL_ROOT/../sim/robots/g1/${scene}.xml"
+    [ -f "$xml" ] || echo "[obk] WARNING: scene XML not found: $xml" >&2
+    cat >"$f" <<EOF
+# Auto-generated by run_*.sh --scene ${scene}. Keyed-merge override of the scene only.
+config: g1_world
+include:
+  - ${base}
+robot:
+  - name: g1_sim
+    sim:
+      - ros_parameter: mujoco_setting
+        model_xml_path: \${ROBOT_RL_ROOT}/../sim/robots/g1/${scene}.xml
+EOF
+    printf '%s' "$f"
+}
+
+# ---------------------------------------------------------------------------
+# Jetson (the depth camera's GPU host)
+# ---------------------------------------------------------------------------
+
+# obk_jetson_zed_cmd: echo a command that ssh's to the Jetson and runs the zed_depth
+# container's baked-in run_node.sh, which launches the ZED depth node in its OWN container
+# tmux and attaches. The onboard minipc has no GPU and the ZED SDK needs one, so the camera
+# lives on the Jetson and reaches us over the shared DDS graph.
+#
+# All the launch logic is baked into the image at /usr/local/bin/run_node.sh, so there is
+# nothing to copy and no nested quoting -- just `docker exec` with plain token args. The
+# node runs in a DETACHED tmux, so it survives the ssh dropping; run_node.sh then attaches.
+# Re-running this whole command (Up+Enter in the pane) is idempotent: it re-attaches to the
+# SAME node rather than starting a second one that would fight over the camera.
+#
+# `docker start` first is a no-op when already running and covers a manual `compose stop`;
+# a container that was never created fails with a clear "No such container", and you bring
+# it up once with `docker compose up -d` in transfer/jetson/zed/docker.
+# Requires minipc->jetson pubkey auth reachable from INSIDE this container.
+# Overrides: OBK_JETSON_HOST, OBK_JETSON_CONTAINER.
+obk_jetson_zed_cmd() {
+    local host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"
+    local container="${OBK_JETSON_CONTAINER:-zed_depth}"
+    local opts="-o StrictHostKeyChecking=accept-new"
+    printf 'ssh -t %s %q "docker start %s >/dev/null 2>&1; docker exec -it %s run_node.sh zed"' \
+        "$opts" "$host" "$container" "$container"
+}
+
+# obk_mark_jetson <0|1>: record whether THIS launch put a node on the Jetson, so stop.sh
+# knows whether to reach out to it. The marker lives in this container's /tmp, so it is
+# naturally wiped by a down/up and teardown simply skips.
+obk_mark_jetson() {
+    if [ "${1:-0}" = 1 ]; then : > /tmp/obk_jetson_active
+    else rm -f /tmp/obk_jetson_active 2>/dev/null || true
+    fi
+}
+
+# obk_jetson_stop_cmd: echo a command (run from INSIDE this container, same ssh path as the
+# launch) that stops the Jetson-side ZED node, leaving the container itself up.
+# Best-effort: BatchMode + a short ConnectTimeout so an unreachable Jetson fails fast, and
+# the remote side tolerates a stopped container or no tmux server.
+#
+# Killing the tmux SESSION is not enough: the `ros2 launch` tree under it survives a pane
+# SIGHUP -- the same orphan problem obk_stop reaps locally -- and a surviving launch would
+# then fight the next one over the camera. So pkill the launch tree too: SIGTERM first for
+# a clean rcl shutdown, then -9 for stragglers. The whole remote script is kept quote-free
+# so it survives the bash -> ssh -> jetson-shell -> docker-exec quoting layers, and `set -f`
+# stops the `[.]` anti-self-match patterns being pathname-expanded.
+#
+# The ${OBK_JETSON_HOST:-...} refs are emitted UNEXPANDED on purpose: obk_stop runs this via
+# `docker compose exec ... bash -c "$(obk_jetson_stop_cmd)"`, and that $( ) substitution runs
+# on the HOST, where the variable is unset (compose sets it only inside the container).
+# Expanding here would bake in the wrong default.
+obk_jetson_stop_cmd() {
+    local reap='set -f; tmux kill-session -t obk_zed >/dev/null 2>&1 || true; pkill -f zed_depth[.]launch[.]py >/dev/null 2>&1 || true; sleep 2; pkill -9 -f zed_depth[.]launch[.]py >/dev/null 2>&1 || true'
+    printf 'host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"; container="${OBK_JETSON_CONTAINER:-zed_depth}"; ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" "docker exec $container bash -c '\''%s'\''"' \
+        "$reap"
+}
+
+# ---------------------------------------------------------------------------
+# Shutdown (HOST side)
+# ---------------------------------------------------------------------------
+
+# obk_stop [--zed] [--stop|--down]: kill the tmux server in the container (SIGHUPs every
+# pane, tearing down obk-launch and its nodes), then reap orphans. Then:
+#   (no arg) leave the container running.
+#   --stop   `docker compose stop`  -- stop but KEEP the container (writable layer intact).
+#   --down   `docker compose down`  -- stop and REMOVE it.
+#
+# The Jetson ZED node runs in its OWN tmux inside the Jetson container -- launched over ssh
+# FROM here, and deliberately outliving this tmux -- so killing the local server does NOT
+# stop it. By DEFAULT it is left running: the ZED is slow and flaky to bring back up (the
+# camera link often needs retries), and the next launch's run_node.sh finds the surviving
+# session and re-attaches instead of starting a second one. Pass --zed to tear it down too.
+obk_stop() {
+    cd "$OBK_DOCKER_DIR" || return 1
+    local dc=(docker compose -f "$OBK_COMPOSE_FILE")
+    # Accept --zed and one mode in any order.
+    local mode="" kill_zed=0 a
+    for a in "$@"; do
+        case "$a" in
+            --zed) kill_zed=1 ;;
+            *)     mode="$a" ;;
+        esac
+    done
+    if "${dc[@]}" ps --status running --services 2>/dev/null | grep -qx "$OBK_SERVICE"; then
+        if [ "$kill_zed" = 1 ] && "${dc[@]}" exec -T "$OBK_SERVICE" \
+                bash -c 'test -f /tmp/obk_jetson_active' 2>/dev/null; then
+            echo "[obk] stopping the Jetson ZED node over ssh (best-effort)..."
+            "${dc[@]}" exec -T "$OBK_SERVICE" bash -c "$(obk_jetson_stop_cmd)" || true
+            "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'rm -f /tmp/obk_jetson_active 2>/dev/null || true'
+        fi
+        echo "[obk] killing tmux server in container (stops all panes/nodes)..."
+        "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'tmux kill-server 2>/dev/null || true'
+        # Reap orphaned launch trees. tmux kill-server only SIGHUPs the panes; a ros2 launch
+        # that survives keeps its lifecycle event handlers and change_state clients alive on
+        # the graph. Because the configs reuse node names via the shared includes
+        # (obelisk_control_low_level, obelisk_estimation_g1_estimator, g1_world, ...), ONE
+        # stale launch poisons the NEXT session: it reacts to the new nodes' transition
+        # events and re-emits configure/activate at them, and an invalid transition on an
+        # active rclpy node raises and kills it. [_]/[.] break pkill self-matching.
+        echo "[obk] reaping orphaned ros2 launch trees + obelisk nodes..."
+        "${dc[@]}" exec -T "$OBK_SERVICE" bash -c '
+            pkill -f "obelisk_bringup[.]launch[.]py" 2>/dev/null || true
+            pkill -f "ros2 la[u]nch" 2>/dev/null || true
+            sleep 2
+            pkill -9 -f "obelisk_bringup[.]launch[.]py" 2>/dev/null || true
+            pkill -9 -f "ros2 la[u]nch" 2>/dev/null || true
+            pkill -f "obelisk[_]unitree|lib/joy/joy[_]node|global[_]state|fsm[_]state[_]echo" 2>/dev/null || true
+            sleep 1
+            left=$(pgrep -af "ros2 la[u]nch|obelisk_bringup[.]launch|obelisk[_]unitree|global[_]state" 2>/dev/null | grep -cv pgrep || true)
+            if [ "${left:-0}" -gt 0 ]; then
+                echo "[obk] WARNING: $left launch/node process(es) still alive after reap:"
+                pgrep -af "ros2 la[u]nch|obelisk_bringup[.]launch|obelisk[_]unitree|global[_]state" | grep -v pgrep || true
+            fi' || true
+    else
+        echo "[obk] container '$OBK_SERVICE' is not running."
+    fi
+    case "$mode" in
+        --down)
+            echo "[obk] docker compose down (stop + REMOVE container)..."
+            "${dc[@]}" down ;;
+        --stop)
+            echo "[obk] docker compose stop (container kept)..."
+            "${dc[@]}" stop ;;
+        "")
+            echo "[obk] nodes stopped; container left running (--stop to stop it, --down to remove it)." ;;
+        *)
+            echo "[obk] unknown option '$mode' (use --stop or --down)."; return 2 ;;
+    esac
+}

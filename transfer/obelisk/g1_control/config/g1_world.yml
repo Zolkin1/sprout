@@ -1,0 +1,98 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The MuJoCo WORLD, and nothing else -- the simulation counterpart of g1_robot_hw.yml.
+# Launched as its own obk-launch alongside the robot-less brain (g1.yml) on the same ROS
+# graph, so the SAME controller config runs in sim and on hardware and the world can be
+# restarted without cycling the brain.
+#
+# Launch:
+#   obk-launch config=${ROBOT_RL_ROOT}/g1_control/config/g1_world.yml
+#
+# It publishes exactly the topics the real robot does -- joint encoders, pelvis IMU, the
+# depth image, /livox/lidar + /livox/imu -- so nothing downstream can tell the difference.
+config: g1_world
+
+robot:
+  - name: g1_sim
+    is_simulated: True
+    pkg: obelisk_unitree_cpp
+    executable: obelisk_unitree_sim
+    params:
+      ic_keyframe: standing
+    sim:
+      - ros_parameter: mujoco_setting
+        # The SAME 29-DoF model the MuJoCo sim2sim runner uses, by absolute path
+        # (${VAR} is expanded at launch, and obelisk takes an absolute model_xml_path
+        # as-is). Not a copy under g1_model/: a second MJCF is a second set of masses,
+        # collision geometry and geom groups to keep in sync, and the whole point of this
+        # stack is that the two simulators agree. ROBOT_RL_ROOT is transfer/obelisk.
+        model_xml_path: ${ROBOT_RL_ROOT}/../sim/robots/g1/g1_29j_terrain_scene.xml
+        time_step: 0.001
+        num_steps_per_viz: 10
+        sensor_settings:
+        # ----- Joint encoders ----- #
+          - topic: /obelisk/g1/joint_encoders
+            dt: 0.002
+            msg_type: ObkJointEncoders
+            sensor_names:
+              joint_pos: jointpos
+              joint_vel: jointvel
+        # ----- Pelvis IMU ----- #
+          - topic: /obelisk/g1/pelvis_imu
+            dt: 0.001
+            msg_type: Imu
+            sensor_names:
+              pelvis_imu_acc_sensor: accelerometer
+              pelvis_imu_gyro_sensor: gyro
+              pelvis_imu_quat_sensor: framequat
+        # ----- Depth camera ----- #
+        # Same topic and same message the Jetson ZED node publishes on hardware, so the
+        # controller cannot tell them apart. `dt` and the whole scan_config come from the
+        # policy's exported contract via scripts/rsl_rl/export_sensor_configs.py -- do not
+        # hand-edit config/scan/depth_*.yml, regenerate it.
+        #
+        # The path form is `config_path:` rather than an inline `scan_config:` because the
+        # file is GENERATED: `include:` merges whole top-level sections and cannot splice a
+        # fragment into this nested list, so a path is what keeps generated content out of
+        # a hand-written file. Inline is otherwise preferred on this obelisk pin.
+        #
+        # UNCOMMENT once a depth-trained policy has been exported and the config generated;
+        # a height-scan policy needs config/scan/height_scan.yml here instead.
+        # - topic: /depth/image_processed
+        #   dt: 0.02
+        #   msg_type: DepthImage
+        #   config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_near.yml
+        #   sensor_names: {depth_pos_sensor: framepos}
+        # ----- Lidar: simulated MID360 feeding the REAL FAST-LIO ----- #
+          - topic: /livox/lidar
+            dt: 0.1
+            msg_type: PointCloud2
+            config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/mid360.yml
+            sensor_names: {head_lidar_pos_sensor: framepos}
+          - topic: /livox/imu
+            dt: 0.005
+            msg_type: Imu
+            sensor_names:
+              head_lidar_acc_sensor: accelerometer
+              head_lidar_gyro_sensor: gyro
+              head_lidar_orientation_sensor: framequat
+    subscribers:
+      - ros_parameter: sub_ctrl_setting
+        topic: /obelisk/g1/ctrl
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_fsm_setting
+        topic: /obelisk/g1/exec_fsm
+        history_depth: 10
+        callback_group: None
+      - ros_parameter: sub_vel_cmd_setting
+        topic: /obelisk/g1/vel_cmd
+        history_depth: 10
+        callback_group: None
+
+# NOTE: MuJoCo has no execution FSM, so nothing here publishes /obelisk/g1/fsm_state and
+# the controller would stay disarmed forever. `g1_control/fsm_state_echo_node.py` echoes
+# the joystick's commanded FSM back as the achieved state; the launch scripts start it with
+# `ros2 run g1_control fsm_state_echo` alongside this world. It is deliberately NOT an
+# obelisk control entry here -- as one it would share a lifecycle and node-name space with
+# the brain's real controller, and a cross-config transition then kills a live node.
