@@ -351,7 +351,7 @@ def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
         raise ValueError(
             "clip library has no per-clip terrain_id (pre-terrain library); "
             "cannot group clips by terrain. Regenerate with the terrain-aware "
-            "generator (scripts/rsl_rl/generate_terrain_clips.py)."
+            "generator (scripts/rsl_rl/generate_mb_library.py)."
         )
     tid = lib.terrain_id.to(torch.long)
     return {int(t): (tid == int(t)).nonzero(as_tuple=False).flatten() for t in torch.unique(tid)}

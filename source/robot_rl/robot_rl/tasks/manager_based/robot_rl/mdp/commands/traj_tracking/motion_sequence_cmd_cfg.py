@@ -12,7 +12,7 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Config for :class:`MotionSequenceCommand`.
 
     ``path`` points at a dense clip-library ``.h5`` (produced by
-    ``scripts/rsl_rl/generate_clips.py``), not a stride-library folder.
+    ``scripts/rsl_rl/generate_mb_library.py``), not a stride-library folder.
     The conditioner / gate / skill-bucket fields of the multi-skill command
     do not apply -- a clip is tracked open-loop by a step index.
     """

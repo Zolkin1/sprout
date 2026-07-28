@@ -8,8 +8,8 @@ sampled tile geometries, with many clips SHARING each tile (the RL importer roun
 a tile is a reuse unit). This pass does the whole env_isaaclab half of that up front:
 
 1. **Sample tiles** with the same samplers + ranges the DP generator uses
-   (:func:`~motion_gen.motion_matching.terrain_sampler.sample_stair_tiles` /
-   :func:`~motion_gen.motion_matching.terrain_sampler.sample_box_tiles`), so the MB library's tile
+   (:func:`~motion_gen.terrain.terrain_sampler.sample_stair_tiles` /
+   :func:`~motion_gen.terrain.terrain_sampler.sample_box_tiles`), so the MB library's tile
    population is statistically the DP library's.
 2. **Plan every clip** via ``mb_terrain_clips.plan_from_spec`` (one reference selection + placement +
    boundary gate per clip), writing one :class:`~motion_gen.motionbricks.terrain_plan.TerrainPlan` each.
@@ -47,7 +47,7 @@ from mb_terrain_clips import (                                            # noqa
     plan_from_spec,
 )
 
-from motion_gen.motion_matching.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
+from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
                                     save_terrain_plan)
 

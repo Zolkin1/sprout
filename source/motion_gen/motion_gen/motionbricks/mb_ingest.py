@@ -1,7 +1,7 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
 """Stage 2: turn a :class:`~motion_gen.motionbricks.raw_schema.RawMotion` into the world
-trajectory the existing :class:`~motion_gen.motion_matching.clip_output.ClipOutputBuilder` consumes.
+trajectory the existing :class:`~motion_gen.clip_output.ClipOutputBuilder` consumes.
 
 Motion Bricks emits ``mujoco_qpos`` at 30 Hz; the clip library must be at the RL control dt
 (50 Hz). :func:`raw_to_world` reindexes the 29 joints to ``G1_JOINT_NAMES`` order and resamples

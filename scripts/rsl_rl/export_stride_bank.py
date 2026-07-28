@@ -6,7 +6,7 @@
 Phase-2 Motion Bricks generation drives the model with *our* optimized traj-opt strides as
 velocity-indexed keyframes. Those strides live in the clean steady-state library
 (``trajectories/skills/library_v2``) and are ingested via
-:func:`motion_gen.motion_matching.clean_ingest.ingest_clean_library` -- which needs ``motion_gen``
+:func:`motion_gen.ingest.clean_ingest.ingest_clean_library` -- which needs ``motion_gen``
 (env_isaaclab), NOT the Motion Bricks conda env. So, mirroring the Stage-1/Stage-2 ``RawMotion``
 contract, this stage writes a self-contained, numpy-only ``.npz`` that the Motion Bricks-side
 ``mb_encode.py`` loads without importing ``motion_gen``.
@@ -30,7 +30,7 @@ import json
 import numpy as np
 import torch
 
-from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+from motion_gen.ingest.clean_ingest import ingest_clean_library
 
 
 def main() -> int:

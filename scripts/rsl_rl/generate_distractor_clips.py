@@ -1,7 +1,15 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Generate DISTRACTOR box clips: a box the robot sees but does NOT jump on.
+"""PARTLY DEPRECATED -- read before deleting.
+
+The CLI here (DP-matched distractor clips) is deprecated: the live pipeline generates this
+family with ``mb_distractor_clips.py``.  But ``_box_pool`` and ``_make_tile`` are NOT
+deprecated -- ``mb_distractor_clips.py`` imports both from this module as a sibling, so the
+tile geometry / footprint / manifest is byte-identical between the two motion sources.  Keep
+this file (or move those two functions into ``motion_gen``) as long as that import exists.
+
+Generate DISTRACTOR box clips: a box the robot sees but does NOT jump on.
 
 Coherence-first design (each clip's box is placed so the motion's relationship to it is valid --
 never "walk into a box"): generate SHORT flat motions by TYPE, then fit a box/wall per type so the
@@ -42,17 +50,17 @@ import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, se2z_align
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.distractor import occupancy_grid
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.terrain.box_clip import _quat_yaw_wxyz, se2z_align
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.terrain.distractor import occupancy_grid
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
     clean_library_fingerprint,
 )
 from motion_gen.motionbricks.distractor_plan import profile_cmd
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -317,8 +325,8 @@ def main() -> int:
     dev = args.device
 
     matcher = _build_flat_matcher(args, dev)
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
     T = max(1, int(round(args.short_s / args.dt)))
 
@@ -336,7 +344,7 @@ def main() -> int:
             "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
             "vel_output_names": list(builder.vel_names),
             "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
-            "skill_list": [s.name for s in manager.skills]}
+            "skill_list": lib_meta.skill_list}
     writer = ClipLibraryWriter(args.out, len(records), meta)
     writer.set_attr("generator", "distractor")
     writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))

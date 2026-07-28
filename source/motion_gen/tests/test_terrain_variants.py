@@ -12,7 +12,7 @@ from collections import Counter
 
 import numpy as np
 
-from motion_gen.motion_matching.terrain_variants import (
+from motion_gen.terrain.terrain_variants import (
     BOX_VARIANTS,
     normalize_box_variant_fracs,
     resolve_box_variant,

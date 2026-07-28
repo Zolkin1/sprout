@@ -87,7 +87,7 @@ class TerrainFamily:
 # mount + both dismount directions: ``jump_off`` steps off backwards, ``jump_off_front`` forwards.
 #
 # Every box family WALKS on both sides, exactly like the stair families: the tile authors a short walkable
-# platform flush with the box top (:func:`~motion_gen.motion_matching.box_clip.box_tile_boxes`), so the
+# platform flush with the box top (:func:`~motion_gen.terrain.box_clip.box_tile_boxes`), so the
 # elevated segment has somewhere to go.  It used to be a standing hold -- a mount ended by standing on the
 # box, a dismount began by standing on it -- and because both MB segments carry the ego anchor mask, a
 # standing hold RE-ANCHORS onto whatever pose the robot actually reached: missing the box cost nothing and
@@ -191,7 +191,7 @@ def sole_heights(y: np.ndarray, pos_names: list[str],
                  sole_offset: float = SOLE_Z) -> np.ndarray:
     """Per-frame SOLE heights ``[T, 2]`` (left, right) from a built clip-output block ``y[T, P]``.
 
-    ``y`` is what :class:`~motion_gen.motion_matching.clip_output.ClipOutputBuilder` produces (the
+    ``y`` is what :class:`~motion_gen.clip_output.ClipOutputBuilder` produces (the
     ``pos_output_names`` layout); the ankle-frame z is lowered by ``sole_offset`` so the value can be
     compared directly against a tread / box top height.
     """

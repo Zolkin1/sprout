@@ -12,7 +12,7 @@ command:
 * ``mujoco_qpos`` ``[T, 36]`` -- Motion Bricks' MuJoCo qpos: ``[root_pos(3), root_quat_wxyz(4),
   joints(29)]`` at ``fps`` Hz (Z-up; the quaternion is already reordered to wxyz by the agent).
 * ``joint_names`` -- the 29 joint names in ``qpos[7:36]`` order, so Stage 2 reindexes *by name* to
-  ``motion_gen.motion_matching.features.G1_JOINT_NAMES`` (rather than assuming positional identity).
+  ``motion_gen.joint_names.G1_JOINT_NAMES`` (rather than assuming positional identity).
 * ``target_vel`` ``[T, 3]`` -- the RL-visible ``(vx, vy, wz)`` command; stored verbatim into the clip
   library (the FM tracker requires it).
 * ``target_vel_snapped`` ``[T, 3]`` (optional) -- the command the motion was actually GENERATED at.

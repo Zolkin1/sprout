@@ -7,11 +7,11 @@ existing offline-clip pipeline as a *selectable backend alongside* the DP motion
 split across two stages that never share a Python process:
 
 * **Stage 1** (Motion Bricks conda env, GPU) drives the model and writes an intermediate raw-motion
-  file. That code lives in ``scripts/rsl_rl/mb_generate.py`` / ``mb_encode.py`` and imports the
+  file. That code lives in ``scripts/rsl_rl/mb_encode.py`` and imports the
   external ``motionbricks`` package -- it is *not* part of this subpackage.
 * **Stage 2** (this subpackage, isaaclab-free) reads the raw-motion file and converts it into the
   clip-library ``.h5`` the RL side already consumes, reusing
-  :class:`motion_gen.motion_matching.clip_output.ClipOutputBuilder` and
+  :class:`motion_gen.clip_output.ClipOutputBuilder` and
   :class:`motion_gen.clips.clip_io.ClipLibraryWriter`.
 
 The intermediate file (:mod:`.raw_schema`) is the only contract between the two stages, so Stage 2

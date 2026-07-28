@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mb_terrain_clips import clip_from_plan, make_builder                    # noqa: E402
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library    # noqa: E402
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool  # noqa: E402
+from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_terrain_plan, overlays_for          # noqa: E402
 from motion_gen.world_lift import _ANCHOR_MASK_BOX                           # noqa: E402
 

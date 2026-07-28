@@ -8,7 +8,7 @@ import math
 
 import torch
 
-from motion_gen.motion_matching.box_clip import (
+from motion_gen.terrain.box_clip import (
     align_and_concat,
     build_anchor_mask_t,
     transform_boxes,
@@ -64,7 +64,7 @@ def test_build_anchor_mask_t():
 def test_yaw_normalize_axis_aligns_box_rigidly():
     import numpy as np
 
-    from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, yaw_normalize
+    from motion_gen.terrain.box_clip import _quat_yaw_wxyz, yaw_normalize
     T = 4
     rp = torch.stack([torch.tensor([1.0 + k * 0.1, 0.3, 0.8]) for k in range(T)])
     rq = _quat_yaw_wxyz(math.radians(-13)).unsqueeze(0).repeat(T, 1)
@@ -86,7 +86,7 @@ def test_yaw_normalize_facing_cancels_the_heading_not_the_box_yaw():
     along world x -- transposing the tile's axes and handing the anchor mask's free-y the takeoff
     distance instead of the lateral offset.
     """
-    from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, yaw_normalize
+    from motion_gen.terrain.box_clip import _quat_yaw_wxyz, yaw_normalize
     T = 4
     facing = math.radians(-90)         # the library's jump references sit within ~4 deg of this
     rp = torch.stack([torch.tensor([0.0, -0.2 * k, 0.8]) for k in range(T)])   # walks along -y
@@ -105,7 +105,7 @@ def test_yaw_normalize_facing_cancels_the_heading_not_the_box_yaw():
 def test_yaw_normalize_rejects_an_unknown_align():
     import pytest
 
-    from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, yaw_normalize
+    from motion_gen.terrain.box_clip import _quat_yaw_wxyz, yaw_normalize
     rp, rq = torch.zeros(2, 3), _quat_yaw_wxyz(0.0).unsqueeze(0).repeat(2, 1)
     with pytest.raises(ValueError, match="align"):
         yaw_normalize(rp, rq, [], rq[0], align="tread")

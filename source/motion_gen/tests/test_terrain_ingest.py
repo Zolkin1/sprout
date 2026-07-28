@@ -11,8 +11,8 @@ import json
 
 import numpy as np
 
-from motion_gen.motion_matching.bones_ingest import filter_rows
-from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
+from motion_gen.ingest.bones_ingest import filter_rows
+from motion_gen.ingest.terrain_ingest import ingest_terrain_library
 
 _ANKLES = ["robot/left_ankle_roll_link", "robot/right_ankle_roll_link"]
 _WRISTS = ["robot/left_wrist_yaw_link", "robot/right_wrist_yaw_link"]

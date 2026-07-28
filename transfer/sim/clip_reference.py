@@ -3,7 +3,7 @@
 """Torch-free baked-clip reference source for the MuJoCo sim2sim runner.
 
 Loads a dense motion-clip library (the HDF5 produced by
-``scripts/rsl_rl/generate_parity_clip.py`` / ``generate_clips.py``) with numpy
+``scripts/rsl_rl/generate_mb_library.py``) with numpy
 and serves, per control step, the same world-frame reference dict the online
 flow-matching generator emits -- ``{"current": {...}, "future": [...]}`` -- so it
 drops straight into ``GenTrackerPolicy._build_obs(state, reference=...)``.  This

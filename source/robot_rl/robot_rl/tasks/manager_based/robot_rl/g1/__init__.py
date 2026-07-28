@@ -1,4 +1,18 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
+"""Gym registrations for the G1 offline-clip pipeline.
+
+The pipeline is: motionbricks clip generation -> teacher RL on the clip library ->
+flow-matching generator -> closed-loop tracker -> sim2sim -> hardware.  Every task
+here is terrain-based: the scene ground is a
+:class:`~robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer.ClipTerrainImporter`
+built from the clip library itself, and each env spawns on a clip matching the tile it
+stands on.  A "flat" run is just a library whose tiles happen to be flat, so there is no
+separate flat task -- see ``scripts/rsl_rl/compare_sim2sim.py``, which drives the flat and
+stair cases through the same task with different single-clip libraries.
+
+The clip library is REQUIRED from the CLI (``--clip``); there is deliberately no default,
+because a stale one silently trains on the wrong terrain.
+"""
 
 import gymnasium as gym
 
@@ -13,522 +27,7 @@ _registered = False
 
 if not _registered:
     ## =========================================
-    # Walking Trajectory Optimization
-    ## =========================================
-    gym.register(
-        id="G1-walking-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-symmetric",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        }
-    )
-
-    # Custom network architecture
-    gym.register(
-        id="G1-walking-clf-custom-arch",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
-        }
-    )
-
-    # Transformer Architecture
-    gym.register(
-        id="G1-walking-clf-transformer",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFTransformerEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:CausalTransformerPPORunnerCfg",
-        }
-    )
-
-    # Extra compute (EC)
-    gym.register(
-        id="G1-walking-clf-ec",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    # Play
-    gym.register(
-        id="G1-walking-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walking_clf_env_cfg:G1WalkingCLFEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    ## =========================================
-    # Walking + Depth Camera (flat scan / image)
-    ## =========================================
-    gym.register(
-        id="G1-walking-clf-depth-scan",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-image",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-scan-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthScanEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-walking-clf-depth-image-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_depth_env_cfg:G1WalkingCLFDepthImageEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    ## =========================================
-    # Running Trajectory Optimization
-    ## =========================================
-    gym.register(
-        id="G1-running-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    gym.register(
-        id="G1-running-clf-symmetric",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        }
-    )
-
-    # Play
-    gym.register(
-        id="G1-running-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    # Play
-    gym.register(
-        id="G1-running-clf-experiment",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_running_clf_env_cfg:G1RunningCLFEnvCfgExperiment",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    ## =========================================
-    # Walk + Run Trajectory Optimization
-    ## =========================================
-    #########
-    ## MLP ##
-    #########
-    gym.register(
-        id="G1-walk-run-clf-symmetric",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:MultiSkillSymmetricHalfPeriodicPPORunnerCfg",
-        }
-    )
-
-    # Play
-    gym.register(
-        id="G1-walk-run-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:MultiSkillSymmetricHalfPeriodicPPORunnerCfg",
-        }
-    )
-
-    #########
-    ## MoE ##
-    #########
-    gym.register(
-        id="G1-walk-run-clf-sym-moe",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMoE2MLPDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    ##################
-    ## Distillation ##
-    ##################
-    # MLP -> MLP distillation
-    gym.register(
-        id="G1-walk-run-clf-distill-mlp2mlp",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MulitskillMLP2MLPDistillationRunner"
-            ),
-        }
-    )
-
-    # MLP teacher -> LSTM student
-    gym.register(
-        id="G1-walk-run-clf-distill-mlp2lstm",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2LSTMDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # MLP teacher -> Transformer student
-    gym.register(
-        id="G1-walk-run-clf-distill-mlp2transformer",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2TransformerDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # MLP teacher -> Transformer student with sagittal symmetry augmentation
-    gym.register(
-        id="G1-walk-run-clf-sym-distill-mlp2transformer",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2TransformerSymmetricDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # MLP teacher -> Transformer student with mixed on/off-policy rollout
-    gym.register(
-        id="G1-walk-run-clf-distill-mixed-mlp2transformer",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMixedPolicyMLP2TransformerDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # MoE teacher -> MoE student
-    gym.register(
-        id="G1-walk-run-clf-sym-distill-moe2moe",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMoE2MoEDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # MLP teacher -> MoE student
-    gym.register(
-        id="G1-walk-run-clf-sym-distill-mlp2moe",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1MultiskillMLP2MoEDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # TODO: Test
-    # Hybrid DAgger + PPO distillation, MLP -> Transformer
-    gym.register(
-        id="G1-walk-run-clf-distill-hybrid",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFTransformerDistillationEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1HybridDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    ########
-    # Play #
-    ########
-    gym.register(
-        id="G1-walk-run-clf-custom-arch-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_walk_run_env_cfg:G1WalkRunCLFEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricMoEPPORunnerCfg",
-        }
-    )
-
-    ## =========================================
-    # Bowing Trajectory Optimization
-    ## =========================================
-    gym.register(
-        id="G1-bow_forward-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    gym.register(
-        id="G1-bow_forward-clf-symmetric",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1BowingDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # Play
-    gym.register(
-        id="G1-bow_forward-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bow_forward_clf_env_cfg:G1BowingCLFEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    ## =========================================
-    # Bend Up Trajectory Optimization
-    ## =========================================
-    gym.register(
-        id="G1-bend_up-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bend_up_clf_env_cfg:G1BendUpCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    gym.register(
-        id="G1-bend_up-clf-symmetric",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bend_up_clf_env_cfg:G1BendUpCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
-            "rsl_rl_distillation_cfg_entry_point": (
-                f"{agents.__name__}.rsl_rl_distillation_cfg:G1BowingDistillationRunnerCfg"
-            ),
-        }
-    )
-
-    # Play
-    gym.register(
-        id="G1-bend_up-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_bend_up_clf_env_cfg:G1BendUpCLFEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        }
-    )
-
-    ## =========================================
-    # Stairs Terrain
-    ## =========================================
-    gym.register(
-        id="G1-stairs-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stairs_clf_env_cfg:G1StairsCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-stairs-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_stairs_clf_env_cfg:G1StairsCLFEnvCfg_PLAY",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        },
-    )
-
-    # Multiskill terrain
-    # TODO(zolkin): rename the runner these two point at. "HalfPeriodic" only
-    # describes phase-clock handling (negate sin/cos_phase under reflection),
-    # but this env disables the phase clock (sin_phase/cos_phase = None) and
-    # feeds explicit trajectory-reference obs, so the half-periodic-vs-episodic
-    # distinction is inert here and the label is misleading. Add a phase-
-    # agnostic SagittalSymmetricPPORunnerCfg (same as SymmetricEpisodic, using
-    # symmetric_data_augmentation_episodic) and point both registrations at it.
-    # Don't rename SymmetricHalfPeriodicPPORunnerCfg itself — it's accurate for
-    # the phase-obs envs (running / stairs / walk_run) that still use it.
-    gym.register(
-        id="G1-multiskill-terrain-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_terrain_multiskill_env_cfg:G1TerrainMultiskillCLFEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-multiskill-terrain-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_terrain_multiskill_env_cfg:G1TerrainMultiskillCLFEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricHalfPeriodicPPORunnerCfg",
-        },
-    )
-
-    ## =========================================
-    # Teacher: open-loop motion-clip tracking (pre-generated clips, flat ground)
-    ## =========================================
-    gym.register(
-        id="G1-teacher-clf",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-teacher-clf-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips
-    # are full episodic motions with no gait-phase obs, so the Episodic runner
-    # is the correct choice (phase negation is a no-op here).
-    gym.register(
-        id="G1-teacher-clf-sym",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
-        },
-    )
-
-    gym.register(
-        id="G1-teacher-clf-sym-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherEnvCfgPlay",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
-        },
-    )
-
-    # Deterministic single-clip playback of the trained teacher on the parity clip
-    # (stand -> walk -> run -> stand); ego re-anchoring off by default (override
-    # env.commands.traj_ref.ego_anchor_fraction=1.0 to watch the re-anchoring).
-    gym.register(
-        id="G1-teacher-clf-parity-play",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_teacher_env_cfg:G1TeacherParityPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
-        },
-    )
-
-    ## =========================================
-    # Teacher on TERRAIN: terrain-aware clip tracking (stairs + flat, height scan)
-    # The scene ground is a ClipTerrainImporter built from the clip library, and
-    # each env is assigned a clip matching the terrain tile it stands on.
+    # Teacher: open-loop clip tracking on the clip-library terrain (height scan)
     ## =========================================
     gym.register(
         id="G1-teacher-clf-terrain",
@@ -550,25 +49,47 @@ if not _registered:
         },
     )
 
-    ## =========================================
-    # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
-    ## =========================================
-    # Closed-loop deploy of the ROBOT-STATE-conditioned FM: the teacher (--load_run)
-    # tracks the FM predicted from the LIVE robot-state history each step (the new
-    # paradigm). Pass the robot-state FM via --fm_checkpoint and --clip_device cpu.
+    # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips are full
+    # episodic motions with no gait-phase obs, so the Episodic runner is the correct
+    # choice (phase negation would be a no-op here).
+    #
+    # !! CURRENTLY BROKEN -- these two raise at the first PPO update:
+    #      ValueError: Symmetry augmentation has no handler for obs term 'base_vel_ref'
+    #    The teacher's reference observations (base_vel_ref, ee_ref, future_base_pose,
+    #    future_base_vel, ...) were added without registering reflection rules in
+    #    motion_gen.sagittal_reflector.SagittalReflectionConfig, and the augmentation
+    #    deliberately refuses to run rather than silently identity-copying the mirrored half
+    #    of the batch (which would poison training). Pre-dates the repo slim-down: the same
+    #    error reproduces on the old G1-teacher-clf-sym at 681a624.
+    #    To revive: add each unhandled term to SagittalReflectionConfig with the correct
+    #    reflection (e.g. base_vel_ref negates vy + wz; ee_ref must swap the left/right
+    #    frames AND negate y), extend tests/test_sagittal_reflector.py, then smoke-train.
     gym.register(
-        id="G1-tracker-clf-fm-play",
+        id="G1-teacher-clf-terrain-sym",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
         disable_env_checker=True,
         kwargs={
-            "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
         },
     )
 
-    # Terrain variant: same closed-loop FM deploy, but on the ClipTerrainImporter stairs
-    # (height scan rides the treads). Load the teacher via --load_run + terrain FM via
-    # --fm_checkpoint, --clip_device cpu.
+    gym.register(
+        id="G1-teacher-clf-terrain-sym-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:SymmetricEpisodicPPORunnerCfg",
+        },
+    )
+
+    ## =========================================
+    # Tracker: closed-loop robot-state-conditioned flow-matching deploy (world-frame CLF)
+    ## =========================================
+    # The teacher (--load_run) tracks the FM predicted from the LIVE robot-state history
+    # each step. Pass the FM via --fm_checkpoint and the library via --clip
+    # (--clip_device cpu for the multi-GB libraries).
     gym.register(
         id="G1-tracker-clf-fm-terrain-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
@@ -579,5 +100,3 @@ if not _registered:
         },
     )
     _registered = True
-
-

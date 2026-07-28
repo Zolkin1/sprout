@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Precompute the bones-seed motion-matching feature cache (once).
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- the bones feature cache only the deprecated matchers consume.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Precompute the bones-seed motion-matching feature cache (once).
 
 Filters a broad scope of the bones-seed dataset (default: all ``Locomotion``, any
 style), and for every clip parses -> resamples to ``dt`` (50 Hz) -> finite-difference
@@ -34,9 +38,9 @@ import h5py
 import numpy as np
 import torch
 
-from motion_gen.motion_matching import features as F
-from motion_gen.motion_matching import ingest_common as IC
-from motion_gen.motion_matching.bones_ingest import clip_to_state, filter_rows, load_metadata
+from motion_gen import features as F
+from motion_gen.ingest import ingest_common as IC
+from motion_gen.ingest.bones_ingest import clip_to_state, filter_rows, load_metadata
 
 _STATE = ["joint_pos", "root_pos", "root_quat", "root_lin_vel", "root_ang_vel"]
 _META_COLS = {

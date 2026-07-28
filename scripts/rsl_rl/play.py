@@ -43,14 +43,13 @@ from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
 # The FM exporter lives in scripts/flow_matching; put it on the path like
-# export_deploy_onnx.py does so play.py can write both deploy artifacts itself.
+# the FM script dir on the path so play.py can write both deploy artifacts itself.
 _FM_SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                               os.pardir, "flow_matching"))
 if _FM_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _FM_SCRIPT_DIR)
 from export_tracker_onnx import export_tracker_onnx  # isort: skip
 from export_fm_onnx import export_fm_onnx  # isort: skip
-from robot_rl.network.moe_network import MixtureOfExperts  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
@@ -481,20 +480,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
             export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
-        # Detect MoE architecture and set up gate weight capture
         _policy_model = runner.alg.student if isinstance(runner, DistillationRunner) else runner.alg.actor
         teacher_model = runner.alg.teacher if isinstance(runner, DistillationRunner) else None
-        _moe_net = getattr(_policy_model, "mlp", None)
-        is_moe = isinstance(_moe_net, MixtureOfExperts)
-        if is_moe:
-            print(f"[INFO] MoE detected: {_moe_net.num_experts} experts. Gate weights will be logged.")
-            _last_gate_w: dict[str, torch.Tensor] = {}
-
-            def _gate_hook(module, input, output):
-                _last_gate_w["val"] = output.detach().clone()
-
-            _moe_net.gate.register_forward_hook(_gate_hook)
-            gate_weights_log: list[torch.Tensor] = []
 
         dt = env.unwrapped.step_dt
 
@@ -559,7 +546,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
             except Exception as exc:                                        # noqa: BLE001
                 print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
-                      f"Re-run scripts/rsl_rl/export_deploy_onnx.py by hand if needed.")
+                      f"Re-run export_tracker_onnx.py / export_fm_onnx.py by hand if needed.")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""
@@ -629,8 +616,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                 logger.collect_distillation_actions(
                                     student_actions=actions, teacher_actions=teacher_actions
                                 )
-                    if is_moe and "val" in _last_gate_w:
-                        gate_weights_log.append(_last_gate_w["val"])
                     if ep_stats is not None:
                         tm = env.unwrapped.termination_manager
                         term_fired = {n: tm.get_term(n) for n in tm.active_terms}
@@ -680,12 +665,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Generate plots from collected data
             if logging_enabled and logger.num_steps > 0:
                 data, metadata = logger.finalize()
-                # Inject MoE gate weights into data for plotting
-                if is_moe and gate_weights_log:
-                    data["gate_weights"] = torch.stack(gate_weights_log).cpu().numpy()
-                    metadata["num_experts"] = _moe_net.num_experts
                 # Task-specific subfolder so different tasks loading the SAME run
-                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-fm-play) keep
+                # (e.g. G1-teacher-clf-terrain-play vs G1-tracker-clf-fm-terrain-play) keep
                 # their plots side by side instead of overwriting each other.
                 plots_dir = os.path.join(log_dir, "plots", task_name)
                 if args_cli.dump_play_data:

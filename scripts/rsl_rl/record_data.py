@@ -157,7 +157,7 @@ parser.add_argument(
     "--perturb", action="store_true", default=False,
     help="Gather recovery data: run a clean fraction of envs (play DR) and a perturbed "
          "fraction with windowed action-noise + push toggled on/off. Logs a per-step "
-         "'perturb_active' flag. Record on a PLAY task (e.g. G1-teacher-clf-play) so the "
+         "'perturb_active' flag. Record on a PLAY task (e.g. G1-teacher-clf-terrain-play) so the "
          "clean group is play-DR and perturbations are layered per-env in the loop.",
 )
 parser.add_argument("--clean-fraction", type=float, default=0.5,
@@ -396,7 +396,7 @@ def collect_pairs(
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
     # Height scan (the FM's height-conditioning token), captured when the recording task
-    # has a height_scanner sensor active (e.g. G1-teacher-clf-record). Same mdp.height_scan
+    # has a height_scanner sensor active (e.g. G1-teacher-clf-terrain-play). Same mdp.height_scan
     # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
     has_scan = "height_scanner" in env.unwrapped.scene.sensors
 
@@ -765,7 +765,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     out_dir = args_cli.output_dir or os.path.join(log_dir, "recorded_data")
 
     with launch_simulation(env_cfg, args_cli):
-        # Recursive contact sensor patch (matches play.py / analyze_distillation.py).
+        # Recursive contact sensor patch (matches play.py / train.py).
         import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401
 
         env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
