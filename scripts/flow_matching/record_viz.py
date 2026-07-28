@@ -410,7 +410,7 @@ def _dry_run_fm_context(live_joint_names: list[str], scan_dim: int, device) -> F
         model=model, state_norm=_identity_normalizer(d, device), cmd_norm=None,
         N=cfg.num_history_states, F=cfg.future_len, D=d, nj=nj,
         target_num_extra_frames=0,
-        num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps,
+        num_steps=args_cli.num_sampling_steps or cfg.num_sampling_steps, dt=cfg.dt,
         cmd_dim=0, cmd_steps=list(range(0, cfg.future_len, cfg.cmd_stride)), num_cmd_tokens=0,
         joint_names=list(live_joint_names), target_frame_names=[], device=device,
     )

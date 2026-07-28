@@ -50,9 +50,10 @@ class FlowMatchingConfig:
     cmd_stride: int = 5
 
     # -- dimensions (resolved from the dataset at build time) --
-    # Per-step state width of every token: 2*nj + 15*(1 + num_extra_frames). History
-    # and predicted states share this single representation (no asymmetry).
-    state_dim: int = 57
+    # Per-step state width of every token: nj + 9*(1 + num_extra_frames) (position-only:
+    # joint_pos + per-frame [pos(3), ori6d(6)]). History and predicted states share this
+    # single representation (no asymmetry). The default is a placeholder.
+    state_dim: int = 30
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
@@ -76,35 +77,35 @@ class FlowMatchingConfig:
     # Amplitudes are physical, uniform half-widths (the sample is U(-amp, amp)).
     obs_noise: bool = True
     noise_scale: float = 1.0
+    # State is position-only, so only the position / orientation history channels are
+    # perturbed (velocity channels no longer exist in the token).
     noise_joint_pos: float = 0.01   # rad        (RL match)
-    noise_joint_vel: float = 0.5    # rad/s      (RL match)
     noise_pos: float = 0.02         # m          base + extra-frame positions (estimator)
-    noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
     noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
-    noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
 
     # -- flow --
     num_sampling_steps: int = 8
     ori6d_aux_weight: float = 0.0
 
-    # -- consistency / forward-kinematics regularization (finite-difference + FK) --
-    # ``dt`` is the control step period (seconds), resolved from the recording meta at
-    # train time. ``vel_consistency_weight`` ties each frame's predicted velocity to the
-    # finite difference of its predicted pose; ``joint_vel_consistency_weight`` does the
-    # same for joints; ``accel_consistency_weight`` matches the finite difference of the
-    # predicted velocity to that of the data velocity. The FK terms tie the predicted
-    # end-effector pose/velocity to the forward kinematics (``fk_pose_weight``) and
-    # Jacobian (``fk_vel_weight``) of the predicted joints, using ``fk_model_path``
-    # (a MuJoCo MJCF). ``consistency_tau_min`` gates the acceleration + FK terms to
-    # samples with flow-time ``tau >= consistency_tau_min`` (where the predicted
-    # endpoint is a faithful estimate of the clean target); velocity/joint-velocity
-    # stay ungated. All weights default off.
+    # -- velocity / acceleration FD-match + forward-kinematics regularization --
+    # The state is position-only, so velocity is the finite difference of the predicted
+    # pose. ``dt`` (control step period in seconds, resolved from the recording meta at
+    # train time) sets that finite difference. ``vel_consistency_weight`` matches FD(pred
+    # pose) to FD(data pose) for every frame -- the PRIMARY velocity objective, since the
+    # FM no longer predicts velocities directly; ``joint_vel_consistency_weight`` does the
+    # same for the joints; ``accel_consistency_weight`` matches the second difference
+    # (acceleration) of prediction vs data. ``fk_pose_weight`` ties the predicted
+    # end-effector pose to the forward kinematics of the predicted joints via
+    # ``fk_model_path`` (a MuJoCo MJCF) -- there is no velocity FK term any more.
+    # ``consistency_tau_min`` gates the acceleration + FK terms to samples with flow-time
+    # ``tau >= consistency_tau_min`` (where the predicted endpoint is a faithful estimate
+    # of the clean target); velocity/joint-velocity stay ungated. The velocity weights are
+    # the primary velocity signal now (expect to retune, ~0.5-1.0).
     dt: float = 0.02
-    vel_consistency_weight: float = 0.01 #0.0
+    vel_consistency_weight: float = 1.0
     accel_consistency_weight: float = 0.0
-    joint_vel_consistency_weight: float = 0.01 #0.0
-    fk_pose_weight: float = 0.01 #0.0
-    fk_vel_weight: float = 0.001 #0.0
+    joint_vel_consistency_weight: float = 1.0
+    fk_pose_weight: float = 0.01
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_21j.xml"
 

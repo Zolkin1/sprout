@@ -95,34 +95,32 @@ class G1TeacherObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05)
         actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
 
-        # Reference (current step only), base-relative. The reference *motion* terms
-        # carry observation noise so the teacher learns to track a noisy reference --
-        # the generator (FM) predicts these at deploy and its output is not perfectly
-        # clean. The command terms (command_vel / future_command_vel) stay clean: at
-        # deploy they come from the joystick / scripted profile, not the FM.
+        # Reference (current step only), base-relative -- POSITION-ONLY references.
+        # The reference *motion* terms carry observation noise so the teacher learns to
+        # track a noisy reference -- the generator (FM) predicts these at deploy and its
+        # output is not perfectly clean. The FM-predicted reference VELOCITIES
+        # (joint_vel_ref / base_vel_ref / future_base_vel) are intentionally dropped: the
+        # FM is position-only and its velocities are finite-differenced from positions, so
+        # the policy tracks positional references and infers motion itself. The command
+        # terms (command_vel / future_command_vel) stay clean: at deploy they come from
+        # the joystick / scripted profile, not the FM.
         base_pose_error = ObsTerm(func=mdp.base_pose_error, params={"command_name": "traj_ref"},
                                   noise=Unoise(n_min=-0.03, n_max=0.03))
         joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"},
                                 noise=Unoise(n_min=-0.02, n_max=0.02))
-        joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"},
-                                noise=Unoise(n_min=-0.5, n_max=0.5), clip=(-20.0, 20.0))
         ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"},
                          noise=Unoise(n_min=-0.02, n_max=0.02))
-        # Reference base velocity (current step), rotated into the base frame
-        # (heading-invariant, deployable). The FM predicts this (the achieved-reference
-        # velocity, not the command); noised like the other reference-motion terms.
-        base_vel_ref = ObsTerm(func=mdp.ref_base_velocity_local, params={"command_name": "traj_ref"},
-                               noise=Unoise(n_min=-0.1, n_max=0.1))
         # Joystick-level velocity command that generated the clip (target_vel =
         # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards. No noise:
         # this is the upstream command, not the FM-predicted reference.
         command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
 
         # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps): future
-        # joystick command + future base pose/velocity, so the teacher can
-        # anticipate upcoming slowdowns / turns. Base pose/vel are relative to the
-        # current actual base (a "future base_pose_error"); noised like the
-        # current-step reference (the FM predicts these too).
+        # joystick command + future base POSE (position-only), so the teacher can
+        # anticipate upcoming slowdowns / turns. Base pose is relative to the current
+        # actual base (a "future base_pose_error"); noised like the current-step
+        # reference (the FM predicts these too). The future base VELOCITY is dropped
+        # (position-only references).
         future_command_vel = ObsTerm(
             func=mdp.future_command_velocity,
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
@@ -131,11 +129,6 @@ class G1TeacherObservationsCfg:
             func=mdp.future_base_pose,
             params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
             noise=Unoise(n_min=-0.03, n_max=0.03),
-        )
-        future_base_vel = ObsTerm(
-            func=mdp.future_base_velocity,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-            noise=Unoise(n_min=-0.1, n_max=0.1),
         )
 
         def __post_init__(self):

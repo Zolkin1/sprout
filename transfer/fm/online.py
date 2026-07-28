@@ -30,7 +30,13 @@ from .config import FlowMatchingConfig
 from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
-from .transforms import relative_state as _relative_state, state_to_absolute, target_state_dim
+from .transforms import (
+    matrix_from_quat,
+    relative_state as _relative_state,
+    so3_log,
+    state_to_absolute,
+    target_state_dim,
+)
 
 
 # ----------------------------------------------------------------------
@@ -97,11 +103,12 @@ class FmOnlineContext:
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
         N: Number of conditioning (history) states (the first N tokens).
         F: Window length (number of state tokens); novel frames are ``N..F-1``.
-        D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``).
+        D: State width (= ``nj + 9*(1 + target_num_extra_frames)``).
         nj: Number of joints.
         target_num_extra_frames: Extra body frames the generator predicts (and that
             the conditioning carries).
         num_steps: Euler sampling steps.
+        dt: Control step period (s) used to finite-difference velocities from positions.
         cmd_dim: Per-step command width (0 if not command-conditioned).
         cmd_steps: Strided window indices that become command tokens.
         num_cmd_tokens: Number of command tokens (``len(cmd_steps)`` or 0).
@@ -119,6 +126,7 @@ class FmOnlineContext:
     nj: int
     target_num_extra_frames: int
     num_steps: int
+    dt: float
     cmd_dim: int
     cmd_steps: list[int]
     num_cmd_tokens: int
@@ -202,6 +210,7 @@ def load_fm_context(
         N=cfg.num_history_states, F=cfg.future_len, D=target_d, nj=nj,
         target_num_extra_frames=target_k,
         num_steps=int(num_sampling_steps or cfg.num_sampling_steps),
+        dt=float(cfg.dt),
         cmd_dim=cfg.cmd_dim, cmd_steps=cmd_steps,
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
@@ -246,19 +255,18 @@ def build_cond_states(
     p_ref = root_pos[:, n - 1 : n].expand(v, n, 3).reshape(m, 3)
     q_ref = root_quat[:, n - 1 : n].expand(v, n, 4).reshape(m, 4)
 
-    fpos = fquat = flin = fang = None
+    fpos = fquat = None
     if k > 0:
         if frames is None:
             raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
         fr = frames.reshape(m, k, 13)
-        fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
+        fpos, fquat = fr[..., 0:3], fr[..., 3:7]  # velocities (7:13) unused (position-only state)
 
     rel = _relative_state(
         root_pos.reshape(m, 3), root_quat.reshape(m, 4),
-        root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
-        joint_pos.reshape(m, nj), joint_vel.reshape(m, nj),
+        joint_pos.reshape(m, nj),
         p_ref, q_ref,
-        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+        frame_pos_w=fpos, frame_quat_w=fquat,
     ).reshape(v, n, ctx.D)
     rel = ctx.state_norm.normalize(rel)
 
@@ -287,6 +295,28 @@ def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Te
     return ctx.cmd_norm.normalize(strided)
 
 
+def _finite_diff(seq: torch.Tensor, dt: float) -> torch.Tensor:
+    """Forward finite difference along the time axis (dim 1); backward-filled at the last step.
+
+    ``seq`` is ``(V, F, ·)`` or ``(V, F, K, ·)``. Returns the same shape, with
+    ``out[t] = (seq[t+1] - seq[t]) / dt`` for ``t < F-1`` and ``out[F-1] = out[F-2]``.
+    """
+    diff = (seq[:, 1:] - seq[:, :-1]) / dt
+    return torch.cat([diff, diff[:, -1:]], dim=1)
+
+
+def _angular_velocity(quat: torch.Tensor, dt: float) -> torch.Tensor:
+    """World-frame angular velocity from a quaternion sequence ``(V, F, [K,] 4)``.
+
+    Uses the SO(3) log of consecutive relative rotations ``so3_log(R[t+1] @ R[t]^T) / dt``
+    (the same convention as the training-time velocity-match loss), backward-filled at the
+    last step. Returns ``(V, F, [K,] 3)``.
+    """
+    r = matrix_from_quat(quat)  # (V, F, [K,] 3, 3)
+    w = so3_log(r[:, 1:] @ r[:, :-1].transpose(-1, -2)) / dt
+    return torch.cat([w, w[:, -1:]], dim=1)
+
+
 @torch.no_grad()
 def sample_world(
     ctx: FmOnlineContext,
@@ -302,6 +332,11 @@ def sample_world(
     conditioning. All frames are expressed relative to ``p_ref``/``q_ref`` (the
     current base pose = the anchor at step N-1).
 
+    The state is position-only, so the velocity fields are reconstructed here by
+    finite-differencing the predicted world-frame position / orientation sequence
+    (``ctx.dt`` spacing), giving link linear/angular velocities consistent with the
+    positions -- never an independently-predicted (and less reliable) velocity.
+
     Args:
         ctx: The loaded context.
         cond: Conditioning window ``(V, F, D)`` (from :func:`build_cond_states`).
@@ -316,7 +351,8 @@ def sample_world(
         ``root_link_ang_vel_w (V,F,3)``, ``joint_pos (V,F,nj)``,
         ``joint_vel (V,F,nj)`` and, when the model predicts extra frames,
         ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``
-        each ``(V,F,K_target,·)``.
+        each ``(V,F,K_target,·)``. The velocity fields are finite differences of the
+        position/orientation fields.
     """
     v = cond.shape[0]
     f, d, nj, k = ctx.F, ctx.D, ctx.nj, ctx.target_num_extra_frames
@@ -330,17 +366,23 @@ def sample_world(
     q_ref_f = q_ref[:, None, :].expand(v, f, 4).reshape(v * f, 4)
     world = state_to_absolute(pred.reshape(v * f, d), p_ref_f, q_ref_f, nj, num_extra_frames=k)
 
+    root_pos = world["root_pos_w"].reshape(v, f, 3)
+    root_quat = world["root_quat_w"].reshape(v, f, 4)
+    joint_pos = world["joint_pos"].reshape(v, f, nj)
+    dt = ctx.dt
     out = {
-        "root_pos_w": world["root_pos_w"].reshape(v, f, 3),
-        "root_quat_w": world["root_quat_w"].reshape(v, f, 4),
-        "root_link_lin_vel_w": world["root_link_lin_vel_w"].reshape(v, f, 3),
-        "root_link_ang_vel_w": world["root_link_ang_vel_w"].reshape(v, f, 3),
-        "joint_pos": world["joint_pos"].reshape(v, f, nj),
-        "joint_vel": world["joint_vel"].reshape(v, f, nj),
+        "root_pos_w": root_pos,
+        "root_quat_w": root_quat,
+        "root_link_lin_vel_w": _finite_diff(root_pos, dt),
+        "root_link_ang_vel_w": _angular_velocity(root_quat, dt),
+        "joint_pos": joint_pos,
+        "joint_vel": _finite_diff(joint_pos, dt),
     }
     if k > 0:
-        out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-        out["frame_quat_w"] = world["frame_quat_w"].reshape(v, f, k, 4)
-        out["frame_lin_vel_w"] = world["frame_lin_vel_w"].reshape(v, f, k, 3)
-        out["frame_ang_vel_w"] = world["frame_ang_vel_w"].reshape(v, f, k, 3)
+        frame_pos = world["frame_pos_w"].reshape(v, f, k, 3)
+        frame_quat = world["frame_quat_w"].reshape(v, f, k, 4)
+        out["frame_pos_w"] = frame_pos
+        out["frame_quat_w"] = frame_quat
+        out["frame_lin_vel_w"] = _finite_diff(frame_pos, dt)
+        out["frame_ang_vel_w"] = _angular_velocity(frame_quat, dt)
     return out

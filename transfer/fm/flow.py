@@ -69,7 +69,7 @@ def frame_consistency_terms(
     num_joints: int,
     num_extra_frames: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample velocity + acceleration finite-difference consistency over frame blocks.
+    """Per-sample velocity + acceleration finite-difference MATCH over frame blocks.
 
     Operates on the root + each extra (end-effector) frame block (joints handled
     separately), in DENORMALIZED (physical) relative-frame units. Uses a single
@@ -77,10 +77,13 @@ def frame_consistency_terms(
     *prediction* at the unknown tokens, so the history->prediction boundary jump is
     penalized like the interior of the predicted window.
 
-    - velocity: forward finite difference of the frame **pose** (positions, and a proper
-      SO(3) difference of orientations) vs the predicted linear/angular velocities.
-    - acceleration: forward finite difference of the predicted velocities vs the same
-      finite difference of the **data** velocities.
+    The state is position-only, so velocity is the finite difference of the frame
+    **pose** (positions, and a proper SO(3) difference of orientations). Each term
+    compares the finite difference of the PREDICTION to the finite difference of the
+    DATA (there is no predicted velocity token to compare against any more):
+
+    - velocity: ``d(pose)/dt`` of the prediction vs ``d(pose)/dt`` of the data.
+    - acceleration: ``d²(pose)/dt²`` of the prediction vs that of the data.
 
     Returns:
         ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
@@ -92,18 +95,23 @@ def frame_consistency_terms(
     n = 0
     for fi in range(1 + num_extra_frames):
         b = frame_block_start(num_joints, fi)
-        pos, lin = x[..., b:b + 3], x[..., b + 3:b + 6]
-        ori, ang = x[..., b + 6:b + 12], x[..., b + 12:b + 15]
-        data_lin, data_ang = data_phys[..., b + 3:b + 6], data_phys[..., b + 12:b + 15]
+        pos, ori = x[..., b:b + 3], x[..., b + 3:b + 9]
+        data_pos, data_ori = data_phys[..., b:b + 3], data_phys[..., b + 3:b + 9]
 
         lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
-        vel = vel + ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
-        rmat = rot6d_to_matrix(ori)  # (B, F, 3, 3)
-        ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
-        vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
+        data_lin_fd = (data_pos[:, 1:] - data_pos[:, :-1]) / dt
+        vel = vel + ((lin_fd - data_lin_fd) ** 2).mean(dim=(1, 2))
 
-        accel = accel + (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
-        accel = accel + (((ang[:, 1:] - ang[:, :-1]) / dt - (data_ang[:, 1:] - data_ang[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
+        rmat = rot6d_to_matrix(ori)            # (B, F, 3, 3)
+        data_rmat = rot6d_to_matrix(data_ori)
+        ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
+        data_ang_fd = so3_log(data_rmat[:, 1:] @ data_rmat[:, :-1].transpose(-1, -2)) / dt
+        vel = vel + ((ang_fd - data_ang_fd) ** 2).mean(dim=(1, 2))
+
+        accel = accel + (((lin_fd[:, 1:] - lin_fd[:, :-1]) / dt
+                          - (data_lin_fd[:, 1:] - data_lin_fd[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
+        accel = accel + (((ang_fd[:, 1:] - ang_fd[:, :-1]) / dt
+                          - (data_ang_fd[:, 1:] - data_ang_fd[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
         n += 2
     return vel / n, accel / n
 
@@ -111,68 +119,58 @@ def frame_consistency_terms(
 def joint_vel_consistency_term(
     pred_phys: torch.Tensor, data_phys: torch.Tensor, known: torch.Tensor, dt: float, num_joints: int
 ) -> torch.Tensor:
-    """Per-sample joint-velocity consistency: ``(joint_pos[t+1]-joint_pos[t])/dt ≈ joint_vel[t]``.
+    """Per-sample joint-velocity MATCH: FD(predicted joint_pos) vs FD(data joint_pos).
 
-    Returns ``(B,)`` in physical units (rad/s). Linear in the state, so it is left
-    ungated like the frame velocity term.
+    The state is position-only, so the joint velocity is the finite difference of the
+    joint positions; this compares that finite difference for the prediction against
+    the same for the data. Returns ``(B,)`` in physical units (rad/s); ungated.
     """
     x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)
     jp = x[..., 0:num_joints]
-    jv = x[..., num_joints:2 * num_joints]
+    data_jp = data_phys[..., 0:num_joints]
     jp_fd = (jp[:, 1:] - jp[:, :-1]) / dt
-    return ((jp_fd - jv[:, :-1]) ** 2).mean(dim=(1, 2))
+    data_jp_fd = (data_jp[:, 1:] - data_jp[:, :-1]) / dt
+    return ((jp_fd - data_jp_fd) ** 2).mean(dim=(1, 2))
 
 
 def fk_consistency_terms(
     pred_phys: torch.Tensor,
     data_phys: torch.Tensor,
     known: torch.Tensor,
-    dt: float,
     num_joints: int,
     num_extra_frames: int,
     fk: object,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample forward-kinematics pose + velocity consistency for the EE frames.
+) -> torch.Tensor:
+    """Per-sample forward-kinematics POSE consistency for the EE frames.
 
-    Ties each predicted end-effector frame to the FK of the predicted joints:
-
-    - pose: EE pose expressed relative to the predicted root (base frame) vs ``FK(q)`` --
-      position + SO(3) orientation residual.
-    - velocity: the joint-induced EE velocity (the FM EE twist with the predicted base
-      motion removed, rotated into the base frame) vs ``J(q)·q̇``.
-
-    All on the DENORMALIZED consistency trajectory (clean history + prediction). ``fk``
-    is a :class:`~robot_rl.flow_matching.fk.FKChain` exposing ``pose_and_jacobian``.
+    Ties each predicted end-effector frame pose to the FK of the predicted joints:
+    EE pose expressed relative to the predicted root (base frame) vs ``FK(q)`` --
+    position + SO(3) orientation residual. The state is position-only, so there is no
+    velocity FK term. All on the DENORMALIZED consistency trajectory (clean history +
+    prediction). ``fk`` is a :class:`~robot_rl.flow_matching.fk.FKChain` exposing
+    ``pose_and_jacobian``.
 
     Returns:
-        ``(fk_pose_per_sample, fk_vel_per_sample)`` each ``(B,)``.
+        ``fk_pose_per_sample`` ``(B,)``.
     """
     x = torch.where(known.unsqueeze(-1), data_phys, pred_phys)
     b_, f_, _ = x.shape
     nj, k = num_joints, num_extra_frames
 
     q = x[..., 0:nj].reshape(b_ * f_, nj)
-    qd = x[..., nj:2 * nj].reshape(b_ * f_, nj)
-    fk_pos, fk_rot, jv, jw = fk.pose_and_jacobian(q)               # (M,K,3),(M,K,3,3),(M,K,3,nj)x2
+    fk_pos, fk_rot, _jv, _jw = fk.pose_and_jacobian(q)             # (M,K,3),(M,K,3,3),(unused jac)x2
     fk_pos = fk_pos.reshape(b_, f_, k, 3)
     fk_rot = fk_rot.reshape(b_, f_, k, 3, 3)
-    v_fk = torch.einsum("mkij,mj->mki", jv, qd).reshape(b_, f_, k, 3)
-    w_fk = torch.einsum("mkij,mj->mki", jw, qd).reshape(b_, f_, k, 3)
 
     rb = frame_block_start(nj, 0)
     p_root = x[..., rb:rb + 3]
-    v_root = x[..., rb + 3:rb + 6]
-    R_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])               # (B,F,3,3) base->ref
-    w_root = x[..., rb + 12:rb + 15]
+    R_root = rot6d_to_matrix(x[..., rb + 3:rb + 9])               # (B,F,3,3) base->ref
 
     pose_ps = x.new_zeros(b_)
-    vel_ps = x.new_zeros(b_)
     for kf in range(k):
         eb = frame_block_start(nj, 1 + kf)
         p_ee = x[..., eb:eb + 3]
-        v_ee = x[..., eb + 3:eb + 6]
-        R_ee = rot6d_to_matrix(x[..., eb + 6:eb + 12])
-        w_ee = x[..., eb + 12:eb + 15]
+        R_ee = rot6d_to_matrix(x[..., eb + 3:eb + 9])
 
         rel = p_ee - p_root
         # EE pose relative to the (predicted) base; R_rootᵀ via "...ji,...j->...i".
@@ -181,15 +179,7 @@ def fk_consistency_terms(
         pose_ps = pose_ps + ((p_ee_base - fk_pos[:, :, kf]) ** 2).mean(dim=(1, 2))
         rot_res = so3_log(R_ee_base.transpose(-1, -2) @ fk_rot[:, :, kf])
         pose_ps = pose_ps + (rot_res ** 2).mean(dim=(1, 2))
-
-        # Joint-induced EE twist (remove base motion), expressed in the base frame.
-        v_joints = v_ee - v_root - torch.linalg.cross(w_root, rel)
-        w_joints = w_ee - w_root
-        v_base = torch.einsum("bfji,bfj->bfi", R_root, v_joints)
-        w_base = torch.einsum("bfji,bfj->bfi", R_root, w_joints)
-        vel_ps = vel_ps + ((v_base - v_fk[:, :, kf]) ** 2).mean(dim=(1, 2))
-        vel_ps = vel_ps + ((w_base - w_fk[:, :, kf]) ** 2).mean(dim=(1, 2))
-    return pose_ps / max(k, 1), vel_ps / max(k, 1)
+    return pose_ps / max(k, 1)
 
 
 def terrain_penetration_term(
@@ -234,7 +224,7 @@ def terrain_penetration_term(
             depth = terrain.penetration(p_foot_world)            # (B, F)
             pen = pen + (depth ** 2).mean(dim=1)
         else:
-            r_foot = torch.einsum("bij,bfjk->bfik", r_ref, rot6d_to_matrix(x[..., eb + 6:eb + 12]))
+            r_foot = torch.einsum("bij,bfjk->bfik", r_ref, rot6d_to_matrix(x[..., eb + 3:eb + 9]))
             pc = p_foot_world[:, :, None, :] + torch.einsum("bfik,pk->bfpi", r_foot, cpts)  # (B,F,P,3)
             depth = terrain.penetration(pc)                       # (B, F, P)
             pen = pen + (depth ** 2).mean(dim=(1, 2))
@@ -258,7 +248,6 @@ def flow_matching_loss(
     joint_vel_weight: float = 0.0,
     fk: object | None = None,
     fk_pose_weight: float = 0.0,
-    fk_vel_weight: float = 0.0,
     tau_min: float = 0.0,
     p_ref: torch.Tensor | None = None,
     q_ref: torch.Tensor | None = None,
@@ -275,11 +264,11 @@ def flow_matching_loss(
     """Compute the masked flow-matching loss (+ optional consistency / FK terms).
 
     All auxiliary terms act on the predicted endpoint ``x1_hat`` (denormalized). The
-    velocity and joint-velocity consistency are computed over the whole batch (ungated,
-    since they are linear and τ-robust). The acceleration and FK terms are **τ-gated**:
-    only samples with ``tau >= tau_min`` contribute, because there ``x1_hat ≈ x1`` (at
-    low τ ``x1_hat`` is the blurry conditional mean, where these nonlinear / data-matched
-    terms are unreliable). The terrain term is **ungated by default**
+    velocity and joint-velocity match (FD of prediction vs FD of data) are computed over
+    the whole batch (ungated, since they are linear and τ-robust). The acceleration and
+    FK terms are **τ-gated**: only samples with ``tau >= tau_min`` contribute, because
+    there ``x1_hat ≈ x1`` (at low τ ``x1_hat`` is the blurry conditional mean, where these
+    nonlinear / data-matched terms are unreliable). The terrain term is **ungated by default**
     (``terrain_tau_gated=False``): unlike accel/FK, its low-τ endpoint penetrates ~as much
     as the deployed multi-step sample while the high-τ endpoint ≈ clean data and barely
     crosses the floor, so gating it would hide nearly all the penetration signal.
@@ -296,9 +285,10 @@ def flow_matching_loss(
             all consistency/FK terms.
         dt: Control step period (seconds) for the finite differences.
         num_joints: ``nj``; num_extra_frames: ``K``.
-        vel_weight / accel_weight / joint_vel_weight: consistency weights.
+        vel_weight / accel_weight / joint_vel_weight: FD-match weights (velocity =
+            FD(pred) vs FD(data); accel = second difference).
         fk: An :class:`~robot_rl.flow_matching.fk.FKChain` (or ``None``).
-        fk_pose_weight / fk_vel_weight: FK consistency weights.
+        fk_pose_weight: FK pose-consistency weight (no velocity FK term any more).
         tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
         terrain / foot_idxs / contact_pts / terrain_weight: terrain-penetration pieces.
         terrain_tau_gated: if True, restrict the terrain term to ``tau >= tau_min`` like
@@ -311,7 +301,7 @@ def flow_matching_loss(
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
         ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` /
-        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel``.
+        ``joint_vel_consistency`` / ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1, cond, known)
     v = model(x_tau, tau, cmd_tokens)
@@ -322,7 +312,7 @@ def flow_matching_loss(
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
 
     do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
-    do_fk = fk is not None and state_norm is not None and (fk_pose_weight > 0.0 or fk_vel_weight > 0.0)
+    do_fk = fk is not None and state_norm is not None and fk_pose_weight > 0.0
     do_terrain = (terrain is not None and state_norm is not None and terrain_weight > 0.0
                   and foot_idxs and p_ref is not None and q_ref is not None)
     if (aux_weight > 0.0 and ori_slice is not None) or do_frame or do_fk or do_terrain:
@@ -350,15 +340,14 @@ def flow_matching_loss(
             # Run FK only on the τ-gated samples (it is the expensive term).
             idx = gate.nonzero(as_tuple=True)[0]
             if idx.numel() > 0:
-                fkp_ps, fkv_ps = fk_consistency_terms(
-                    pred_phys[idx], data_phys[idx], known[idx], dt, num_joints, num_extra_frames, fk
+                fkp_ps = fk_consistency_terms(
+                    pred_phys[idx], data_phys[idx], known[idx], num_joints, num_extra_frames, fk
                 )
-                fkp, fkv = fkp_ps.mean(), fkv_ps.mean()
+                fkp = fkp_ps.mean()
             else:
-                fkp = fkv = flow_mse.new_zeros(())
+                fkp = flow_mse.new_zeros(())
             out["fk_pose"] = fkp.detach()
-            out["fk_vel"] = fkv.detach()
-            out["loss"] = out["loss"] + fk_pose_weight * fkp + fk_vel_weight * fkv
+            out["loss"] = out["loss"] + fk_pose_weight * fkp
         if do_terrain:
             pen_ps = terrain_penetration_term(
                 pred_phys, data_phys, known, p_ref, q_ref, num_joints, foot_idxs, contact_pts, terrain

@@ -72,18 +72,21 @@ def test_deploy_parity() -> None:
     fq = _rand_quat(n * K, g).reshape(n, K, 4)
     fl, fa = torch.randn(n, K, 3, generator=g, dtype=torch.float64), torch.randn(n, K, 3, generator=g, dtype=torch.float64)
 
-    rel_t = tt.relative_state(pw, qw, vw, ww, jp, jv, p_ref, q_ref, fp, fq, fl, fa)
-    rel_np = tn.relative_state(np_(pw), np_(qw), np_(vw), np_(ww), np_(jp), np_(jv), np_(p_ref), np_(q_ref),
-                               np_(fp), np_(fq), np_(fl), np_(fa))
+    # Position-only state: relative_state takes (pos, quat, joint_pos, p_ref, q_ref, [frames]).
+    rel_t = tt.relative_state(pw, qw, jp, p_ref, q_ref, fp, fq)
+    rel_np = tn.relative_state(np_(pw), np_(qw), np_(jp), np_(p_ref), np_(q_ref), np_(fp), np_(fq))
     _close("relative_state", rel_np, rel_t, atol=1e-9)
 
     abs_t = tt.state_to_absolute(rel_t, p_ref, q_ref, nj, num_extra_frames=K)
     abs_np = tn.state_to_absolute(rel_np, np_(p_ref), np_(q_ref), nj, num_extra_frames=K)
-    for key in ("root_pos_w", "root_link_lin_vel_w", "frame_pos_w", "frame_lin_vel_w", "joint_pos"):
+    for key in ("root_pos_w", "frame_pos_w", "joint_pos"):
         _close(f"state_to_absolute[{key}]", abs_np[key], abs_t[key], atol=1e-8)
     # quat fields compared as rotation
     _close("state_to_absolute[root_quat asR]",
            qn.matrix_from_quat(abs_np["root_quat_w"]), qt.matrix_from_quat(abs_t["root_quat_w"]), atol=1e-7)
+    # so3_log parity (drives the FD-velocity reconstruction in sample_world / fm_session)
+    R1 = qt.matrix_from_quat(q1)
+    _close("so3_log", tn.so3_log(np_(R1)), tt.so3_log(R1), atol=1e-9)
     print("ALL DEPLOY-CORE PARITY CHECKS PASSED")
 
 

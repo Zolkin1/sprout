@@ -89,6 +89,7 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "joint_names": list(ctx.joint_names),
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
+        "dt": ctx.dt,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
     }
 

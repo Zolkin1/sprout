@@ -152,10 +152,9 @@ def main() -> int:
         p_ref = rp_t[:, -1:].expand(1, N, 3).reshape(m, 3)
         q_ref = rq_t[:, -1:].expand(1, N, 4).reshape(m, 4)
         rel = relative_state(
-            rp_t.reshape(m, 3), rq_t.reshape(m, 4), rl_t.reshape(m, 3), ra_t.reshape(m, 3),
-            jp_t.reshape(m, nj), jv_t.reshape(m, nj), p_ref, q_ref,
+            rp_t.reshape(m, 3), rq_t.reshape(m, 4),
+            jp_t.reshape(m, nj), p_ref, q_ref,
             frame_pos_w=fr[..., 0:3], frame_quat_w=fr[..., 3:7],
-            frame_lin_vel_w=fr[..., 7:10], frame_ang_vel_w=fr[..., 10:13],
         ).reshape(1, N, D)
         cond_t = torch.zeros(1, F, D, device=device)
         cond_t[:, :N] = rel

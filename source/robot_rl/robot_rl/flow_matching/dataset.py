@@ -57,8 +57,11 @@ def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str)
 
 def _stack_frame_tensors(
     split_fn, frame_names: list[str], rows: int
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Gather extra-frame world tensors and flatten to ``(rows, K, ·)`` for relative_state.
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Gather extra-frame world pose tensors and flatten to ``(rows, K, ·)`` for relative_state.
+
+    The state is position-only, so only the per-frame position + orientation are
+    gathered (velocities are derived downstream by finite differences).
 
     Args:
         split_fn: ``name -> (..., dim)`` slicer over the windowed state (the local
@@ -67,17 +70,15 @@ def _stack_frame_tensors(
         rows: Flattened leading dimension (e.g. ``n_win * window_len``).
 
     Returns:
-        ``(frame_pos_w, frame_quat_w, frame_lin_vel_w, frame_ang_vel_w)`` each
-        ``(rows, K, ·)``, or all ``None`` when ``frame_names`` is empty.
+        ``(frame_pos_w, frame_quat_w)`` each ``(rows, K, ·)``, or both ``None`` when
+        ``frame_names`` is empty.
     """
     if not frame_names:
-        return None, None, None, None
+        return None, None
     k = len(frame_names)
     fp = torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
     fq = torch.stack([split_fn(f"{f}:quat_w") for f in frame_names], dim=-2).reshape(rows, k, 4)
-    fl = torch.stack([split_fn(f"{f}:lin_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
-    fa = torch.stack([split_fn(f"{f}:ang_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
-    return fp, fq, fl, fa
+    return fp, fq
 
 
 def episode_windows(
@@ -217,8 +218,8 @@ class FutureStateDataset(Dataset):
         nj = s_dims[s_names.index("joint_pos")]
         self.num_joints = nj
         # Extra body frames recorded beyond root + joints (e.g. feet/hands for the
-        # CLF). Each contributes a [pos, lin_vel, ori6d, ang_vel] block to the state.
-        # History and target share this single (full) representation.
+        # CLF). Each contributes a position-only [pos(3), ori6d(6)] block to the state.
+        # History and target share this single representation.
         recorded_frames = list(getattr(meta, "state_frame_names", []) or [])
         self.target_frame_names = list(recorded_frames)
         self.num_extra_frames = len(self.target_frame_names)
@@ -254,10 +255,7 @@ class FutureStateDataset(Dataset):
 
         p = _split("root_pos_w")              # (Nw, F, 3)
         q = _split("root_quat_w")             # (Nw, F, 4)
-        v = _split("root_link_lin_vel_w")     # (Nw, F, 3)
-        wv = _split("root_link_ang_vel_w")    # (Nw, F, 3)
         jp = _split("joint_pos")              # (Nw, F, nj)
-        jv = _split("joint_vel")              # (Nw, F, nj)
 
         # Relative-frame anchor = most recent history step (index N-1), shared by the
         # actual-state conditioning and the prediction target.
@@ -268,11 +266,10 @@ class FutureStateDataset(Dataset):
         pr = p_ref0.expand(n_win, f, 3).reshape(m, 3)
         qr = q_ref0.expand(n_win, f, 4).reshape(m, 4)
 
-        fp, fq, fl, fa = _stack_frame_tensors(_split, self.target_frame_names, m)
+        fp, fq = _stack_frame_tensors(_split, self.target_frame_names, m)
         actual = relative_state(
-            p.reshape(m, 3), q.reshape(m, 4), v.reshape(m, 3), wv.reshape(m, 3),
-            jp.reshape(m, nj), jv.reshape(m, nj), pr, qr,
-            frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
+            p.reshape(m, 3), q.reshape(m, 4), jp.reshape(m, nj), pr, qr,
+            frame_pos_w=fp, frame_quat_w=fq,
         ).reshape(n_win, f, self.state_dim).contiguous()  # conditioning source
 
         if cfg.target_source == "reference":
@@ -375,32 +372,28 @@ class FutureStateDataset(Dataset):
 
         pf = _split("root_pos_w")
         qf = _split("root_quat_w")
-        vf = _split("root_link_lin_vel_w")
-        wf = _split("root_link_ang_vel_w")
         jpf = _split("joint_pos")
-        jvf = _split("joint_vel")
 
         p_ref = p_actual[:, anchor : anchor + 1, :].expand(n_win, f, 3)
         q_ref = q_actual[:, anchor : anchor + 1, :].expand(n_win, f, 4)
 
         m = n_win * f
-        fpos, fquat, flin, fang = _stack_frame_tensors(_split, self.target_frame_names, m)
+        fpos, fquat = _stack_frame_tensors(_split, self.target_frame_names, m)
         return relative_state(
-            pf.reshape(m, 3), qf.reshape(m, 4), vf.reshape(m, 3), wf.reshape(m, 3),
-            jpf.reshape(m, nj), jvf.reshape(m, nj),
+            pf.reshape(m, 3), qf.reshape(m, 4), jpf.reshape(m, nj),
             p_ref.reshape(m, 3), q_ref.reshape(m, 4),
-            frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+            frame_pos_w=fpos, frame_quat_w=fquat,
         ).reshape(n_win, f, self.state_dim)
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
         """Per-channel uniform noise half-width (normalized space) for a state token.
 
-        Maps the config's physical per-group amplitudes onto the state layout
-        ``[joint_pos | joint_vel | frame blocks x (1+K)]`` (each frame block =
-        ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]``, frame 0 the root), scales by
-        ``cfg.noise_scale``, then divides by the normalizer std so the amplitude is in
-        the same normalized space as ``self.state`` (ori6d channels have ``std == 1``,
-        so their noise stays in raw 6D units).
+        Maps the config's physical per-group amplitudes onto the position-only state
+        layout ``[joint_pos | frame blocks x (1+K)]`` (each frame block =
+        ``[pos(3), ori6d(6)]``, frame 0 the root), scales by ``cfg.noise_scale``, then
+        divides by the normalizer std so the amplitude is in the same normalized space as
+        ``self.state`` (ori6d channels have ``std == 1``, so their noise stays in raw 6D
+        units). The state has no velocity channels, so no velocity noise is applied.
 
         Args:
             state_normalizer: The fitted state normalizer.
@@ -412,13 +405,10 @@ class FutureStateDataset(Dataset):
         nj = self.num_joints
         amp = torch.zeros(self.state_dim, dtype=self.state.dtype)
         amp[0:nj] = cfg.noise_joint_pos
-        amp[nj : 2 * nj] = cfg.noise_joint_vel
         for fi in range(1 + self.num_extra_frames):
             b = frame_block_start(nj, fi)
             amp[b : b + 3] = cfg.noise_pos              # pos(3)
-            amp[b + 3 : b + 6] = cfg.noise_lin_vel      # lin_vel(3)
-            amp[b + 6 : b + 12] = cfg.noise_ori         # ori6d(6)
-            amp[b + 12 : b + FRAME_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
+            amp[b + 3 : b + FRAME_BLOCK_DIM] = cfg.noise_ori  # ori6d(6)
         return (amp * cfg.noise_scale) / state_normalizer.std
 
     def __len__(self) -> int:

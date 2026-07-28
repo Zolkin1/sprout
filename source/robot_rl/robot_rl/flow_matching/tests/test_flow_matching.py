@@ -90,13 +90,10 @@ def test_relative_state_invertible():
     nj, w = 21, 50
     p = torch.randn(w, 3, dtype=torch.float64)
     q = _rand_unit_quat(w)
-    v = torch.randn(w, 3, dtype=torch.float64)
-    om = torch.randn(w, 3, dtype=torch.float64)
     jp = torch.randn(w, nj, dtype=torch.float64)
-    jv = torch.randn(w, nj, dtype=torch.float64)
     ref = w // 2
 
-    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
+    rel = relative_state_from_window(p, q, jp, ref_index=ref)
     assert rel.shape == (w, target_state_dim(nj))
 
     p_ref = p[ref : ref + 1].expand(w, -1)
@@ -104,12 +101,11 @@ def test_relative_state_invertible():
     rec = state_to_absolute(rel, p_ref, q_ref, nj)
 
     assert torch.allclose(rec["joint_pos"], jp, atol=1e-6)
-    assert torch.allclose(rec["joint_vel"], jv, atol=1e-6)
     assert torch.allclose(rec["root_pos_w"], p, atol=1e-5)
-    assert torch.allclose(rec["root_link_lin_vel_w"], v, atol=1e-5)
-    assert torch.allclose(rec["root_link_ang_vel_w"], om, atol=1e-5)
     # quaternions compared as matrices (double cover)
     assert torch.allclose(matrix_from_quat(rec["root_quat_w"]), matrix_from_quat(q), atol=1e-5)
+    # position-only state: no velocity keys are decoded
+    assert "joint_vel" not in rec and "root_link_lin_vel_w" not in rec
 
 
 def test_relative_state_invertible_with_frames():
@@ -118,21 +114,16 @@ def test_relative_state_invertible_with_frames():
     nj, w, k = 21, 30, 4
     p = torch.randn(w, 3, dtype=torch.float64)
     q = _rand_unit_quat(w)
-    v = torch.randn(w, 3, dtype=torch.float64)
-    om = torch.randn(w, 3, dtype=torch.float64)
     jp = torch.randn(w, nj, dtype=torch.float64)
-    jv = torch.randn(w, nj, dtype=torch.float64)
     fpos = torch.randn(w, k, 3, dtype=torch.float64)
     fquat = _rand_unit_quat(w * k).reshape(w, k, 4)
-    flin = torch.randn(w, k, 3, dtype=torch.float64)
-    fang = torch.randn(w, k, 3, dtype=torch.float64)
     ref = w // 2
 
     p_ref = p[ref : ref + 1].expand(w, -1)
     q_ref = q[ref : ref + 1].expand(w, -1)
     rel = relative_state(
-        p, q, v, om, jp, jv, p_ref, q_ref,
-        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+        p, q, jp, p_ref, q_ref,
+        frame_pos_w=fpos, frame_quat_w=fquat,
     )
     assert rel.shape == (w, target_state_dim(nj, k))
     # every ori block (base + frames) is left raw (not standardized) -> there are k+1
@@ -142,13 +133,12 @@ def test_relative_state_invertible_with_frames():
     assert torch.allclose(rec["root_pos_w"], p, atol=1e-5)
     assert rec["frame_pos_w"].shape == (w, k, 3)
     assert torch.allclose(rec["frame_pos_w"], fpos, atol=1e-5)
-    assert torch.allclose(rec["frame_lin_vel_w"], flin, atol=1e-5)
-    assert torch.allclose(rec["frame_ang_vel_w"], fang, atol=1e-5)
     assert torch.allclose(
         matrix_from_quat(rec["frame_quat_w"].reshape(w * k, 4)),
         matrix_from_quat(fquat.reshape(w * k, 4)),
         atol=1e-5,
     )
+    assert "frame_lin_vel_w" not in rec and "frame_ang_vel_w" not in rec
 
 
 def test_relative_state_reference_is_identity():
@@ -156,38 +146,15 @@ def test_relative_state_reference_is_identity():
     nj, w = 21, 10
     p = torch.randn(w, 3, dtype=torch.float64)
     q = _rand_unit_quat(w)
-    v = torch.randn(w, 3, dtype=torch.float64)
-    om = torch.randn(w, 3, dtype=torch.float64)
     jp = torch.randn(w, nj, dtype=torch.float64)
-    jv = torch.randn(w, nj, dtype=torch.float64)
     ref = 7
-    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
+    rel = relative_state_from_window(p, q, jp, ref_index=ref)
     o0, o1 = orientation_slice(nj)
-    p_rel = rel[ref, 2 * nj : 2 * nj + 3]
+    p_rel = rel[ref, nj : nj + 3]
     ori6d = rel[ref, o0:o1]
     assert torch.allclose(p_rel, torch.zeros(3, dtype=torch.float64), atol=1e-6)
     expected_ori = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float64)
     assert torch.allclose(ori6d, expected_ori, atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
-# 3. Velocity reference transform is a pure rotation R_ref^T v_w
-# ---------------------------------------------------------------------------
-def test_velocity_frame_pure_rotation():
-    torch.manual_seed(4)
-    nj, w = 5, 4
-    p = torch.zeros(w, 3, dtype=torch.float64)
-    q = _rand_unit_quat(w)
-    v = torch.randn(w, 3, dtype=torch.float64)
-    om = torch.zeros(w, 3, dtype=torch.float64)
-    jp = torch.zeros(w, nj, dtype=torch.float64)
-    jv = torch.zeros(w, nj, dtype=torch.float64)
-    ref = 0
-    rel = relative_state_from_window(p, q, v, om, jp, jv, ref_index=ref)
-    v_rel = rel[:, 2 * nj + 3 : 2 * nj + 6]
-    r_ref = matrix_from_quat(q[ref : ref + 1].expand(w, -1))  # (w,3,3)
-    expected = (r_ref.transpose(-1, -2) @ v.unsqueeze(-1)).squeeze(-1)
-    assert torch.allclose(v_rel, expected, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -499,12 +466,12 @@ def test_dataset_build_shapes():
     cfg = FlowMatchingConfig(future_len=10, num_history_states=2, cmd_stride=5,
                              val_fraction=0.34, seed=0, cmd_array="target_vel")
     train_ds, val_ds = build_train_val(data, meta, cfg)
-    assert cfg.state_dim == target_state_dim(21)  # 57
+    assert cfg.state_dim == target_state_dim(21)  # 30 (= nj + 9, position-only, K=0)
     assert cfg.cmd_dim == 3
     assert cfg.num_cmd_tokens == 2  # ceil(10/5)
     s = train_ds[0]
-    assert s["state"].shape == (10, 57)
-    assert s["cond"].shape == (10, 57)
+    assert s["state"].shape == (10, target_state_dim(21))
+    assert s["cond"].shape == (10, target_state_dim(21))
     assert s["cmd_tokens"].shape == (2, 3)
     assert s["p_ref"].shape == (3,) and s["q_ref"].shape == (4,)
     assert val_ds is not None and len(val_ds) > 0
@@ -523,7 +490,7 @@ def test_dataset_build_with_extra_frames():
                              cmd_array="target_vel")
     train_ds, _ = build_train_val(data, meta, cfg)
     assert train_ds.num_extra_frames == k
-    assert cfg.state_dim == target_state_dim(21, k)  # 57 + 4*15 = 117
+    assert cfg.state_dim == target_state_dim(21, k)  # 30 + 4*9 = 66 (position-only)
     s = train_ds[0]
     assert s["state"].shape == (10, target_state_dim(21, k))
     assert s["cond"].shape == (10, target_state_dim(21, k))
@@ -637,8 +604,7 @@ def test_target_source_reference_uses_ref_state():
     q_ref = state_w[anchor : anchor + 1, s_slc["root_quat_w"][0]:s_slc["root_quat_w"][1]].expand(f, 4)
     expected = relative_state(
         _split_state(ref_w, s_slc, "root_pos_w"), _split_state(ref_w, s_slc, "root_quat_w"),
-        _split_state(ref_w, s_slc, "root_link_lin_vel_w"), _split_state(ref_w, s_slc, "root_link_ang_vel_w"),
-        _split_state(ref_w, s_slc, "joint_pos"), _split_state(ref_w, s_slc, "joint_vel"),
+        _split_state(ref_w, s_slc, "joint_pos"),
         p_ref, q_ref,
     )
     torch.testing.assert_close(fut_r[0], expected, rtol=1e-4, atol=1e-4)
@@ -726,12 +692,17 @@ def test_so3_log_recovers_rotation_vector():
 
 
 def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> torch.Tensor:
-    """A physically self-consistent ``(1, F, D)`` trajectory: positions integrate the
-    (constant) linear velocity and orientations integrate the (constant) angular
-    velocity, so every frame block satisfies pos/ori finite-difference == velocity."""
+    """A smooth position-only ``(1, F, D)`` trajectory: each frame's position ramps at a
+    constant linear velocity, its orientation integrates a constant angular velocity, and
+    the joints ramp linearly. The FD-match consistency terms compare FD(prediction) to
+    FD(data), so passing this same trajectory as both gives ~0 residual."""
     g = torch.Generator().manual_seed(seed)
     d = target_state_dim(nj, k)
     x = torch.zeros(1, nf, d, dtype=torch.float64)
+    jp0 = torch.randn(nj, generator=g, dtype=torch.float64)
+    jvel = torch.randn(nj, generator=g, dtype=torch.float64) * 0.5
+    for t in range(nf):
+        x[0, t, 0:nj] = jp0 + jvel * (t * dt)
     for fi in range(1 + k):
         b = frame_block_start(nj, fi)
         pos0 = torch.randn(3, generator=g, dtype=torch.float64)
@@ -740,9 +711,7 @@ def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> to
         for t in range(nf):
             r = _rodrigues((omega * (t * dt)).unsqueeze(0))[0]   # (3, 3)
             x[0, t, b:b + 3] = pos0 + vel * (t * dt)
-            x[0, t, b + 3:b + 6] = vel
-            x[0, t, b + 6:b + 12] = matrix_to_rot6d(r)
-            x[0, t, b + 12:b + 15] = omega
+            x[0, t, b + 3:b + 9] = matrix_to_rot6d(r)
     return x
 
 
@@ -855,38 +824,31 @@ def test_fk_consistency_zero_for_fk_consistent_state():
     nf = 4
     rng = np.random.default_rng(1)
     q = torch.tensor(rng.uniform(-0.5, 0.5, size=(1, nf, nj)), dtype=torch.float64)
-    qd = torch.tensor(rng.standard_normal((1, nf, nj)) * 0.3, dtype=torch.float64)
-    fk_pos, fk_rot, jv, jw = chain.pose_and_jacobian(q.reshape(nf, nj))
+    fk_pos, fk_rot, _jv, _jw = chain.pose_and_jacobian(q.reshape(nf, nj))
     fk_pos = fk_pos.reshape(1, nf, k, 3); fk_rot = fk_rot.reshape(1, nf, k, 3, 3)
-    v_fk = torch.einsum("mkij,mj->mki", jv, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
-    w_fk = torch.einsum("mkij,mj->mki", jw, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
 
     x = torch.zeros(1, nf, d, dtype=torch.float64)
     x[..., 0:nj] = q
-    x[..., nj:2 * nj] = qd
-    # root block: identity rotation, zero pose/velocity -> base frame == ref frame.
+    # root block: identity rotation, zero position -> base frame == ref frame.
     rb = frame_block_start(nj, 0)
-    x[..., rb + 6:rb + 12] = torch.tensor([1.0, 0, 0, 0, 1, 0], dtype=torch.float64)  # ori6d of I
+    x[..., rb + 3:rb + 9] = torch.tensor([1.0, 0, 0, 0, 1, 0], dtype=torch.float64)  # ori6d of I
     for kf in range(k):
         eb = frame_block_start(nj, 1 + kf)
         x[..., eb:eb + 3] = fk_pos[:, :, kf]
-        x[..., eb + 3:eb + 6] = v_fk[:, :, kf]
-        x[..., eb + 6:eb + 12] = matrix_to_rot6d(fk_rot[:, :, kf])
-        x[..., eb + 12:eb + 15] = w_fk[:, :, kf]
+        x[..., eb + 3:eb + 9] = matrix_to_rot6d(fk_rot[:, :, kf])
 
     known = torch.zeros(1, nf, dtype=torch.bool)
-    pose_ps, vel_ps = fk_consistency_terms(x, x, known, 0.05, nj, k, chain)
+    pose_ps = fk_consistency_terms(x, x, known, nj, k, chain)
     assert pose_ps.max().item() < 1e-8, pose_ps.max().item()
-    assert vel_ps.max().item() < 1e-8, vel_ps.max().item()
     # perturb an ee position -> pose loss rises
     xb = x.clone(); xb[0, 1, frame_block_start(nj, 1):frame_block_start(nj, 1) + 3] += 0.1
-    pose_b, _ = fk_consistency_terms(xb, xb, known, 0.05, nj, k, chain)
+    pose_b = fk_consistency_terms(xb, xb, known, nj, k, chain)
     assert pose_b.max().item() > 1e-4
 
 
 @pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
 def test_flow_loss_fk_terms_and_tau_gate():
-    """flow_matching_loss reports fk_pose/fk_vel/joint_vel; tau_min>1 gates accel+FK to 0."""
+    """flow_matching_loss reports fk_pose/joint_vel; tau_min>1 gates accel+FK to 0."""
     torch.manual_seed(30)
     chain = FKChain(_FK_MJCF, _FK_JOINTS, _FK_FRAMES, base_link="pelvis_link")
     nj, k = len(_FK_JOINTS), len(_FK_FRAMES)
@@ -900,15 +862,15 @@ def test_flow_loss_fk_terms_and_tau_gate():
     norm = Normalizer.fit(x1.reshape(-1, d), torch.ones(d, dtype=torch.bool))
     ckw = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k,
                vel_weight=0.1, accel_weight=0.01, joint_vel_weight=0.1,
-               fk=chain, fk_pose_weight=0.1, fk_vel_weight=0.01)
+               fk=chain, fk_pose_weight=0.1)
     out = flow_matching_loss(model, x1, cond, known, None, tau_min=0.0, **ckw)
-    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel"):
+    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose"):
         assert key in out
     assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
     # tau_min above 1 -> no sample passes the gate -> accel + FK contribute 0.
     out_g = flow_matching_loss(model, x1, cond, known, None, tau_min=2.0, **ckw)
     assert out_g["accel_consistency"].item() == 0.0
-    assert out_g["fk_pose"].item() == 0.0 and out_g["fk_vel"].item() == 0.0
+    assert out_g["fk_pose"].item() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -923,11 +885,11 @@ def _foot_state(nj: int, k: int, nf: int, foot_pos: torch.Tensor, foot_R: torch.
     d = target_state_dim(nj, k)
     x = torch.zeros(1, nf, d, dtype=torch.float64)
     rb = frame_block_start(nj, 0)
-    x[..., rb + 6:rb + 12] = _IDENT_ORI6D.to(torch.float64)        # root ori = identity
+    x[..., rb + 3:rb + 9] = _IDENT_ORI6D.to(torch.float64)         # root ori = identity
     eb = frame_block_start(nj, 1)                                   # first extra (foot) frame
     x[..., eb:eb + 3] = foot_pos.to(torch.float64)
     ori = _IDENT_ORI6D if foot_R is None else matrix_to_rot6d(foot_R)
-    x[..., eb + 6:eb + 12] = ori.to(torch.float64)
+    x[..., eb + 3:eb + 9] = ori.to(torch.float64)
     return x
 
 

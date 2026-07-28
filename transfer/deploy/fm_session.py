@@ -19,7 +19,7 @@ import numpy as np
 import onnxruntime as ort
 
 from .tracker_session import make_session
-from .transforms_np import relative_state, state_to_absolute
+from .transforms_np import matrix_from_quat, relative_state, so3_log, state_to_absolute
 
 
 @dataclass
@@ -33,6 +33,7 @@ class FmContext:
     nj: int
     target_num_extra_frames: int
     num_steps: int
+    dt: float
     cmd_dim: int
     cmd_steps: list[int]
     num_cmd_tokens: int
@@ -60,7 +61,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         target_num_extra_frames=len(m["target_frame_names"]),
-        num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
+        num_steps=m["num_steps"], dt=float(m["dt"]), cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
     )
@@ -82,18 +83,17 @@ def build_cond_states(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, join
     p_ref = np.broadcast_to(root_pos[:, n - 1 : n], (v, n, 3)).reshape(m, 3)
     q_ref = np.broadcast_to(root_quat[:, n - 1 : n], (v, n, 4)).reshape(m, 4)
 
-    fpos = fquat = flin = fang = None
+    fpos = fquat = None
     if k > 0:
         if frames is None:
             raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
         fr = frames.reshape(m, k, 13)
-        fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
+        fpos, fquat = fr[..., 0:3], fr[..., 3:7]  # velocities (7:13) unused (position-only state)
 
     rel = relative_state(
         root_pos.reshape(m, 3), root_quat.reshape(m, 4),
-        root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
-        joint_pos.reshape(m, nj), joint_vel.reshape(m, nj), p_ref, q_ref,
-        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+        joint_pos.reshape(m, nj), p_ref, q_ref,
+        frame_pos_w=fpos, frame_quat_w=fquat,
     ).reshape(v, n, ctx.D)
 
     cond = np.zeros((v, ctx.F, ctx.D), dtype=rel.dtype)
@@ -117,8 +117,32 @@ def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
     return future_cmd[:, ctx.cmd_steps, :]
 
 
+def _finite_diff(seq: np.ndarray, dt: float) -> np.ndarray:
+    """Forward finite difference along the time axis (axis 1); backward-filled at the last step.
+
+    ``seq`` is ``(V, F, ·)`` or ``(V, F, K, ·)``; returns the same shape.
+    """
+    diff = (seq[:, 1:] - seq[:, :-1]) / dt
+    return np.concatenate([diff, diff[:, -1:]], axis=1)
+
+
+def _angular_velocity(quat: np.ndarray, dt: float) -> np.ndarray:
+    """World-frame angular velocity from a quaternion sequence ``(V, F, [K,] 4)``.
+
+    ``so3_log(R[t+1] @ R[t]^T) / dt`` (matches the torch ``online.sample_world`` and the
+    training-time velocity-match loss), backward-filled at the last step.
+    """
+    r = matrix_from_quat(quat)  # (V, F, [K,] 3, 3)
+    w = so3_log(r[:, 1:] @ np.swapaxes(r[:, :-1], -1, -2)) / dt
+    return np.concatenate([w, w[:, -1:]], axis=1)
+
+
 def sample_world(ctx: FmContext, cond, known, p_ref, q_ref, cmd_tokens, noise) -> dict:
     """Run the ONNX sampler and lift the predicted relative state to the world frame.
+
+    The state is position-only, so the velocity fields are reconstructed here by
+    finite-differencing the predicted world-frame position / orientation sequence
+    (``ctx.dt`` spacing) -- matching the torch ``transfer/fm`` ``sample_world``.
 
     Args:
         ctx: Loaded FM context.
@@ -131,7 +155,8 @@ def sample_world(ctx: FmContext, cond, known, p_ref, q_ref, cmd_tokens, noise) -
 
     Returns:
         World-frame prediction dict (same keys as ``transfer/fm`` ``sample_world``).
-        Novel (predicted) frames are ``N..F-1``.
+        Novel (predicted) frames are ``N..F-1``. The velocity fields are finite
+        differences of the position/orientation fields.
     """
     feed = {
         "cond": cond.astype(np.float32),
@@ -146,17 +171,23 @@ def sample_world(ctx: FmContext, cond, known, p_ref, q_ref, cmd_tokens, noise) -
     q_ref_f = np.broadcast_to(q_ref[:, None, :], (v, f, 4)).reshape(v * f, 4)
     world = state_to_absolute(pred.reshape(v * f, ctx.D), p_ref_f, q_ref_f, ctx.nj, num_extra_frames=k)
 
+    root_pos = world["root_pos_w"].reshape(v, f, 3)
+    root_quat = world["root_quat_w"].reshape(v, f, 4)
+    joint_pos = world["joint_pos"].reshape(v, f, ctx.nj)
+    dt = ctx.dt
     out = {
-        "root_pos_w": world["root_pos_w"].reshape(v, f, 3),
-        "root_quat_w": world["root_quat_w"].reshape(v, f, 4),
-        "root_link_lin_vel_w": world["root_link_lin_vel_w"].reshape(v, f, 3),
-        "root_link_ang_vel_w": world["root_link_ang_vel_w"].reshape(v, f, 3),
-        "joint_pos": world["joint_pos"].reshape(v, f, ctx.nj),
-        "joint_vel": world["joint_vel"].reshape(v, f, ctx.nj),
+        "root_pos_w": root_pos,
+        "root_quat_w": root_quat,
+        "root_link_lin_vel_w": _finite_diff(root_pos, dt),
+        "root_link_ang_vel_w": _angular_velocity(root_quat, dt),
+        "joint_pos": joint_pos,
+        "joint_vel": _finite_diff(joint_pos, dt),
     }
     if k > 0:
-        out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-        out["frame_quat_w"] = world["frame_quat_w"].reshape(v, f, k, 4)
-        out["frame_lin_vel_w"] = world["frame_lin_vel_w"].reshape(v, f, k, 3)
-        out["frame_ang_vel_w"] = world["frame_ang_vel_w"].reshape(v, f, k, 3)
+        frame_pos = world["frame_pos_w"].reshape(v, f, k, 3)
+        frame_quat = world["frame_quat_w"].reshape(v, f, k, 4)
+        out["frame_pos_w"] = frame_pos
+        out["frame_quat_w"] = frame_quat
+        out["frame_lin_vel_w"] = _finite_diff(frame_pos, dt)
+        out["frame_ang_vel_w"] = _angular_velocity(frame_quat, dt)
     return out

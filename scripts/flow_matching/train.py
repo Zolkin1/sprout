@@ -124,20 +124,17 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--dt", type=float, default=None,
                         help="Control dt (s) for the consistency finite differences; default: recording meta.")
     parser.add_argument("--vel_consistency_weight", type=float, default=_wc.vel_consistency_weight,
-                        help="Weight on the frame velocity finite-difference consistency loss "
-                             "(predicted pose d/dt vs predicted velocity).")
+                        help="Weight on the frame velocity FD-match loss (FD of predicted pose vs "
+                             "FD of data pose). Ungated. Primary velocity signal now.")
     parser.add_argument("--accel_consistency_weight", type=float, default=_wc.accel_consistency_weight,
-                        help="Weight on the frame acceleration finite-difference consistency loss "
-                             "(predicted velocity d/dt vs data velocity d/dt). tau-gated.")
+                        help="Weight on the frame acceleration FD-match loss (second difference of "
+                             "predicted pose vs of data pose). tau-gated.")
     parser.add_argument("--joint_vel_consistency_weight", type=float, default=_wc.joint_vel_consistency_weight,
-                        help="Weight on the joint-velocity finite-difference consistency "
-                             "(predicted joint_pos d/dt vs predicted joint_vel). Ungated.")
+                        help="Weight on the joint-velocity FD-match loss (FD of predicted joint_pos "
+                             "vs FD of data joint_pos). Ungated.")
     parser.add_argument("--fk_pose_weight", type=float, default=_wc.fk_pose_weight,
                         help="Weight on the FK pose consistency (predicted ee pose vs FK of "
                              "predicted joints). tau-gated.")
-    parser.add_argument("--fk_vel_weight", type=float, default=_wc.fk_vel_weight,
-                        help="Weight on the FK velocity consistency (predicted ee velocity vs "
-                             "J(q)*qdot of predicted joints/joint-vels). tau-gated.")
     parser.add_argument("--consistency_tau_min", type=float, default=FlowMatchingConfig().consistency_tau_min,
                         help="Only score the acceleration + FK terms on samples with flow-time "
                              "tau >= this (velocity/joint-velocity stay ungated).")
@@ -181,11 +178,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--noise_scale", type=float, default=_dn.noise_scale,
                         help="Global multiplier on every noise amplitude.")
     parser.add_argument("--noise_joint_pos", type=float, default=_dn.noise_joint_pos)
-    parser.add_argument("--noise_joint_vel", type=float, default=_dn.noise_joint_vel)
     parser.add_argument("--noise_pos", type=float, default=_dn.noise_pos)
-    parser.add_argument("--noise_lin_vel", type=float, default=_dn.noise_lin_vel)
     parser.add_argument("--noise_ori", type=float, default=_dn.noise_ori)
-    parser.add_argument("--noise_ang_vel", type=float, default=_dn.noise_ang_vel)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -206,7 +200,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         vel_consistency_weight=args.vel_consistency_weight,
         accel_consistency_weight=args.accel_consistency_weight,
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
-        fk_pose_weight=args.fk_pose_weight, fk_vel_weight=args.fk_vel_weight,
+        fk_pose_weight=args.fk_pose_weight,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         terrain_penetration_weight=args.terrain_penetration_weight,
         terrain_penetration_mode=args.terrain_penetration_mode,
@@ -221,9 +215,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
-        noise_joint_pos=args.noise_joint_pos, noise_joint_vel=args.noise_joint_vel,
-        noise_pos=args.noise_pos, noise_lin_vel=args.noise_lin_vel,
-        noise_ori=args.noise_ori, noise_ang_vel=args.noise_ang_vel,
+        noise_joint_pos=args.noise_joint_pos,
+        noise_pos=args.noise_pos, noise_ori=args.noise_ori,
     )
     return cfg, args
 
@@ -260,12 +253,10 @@ def channel_metrics(
         return torch.arccos(cos).mean().item()
 
     bo0, bo1 = orientation_slice(nj)
+    rp0 = frame_block_start(nj, 0)  # root position block start (position-only state)
     out = {
         "rmse_joint_pos": _rmse(pred[..., 0:nj], tgt[..., 0:nj]),
-        "rmse_joint_vel": _rmse(pred[..., nj:2 * nj], tgt[..., nj:2 * nj]),
-        "rmse_root_pos": _rmse(pred[..., 2 * nj:2 * nj + 3], tgt[..., 2 * nj:2 * nj + 3]),
-        "rmse_root_lin_vel": _rmse(pred[..., 2 * nj + 3:2 * nj + 6], tgt[..., 2 * nj + 3:2 * nj + 6]),
-        "rmse_root_ang_vel": _rmse(pred[..., 2 * nj + 12:2 * nj + 15], tgt[..., 2 * nj + 12:2 * nj + 15]),
+        "rmse_root_pos": _rmse(pred[..., rp0:rp0 + 3], tgt[..., rp0:rp0 + 3]),
         "ori_geodesic_rad": _geodesic(bo0, bo1),
     }
     if num_extra_frames > 0:
@@ -273,7 +264,7 @@ def channel_metrics(
         for k in range(num_extra_frames):
             b = frame_block_start(nj, 1 + k)
             pos_rmse += _rmse(pred[..., b:b + 3], tgt[..., b:b + 3])
-            geo += _geodesic(b + 6, b + 12)
+            geo += _geodesic(b + 3, b + 9)
         out["rmse_frame_pos"] = pos_rmse / num_extra_frames
         out["frame_ori_geodesic_rad"] = geo / num_extra_frames
     return out
@@ -298,7 +289,7 @@ def make_known_mask(batch_size: int, cfg: FlowMatchingConfig, device, use_histor
     return use_history.unsqueeze(1) & is_hist
 
 
-_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel",
+_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose",
               "terrain_penetration", "terrain_penetration_sample")
 
 
@@ -319,7 +310,7 @@ def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> N
     fk_pos = fk_pos.reshape(w, f, k, 3)
     rb = frame_block_start(nj, 0)
     p_root = x[..., rb:rb + 3]
-    r_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])
+    r_root = rot6d_to_matrix(x[..., rb + 3:rb + 9])
     errs = []
     for kf in range(k):
         eb = frame_block_start(nj, 1 + kf)
@@ -374,7 +365,7 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk,
         dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
         vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
         joint_vel_weight=cfg.joint_vel_consistency_weight,
-        fk=fk, fk_pose_weight=cfg.fk_pose_weight, fk_vel_weight=cfg.fk_vel_weight,
+        fk=fk, fk_pose_weight=cfg.fk_pose_weight,
         tau_min=cfg.consistency_tau_min,
         terrain=terrain, foot_idxs=foot_idxs, contact_pts=contact_pts,
         terrain_weight=cfg.terrain_penetration_weight,
@@ -473,9 +464,8 @@ def main() -> None:
           f"val_windows={0 if val_ds is None else len(val_ds)}")
     if cfg.obs_noise:
         print(f"[INFO] obs_noise=on (conditioning tokens, train split only), scale={cfg.noise_scale} | "
-              f"joint_pos={cfg.noise_joint_pos} joint_vel={cfg.noise_joint_vel} "
-              f"pos={cfg.noise_pos} lin_vel={cfg.noise_lin_vel} ori={cfg.noise_ori} "
-              f"ang_vel={cfg.noise_ang_vel}")
+              f"joint_pos={cfg.noise_joint_pos} pos={cfg.noise_pos} ori={cfg.noise_ori} "
+              "(position-only state: no velocity-channel noise)")
     else:
         print("[INFO] obs_noise=off (clean conditioning tokens)")
 
@@ -532,10 +522,10 @@ def main() -> None:
 
     # Forward-kinematics chain for the FK consistency losses (only when weighted).
     fk = None
-    if cfg.fk_pose_weight > 0.0 or cfg.fk_vel_weight > 0.0:
+    if cfg.fk_pose_weight > 0.0:
         if train_ds.num_extra_frames == 0:
-            print("[WARN] fk_pose_weight/fk_vel_weight set but the dataset has no extra (ee) "
-                  "frames; skipping the FK losses.")
+            print("[WARN] fk_pose_weight set but the dataset has no extra (ee) "
+                  "frames; skipping the FK loss.")
         else:
             fk_path = cfg.fk_model_path if os.path.isabs(cfg.fk_model_path) else os.path.join(_REPO_ROOT, cfg.fk_model_path)
             fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)
