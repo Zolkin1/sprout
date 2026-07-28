@@ -143,7 +143,7 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
                 "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
             },
         )
-        # Half the envs carry a 5–7 kg back payload: a point mass at a random position
+        # Half the envs carry a 5–9 kg back payload: a point mass at a random position
         # within a 5 cm cube centered ~10 cm behind and ~15 cm above the torso frame
         # (a backpack-like load that pulls the robot backward/up when it bends).
         self.events.add_back_payload = EventTerm(
@@ -151,7 +151,7 @@ class G1BendCycleCLFEnvCfg(G1ClfTrackingEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names="waist_yaw_link"),
-                "mass_range": (5.0, 7.0),
+                "mass_range": (5.0, 9.0),
                 "position_range": {
                     "x": (-0.125, -0.075),
                     "y": (-0.025, 0.025),
