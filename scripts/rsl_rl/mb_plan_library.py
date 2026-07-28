@@ -176,15 +176,22 @@ def _box_tile_specs(rng, skill: str, sources, args, n_tiles: int) -> list[dict]:
                              nav_width_range=tuple(args.tile_width_range))
     print(f"[mb_plan] {skill}: box heights={heights} -> {len(specs)} tiles")
     out = []
-    n_two = 0
+    # ONE-SIDED vs TWO-SIDED is a TILE property: a one-sided tile is the bare jump box (no walkable
+    # platform), a two-sided one carries the platform its elevated segment walks on, and every clip on
+    # a tile must emit byte-identical geometry.  One-sided tiles teach the interaction on its own --
+    # run up and mount, or drop off and walk away -- without also demanding the on-box walk.
+    #
+    # EXACTLY ``round(frac * n)`` tiles are two-sided, rather than an independent Bernoulli per tile: a
+    # family has only ~15-20 tiles, so a coin flip lands well off the requested split (0.5 measured 32/50
+    # = 64% two-sided across the three families), and the one-sided tiles exist to fix a specific learning
+    # failure -- their count is the point, not its expectation.
+    n_two = int(round(float(args.box_two_sided_frac) * len(specs)))
+    two_idx = set(np.random.default_rng([args.seed + 7, _skill_seed(skill)])
+                  .permutation(len(specs))[:n_two].tolist())
     for i, s in enumerate(specs):
         t_rng = np.random.default_rng([args.seed + 4, _skill_seed(skill), i])
-        # ONE-SIDED vs TWO-SIDED is a TILE property: a one-sided tile is the bare jump box (no walkable
-        # platform), a two-sided one carries the platform its elevated segment walks on, and every clip on
-        # a tile must emit byte-identical geometry.  One-sided tiles teach the interaction on its own --
-        # run up and mount, or drop off and walk away -- without also demanding the on-box walk.
-        two_sided = bool(t_rng.random() < args.box_two_sided_frac)
-        n_two += two_sided
+        t_rng.random()          # consumed, not used: keeps the rest of this tile's draws where they were
+        two_sided = i in two_idx
         out.append({"box_height": heights[int(s.source_idx) % len(heights)],
                     # 0 keeps the source box's own (narrow) width; anything else widens box + platform.
                     "box_nav_width": (float(s.nav_width) if args.box_nav_width < 0.0
