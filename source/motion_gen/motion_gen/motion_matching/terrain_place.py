@@ -12,6 +12,8 @@ exact treads, anchoring an episodic jump onto the tile box -- must be ONE implem
   first tread exactly as the source solved it.
 * :func:`place_episodic_on_tile` -- an episodic box interaction (``jump_on`` / ``jump_off*``) played once
   and anchored by its solved box onto the tile's fixed box.
+* :func:`episodic_box_extents` -- how big that solved box is in the frame the placement will put it in,
+  so the tile can be authored before the interaction is placed on it.
 * :func:`select_terrain_reference` -- the two-stage reference pick (nearest geometry, then nearest speed)
   both generators use.
 
@@ -130,24 +132,67 @@ def place_periodic_on_tile(ts, tile, boxes, dev, k: int = 0, truncate: bool = Tr
     return Wp, Wq, Wj, terr_contact
 
 
-def place_episodic_on_tile(ts, tile_box, dev, k: int = 0):
+def episodic_box_extents(ts, align: str = "facing") -> list[float]:
+    """Full extents ``[sx, sy, sz]`` of an episodic source's solved box, in the frame it will be PLACED in.
+
+    The tile box has to be authored before the interaction can be placed on it, so this answers "how big
+    is the box along the robot's travel direction?" without running the placement.  With
+    ``align="facing"`` (what :func:`place_episodic_on_tile` uses for the Motion-Bricks path) the box is
+    rotated with the motion onto ``+x``, so ``sx`` is its depth ALONG TRAVEL and ``sy`` its lateral width
+    -- which for every jump reference in the library is the SWAP of the raw solved extents, because the
+    robot walks along the source's ``y``.  The rotated footprint is returned as its axis-aligned bounding
+    box, since tile boxes are axis-aligned (``yaw = 0``); for the near-90-degree rotations in the library
+    that inflates the extents by well under a centimetre.
+
+    ``align="box"`` reproduces the raw solved extents (the frame the DP path places in).
+
+    Args:
+        ts: ingested terrain :class:`~.motion_db.MotionSource` (episodic ``jump_on`` / ``jump_off*``).
+        align: ``"facing"`` (travel frame) or ``"box"`` (the source's own frame).
+
+    Returns:
+        ``[sx, sy, sz]`` full extents (m).
+    """
+    src = dict(ts.terrain_meta.get("terrain", {}).get("boxes", [{}])[0])
+    sx, sy, sz = (float(v) for v in src["size"])
+    if align == "box":
+        return [sx, sy, sz]
+    qw, qx, qy, qz = (float(v) for v in ts.root_quat[0])
+    fy = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))   # source facing yaw
+    th = float(src.get("yaw", 0.0)) - fy                    # the box's yaw after yaw_normalize("facing")
+    c, s = abs(math.cos(th)), abs(math.sin(th))
+    return [c * sx + s * sy, s * sx + c * sy, sz]           # AABB of the rotated footprint
+
+
+def place_episodic_on_tile(ts, tile_box, dev, k: int = 0, align: str = "box"):
     """Play an episodic box interaction from frame ``k`` and anchor its solved box onto the tile box.
 
     The box-family mirror of :func:`place_periodic_on_tile`: play once (no looping),
-    :func:`.box_clip.yaw_normalize` so the solved box is axis-aligned, then translate so the source box
-    CENTER coincides with the tile's fixed box center -- so every clip that shares the tile interacts with
-    the SAME box, and a mount lands on / a dismount drops off it exactly as it was solved.
+    :func:`.box_clip.yaw_normalize` to put the interaction in the tile frame, then translate so the source
+    box CENTER coincides with the tile's fixed box center -- so every clip that shares the tile interacts
+    with the SAME box, and a mount lands on / a dismount drops off it exactly as it was solved.
 
-    NOTE: the tile box must keep the source box's DEPTH (travel-direction x) and HEIGHT; only the lateral
+    ``align`` picks WHICH rotation normalizes the clip:
+
+    * ``"facing"`` -- cancel the robot's heading, so the interaction TRAVELS along ``+x`` exactly as a
+      stair traversal does, and the solved box rotates with it.  The tile must then be authored from
+      :func:`episodic_box_extents` (the travel-frame extents), not from the raw solved ``size``.
+    * ``"box"`` -- cancel the solved box's own yaw.  For a box that yaw is always 0, so this is a no-op
+      that leaves the clip on its source heading (~-91 deg for every jump reference in the library):
+      the interaction then runs along world ``y`` while the tile is laid out along world ``x``.  Kept as
+      the default for the DP generator, which authors its tile boxes in that same unrotated frame.
+
+    NOTE: the tile box must keep the source box's DEPTH (travel direction) and HEIGHT; only the lateral
     width may be widened (see ``generate_box_clips._box_tile_worker``).  A center-align is only correct
     while depth/height match the source -- a deeper box would leave its near footprint under the run-up,
     which the approach then walks through.
 
     Args:
         ts: ingested terrain :class:`~.motion_db.MotionSource` (episodic ``jump_on`` / ``jump_off*``).
-        tile_box: the authored tile box (:func:`.box_clip.box_tile_box`).
+        tile_box: the authored tile box (:func:`.box_clip.box_tile_box` / ``box_tile_boxes``' index 0).
         dev: torch device for the placed tensors.
         k: source frame to start the interaction at (the ENTRY frame).
+        align: normalizing rotation, ``"box"`` (default, the DP path) or ``"facing"`` (see above).
 
     Returns:
         ``(root_pos[T,3], root_quat[T,4], joints[T,29], contact[T,2] | None)`` in the tile frame (tile
@@ -158,7 +203,7 @@ def place_episodic_on_tile(ts, tile_box, dev, k: int = 0):
         None if ts.contact is None else ts.contact.to(dev), 1, offset=None, start=k)   # episodic: play once
     Wp, Wq, Wj, _, _ = align_and_concat([(rp, rq, jt)])
     src = dict(ts.terrain_meta.get("terrain", {}).get("boxes", [{}])[0])
-    Wp, Wq, aligned = yaw_normalize(Wp, Wq, [src], Wq[0])   # rotate so the box yaw -> 0 (axis-aligned)
+    Wp, Wq, aligned = yaw_normalize(Wp, Wq, [src], Wq[0], align=align)
     sc = aligned[0]["pos"]                                  # source box CENTER in the aligned frame
     sh = torch.tensor([float(tile_box["pos"][j]) - float(sc[j]) for j in range(3)],
                       device=Wp.device, dtype=Wp.dtype)

@@ -139,7 +139,7 @@ def test_redatum_gives_every_clip_of_a_tile_one_origin_and_footprint():
     recs = [_rec((-1.0, -1.0), (6.0, 4.0)), _rec((-1.5, -1.2), (6.5, 4.1))]
     y0_before = recs[0]["y"].clone()
     foot_gap_before = (recs[0]["y"][:, [0, 1]] - recs[0]["y"][:, [3, 4]]).clone()
-    sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
+    sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin, "stairs")
 
     assert recs[0]["manifest"]["size_x"] == recs[1]["manifest"]["size_x"] == sx
     assert recs[0]["manifest"]["size_y"] == recs[1]["manifest"]["size_y"] == sy
@@ -165,7 +165,7 @@ def test_redatum_is_a_noop_when_clips_already_share_a_datum():
     mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
     recs = [_rec((-1.0, -1.0), (6.0, 4.0)), _rec((-1.0, -1.0), (6.0, 4.0))]
     before = [r["y"].clone() for r in recs]
-    sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
+    sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin, "stairs")
     assert (sx, sy) == pytest.approx((6.0, 4.0))
     for r, b in zip(recs, before):
         assert r["y"].numpy() == pytest.approx(b.numpy())
@@ -178,8 +178,24 @@ def test_redatum_widens_stair_platforms_to_the_shared_footprint():
              {"pos": [3.0, 0.0, 0.1], "size": [2.5, 1.0, 0.2], "yaw": 0.0}]     # wide platform
     mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
     recs = [_rec((-1.0, -1.0), (6.0, 4.0))]
-    _sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin)
+    _sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin, "stairs")
     ov = recs[0]["manifest"]["overlays"]
     assert ov[0]["size_xyz"][1] == pytest.approx(1.0)      # tread keeps its authored width
     assert ov[1]["size_xyz"][1] == pytest.approx(sy)       # platform spans the tile
     assert ov[1]["pos_xy"][1] == pytest.approx(sy / 2.0)
+
+
+def test_redatum_leaves_a_box_tiles_authored_widths_alone():
+    """A box tile also has two overlays (jump box + top platform), but its widths are deliberate.
+
+    Widening them to the tile footprint -- which includes the margin -- would lay a box-high slab over the
+    whole tile, so the stair rule must key on the GEOMETRY, not on "more than one overlay".
+    """
+    margin = 1.0
+    boxes = [{"pos": [0.5, 0.0, 0.235], "size": [0.8, 1.0, 0.47], "yaw": 0.0},   # the jump box
+             {"pos": [1.65, 0.0, 0.235], "size": [1.5, 1.0, 0.47], "yaw": 0.0}]  # its top platform
+    mb_assemble_library._SHARED.update(x_ch=_X_CH, y_ch=_Y_CH)
+    recs = [_rec((-1.0, -1.0), (6.0, 4.0))]
+    _sx, sy = mb_assemble_library._redatum_tile(recs, boxes, margin, "box")
+    assert sy > 1.0                                        # the tile IS wider than the authored geometry
+    assert [o["size_xyz"][1] for o in recs[0]["manifest"]["overlays"]] == pytest.approx([1.0, 1.0])

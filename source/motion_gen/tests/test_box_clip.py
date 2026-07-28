@@ -76,3 +76,36 @@ def test_yaw_normalize_axis_aligns_box_rigidly():
     # rotation is about the origin -> rigid (norms preserved for clip + box)
     assert torch.allclose(rp.norm(dim=1), rp2.norm(dim=1), atol=1e-5)
     assert abs(np.linalg.norm(b2[0]["pos"][:2]) - np.linalg.norm([1.5, 0.5])) < 1e-5
+
+
+def test_yaw_normalize_facing_cancels_the_heading_not_the_box_yaw():
+    """A solved BOX carries yaw=0 whichever way the robot walked, so aligning by it is a no-op.
+
+    That is why the box families need ``align="facing"``: without it the interaction keeps its raw source
+    heading (~-91 deg for every jump reference) and travels along world y, while the tile is laid out
+    along world x -- transposing the tile's axes and handing the anchor mask's free-y the takeoff
+    distance instead of the lateral offset.
+    """
+    from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, yaw_normalize
+    T = 4
+    facing = math.radians(-90)         # the library's jump references sit within ~4 deg of this
+    rp = torch.stack([torch.tensor([0.0, -0.2 * k, 0.8]) for k in range(T)])   # walks along -y
+    rq = _quat_yaw_wxyz(facing).unsqueeze(0).repeat(T, 1)
+    boxes = [{"pos": [0.0, -0.6, 0.2], "size": [0.8, 0.45, 0.4], "yaw": 0.0}]  # ahead of the robot, in -y
+
+    same, _, _ = yaw_normalize(rp, rq, boxes, rq[0])                            # align="box" -> no-op
+    assert torch.allclose(same, rp, atol=1e-6)
+
+    rot, rq2, b2 = yaw_normalize(rp, rq, boxes, rq[0], align="facing")
+    assert abs(rot[-1, 0] - 0.6) < 1e-4 and abs(rot[-1, 1]) < 1e-4              # travel is now +x
+    assert b2[0]["pos"][0] > 0.5 and abs(b2[0]["pos"][1]) < 1e-4                # the box came with it
+    assert abs(abs(b2[0]["yaw"]) - abs(facing)) < 1e-6                          # ...rotated a quarter turn
+
+
+def test_yaw_normalize_rejects_an_unknown_align():
+    import pytest
+
+    from motion_gen.motion_matching.box_clip import _quat_yaw_wxyz, yaw_normalize
+    rp, rq = torch.zeros(2, 3), _quat_yaw_wxyz(0.0).unsqueeze(0).repeat(2, 1)
+    with pytest.raises(ValueError, match="align"):
+        yaw_normalize(rp, rq, [], rq[0], align="tread")

@@ -220,6 +220,49 @@ def box_tile_box(*, box_size, approach_len: float, y_offset: float = 0.0) -> dic
             "size": [sx, sy, sz], "yaw": 0.0}
 
 
+def box_tile_boxes(*, box_size, approach_len: float, platform_len: float = 0.0,
+                   platform_sign: float = 1.0, y_offset: float = 0.0,
+                   nav_width: float | None = None) -> list[dict]:
+    """FIXED tile geometry for a box interaction: the jump BOX plus a walkable TOP PLATFORM flush with it.
+
+    The box-family analog of :func:`stair_tile_boxes`, and authored the same way -- a solid block from
+    ``z = 0`` whose top is flush with the surface beside it -- so that the elevated end of the clip has
+    somewhere to WALK instead of standing still on a bare box.  Which side the platform goes on is the
+    caller's ``platform_sign`` (see
+    :func:`~motion_gen.motionbricks.terrain_families.box_platform_sign`): always the side AWAY from the
+    face the jump uses, so the takeoff / landing footprint stays exactly as the reference solved it and
+    the mount is no easier than it was.
+
+    Returns ``[jump_box, top_platform]`` -- the jump box is ALWAYS index 0, because
+    :func:`~motion_gen.motion_matching.terrain_place.place_episodic_on_tile` anchors the played
+    interaction onto ``boxes[0]``.  With ``platform_len <= 0`` only the jump box is returned, which is
+    :func:`box_tile_box`'s geometry.
+
+    Args:
+        box_size: the played jump source's box extents ``(sx, sy, sz)`` (full, not half).
+        approach_len: flat ground kept clear ahead of the structure (m); >= the longest ground-level
+            segment that shares the tile.
+        platform_len: x-length of the top platform (m); >= the longest elevated segment on the tile.
+        platform_sign: which side of the box the platform extends to (``+1`` = ``+x``, ``-1`` = ``-x``).
+        y_offset: signed lateral offset of the structure from the corridor centerline (m).
+        nav_width: y-width (m) to widen BOTH blocks to (expand-only; ``None`` keeps the source's ``sy``).
+            The landing is laterally free under ``_ANCHOR_MASK_BOX``, so a walkable top wants the corridor
+            width the same way a stair platform does.
+    """
+    sx, sy, sz = (float(v) for v in box_size)
+    plat_len = max(0.0, float(platform_len))
+    w = max(sy, float(nav_width)) if nav_width else sy
+    # Lay the structure out from ``approach_len``: the platform first when it extends in -x, so the whole
+    # tile stays at x >= approach_len either way (the clip is re-datumed by footprint_recenter regardless).
+    box_x0 = float(approach_len) + (plat_len if float(platform_sign) < 0.0 else 0.0)
+    boxes = [{"pos": [box_x0 + sx / 2.0, float(y_offset), sz / 2.0], "size": [sx, w, sz], "yaw": 0.0}]
+    if plat_len > 0.0:
+        plat_x0 = box_x0 + sx if float(platform_sign) >= 0.0 else box_x0 - plat_len
+        boxes.append({"pos": [plat_x0 + plat_len / 2.0, float(y_offset), sz / 2.0],
+                      "size": [plat_len, w, sz], "yaw": 0.0})
+    return boxes
+
+
 def loop_periodic(rp: torch.Tensor, rq: torch.Tensor, jt: torch.Tensor,
                   contact: torch.Tensor | None, n_loops: int, offset=None, start: int = 0):
     """Play the FULL periodic stride from frame ``start``, then wrap it forward ``n_loops-1`` more times.
@@ -260,7 +303,7 @@ def _quat_yaw_wxyz(theta: float) -> torch.Tensor:
 
 
 def yaw_normalize(root_pos: torch.Tensor, root_quat: torch.Tensor, boxes: list[dict],
-                  ref_gq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
+                  ref_gq: torch.Tensor, align: str = "box") -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
     """Rotate the whole clip + its boxes about the world origin so the TERRAIN is axis-aligned.
 
     Since the DP builds backward from the (globally placed) terrain interaction, the terrain
@@ -273,8 +316,17 @@ def yaw_normalize(root_pos: torch.Tensor, root_quat: torch.Tensor, boxes: list[d
     staircase: its treads carry a native world yaw (~-85 deg) that ``ref_gq`` does NOT cancel, which
     left the tread slab rotated ~90 deg (long axis along the descent) and put the descent on the
     y-free anchor axis.  ``ref_gq`` is the fallback heading when the clip carries no boxes.
+
+    ``align="facing"`` instead cancels ``ref_gq`` (the robot's heading) even when boxes ARE supplied,
+    rotating them along with the motion.  That is what a BOX interaction needs: unlike a staircase, a
+    solved box carries ``yaw = 0`` whatever direction the robot walks, so aligning by it is a no-op that
+    leaves the clip on its source heading (~-91 deg for every jump reference) -- travelling along world
+    y while the tile is laid out along world x, which transposes the tile's axes and hands the anchor
+    mask's FREE-y axis the takeoff distance instead of the lateral offset.
     """
-    ref_yaw = float(boxes[0]["yaw"]) if boxes else _yaw_of(ref_gq)
+    if align not in ("box", "facing"):
+        raise ValueError(f"align must be 'box' or 'facing', got {align!r}")
+    ref_yaw = float(boxes[0]["yaw"]) if (boxes and align == "box") else _yaw_of(ref_gq)
     gq = _quat_yaw_wxyz(-ref_yaw).to(root_pos.device)
     n = root_pos.shape[0]
     rp = quat_apply(gq.unsqueeze(0).expand(n, 4), root_pos)
