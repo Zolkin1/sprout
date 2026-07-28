@@ -3,7 +3,7 @@
 
 """Stage 2 driver: ingest Motion Bricks raw motions into a flat clip library (drop-in beside the DP).
 
-Reads the raw ``.npz`` files written by ``scripts/rsl_rl/mb_encode.py`` / ``mb_generate.py`` (Stage 1,
+Reads the raw ``.npz`` files written by ``scripts/rsl_rl/mb_encode.py`` (Stage 1,
 Motion Bricks env), resamples each to the RL control dt + reindexes joints
 (``motion_gen.motionbricks.mb_ingest``), and writes them through the SAME ``MultiSkillManager``
 output-name layout + ``ClipOutputBuilder`` + ``ClipLibraryWriter`` that ``generate_mm_clips.py`` uses --
@@ -35,10 +35,10 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.gen_parallel import default_workers, unit_pool
 from motion_gen.motionbricks import fit_to_length, load_raw_motion, raw_to_world, resample_rows
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -51,7 +51,7 @@ def _convert(raw, dt: float, T: int, builder, rl_vels: str, dev):
     """One raw motion -> the per-clip arrays the writer wants, plus the snap error for reporting.
 
     Returns ``(y, dy, contact, target_vel, clip_len, snap_err[T,3], pelvis_z_mean)``. ``target_vel`` is the
-    channel selected by ``rl_vels``; a raw motion with no snapped channel (e.g. ``mb_generate.py`` output,
+    channel selected by ``rl_vels``; a raw motion with no snapped channel (e.g. a free-run capture,
     which never snapped) reports zero error and uses its single command for both.
     """
     Wp, Wq, Wj, tvel_raw = raw_to_world(raw, dt, device=dev)
@@ -104,8 +104,8 @@ def main() -> int:
     if not raw_paths:
         raise SystemExit(f"no raw .npz found under {args.raw_dir}")
     dev = args.device
-    manager = MultiSkillManager(args.source, dev, env=None)          # robot output-names + skill_list only
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)          # robot output-names + skill_list only
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT_FRAMES, device=dev)
     anchor = int(anchor_mask_from_free([x.strip() for x in args.flat_anchor.split(",") if x.strip()]))
     T = max(1, int(round(args.clip_length / args.dt)))
@@ -117,7 +117,7 @@ def main() -> int:
         "vel_output_names": list(builder.vel_names),
         "contact_frames": _CONTACT_FRAMES,
         "ref_frame": "pelvis_link",
-        "skill_list": [s.name for s in manager.skills],
+        "skill_list": lib_meta.skill_list,
     }
     n_workers = default_workers(N, args.workers)
     print(f"[mb_clips] {N} raw clips -> {args.out}  (T={T}, P={len(builder.pos_names)}, "

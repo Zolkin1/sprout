@@ -22,18 +22,24 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from motion_gen.world_lift import (
-    ego_placement,
-    ego_placement_masked,
     anchor_mask_from_free,
     anchor_mask_free_names,
-    _yaw_from_quat,
     _ANCHOR_MASK_LEGACY,
     _ANCHOR_MASK_FLAT,
     _ANCHOR_MASK_STAIRS,
     _ANCHOR_MASK_SLOPE,
+)
+# The placement/lift helpers are quaternion-order sensitive, so Isaac Lab-side code
+# (these tests included) must reach them through the scalar-last adapter.
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.world_lift_isaac import (
+    ego_placement,
+    ego_placement_masked,
+    ego_placement_masked_window,
+    yaw_from_quat as _yaw_from_quat,
 )
 
 DEVICE = "cpu"
@@ -222,12 +228,27 @@ def _random_inputs(n, seed):
 
 
 def test_mask_named_constants_bit_patterns():
-    """The named masks encode exactly the intended FREE DOF sets."""
-    assert set(anchor_mask_free_names(_ANCHOR_MASK_LEGACY)) == {"x", "y", "z", "yaw"}
-    assert set(anchor_mask_free_names(_ANCHOR_MASK_FLAT)) == {"x", "y", "yaw"}
-    assert set(anchor_mask_free_names(_ANCHOR_MASK_STAIRS)) == {"y"}
-    assert set(anchor_mask_free_names(_ANCHOR_MASK_SLOPE)) == {"x", "y"}
+    """The named masks encode exactly the intended FREE DOF sets, in TERRAIN-frame names."""
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_LEGACY)) == {"downrange", "lateral", "height", "yaw"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_FLAT)) == {"downrange", "lateral", "yaw"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_STAIRS)) == {"lateral"}
+    assert set(anchor_mask_free_names(_ANCHOR_MASK_SLOPE)) == {"downrange", "lateral"}
     assert (_ANCHOR_MASK_LEGACY, _ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_SLOPE) == (39, 35, 2, 3)
+
+
+def test_legacy_world_axis_spellings_map_to_the_same_bits():
+    """``x``/``y``/``z`` stay accepted aliases, so stored masks and generator CLIs keep working.
+
+    The bit ORDER never moved -- only the names -- so a uint8 mask written by any existing library
+    still means the same thing. This is the compatibility contract that lets the rename land without
+    regenerating anything.
+    """
+    assert anchor_mask_from_free({"x", "y", "z", "yaw"}) == _ANCHOR_MASK_LEGACY
+    assert anchor_mask_from_free({"x", "y", "yaw"}) == _ANCHOR_MASK_FLAT
+    assert anchor_mask_from_free({"y"}) == _ANCHOR_MASK_STAIRS
+    assert anchor_mask_from_free(["x", "lateral"]) == _ANCHOR_MASK_SLOPE   # mixed spellings
+    with pytest.raises(ValueError, match="unknown anchor DOF"):
+        anchor_mask_from_free({"sideways"})
 
 
 def test_masked_legacy_equivalence():
@@ -315,3 +336,116 @@ def test_free_roll_pitch_rejected():
             assert False, f"expected free '{bad}' to raise"
         except ValueError:
             pass
+
+
+# ----------------------------------------------------------------------
+# Terrain-frame mask resolution (mask_frame_yaw) + the windowed placement.
+# ----------------------------------------------------------------------
+
+def _identity_snapshot(n: int, target_xy: tuple[float, float]):
+    """A snapshot whose clip base sits at the cell anchor and whose robot is offset in xy."""
+    base_pos = torch.zeros(n, 3)
+    base_ori = torch.zeros(n, 4); base_ori[:, 3] = 1.0        # identity, xyzw
+    target_pos = torch.zeros(n, 3)
+    target_pos[:, 0], target_pos[:, 1] = target_xy
+    target_quat = base_ori.clone()
+    return base_pos, base_ori, target_pos, target_quat
+
+
+def test_free_lateral_follows_the_terrain_frame_not_world_y():
+    """``lateral`` free means ACROSS THE TERRAIN, so a 90-degree terrain frame frees world x.
+
+    This is the bug the terrain frame exists to prevent: the box families were baked travelling
+    along world y, so a world-axis mask handed "free y" the traversal axis and a slow robot dragged
+    the reference off the box along the direction of travel.  With the frame authored, the same mask
+    frees the axis perpendicular to the traversal whatever heading the terrain carries.
+    """
+    n = 4
+    base_pos, base_ori, target_pos, target_quat = _identity_snapshot(n, (0.3, 0.7))
+    cell = torch.zeros(n, 3)
+    kw = dict(anchor_mask=torch.full((n,), _ANCHOR_MASK_STAIRS, dtype=torch.uint8),
+              cell_anchor_pos=cell)
+
+    # theta = 0: downrange == world x (pinned), lateral == world y (free -> absorbs 0.7).
+    pos0, _ = ego_placement_masked(base_pos, base_ori, target_pos, target_quat, **kw)
+    assert torch.allclose(pos0, torch.tensor([[0.0, 0.7, 0.0]]).expand(n, 3), atol=1e-6)
+
+    # theta = 90 deg: downrange == world y (pinned), lateral == world -x (free -> absorbs 0.3).
+    pos90, _ = ego_placement_masked(
+        base_pos, base_ori, target_pos, target_quat,
+        mask_frame_yaw=torch.full((n,), math.pi / 2), **kw)
+    assert torch.allclose(pos90, torch.tensor([[0.3, 0.0, 0.0]]).expand(n, 3), atol=1e-6)
+
+
+def test_mask_frame_yaw_default_is_world_axes():
+    """Omitting / zeroing ``mask_frame_yaw`` reproduces the old world-axis masking exactly."""
+    n = 16
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=7)
+    cell = torch.randn(n, 3)
+    kw = dict(anchor_mask=torch.full((n,), _ANCHOR_MASK_FLAT, dtype=torch.uint8), cell_anchor_pos=cell)
+    a = ego_placement_masked(base_pos_cf, base_ori_cf, target_pos, target_quat, **kw)
+    b = ego_placement_masked(base_pos_cf, base_ori_cf, target_pos, target_quat,
+                            mask_frame_yaw=torch.zeros(n), **kw)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def test_window_with_a_constant_mask_matches_the_single_step_solve():
+    """A mask-CONSTANT window reproduces the single-step placement, frame for frame.
+
+    The invariant that makes the per-segment rework safe to land: a clip whose mask never changes
+    (55% of the terrain library, and all flat / distractor libraries) is placed exactly as before.
+
+    Frame-to-frame equality inside the window is EXACT. Window-vs-single-step is asserted to
+    floating-point tolerance rather than bitwise: the window solves ``N*K`` elements where the
+    single-step solve does ``N``, and the vectorized CPU ``sin``/``cos`` can land a different lane on
+    the tail, which moves the last bit (~1 ULP, measured 4.8e-07 at a coordinate magnitude of 8.7).
+    """
+    n, k = 8, 5
+    base_pos_cf, base_ori_cf, target_pos, target_quat = _random_inputs(n, seed=11)
+    cell = torch.randn(n, 3)
+    cell_yaw = torch.empty(n).uniform_(-math.pi, math.pi)
+    single = ego_placement_masked(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=torch.full((n,), _ANCHOR_MASK_FLAT, dtype=torch.uint8),
+        cell_anchor_pos=cell, cell_anchor_yaw=cell_yaw)
+    win = ego_placement_masked_window(
+        base_pos_cf, base_ori_cf, target_pos, target_quat,
+        anchor_mask=torch.full((n, k), _ANCHOR_MASK_FLAT, dtype=torch.uint8),
+        cell_anchor_pos=cell, cell_anchor_yaw=cell_yaw)
+    assert win[0].shape == (n, k, 3) and win[1].shape == (n, k, 4)
+    for j in range(k):
+        assert torch.allclose(win[0][:, j], single[0], atol=1e-6)
+        assert torch.allclose(win[1][:, j], single[1], atol=1e-6)
+        # Within the window, a constant mask must give byte-identical frames (same shapes, one call).
+        assert torch.equal(win[0][:, j], win[0][:, 0])
+        assert torch.equal(win[1][:, j], win[1][:, 0])
+
+
+def test_window_places_each_frame_through_its_own_segment_mask():
+    """A window spanning [flat, terrain-pinned, flat] gets three DIFFERENT placements.
+
+    The terrain-pinned frame stays on the cell anchor in downrange/height/yaw no matter how far the
+    snapshot's robot has drifted, while the flat frames ride the robot -- which is exactly what keeps
+    the ribbon / future window / recorder showing the interaction on its terrain during the approach.
+    """
+    n = 3
+    base_pos, base_ori, target_pos, target_quat = _identity_snapshot(n, (1.25, 0.4))
+    cell = torch.zeros(n, 3)
+    masks = torch.tensor([[_ANCHOR_MASK_FLAT, _ANCHOR_MASK_STAIRS, _ANCHOR_MASK_FLAT]],
+                         dtype=torch.uint8).expand(n, 3).contiguous()
+    pos, quat = ego_placement_masked_window(
+        base_pos, base_ori, target_pos, target_quat,
+        anchor_mask=masks, cell_anchor_pos=cell)
+
+    # Flat frames: downrange + lateral both absorb the robot offset (ego).
+    assert torch.allclose(pos[:, 0], torch.tensor([[1.25, 0.4, 0.0]]).expand(n, 3), atol=1e-6)
+    assert torch.equal(pos[:, 0], pos[:, 2])
+    # Terrain frame: downrange pinned to the cell, ONLY lateral follows the robot.
+    assert torch.allclose(pos[:, 1], torch.tensor([[0.0, 0.4, 0.0]]).expand(n, 3), atol=1e-6)
+    # ...and it is independent of how far the robot has drifted downrange.
+    far_target = target_pos.clone()
+    far_target[:, 0] += 10.0
+    pos_far, _ = ego_placement_masked_window(
+        base_pos, base_ori, far_target, target_quat, anchor_mask=masks, cell_anchor_pos=cell)
+    assert torch.allclose(pos_far[:, 1], pos[:, 1], atol=1e-6)
+    assert not torch.allclose(pos_far[:, 0], pos[:, 0], atol=1e-6)   # the flat frames DID move

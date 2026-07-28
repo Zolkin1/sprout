@@ -3,7 +3,7 @@
 """Torch-free baked-clip reference source for the MuJoCo sim2sim runner.
 
 Loads a dense motion-clip library (the HDF5 produced by
-``scripts/rsl_rl/generate_parity_clip.py`` / ``generate_clips.py``) with numpy
+``scripts/rsl_rl/generate_mb_library.py``) with numpy
 and serves, per control step, the same world-frame reference dict the online
 flow-matching generator emits -- ``{"current": {...}, "future": [...]}`` -- so it
 drops straight into ``GenTrackerPolicy._build_obs(state, reference=...)``.  This
@@ -253,8 +253,17 @@ class ClipReference:
             fut.append(fs)
         return {"current": cur, "future": fut}
 
-    def spawn_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Spawn pose at ``start_step``: ``(base_pos, base_quat_wxyz, joint_pos_isaac)``.
+    def spawn_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Spawn state at ``start_step``.
+
+        Returns ``(base_pos, base_quat_wxyz, joint_pos_isaac, base_vel_w, joint_vel_isaac)``
+        where ``base_vel_w`` is ``[lin_vel_w(3), ang_vel_w(3)]`` in the WORLD frame.
+
+        The velocities matter: clips routinely start mid-stride (a 2.6 m/s walk-in), and
+        IsaacLab's ``reset_on_motion_sequence`` writes both root and joint velocity from
+        ``dy_des`` alongside the pose. Spawning the same pose at rest instead leaves the robot
+        a full stride-speed behind its own reference on step 0 -- which then feeds a stalled
+        state history to the FM, so the predicted reference stalls too.
 
         ``base_quat`` is converted to MuJoCo ``(w, x, y, z)`` order for
         ``Robot.set_base_and_joints``; joints stay in the isaac order.
@@ -262,4 +271,6 @@ class ClipReference:
         s0 = self._frame_state(self.start_step)
         q = s0["root_quat"]  # xyzw
         base_quat_wxyz = np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
-        return s0["root_pos"].copy(), base_quat_wxyz, s0["jp"].copy()
+        base_vel_w = np.concatenate([s0["root_lin"], s0["root_ang"]]).astype(np.float64)
+        return (s0["root_pos"].copy(), base_quat_wxyz, s0["jp"].copy(),
+                base_vel_w, s0["jv"].copy())

@@ -88,6 +88,31 @@ class BatchedHistory:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
         return torch.stack([s[key] for s in self._steps], dim=1)
 
+    def null_mask(self) -> torch.Tensor:
+        """Per-env ``(N,)`` bool: True where the history window is NOT yet complete.
+
+        Hand this to the model as ``history_null_mask``: training nulled ``null_cond_prob`` of
+        its samples, so the learned ``null_history`` embedding covers exactly this case and the
+        FM can be sampled from step 0 -- no clip warmup, no fabricated static history.
+        """
+        if len(self._steps) < self.maxlen:
+            return torch.ones_like(self._steps_since_reset, dtype=torch.bool)
+        return self._steps_since_reset < self.maxlen
+
+    def stack_padded(self, key: str) -> torch.Tensor:
+        """Like :meth:`stack`, but always ``maxlen`` long -- front-padded by repeating the oldest.
+
+        Only the global deque underfill (the first steps of a run) is padded. Per-env staleness
+        is not repaired: those envs are the ones :meth:`null_mask` flags, whose history content
+        the model replaces with the learned null embedding. The newest step stays at index -1,
+        so the caller's anchor is always the live state.
+        """
+        if not self._steps:
+            raise RuntimeError("stack_padded on an empty history: append at least one step first.")
+        steps = list(self._steps)
+        pad = [steps[0]] * (self.maxlen - len(steps))
+        return torch.stack([s[key] for s in (pad + steps)], dim=1)
+
 
 # ----------------------------------------------------------------------
 # Loaded-checkpoint context.
@@ -319,6 +344,7 @@ def sample_world(
     cmd_tokens: torch.Tensor | None,
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
+    history_null_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Sample the ``F``-step future window and lift it to the world frame.
 
@@ -334,6 +360,10 @@ def sample_world(
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
         p_ref: World reference position ``(V, 3)`` (the current robot base position).
         q_ref: World reference quaternion ``(V, 4, xyzw)``.
+        history_null_mask: Optional ``(V,)`` bool; where True the history content is replaced by
+            the model's learned ``null_history`` embedding. Pass
+            :meth:`BatchedHistory.null_mask` to sample before the window has filled instead of
+            falling back to a clip or a fabricated static history.
 
     Returns:
         World-frame prediction dict with ``root_pos_w (V,F,3)``,
@@ -348,7 +378,8 @@ def sample_world(
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
 
-    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps)
+    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps,
+                                 history_null_mask=history_null_mask)
     pred = ctx.state_norm.denormalize(pred_std)  # (V, F, D)
 
     p_ref_f = p_ref[:, None, :].expand(v, f, 3).reshape(v * f, 3)

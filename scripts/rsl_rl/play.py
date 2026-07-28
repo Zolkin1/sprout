@@ -42,7 +42,14 @@ from data_logger import DataLogger  # isort: skip
 from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
 from export_parameters import export_policy_parameters  # isort: skip
-from robot_rl.network.moe_network import MixtureOfExperts  # isort: skip
+# The FM exporter lives in scripts/flow_matching; put it on the path like
+# the FM script dir on the path so play.py can write both deploy artifacts itself.
+_FM_SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              os.pardir, "flow_matching"))
+if _FM_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _FM_SCRIPT_DIR)
+from export_tracker_onnx import export_tracker_onnx  # isort: skip
+from export_fm_onnx import export_fm_onnx  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
@@ -129,6 +136,12 @@ parser.add_argument(
          "clip/FM references + the FM prediction window) to play_data.npz in the plots "
          "dir, for offline analysis. "
          "Pair with --plots fm_predictions to include the full FM prediction window.",
+)
+parser.add_argument(
+    "--no_deploy_onnx", action="store_true", default=False,
+    help="Skip writing the two deploy ONNX artifacts (exported/tracker.onnx and, with "
+         "--fm_checkpoint, exported/fm.onnx). They are written by default because they must "
+         "stay in sync with the policy.pt + policy_parameters.yaml this run exports.",
 )
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
@@ -297,8 +310,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
             # The ClipTerrainImporter builds its terrain mesh + per-env terrain_id from
             # its OWN clip_library_path, which must stay identical to the command's clip
-            # path (the env cfg asserts this -- tile terrain ids must line up with the
-            # clips' terrain ids). Re-point it too so --clip is a single source of truth.
+            # path -- tile terrain ids must line up with the clips' terrain ids. Re-point it
+            # too so --clip is a single source of truth. NOTE: nothing asserts the two match;
+            # setting only one (e.g. a bare hydra override of commands.traj_ref.path) trains
+            # on a terrain the clips do not belong to. Go through --clip.
             terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
             if terrain is not None and hasattr(terrain, "clip_library_path"):
                 terrain.clip_library_path = args_cli.clip
@@ -468,20 +483,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
             export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
-        # Detect MoE architecture and set up gate weight capture
         _policy_model = runner.alg.student if isinstance(runner, DistillationRunner) else runner.alg.actor
         teacher_model = runner.alg.teacher if isinstance(runner, DistillationRunner) else None
-        _moe_net = getattr(_policy_model, "mlp", None)
-        is_moe = isinstance(_moe_net, MixtureOfExperts)
-        if is_moe:
-            print(f"[INFO] MoE detected: {_moe_net.num_experts} experts. Gate weights will be logged.")
-            _last_gate_w: dict[str, torch.Tensor] = {}
-
-            def _gate_hook(module, input, output):
-                _last_gate_w["val"] = output.detach().clone()
-
-            _moe_net.gate.register_forward_hook(_gate_hook)
-            gate_weights_log: list[torch.Tensor] = []
 
         dt = env.unwrapped.step_dt
 
@@ -527,6 +530,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             actions = policy(obs)
         export_policy_parameters(env, obs, actions, log_dir)
+
+        # Deploy artifacts for the MuJoCo / hardware runners: exactly two ONNX files, the RL
+        # tracker and (when an FM is loaded) the FM generator. Both carry their metadata
+        # embedded, so the runner needs no YAML. Done here rather than in a separate step
+        # because tracker.onnx needs the policy.pt + policy_parameters.yaml this run just
+        # wrote -- exporting them together is what keeps the three in sync.
+        if not args_cli.no_deploy_onnx:
+            try:
+                export_tracker_onnx(export_model_dir)
+                _trk = os.path.join(export_model_dir, "tracker.onnx")
+                print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
+                if args_cli.fm_checkpoint is not None:
+                    fm_out = os.path.join(export_model_dir, "fm.onnx")
+                    export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                    print(f"[INFO] wrote {fm_out}")
+                else:
+                    print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
+            except Exception as exc:                                        # noqa: BLE001
+                print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
+                      f"Re-run export_tracker_onnx.py / export_fm_onnx.py by hand if needed.")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""
@@ -596,8 +619,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                                 logger.collect_distillation_actions(
                                     student_actions=actions, teacher_actions=teacher_actions
                                 )
-                    if is_moe and "val" in _last_gate_w:
-                        gate_weights_log.append(_last_gate_w["val"])
                     if ep_stats is not None:
                         tm = env.unwrapped.termination_manager
                         term_fired = {n: tm.get_term(n) for n in tm.active_terms}
@@ -647,12 +668,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Generate plots from collected data
             if logging_enabled and logger.num_steps > 0:
                 data, metadata = logger.finalize()
-                # Inject MoE gate weights into data for plotting
-                if is_moe and gate_weights_log:
-                    data["gate_weights"] = torch.stack(gate_weights_log).cpu().numpy()
-                    metadata["num_experts"] = _moe_net.num_experts
                 # Task-specific subfolder so different tasks loading the SAME run
-                # (e.g. G1-teacher-clf-play vs G1-tracker-clf-fm-play) keep
+                # (e.g. G1-teacher-clf-terrain-play vs G1-tracker-clf-fm-terrain-play) keep
                 # their plots side by side instead of overwriting each other.
                 plots_dir = os.path.join(log_dir, "plots", task_name)
                 if args_cli.dump_play_data:

@@ -14,7 +14,7 @@ forward -- which is strictly more information than a real-time forward-only matc
 A beam (width ``B``) keeps the ``B`` cheapest partial paths; ``min_cut_gap`` + ``cut_penalty``
 stop it from thrashing (jumping every frame for tiny local gains).  Playback (world
 construction, inertialisation) is shared with vanilla via
-:func:`~motion_gen.motion_matching.playback.play_frame_path`, so only the *selection* differs.
+:func:`~motion_gen.playback.play_frame_path`, so only the *selection* differs.
 
 Bones-only for now: every frame is VARIED, so the STEADY-tier term is inert (``w_tier=0``).
 """
@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from .graph import STEADY, VARIED  # noqa: F401  (STEADY kept for the tier hook)
-from .playback import play_frame_path
+from ..playback import play_frame_path
 from .vanilla import VanillaConfig, VanillaMatcher
 
 

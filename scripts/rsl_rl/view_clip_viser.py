@@ -53,6 +53,12 @@ _GHOST_COLOR = (0.45, 0.55, 0.70)       # translucent steel-blue ghosts
 _GHOST_ALPHA_NEAR, _GHOST_ALPHA_FAR = 0.7, 0.18
 _KEYFRAME_COLOR = (0.95, 0.80, 0.15)    # gold -- pinned target keyframes (Phase-2 mb_encode overlay)
 _KEYFRAME_ALPHA = 0.55
+# A TERRAIN keyframe is drawn red because it is only half a pin: the replay's pose is honoured, but its
+# root xy is thrown away and replaced by the command's exact-velocity rollout (see
+# mb_env.target_pose_override / full_agent.py's target_root_realignment branch).  So a red ghost's POSE is
+# what Motion Bricks was asked to reach, while its PLACE is wherever the commanded velocity happened to
+# put it -- not where the terrain is.  Gold ghosts (our steady stride) are pose-only by design.
+_KEYFRAME_TERRAIN_COLOR = (0.90, 0.25, 0.20)
 _DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j.urdf"
 
 
@@ -68,6 +74,7 @@ def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
     d = np.load(path, allow_pickle=False)
     clip_idx, qpos = d["clip_idx"], d["qpos"]
     tks = d["t"] if "t" in d else np.zeros(len(qpos), np.float32)
+    kinds = np.array(_json.loads(str(d["kind"]))) if "kind" in d else np.array(["stride"] * len(qpos))
     joint_names = _json.loads(str(d["joint_names"]))
     perm = recording_to_urdf_perm(joint_names, urdf)
     out: dict[int, dict] = {}
@@ -78,6 +85,7 @@ def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
             "wxyz": qpos[m, 3:7].astype(np.float32),
             "cfg": qpos[m, 7:][:, perm].astype(np.float32),
             "t": tks[m].astype(np.float32),
+            "kind": kinds[m],
         }
     return out
 
@@ -419,7 +427,8 @@ class ClipScene:
         # Pinned-keyframe ghost pool (gold) -- the Phase-2 target poses fed to Motion Bricks' predict().
         # Populated only when a --keyframes sidecar is supplied; sized on first set_keyframes.
         self._keyframes: dict[int, dict] | None = None
-        self._kf_ghosts: list[tuple[viser.FrameHandle, ViserUrdf]] = []
+        # One entry per keyframe slot: {"stride": (frame, urdf), "terrain": (frame, urdf)}.
+        self._kf_ghosts: list[dict[str, tuple[viser.FrameHandle, ViserUrdf]]] = []
         self._kf_markers: viser.SceneNodeHandle | None = None
         self.show_keyframes = False   # default off -- many robot meshes can hang the browser; toggle via GUI
 
@@ -609,33 +618,51 @@ class ClipScene:
         self.set_frame(0)
 
     def set_keyframes(self, kf_by_clip: dict[int, dict]) -> None:
-        """Attach pinned-keyframe data and build the gold ghost pool sized to the busiest clip."""
+        """Attach pinned-keyframe data and build the ghost pool sized to the busiest clip.
+
+        Two ghosts per slot -- gold and red -- because ``ViserUrdf`` takes its colour at construction and
+        slots are reused as you switch clips, so a slot cannot be recoloured in place.  Exactly one of
+        each pair is ever visible (see :meth:`_refresh_keyframes`).
+        """
         self._keyframes = kf_by_clip
         pool = max((len(v["pos"]) for v in kf_by_clip.values()), default=0)
         for s in range(pool):
-            fr = self.server.scene.add_frame(f"/keyframes/{s}", show_axes=False, visible=False)
-            gh = ViserUrdf(self.server, self.urdf, root_node_name=f"/keyframes/{s}",
-                           mesh_color_override=(*_KEYFRAME_COLOR, _KEYFRAME_ALPHA))
-            self._kf_ghosts.append((fr, gh))
+            pair = {}
+            for tag, col in (("stride", _KEYFRAME_COLOR), ("terrain", _KEYFRAME_TERRAIN_COLOR)):
+                fr = self.server.scene.add_frame(f"/keyframes/{tag}/{s}", show_axes=False, visible=False)
+                gh = ViserUrdf(self.server, self.urdf, root_node_name=f"/keyframes/{tag}/{s}",
+                               mesh_color_override=(*col, _KEYFRAME_ALPHA))
+                pair[tag] = (fr, gh)
+            self._kf_ghosts.append(pair)
 
     def _refresh_keyframes(self) -> None:
-        """Pose the gold keyframe ghosts (+ root markers) for the current clip; hide the rest."""
+        """Pose the keyframe ghosts (+ root markers) for the current clip; hide the rest.
+
+        Gold = pinned against our steady stride, red = pinned against the terrain replay.  A red ghost's
+        POSE is what Motion Bricks was told to reach; its PLACE is not -- the terrain window's root xy is
+        discarded and replaced by the command rollout, so where it stands is a consequence of the
+        commanded velocity, not of where the terrain actually is.
+        """
         kf = (self._keyframes or {}).get(self.clip_idx)
         if self._kf_markers is not None:
             self._kf_markers.remove()
             self._kf_markers = None
-        for s, (fr, gh) in enumerate(self._kf_ghosts):
-            if kf is not None and self.show_keyframes and s < len(kf["pos"]):
-                fr.position = kf["pos"][s]
-                fr.wxyz = kf["wxyz"][s]
-                gh.update_cfg(kf["cfg"][s])
-                fr.visible = True
-            else:
-                fr.visible = False
+        for s, pair in enumerate(self._kf_ghosts):
+            live = (kf is not None and self.show_keyframes and s < len(kf["pos"]))
+            tag = str(kf["kind"][s]) if live else ""
+            for name, (fr, gh) in pair.items():
+                if live and name == (tag if tag in pair else "stride"):
+                    fr.position = kf["pos"][s]
+                    fr.wxyz = kf["wxyz"][s]
+                    gh.update_cfg(kf["cfg"][s])
+                    fr.visible = True
+                else:
+                    fr.visible = False
         if kf is not None and self.show_keyframes and len(kf["pos"]):
+            cols = np.array([_KEYFRAME_TERRAIN_COLOR if str(k) == "terrain" else _KEYFRAME_COLOR
+                             for k in kf["kind"]], np.float32)
             self._kf_markers = self.server.scene.add_point_cloud(
-                "/keyframe_roots", points=kf["pos"].astype(np.float32),
-                colors=np.tile(np.array(_KEYFRAME_COLOR, np.float32), (len(kf["pos"]), 1)),
+                "/keyframe_roots", points=kf["pos"].astype(np.float32), colors=cols,
                 point_size=0.05, point_shape="circle",
             )
 
@@ -761,8 +788,12 @@ def main() -> int:
         ttype = type_names[int(lib.terrain_type_code[ci])] if lib.terrain_type_code.numel() else "?"
         tid = int(lib.terrain_id[ci]) if lib.terrain_id.numel() else -1
         tinfo = f"{ttype}" + (f" (terrain {tid})" if tid >= 0 else "")
+        # The clip control is a bare numeric slider, so a library that names its clips (``clip_labels``,
+        # e.g. one assembled to compare generator settings side by side) is unreadable without this.
+        labels = lib.attrs.get("clip_labels") or lib.attrs.get("merge_labels") or []
+        lab = f" \"{labels[ci]}\"" if ci < len(labels) else ""
         gui_info.value = (
-            f"clip {ci} [{tinfo}] | step {step}/{scene.num_steps - 1} | now: {cur_skill} | "
+            f"clip {ci}{lab} [{tinfo}] | step {step}/{scene.num_steps - 1} | now: {cur_skill} | "
             f"clip skills: {', '.join(skills)}"
         )
         tv = scene.target_vel_at(step)

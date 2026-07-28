@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Motion-matching toy clip (bones-seed only; no skills / traj-opt / handoff).
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- a matcher research one-off.  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Motion-matching toy clip (bones-seed only; no skills / traj-opt / handoff).
 
 Drives a scripted ``(vx, vy, omega)`` command through motion matching over the bones-seed
 database and writes a standard ``.h5`` clip.  Runs with NO IsaacLab.  Two algorithms,
@@ -27,9 +31,9 @@ import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
-from motion_gen.motion_matching.bones_ingest import load_cache
+from motion_gen.ingest.bones_ingest import load_cache
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
+from motion_gen.clip_output import ClipOutputBuilder
 from motion_gen.motion_matching.graph import (
     CandidateGraph,
     GraphConfig,
@@ -38,7 +42,7 @@ from motion_gen.motion_matching.graph import (
     graph_cache_path,
 )
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import anchor_mask_from_free
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -261,7 +265,7 @@ def main() -> int:
                             limit=args.bones_limit, device=dev)
     clean_paths = None
     if args.include_clean:
-        from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+        from motion_gen.ingest.clean_ingest import ingest_clean_library
         print(f"[toy] ingesting clean library {args.clean_source} (hf_repo={args.clean_hf_repo}) ...")
         clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt,
                                      device=dev, skills=_csv_set(args.clean_skills))
@@ -316,8 +320,8 @@ def main() -> int:
             print(f"  {t0:8.2f}  {t1:7.2f}  {t1 - t0:5.2f}   [{s['l0']:>4}-{s['l1']:<4}] {matcher.src_names[s['o']]}")
         print()
 
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
     y, dy, contact = builder.build(root_pos, root_quat, joints, args.dt)
     tvel = torch.tensor([[*command(i * args.dt)] for i in range(T)], dtype=torch.float32, device=dev)
@@ -334,7 +338,7 @@ def main() -> int:
         "pos_output_names": list(builder.pos_names),   # builder is authoritative (full 29-joint layout)
         "vel_output_names": list(builder.vel_names),
         "contact_frames": _CONTACT, "ref_frame": "pelvis_link",
-        "skill_list": [s.name for s in manager.skills],
+        "skill_list": lib_meta.skill_list,
     }
     writer = ClipLibraryWriter(args.out, 1, meta)
     writer.set_attr("generator", generator_name)

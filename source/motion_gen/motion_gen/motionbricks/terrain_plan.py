@@ -129,7 +129,8 @@ class TerrainPlan:
         return list(self.meta.get("boxes", []))
 
     # ---- windows for the Motion Bricks side ---------------------------------------------------
-    def approach_pin_window(self, t_offset: float, n: int, dt_mb: float) -> np.ndarray:
+    def approach_pin_window(self, t_offset: float, n: int, dt_mb: float,
+                            hold: bool = False) -> np.ndarray:
         """Target-pose window ``[n, 36]`` for an approach that is ``-t_offset`` seconds from the entry.
 
         The window is the replay itself, read at the Motion Bricks frame spacing ``dt_mb`` starting
@@ -138,11 +139,22 @@ class TerrainPlan:
         over to).  Pinning the terrain's FUTURE as the target -- rather than freezing the entry pose -- is
         what keeps the last approach frames moving at the entry's velocity instead of settling onto it.
 
+        ``hold`` collapses the window to ONE keyframe: the entry frame, repeated.  That is what
+        ``pin_future=False`` has always meant to express -- hold the entry pose -- but clamping only
+        ``t_offset`` did not achieve it, because the window still spans ``n * dt_mb`` seconds FORWARD from
+        wherever it starts.  So once the arrival came inside the horizon (``t_offset -> 0``) the tail of
+        the window slid into the replay anyway, asking the approach to begin generating the interaction
+        it is supposed to hand over to.  With ``hold`` the target is unambiguous and does not move
+        between replans.
+
         Root xy is zeroed (the planar target comes from the exact-velocity pin, which overwrites it) and
         root z is made RELATIVE to :attr:`approach_surf_z`, because the MB approach is generated on its own
         flat ground and only grounded onto the real surface when the clip is spliced.
         """
-        idx = self.entry_frame + (float(t_offset) + np.arange(int(n)) * float(dt_mb)) / float(self.dt)
+        if hold:
+            idx = np.full(int(n), float(self.entry_frame))
+        else:
+            idx = self.entry_frame + (float(t_offset) + np.arange(int(n)) * float(dt_mb)) / float(self.dt)
         win = sample_qpos(self.terrain_qpos, idx)
         win[:, 0:2] = 0.0
         win[:, 2] -= float(self.approach_surf_z)

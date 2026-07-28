@@ -7,13 +7,11 @@ from __future__ import annotations
 
 import torch
 import warp as wp
-import math
 import re
 from typing import TYPE_CHECKING, Sequence
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi, quat_rotate_inverse, yaw_quat, quat_rotate, quat_inv
 
 KAPPA = 0.5
 
@@ -63,35 +61,6 @@ def clf_decreasing_condition(
     penalty = violation / max_violation
     penalty = torch.clamp(penalty, min=0.0, max=1.0)
     return penalty
-
-
-def _base_vel_output_indices(cmd) -> list[int]:
-    """Indices of the base frame's linear (pos_*) + angular (ori_*) velocity
-    channels within a trajectory command's ``ordered_vel_output_names``."""
-    base = cmd.cfg.base_frame_name
-    names = cmd.ordered_vel_output_names
-    return (
-        [names.index(f"{base}:pos_{a}") for a in ("x", "y", "z")]
-        + [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
-    )
-
-
-def ref_base_vel_tracking_exp(
-    env: ManagerBasedRLEnv, command_name: str, std: float = 0.5,
-) -> torch.Tensor:
-    """Dense exp reward for tracking the clip's reference base velocity.
-
-    Compares the measured vs reference base (pelvis) linear + angular velocity
-    -- the ``dy_act`` / ``dy_des`` channels of the trajectory command, both in
-    the same yaw-aligned anchor frame -- giving a smooth, shaped locomotion
-    signal on top of the (harder) CLF tracking reward.  Analogous to the
-    velocity-command ``track_lin_vel_xy_exp`` / ``track_ang_vel_z_exp`` rewards,
-    but graded against the reference trajectory rather than a commanded velocity.
-    """
-    cmd = env.command_manager.get_term(command_name)
-    idx = _base_vel_output_indices(cmd)
-    err = cmd.dy_act[:, idx] - cmd.dy_des[:, idx]
-    return torch.exp(-torch.sum(err * err, dim=1) / (std ** 2))
 
 
 def command_lin_vel_xy_tracking_exp(
@@ -231,62 +200,3 @@ def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
 ##
 # Individual tracking rewards
 ##
-def base_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_base_pos = cmd_term.clf.v_subgroups["pelvis_pos"]
-
-    return torch.exp(-KAPPA * v_base_pos / sigma)
-
-def base_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_base_lin_vel = cmd_term.clf.v_subgroups["pelvis_lin_vel"]
-
-    return torch.exp(-KAPPA * v_base_lin_vel / sigma)
-
-def base_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_base_ori = cmd_term.clf.v_subgroups["pelvis_ori"]
-
-    return torch.exp(-KAPPA * v_base_ori / sigma)
-
-def base_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_base_ang_vel = cmd_term.clf.v_subgroups["pelvis_ang_vel"]
-
-    return torch.exp(-KAPPA * v_base_ang_vel / sigma)
-
-def joint_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_joint_pos = cmd_term.clf.v_subgroups["joint_pos"]
-
-    return torch.exp(-KAPPA * v_joint_pos / sigma)
-
-def joint_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_joint_vel = cmd_term.clf.v_subgroups["joint_vel"]
-
-    return torch.exp(-KAPPA * v_joint_vel / sigma)
-
-def body_pos_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_body_pos = cmd_term.clf.v_subgroups["other_body_pos"]
-
-    return torch.exp(-KAPPA * v_body_pos / sigma)
-
-def body_lin_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_body_lin_vel = cmd_term.clf.v_subgroups["other_body_lin_vel"]
-
-    return torch.exp(-KAPPA * v_body_lin_vel / sigma)
-
-def body_ori_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_body_ori = cmd_term.clf.v_subgroups["other_body_ori"]
-
-    return torch.exp(-KAPPA * v_body_ori / sigma)
-
-def body_ang_vel_reward(env: ManagerBasedRLEnv, command_name: str, sigma: float) -> torch.Tensor:
-    cmd_term = env.command_manager.get_term(command_name)
-    v_body_ang_vel = cmd_term.clf.v_subgroups["other_body_ang_vel"]
-
-    return torch.exp(-KAPPA * v_body_ang_vel / sigma)

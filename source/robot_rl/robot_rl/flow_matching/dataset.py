@@ -192,7 +192,7 @@ class FutureStateDataset(Dataset):
         if data.get("height_scan") is None:
             raise ValueError(
                 "the height-scan FM requires a 'height_scan' array; re-record with a "
-                "height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)."
+                "height_scanner sensor active (e.g. --task G1-teacher-clf-terrain-play)."
             )
         if len(windows) == 0:
             raise ValueError("No valid snap windows; check reanchor_active vs num_history_states.")

@@ -4,8 +4,8 @@
 
 Every Motion-Bricks terrain clip has the SAME shape -- ``MB approach -> replayed terrain -> MB exit`` --
 and the families differ only in a handful of declarative facts (does the traversal loop, which walkable
-level does the approach run on, which way does the exit walk away) plus HOW the two boundary frames of
-the replay are chosen:
+level does each end run on, which way does each end walk) plus HOW the two boundary frames of the replay
+are chosen:
 
 * **Episodic** interactions (a box mount / dismount) are played whole, so the boundaries are simply the
   first and last frame (:func:`episodic_boundaries`).
@@ -14,6 +14,21 @@ the replay are chosen:
   boundary frames are FILTERED by contact + geometry (:func:`boundary_candidates`): a foot planted on a
   walkable level with the other foot a small height above it -- an ordinary single-support mid-stride pose
   the flat MB segment can hand off to / pick up from.
+
+TWO VELOCITIES, ONE AUTHORED.  A terrain clip has a velocity the GENERATOR uses and a velocity the RL
+SEES, and they are deliberately different:
+
+* The generator's command is whatever the terrain needs -- notably it ramps DOWN into a box takeoff,
+  because Motion Bricks pins the root to the exact-velocity rollout of the command, so a steady command
+  walks the robot into the box at full speed (measured: arrives at 1.14 m/s where the replay's entry
+  frame is at 0.11).  Releasing that root pin near the boundary does not fix it; the deceleration has to
+  be prescribed.  It is derived per clip from the chosen reference, and never leaves the generator.
+* The RL / flow-matching command is what a USER or PLANNER would ask for: one steady velocity, ignorant
+  of the terrain.  Adapting it to the terrain is the flow model's job, and the FM can only learn that if
+  the clips pair a terrain-agnostic command with a terrain-aware motion.
+
+So a family carries no "what does the RL see over the replay" knob -- that is one constant per clip,
+written by :mod:`scripts.rsl_rl.mb_terrain_clips`.
 
 This module is numpy-only (no torch, no Motion Bricks, no IsaacLab imports) so it loads in the Motion
 Bricks conda env as well as in ``env_isaaclab`` -- the terrain plan (:mod:`.terrain_plan`) is built on one
@@ -37,9 +52,10 @@ class TerrainFamily:
 
     ``lower`` / ``upper`` name the two walkable LEVELS a tile has: for stairs the bottom platform (flush
     with the lowest tread) and the top platform (flush with the highest tread); for a box the ground and
-    the box top.  A family says which level its approach runs on and which its exit runs on -- everything
-    directional (which tread the traversal peels off, which surface each MB segment is grounded to)
-    follows from that, so no generator carries per-skill branches.
+    the box top (which likewise carries a platform flush with it, so the elevated segment can walk).  A
+    family says which level its approach runs on and which its exit runs on -- everything directional
+    (which tread the traversal peels off, which surface each MB segment is grounded to, which side of the
+    box its platform extends to) follows from that, so no generator carries per-skill branches.
     """
 
     skill: str                  # terrain library skill name (manifest "skill" column)
@@ -50,8 +66,8 @@ class TerrainFamily:
     exit_level: str             # "lower" | "upper" -- level the MB exit walks/stands on
     approach_mode: str          # "walk" (locomote into the terrain) | "stand" (settle in place on it)
     exit_mode: str              # "walk" (locomote away) | "stand" (arrived; hold position)
+    approach_sign: float        # approach travel direction along tile +x: +1 forward, -1 backward
     exit_sign: float            # exit travel direction along tile +x: +1 forward, -1 backward
-    terrain_tvel: str           # RL target_vel over the replay: "steady" | "hold_approach" | "exit_walk"
     pin_future: bool            # approach pin tracks the replay's FUTURE frames (see below) vs holds the entry
     blurb: str                  # one-line human description (printed by the drivers)
 
@@ -69,32 +85,39 @@ class TerrainFamily:
 
 # ``jump_on`` is the only MOUNT in the library (there is no backward mount), so the box family covers
 # mount + both dismount directions: ``jump_off`` steps off backwards, ``jump_off_front`` forwards.
+#
+# Every box family WALKS on both sides, exactly like the stair families: the tile authors a short walkable
+# platform flush with the box top (:func:`~motion_gen.terrain.box_clip.box_tile_boxes`), so the
+# elevated segment has somewhere to go.  It used to be a standing hold -- a mount ended by standing on the
+# box, a dismount began by standing on it -- and because both MB segments carry the ego anchor mask, a
+# standing hold RE-ANCHORS onto whatever pose the robot actually reached: missing the box cost nothing and
+# the RL command fell to zero.  A walking end demands the traversal be completed, as a staircase does.
 FAMILIES: dict[str, TerrainFamily] = {
     "stairs_up": TerrainFamily(
         skill="stairs_up", geom="stairs", periodic=True, going_up=True,
         approach_level="lower", exit_level="upper", approach_mode="walk", exit_mode="walk",
-        exit_sign=1.0, terrain_tvel="steady", pin_future=True,
+        approach_sign=1.0, exit_sign=1.0, pin_future=True,
         blurb="walk in on the bottom platform, climb the treads, walk off the top platform"),
     "stairs_down": TerrainFamily(
         skill="stairs_down", geom="stairs", periodic=True, going_up=False,
         approach_level="upper", exit_level="lower", approach_mode="walk", exit_mode="walk",
-        exit_sign=1.0, terrain_tvel="steady", pin_future=False,
+        approach_sign=1.0, exit_sign=1.0, pin_future=False,
         blurb="walk in on the top platform, descend the treads, walk off the bottom platform"),
     "jump_on": TerrainFamily(
         skill="jump_on", geom="box", periodic=False, going_up=False,
-        approach_level="lower", exit_level="upper", approach_mode="walk", exit_mode="stand",
-        exit_sign=1.0, terrain_tvel="hold_approach", pin_future=False,
-        blurb="walk in on the ground, jump onto the box, stand on top"),
+        approach_level="lower", exit_level="upper", approach_mode="walk", exit_mode="walk",
+        approach_sign=1.0, exit_sign=1.0, pin_future=False,
+        blurb="walk in on the ground, jump onto the box, walk on along the box top"),
     "jump_off": TerrainFamily(
         skill="jump_off", geom="box", periodic=False, going_up=False,
-        approach_level="upper", exit_level="lower", approach_mode="stand", exit_mode="walk",
-        exit_sign=-1.0, terrain_tvel="exit_walk", pin_future=False,
-        blurb="stand on the box, drop off BACKWARDS, walk away backwards"),
+        approach_level="upper", exit_level="lower", approach_mode="walk", exit_mode="walk",
+        approach_sign=-1.0, exit_sign=-1.0, pin_future=False,
+        blurb="walk BACKWARDS along the box top, drop off backwards, walk away backwards"),
     "jump_off_front": TerrainFamily(
         skill="jump_off_front", geom="box", periodic=False, going_up=False,
-        approach_level="upper", exit_level="lower", approach_mode="stand", exit_mode="walk",
-        exit_sign=1.0, terrain_tvel="exit_walk", pin_future=False,
-        blurb="stand on the box, drop off FORWARDS, walk away forwards"),
+        approach_level="upper", exit_level="lower", approach_mode="walk", exit_mode="walk",
+        approach_sign=1.0, exit_sign=1.0, pin_future=False,
+        blurb="walk FORWARDS along the box top, drop off forwards, walk away forwards"),
 }
 
 
@@ -105,6 +128,52 @@ def family_for(skill: str) -> TerrainFamily:
     except KeyError:
         raise KeyError(f"no Motion-Bricks terrain family for skill {skill!r}; "
                        f"have {sorted(FAMILIES)}") from None
+
+
+def elevated_side(family: TerrainFamily) -> str:
+    """Which MB segment runs on the UPPER level -- ``"approach"`` or ``"exit"``.
+
+    The one fact a ONE-SIDED clip needs.  "Terrain plus the ground side only" means omitting the segment
+    on the upper level, and which one that is differs per family: a MOUNT lands up there so it is the
+    exit, a DISMOUNT starts up there so it is the approach.  Reading it off ``*_level`` keeps the
+    one-sided path family-agnostic instead of branching on the skill name.
+
+    Raises:
+        ValueError: if neither end is elevated (both levels ``"lower"``), which no family does today.
+    """
+    if family.exit_level == "upper":
+        return "exit"
+    if family.approach_level == "upper":
+        return "approach"
+    raise ValueError(f"{family.skill}: neither end runs on the upper level, so no side is elevated")
+
+
+def ground_side(family: TerrainFamily) -> str:
+    """Which MB segment runs on the LOWER level -- the complement of :func:`elevated_side`."""
+    return "approach" if elevated_side(family) == "exit" else "exit"
+
+
+def box_platform_sign(family: TerrainFamily) -> float:
+    """Which side of the jump box (``+1`` = ``+x``, ``-1`` = ``-x``) the walkable TOP PLATFORM extends to.
+
+    Derived rather than declared, because it is fully determined by which end of the interaction is
+    elevated and which way that end travels:
+
+    * a MOUNT (``exit_level == "upper"``) lands near the face it cleared and walks AWAY along
+      ``exit_sign``, so the platform must lie ahead of the landing, at ``+exit_sign``;
+    * a DISMOUNT (``approach_level == "upper"``) arrives at the edge it drops off travelling along
+      ``approach_sign``, so the platform it walked in on lies BEHIND it, at ``-approach_sign``.
+
+    Either way the platform is on the opposite side of the box from the face the jump uses, which is what
+    leaves the takeoff / landing footprint exactly as the reference solved it.
+
+    Raises:
+        ValueError: if ``family`` is not a box family (a staircase's platforms come from its tread layout).
+    """
+    if family.geom != "box":
+        raise ValueError(f"{family.skill}: box top platforms are a box-family notion, not {family.geom!r} "
+                         f"(stair platforms come from stair_tile_boxes)")
+    return float(family.exit_sign) if family.exit_level == "upper" else -float(family.approach_sign)
 
 
 @dataclass(frozen=True)
@@ -122,7 +191,7 @@ def sole_heights(y: np.ndarray, pos_names: list[str],
                  sole_offset: float = SOLE_Z) -> np.ndarray:
     """Per-frame SOLE heights ``[T, 2]`` (left, right) from a built clip-output block ``y[T, P]``.
 
-    ``y`` is what :class:`~motion_gen.motion_matching.clip_output.ClipOutputBuilder` produces (the
+    ``y`` is what :class:`~motion_gen.clip_output.ClipOutputBuilder` produces (the
     ``pos_output_names`` layout); the ankle-frame z is lowered by ``sole_offset`` so the value can be
     compared directly against a tread / box top height.
     """

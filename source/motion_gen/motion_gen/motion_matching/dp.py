@@ -22,7 +22,7 @@ from the commanded integrated position -- that is by design; it is what makes th
 and comparing its drift against beam's position-tracked path is the point of the method.
 
 Playback (world construction) is shared with vanilla/beam via
-:func:`~motion_gen.motion_matching.playback.play_frame_path`, so only the *selection* differs.
+:func:`~motion_gen.playback.play_frame_path`, so only the *selection* differs.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import numpy as np
 import torch
 
 from .graph import STEADY, VARIED
-from .playback import play_frame_path
+from ..playback import play_frame_path
 from .vanilla import VanillaConfig, VanillaMatcher
 
 

@@ -5,7 +5,7 @@
 Motion Bricks emits a 36-D MuJoCo ``qpos`` (``assets/skeletons/g1/g1.xml``):
 ``[root_pos(3), root_quat_wxyz(4), joints(29)]`` (Z-up; the agent reorders the root quaternion to
 wxyz before we ever see it). The 29 joints of that skeleton happen to be in the *same order* as this
-repo's :data:`motion_gen.motion_matching.features.G1_JOINT_NAMES`, but we never rely on that -- the
+repo's :data:`motion_gen.joint_names.G1_JOINT_NAMES`, but we never rely on that -- the
 raw file carries its own ``joint_names`` and we reindex *by name* so a future skeleton change surfaces
 as a clear error (or a correct permutation) instead of a silent misalignment.
 """
@@ -35,12 +35,12 @@ def split_qpos(qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def reindex_to(src_names: list[str], dst_names: list[str] | None = None) -> np.ndarray:
     """Return int indices ``idx`` such that ``src_joints[:, idx]`` is in ``dst_names`` order.
 
-    ``dst_names`` defaults to the repo's :data:`~motion_gen.motion_matching.features.G1_JOINT_NAMES`.
+    ``dst_names`` defaults to the repo's :data:`~motion_gen.joint_names.G1_JOINT_NAMES`.
     Raises ``ValueError`` if any destination joint is absent from ``src_names`` (a genuine skeleton
     mismatch we want to fail loudly on, not paper over).
     """
     if dst_names is None:
-        from ..motion_matching.features import G1_JOINT_NAMES
+        from ..joint_names import G1_JOINT_NAMES
 
         dst_names = G1_JOINT_NAMES
     src_index = {name: i for i, name in enumerate(src_names)}

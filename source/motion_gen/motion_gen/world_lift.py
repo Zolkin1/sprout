@@ -39,46 +39,68 @@ from motion_gen.math_utils import quat_apply, quat_inv, quat_mul, yaw_quat
 # (x, y, z, yaw FREE; roll, pitch kept from the clip).
 # ----------------------------------------------------------------------
 
-_ANCHOR_DOF_NAMES: list[str] = ["x", "y", "z", "roll", "pitch", "yaw"]  # bit index = list index
+#
+# The translational bits are named in the TERRAIN's frame, not the world's: ``downrange`` is the
+# axis the traversal crosses the terrain along, ``lateral`` is across it, ``height`` is up (always
+# gravity-aligned).  Which world axes those are is carried per terrain by ``mask_frame_yaw`` (see
+# :func:`ego_placement_masked`), NOT assumed.  The world-axis spelling this file used to carry is
+# exactly how a 90-degree-rotated terrain family once slipped through: its clips travelled along
+# world y, so "free y" handed the mask the traversal axis instead of the lateral offset.
+_ANCHOR_DOF_NAMES: list[str] = ["downrange", "lateral", "height", "roll", "pitch", "yaw"]
 _ANCHOR_DOF_INDEX: dict[str, int] = {n: i for i, n in enumerate(_ANCHOR_DOF_NAMES)}
+
+# Accepted legacy spellings.  The BIT ORDER is unchanged, so every stored uint8 mask keeps its
+# meaning; only the names moved.  Kept so generator CLIs (``--flat_anchor x,y,yaw``) and older call
+# sites keep working -- but new code should use the terrain-frame names.
+_ANCHOR_DOF_ALIASES: dict[str, str] = {"x": "downrange", "y": "lateral", "z": "height"}
 
 
 def anchor_mask_from_free(free: Iterable[str]) -> int:
     """Build a uint8 anchor bitmask (bit SET = FREE) from FREE DOF names.
 
     Args:
-        free: DOF names to mark FREE (a subset of :data:`_ANCHOR_DOF_NAMES`).
+        free: DOF names to mark FREE (a subset of :data:`_ANCHOR_DOF_NAMES`; the legacy
+            ``x`` / ``y`` / ``z`` spellings in :data:`_ANCHOR_DOF_ALIASES` are accepted).
 
     Returns:
         The integer bitmask.
     """
     mask = 0
     for name in free:
-        if name not in _ANCHOR_DOF_INDEX:
-            raise ValueError(f"unknown anchor DOF '{name}'; expected one of {_ANCHOR_DOF_NAMES}")
-        mask |= 1 << _ANCHOR_DOF_INDEX[name]
+        canon = _ANCHOR_DOF_ALIASES.get(name, name)
+        if canon not in _ANCHOR_DOF_INDEX:
+            raise ValueError(f"unknown anchor DOF '{name}'; expected one of {_ANCHOR_DOF_NAMES} "
+                             f"(or {sorted(_ANCHOR_DOF_ALIASES)})")
+        mask |= 1 << _ANCHOR_DOF_INDEX[canon]
     return mask
 
 
 def anchor_mask_free_names(mask: int) -> list[str]:
-    """The FREE DOF names encoded in ``mask`` (inverse of :func:`anchor_mask_from_free`)."""
+    """The FREE DOF names encoded in ``mask`` (inverse of :func:`anchor_mask_from_free`).
+
+    Returns the canonical terrain-frame names, never the legacy aliases.
+    """
     return [n for n, i in _ANCHOR_DOF_INDEX.items() if (int(mask) >> i) & 1]
 
 
 # Named masks (computed, not hand-typed, to stay in lock-step with the bit order).
-_ANCHOR_MASK_LEGACY: int = anchor_mask_from_free({"x", "y", "z", "yaw"})  # 0b100111 = 39; today's ego_placement
-_ANCHOR_MASK_FLAT: int = anchor_mask_from_free({"x", "y", "yaw"})          # 0b100011 = 35; flat, z clip-fixed
-_ANCHOR_MASK_STAIRS: int = anchor_mask_from_free({"y"})                    # 0b000010 = 2
-_ANCHOR_MASK_SLOPE: int = anchor_mask_from_free({"x", "y"})                # 0b000011 = 3; yaw FIXED (uniform plane)
-_ANCHOR_MASK_BOX: int = anchor_mask_from_free({"y"})                       # 0b000010 = 2; box MOUNT (jump-on)
-# Box clips use a PER-FRAME mask.  This constant is the jump-ON (mount) phase: y FREE so the
-# lateral landing follows the robot's approach (approach a little off-center -> the reference
-# slides over, same as stairs), while x/z/yaw stay FIXED (world-pinned to the box) so the
-# takeoff distance + height + heading make the ballistic arc land on the box.  The on-top
-# walk / dismount / recovery phases use ``_ANCHOR_MASK_FLAT`` (ego).  Requires the box sized
-# wide enough in y to absorb the free-y lateral spread (like stairs spanning the corridor).
-# Frame note: the mask is applied in the WORLD frame and terrain clips place with identity
-# heading (yaw=0), so world-y == lateral-across-the-box (holds only while axis-aligned).
+_ANCHOR_MASK_LEGACY: int = anchor_mask_from_free(       # 0b100111 = 39; today's ego_placement
+    {"downrange", "lateral", "height", "yaw"})
+_ANCHOR_MASK_FLAT: int = anchor_mask_from_free(         # 0b100011 = 35; flat, height clip-fixed
+    {"downrange", "lateral", "yaw"})
+_ANCHOR_MASK_STAIRS: int = anchor_mask_from_free({"lateral"})               # 0b000010 = 2
+_ANCHOR_MASK_SLOPE: int = anchor_mask_from_free(        # 0b000011 = 3; yaw FIXED (uniform plane)
+    {"downrange", "lateral"})
+_ANCHOR_MASK_BOX: int = anchor_mask_from_free({"lateral"})                  # 0b000010 = 2; box MOUNT
+# Box clips use a PER-FRAME mask.  This constant is the jump-ON (mount) phase: LATERAL free so the
+# landing follows the robot's approach (approach a little off-center -> the reference slides over,
+# same as stairs), while downrange/height/yaw stay FIXED (pinned to the box) so the takeoff distance
+# + height + heading make the ballistic arc land on the box.  The on-top walk / dismount / recovery
+# phases use ``_ANCHOR_MASK_FLAT`` (ego).  Requires the box sized wide enough laterally to absorb the
+# free-lateral spread (like stairs spanning the corridor).
+# Frame note: "downrange"/"lateral" are resolved in the terrain's own yaw frame via
+# ``ego_placement_masked(mask_frame_yaw=...)``, so a rotated tile or a family baked on a rotated
+# heading is handled rather than silently transposed.
 
 
 def anchor_inv_yaw(anchor_quat: torch.Tensor) -> torch.Tensor:
@@ -154,6 +176,131 @@ def _yaw_from_quat(quat_xyzw: torch.Tensor) -> torch.Tensor:
     return torch.atan2(siny_cosp, cosy_cosp)
 
 
+def _placement_core(
+    base_pos_cf: torch.Tensor,
+    base_ori_cf: torch.Tensor,
+    target_pos_w: torch.Tensor,
+    target_quat_w: torch.Tensor,
+    mask: torch.Tensor,
+    cell_anchor_pos: torch.Tensor,
+    cell_anchor_yaw: torch.Tensor,
+    mask_frame_yaw: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat-batch placement solve; every argument carries the same leading dim ``[M]``.
+
+    The one place the FREE/FIXED split is resolved.  Translational bits are masked in the TERRAIN
+    frame (rotated by ``mask_frame_yaw`` about world z), so "free lateral" means across the terrain
+    whatever the terrain's world heading is; ``height`` is never rotated (gravity-aligned).
+    """
+    free = {name: ((mask >> i) & 1).bool() for name, i in _ANCHOR_DOF_INDEX.items()}
+    if bool(free["roll"].any()) or bool(free["pitch"].any()):
+        raise ValueError("free roll/pitch is reserved and unsupported; the mask must FIX roll & pitch")
+
+    # Placement yaw: robot-relative when yaw is FREE, else the terrain-cell heading.
+    yaw_free = _yaw_from_quat(target_quat_w) - _yaw_from_quat(base_ori_cf)
+    yaw = torch.where(free["yaw"], yaw_free, cell_anchor_yaw)
+    half = 0.5 * yaw
+    zeros = torch.zeros_like(yaw)
+    world_quat = torch.stack([zeros, zeros, torch.sin(half), torch.cos(half)], dim=-1)
+
+    # Planar rotation R(yaw) applied to the clip base xy (z is yaw-invariant); this equals
+    # quat_apply(world_quat, base_pos_cf)[:, :2] for the pure-yaw world_quat.
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    rot_x = cos_y * base_pos_cf[:, 0] - sin_y * base_pos_cf[:, 1]
+    rot_y = sin_y * base_pos_cf[:, 0] + cos_y * base_pos_cf[:, 1]
+
+    # Planar discrepancy between the robot and the clip sitting on its terrain cell, expressed in
+    # WORLD axes, then rotated into the terrain frame, masked there, and rotated back.  With
+    # mask_frame_yaw == 0 this is componentwise masking of the world discrepancy (the old behavior).
+    d_wx = target_pos_w[:, 0] - rot_x - cell_anchor_pos[:, 0]
+    d_wy = target_pos_w[:, 1] - rot_y - cell_anchor_pos[:, 1]
+    c_t, s_t = torch.cos(mask_frame_yaw), torch.sin(mask_frame_yaw)
+    d_down = c_t * d_wx + s_t * d_wy        # R(theta)^T . d_world
+    d_lat = -s_t * d_wx + c_t * d_wy
+    d_down = torch.where(free["downrange"], d_down, torch.zeros_like(d_down))
+    d_lat = torch.where(free["lateral"], d_lat, torch.zeros_like(d_lat))
+
+    world_pos = torch.empty_like(target_pos_w)
+    world_pos[:, 0] = cell_anchor_pos[:, 0] + (c_t * d_down - s_t * d_lat)   # R(theta) . d_masked
+    world_pos[:, 1] = cell_anchor_pos[:, 1] + (s_t * d_down + c_t * d_lat)
+    d_h = target_pos_w[:, 2] - base_pos_cf[:, 2] - cell_anchor_pos[:, 2]
+    world_pos[:, 2] = cell_anchor_pos[:, 2] + torch.where(free["height"], d_h, torch.zeros_like(d_h))
+    return world_pos, world_quat
+
+
+def _broadcast_placement_args(
+    n: int, device, dtype, anchor_mask, cell_anchor_yaw, mask_frame_yaw,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize the three optional/scalar placement inputs to ``[n]`` tensors on ``device``."""
+    if not torch.is_tensor(anchor_mask):
+        anchor_mask = torch.full((n,), int(anchor_mask), dtype=torch.long, device=device)
+    mask = anchor_mask.to(device=device, dtype=torch.long)
+    if cell_anchor_yaw is None:
+        cell_yaw = torch.zeros(n, device=device, dtype=dtype)
+    else:
+        cell_yaw = cell_anchor_yaw.to(device=device, dtype=dtype)
+    if mask_frame_yaw is None:
+        frame_yaw = torch.zeros(n, device=device, dtype=dtype)
+    elif not torch.is_tensor(mask_frame_yaw):
+        frame_yaw = torch.full((n,), float(mask_frame_yaw), device=device, dtype=dtype)
+    else:
+        frame_yaw = mask_frame_yaw.to(device=device, dtype=dtype)
+    return mask, cell_yaw, frame_yaw
+
+
+def ego_placement_masked_window(
+    base_pos_cf: torch.Tensor,
+    base_ori_cf: torch.Tensor,
+    target_pos_w: torch.Tensor,
+    target_quat_w: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    cell_anchor_pos: torch.Tensor,
+    cell_anchor_yaw: torch.Tensor | None = None,
+    mask_frame_yaw: torch.Tensor | float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-FRAME placements for ``K`` anchor masks per env, from ONE re-anchor snapshot.
+
+    The windowed counterpart of :func:`ego_placement_masked`.  A clip's mask varies along its
+    timeline (flat approach -> terrain-pinned interaction -> flat exit), and each of those segments
+    needs its OWN placement: the terrain-pinned frames must stay welded to the terrain even while
+    the robot is still on the ego-anchored approach.  Since a placement is a pure function of the
+    re-anchor snapshot and the mask, solving it per frame costs one extra gather.
+
+    The snapshot (``base_*``, ``target_*``) is the SAME for every frame -- it is the pose pair
+    captured at the last re-anchor -- so only ``anchor_mask`` carries the per-frame dimension.
+
+    Args:
+        base_pos_cf: ``[N, 3]`` clip-world base position at the re-anchor step.
+        base_ori_cf: ``[N, 4]`` clip-world base orientation (xyzw) at the re-anchor step.
+        target_pos_w: ``[N, 3]`` robot root world position at the re-anchor step.
+        target_quat_w: ``[N, 4]`` robot root world orientation (xyzw) at the re-anchor step.
+        anchor_mask: ``[N, K]`` uint8 bitmask per frame (bit SET = FREE).
+        cell_anchor_pos: ``[N, 3]`` terrain-cell world anchor for FIXED DOFs.
+        cell_anchor_yaw: ``[N]`` terrain-cell heading (rad) for a FIXED yaw; ``None`` -> 0.
+        mask_frame_yaw: ``[N]`` terrain-frame heading (rad) the translational bits resolve in;
+            ``None`` -> 0 (world-axis masking).
+
+    Returns:
+        ``(world_pos[N, K, 3], world_quat[N, K, 4] xyzw)``.
+    """
+    n, k = anchor_mask.shape
+    device, dtype = base_pos_cf.device, base_pos_cf.dtype
+    mask, cell_yaw, frame_yaw = _broadcast_placement_args(
+        n, device, dtype, anchor_mask, cell_anchor_yaw, mask_frame_yaw)
+
+    def _rep3(t: torch.Tensor) -> torch.Tensor:
+        return t.unsqueeze(1).expand(n, k, t.shape[-1]).reshape(n * k, t.shape[-1])
+
+    def _rep1(t: torch.Tensor) -> torch.Tensor:
+        return t.unsqueeze(1).expand(n, k).reshape(n * k)
+
+    pos, quat = _placement_core(
+        _rep3(base_pos_cf), _rep3(base_ori_cf), _rep3(target_pos_w), _rep3(target_quat_w),
+        mask.reshape(n * k), _rep3(cell_anchor_pos), _rep1(cell_yaw), _rep1(frame_yaw),
+    )
+    return pos.reshape(n, k, 3), quat.reshape(n, k, 4)
+
+
 def ego_placement_masked(
     base_pos_cf: torch.Tensor,
     base_ori_cf: torch.Tensor,
@@ -162,6 +309,7 @@ def ego_placement_masked(
     anchor_mask: torch.Tensor | int,
     cell_anchor_pos: torch.Tensor,
     cell_anchor_yaw: torch.Tensor | None = None,
+    mask_frame_yaw: torch.Tensor | float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-env placement honoring a per-clip root-DOF anchor mask.
 
@@ -195,44 +343,19 @@ def ego_placement_masked(
             (the reset placement position); zeros for flat.
         cell_anchor_yaw: ``[N]`` terrain-cell heading (rad) for a FIXED yaw;
             ``None`` treats it as 0 (identity heading, all current terrain cases).
+        mask_frame_yaw: ``[N]`` heading (rad) of the TERRAIN's own frame, which the
+            ``downrange`` / ``lateral`` bits are resolved in; ``None`` treats it as 0
+            (the translational split then falls on world x / y).
 
     Returns:
         ``(world_pos[N, 3], world_quat[N, 4] xyzw)`` -- the per-env placement.
     """
     n = base_pos_cf.shape[0]
     device, dtype = base_pos_cf.device, base_pos_cf.dtype
-    if not torch.is_tensor(anchor_mask):
-        anchor_mask = torch.full((n,), int(anchor_mask), dtype=torch.long, device=device)
-    m = anchor_mask.to(device=device, dtype=torch.long)
-    free = {name: ((m >> i) & 1).bool() for name, i in _ANCHOR_DOF_INDEX.items()}  # [N] bool each
-    if bool(free["roll"].any()) or bool(free["pitch"].any()):
-        raise ValueError("free roll/pitch is reserved and unsupported; the mask must FIX roll & pitch")
-
-    if cell_anchor_yaw is None:
-        cell_anchor_yaw = torch.zeros(n, device=device, dtype=dtype)
-    else:
-        cell_anchor_yaw = cell_anchor_yaw.to(device=device, dtype=dtype)
-
-    # Placement yaw: robot-relative when yaw is FREE, else the terrain-cell heading.
-    yaw_free = _yaw_from_quat(target_quat_w) - _yaw_from_quat(base_ori_cf)  # [N]
-    yaw = torch.where(free["yaw"], yaw_free, cell_anchor_yaw)  # [N]
-    half = 0.5 * yaw
-    zeros = torch.zeros_like(yaw)
-    world_quat = torch.stack([zeros, zeros, torch.sin(half), torch.cos(half)], dim=-1)
-
-    # Planar rotation R(yaw) applied to the clip base xy (z is yaw-invariant); this
-    # equals quat_apply(world_quat, base_pos_cf)[:, :2] for the pure-yaw world_quat.
-    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
-    rot_x = cos_y * base_pos_cf[:, 0] - sin_y * base_pos_cf[:, 1]
-    rot_y = sin_y * base_pos_cf[:, 0] + cos_y * base_pos_cf[:, 1]
-
-    # lifted base = world_pos + R(yaw) . base_pos_cf.  FREE d: solve so lifted == target[d];
-    # FIXED d: set the placement origin to the cell anchor so lifted == cell + clip motion.
-    world_pos = torch.empty_like(target_pos_w)
-    world_pos[:, 0] = torch.where(free["x"], target_pos_w[:, 0] - rot_x, cell_anchor_pos[:, 0])
-    world_pos[:, 1] = torch.where(free["y"], target_pos_w[:, 1] - rot_y, cell_anchor_pos[:, 1])
-    world_pos[:, 2] = torch.where(free["z"], target_pos_w[:, 2] - base_pos_cf[:, 2], cell_anchor_pos[:, 2])
-    return world_pos, world_quat
+    mask, cell_yaw, frame_yaw = _broadcast_placement_args(
+        n, device, dtype, anchor_mask, cell_anchor_yaw, mask_frame_yaw)
+    return _placement_core(base_pos_cf, base_ori_cf, target_pos_w, target_quat_w,
+                           mask, cell_anchor_pos, cell_yaw, frame_yaw)
 
 
 def ego_placement(
@@ -275,35 +398,48 @@ def ego_placement(
 # Mirrors the expand/reshape pattern of ``_align_yaw_batched``.
 # ----------------------------------------------------------------------
 
+def _flat_anchor(anchor: torch.Tensor, n: int, b: int) -> torch.Tensor:
+    """Flatten a batched-lift anchor to ``[N*B, C]``, accepting one anchor per env OR per frame.
+
+    ``[N, C]`` (one anchor for the whole window) is expanded; ``[N, B, C]`` (a per-frame anchor, as
+    a per-SEGMENT placement produces) is reshaped.  Lets one lift serve both.
+    """
+    if anchor.dim() == 2:
+        return anchor.unsqueeze(1).expand(n, b, anchor.shape[-1]).reshape(n * b, anchor.shape[-1])
+    if anchor.shape[:2] != (n, b):
+        raise ValueError(f"per-frame anchor must be [{n}, {b}, C]; got {tuple(anchor.shape)}")
+    return anchor.reshape(n * b, anchor.shape[-1])
+
+
 def lift_position_batched(anchor_pos: torch.Tensor, anchor_quat: torch.Tensor, pos_rel: torch.Tensor) -> torch.Tensor:
     """Lift ``B`` anchor-relative positions per env to the world frame.
 
     Args:
-        anchor_pos: ``[N, 3]`` anchor world positions.
-        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw).
+        anchor_pos: ``[N, 3]`` anchor world positions, or ``[N, B, 3]`` per frame.
+        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw), or ``[N, B, 4]`` per frame.
         pos_rel: ``[N, B, 3]`` anchor-relative positions.
 
     Returns:
         ``[N, B, 3]`` world positions.
     """
     n, b, _ = pos_rel.shape
-    inv_yaw = anchor_inv_yaw(anchor_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
-    rotated = quat_apply(inv_yaw, pos_rel.reshape(n * b, 3)).reshape(n, b, 3)
-    return anchor_pos.unsqueeze(1) + rotated
+    inv_yaw = anchor_inv_yaw(_flat_anchor(anchor_quat, n, b))
+    rotated = quat_apply(inv_yaw, pos_rel.reshape(n * b, 3))
+    return (_flat_anchor(anchor_pos, n, b) + rotated).reshape(n, b, 3)
 
 
 def lift_orientation_batched(anchor_quat: torch.Tensor, quat_rel: torch.Tensor) -> torch.Tensor:
     """Lift ``B`` anchor-relative orientations per env to the world frame.
 
     Args:
-        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw).
+        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw), or ``[N, B, 4]`` per frame.
         quat_rel: ``[N, B, 4]`` anchor-relative quaternions (xyzw).
 
     Returns:
         ``[N, B, 4]`` world quaternions (xyzw).
     """
     n, b, _ = quat_rel.shape
-    inv_yaw = anchor_inv_yaw(anchor_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
+    inv_yaw = anchor_inv_yaw(_flat_anchor(anchor_quat, n, b))
     return quat_mul(inv_yaw, quat_rel.reshape(n * b, 4)).reshape(n, b, 4)
 
 
@@ -311,14 +447,14 @@ def lift_vector_batched(anchor_quat: torch.Tensor, vec_rel: torch.Tensor) -> tor
     """Rotate ``B`` anchor-relative vectors per env into the world frame.
 
     Args:
-        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw).
+        anchor_quat: ``[N, 4]`` anchor world quaternions (xyzw), or ``[N, B, 4]`` per frame.
         vec_rel: ``[N, B, 3]`` anchor-relative vectors.
 
     Returns:
         ``[N, B, 3]`` world vectors.
     """
     n, b, _ = vec_rel.shape
-    inv_yaw = anchor_inv_yaw(anchor_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
+    inv_yaw = anchor_inv_yaw(_flat_anchor(anchor_quat, n, b))
     return quat_apply(inv_yaw, vec_rel.reshape(n * b, 3)).reshape(n, b, 3)
 
 

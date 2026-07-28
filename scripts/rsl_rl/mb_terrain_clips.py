@@ -10,7 +10,7 @@ in two passes because the middle segment must be planned before Motion Bricks (a
 generate the two ends:
 
 **Pass 1 --** ``--dump-plan plan.npz``: select the reference nearest the requested geometry + speed, author
-the tile, place the replay on it (:mod:`motion_gen.motion_matching.terrain_place`), FILTER the entry / exit
+the tile, place the replay on it (:mod:`motion_gen.terrain.terrain_place`), FILTER the entry / exit
 frames, and write the :class:`~motion_gen.motionbricks.terrain_plan.TerrainPlan`.
 
 **Pass 2 --** ``--plan plan.npz --approach-raw ... --exit-raw ...``: splice the Motion Bricks segments onto
@@ -45,18 +45,20 @@ import numpy as np
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
-from motion_gen.motion_matching.box_clip import box_tile_box, build_anchor_mask_t, stair_tile_boxes
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder
-from motion_gen.motion_matching.terrain_ingest import ingest_terrain_library
-from motion_gen.motion_matching.terrain_place import (
+from motion_gen.terrain.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
+from motion_gen.clip_output import ClipOutputBuilder
+from motion_gen.ingest.terrain_ingest import ingest_terrain_library
+from motion_gen.terrain.terrain_place import (
+    episodic_box_extents,
     place_episodic_on_tile,
     place_periodic_on_tile,
     select_terrain_reference,
 )
-from motion_gen.motion_matching.terrain_sampler import TerrainSpec
+from motion_gen.terrain.terrain_sampler import TerrainSpec
 from motion_gen.motionbricks import (
     TerrainPlan,
     boundary_candidates,
+    box_platform_sign,
     episodic_boundaries,
     family_for,
     footprint_recenter,
@@ -69,7 +71,7 @@ from motion_gen.motionbricks import (
     sole_heights,
     splice_terrain,
 )
-from motion_gen.multiskill_manager import MultiSkillManager
+from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
 _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
@@ -120,16 +122,20 @@ def _author_tile(family, ts, args):
 
     Stairs get a transition tile (approach platform -> treads -> recovery platform) sized to the reference's
     SOLVED riser / tread, because feet only sit on the treads when the played pose matches the geometry it
-    was solved for.  A box tile gets the single walkable box at the source's solved extents (a center-align
-    placement is only valid while depth + height match the source).
+    was solved for.  A box tile mirrors that shape: the walkable box at the source's solved extents (a
+    center-align placement is only valid while depth + height match the source) PLUS a top platform flush
+    with it, on the side away from the jump face, so the elevated end of the clip can walk instead of
+    standing still (:func:`~motion_gen.terrain.box_clip.box_tile_boxes`).  Only the platform is new
+    geometry -- the takeoff / landing footprint is untouched.
 
     ``lower_z`` / ``upper_z`` are the two walkable levels the family's approach / exit run on: bottom and
     top platform for stairs, ground and box top for a box.
 
-    The walking surface is sized to hold ``args.approach_s`` seconds of travel, i.e. it depends on SPEED --
-    so a tile shared by clips of different speeds MUST be authored with ``args.platform_vx`` (the fastest
-    speed on that tile). Without it each clip authors its own platform length, the geometry stops being
-    fixed per tile, and every clip but the longest ends up standing somewhere else than the meshed tile.
+    A walking surface is sized to hold its segment's seconds of travel, i.e. it depends on SPEED -- so a
+    tile shared by clips of different speeds MUST be authored with ``args.platform_vx`` (the fastest
+    GROUND-level speed on that tile) and ``args.platform_top_vx`` (its single box-top speed). Without them
+    each clip authors its own platform length, the geometry stops being fixed per tile, and every clip but
+    the longest ends up standing somewhere else than the meshed tile.
     """
     tm = ts.terrain_meta["terrain"]
     plat_vx = getattr(args, "platform_vx", None)      # tile-level speed: one geometry for all its clips
@@ -146,33 +152,75 @@ def _author_tile(family, ts, args):
             stair_steps=[n_steps], flat_after=[0.0], nav_width=float(args.nav_width or args.width),
             spawn_y_offset=0.0, stair_decor=[], has_floor=bool(args.has_floor),
         )
+        # FLOATING treads: a thickness > 0 tags each tread so the RL importer meshes a thin slab with an
+        # open gap beneath instead of a solid pillar.  The tread-TOP surface is unchanged, so the played
+        # traversal, its contact filtering and the boundary gate below are all unaffected -- the reference
+        # walks on exactly the same steps either way.  Per TILE (the mesh is per terrain_id).
+        float_thickness = float(getattr(args, "stair_float_thickness", 0.0) or 0.0)
         boxes = stair_tile_boxes(step_height=riser, step_depth=tread, num_steps=n_steps,
                                  tread_width=tile.width, ttype="transition",
                                  top_platform_len=plat, bottom_platform_len=plat,
-                                 nav_width=tile.nav_width, going_up=family.going_up)
+                                 nav_width=tile.nav_width, going_up=family.going_up,
+                                 float_thickness=float_thickness)
         lower_z, upper_z = riser, n_steps * riser        # bottom platform / top platform tops
         meta = {"geom": "stairs", "riser": riser, "tread": tread, "n_steps": n_steps,
                 "platform_len": plat, "width": float(tile.width), "nav_width": float(tile.nav_width),
-                "has_floor": bool(args.has_floor), "clip_type": "transition"}
+                "has_floor": bool(args.has_floor), "clip_type": "transition",
+                "float_thickness": float_thickness}
         return boxes, tile, lower_z, upper_z, meta
 
-    box_size = [float(v) for v in tm["boxes"][0]["size"]]
-    ground_s = args.exit_s if family.approach_mode == "stand" else args.approach_s
-    ground_vx = (abs(float(plat_vx)) if plat_vx is not None else
-                 abs(args.exit_vx if family.approach_mode == "stand" else (args.approach_vx or 1.0)))
-    tile_box = box_tile_box(box_size=box_size, approach_len=max(1.0, ground_s * ground_vx + 1.0))
+    # The box's extents IN THE TRAVEL FRAME the placement will use (see _place): for every jump reference
+    # in the library the robot walks along the source's y, so this is the swap of the raw solved size --
+    # sx is the depth the robot crosses, sy the lateral width.
+    box_size = episodic_box_extents(ts, align="facing")
+    # Which SIDE of the interaction is on the ground and which is on the box top comes from the family's
+    # levels (both ends walk now, so the old "which one is a standing hold" test is gone).
+    ground_on_approach = family.approach_level == "lower"
+    ground_s = args.approach_s if ground_on_approach else args.exit_s
+    top_s = args.exit_s if ground_on_approach else args.approach_s
+    # Tile-level speeds when a batch driver supplies them (so every clip on the tile authors byte-identical
+    # geometry), else this clip's own per-side command.
+    top_vx = getattr(args, "platform_top_vx", None) or (args.exit_vx if ground_on_approach
+                                                        else args.approach_vx)
+    ground_vx = plat_vx or ((args.approach_vx if ground_on_approach else args.exit_vx) or 1.0)
+    plat_sign = box_platform_sign(family)
+    # A ONE-SIDED tile has no elevated segment, so it needs no platform to walk on: it is the bare jump
+    # box -- exactly the geometry this family had before the platform existed.  ``box_tile_boxes``
+    # degenerates to a single box at ``platform_len <= 0``, so there is no separate code path.  The split
+    # is a TILE property, not a clip one: every clip on a terrain_id must emit byte-identical geometry
+    # (the RL importer meshes one mesh per tile), so platformed and bare clips cannot share a tile.
+    two_sided = bool(getattr(args, "two_sided", True))
+    # BUFFER past the nominal travel so the reference cannot walk off the far edge.  Needed because the
+    # nominal is only an estimate in BOTH directions: the elevated segment covers roughly
+    # vx * (s - 1.1) (gait initiation eats the first ~1.1 s, so usually LESS), but the exit ramp was
+    # measured overshooting its command by ~12%, so it can also be MORE.  The ground side needs no such
+    # margin -- a box tile keeps its floor, so running long there is flat ground, not a hole.
+    buf = float(getattr(args, "box_platform_buffer", 1.0) or 0.0)
+    plat_len = (max(buf, float(top_s) * max(0.2, abs(float(top_vx or 1.0))) + buf) if two_sided else 0.0)
+    boxes = box_tile_boxes(box_size=box_size, platform_len=plat_len, platform_sign=plat_sign,
+                           approach_len=max(1.0, float(ground_s) * max(0.3, abs(float(ground_vx))) + 1.0),
+                           nav_width=(getattr(args, "box_nav_width", None) or None))
     lower_z = 0.0
-    upper_z = float(tile_box["pos"][2]) + float(tile_box["size"][2]) / 2.0
+    upper_z = float(boxes[0]["pos"][2]) + float(boxes[0]["size"][2]) / 2.0
     meta = {"geom": "box", "box_size": box_size, "box_top": upper_z,
-            "box_height": float(tm.get("box_height", upper_z)), "clip_type": "box"}
-    return [tile_box], None, lower_z, upper_z, meta
+            "box_height": float(tm.get("box_height", upper_z)), "clip_type": "box",
+            "platform_len": float(plat_len), "platform_sign": float(plat_sign),
+            "platform_buffer": buf, "two_sided": two_sided, "nav_width": float(boxes[0]["size"][1])}
+    return boxes, None, lower_z, upper_z, meta
 
 
 def _place(family, ts, tile, boxes, dev, k: int):
-    """Place the replay on the tile from source frame ``k`` (looped for periodic, played once for episodic)."""
+    """Place the replay on the tile from source frame ``k`` (looped for periodic, played once for episodic).
+
+    Both families place TRAVEL-ALIGNED, i.e. running along the tile's ``+x`` -- which is what the tile
+    layout (run-up, top platform, ``exit_sign``) and the world-frame anchor mask both assume.  For the
+    stair path that is automatic; the box path has to ask for it (``align="facing"``), because a solved
+    box's own yaw is 0 no matter which way the robot walked, so normalizing by it is a no-op that would
+    leave the interaction on its raw source heading.
+    """
     if family.periodic:
         return place_periodic_on_tile(ts, tile, boxes, dev, k=k, truncate=False, going_up=family.going_up)
-    return place_episodic_on_tile(ts, boxes[0], dev, k=k)
+    return place_episodic_on_tile(ts, boxes[0], dev, k=k, align="facing")
 
 
 def _soles(builder, Wp, Wq, Wj, dt) -> np.ndarray:
@@ -187,8 +235,8 @@ def make_builder(args, dev) -> ClipOutputBuilder:
     Split out because constructing it loads the whole traj-opt library (1470 trajectories), so a batch
     driver building many clips must make ONE and pass it in rather than paying that per clip.
     """
-    manager = MultiSkillManager(args.source, dev, env=None)
-    return ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    return ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                              contact_frames=_CONTACT_FRAMES, device=dev)
 
 
@@ -269,19 +317,31 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
     entry_vx = _heading_speed(Wp, Wq, entry_frame, args.dt)
     exit_speed = _heading_speed(Wp, Wq, exit_frame, args.dt)
     # A walking approach defaults to the reference's own steady speed; a box interaction records no command
-    # (its reference is a standing jump), so fall back to the requested traversal speed.  A STANDING approach
-    # (on a box top) commands zero -- there is nowhere to walk.
-    approach_vx = float(args.approach_vx) if args.approach_vx is not None else \
-        ((abs(ref_speed) or abs(args.terrain_speed)) if family.approach_mode == "walk" else 0.0)
-    exit_vx = float(family.exit_sign) * (float(args.exit_vx) if family.exit_mode == "walk" else 0.0)
-    terrain_vx = {"steady": ref_speed, "hold_approach": approach_vx, "exit_walk": exit_vx}[family.terrain_tvel]
+    # (its reference is a standing jump), so fall back to the requested traversal speed.  A STANDING end
+    # commands zero -- there is nowhere to walk.  Both directions come from the family, never from the sign
+    # of the requested magnitude: a backward dismount walks in BEFORE the drop and away AFTER it.
+    approach_mag = abs(float(args.approach_vx)) if args.approach_vx is not None \
+        else (abs(ref_speed) or abs(args.terrain_speed))
+    approach_vx = float(family.approach_sign) * (approach_mag if family.approach_mode == "walk" else 0.0)
+    exit_vx = float(family.exit_sign) * (abs(float(args.exit_vx)) if family.exit_mode == "walk" else 0.0)
+    # The RL / flow-matching command: ONE steady velocity for the whole clip, the terrain-agnostic thing a
+    # user or planner would ask for.  Deliberately NOT the generator's own command, which slows into the
+    # interaction and picks back up -- see the module docstring of .terrain_families.  ``terrain_speed`` is
+    # the requested speed (it is also what select_terrain_reference matched the reference to, so a 1.2 m/s
+    # request can legitimately be served by a 0.9 m/s stair reference); the family supplies the direction.
+    rl_vx = float(family.exit_sign) * abs(float(args.terrain_speed))
 
     qpos = torch.cat([Wp, Wq, Wj], dim=-1).detach().cpu().numpy().astype(np.float32)
     meta = dict(tile_meta)
     meta.update({
-        "boxes": [{"pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
+        # Coerce the placement-critical fields to plain floats (they may arrive as numpy scalars, which
+        # do not survive the JSON round trip), but carry every OTHER authored key through verbatim: a
+        # support-structure key like ``variant`` / ``slab_thickness`` is authored here and consumed much
+        # later by ``overlays_for``, so dropping unrecognised keys silently downgrades the tile to solid.
+        "boxes": [{**{k: v for k, v in b.items() if k not in ("pos", "size", "yaw")},
+                   "pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
                    "yaw": float(b.get("yaw", 0.0))} for b in boxes],
-        "reference": ts.name, "reference_speed": ref_speed, "terrain_vx": float(terrain_vx),
+        "reference": ts.name, "reference_speed": ref_speed, "rl_vx": float(rl_vx),
         "terrain_id": int(args.terrain_id), "footprint_margin": float(args.footprint_margin),
         "family_blurb": family.blurb, "exit_sign": float(family.exit_sign),
         "lower_z": float(lower_z), "upper_z": float(upper_z),
@@ -313,8 +373,10 @@ def print_plan(plan: TerrainPlan) -> None:
     print(f"[mb_terrain]   approach: {plan.approach_mode} @ {plan.approach_vx:+.2f} m/s on "
           f"z={plan.approach_surf_z:.2f} -> entry speed {plan.entry_vx:+.2f} m/s")
     print(f"[mb_terrain]   exit:     {plan.exit_mode} @ {plan.exit_vx:+.2f} m/s on z={plan.exit_surf_z:.2f} "
-          f"<- exit speed {plan.exit_speed:+.2f} m/s;  RL target_vel over the replay = "
-          f"{float(plan.meta.get('terrain_vx', 0.0)):+.2f} m/s")
+          f"<- exit speed {plan.exit_speed:+.2f} m/s")
+    print(f"[mb_terrain]   RL target_vel (whole clip, terrain-agnostic) = "
+          f"{float(plan.meta.get('rl_vx', 0.0)):+.2f} m/s "
+          f"(reference solved at {float(plan.meta.get('reference_speed', 0.0)):+.2f})")
 
 
 def _dump_plan(args, dev) -> int:
@@ -328,12 +390,19 @@ def _dump_plan(args, dev) -> int:
 
 
 def _load_segment(path: str | None, dt: float, dev):
-    """Load an MB segment ``.npz`` -> ``((P, Q, J), target_vel, provenance)`` resampled to ``dt`` (or Nones)."""
+    """Load an MB segment ``.npz`` -> ``((P, Q, J), provenance)`` resampled to ``dt`` (or Nones).
+
+    The segment's own ``target_vel`` -- the command Motion Bricks was DRIVEN with, ramps and all -- is
+    deliberately dropped here.  It used to be copied straight into the clip as the RL command, which gave
+    the policy and the flow model a jagged terrain-shaped profile (measured on a jump_off_front clip:
+    +0.67 through the approach, 0.00, then a step to +2.05 for the replay) that no planner would ever
+    emit.  The RL command is one steady value for the whole clip instead; see ``plan.meta["rl_vx"]``.
+    """
     if not path:
-        return None, None, {}
+        return None, {}
     raw = load_raw_motion(path)
-    Wp, Wq, Wj, tvel = raw_to_world(raw, dt, device=dev)
-    return (Wp, Wq, Wj), tvel, dict(raw.provenance or {})
+    Wp, Wq, Wj, _tvel = raw_to_world(raw, dt, device=dev)
+    return (Wp, Wq, Wj), dict(raw.provenance or {})
 
 
 def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
@@ -350,12 +419,14 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     if not boxes:
         raise SystemExit(f"plan for {plan.skill} carries no tile geometry")
 
-    approach, a_tvel, a_prov = _load_segment(args.approach_raw, dt, dev)
-    exit_seg, e_tvel, e_prov = _load_segment(args.exit_raw, dt, dev)
+    approach, a_prov = _load_segment(args.approach_raw, dt, dev)
+    exit_seg, e_prov = _load_segment(args.exit_raw, dt, dev)
     # The SEAM treatment is a splice-time choice (default: whatever Stage 1 pinned for), but the segment's
     # coordinate FRAME is a fact of how it was generated -- a context-seeded exit already stands on the box.
-    a_seam = "weld" if (args.approach_pin or a_prov.get("pin", "hard")) == "hard" else "ease"
-    e_seam = "weld" if (args.exit_pin or e_prov.get("pin", "hard")) == "hard" else "ease"
+    a_pin = a_prov.get("pin", "hard") if args.approach_pin in (None, "auto") else args.approach_pin
+    e_pin = e_prov.get("pin", "hard") if args.exit_pin in (None, "auto") else args.exit_pin
+    a_seam = "weld" if a_pin == "hard" else "ease"
+    e_seam = "weld" if e_pin == "hard" else "ease"
     a_frame = str(a_prov.get("frame", "flat"))
     e_frame = str(e_prov.get("frame", "flat"))
     e_seeded = bool(e_prov.get("seeded", False))
@@ -402,22 +473,34 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     seg_masks = [_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT]
     amt = build_anchor_mask_t(T, bounds, seg_masks, device=dev)
 
-    # RL-visible command: each MB segment reports the command it was generated for, the replay holds the
-    # family's rule (a stair traversal tracks its climb speed; a mount holds the approach command through
-    # the jump; a dismount holds the signed walk-away).
+    # RL-visible command: ONE steady value for the whole clip -- what a user or planner asked for, with no
+    # knowledge of the terrain.  The motion underneath does whatever the terrain requires (slow into the
+    # takeoff, jump, pick back up); teaching the flow model to bridge that gap is the entire point, and it
+    # can only learn it from clips that pair a terrain-agnostic command with a terrain-aware reference.
     tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)
-    tvel[ta:tb, 0] = float(plan.meta.get("terrain_vx", 0.0))
-    if a_tvel is not None:
-        tvel[bounds[0][0]:bounds[0][1]] = a_tvel[:bounds[0][1] - bounds[0][0]].to(tvel.dtype)
-    if e_tvel is not None:
-        j = int(diag.get("exit_overlap_skip", 0)) + 1
-        n_exit = bounds[2][1] - bounds[2][0]
-        tvel[bounds[2][0]:bounds[2][1]] = e_tvel[j:j + n_exit].to(tvel.dtype)
+    if "rl_vx" not in plan.meta:
+        # NEVER default this. A plan written before the RL-command split carries the old per-family
+        # ``terrain_vx`` (the replay's own speed, or the approach command held through it) -- a different
+        # quantity, not a stand-in for the user command. Defaulting to 0.0 wrote a SILENT zero-velocity
+        # command into every clip, which trains wrong without erroring anywhere.
+        raise SystemExit(
+            f"plan for {plan.skill} predates the RL-command split: it has "
+            f"{'terrain_vx' if 'terrain_vx' in plan.meta else 'neither rl_vx nor terrain_vx'}, not 'rl_vx'. "
+            f"Re-run pass 1 (mb_terrain_clips --dump-plan / mb_plan_library) to regenerate the plans.")
+    tvel[:, 0] = float(plan.meta["rl_vx"])
 
+    # ``frame_yaw``: the heading of the TERRAIN's own frame within the tile -- the axis the traversal
+    # crosses it along.  The RL anchor mask resolves its downrange / lateral bits in this frame
+    # (world_lift.ego_placement_masked), so it is AUTHORED here rather than inferred at runtime from
+    # the motion (which is degenerate for a standing approach and only approximate otherwise).  0.0
+    # because ``_place`` puts every family travel-aligned along the tile's +x: the stair path by
+    # construction, the box path via ``align="facing"``.  If a family is ever authored on a rotated
+    # heading, this is the ONE number that has to change with it.
     manifest = {"terrain_id": int(plan.meta.get("terrain_id", 0)),
                 "type": str(plan.meta.get("clip_type", "transition")),
                 "size_x": float(size_x), "size_y": float(size_y), "overlays": overlays,
-                "has_floor": bool(plan.meta.get("has_floor", True))}
+                "has_floor": bool(plan.meta.get("has_floor", True)),
+                "frame_yaw": 0.0}
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "manifest": manifest, "bounds": bounds, "diag": diag, "overlays": overlays,
             "size_x": float(size_x), "size_y": float(size_y), "Wp": Wp, "n": T,
@@ -427,6 +510,63 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             # would place the same geometry at a different tile-local position.
             "corner": (float(corner[0]), float(corner[1])),
             "seams": {"approach": f"{a_frame}/{a_seam}", "exit": f"{e_frame}/{e_seam}"}}
+
+
+def _write_keyframe_sidecar(srcs: dict, out: str, diag: dict, corner, dev) -> int:
+    """Map the SEGMENTS' pinned keyframes into the spliced clip's frame and write one viser sidecar.
+
+    ``mb_terrain_segments`` records the keyframe Motion Bricks was actually aiming at on each replan, in
+    the segment's own MB world frame.  The splice then moves that segment rigidly onto the terrain
+    boundary and the tile is re-datumed, so the keyframes have to ride along or they land metres away.
+    Both transforms are replayed here: ``diag["<side>_xform"]`` from the splice, then the footprint
+    corner shift.
+
+    ``srcs`` maps side ("approach" / "exit") -> that segment's ``_keyframes.npz``; both are merged into
+    one sidecar so the overlay shows the whole clip at once.  NOTE the two sides are recorded by
+    SEPARATE generator runs (``mb.reset`` clears the buffer), so generate them with ``--side approach``
+    / ``--side exit`` if you want both -- a ``--side both`` run leaves only the exit's.
+
+    The ``kind`` tag ("stride" / "terrain") is carried through untouched -- it is what lets the viewer
+    show that a TERRAIN keyframe pins a pose but not a place (its root xy is overwritten by the command
+    rollout unless ``--pin-place terrain``; see ``mb_env.target_pose_override``).  Exit keyframes are
+    always "stride": the exit is context-SEEDED from the replay rather than pose-pinned to it.
+
+    Returns the number of keyframes written.  Note an EASED seam additionally inertializes the segment
+    near the join, which the keyframes do not reflect -- they are where the model was AIMED, not where it
+    ended up.
+    """
+    import json
+
+    from motion_gen.math_utils import quat_apply, quat_mul
+
+    qs, ts, kinds, jn, fps = [], [], [], None, None
+    for side, src in sorted(srcs.items()):
+        if not src or f"{side}_xform" not in diag:
+            continue
+        d = np.load(src, allow_pickle=False)
+        q, tk = d["qpos"], d["t"]
+        if not len(q):
+            continue
+        gq_l, t_l = diag[f"{side}_xform"]
+        gq = torch.tensor(gq_l, dtype=torch.float32, device=dev)
+        tv = torch.tensor(t_l, dtype=torch.float32, device=dev)
+        P = torch.as_tensor(q[:, 0:3], dtype=torch.float32, device=dev)
+        Q = torch.as_tensor(q[:, 3:7], dtype=torch.float32, device=dev)
+        n = P.shape[0]
+        P = quat_apply(gq.unsqueeze(0).expand(n, 4), P) + tv
+        Q = quat_mul(gq.unsqueeze(0).expand(n, 4), Q)
+        P[:, 0] -= float(corner[0])
+        P[:, 1] -= float(corner[1])
+        qs.append(np.concatenate([P.cpu().numpy(), Q.cpu().numpy(), q[:, 7:]], 1).astype(np.float32))
+        ts.append(tk)
+        kinds += json.loads(str(d["kind"])) if "kind" in d else ["stride"] * n
+        jn, fps = d["joint_names"], d["fps"]
+    if not qs:
+        return 0
+    out_q = np.concatenate(qs, 0)
+    np.savez_compressed(out, clip_idx=np.zeros(len(out_q), np.int32), t=np.concatenate(ts),
+                        qpos=out_q, kind=np.array(json.dumps(kinds)), joint_names=jn, fps=fps)
+    return len(out_q)
 
 
 def _splice_clip(args, dev) -> int:
@@ -486,6 +626,13 @@ def _splice_clip(args, dev) -> int:
         print(f"[mb_terrain]   {name:8s} frames {a:4d}..{b - 1:4d}  min sole z={lo:+.3f}{extra}"
               + (f"  [WARN] {n_off} frames OFF the walkable surface (segment longer than the platform, "
                  f"or drifted off it)" if n_off else ""))
+    if args.approach_keyframes or args.exit_keyframes:
+        kf_out = os.path.splitext(args.out)[0] + "_keyframes.npz"
+        n_kf = _write_keyframe_sidecar({"approach": args.approach_keyframes,
+                                        "exit": args.exit_keyframes},
+                                       kf_out, diag, rec["corner"], dev)
+        print(f"[mb_terrain]   {n_kf} pinned keyframes -> {kf_out} "
+              f"(view: view_clip_viser.py --lib {args.out} --keyframes {kf_out})")
     lib = load_clip_library(args.out)
     yl = torch.as_tensor(lib.y_des)
     zc = yl[0, :, 2]
@@ -512,7 +659,18 @@ def main() -> int:
     p.add_argument("--n-steps", type=int, default=6, help="[stairs] number of treads on the tile.")
     p.add_argument("--width", type=float, default=1.4, help="[stairs] tread y-width (m).")
     p.add_argument("--nav-width", type=float, default=None, help="[stairs] platform y-width (default --width).")
+    p.add_argument("--stair-float-thickness", type=float, default=0.0,
+                   help="[stairs] FLOATING treads: slab thickness (m) of each riser-less tread, leaving an "
+                        "open gap beneath it (0 = solid steps). The tread-top surface is identical either "
+                        "way, so the reference motion is unchanged -- only the mesh below it. Clamped per "
+                        "tread to that tread's height.")
     p.add_argument("--box-height", type=float, default=0.45, help="[box] target box height (m).")
+    p.add_argument("--box-platform-buffer", type=float, default=1.0,
+                   help="[box] extra metres of top platform beyond the elevated segment's nominal travel, "
+                        "so the reference cannot walk off the far edge.")
+    p.add_argument("--box-nav-width", type=float, default=0.0,
+                   help="[box] y-width (m) to widen the box AND its top platform to (expand-only); "
+                        "0 keeps the reference box's own extents.")
     p.add_argument("--terrain-speed", type=float, default=0.6,
                    help="Target speed for the reference pick (m/s); also the stair traversal command.")
     p.add_argument("--approach-vx", type=float, default=None,
@@ -542,18 +700,30 @@ def main() -> int:
     p.add_argument("--plan", default=None, help="PASS 2: the terrain plan written by --dump-plan.")
     p.add_argument("--approach-raw", default=None, help="PASS 2: MB approach RawMotion .npz.")
     p.add_argument("--exit-raw", default=None, help="PASS 2: MB exit RawMotion .npz.")
+    p.add_argument("--approach-keyframes", default=None,
+                   help="PASS 2: the approach segment's '_keyframes.npz' (written by mb_terrain_segments "
+                        "--plan). Maps the pinned target keyframes through the splice into clip "
+                        "coordinates and writes '<out>_keyframes.npz' for view_clip_viser --keyframes.")
+    p.add_argument("--exit-keyframes", default=None,
+                   help="PASS 2: the exit segment's '_keyframes.npz', merged into the same sidecar. The two "
+                        "sides are recorded by separate generator runs, so use --side approach / --side "
+                        "exit to capture both (a --side both run keeps only the exit's).")
     p.add_argument("--out", default=None, help="PASS 2: output clip library .h5.")
-    p.add_argument("--approach-pin", default=None, choices=["hard", "soft"],
-                   help="PASS 2: seam treatment for the approach -- hard welds the boundary frame with no "
-                        "ease, soft inertializes the residual. Default: whatever Stage 1 pinned for. A "
-                        "PINNED segment spliced SOFT is the hybrid: in-betweened pose, eased remainder.")
-    p.add_argument("--exit-pin", default=None, choices=["hard", "soft"],
+    p.add_argument("--approach-pin", default="soft", choices=["hard", "soft", "auto"],
+                   help="PASS 2: seam treatment for the approach -- 'hard' welds the boundary frame with no "
+                        "ease, 'soft' (default) inertializes the residual, 'auto' follows whatever Stage 1 "
+                        "pinned for. A PINNED segment spliced SOFT is the hybrid and the measured best: the "
+                        "pin buys the boundary POSE, the ease keeps the feet on their own surface. Welding "
+                        "instead leaves a stairs_up approach ~0.07 m INSIDE the platform (surface_err is "
+                        "exactly 0 when eased) and a nonzero seam speed. This matches "
+                        "mb_assemble_library --seams, whose default is likewise ease.")
+    p.add_argument("--exit-pin", default="soft", choices=["hard", "soft", "auto"],
                    help="PASS 2: seam treatment for the exit (see --approach-pin).")
     p.add_argument("--seam-blend-s", type=float, default=0.25,
                    help="PASS 2: seam inertialization window (s); only used by SOFT seams.")
     p.add_argument("--weld-search", type=int, default=12,
                    help="PASS 2: leading exit frames searched for the context-seed overlap (hard exit).")
-    p.add_argument("--arrival-search", type=int, default=30,
+    p.add_argument("--arrival-search", type=int, default=60,
                    help="PASS 2: trailing approach frames searched for the in-betweened arrival pose "
                         "(hard approach); 1 welds the last generated frame as-is.")
     args = p.parse_args()

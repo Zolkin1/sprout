@@ -71,6 +71,7 @@ class GeneratorTrackerPolicy:
         future_horizon_s: float = 0.5,
         future_stride: int = 5,
         base_frame_name: str = "pelvis_link",
+        null_history_warmup: bool = True,
     ):
         """Configure the generator + tracker pair.
 
@@ -85,6 +86,10 @@ class GeneratorTrackerPolicy:
             future_horizon_s: Look-ahead window for the future obs terms.
             future_stride: Sub-sampling stride (in control steps) within the window.
             base_frame_name: Base/root link the CLF + FM are anchored on.
+            null_history_warmup: Sample the generator from step 0 with the model's learned
+                ``null_history`` embedding while the N-step window fills, instead of fabricating
+                a static history. Matches ``FmTrackingCommandCfg.fm_null_history_warmup`` and
+                ``deploy.gen_tracker.GenTrackerPolicy``.
         """
         self._rl = RLPolicy(policy_params_path, policy_path)  # param handling + get_action
         self.policy_path = policy_path
@@ -97,6 +102,7 @@ class GeneratorTrackerPolicy:
         self.future_horizon_s = future_horizon_s
         self.future_stride = future_stride
         self.base_frame_name = base_frame_name
+        self.null_history_warmup = bool(null_history_warmup)
 
         self.ctx = None
         self._loaded = False
@@ -214,7 +220,10 @@ class GeneratorTrackerPolicy:
         frames -- ``frame_pos``/``frame_quat``/``frame_lin``/``frame_ang`` each
         ``(K_hist, ·)``. Measured joints are permuted isaac->FM order.
         """
-        tf = lambda a: torch.as_tensor(a, dtype=torch.float32, device=self.fm_device)
+        # ``torch.as_tensor`` shares memory with a matching-dtype numpy array, so clone: the
+        # caller may pass slices of live simulator state, and an aliased history slot would read
+        # as the latest state (see deploy.gen_tracker._make_snapshot).
+        tf = lambda a: torch.as_tensor(a, dtype=torch.float32, device=self.fm_device).clone()
         jp, jv = tf(state["joint_pos"]), tf(state["joint_vel"])
         if self._isaac_to_fm is not None:
             jp, jv = jp[self._isaac_to_fm], jv[self._isaac_to_fm]
@@ -235,8 +244,17 @@ class GeneratorTrackerPolicy:
         return snap
 
     def warm_start(self, state: dict) -> None:
-        """Pre-fill the history window with a (standing) snapshot so the FM is valid at step 0."""
-        self._history.fill(self._make_snapshot(state))
+        """Make the generator usable at step 0.
+
+        With ``null_history_warmup`` the first steps are sampled using the model's learned
+        ``null_history`` embedding (what it was trained for), so no history is fabricated; only
+        the legacy path repeats this snapshot into all N slots. Mirrors
+        ``deploy.gen_tracker.GenTrackerPolicy.warm_start``.
+        """
+        if self.null_history_warmup:
+            self._history.invalidate(torch.ones(1, dtype=torch.bool))
+        else:
+            self._history.fill(self._make_snapshot(state))
         self._pred_valid = False
         self._pred_idx = 0
         self._warm = True
@@ -252,16 +270,20 @@ class GeneratorTrackerPolicy:
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
 
-        valid = bool(self._history.valid()[0].item())
+        null_hist = bool(self._history.null_mask()[0].item())
+        # With the null-history warmup the generator runs from step 0, conditioned on the learned
+        # null embedding until the window fills -- the same flow as FmTrackingCommand and the
+        # ONNX deploy policy.
+        gate = (not null_hist) or self.null_history_warmup
         exhausted = self._pred_idx >= (self.ctx.F - 1)
         due = (self._ctrl_step % self.fm_update_every) == 0
-        if valid and (due or not self._pred_valid or exhausted):
-            self._run_fm(state)
+        if gate and (due or not self._pred_valid or exhausted):
+            self._run_fm(state, history_null=(null_hist and self.null_history_warmup))
         elif self._pred_valid:
             self._pred_idx = min(self._pred_idx + 1, self.ctx.F - 1)
 
     @torch.no_grad()
-    def _run_fm(self, state: dict) -> None:
+    def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample an F-step world trajectory anchored on the robot's current base pose.
 
         Conditions the FM on the N most-recent MEASURED robot states (phase history),
@@ -271,14 +293,14 @@ class GeneratorTrackerPolicy:
         Mirrors ``FmTrackingCommand._run_fm`` for a single env.
         """
         ctx = self.ctx
-        rp = self._history.stack("root_pos")
-        rq = self._history.stack("root_quat")
-        rl = self._history.stack("root_lin")
-        ra = self._history.stack("root_ang")
-        jp = self._history.stack("jp")
-        jv = self._history.stack("jv")
-        cmd = self._history.stack("cmd")
-        frames = self._history.stack("frames") if ctx.num_extra_frames > 0 else None
+        rp = self._history.stack_padded("root_pos")
+        rq = self._history.stack_padded("root_quat")
+        rl = self._history.stack_padded("root_lin")
+        ra = self._history.stack_padded("root_ang")
+        jp = self._history.stack_padded("jp")
+        jv = self._history.stack_padded("jv")
+        cmd = self._history.stack_padded("cmd")
+        frames = self._history.stack_padded("frames") if ctx.num_extra_frames > 0 else None
 
         history = build_history_tokens(ctx, rp, rq, rl, ra, jp, jv, frames=frames)
         # Height token: the live per-ray height scan at "now" (state["height_scan"]);
@@ -296,7 +318,8 @@ class GeneratorTrackerPolicy:
         # state, so its base pose is the xyz+yaw ground frame the FM was trained on.
         p_ref = rp[:, -1].clone()
         q_ref = rq[:, -1].clone()
-        world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref)
+        world = sample_world(ctx, history, height, cmd_tokens, p_ref, q_ref,
+                             history_null_mask=torch.tensor([bool(history_null)]))
 
         self._pred["root_pos"] = world["root_pos_w"]
         self._pred["root_quat"] = world["root_quat_w"]

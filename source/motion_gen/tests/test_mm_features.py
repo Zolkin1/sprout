@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from motion_gen.math_utils import quat_apply, quat_mul
-from motion_gen.motion_matching import features as F
+from motion_gen import features as F
 
 _MJCF = F.DEFAULT_MJCF
 _HAVE_MJCF = os.path.isfile(_MJCF)

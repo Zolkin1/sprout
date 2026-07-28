@@ -3,7 +3,7 @@
 
 """Stage-1 harness: the Motion Bricks agent plus the pinning hooks every MB driver installs.
 
-Everything the Motion-Bricks-side drivers (``mb_generate.py`` free-run, ``mb_encode.py`` flat, and
+Everything the Motion-Bricks-side drivers (``mb_encode.py`` flat and
 ``mb_terrain_segments.py`` terrain approach/exit) share lives here, so a driver is only its schedule:
 
 * :func:`build_demo_args` / :class:`MBAgent` -- construct the live ``full_navigation_agent`` and install
@@ -172,7 +172,8 @@ def schedule_bounds(segs: list[tuple]) -> np.ndarray:
     return np.cumsum([d for d, *_ in segs])[:-1] if len(segs) > 1 else np.zeros(0)
 
 
-def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: bool | None = None) -> dict:
+def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: bool | None = None,
+                 target: tuple[float, float, float] | None = None) -> dict:
     """Build one exact-velocity control dict for ``generate_new_frames``.
 
     The root is pinned to the exact-velocity rollout of ``cmd`` (``specific_target_positions`` /
@@ -180,16 +181,31 @@ def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: b
     the SIGN of the command (so a negative ``vx`` walks backwards) while ``facing_direction`` keeps the
     heading, and ``target_vel`` the speed magnitude.
 
+    ``target`` replaces that rollout with a FIXED world pose ``(x, y, yaw)`` held at every lookahead time.
+    Use it when the destination is known -- a terrain boundary sitting at a definite place on the tile --
+    rather than implied by a command.  The difference matters more than it looks: the rollout is anchored
+    on the robot's CURRENT pose, so the target travels along with the robot and always sits
+    ``|cmd| * horizon`` ahead of it, which is why a decelerating command is what stops the robot (the
+    target collapses onto it) and why the terrain's real location never reaches the model.  A fixed target
+    inverts that -- the gap closes because the robot arrives, so the deceleration is a consequence of the
+    geometry instead of something prescribed.
+
     Args:
         ctx: the agent's current context qpos ``[1, nfpt, 36]`` (world frame).
         cmd: ``(vx, vy, wz)`` command in the body frame.
         lookahead_times: the target times (s) to pin, increasing.
         start: optional ``(x, y, yaw)`` to integrate from instead of the context pose.
         standing: force stand / walk mode; by default a ~zero command stands.
+        target: optional fixed world ``(x, y, yaw)`` to pin instead of integrating ``cmd``.
     """
     cx, cy, _cz, cyaw = cur_pose(ctx) if start is None else (start[0], start[1], 0.0, start[2])
     cmd = np.asarray(cmd, np.float32)
-    spec_pos, spec_head = integrate_lookahead(cx, cy, cyaw, cmd, lookahead_times)
+    if target is None:
+        spec_pos, spec_head = integrate_lookahead(cx, cy, cyaw, cmd, lookahead_times)
+    else:
+        k = len(lookahead_times)
+        spec_pos = np.tile(np.array([target[0], target[1], 0.0], np.float32), (k, 1))
+        spec_head = np.full(k, float(target[2]), np.float32)
     speed = float(np.hypot(cmd[0], cmd[1]))
     if standing is None:
         standing = speed < 1e-3 and abs(float(cmd[2])) < 1e-3
@@ -284,7 +300,8 @@ def target_pose_override(self, input: dict):
         mj_quat = matrix_to_quaternion(mj_rot[None])[0]                                    # wxyz
         joints = self._active_target_qpos[0, k, 7:]
         kf = t.cat([mj_pos, mj_quat, joints]).detach().cpu().numpy().astype(np.float32)
-        self._captured_kf.append((float(getattr(self, "_active_time_s", 0.0)), kf))
+        self._captured_kf.append((float(getattr(self, "_active_time_s", 0.0)), kf,
+                                  str(getattr(self, "_active_target_kind", "stride"))))
 
     return global_joint_positions, global_joint_rotations, global_root_positions
 
@@ -391,10 +408,18 @@ class MBAgent:
         self.agent.reset()
         self.agent._captured_kf = []
 
-    def set_target_pose(self, window: np.ndarray) -> None:
-        """Set the ``[nfpt, 36]`` target-pose window the override feeds the model this replan."""
+    def set_target_pose(self, window: np.ndarray, kind: str = "stride") -> None:
+        """Set the ``[nfpt, 36]`` target-pose window the override feeds the model this replan.
+
+        ``kind`` labels where the window came from -- ``"stride"`` (our optimized steady stride) or
+        ``"terrain"`` (the replay's own frames, under a hard boundary pin).  It is recorded with the
+        captured keyframe purely for diagnostics: the two look identical in the overlay otherwise, and
+        the distinction matters because a terrain window's ROOT XY is discarded (see
+        :func:`target_pose_override`) -- it pins a pose, not a place.
+        """
         self.agent._active_target_qpos = t.as_tensor(np.asarray(window, np.float32),
                                                      dtype=t.float32, device=self.agent._device)[None]
+        self.agent._active_target_kind = str(kind)
 
     def set_regime(self, weight: float, t_now: float | None = None) -> None:
         """Set the steady-weight (``< thresh`` drops the target-pose pins) and the keyframe timestamp."""
@@ -425,9 +450,13 @@ class MBAgent:
         with t.no_grad():
             self.agent.generate_new_frames(control, self.gen_dt, force_generation=True)
 
-    def captured_keyframes(self) -> tuple[np.ndarray, np.ndarray]:
-        """The pinned target keyframes recorded this clip: ``(t[K], qpos[K, 36])``."""
+    def captured_keyframes(self) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """The pinned target keyframes recorded this clip: ``(t[K], qpos[K, 36], kind[K])``.
+
+        ``kind`` is ``"stride"`` or ``"terrain"`` per :meth:`set_target_pose`.
+        """
         kf = list(self.agent._captured_kf)
         if not kf:
-            return np.zeros((0,), np.float32), np.zeros((0, 36), np.float32)
-        return (np.array([x[0] for x in kf], dtype=np.float32), np.stack([x[1] for x in kf], 0))
+            return np.zeros((0,), np.float32), np.zeros((0, 36), np.float32), []
+        return (np.array([x[0] for x in kf], dtype=np.float32), np.stack([x[1] for x in kf], 0),
+                [x[2] for x in kf])

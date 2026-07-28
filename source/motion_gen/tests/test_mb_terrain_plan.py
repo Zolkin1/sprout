@@ -108,3 +108,25 @@ def test_exit_seed_window_ends_at_the_exit_frame_at_the_mb_rate():
     # Spacing must be the MB frame period, not the plan's dt: 1/30 s of a 0.5 m/s root = ~1.67 cm.
     dx = np.diff(win[:, 0])
     np.testing.assert_allclose(dx, 0.5 * dt_mb, atol=1e-4)
+
+
+def test_approach_pin_window_hold_is_one_repeated_entry_keyframe():
+    """``hold`` pins exactly the entry frame, so the target does not move between replans.
+
+    Without it, clamping ``t_offset`` to <= 0 still let the window's TAIL span forward into the replay,
+    which asks the approach to start generating the interaction it is meant to hand over to.
+    """
+    plan = _plan()
+    for t_offset in (-1.0, -0.3, 0.0):
+        win = plan.approach_pin_window(t_offset, 8, 1.0 / 30.0, hold=True)
+        assert win.shape == (8, 36)
+        assert np.allclose(win, win[0])                      # one keyframe, repeated
+    # ...and it is the ENTRY, surface-relative like the sliding window.
+    held = plan.approach_pin_window(-1.0, 8, 1.0 / 30.0, hold=True)
+    entry = plan.terrain_qpos[plan.entry_frame]
+    assert held[0, 2] == pytest.approx(entry[2] - plan.approach_surf_z, abs=1e-5)
+    assert np.allclose(held[0, 7:], entry[7:], atol=1e-5)
+    assert np.allclose(held[:, 0:2], 0.0)
+    # The sliding window does slide; the held one does not.
+    slid = plan.approach_pin_window(0.0, 8, 1.0 / 30.0)
+    assert not np.allclose(slid, slid[0])

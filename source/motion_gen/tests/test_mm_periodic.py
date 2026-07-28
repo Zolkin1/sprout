@@ -14,10 +14,10 @@ import torch
 from motion_gen.math_utils import quat_mul
 from motion_gen.motion_matching.graph import (
     STEADY, VARIED, GraphConfig, build_candidate_graph, graph_cache_key)
-from motion_gen.motion_matching.playback import play_frame_path
+from motion_gen.playback import play_frame_path
 from motion_gen.motion_matching.vanilla import (
     VanillaConfig, compute_vanilla_features, make_ee_fk, _periodic_extension)
-from motion_gen.motion_matching.features import G1_JOINT_NAMES as _G1_JN
+from motion_gen.features import G1_JOINT_NAMES as _G1_JN
 
 _DT = 0.02
 _NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width

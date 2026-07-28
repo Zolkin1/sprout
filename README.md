@@ -70,70 +70,186 @@ stored with **Git LFS**, so clone with LFS enabled.
     (cd ../IsaacLab && ./isaaclab.sh -i)
     ```
 
-6. Install this project's two packages in editable mode. `robot_rl` is the IsaacLab side; `motion_gen` is
-   the IsaacLab-free offline clip generation that `robot_rl` imports (so both are required). `--no-deps`
-   on `motion_gen` keeps `uv` from re-resolving the pinned Isaac Sim / CUDA `torch` stack:
+6. Install this project in editable mode:
 
     ```bash
     uv pip install -e source/robot_rl
-    uv pip install -e source/motion_gen --no-deps
     ```
 
-7. Verify the install by listing tasks and running a short headless training:
+7. Verify the install by listing tasks and running a short headless training. The task
+   needs a clip library (`--clip`); see [The pipeline](#the-pipeline) for how to build one.
 
     ```bash
-    python scripts/list_envs.py --keyword G1
-    python scripts/rsl_rl/train.py --task=<TASK_NAME> --num_envs=64
+    python scripts/list_envs.py --keyword G1        # expect 5 G1-* tasks
+    python scripts/rsl_rl/train.py --task=G1-teacher-clf-terrain --headless \
+        --num_envs=64 --max_iterations=2 --clip <lib.h5> --clip_device cpu
     ```
 
-## Running Tasks
-Get a list of available tasks:
-```
-python scripts/list_envs.py --keyword clf
-```
-or you could use `G1` as the keyword.
+## The pipeline
 
-To train a policy run:
+Everything runs through one chain. Each stage's output is the next stage's input:
+
+```
+motionbricks clip generation  ->  teacher RL  ->  flow-matching generator  ->  tracker  ->  sim2sim  ->  hardware
+   generate_mb_library.py         train.py         flow_matching/train.py      play.py     compare_sim2sim.py
+```
+
+The **clip library** (`.h5`) is the spine. It carries the reference motions AND the terrain
+they were generated on, so a single file defines both what the robot tracks and what it walks
+on. Every task takes it via `--clip`; there is deliberately no default, because a stale
+library silently trains on the wrong terrain.
+
+List the tasks:
+
 ```bash
-python scripts/rsl_rl/train.py --task=<TASK_NAME>
+python scripts/list_envs.py --keyword G1
 ```
 
-Runs are headless by default. Pass `--viz kit` to train or play with a viewer (`--visualizer`/`--viz` takes a
-CSV of backends: `kit,newton,rerun,viser`), or `--viz none` to force-disable visualizers. `--headless` is
-deprecated as of IsaacLab v3.0.
+### 1. Generate a clip library
 
-To add a run name add `--run_name=my_run_name`. This will add the name after the date on the folder with the run name.
+Motion Bricks runs in its own conda env (GPU), so generation is staged: the driver
+shells out and skips stages that are already done.
 
-Note that right now the only RL library that is tested in `RSL_RL`.
-
-To play the most recently trained policy for a given task run:
 ```bash
-python scripts/rsl_rl/play.py --task=<TASK_NAME>-play
+python scripts/rsl_rl/generate_mb_library.py --out clips/g1_mb_v5.h5 [--stage N] [--quick]
 ```
 
-Play always exports the policy to JIT and ONNX (into `exported/` next to the checkpoint) — there is no flag
-for it. Add `--dump_play_data` to log the rollout, `--plots` for the per-run plots, and `--episode_stats`
-for a summary.
+It orchestrates `export_stride_bank` -> `mb_plan_library` -> `mb_terrain_segments` /
+`mb_encode` (in the `motionbricks` env) -> `mb_assemble_library` / `generate_mb_clips` /
+`mb_distractor_clips` -> `compose_terrain_library`.
 
-for a specific run you can pass in additional config such as `--load_run=<run_dir>`
-If you want to play from a specific checkpoint then you can run the play script with `--checkpoint=<checkpoint>` (`<checkpoint>` is something like "model_1800").
+Then check what came out:
 
-For both `train` and `play` you can also specify a number of envs with `--num_envs=###`.
-
-### Preparing for Hardware/Uploading to Hugging Face
-We suggest uploading the policy to hugging face when you are ready to run it on hardware so that this repo (the code repo) is kept clean.
-You can upload to hugging face automatically with
 ```bash
-python scripts/rsl_rl/export_to_hardware.py --hf_repo_id=<username/repo> --folder_name=<name> \
-    --log_dir=<experiment_log_dir> --load_run=<run_dir>
+python scripts/rsl_rl/mb_qc.py --lib clips/g1_mb_v5.h5        # objective quality report
+python scripts/rsl_rl/inspect_clip.py --mode timeseries --lib clips/g1_mb_v5.h5 --clip 0
+python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_mb_v5.h5    # interactive
+python scripts/rsl_rl/view_terrain_isaac.py --lib clips/g1_mb_v5.h5 # per-family tile split
 ```
-This will load a already exported run and upload the exported policy to hugging face in the specified repo with the specified name.
 
-NOTE: The policy must already be exported (see `play.py` above).
+### 2. Train the teacher
 
-For now we are uploading the policies to the hugging face repo [here](https://huggingface.co/zolkin/robot_rl/tree/main).
+```bash
+python scripts/rsl_rl/train.py --task=G1-teacher-clf-terrain --headless \
+    --num_envs=4096 --clip clips/g1_mb_v5.h5 --run_name my_run
+```
 
-These policies are automatically downloaded in the `transfer/obelisk` controller.
+`--clip` sets the terrain importer's mesh AND the tracked clips together; both must read the
+same file or the tile terrain ids won't line up with the clips'. Add `--run_name` to label
+the log dir. Large libraries need `--clip_device cpu` on a small GPU.
+
+Play it back:
+
+```bash
+python scripts/rsl_rl/play.py --task=G1-teacher-clf-terrain-play \
+    --load_run <run_dir> --clip clips/g1_mb_v5.h5 --clip_device cpu
+```
+
+`play.py` also writes the deploy artifacts: `exported/policy.pt`, `policy.onnx`,
+`policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + `fm.onnx`. Pass
+`--no_deploy_onnx` to skip the ONNX pair.
+
+### 3. Train the flow-matching generator
+
+Record teacher rollouts, then fit the FM to them:
+
+```bash
+python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-play \
+    --load_run <run_dir> --clip clips/g1_mb_v5.h5 --num_windows 200000 --num_envs 256
+python scripts/flow_matching/train.py --data <windows.h5> --wandb
+```
+
+`--num_windows` streams only the FM snap windows to a chunked `.h5` (bounded RAM); omit it
+for the older buffered per-step `.npz`. `command_distribution_stats.py` reports the
+command-dynamics split of either format.
+
+### 4. Deploy the tracker, in Isaac and in MuJoCo
+
+The tracker is the *same* teacher policy, tracking the FM instead of the clip:
+
+```bash
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-play \
+    --load_run <run_dir> --fm_checkpoint <fm.pt> --clip clips/g1_mb_v5.h5 --clip_device cpu
+```
+
+For a like-for-like Isaac-vs-MuJoCo comparison, `compare_sim2sim.py` builds a single-clip
+library **and a MuJoCo scene from that clip's own tiles**, so the two sims get identical
+geometry rather than a parametric staircase that merely resembles it:
+
+```bash
+python scripts/rsl_rl/compare_sim2sim.py --stage prep   --lib clips/g1_mb_v5.h5 --out-dir logs/sim2sim
+python scripts/rsl_rl/compare_sim2sim.py --stage isaac  --case flat   --out-dir logs/sim2sim ...
+python scripts/rsl_rl/compare_sim2sim.py --stage mujoco --case flat   --out-dir logs/sim2sim ...
+python scripts/rsl_rl/compare_sim2sim.py --stage plot   --case flat   --out-dir logs/sim2sim
+```
+
+For a free-roaming joystick playground instead of one clip, generate a standalone scene and
+drive it directly:
+
+```bash
+python transfer/sim/generate_stairs_scene.py --robot g1_29j   # symmetric up/platform/down lanes
+cd transfer/sim && python gen_tracker_runner.py --load_run <run_dir> ...
+```
+
+Deeper Isaac-side debugging (height-scan depth images, reference ribbons):
+
+```bash
+python scripts/rsl_rl/debug_episodes.py --task G1-teacher-clf-terrain-play ... --out bundle.npz
+python scripts/rsl_rl/view_debug_episodes.py bundle.npz     # viser replay + plots, no Isaac
+```
+
+### 5. Hardware
+
+Upload an exported run to HuggingFace; the obelisk controller pulls from there.
+
+```bash
+python scripts/rsl_rl/export_to_hardware.py --load_run <run_dir> \
+    --hf_repo_id <username/repo> --folder_name <name>
+```
+
+The policy must already be exported (step 2). See [Obelisk Transfer](#obelisk-transfer) for
+the ROS2 side.
+
+## RL Tasks
+
+Five tasks, all terrain-based. The scene ground is a `ClipTerrainImporter` meshed from the
+clip library, so a "flat" run is just a library whose tiles are flat — there is no separate
+flat task.
+
+| Task | Purpose |
+|---|---|
+| `G1-teacher-clf-terrain` | **Train** the teacher: open-loop clip tracking, world-frame CLF. |
+| `G1-teacher-clf-terrain-play` | Play / record / export the teacher. One env per terrain tile. |
+| `G1-teacher-clf-terrain-sym` | Symmetry-augmented training. **Currently broken — see below.** |
+| `G1-teacher-clf-terrain-sym-play` | Play variant of the above. **Currently broken.** |
+| `G1-tracker-clf-fm-terrain-play` | Closed-loop deploy: the teacher tracks the FM predicted from live robot state. |
+
+There is no separate tracker *training* task — the tracker policy **is** the teacher.
+
+> **The two `-sym` tasks do not currently run.** They raise
+> `ValueError: Symmetry augmentation has no handler for obs term 'base_vel_ref'` at the first
+> PPO update. The teacher's reference observations (`base_vel_ref`, `ee_ref`,
+> `future_base_pose`, `future_base_vel`, ...) were added without registering reflection rules
+> in `motion_gen.sagittal_reflector.SagittalReflectionConfig`, and the augmentation
+> deliberately refuses to run rather than silently identity-copying the mirrored half of the
+> batch. This pre-dates the repo slim-down. To revive them, add each unhandled term with its
+> correct reflection (e.g. `base_vel_ref` negates vy + wz; `ee_ref` must swap the left/right
+> frames *and* negate y), extend `source/robot_rl/tests/test_sagittal_reflector.py`, then
+> smoke-train.
+
+## Deprecated: motion-matching / DP clip generation
+
+The clip generator that preceded Motion Bricks is retained for ablation studies. Nothing on
+the live pipeline imports it; see `source/motion_gen/motion_gen/motion_matching/README.md`
+for the module map and how to run it. Its drivers each carry a `DEPRECATED:` banner naming
+the Motion Bricks equivalent:
+
+`precompute_bones_cache.py`, `generate_mm_clips.py`, `generate_box_clips.py`,
+`generate_terrain_library.py`, `generate_mm_toy.py`, `mm_experiment.py`.
+
+`generate_distractor_clips.py` is **partly** deprecated: its CLI is superseded, but
+`mb_distractor_clips.py` imports `_box_pool` / `_make_tile` from it so both motion sources
+emit byte-identical tile geometry.
 
 ## Profiling
 
@@ -147,7 +263,7 @@ trajectory-command internals. It is zero-cost when off. Use it to find where tim
 
 Training — run a short, bounded profile (use a small `--max_iterations`):
 ```bash
-python scripts/rsl_rl/train.py --task=<TASK_NAME> --num_envs=4096 \
+python scripts/rsl_rl/train.py --task=<TASK_NAME> --headless --num_envs=4096 \
     --max_iterations=5 --profile
 ```
 
@@ -235,29 +351,17 @@ pipeline), so read the *proportions*, not the absolute FPS. The script prints
 For **throughput decisions** (e.g. comparing `decimation` or `num_envs`), prefer the
 artifact-free `Perf/total_fps` that rsl_rl logs every iteration, and change one knob at a time.
 
-## RL Tasks
-
-RL Task list:
-
-| Env. Type             |   Robot    |      Hardware Tested?      | Description                                                                          |
-|-----------------------|:----------:|:--------------------------:|--------------------------------------------------------------------------------------|
-| `vanilla`             |     G1     |     :white_check_mark:     | Basic, hand-tuned, RL walking on the G1 humanoid on flat ground.                     |
-| `lip_clf`             |     G1     |     :white_check_mark:     | Basic, LIP CLF RL walking on the G1 humanoid on flat ground.                         |
-| `walking_clf`         |     G1     |             No             | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground.                |
-| `walking_clf_sym`     |     G1     |     :white_check_mark:     | A HZD gait library; CLF RL walking on the G1 humanoid on flat ground, uses symmetry. |
-| `running_clf_sym`     | G1 |     :white_check_mark:     | Running controller using a gait library.                                             |
-| `waving_clf`          | G1 |             No             | Robot stands still and waves. Uses trajectories and CLFs.                            |
-| `bow_forward_clf_sym` | G1 |     :white_check_mark:     | Robot bows forward then holds its position. Uses symmetry.                           |
-| `bend_up_clf_sym`     | G1 |     :white_check_mark:     | Robot bends back up then holds in the standing position. Uses symmetry.              |
-
-You can also append "_ec" to any of the above tasks to run them on the robot model that has the additional weight from the extra compute (EC).
-
 ## Generating the USD
-Now we use the default IsaacLab built in urdf to usd converter:
+IsaacLab's built-in URDF -> USD converter, run from the IsaacLab checkout. The robot is
+29-DOF (waist roll/pitch + the 6 wrists unlocked), and `robot_rl/assets/robots/g1_21j.py`
+points at the `_29j` USD despite the `g1_21j` module name:
 ```
-./isaaclab.sh -p scripts/tools/convert_urdf.py robot_rl/robot_assets/g1/g1_21j/g1_21j_merged.urdf robot_rl/robot_assets/g1/g1_21j/isaac_converter
+./isaaclab.sh -p scripts/tools/convert_urdf.py \
+    <sprout>/robot_assets/g1/g1_21j/g1_21j_box_merged_29j.urdf \
+    <sprout>/robot_assets/g1/g1_21j/g1_21j_box_merged_29j
 ```
-TODO: Update this to not have different paths
+The MuJoCo / FK counterpart is `transfer/sim/robots/g1/g1_29j.xml`, which
+`motion_gen.features.DEFAULT_MJCF` resolves to.
 
 ## Copying checkpoints from remote server 
 First mount the server to your local desktop
@@ -269,29 +373,15 @@ bash scripts/mount_remote.sh
 Note: this script might require a few changes as somethings are hard-coded.
 
 ## sim2sim Transfer
-This code base has a built in sim2sim transfer (i.e. the policy is trained in IsaacLab and can be run in Mujoco).
-Currently, we only support the G1 (as that is the only policy we have right now), but the code is easily extended to other robots.
-To run the sim2sim transfer, go to the `transfer/sim/` directory. From this directory run
-```
-python g1_runner.py --experiment=<EXPERIMENT_NAME>
-```
-where `EXPERIMENT_NAME` is the experiment log directory the policy was trained into.
-Optionally you can also add `--load_run=<run_dir>` to run a specific policy, otherwise the newest one will be run.
-`--log` enables logging to the same directory. You can choose the logging directory with `--log_dir`.
-`--scene` selects the MuJoCo scene (e.g. a generated staircase) and `--robot_name` the robot model.
 
-This uses information that must have been exported from the `play.py` script.
+Policies trained in IsaacLab run in MuJoCo without retraining. See
+[step 4 of the pipeline](#4-deploy-the-tracker-in-isaac-and-in-mujoco) — `compare_sim2sim.py`
+for a like-for-like comparison against a specific clip, or
+`transfer/sim/gen_tracker_runner.py` for a joystick playground on a generated scene.
 
-Then we can generate plots for the mujoco simulation. We can run
-```
-python plot_from_sim.py --env_type=<ENV_NAME>
-```
-and optionally you can pass `--load_run=<run_dir>` where `<run_dir>` is something like `025-11-17_15-04-12_walking_test`.
-You can also pass `--log_session=<folder>` to choose a folder from within those mujoco logs. 
-If either of these are unspecified then we plot the data for the newest run.
-
-To add a new robot, the associated robot sim files will need to be added into the `transfer/sim/robots/` folder,
-the `rl_policy_wrapper` will need to be adjusted a bit, and a new `runner` file will need to be made.
+Both read the artifacts `play.py` exports (`exported/policy_parameters.yaml` +
+`tracker.onnx` / `fm.onnx`), so export before running either. To add a robot, drop its sim
+files in `transfer/sim/robots/` and add a runner.
 
 ## Code formatting
 
@@ -412,33 +502,3 @@ and
 }
 ```
 
-## Branch Overview
-
-Snapshot as of 2026-06-08, after merging `multiskill-stair-slowdown` into `main` (PR #1).
-`ahead`/`behind` are relative to `main`.
-
-| Branch | ahead / behind | Description | Recommendation |
-|---|---|---|---|
-| `multiskill-stair-slowdown` | 0 / 1 | Active multiskill work; superset of the whole multiskill chain. Merged into `main`. | Prune (merged) |
-| `multiskill-terrain-blocks` | 0 / 4 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
-| `multiskill-terrain` | 0 / 8 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
-| `multiskill` | 0 / 33 | ⊂ `multiskill-stair-slowdown`. Merged. | Prune (merged) |
-| `clf-running-opt-sim` | 0 / 153 | Fully merged into `main`. | Prune (merged) |
-| `clf-running` | 1 / 125 | Single unique commit (obelisk readme note) already contained in `demo`. | Prune (redundant) |
-| `dual-cmd` | 3 / 54 | "Dual command" feature v1 + the idempotent-guard bug fix. **Not** in the multiskill line. | Decide — unique work |
-| `clf-analytic` | 4 / 124 | Analytic Vdot, double-integrator, paper plots ("initial submission"). | Keep? (paper-relevant) |
-| `demo` | 7 / 125 | Hardware demo configs (bow / bend-over, state machine). | Keep? (HW demos) |
-| `mlip` | 64 / 441 | Older HW transfer + data-processing code (incl. Talos), 2025-12. | Prune? (old experiment) |
-| `revision` | 7 / 449 | Paper rebuttal/revision code, mechanical cost-of-transport (2025-10/11). | Prune (stale) |
-| `clf-rl` | 3 / 449 | Old CLF-RL work, cleanup/formatting commits (2025-08). | Prune (stale) |
-
-> Already deleted: `spc-rl`, `longtest_real`, `amber5`, `distillation`.
-
-### TODO: prune remaining branches
-
-Not dealing with this right now — revisit and delete the branches that are no longer needed.
-Delete a remote branch with `git push origin --delete <branch>` (then `git fetch --prune`).
-
-- [ ] Prune merged/redundant (zero unique work lost): `multiskill-stair-slowdown`, `multiskill-terrain-blocks`, `multiskill-terrain`, `multiskill`, `clf-running-opt-sim`, `clf-running`
-- [ ] Prune stale: `revision`, `clf-rl`, `mlip`
-- [ ] Review before pruning (have unique commits): `dual-cmd`, `clf-analytic`, `demo`

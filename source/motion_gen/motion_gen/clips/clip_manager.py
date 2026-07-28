@@ -16,7 +16,7 @@ from __future__ import annotations
 import torch
 
 from ..manager_base import ManagerBase
-from ..trajectory_manager import TrajectoryType
+from ..manager_base import TrajectoryType
 from .clip_io import ClipLibraryData
 
 

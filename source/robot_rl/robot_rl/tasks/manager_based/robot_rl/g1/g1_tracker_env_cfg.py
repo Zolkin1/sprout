@@ -1,6 +1,6 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 tracker: closed-loop robot-state-conditioned flow-matching deploy (flat ground).
+"""G1 tracker: closed-loop robot-state-conditioned flow-matching deploy.
 
 Deploys a trained teacher policy against the **robot-state-conditioned** flow-matching
 reference: each control step the FM conditions on the LIVE robot-state history (the ``N``
@@ -13,13 +13,14 @@ same teacher trained on world/ego-anchored clips tracks the generator with no pr
 info in the policy.
 
 There is no separate tracker *training* task: the policy is the teacher
-(:mod:`g1_teacher_env_cfg`, ``G1-teacher-clf``). :class:`G1FmTrackerPlayEnvCfg` is a
-play-only deploy entry point -- pass the teacher via ``--load_run`` and the robot-state FM
-via ``--fm_checkpoint`` (``--clip_device cpu`` for the multi-GB clip library).
+(:mod:`g1_teacher_env_cfg`, ``G1-teacher-clf-terrain``).
+:class:`G1FmTrackerTerrainPlayEnvCfg` is a play-only deploy entry point -- pass the teacher
+via ``--load_run``, the FM via ``--fm_checkpoint``, and the library via ``--clip``.
 
-Differs from :class:`G1TeacherEnvCfg` only in the command term
-(:class:`FmTrackingCommand`) and a reference-independent fall termination. Both run a
-world-frame CLF, so they share one observation layout (:class:`G1TeacherObservationsCfg`).
+Differs from :class:`~.g1_teacher_terrain_env_cfg.G1TeacherTerrainEnvCfg` only in the
+command term (:class:`FmTrackingCommand`) and a reference-independent fall termination.
+Both run a world-frame CLF, so they share one observation layout
+(:class:`~.g1_teacher_env_cfg.G1TeacherObservationsCfg`).
 """
 
 from __future__ import annotations
@@ -30,16 +31,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
-from .g1_teacher_env_cfg import (
-    DEFAULT_CLIP_PATH,
-    G1TeacherObservationsCfg,
-    G1TeacherTerminationCfg,
-    G1TeacherEnvCfg,
-)
-from .g1_teacher_terrain_env_cfg import (
-    DEFAULT_TERRAIN_CLIP_PATH,
-    G1TeacherTerrainSceneCfg,
-)
+from .g1_teacher_env_cfg import G1TeacherTerminationCfg
+from .g1_teacher_terrain_env_cfg import G1TeacherTerrainEnvCfg
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
 # Default robot-state-conditioned FM checkpoint (override per-run via --fm_checkpoint).
@@ -75,7 +68,9 @@ class G1FmTrackerCommandsCfg:
 
     traj_ref = FmTrackingCommandCfg(
         contact_bodies=[".*_ankle_roll_link"],
-        path=DEFAULT_CLIP_PATH,
+        # No default library -- ``--clip`` sets this and scene.terrain.clip_library_path
+        # together (see g1_teacher_terrain_env_cfg).
+        path="",
         base_frame_name="pelvis_link",
         random_start_phase=True,
         random_start_min_remaining_s=2.0,
@@ -84,10 +79,10 @@ class G1FmTrackerCommandsCfg:
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
         fm_checkpoint=DEFAULT_FM_ROBOT_CKPT,
-        fm_update_every=10,
+        fm_update_every=12,          # 0.24 s -- MUST match the recording's ego_anchor_every
         # Warmup clip is robot-anchored on the FM re-plan cadence (matches the deploy regime).
         ego_anchor_fraction=1.0,
-        ego_anchor_every=10,
+        ego_anchor_every=12,         # 0.24 s -- same cadence as the FM re-plan above
         # The clip library only supplies the reset spawn pose + velocity command here, so
         # keep it on CPU by default -- loading the multi-GB library onto a 12GB GPU next to
         # the sim + FM + teacher OOMs (override with --clip_device).
@@ -96,72 +91,21 @@ class G1FmTrackerCommandsCfg:
 
 
 @configclass
-class G1FmTrackerEnvCfg(G1TeacherEnvCfg):
-    """Flat-ground closed-loop FM tracking env: the teacher tracks the FM predicted from
-    the LIVE robot-state history. Shared world-frame observation layout; adds the
-    reference-independent ``base_fallen`` termination (the FM may steer OOD)."""
+class G1FmTrackerTerrainEnvCfg(G1TeacherTerrainEnvCfg):
+    """Closed-loop FM tracking on the clip-library terrain.
 
-    observations: G1TeacherObservationsCfg = G1TeacherObservationsCfg()
-    commands: G1FmTrackerCommandsCfg = G1FmTrackerCommandsCfg()
-    terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
+    Differs from :class:`G1TeacherTerrainEnvCfg` in the command term only: the reference is
+    the FM predicted from the LIVE robot-state history rather than the clip itself. The clip
+    library still supplies the reset spawn pose and the ``target_vel`` command that
+    conditions the FM. Both run a world-frame CLF, so the observation layout is shared.
+    Adds a reference-independent ``base_fallen`` termination, since the FM may steer OOD.
 
-
-@configclass
-class G1FmTrackerPlayEnvCfg(G1FmTrackerEnvCfg):
-    """Play/deploy viewer: 16 envs, noise-free, no pushes. Load the teacher via
-    ``--load_run`` and the robot-state FM via ``--fm_checkpoint``; ``--clip_device cpu``
-    for the multi-GB clip library (seed spawn + velocity command only)."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.num_envs = 16
-        self.observations.policy.enable_corruption = False
-        self.events.push_robot = None
-        self.events.randomize_ground_contact_friction = None
-        self.commands.traj_ref.debug_vis = True
-
-
-##
-# Terrain closed-loop deploy: the teacher tracks the terrain-trained FM ON the stairs
-##
-@configclass
-class G1FmTrackerTerrainEnvCfg(G1FmTrackerEnvCfg):
-    """Terrain counterpart of :class:`G1FmTrackerEnvCfg`: the flat ground is swapped for the
-    clip-library :class:`ClipTerrainImporter` (staircases + transitions + flat patches), so
-    the pelvis height scan rides the treads and the robot has real stairs to climb while the
-    teacher tracks the robot-state-conditioned FM.
-
-    Only the scene + reset differ from the flat FM tracker: the terrain-aware reset spawns
-    each env on a clip that matches its tile's ``terrain_id`` (so the robot starts on the
-    right staircase / lead-in), and both the importer mesh AND the command's seed clip
-    library are pinned to the same terrain ``.h5``. The reference is still the FM (the clip
-    only supplies the reset spawn + the ``target_vel`` command that conditions the FM), so
-    a terrain-trained FM should emit climbing references from the live height scan.
-
-    Wiring mirrors :class:`G1TeacherTerrainEnvCfg.__post_init__` (kept inline rather than
-    shared so this addition is purely additive and does not touch the teacher-terrain env).
+    Inheriting from the teacher-terrain env means the terrain wiring (importer mesh,
+    terrain-aware reset, heading) is defined once, in that class.
     """
 
-    scene: G1TeacherTerrainSceneCfg = G1TeacherTerrainSceneCfg(num_envs=4096, env_spacing=2.5)
-
-    def __post_init__(self):
-        super().__post_init__()  # G1TeacherEnvCfg: FmTrackingCommand + teacher obs + base_fallen
-        # The ClipTerrainImporter builds its mesh from clip_library_path and IGNORES the
-        # inherited flat terrain_generator; clear it to avoid confusion.
-        self.scene.terrain.terrain_generator = None
-        # Terrain-aware reset: each env spawns on a clip matching its tile's terrain_id.
-        self.events.reset_on_clip.func = mdp.reset_on_terrain_motion_sequence
-        # Single clip-library source of truth: importer (mesh + per-env terrain_id) and the
-        # FM command's seed/velocity clips MUST read the same file, or tile terrain ids won't
-        # line up with the clips' terrain ids.
-        self.commands.traj_ref.path = DEFAULT_TERRAIN_CLIP_PATH
-        self.scene.terrain.clip_library_path = DEFAULT_TERRAIN_CLIP_PATH
-        assert self.commands.traj_ref.path == self.scene.terrain.clip_library_path, (
-            "terrain clip library (scene.terrain.clip_library_path) and command clip "
-            "library (commands.traj_ref.path) must be the same file."
-        )
-        # Clips are baked axis-aligned with their staircase -> placement is a pure translation.
-        self.commands.traj_ref.randomize_heading = False
+    commands: G1FmTrackerCommandsCfg = G1FmTrackerCommandsCfg()
+    terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
 
 
 @configclass

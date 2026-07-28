@@ -60,7 +60,7 @@ class RecordingMeta:
         height_scan_dim: Number of rays ``K`` in the per-step ``height_scan`` array (0 if
             absent). The height scan is the FM's height-conditioning token (per-ray ground
             clearance from the ``height_scanner`` sensor), captured when the recording task
-            has one active (e.g. ``G1-teacher-clf-record``).
+            has one active (e.g. ``G1-teacher-clf-terrain-play``).
         content_sha256: Content hash of the recorded arrays (see :func:`fingerprint_arrays`),
             set after collection. Compression-robust dataset identity; empty for older files.
         format: Storage layout. "per_step_npz" (the legacy every-step ``.npz``) or

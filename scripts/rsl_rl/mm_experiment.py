@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Batch motion-matching experiment for investigating solutions.
+"""DEPRECATED: part of the motion-matching / DP clip generator, retained for ablation studies
+only -- a matcher research one-off (vanilla vs beam vs DP).  Not on the live pipeline; see
+``source/motion_gen/motion_gen/motion_matching/README.md``.
+
+Batch motion-matching experiment for investigating solutions.
 
 Runs BOTH matchers (``vanilla`` greedy + ``beam`` offline global, sharing the cached v2
 candidate graph) on several velocity-command schedules -- a simple forward proof-of-concept
@@ -40,14 +44,14 @@ from scipy.spatial import cKDTree  # noqa: E402
 from motion_gen.clips.clip_io import ClipLibraryWriter                     # noqa: E402
 from motion_gen.world_lift import _ANCHOR_MASK_FLAT                        # noqa: E402
 from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher        # noqa: E402
-from motion_gen.motion_matching.bones_ingest import load_cache            # noqa: E402
+from motion_gen.ingest.bones_ingest import load_cache            # noqa: E402
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher             # noqa: E402
-from motion_gen.motion_matching.clip_output import ClipOutputBuilder      # noqa: E402
+from motion_gen.clip_output import ClipOutputBuilder      # noqa: E402
 from motion_gen.motion_matching.graph import (                            # noqa: E402
     STEADY, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_key, graph_cache_path)
-from motion_gen.motion_matching.playback import play_frame_path           # noqa: E402
+from motion_gen.playback import play_frame_path           # noqa: E402
 from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig  # noqa: E402
-from motion_gen.multiskill_manager import MultiSkillManager               # noqa: E402
+from motion_gen.library_metadata import read_library_metadata
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _FILTERS = {"package": "Locomotion",
@@ -216,7 +220,7 @@ def main() -> int:
     sources, _ = load_cache(args.bones_cache, filters=_FILTERS, exclude_name_substrings=_EXCLUDE, device=dev)
     clean_paths = None
     if args.include_clean:
-        from motion_gen.motion_matching.clean_ingest import ingest_clean_library
+        from motion_gen.ingest.clean_ingest import ingest_clean_library
         clean = ingest_clean_library(args.clean_source, hf_repo=args.clean_hf_repo, dt=args.dt, device=dev)
         print(f"[exp] + {len(clean)} clean STEADY clips")
         sources = sources + clean
@@ -249,12 +253,12 @@ def main() -> int:
     print("[exp] building DP matcher (shares the same graph) ...")
     dm = DPMatcher(sources, vcfg, DPConfig(dt=args.dt, **tier_kw), graph=graph, device=dev)
 
-    manager = MultiSkillManager(args.source, dev, env=None)
-    builder = ClipOutputBuilder(manager.pos_output_names, manager.vel_output_names,
+    lib_meta = read_library_metadata(args.source)
+    builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=dev)
-    base_meta = {"dt": args.dt, "pos_output_names": list(manager.pos_output_names),
-                 "vel_output_names": list(manager.vel_output_names), "contact_frames": _CONTACT,
-                 "ref_frame": "pelvis_link", "skill_list": [s.name for s in manager.skills]}
+    base_meta = {"dt": args.dt, "pos_output_names": list(lib_meta.pos_output_names),
+                 "vel_output_names": list(lib_meta.vel_output_names), "contact_frames": _CONTACT,
+                 "ref_frame": "pelvis_link", "skill_list": lib_meta.skill_list}
 
     rows = []
     for name, sched in scheds:

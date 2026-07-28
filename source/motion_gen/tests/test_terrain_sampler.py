@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from motion_gen.motion_matching.terrain_sampler import sample_stair_tiles, sample_terrain_specs
+from motion_gen.terrain.terrain_sampler import sample_stair_tiles, sample_terrain_specs
 
 
 _COMMON = dict(

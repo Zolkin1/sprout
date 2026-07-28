@@ -328,39 +328,6 @@ class TestNamedReflectorTrajectoryRegression:
                 f"Mismatch!\nOld: {old}\nNew: {new}"
             )
 
-
-# ---------------------------------------------------------------------------
-# TestRelabelMatrixRegression
-# ---------------------------------------------------------------------------
-
-class TestRelabelMatrixRegression:
-    """Verify the relabel matrix matches the old relable_ee_stance_coeffs."""
-
-    def test_matches_old_relabel_matrix(self, running_manager):
-        """Compare NamedReflector matrix against the TrajectoryManager's output.
-
-        This test exercises the actual trajectory output names from a loaded YAML.
-        """
-        names = running_manager.traj_data.pos_output_names
-        R_old = running_manager.relable_ee_stance_coeffs(names)
-
-        reflector = NamedReflector(SagittalReflectionConfig(), names, DEVICE)
-        R_new = reflector.build_relabel_matrix_numpy()
-
-        assert np.allclose(R_old, R_new, atol=1e-10), (
-            f"Relabel matrix mismatch!\nOld:\n{R_old}\nNew:\n{R_new}"
-        )
-
-    def test_vel_matches_old_relabel_matrix(self, running_manager):
-        names = running_manager.traj_data.vel_output_names
-        R_old = running_manager.relable_ee_stance_coeffs(names)
-
-        reflector = NamedReflector(SagittalReflectionConfig(), names, DEVICE)
-        R_new = reflector.build_relabel_matrix_numpy()
-
-        assert np.allclose(R_old, R_new, atol=1e-10)
-
-
 # ---------------------------------------------------------------------------
 # TestMotionSequenceObsReflection
 # ---------------------------------------------------------------------------

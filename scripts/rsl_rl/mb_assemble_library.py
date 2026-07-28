@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mb_terrain_clips import clip_from_plan, make_builder                    # noqa: E402
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library    # noqa: E402
-from motion_gen.motion_matching.gen_parallel import default_workers, unit_pool  # noqa: E402
+from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_terrain_plan, overlays_for          # noqa: E402
 from motion_gen.world_lift import _ANCHOR_MASK_BOX                           # noqa: E402
 
@@ -48,13 +48,16 @@ _CONTACT_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _SHARED: dict = {}
 
 
-def _redatum_tile(recs: list[dict], boxes: list[dict], margin: float) -> tuple[float, float]:
+def _redatum_tile(recs: list[dict], boxes: list[dict], margin: float, geom: str) -> tuple[float, float]:
     """Put every clip of one tile on a COMMON origin + footprint, in place. Returns ``(size_x, size_y)``.
 
     Each rec arrives recentred on its own ``corner`` (= its own ``lo - margin``). Recover each clip's extent
     in the pre-recentre frame, take the union, and shift the clips that were datumed further in so all of
     them share the tile's origin. The manifest + overlays are then rebuilt once for that origin, giving the
     single geometry the RL importer will mesh for this terrain_id.
+
+    ``geom`` is the tile's family geometry (``"stairs"`` / ``"box"``), which decides whether the platform
+    widening below applies.
     """
     los = [(r["corner"][0] + margin, r["corner"][1] + margin) for r in recs]
     his = [(lo[0] + r["size_x"] - 2.0 * margin, lo[1] + r["size_y"] - 2.0 * margin)
@@ -65,7 +68,10 @@ def _redatum_tile(recs: list[dict], boxes: list[dict], margin: float) -> tuple[f
     size_x, size_y = (HI[0] - LO[0]) + 2.0 * margin, (HI[1] - LO[1]) + 2.0 * margin
     overlays = overlays_for(boxes, CORNER)
     # Stair platforms are widened to the tile width by the per-clip path; redo it on the common footprint.
-    if len(overlays) > 1:
+    # STAIRS ONLY, and keyed on the geometry rather than on "more than one overlay": a box tile also has two
+    # overlays now (the jump box + its top platform), but its widths are authored deliberately -- stretching
+    # the platform across the tile would lay a box-high slab over the whole footprint, margin included.
+    if geom == "stairs" and len(overlays) > 1:
         min_sx = min(o["size_xyz"][0] for o in overlays)
         for o in overlays:
             if o["size_xyz"][0] > 1.5 * min_sx:
@@ -93,7 +99,7 @@ def _tile_worker(i: int):
     args, work, builder, dev = S["args"], S["work"], S["builder"], S["dev"]
     key, jobs = S["tiles"][i]
     family, tid = key
-    recs, boxes, margin = [], None, float(args.footprint_margin)
+    recs, boxes, geom, margin = [], None, "stairs", float(args.footprint_margin)
     for j in jobs:
         try:
             plan = load_terrain_plan(os.path.join(work, j["plan"]))
@@ -102,27 +108,34 @@ def _tile_worker(i: int):
             # measured best pair -- the pin buys the boundary POSE, the ease keeps the feet on the surface
             # (welding a pinned stairs_up approach leaves its feet ~0.09 m inside the platform).
             pin = {"ease": "soft", "weld": "hard", "auto": None}[args.seams]
+            # A ONE-SIDED box clip carries a null key for its elevated side (mb_plan_library never
+            # requested it), so that side splices as None -- the clip is terrain + the ground side only.
+            def _raw(key):
+                return None if not key else os.path.join(work, "segments", f"{key}.npz")
+
             job_args = SimpleNamespace(
                 source=args.source, seam_blend_s=args.seam_blend_s, weld_search=args.weld_search,
                 arrival_search=args.arrival_search, approach_pin=pin, exit_pin=pin,
-                approach_raw=os.path.join(work, "segments", f"{j['approach_key']}.npz"),
-                exit_raw=os.path.join(work, "segments", f"{j['exit_key']}.npz"),
+                approach_keyframes=None, exit_keyframes=None,
+                approach_raw=_raw(j.get("approach_key")), exit_raw=_raw(j.get("exit_key")),
             )
+            if job_args.approach_raw is None and job_args.exit_raw is None:
+                raise ValueError("clip has neither an approach nor an exit segment")
             for side in ("approach_raw", "exit_raw"):
-                if not os.path.exists(getattr(job_args, side)):
-                    raise FileNotFoundError(f"missing {side}: {getattr(job_args, side)} "
-                                            f"(pass B did not generate it)")
+                path = getattr(job_args, side)
+                if path is not None and not os.path.exists(path):
+                    raise FileNotFoundError(f"missing {side}: {path} (pass B did not generate it)")
             rec = clip_from_plan(plan, job_args, builder, dev)
         except (Exception, SystemExit) as e:
             print(f"[mb_asm][SKIP] {family} tile {tid} clip {j['clip']}: {type(e).__name__}: {e}", flush=True)
             continue
         rec["family"], rec["clip"] = family, int(j["clip"])
         recs.append(rec)
-        boxes = plan.boxes
+        boxes, geom = plan.boxes, str(plan.meta.get("geom", "stairs"))
     if not recs:
         print(f"[mb_asm][SKIP] {family} tile {tid}: no clip survived", flush=True)
         return []
-    sx, sy = _redatum_tile(recs, boxes, margin)
+    sx, sy = _redatum_tile(recs, boxes, margin, geom)
     print(f"[mb_asm] {family} tile {tid}: {len(recs)}/{len(jobs)} clips, footprint {sx:.1f}x{sy:.1f} m",
           flush=True)
     return recs
@@ -177,7 +190,9 @@ def main() -> int:
                         "seams is the measured best combination.")
     p.add_argument("--seam-blend-s", type=float, default=0.25, help="Seam ease window (s) for eased seams.")
     p.add_argument("--weld-search", type=int, default=12)
-    p.add_argument("--arrival-search", type=int, default=30)
+    p.add_argument("--arrival-search", type=int, default=60,
+                   help="Trailing approach frames searched for the in-betweened arrival. Must cover "
+                        "--pin-tail, which is longer now that the arrival time is emergent.")
     args = p.parse_args()
 
     work = args.work_dir

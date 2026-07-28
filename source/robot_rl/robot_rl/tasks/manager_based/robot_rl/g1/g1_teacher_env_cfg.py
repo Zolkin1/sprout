@@ -1,16 +1,18 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""G1 teacher policy: open-loop motion-clip tracking environment (flat ground, v1).
+"""G1 teacher policy: open-loop motion-clip tracking -- the shared, terrain-agnostic half.
 
-Tracks pre-generated fixed motion clips (see
-``scripts/rsl_rl/generate_clips.py`` and the ``clips/`` package) instead of
-the online re-anchored multi-skill command.  No velocity conditioner, no
-contact gates, no skill cross-fades.  Clips are stored in a single clip-world
-frame and the CLF runs in the absolute world frame (the same frame as the
-tracker task), so the policy's reference observations are
-base-relative / heading-invariant while the privileged critic sees the raw
-world-frame tracking vectors.  A single base-pose-error termination replaces
-the upright / height / frame-drift terminations.
+Tracks pre-generated fixed motion clips (see ``scripts/rsl_rl/generate_mb_library.py``).
+No velocity conditioner, no contact gates, no skill cross-fades.  Clips are stored in a
+single clip-world frame and the CLF runs in the absolute world frame (the same frame as
+the tracker task), so the policy's reference observations are base-relative /
+heading-invariant while the privileged critic sees the raw world-frame tracking vectors.
+A single base-pose-error termination covers failure.
+
+:class:`G1TeacherEnvCfg` here is ABSTRACT -- it declares no ground.  The concrete env is
+:mod:`g1_teacher_terrain_env_cfg`, whose scene meshes the clip library itself; a "flat"
+run is just a library whose tiles are flat.  The split is kept (rather than folded into
+one file) because the depth-camera work builds on both halves.
 """
 
 from __future__ import annotations
@@ -24,8 +26,6 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
-from isaaclab.terrains import TerrainGeneratorCfg
-from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
@@ -38,26 +38,6 @@ from .g1_clf_tracking_base import (
 )
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
-# Default clip library (generate with scripts/rsl_rl/generate_clips.py at the
-# env control dt, e.g. --dt 0.02).  Override per-run via the cfg.  Clean
-# reference clips only -- no sim-recorded clips in this paradigm.
-DEFAULT_CLIP_PATH = "clips/g1_flat_v1.h5"
-
-# Single deterministic parity clip (stand -> walk -> run -> stand; see
-# scripts/rsl_rl/generate_parity_clip.py).  Shared with the tracker parity-play
-# task; the teacher parity-play variant tracks it open-loop for a quick, clean
-# look at how the teacher follows a known profile (and IsaacLab <-> MuJoCo checks).
-DEFAULT_PARITY_CLIP_PATH = "clips/g1_parity_v1.h5"
-
-# Flat TRIANGLE-MESH terrain for FM-data recording. The height-scan RayCaster cannot hit
-# the infinite "plane" primitive the teacher trains on, so recording uses a flat mesh at
-# z=0 -- keeps the robot's flat-ground distribution while giving the scanner a surface.
-FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
-    size=(8.0, 8.0), border_width=20.0, num_rows=10, num_cols=20,
-    horizontal_scale=0.1, vertical_scale=0.005, slope_threshold=0.75, use_cache=False,
-    sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
-)
-
 
 ##
 # Scene
@@ -66,9 +46,10 @@ FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
 class G1TeacherSceneCfg(G1ClfTrackingSceneCfg):
     """Teacher scene + a downward height-scan ray-caster on the pelvis (176 rays).
 
-    The scan is the FM's height-conditioning token AND (Phase D) a teacher observation;
-    it needs a raycast-able MESH terrain (see ``G1TeacherEnvCfg``'s flat-mesh override --
-    the RayCaster cannot hit the infinite "plane" primitive).
+    The scan is the FM's height-conditioning token AND a teacher observation.  It needs a
+    raycast-able MESH terrain -- the RayCaster cannot hit the infinite "plane" primitive --
+    which the clip-library terrain importer provides (see
+    :class:`~.g1_teacher_terrain_env_cfg.G1TeacherTerrainSceneCfg`).
     """
 
     height_scanner = RayCasterCfg(
@@ -90,7 +71,10 @@ class G1TeacherCommandsCfg:
 
     traj_ref = MotionSequenceCommandCfg(
         contact_bodies=[".*_ankle_roll_link"],
-        path=DEFAULT_CLIP_PATH,
+        # No default library: the terrain mesh AND the tracked clips both come from one
+        # ``.h5``, and a stale default silently trains on the wrong terrain. ``--clip``
+        # sets this and scene.terrain.clip_library_path together.
+        path="",
         base_frame_name="pelvis_link",
         random_start_phase=True,
         random_start_min_remaining_s=2.0,
@@ -103,7 +87,7 @@ class G1TeacherCommandsCfg:
         # the reference looks like an MPC plan that re-plans every few steps. The
         # rest keep the fixed world-frame clip. Set ego_anchor_fraction=0 to disable.
         ego_anchor_fraction=0.5,
-        ego_anchor_every=10,  # re-plan every 10 control steps (~0.2 s at dt=0.02)
+        ego_anchor_every=12,  # re-plan every 12 control steps (0.24 s at dt=0.02)
     )
 
 
@@ -244,9 +228,8 @@ class G1TeacherObservationsCfg:
 ##
 @configclass
 class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
-    """Reuse dynamics randomization; swap the reset onto a clip."""
+    """Reuse dynamics randomization; add the reset onto a clip."""
 
-    reset_on_ref = None  # remove the velocity-conditioned reference reset
     reset_on_clip = EventTerm(
         func=mdp.reset_on_motion_sequence,
         mode="reset",
@@ -259,17 +242,12 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
 ##
 @configclass
 class G1TeacherRewardCfg(G1ClfTrackingRewardCfg):
-    """CLF tracking + penalties; drop the velocity-command rewards and add a
-    dense reference-base-velocity tracking term for shaping."""
+    """CLF tracking + penalties, plus dense commanded-velocity tracking."""
 
-    xy_vel = None
-    yaw_vel = None
-
-    # Dense shaped signal replacing the dropped xy_vel/yaw_vel: track the clip's
-    # joystick-level velocity command (target_vel = (vx, vy, wz)) -- the same
-    # signal a velocity joystick would supply -- rather than the achieved
-    # reference base velocity.  Split into planar (xy) + yaw exactly like the
-    # stock track_lin_vel_xy_exp / track_ang_vel_z_exp, but sourced from traj_ref.
+    # Track the clip's joystick-level velocity command (target_vel = (vx, vy, wz)) -- the
+    # same signal a velocity joystick would supply -- rather than the achieved reference
+    # base velocity.  Split into planar (xy) + yaw exactly like the stock
+    # track_lin_vel_xy_exp / track_ang_vel_z_exp, but sourced from traj_ref.
     xy_vel = RewTerm(
         func=mdp.command_lin_vel_xy_tracking_exp,
         weight=1.0,
@@ -304,12 +282,13 @@ class G1TeacherTerminationCfg:
 ##
 @configclass
 class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
-    """Flat-ground open-loop motion-sequence tracking env (with a height scan).
+    """Open-loop motion-sequence tracking env -- ABSTRACT (no ground assigned).
 
-    The scene carries a height-scan ray-caster (a teacher observation + the FM's
-    height token), so the ground is a flat raycast-able TRIANGLE MESH rather than the
-    infinite "plane" primitive (which the RayCaster cannot hit); the robot still runs
-    on flat ground.
+    Everything that does not depend on the ground lives here: the clip-tracking command,
+    the CLF + commanded-velocity rewards, the base-relative policy observations, the
+    privileged critic, the clip reset, and the pelvis height scanner.  The ground itself
+    comes from :class:`~.g1_teacher_terrain_env_cfg.G1TeacherTerrainEnvCfg`, which meshes
+    the clip library; this class is not registered.
     """
 
     scene: G1TeacherSceneCfg = G1TeacherSceneCfg(num_envs=4096, env_spacing=2.5)
@@ -321,58 +300,13 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # Flat ground for v1, but a raycast-able MESH (not the "plane" primitive) so the
-        # height_scanner returns valid hits; the robot's flat-ground distribution is unchanged.
-        self.scene.terrain.terrain_type = "generator"
-        self.scene.terrain.terrain_generator = FLAT_MESH_TERRAIN_CFG
         # Episode length matches a 20 s clip at the 0.02 s control dt
         # (decimation 4 * sim.dt 0.005); regenerate clips at this dt.
         self.episode_length_s = 20.0
-
-        # --- Parity with the multiskill baseline (g1_terrain_multiskill) ---
-        # (1) No external pushes (the baseline disables them).
+        # No external pushes.
         self.events.push_robot = None
-        # (2) Reward-knob parity: stronger undesired-contact penalty + tighter
-        #     CLF normalization (baseline used these).
+        # Stronger undesired-contact penalty + tighter CLF normalization.
         self.rewards.undesired_contacts.weight = -0.5
         self.rewards.clf_reward.params["max_eta_err"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
-
-
-@configclass
-class G1TeacherEnvCfgPlay(G1TeacherEnvCfg):
-    """Smaller, noise-free variant for play / debugging."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.num_envs = 16
-        self.observations.policy.enable_corruption = False
-        self.events.push_robot = None
-        self.events.randomize_ground_contact_friction = None
-        # Draw the reference-trajectory markers in the viewer.
-        self.commands.traj_ref.debug_vis = True
-        # Draw the height-scan ray hits in the viewer.
-        self.scene.height_scanner.debug_vis = True
-
-
-@configclass
-class G1TeacherParityPlayEnvCfg(G1TeacherEnvCfgPlay):
-    """Deterministic single-clip playback of the trained teacher.
-
-    Tracks the hand-authored parity clip (stand -> walk -> run -> stand) open-loop
-    from step 0 in a single env, so you can watch how the teacher follows a known
-    profile (and reuse it for IsaacLab <-> MuJoCo parity).  Ego re-anchoring is
-    turned OFF here so the reference placement is fixed and the playback is
-    deterministic; override ``env.commands.traj_ref.ego_anchor_fraction=1.0`` on
-    the play command line to instead watch the receding-horizon re-anchoring on
-    the parity clip.
-    """
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.scene.num_envs = 1
-        self.commands.traj_ref.path = DEFAULT_PARITY_CLIP_PATH
-        self.commands.traj_ref.random_start_phase = False   # start at clip step 0
-        self.commands.traj_ref.randomize_heading = False
-        self.commands.traj_ref.ego_anchor_fraction = 0.0    # fixed placement (deterministic)
