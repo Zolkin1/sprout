@@ -258,10 +258,18 @@ def footprint_recenter(Wp: torch.Tensor, boxes: list[dict], margin: float):
         float(hi[0] - lo[0]) + 2.0 * margin, float(hi[1] - lo[1]) + 2.0 * margin
 
 
+#: Optional support-structure keys an authored box may carry (``stair_tile_boxes(float_thickness=...)``,
+#: ``resolve_box_variant``).  Copied VERBATIM into the manifest overlay so the RL importer and the viewers
+#: rebuild the same sub-boxes; absent keys leave the loader on its "solid" defaults, which keeps an
+#: undecorated tile byte-identical to prior libraries.
+_VARIANT_KEYS = ("variant", "slab_thickness", "leg_size", "leg_inset")
+
+
 def overlays_for(boxes: list[dict], corner: tuple[float, float]) -> list[dict]:
     """Terrain-manifest overlay dicts for ``boxes``, shifted into the tile-local frame of ``corner``."""
     return [{"kind": "box",
              "pos_xy": [float(b["pos"][0]) - corner[0], float(b["pos"][1]) - corner[1]],
              "size_xyz": [float(v) for v in b["size"]],
              "base_z": float(b["pos"][2]) - float(b["size"][2]) / 2.0,
-             "walkable_top": True, "yaw": float(b.get("yaw", 0.0))} for b in boxes]
+             "walkable_top": True, "yaw": float(b.get("yaw", 0.0)),
+             **{k: b[k] for k in _VARIANT_KEYS if k in b}} for b in boxes]

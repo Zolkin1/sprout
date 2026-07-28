@@ -149,6 +149,7 @@ def stair_tile_boxes(
     bottom_platform_len: float = 0.0,
     nav_width: float | None = None,
     going_up: bool = False,
+    float_thickness: float = 0.0,
 ) -> list[dict]:
     """FIXED tile geometry for a uniform staircase (tile-local, axis-aligned, +x = direction of travel).
 
@@ -165,6 +166,15 @@ def stair_tile_boxes(
     platforms are WIDE, so the downstream pipeline tells them apart by width.  ``ttype == "terrain"``
     (pure stairs) emits the treads only -- no platforms.
 
+    ``float_thickness > 0`` makes the treads FLOATING: each tread additionally carries
+    ``variant="floating"`` + ``slab_thickness``, which the RL importer / viewers expand into a thin
+    top slab with an open gap beneath it (see ``blocks.overlay.overlay_sub_boxes``) instead of a solid
+    pillar down to the floor.  ``pos`` / ``size`` are UNCHANGED -- they stay the full solid extents, so
+    the tread-top surface, the AABB and every placement / footprint / off-surface consumer of these
+    boxes sees exactly the same geometry as a solid staircase; only the mesh below the tread differs.
+    The platforms stay solid: they are the ground- and top-level surfaces the robot walks on, and
+    "no ground under the structure" is the separate per-tile ``has_floor`` knob.
+
     Args:
         step_height / step_depth: Uniform riser / tread depth (m).
         num_steps: Number of treads ``N``.
@@ -174,6 +184,10 @@ def stair_tile_boxes(
             sized to the longest approach / recovery that will run on the tile (transition only).
         nav_width: Platform y-width (m); defaults to ``tread_width``.
         going_up: Ascend (+x uphill) instead of descend.  Descent is byte-identical to the prior code.
+        float_thickness: Floating-tread slab thickness (m); ``0`` (default) emits solid treads and adds
+            no keys at all, so an undecorated tile reproduces prior libraries byte-for-byte.  Clamped
+            per tread to that tread's own height, so the lowest tread never floats thicker than its
+            single riser.
     """
     h, d, N = float(step_height), float(step_depth), int(num_steps)
     w = float(tread_width)
@@ -183,10 +197,15 @@ def stair_tile_boxes(
     # riser below the lowest tread.  going_up flips the tread z-ordering along +x (see stair_geom).
     lay = stair_tread_layout(size_x=N * d, size_y=w, step_height=h, step_depth_nominal=d,
                              going_up=going_up, x_offset=top_len, y_offset=-w / 2.0, start_z_zero=True)
+    ft = float(float_thickness)
     boxes: list[dict] = []
     for c in lay.tread_top_centers:
         cx, top = float(c[0]), float(c[2]) + h                # solid tread box from z=0 up to its top
-        boxes.append({"pos": [cx, 0.0, top / 2.0], "size": [d, w, top], "yaw": 0.0})
+        box = {"pos": [cx, 0.0, top / 2.0], "size": [d, w, top], "yaw": 0.0}
+        if ft > 0.0:                                          # riser-less: thin slab at the tread top
+            box["variant"] = "floating"
+            box["slab_thickness"] = min(ft, top)
+        boxes.append(box)
     if ttype != "terrain":
         # Platforms flush with the adjacent tread: approach (low x) == first tread top, recovery
         # (high x) == last tread top.  Direction-agnostic -- descent gives approach=N*h/recovery=h

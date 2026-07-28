@@ -141,11 +141,21 @@ def _stair_tile_specs(rng, skill: str, sources, args) -> list[dict]:
         lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
         nav_width_range=tuple(args.tile_width_range), flat_width_margin=0.3,
         single_step_frac=0.0, floor_frac=float(args.stair_floor_frac),
+        # FLOATING treads ride the shared stair-decor policy, resolved ONCE per tile here (one band per
+        # transition tile) and carried as an explicit thickness -- the generator and the RL importer must
+        # not re-draw it independently.  All-zero fracs consume no rng, so an undecorated run reproduces
+        # earlier tile populations exactly.
+        decor_params={"float_frac": float(args.stair_float_frac),
+                      "float_thick_range": tuple(args.stair_float_thick_range)},
     )
-    print(f"[mb_plan] {skill}: hd_grid={hd_grid} -> {len(tiles)} transition tiles")
+    n_float = sum(1 for t in tiles if t.stair_decor and t.stair_decor[0]["float_thickness"] > 0.0)
+    print(f"[mb_plan] {skill}: hd_grid={hd_grid} -> {len(tiles)} transition tiles "
+          f"({n_float} floating-tread / {len(tiles) - n_float} solid)")
     return [{"riser": float(t.step_height), "tread": float(t.step_depth),
              "n_steps": int(t.stair_steps[0]), "width": float(t.width),
-             "nav_width": float(t.nav_width), "has_floor": bool(t.has_floor)} for t in tiles]
+             "nav_width": float(t.nav_width), "has_floor": bool(t.has_floor),
+             "float_thickness": (float(t.stair_decor[0]["float_thickness"]) if t.stair_decor else 0.0)}
+            for t in tiles]
 
 
 def _box_tile_specs(rng, skill: str, sources, args, n_tiles: int) -> list[dict]:
@@ -277,6 +287,16 @@ def main() -> int:
     p.add_argument("--tile-width-range", type=float, nargs=2, default=(0.8, 1.2), metavar=("MIN", "MAX"))
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
                    help="Fraction of stair tiles keeping a ground plane (rest are bare stairs).")
+    p.add_argument("--stair-float-frac", type=float, default=0.0,
+                   help="Fraction of stair TILES built with FLOATING (riser-less) treads: each tread is a "
+                        "thin slab with an open gap beneath instead of a solid pillar to the floor. The "
+                        "tread-top surface is identical, so the same played traversals are reused -- this "
+                        "changes what the height scan and the feet-adjacent geometry look like, not the "
+                        "motion. Independent of --stair-floor-frac, which drops the GROUND under the "
+                        "whole structure.")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
+                   metavar=("MIN", "MAX"),
+                   help="Floating-tread slab thickness band (m), sampled per floating tile.")
     p.add_argument("--steady-approach-frac", type=float, default=0.5,
                    help="Fraction of clips whose approach starts ALREADY AT SPEED (context-seeded from the "
                         "matched stride) rather than from a stand. 0 = every clip runs up from rest.")
@@ -369,6 +389,7 @@ def main() -> int:
                     n_steps=spec.get("n_steps", 6), width=spec.get("width", 1.4),
                     nav_width=spec.get("nav_width"), box_height=spec.get("box_height", 0.45),
                     has_floor=spec.get("has_floor", True), box_nav_width=spec.get("box_nav_width"),
+                    stair_float_thickness=spec.get("float_thickness", 0.0),
                     box_platform_buffer=args.box_platform_buffer,
                     two_sided=two_sided,
                     # The commanded GROUND-level speed varies per clip (the DP path's --transition-vels

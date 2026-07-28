@@ -63,6 +63,21 @@ _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 # distractors all match against ONE library.  ``APPROACH_FILTERS`` keys used here: "stair_transition"
 # (a played traversal -> {flat, clean}) and "box" (a jump synthesises a takeoff -> +leadin).
 
+# Support-structure keys an authored box may carry (floating treads / box support variants).  Copied
+# VERBATIM from the authored geometry into the manifest overlay so the RL importer and the viewers rebuild
+# the same sub-boxes; absent keys leave the loader on its "solid" defaults.  Mirrors
+# ``motionbricks.terrain_splice._VARIANT_KEYS`` (the MB path's emitter).
+_VARIANT_KEYS = ("variant", "slab_thickness", "leg_size", "leg_inset")
+
+
+def _tile_float_thickness(tile) -> float:
+    """Floating-tread slab thickness (m) resolved for a stair ``tile`` (``0`` = solid treads).
+
+    The stair-decor policy resolves one dict per stair band; a tiles-then-clips stair tile has exactly
+    one band, so band 0 carries the tile's thickness.  ``0`` / no decor => solid steps.
+    """
+    return float(tile.stair_decor[0]["float_thickness"]) if tile.stair_decor else 0.0
+
 
 def _steady_cmd(vx: float):
     return lambda _t: (float(vx), 0.0, 0.0)
@@ -413,7 +428,7 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev, target_vx=0.0):
     going_up = float(ts.terrain_meta.get("terrain", {}).get("direction_z", -1)) > 0
     boxes = stair_tile_boxes(step_height=tile.step_height, step_depth=tile.step_depth,
                              num_steps=int(tile.stair_steps[0]), tread_width=tile.width, ttype="terrain",
-                             going_up=going_up)
+                             going_up=going_up, float_thickness=_tile_float_thickness(tile))
     Wp, Wq, Wj, terr_contact = place_periodic_on_tile(ts, tile, boxes, dev, k=0, going_up=going_up,
                                                        end_buffer_treads=args.pure_end_buffer)
     bounds = [(0, Wp.shape[0])]
@@ -439,7 +454,8 @@ def _make_pure_tile_clip(builder, ts, tile, args, dev, target_vx=0.0):
                  "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],
                  "size_xyz": [float(v) for v in b_["size"]],
                  "base_z": float(b_["pos"][2] - b_["size"][2] / 2.0),
-                 "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
+                 "walkable_top": True, "yaw": float(b_["yaw"]),
+                 **{k: b_[k] for k in _VARIANT_KEYS if k in b_}} for b_ in boxes]
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
     # frame_yaw: the terrain frame the RL anchor mask resolves downrange / lateral in. 0 is CORRECT
@@ -527,7 +543,8 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
     boxes = stair_tile_boxes(step_height=tile.step_height, step_depth=tile.step_depth,
                              num_steps=int(tile.stair_steps[0]), tread_width=tile.width,
                              ttype="transition", top_platform_len=top_len, bottom_platform_len=bot_len,
-                             nav_width=tile.nav_width, going_up=going_up)
+                             nav_width=tile.nav_width, going_up=going_up,
+                             float_thickness=_tile_float_thickness(tile))
     top_surf = int(tile.stair_steps[0]) * float(tile.step_height)   # top platform (= highest tread top)
     bot_surf = float(tile.step_height)                               # bottom platform (= lowest tread top)
     peel_tread = top_surf if going_up else bot_surf                  # tread the recovery peels off from
@@ -671,7 +688,8 @@ def _make_transition_tile_clip(matcher, builder, ts, tile, approach_vx, args, de
                  "pos_xy": [b_["pos"][0] - float(corner[0]), b_["pos"][1] - float(corner[1])],
                  "size_xyz": [float(v) for v in b_["size"]],
                  "base_z": float(b_["pos"][2] - b_["size"][2] / 2.0),
-                 "walkable_top": True, "yaw": float(b_["yaw"])} for b_ in boxes]
+                 "walkable_top": True, "yaw": float(b_["yaw"]),
+                 **{k: b_[k] for k in _VARIANT_KEYS if k in b_}} for b_ in boxes]
     size_x = float(hi[0] - lo[0]) + 2 * m
     size_y = float(hi[1] - lo[1]) + 2 * m
     # frame_yaw 0: ``place_periodic_on_tile`` yaw-normalizes the descent onto the tile's +x (see above).
@@ -1054,6 +1072,16 @@ def main() -> int:
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
                    help="[tiles] fraction of stair tiles (pure + transition) that keep a flat ground plane; "
                         "the rest are the bare stairs (+ platforms) with NO ground under them (isolated).")
+    p.add_argument("--stair-float-frac", type=float, default=0.0,
+                   help="[tiles] fraction of stair tiles built with FLOATING (riser-less) treads: each tread "
+                        "is a thin slab with an open gap beneath instead of a solid pillar to the floor. The "
+                        "tread-TOP surface is identical, so the same played traversals are reused -- this "
+                        "changes what the height scan and the feet-adjacent geometry look like, not the "
+                        "motion. Independent of --stair-floor-frac, which drops the GROUND under the whole "
+                        "structure.")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
+                   metavar=("MIN", "MAX"),
+                   help="[tiles] floating-tread slab thickness band (m), sampled per floating tile.")
     p.add_argument("--num-box-tiles", type=int, default=0,
                    help="[tiles] If >0, generate N jump-on BOX tiles (fixed box on flat ground); each is "
                         "REUSED by --box-clips-per-tile approach speeds (shared terrain_id, no 1:1 tid).")
@@ -1175,7 +1203,16 @@ def main() -> int:
             num_steps_range=(args.tile_num_steps_min, args.tile_num_steps_max),
             lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
             nav_width_range=(args.tile_width_min, args.tile_width_max), flat_width_margin=0.3,
-            floor_frac=args.stair_floor_frac)
+            floor_frac=args.stair_floor_frac,
+            # FLOATING treads, resolved ONCE per tile by the shared stair-decor policy and read back via
+            # ``_tile_float_thickness`` when the tile's geometry is authored.  All-zero fracs consume no
+            # rng, so an undecorated run reproduces earlier tile populations exactly.
+            decor_params={"float_frac": args.stair_float_frac,
+                          "float_thick_range": tuple(args.stair_float_thick_range)})
+        n_float = sum(1 for t in tiles if _tile_float_thickness(t) > 0.0)
+        if n_float:
+            print(f"[stairs] floating treads: {n_float}/{len(tiles)} tiles "
+                  f"(thickness {args.stair_float_thick_range[0]:.3f}-{args.stair_float_thick_range[1]:.3f} m)")
         # Fan the tiles across the fork pool: one worker builds ALL clips for one tile (matcher / builder /
         # tiles / variants shared COW via _SHARED); per-tile approach/recovery RNG is seeded by
         # (tile_seed, terrain_id) inside the worker, so the output is reproducible and worker-order

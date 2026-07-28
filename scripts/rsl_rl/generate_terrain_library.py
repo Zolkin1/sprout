@@ -102,6 +102,11 @@ def main() -> int:
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
                    help="Fraction of stair tiles (pure + transition) that keep a flat ground plane; the "
                         "rest are the bare stairs (+ platforms) with no ground under them.")
+    p.add_argument("--stair-float-frac", type=float, default=0.0,
+                   help="Fraction of stair TILES with FLOATING (riser-less) treads -- thin slabs with an "
+                        "open gap beneath, same tread tops (so the same clips are reused).")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
+                   metavar=("MIN", "MAX"), help="Floating-tread slab thickness band (m), per tile.")
     p.add_argument("--skip", default="", help="Comma-sep families to skip (stairs,boxes,distractors,flat).")
     args = p.parse_args()
 
@@ -136,7 +141,10 @@ def main() -> int:
     # --- STAIRS: (descent/ascent) x (transition/pure), each with cpt evenly-spaced approach vels ---
     # transition + pure MUST be separate runs: --transition-vels drives clips-per-tile for both.
     stair_base = base + terr_bl + ["--terrain-lib", args.terrain_lib, "--transition-vels", tvels,
-                                   "--tile-seed", str(args.seed), "--stair-floor-frac", str(args.stair_floor_frac)]
+                                   "--tile-seed", str(args.seed), "--stair-floor-frac", str(args.stair_floor_frac),
+                                   "--stair-float-frac", str(args.stair_float_frac),
+                                   "--stair-float-thick-range",
+                                   *(str(v) for v in args.stair_float_thick_range)]
     stair_runs = [
         ("stairs_dn_trans", "stairs_down", ["--n-transition-tiles", str(trans_dn), "--n-pure-tiles", "0"]),
         ("stairs_up_trans", "stairs_up", ["--n-transition-tiles", str(trans_up), "--n-pure-tiles", "0"]),

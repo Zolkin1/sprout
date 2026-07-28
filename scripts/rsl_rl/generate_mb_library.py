@@ -156,6 +156,11 @@ def main() -> int:
                    help="Cap (m/s) on any BACKWARD command (the jump_off dismount), where the clean "
                         "library's walk_backwards strides stop.")
     p.add_argument("--stair-floor-frac", type=float, default=0.5)
+    p.add_argument("--stair-float-frac", type=float, default=0.0,
+                   help="Fraction of stair TILES with FLOATING (riser-less) treads -- thin slabs with an "
+                        "open gap beneath. Same tread tops, so the same references are reused.")
+    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
+                   metavar=("MIN", "MAX"), help="Floating-tread slab thickness band (m), per tile.")
     p.add_argument("--steady-approach-frac", type=float, default=0.5,
                    help="Fraction of terrain clips whose approach starts ALREADY AT SPEED rather than from "
                         "a stand (see mb_terrain_segments --approach-start).")
@@ -216,6 +221,8 @@ def main() -> int:
             "--box-nav-width", str(args.box_nav_width),
             "--backward-vx-max", str(args.backward_vx_max),
             "--stair-floor-frac", str(args.stair_floor_frac),
+            "--stair-float-frac", str(args.stair_float_frac),
+            "--stair-float-thick-range", *(str(v) for v in args.stair_float_thick_range),
             "--steady-approach-frac", str(args.steady_approach_frac)])
     if stage in ("all", "a") and args.distractor_tiles > 0 \
             and not os.path.exists(os.path.join(_REPO, dis_sched)):

@@ -111,3 +111,41 @@ def test_transition_x_layout_contiguous():
     xmax = max(b["pos"][0] + b["size"][0] / 2 for b in boxes)
     assert abs(xmin - 0.0) < 1e-5                             # starts at tile x=0
     assert abs((xmax - xmin) - (top + N * d + bot)) < 1e-4    # total x = top + stairs + bottom
+
+
+def test_solid_treads_carry_no_variant_keys():
+    """``float_thickness=0`` (default) must add nothing -- prior libraries stay byte-identical."""
+    kw = dict(step_height=0.15, step_depth=0.19, num_steps=5, tread_width=1.0, ttype="transition",
+              top_platform_len=3.0, bottom_platform_len=2.0)
+    assert stair_tile_boxes(**kw) == stair_tile_boxes(**kw, float_thickness=0.0)
+    for b in stair_tile_boxes(**kw):
+        assert "variant" not in b and "slab_thickness" not in b
+
+
+def test_floating_tags_treads_only_and_preserves_extents():
+    """Floating treads get the overlay variant; platforms stay solid; pos/size are untouched."""
+    h, d, N = 0.15, 0.19, 5
+    kw = dict(step_height=h, step_depth=d, num_steps=N, tread_width=1.0, ttype="transition",
+              top_platform_len=3.0, bottom_platform_len=2.0, nav_width=1.4)
+    solid = stair_tile_boxes(**kw)
+    floating = stair_tile_boxes(**kw, float_thickness=0.05)
+    steps, plats = _steps_and_platforms(floating)
+    assert len(steps) == N and len(plats) == 2
+    for b in steps:
+        assert b["variant"] == "floating"
+        assert abs(b["slab_thickness"] - 0.05) < 1e-9
+    for b in plats:                                              # ground/top surfaces stay supported
+        assert "variant" not in b
+    # The solid extents are the contract every placement / footprint / AABB consumer reads.
+    for a, b in zip(solid, floating):
+        assert a["pos"] == b["pos"] and a["size"] == b["size"]
+
+
+def test_floating_slab_clamped_to_each_tread_height():
+    """A thickness thicker than the lowest tread's own riser must clamp, not overhang below z=0."""
+    h, d, N = 0.15, 0.19, 4
+    boxes = stair_tile_boxes(step_height=h, step_depth=d, num_steps=N, tread_width=1.0,
+                             ttype="terrain", float_thickness=10.0)
+    for b in boxes:
+        assert b["slab_thickness"] <= b["size"][2] + 1e-9        # never thicker than the tread itself
+    assert abs(min(b["slab_thickness"] for b in boxes) - h) < 1e-9   # lowest tread: clamped to one riser

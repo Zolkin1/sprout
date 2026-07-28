@@ -152,14 +152,21 @@ def _author_tile(family, ts, args):
             stair_steps=[n_steps], flat_after=[0.0], nav_width=float(args.nav_width or args.width),
             spawn_y_offset=0.0, stair_decor=[], has_floor=bool(args.has_floor),
         )
+        # FLOATING treads: a thickness > 0 tags each tread so the RL importer meshes a thin slab with an
+        # open gap beneath instead of a solid pillar.  The tread-TOP surface is unchanged, so the played
+        # traversal, its contact filtering and the boundary gate below are all unaffected -- the reference
+        # walks on exactly the same steps either way.  Per TILE (the mesh is per terrain_id).
+        float_thickness = float(getattr(args, "stair_float_thickness", 0.0) or 0.0)
         boxes = stair_tile_boxes(step_height=riser, step_depth=tread, num_steps=n_steps,
                                  tread_width=tile.width, ttype="transition",
                                  top_platform_len=plat, bottom_platform_len=plat,
-                                 nav_width=tile.nav_width, going_up=family.going_up)
+                                 nav_width=tile.nav_width, going_up=family.going_up,
+                                 float_thickness=float_thickness)
         lower_z, upper_z = riser, n_steps * riser        # bottom platform / top platform tops
         meta = {"geom": "stairs", "riser": riser, "tread": tread, "n_steps": n_steps,
                 "platform_len": plat, "width": float(tile.width), "nav_width": float(tile.nav_width),
-                "has_floor": bool(args.has_floor), "clip_type": "transition"}
+                "has_floor": bool(args.has_floor), "clip_type": "transition",
+                "float_thickness": float_thickness}
         return boxes, tile, lower_z, upper_z, meta
 
     # The box's extents IN THE TRAVEL FRAME the placement will use (see _place): for every jump reference
@@ -647,6 +654,11 @@ def main() -> int:
     p.add_argument("--n-steps", type=int, default=6, help="[stairs] number of treads on the tile.")
     p.add_argument("--width", type=float, default=1.4, help="[stairs] tread y-width (m).")
     p.add_argument("--nav-width", type=float, default=None, help="[stairs] platform y-width (default --width).")
+    p.add_argument("--stair-float-thickness", type=float, default=0.0,
+                   help="[stairs] FLOATING treads: slab thickness (m) of each riser-less tread, leaving an "
+                        "open gap beneath it (0 = solid steps). The tread-top surface is identical either "
+                        "way, so the reference motion is unchanged -- only the mesh below it. Clamped per "
+                        "tread to that tread's height.")
     p.add_argument("--box-height", type=float, default=0.45, help="[box] target box height (m).")
     p.add_argument("--box-nav-width", type=float, default=0.0,
                    help="[box] y-width (m) to widen the box AND its top platform to (expand-only); "
