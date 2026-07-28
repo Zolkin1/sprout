@@ -108,16 +108,23 @@ def _tile_worker(i: int):
             # measured best pair -- the pin buys the boundary POSE, the ease keeps the feet on the surface
             # (welding a pinned stairs_up approach leaves its feet ~0.09 m inside the platform).
             pin = {"ease": "soft", "weld": "hard", "auto": None}[args.seams]
+            # A ONE-SIDED box clip carries a null key for its elevated side (mb_plan_library never
+            # requested it), so that side splices as None -- the clip is terrain + the ground side only.
+            def _raw(key):
+                return None if not key else os.path.join(work, "segments", f"{key}.npz")
+
             job_args = SimpleNamespace(
                 source=args.source, seam_blend_s=args.seam_blend_s, weld_search=args.weld_search,
                 arrival_search=args.arrival_search, approach_pin=pin, exit_pin=pin,
-                approach_raw=os.path.join(work, "segments", f"{j['approach_key']}.npz"),
-                exit_raw=os.path.join(work, "segments", f"{j['exit_key']}.npz"),
+                approach_keyframes=None, exit_keyframes=None,
+                approach_raw=_raw(j.get("approach_key")), exit_raw=_raw(j.get("exit_key")),
             )
+            if job_args.approach_raw is None and job_args.exit_raw is None:
+                raise ValueError("clip has neither an approach nor an exit segment")
             for side in ("approach_raw", "exit_raw"):
-                if not os.path.exists(getattr(job_args, side)):
-                    raise FileNotFoundError(f"missing {side}: {getattr(job_args, side)} "
-                                            f"(pass B did not generate it)")
+                path = getattr(job_args, side)
+                if path is not None and not os.path.exists(path):
+                    raise FileNotFoundError(f"missing {side}: {path} (pass B did not generate it)")
             rec = clip_from_plan(plan, job_args, builder, dev)
         except (Exception, SystemExit) as e:
             print(f"[mb_asm][SKIP] {family} tile {tid} clip {j['clip']}: {type(e).__name__}: {e}", flush=True)

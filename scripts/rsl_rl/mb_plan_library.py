@@ -48,7 +48,8 @@ from mb_terrain_clips import (                                            # noqa
 )
 
 from motion_gen.motion_matching.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
-from motion_gen.motionbricks import family_for, save_terrain_plan                            # noqa: E402
+from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
+                                    save_terrain_plan)
 
 # Frames of the replay hashed into a segment key: MB is conditioned on a ~1 s window around the boundary
 # frame (its planning horizon / context), so a window this long covers everything the model can see.
@@ -165,14 +166,26 @@ def _box_tile_specs(rng, skill: str, sources, args, n_tiles: int) -> list[dict]:
                              nav_width_range=tuple(args.tile_width_range))
     print(f"[mb_plan] {skill}: box heights={heights} -> {len(specs)} tiles")
     out = []
+    n_two = 0
     for i, s in enumerate(specs):
         t_rng = np.random.default_rng([args.seed + 4, _skill_seed(skill), i])
+        # ONE-SIDED vs TWO-SIDED is a TILE property: a one-sided tile is the bare jump box (no walkable
+        # platform), a two-sided one carries the platform its elevated segment walks on, and every clip on
+        # a tile must emit byte-identical geometry.  One-sided tiles teach the interaction on its own --
+        # run up and mount, or drop off and walk away -- without also demanding the on-box walk.
+        two_sided = bool(t_rng.random() < args.box_two_sided_frac)
+        n_two += two_sided
         out.append({"box_height": heights[int(s.source_idx) % len(heights)],
                     # 0 keeps the source box's own (narrow) width; anything else widens box + platform.
                     "box_nav_width": (float(s.nav_width) if args.box_nav_width < 0.0
                                       else float(args.box_nav_width)) or None,
-                    "box_top_s": _quantize(t_rng.uniform(*args.box_top_s_range), args.duration_step),
+                    "two_sided": two_sided,
+                    "box_approach_s": _quantize(t_rng.uniform(*args.box_approach_s_range),
+                                                args.duration_step),
+                    "box_exit_s": _quantize(t_rng.uniform(*args.box_exit_s_range), args.duration_step),
                     "box_top_vx": float(t_rng.uniform(*args.box_top_vx_range))})
+    print(f"[mb_plan] {skill}: {n_two} two-sided (box + platform) / {len(specs) - n_two} one-sided "
+          f"(bare box, terrain + ground side only)")
     return out
 
 
@@ -223,18 +236,29 @@ def main() -> int:
     p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
     p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
                    help="GROUND-level speed band for the box families (the run-up / walk-away).")
-    p.add_argument("--box-top-s-range", type=float, nargs=2, default=(2.0, 3.0), metavar=("MIN", "MAX"),
-                   help="Duration (s) of the ELEVATED segment on a box tile, sampled per tile. It sizes "
-                        "the walkable platform authored flush with the box top, so keeping it short keeps "
-                        "the box a box rather than a raised walkway -- but NOT below ~2 s: a mount's exit "
-                        "is context-seeded from a STANDING pose on the box and needs about that long to "
-                        "get walking (measured, jump_on exit at cmd 0.8 m/s: 1 s reaches 0.16 m/s, 2 s "
-                        "reaches 0.79, 3 s reaches 0.78). Under that the reference is still shuffling "
-                        "while its target_vel says walk, which is the mismatch this whole change removes.")
+    p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
+                   metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's LEAD-IN -- the segment before the interaction, "
+                        "sampled per tile. Whichever LEVEL that runs on depends on the family (jump_on "
+                        "leads in on the ground, the dismounts lead in along the box top), and when it is "
+                        "the elevated one it also sizes the top platform.")
+    p.add_argument("--box-exit-s-range", type=float, nargs=2, default=(2.5, 6.0), metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's TRAIL-AWAY -- the segment after the interaction "
+                        "(see --box-approach-s-range).")
     p.add_argument("--box-top-vx-range", type=float, nargs=2, default=(0.3, 0.7), metavar=("MIN", "MAX"),
-                   help="Speed band (m/s) of the ELEVATED segment on a box tile, sampled per tile. Modest, "
-                        "because platform length is roughly this times --box-top-s-range: with the 2 s "
-                        "floor above, this band keeps the authored top to ~1.1-2.6 m.")
+                   help="Speed band (m/s) of the ELEVATED segment on a box tile, sampled per tile. Modest "
+                        "on purpose: the top platform is sized from this times the elevated duration, so a "
+                        "fast on-box walk turns the box into a raised walkway.")
+    p.add_argument("--box-two-sided-frac", type=float, default=0.5,
+                   help="Fraction of box TILES that get the walkable top platform and an ELEVATED segment "
+                        "(approach + interaction + exit). The rest are the BARE jump box: terrain plus the "
+                        "GROUND side only -- run up and mount, or drop off and walk away -- which teaches "
+                        "the interaction without also demanding the on-box walk. Per TILE, not per clip: "
+                        "every clip on a terrain_id must emit byte-identical geometry.")
+    p.add_argument("--box-platform-buffer", type=float, default=1.0,
+                   help="Extra metres of top platform beyond the elevated segment's nominal travel, so the "
+                        "reference cannot walk off the far edge (the ground side needs none -- the tile "
+                        "keeps its floor there).")
     p.add_argument("--box-nav-width", type=float, default=-1.0,
                    help="y-width (m) the box AND its top platform are widened to. -1 (default) uses the "
                         "tile's sampled corridor width, 0 keeps the reference box's own narrow extents. "
@@ -302,15 +326,18 @@ def main() -> int:
             d_rng = np.random.default_rng([args.seed + 1, tid])
             a_s = _quantize(d_rng.uniform(*args.approach_s_range), args.duration_step)
             x_s = _quantize(d_rng.uniform(*args.exit_s_range), args.duration_step)
-            # A box family's ELEVATED end walks on a short authored platform rather than on ground the tile
-            # has for free, so it gets its own (shorter, slower) duration + speed -- otherwise a fast clip
-            # would author a multi-metre raised walkway and the box would stop being a box to jump onto.
-            top_s, top_vx = spec.get("box_top_s"), spec.get("box_top_vx")
+            # A box family's two ends get their own BOX-SPECIFIC durations, keyed by ORDER (the lead-in
+            # into the interaction vs the trail-away from it) rather than by level.  Order is what a caller
+            # actually reasons about, and level cannot express it: jump_on leads in on the GROUND while the
+            # dismounts lead in on the BOX TOP, so one shared "ground" range would have to be both the
+            # lead-in bound and the trail-away bound at once.  Box-specific because the shared
+            # --approach-s-range / --exit-s-range also drive STAIRS, whose platform is duration x speed with
+            # speeds to 2.6 m/s -- a 6 s box duration there would author a ~17 m stair platform.
+            # Whichever end is ELEVATED still sizes the top platform; _author_tile reads that off the family.
+            top_vx = spec.get("box_top_vx")
+            two_sided = bool(spec.get("two_sided", True))
             if kind == "box":
-                if family.approach_level == "upper":
-                    a_s = top_s
-                else:
-                    x_s = top_s
+                a_s, x_s = spec.get("box_approach_s"), spec.get("box_exit_s")
             v_rng = np.random.default_rng([args.seed + 2, tid])
             s_rng = np.random.default_rng([args.seed + 3, tid])
             speeds = _clip_speeds(v_rng, kind, args, cpt,
@@ -332,10 +359,9 @@ def main() -> int:
             for ci, (vx, g_mag, a_start) in enumerate(zip(speeds, ground_mags, starts)):
                 if kind != "box":
                     a_mag = x_mag = g_mag
-                elif family.approach_level == "upper":
-                    a_mag, x_mag = top_mag, g_mag    # dismount: in along the box top, away on the ground
                 else:
-                    a_mag, x_mag = g_mag, top_mag    # mount: run up on the ground, on along the box top
+                    mag = {elevated_side(family): top_mag, ground_side(family): g_mag}
+                    a_mag, x_mag = mag["approach"], mag["exit"]
                 job_args = SimpleNamespace(
                     skill=skill, source=args.source, library=args.library, hf_repo=args.hf_repo,
                     dt=args.dt, device=args.device, terrain_id=tid,
@@ -343,6 +369,8 @@ def main() -> int:
                     n_steps=spec.get("n_steps", 6), width=spec.get("width", 1.4),
                     nav_width=spec.get("nav_width"), box_height=spec.get("box_height", 0.45),
                     has_floor=spec.get("has_floor", True), box_nav_width=spec.get("box_nav_width"),
+                    box_platform_buffer=args.box_platform_buffer,
+                    two_sided=two_sided,
                     # The commanded GROUND-level speed varies per clip (the DP path's --transition-vels
                     # role), so a tile's clips differ in how fast the robot arrives at / leaves the terrain,
                     # not just in which reference was matched.  The elevated side is per TILE, because the
@@ -372,8 +400,17 @@ def main() -> int:
                     continue
                 save_terrain_plan(os.path.join(work, rel), plan)
                 a_key, x_key = _segment_keys(plan, args.approach_pin, args.exit_pin, a_start)
+                # A one-sided box tile has no ELEVATED segment: don't request it and don't record its key,
+                # so pass B never generates it and pass C knows to splice that side as None.
+                drop = elevated_side(family) if (kind == "box" and not two_sided) else None
+                if drop == "approach":
+                    a_key = None
+                elif drop == "exit":
+                    x_key = None
                 for key, side, pin in ((a_key, "approach", args.approach_pin),
                                        (x_key, "exit", args.exit_pin)):
+                    if key is None:
+                        continue
                     requests.setdefault(key, {"key": key, "side": side, "pin": pin, "plan": rel,
                                               "out": os.path.join("segments", f"{key}.npz"),
                                               "start": a_start if side == "approach" else "stand",
@@ -381,7 +418,7 @@ def main() -> int:
                     requests[key]["n_uses"] += 1
                 jobs.append({"family": skill, "kind": kind, "terrain_id": tid, "clip": ci,
                              "plan": rel, "approach_key": a_key, "exit_key": x_key,
-                             "approach_start": a_start,
+                             "approach_start": a_start, "two_sided": two_sided,
                              "vx": float(vx), "approach_s": a_s, "exit_s": x_s,
                              "approach_vx": float(a_mag), "exit_vx": float(x_mag),
                              "top_vx": (None if top_mag is None else float(top_mag)),

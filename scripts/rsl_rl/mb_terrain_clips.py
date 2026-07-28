@@ -177,7 +177,19 @@ def _author_tile(family, ts, args):
                                                         else args.approach_vx)
     ground_vx = plat_vx or ((args.approach_vx if ground_on_approach else args.exit_vx) or 1.0)
     plat_sign = box_platform_sign(family)
-    plat_len = max(0.5, float(top_s) * max(0.2, abs(float(top_vx or 1.0))) + 0.5)
+    # A ONE-SIDED tile has no elevated segment, so it needs no platform to walk on: it is the bare jump
+    # box -- exactly the geometry this family had before the platform existed.  ``box_tile_boxes``
+    # degenerates to a single box at ``platform_len <= 0``, so there is no separate code path.  The split
+    # is a TILE property, not a clip one: every clip on a terrain_id must emit byte-identical geometry
+    # (the RL importer meshes one mesh per tile), so platformed and bare clips cannot share a tile.
+    two_sided = bool(getattr(args, "two_sided", True))
+    # BUFFER past the nominal travel so the reference cannot walk off the far edge.  Needed because the
+    # nominal is only an estimate in BOTH directions: the elevated segment covers roughly
+    # vx * (s - 1.1) (gait initiation eats the first ~1.1 s, so usually LESS), but the exit ramp was
+    # measured overshooting its command by ~12%, so it can also be MORE.  The ground side needs no such
+    # margin -- a box tile keeps its floor, so running long there is flat ground, not a hole.
+    buf = float(getattr(args, "box_platform_buffer", 1.0) or 0.0)
+    plat_len = (max(buf, float(top_s) * max(0.2, abs(float(top_vx or 1.0))) + buf) if two_sided else 0.0)
     boxes = box_tile_boxes(box_size=box_size, platform_len=plat_len, platform_sign=plat_sign,
                            approach_len=max(1.0, float(ground_s) * max(0.3, abs(float(ground_vx))) + 1.0),
                            nav_width=(getattr(args, "box_nav_width", None) or None))
@@ -186,7 +198,7 @@ def _author_tile(family, ts, args):
     meta = {"geom": "box", "box_size": box_size, "box_top": upper_z,
             "box_height": float(tm.get("box_height", upper_z)), "clip_type": "box",
             "platform_len": float(plat_len), "platform_sign": float(plat_sign),
-            "nav_width": float(boxes[0]["size"][1])}
+            "platform_buffer": buf, "two_sided": two_sided, "nav_width": float(boxes[0]["size"][1])}
     return boxes, None, lower_z, upper_z, meta
 
 

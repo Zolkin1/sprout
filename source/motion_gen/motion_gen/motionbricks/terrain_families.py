@@ -130,6 +130,29 @@ def family_for(skill: str) -> TerrainFamily:
                        f"have {sorted(FAMILIES)}") from None
 
 
+def elevated_side(family: TerrainFamily) -> str:
+    """Which MB segment runs on the UPPER level -- ``"approach"`` or ``"exit"``.
+
+    The one fact a ONE-SIDED clip needs.  "Terrain plus the ground side only" means omitting the segment
+    on the upper level, and which one that is differs per family: a MOUNT lands up there so it is the
+    exit, a DISMOUNT starts up there so it is the approach.  Reading it off ``*_level`` keeps the
+    one-sided path family-agnostic instead of branching on the skill name.
+
+    Raises:
+        ValueError: if neither end is elevated (both levels ``"lower"``), which no family does today.
+    """
+    if family.exit_level == "upper":
+        return "exit"
+    if family.approach_level == "upper":
+        return "approach"
+    raise ValueError(f"{family.skill}: neither end runs on the upper level, so no side is elevated")
+
+
+def ground_side(family: TerrainFamily) -> str:
+    """Which MB segment runs on the LOWER level -- the complement of :func:`elevated_side`."""
+    return "approach" if elevated_side(family) == "exit" else "exit"
+
+
 def box_platform_sign(family: TerrainFamily) -> float:
     """Which side of the jump box (``+1`` = ``+x``, ``-1`` = ``-x``) the walkable TOP PLATFORM extends to.
 

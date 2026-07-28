@@ -133,14 +133,22 @@ def main() -> int:
     p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
     p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
                    help="GROUND-level speed band for the box families (the run-up / walk-away).")
-    p.add_argument("--box-top-s-range", type=float, nargs=2, default=(2.0, 3.0), metavar=("MIN", "MAX"),
-                   help="Duration (s) of a box clip's ELEVATED segment -- the walk along the box top after "
-                        "a mount / before a dismount. Sizes the platform authored flush with the box top; "
-                        "do not go below ~2 s (a mount's exit needs that long to get walking from its "
-                        "standing seed -- see mb_plan_library for the measurement).")
+    p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
+                   metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's LEAD-IN (the segment before the interaction). Keyed by "
+                        "ORDER, not level: jump_on leads in on the ground, the dismounts along the box top.")
+    p.add_argument("--box-exit-s-range", type=float, nargs=2, default=(2.5, 6.0), metavar=("MIN", "MAX"),
+                   help="Duration (s) of a box clip's TRAIL-AWAY (the segment after the interaction).")
     p.add_argument("--box-top-vx-range", type=float, nargs=2, default=(0.3, 0.7), metavar=("MIN", "MAX"),
                    help="Speed band (m/s) of a box clip's ELEVATED segment (see --box-top-s-range); "
                         "platform length is roughly their product.")
+    p.add_argument("--box-two-sided-frac", type=float, default=0.5,
+                   help="Fraction of box tiles with the top platform + an elevated segment; the rest are "
+                        "the bare box with the ground side only.")
+    p.add_argument("--box-platform-buffer", type=float, default=1.0,
+                   help="Extra metres of top platform beyond the elevated segment's nominal travel, so the "
+                        "reference cannot walk off the far edge (the ground side needs none -- the tile "
+                        "keeps its floor there).")
     p.add_argument("--box-nav-width", type=float, default=-1.0,
                    help="y-width (m) the box + its top platform are widened to; -1 = the tile's corridor "
                         "width, 0 = the reference box's own narrow extents.")
@@ -200,8 +208,11 @@ def main() -> int:
             "--clips-per-tile", str(cpt), "--seed", str(args.seed), "--device", args.device,
             "--stair-vel-range", *(str(v) for v in args.stair_vel_range),
             "--box-vel-range", *(str(v) for v in args.box_vel_range),
-            "--box-top-s-range", *(str(v) for v in args.box_top_s_range),
+            "--box-approach-s-range", *(str(v) for v in args.box_approach_s_range),
+            "--box-exit-s-range", *(str(v) for v in args.box_exit_s_range),
             "--box-top-vx-range", *(str(v) for v in args.box_top_vx_range),
+            "--box-two-sided-frac", str(args.box_two_sided_frac),
+            "--box-platform-buffer", str(args.box_platform_buffer),
             "--box-nav-width", str(args.box_nav_width),
             "--backward-vx-max", str(args.backward_vx_max),
             "--stair-floor-frac", str(args.stair_floor_frac),
