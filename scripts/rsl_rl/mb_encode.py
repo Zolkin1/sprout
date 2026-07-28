@@ -149,7 +149,9 @@ def _generate_clip(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, segs: li
         qpos_stream.append(qpos)
         raw_stream.append(np.asarray(cmd_raw, dtype=np.float32).copy())
         snap_stream.append(cmd)
-    kf_t, kf_qpos = mb.captured_keyframes()
+    # The third element is the per-keyframe KIND ("stride" / "terrain"); a flat clip only ever pins stride
+    # targets, so there is nothing to distinguish and the sidecar stays (t, qpos) as its consumers expect.
+    kf_t, kf_qpos, _kf_kind = mb.captured_keyframes()
     return (np.stack(qpos_stream, 0), np.stack(raw_stream, 0), np.stack(snap_stream, 0), kf_t, kf_qpos)
 
 

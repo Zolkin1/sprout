@@ -4,7 +4,10 @@
 
 Emits a scene XML (``robots/g1/<robot>_<scene>.xml``) that mirrors
 ``g1_21j_basic_scene.xml`` -- same lights / ground plane / assets / ankle sensors --
-but adds a handful of ascending staircases, each leading up to a flat top platform.
+but adds a handful of staircases. Each lane is **symmetric**: it climbs to a flat
+platform and then descends back to the floor on the far side, so it can be walked up
+one side and down the other (and looks the same entered from either end) instead of
+dead-ending on a plateau. ``--no_descent`` gives the old ascend-only shape.
 The scene is the sim2sim counterpart of the ``G1-teacher-clf-terrain`` training
 terrain: an *in-distribution playground* (not tied to any one clip) for driving the
 flow-matching generator + RL tracker over stairs with a joystick and watching the
@@ -131,51 +134,78 @@ def _box_geoms(box: Box) -> list[str]:
     ]
 
 
-def _lane_geoms(lane: Lane, rise: float, run: float, x_start: float, platform_depth: float) -> list[str]:
-    rise = lane.rise if lane.rise is not None else rise
-    run = lane.run if lane.run is not None else run
+def _lane_geoms(lane: Lane, rise: float, run: float, x_start: float, platform_depth: float,
+                descend: bool = True) -> list[str]:
     """Return the MuJoCo ``<geom>`` XML lines for one staircase lane.
 
-    Builds ``lane.steps`` full-height box pillars (step ``n`` occupies
-    ``x in [x_start + (n-1)*run, x_start + n*run]`` and ``z in [0, n*rise]``) followed
-    by a flat top platform flush with the last tread. All boxes are group 2 so the
-    height-scan ray hits them and the robot's default-collision feet rest on them.
+    Builds ``lane.steps`` ascending full-height box pillars (step ``n`` occupies
+    ``x in [x_start + (n-1)*run, x_start + n*run]`` and ``z in [0, n*rise]``) up to a
+    flat top platform flush with the last tread and, when ``descend`` is set, a mirrored
+    flight back down to the floor past the far platform edge. The lane is then
+    traversable end-to-end (approach -> up -> platform -> down -> floor) and symmetric:
+    it presents the same staircase whichever end it is entered from, so both the
+    ``stairs_up`` and ``stairs_down`` trained skills get exercised in one pass instead of
+    dead-ending on a plateau with a full-height drop off the far edge.
+
+    The descent needs only ``steps - 1`` pillars -- the last step down lands on the floor
+    -- so both flights have exactly ``lane.steps`` risers. Descending pillars are
+    full-height from ``z = 0`` like the ascending ones, keeping clean tread tops and
+    vertical risers with no gaps for a foot to catch.
+
+    All boxes are group 2 so the height-scan ray hits them and the robot's
+    default-collision feet rest on them.
 
     Args:
-        lane: The lane geometry (lateral centre, width, step count).
-        rise: Per-step height (m).
-        run: Per-step depth / tread run (m).
+        lane: The lane geometry (lateral centre, width, step count, optional rise/run).
+        rise: Scene-wide per-step height (m); overridden by ``lane.rise``.
+        run: Scene-wide per-step depth / tread run (m); overridden by ``lane.run``.
         x_start: World x (m) of the first riser (front of step 1).
-        platform_depth: Depth (m) of the flat platform past the last tread.
+        platform_depth: Depth (m) of the flat platform between the two flights.
+        descend: Emit the mirrored descending flight past the platform.
 
     Returns:
         A list of formatted ``<geom .../>`` XML strings for this lane.
     """
+    rise = lane.rise if lane.rise is not None else rise
+    run = lane.run if lane.run is not None else run
     hy = lane.width / 2.0
-    lines: list[str] = [f'        <!-- {lane.name} staircase: {lane.steps} steps, width {lane.width} m -->']
-    for n in range(1, lane.steps + 1):
-        top_z = n * rise
-        cx = x_start + (n - 0.5) * run
-        lines.append(
-            f'        <geom name="{lane.name}_step{n}" type="box" '
+
+    def _pillar(name: str, cx: float, top_z: float) -> str:
+        """One full-height tread pillar spanning ``z in [0, top_z]``, centred at ``cx``."""
+        return (
+            f'        <geom name="{name}" type="box" '
             f'size="{run / 2.0:.4f} {hy:.4f} {top_z / 2.0:.4f}" '
             f'pos="{cx:.4f} {lane.y:.4f} {top_z / 2.0:.4f}" '
             f'group="2" material="box_material"/>'
         )
+
+    flights = f"{lane.steps} up + {lane.steps} down" if descend else f"{lane.steps} up"
+    lines: list[str] = [
+        f'        <!-- {lane.name} staircase: {flights}, width {lane.width} m -->'
+    ]
+    for n in range(1, lane.steps + 1):
+        lines.append(_pillar(f"{lane.name}_step{n}", x_start + (n - 0.5) * run, n * rise))
+
     top_z = lane.steps * rise
-    cx = x_start + lane.steps * run + platform_depth / 2.0
+    x_platform_start = x_start + lane.steps * run
     lines.append(
         f'        <geom name="{lane.name}_platform" type="box" '
         f'size="{platform_depth / 2.0:.4f} {hy:.4f} {top_z / 2.0:.4f}" '
-        f'pos="{cx:.4f} {lane.y:.4f} {top_z / 2.0:.4f}" '
+        f'pos="{x_platform_start + platform_depth / 2.0:.4f} {lane.y:.4f} {top_z / 2.0:.4f}" '
         f'group="2" material="box_material"/>'
     )
+
+    if descend:
+        x_desc = x_platform_start + platform_depth  # far platform edge = first descending riser
+        for m in range(1, lane.steps):
+            lines.append(_pillar(f"{lane.name}_down{m}", x_desc + (m - 0.5) * run,
+                                 (lane.steps - m) * rise))
     return lines
 
 
 def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: float,
                     x_start: float, platform_depth: float,
-                    boxes: tuple[Box, ...] = ()) -> str:
+                    boxes: tuple[Box, ...] = (), descend: bool = True) -> str:
     """Assemble the full MuJoCo scene XML string.
 
     Mirrors ``g1_21j_basic_scene.xml`` (visual / asset / ankle sensors / lights +
@@ -188,15 +218,16 @@ def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: f
         rise: Per-step height (m).
         run: Per-step depth / tread run (m).
         x_start: World x (m) of the first riser.
-        platform_depth: Depth (m) of each flat top platform.
+        platform_depth: Depth (m) of each flat platform.
         boxes: Free-standing jump-on/off boxes to add (see :data:`DEFAULT_BOXES`).
+        descend: Give every lane a mirrored descending flight past its platform.
 
     Returns:
         The complete scene XML as a string.
     """
     stair_lines: list[str] = []
     for lane in lanes:
-        stair_lines.extend(_lane_geoms(lane, rise, run, x_start, platform_depth))
+        stair_lines.extend(_lane_geoms(lane, rise, run, x_start, platform_depth, descend))
     for box in boxes:
         stair_lines.extend(_box_geoms(box))
     stairs = "\n".join(stair_lines)
@@ -289,7 +320,12 @@ def main() -> None:
     parser.add_argument("--x_start", type=float, default=DEFAULT_X_START,
                         help="Flat approach (m) before the first riser (robot spawns at x=0).")
     parser.add_argument("--platform_depth", type=float, default=DEFAULT_PLATFORM_DEPTH,
-                        help="Flat top-platform depth (m) past the last tread.")
+                        help="Flat platform depth (m) between the ascending and descending flights.")
+    parser.add_argument("--no_descent", dest="descend", action="store_false", default=True,
+                        help="Emit ascending stairs only, dead-ending on the top platform. Default "
+                             "is symmetric: every lane also gets a mirrored flight back down to the "
+                             "floor, so it can be walked up one side and down the other (and is "
+                             "identical entered from either end).")
     parser.add_argument("--lane", action="append", dest="lanes", type=str, default=None,
                         help="Add a staircase 'width:steps[:y]' (repeatable). Omit for the default 3 lanes.")
     parser.add_argument("--box", action="append", dest="boxes", type=str, default=None,
@@ -322,7 +358,7 @@ def main() -> None:
                   f"{TRAINED_RISERS}/{TRAINED_TREADS} -- deliberate OOD test?")
 
     xml = build_scene_xml(f"{args.robot}.xml", lanes, args.rise, args.run,
-                          args.x_start, args.platform_depth, boxes)
+                          args.x_start, args.platform_depth, boxes, args.descend)
 
     if args.out is not None:
         out_path = args.out
@@ -332,17 +368,24 @@ def main() -> None:
     with open(out_path, "w") as f:
         f.write(xml)
 
-    total_geoms = sum(lane.steps + 1 for lane in lanes) + len(boxes)
+    # Per lane: `steps` ascending pillars + 1 platform + (steps - 1) descending pillars.
+    total_geoms = sum(2 * ln.steps if args.descend else ln.steps + 1 for ln in lanes) + len(boxes)
+    profile = "up -> platform -> down (symmetric)" if args.descend else \
+              "up -> platform (dead end, --no_descent)"
     print(f"[INFO] Wrote {out_path}")
     print(f"[INFO] {len(lanes)} staircase(s) + {len(boxes)} box(es), {total_geoms} terrain "
           f"geoms (group 2). Scene-wide rise={args.rise} m run={args.run} m; lanes may override.")
+    print(f"[INFO] Lane profile: {profile}")
     for lane in lanes:
         # Report each lane's EFFECTIVE geometry, not the scene-wide default -- with per-lane
         # overrides those differ, and the emitted geoms follow the lane.
         r = lane.rise if lane.rise is not None else args.rise
         rn = lane.run if lane.run is not None else args.run
-        print(f"       - {lane.name}: width {lane.width} m, {lane.steps} steps, "
-              f"rise {r} m / run {rn} m (top {lane.steps * r:.3f} m) at y={lane.y}")
+        span = lane.steps * rn * (2 if args.descend else 1) + args.platform_depth
+        print(f"       - {lane.name}: width {lane.width} m, {lane.steps} steps"
+              f"{' up + ' + str(lane.steps) + ' down' if args.descend else ''}, "
+              f"rise {r} m / run {rn} m (top {lane.steps * r:.3f} m) at y={lane.y}; "
+              f"x span {args.x_start:.2f}-{args.x_start + span:.2f} m")
     for b in boxes:
         print(f"       - {b.name}: height {b.height} m, {b.depth}x{b.width} m at "
               f"(x={b.x}, y={b.y})")

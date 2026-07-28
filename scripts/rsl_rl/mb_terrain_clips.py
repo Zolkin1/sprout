@@ -334,7 +334,12 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
     qpos = torch.cat([Wp, Wq, Wj], dim=-1).detach().cpu().numpy().astype(np.float32)
     meta = dict(tile_meta)
     meta.update({
-        "boxes": [{"pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
+        # Coerce the placement-critical fields to plain floats (they may arrive as numpy scalars, which
+        # do not survive the JSON round trip), but carry every OTHER authored key through verbatim: a
+        # support-structure key like ``variant`` / ``slab_thickness`` is authored here and consumed much
+        # later by ``overlays_for``, so dropping unrecognised keys silently downgrades the tile to solid.
+        "boxes": [{**{k: v for k, v in b.items() if k not in ("pos", "size", "yaw")},
+                   "pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
                    "yaw": float(b.get("yaw", 0.0))} for b in boxes],
         "reference": ts.name, "reference_speed": ref_speed, "rl_vx": float(rl_vx),
         "terrain_id": int(args.terrain_id), "footprint_margin": float(args.footprint_margin),
@@ -660,6 +665,9 @@ def main() -> int:
                         "way, so the reference motion is unchanged -- only the mesh below it. Clamped per "
                         "tread to that tread's height.")
     p.add_argument("--box-height", type=float, default=0.45, help="[box] target box height (m).")
+    p.add_argument("--box-platform-buffer", type=float, default=1.0,
+                   help="[box] extra metres of top platform beyond the elevated segment's nominal travel, "
+                        "so the reference cannot walk off the far edge.")
     p.add_argument("--box-nav-width", type=float, default=0.0,
                    help="[box] y-width (m) to widen the box AND its top platform to (expand-only); "
                         "0 keeps the reference box's own extents.")
