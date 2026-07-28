@@ -91,7 +91,7 @@ class G1RunningRefreshCLFEnvCfg(G1MultiSkillCLFEnvCfg):
         # Regenerated submission running trajectory (21 half-periodic solutions,
         # conditioner vel_x in [1.38, 3.29] m/s). Flat folder of YAMLs -> the
         # multiskill loader names the single skill "default".
-        self.commands.traj_ref.path = "trajectories/running/2026-07-06_11-46-52_running_config_icra_port"
+        self.commands.traj_ref.path = "trajectories/running/2026-07-13_08-42-52_running_config_icra_port_kinematic" #"trajectories/running/2026-07-06_11-46-52_running_config_icra_port"
 
         # Single skill ("default"); lin_vel_x = the trajectory's actual speed
         # coverage so commands map to an in-distribution trajectory.

@@ -30,6 +30,7 @@ Multi-seed 2x2 panel, two conditions x N seeds each::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import os
 
@@ -66,6 +67,7 @@ def _apply_paper_style() -> None:
 COLOR_CYCLE = ["#0077BB", "#EE7733", "#009988", "#CC3311", "#33BBEE", "#EE3377", "#BBBBBB", "#000000"]
 SINGLE_COL = (3.5, 2.8)
 DOUBLE_COL = (7.0, 4.5)
+PANEL_SIZE = (4.8, 3.0)  # per-metric panel (w, h) in inches for the multi-panel grid
 
 
 def _ema(values: np.ndarray, weight: float) -> np.ndarray:
@@ -134,6 +136,8 @@ def main() -> None:
     p.add_argument("--metric", default=None, help="Single-metric alias for --metrics.")
     p.add_argument("--ylabels", nargs="+", default=None, help="Y-axis label per metric.")
     p.add_argument("--ylabel", default=None, help="Single-metric y-axis label.")
+    p.add_argument("--log_metrics", nargs="+", default=None,
+                   help="Metric key(s) to render with a log y-axis (e.g. Loss/symmetry); others stay linear.")
     p.add_argument("--x_key", default="_step", help="X-axis metric key (default _step).")
     p.add_argument("--xlabel", default="Iteration")
     p.add_argument("--smooth", type=float, default=0.0, help="EMA weight in [0,1); 0 = off.")
@@ -141,6 +145,12 @@ def main() -> None:
                    help="Multi-seed shaded band: +-1 std (default), SEM, or none.")
     p.add_argument("--ncols", type=int, default=2)
     p.add_argument("--figsize", choices=["single", "double"], default="double", help="Only for a single metric.")
+    p.add_argument("--panel_size", nargs=2, type=float, default=list(PANEL_SIZE), metavar=("W", "H"),
+                   help="Per-metric panel size (inches) for the multi-panel grid (default 4.8 3.0). Grid figure "
+                        "= (W*ncols, H*nrows); a bar chart of matching width + one-panel height is (W*ncols, H).")
+    p.add_argument("--exact_size", action="store_true",
+                   help="Save at exactly the figure size (bbox_inches=None) instead of tight-cropping, so widths "
+                        "match a companion figure pixel-for-pixel when compositing (e.g. bar chart below).")
     p.add_argument("--grid", action="store_true")
     p.add_argument("--entity", default="zolkin-california-institute-of-technology-caltech")
     p.add_argument("--project", default="robot_rl")
@@ -185,13 +195,14 @@ def main() -> None:
         run_names[ref] = run.name
 
     n = len(metrics)
+    panel_w, panel_h = args.panel_size
     if n == 1:
         ncols, nrows = 1, 1
         figsize = SINGLE_COL if args.figsize == "single" else DOUBLE_COL
     else:
         ncols = min(args.ncols, n)
         nrows = math.ceil(n / ncols)
-        figsize = (4.8 * ncols, 3.7 * nrows)
+        figsize = (panel_w * ncols, panel_h * nrows)
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
     flat = axes.flat
 
@@ -209,6 +220,8 @@ def main() -> None:
                 ax.fill_between(gx, lo, hi, color=color, alpha=0.2, linewidth=0)
         ax.set_xlabel(args.xlabel)
         ax.set_ylabel(ylabels[mi] if ylabels else metric.replace("_", r"\_"))
+        if args.log_metrics and metric in set(args.log_metrics):
+            ax.set_yscale("log")
         if args.grid:
             ax.grid(True, alpha=0.3, linewidth=0.8)
     for j in range(n, nrows * ncols):
@@ -240,10 +253,19 @@ def main() -> None:
             dests.append(args.out)
     else:
         dests.append(args.out)
-    for d in dests:
-        for ext in ("png", "svg"):
-            fig.savefig(f"{d}.{ext}")
+    # --exact_size: save the full canvas at exactly `figsize` (override the paper
+    # style's tight-crop) so a companion bar chart of the same width lines up.
+    save_ctx = mpl.rc_context({"savefig.bbox": "standard"}) if args.exact_size else contextlib.nullcontext()
+    with save_ctx:
+        for d in dests:
+            for ext in ("png", "svg"):
+                fig.savefig(f"{d}.{ext}")
     print("[done] wrote:\n  " + "\n  ".join(f"{d}.png / {d}.svg" for d in dests))
+    if n > 1:
+        print(f"[size] grid = {figsize[0]:.2f} x {figsize[1]:.2f} in ({ncols}x{nrows} panels of "
+              f"{panel_w:g} x {panel_h:g}). For a matching bar chart (same width, one panel tall):\n"
+              f"       plot_tracking_bars.py --match_grid {ncols} --panel_size {panel_w:g} {panel_h:g}"
+              f"{' --exact_size' if args.exact_size else ''}  -> {panel_w*ncols:.2f} x {panel_h:g} in")
 
 
 if __name__ == "__main__":

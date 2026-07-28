@@ -25,6 +25,7 @@ Pelvis/ankle tracking error, two runs, clean labels, saved into the run folder::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 
 import matplotlib as mpl
@@ -73,16 +74,34 @@ def main() -> None:
     p.add_argument("--metric_prefix", default="frame_track_err",
                    help="Plot all '<prefix>:<category>' rows (default frame_track_err).")
     p.add_argument("--velocity", type=float, default=None, help="Which vx (default: first in the CSV).")
+    p.add_argument("--frames", nargs="+", default=None,
+                   help="Only plot these frame categories, in this order (default: all in the CSV).")
+    p.add_argument("--exclude_frames", nargs="+", default=None,
+                   help="Drop these frame categories (e.g. 'pelvis_link' to show the feet only).")
     p.add_argument("--labels", nargs="+", default=None, help="Clean policy labels, in CSV policy order.")
     p.add_argument("--group", nargs="+", action="append", default=None, metavar="LABEL RUN...",
                    help="Multi-seed: LABEL followed by its seed run names (must match CSV policies). "
-                        "Repeat per condition. Bars show the across-seed mean; error bars = +-1 std "
-                        "ACROSS SEEDS (overrides the within-run std). Requires one eval over all seeds.")
+                        "Repeat per condition. Bars show the across-seed mean; error-bar meaning is set "
+                        "by --group_err. Requires one eval over all seeds.")
+    p.add_argument("--group_err", choices=["mean_std", "seed_std", "sem"], default="mean_std",
+                   help="Multi-seed error bar: 'mean_std' (default) = mean of the per-seed within-run stds "
+                        "(typical spread of the metric, averaged over seeds); 'seed_std' = std of the "
+                        "per-seed means (seed-to-seed reproducibility); 'sem' = that std / sqrt(n_seeds).")
     p.add_argument("--ylabel", default="Position tracking error (m)")
     p.add_argument("--title", default=None, help="Optional title (off by default; papers use captions).")
     p.add_argument("--no_error_bars", action="store_true",
                    help="Disable +-1 std error bars (drawn by default when '<prefix>_std:*' rows exist).")
     p.add_argument("--figsize", nargs=2, type=float, default=[7.0, 4.5])
+    p.add_argument("--match_grid", type=int, default=None, metavar="COLS",
+                   help="Size this chart to sit under a plot_wandb_rewards.py grid: figure becomes "
+                        "(panel_w*COLS, panel_h) -- same width as the grid, exactly one panel tall. "
+                        "Overrides --figsize.")
+    p.add_argument("--panel_size", nargs=2, type=float, default=[4.8, 3.0], metavar=("W", "H"),
+                   help="Per-panel size (inches) used with --match_grid; must match the grid's --panel_size "
+                        "(default 4.8 3.0).")
+    p.add_argument("--exact_size", action="store_true",
+                   help="Save at exactly the figure size (bbox_inches=None) instead of tight-cropping, so the "
+                        "width matches the companion grid figure pixel-for-pixel.")
     p.add_argument("--out", default="tracking_bars", help="Output basename (writes .png and .svg).")
     p.add_argument("--save_to_runs", action="store_true",
                    help="Save into each involved run's figures/ folder instead of the CWD.")
@@ -105,44 +124,79 @@ def main() -> None:
 
     policies = list(dict.fromkeys(mean_df["policy"]))     # preserve CSV order
     categories = list(dict.fromkeys(mean_df["category"]))
+    if args.frames:                                   # whitelist, in the user's order
+        missing_f = [f for f in args.frames if f not in categories]
+        if missing_f:
+            raise SystemExit(f"[error] --frames not in the CSV categories {categories}: {missing_f}")
+        categories = list(dict.fromkeys(args.frames))
+    if args.exclude_frames:                           # blacklist (e.g. drop pelvis -> feet only)
+        drop = set(args.exclude_frames)
+        categories = [c for c in categories if c not in drop]
+    if not categories:
+        raise SystemExit("[error] no frame categories left after --frames/--exclude_frames.")
     if args.labels and len(args.labels) != len(policies):
         raise SystemExit(f"[error] --labels needs {len(policies)} entries (policies: {policies}).")
     disp = args.labels if args.labels else [_pretty(p_) for p_ in policies]
 
     mpivot = mean_df.pivot_table(index="policy", columns="category", values="value")
 
+    # Within-run std rows ('<prefix>_std:<frame>') -> spivot[policy, frame], if present.
+    std_df = df_all[df_all["metric"].str.startswith(f"{args.metric_prefix}_std:")].copy()
+    spivot = None
+    if not std_df.empty:
+        std_df["category"] = std_df["metric"].str.split(":", n=1).str[1]
+        spivot = std_df.pivot_table(index="policy", columns="category", values="value")
+
+    def _std_lookup(pol: str, cat: str) -> float:
+        """Within-run std for (policy, frame); NaN if absent."""
+        if spivot is None or pol not in spivot.index or cat not in spivot.columns:
+            return float("nan")
+        return float(spivot.loc[pol, cat])
+
     if args.group:
-        # Multi-seed: one series per condition; value = across-seed mean, error =
-        # across-seed std (the paper-standard N-seed error bar).
+        # Multi-seed: one series per condition. Bar = across-seed mean; error bar per --group_err.
         groups = [(g[0], g[1:]) for g in args.group]
         series_labels = [lab for lab, _ in groups]
         missing = [r for _, runs in groups for r in runs if r not in mpivot.index]
         if missing:
             raise SystemExit(f"[error] group run(s) not in the CSV policies {list(mpivot.index)}: {missing}")
 
-        def _reduce(fn):
-            return np.array([[fn([mpivot.loc[r, cat] for r in runs]) for cat in categories]
-                             for _, runs in groups])
-        values = _reduce(np.nanmean)
-        errors = None if args.no_error_bars else _reduce(np.nanstd)
+        values = np.array([[np.nanmean([mpivot.loc[r, cat] for r in runs]) for cat in categories]
+                           for _, runs in groups])
+        if args.no_error_bars:
+            errors = None
+        elif args.group_err == "mean_std":            # mean of the per-seed within-run stds
+            if spivot is None:
+                print(f"[warn] no '{args.metric_prefix}_std:*' rows -- --group_err mean_std needs them; "
+                      "no error bars. (Re-run eval_compare_policies, or use --group_err seed_std.)")
+                errors = None
+            else:
+                errors = np.array([[np.nanmean([_std_lookup(r, cat) for r in runs]) for cat in categories]
+                                   for _, runs in groups])
+        else:                                          # seed_std / sem: on the per-seed means
+            errors = np.array([[np.nanstd([mpivot.loc[r, cat] for r in runs]) for cat in categories]
+                               for _, runs in groups])
+            if args.group_err == "sem":
+                errors = np.array([e / np.sqrt(len(runs)) for (_, runs), e in zip(groups, errors)])
     else:
         series_labels = disp
         values = np.array([[mpivot.loc[pol, cat] for cat in categories] for pol in policies])
-        # +-1 std error bars from the '<prefix>_std:*' rows (within-run std), when present.
+        # +-1 within-run std error bars from the '<prefix>_std:*' rows, when present.
         errors = None
         if not args.no_error_bars:
-            std_df = df_all[df_all["metric"].str.startswith(f"{args.metric_prefix}_std:")].copy()
-            if not std_df.empty:
-                std_df["category"] = std_df["metric"].str.split(":", n=1).str[1]
-                spivot = std_df.pivot_table(index="policy", columns="category", values="value")
-                errors = np.array([[spivot.loc[pol, cat] if (pol in spivot.index and cat in spivot.columns)
-                                    else np.nan for cat in categories] for pol in policies])
+            if spivot is not None:
+                errors = np.array([[_std_lookup(pol, cat) for cat in categories] for pol in policies])
             else:
                 print(f"[warn] no '{args.metric_prefix}_std:*' rows found -- no error bars "
                       "(re-run eval_compare_policies to regenerate the CSV with stds).")
 
     _apply_paper_style()
-    fig, ax = plt.subplots(figsize=tuple(args.figsize))
+    if args.match_grid:
+        pw, ph = args.panel_size
+        figsize = (pw * args.match_grid, ph)   # same width as the grid, one panel tall
+    else:
+        figsize = tuple(args.figsize)
+    fig, ax = plt.subplots(figsize=figsize)
     x = np.arange(len(categories))
     width = 0.8 / max(len(series_labels), 1)
     for i, lab in enumerate(series_labels):
@@ -173,9 +227,15 @@ def main() -> None:
             dests.append(args.out)
     else:
         dests.append(args.out)
-    for d in dests:
-        for ext in ("png", "svg"):
-            fig.savefig(f"{d}.{ext}")
+    # --exact_size: save the full canvas at exactly `figsize` (override the paper
+    # style's tight-crop) so widths match a companion figure pixel-for-pixel.
+    save_ctx = mpl.rc_context({"savefig.bbox": "standard"}) if args.exact_size else contextlib.nullcontext()
+    with save_ctx:
+        for d in dests:
+            for ext in ("png", "svg"):
+                fig.savefig(f"{d}.{ext}")
+    print(f"[size] bar figure = {figsize[0]:.2f} x {figsize[1]:.2f} in"
+          + (" (exact, no tight-crop)" if args.exact_size else ""))
     print("[done] wrote:\n  " + "\n  ".join(f"{d}.png / {d}.svg" for d in dests))
 
 
