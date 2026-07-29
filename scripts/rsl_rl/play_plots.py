@@ -916,12 +916,15 @@ def plot_domain_info(
     save_dir: str,
     env_ids: list[int],
 ) -> None:
-    """Phasing variable, current domain, and (optionally) gate offset + phase obs.
+    """Phasing variable and (optionally) gate offset + phase obs.
 
     Layout (rows added only when the corresponding data is present):
-      row 0: phasing_var | current_domain
+      row 0: phasing_var (full width)
       row 1 (if gate_rel_phi logged): gate offset (full width)
       row 2 (if phase_obs logged):    sin phase obs | cos phase obs
+
+    The old ``current_domain`` panel beside row 0 is gone: nothing has written that index since
+    the foot-stance removal, so it only ever drew a flat line at its -1 init value.
     """
     if "phasing_var" not in data:
         print("[WARN plot_domain_info] Missing phasing_var data, skipping.")
@@ -944,21 +947,12 @@ def plot_domain_info(
 
         row = 0
 
-        # Row 0: phasing var | current domain
-        ax_phi = fig.add_subplot(gs[row, 0])
+        # Row 0: phasing var (spans both columns now that the domain panel is gone)
+        ax_phi = fig.add_subplot(gs[row, :])
         ax_phi.plot(time_s, data["phasing_var"][:, env_id], linewidth=2)
         ax_phi.set_title("Phasing Var")
         ax_phi.set_xlabel("Time (s)")
         ax_phi.grid(True, alpha=0.3)
-
-        ax_dom = fig.add_subplot(gs[row, 1])
-        if "current_domain" in data:
-            ax_dom.plot(time_s, data["current_domain"][:, env_id], linewidth=2)
-            ax_dom.set_title("Current Domain")
-            ax_dom.set_xlabel("Time (s)")
-            ax_dom.grid(True, alpha=0.3)
-        else:
-            ax_dom.set_visible(False)
         row += 1
 
         # Row 1 (optional): gate offset spans both columns
@@ -1012,68 +1006,38 @@ def plot_reference_frame(
     save_dir: str,
     env_ids: list[int],
 ) -> None:
-    """Reference-frame position and identity over time, for debugging skill transitions.
+    """World-frame x/y/z of the clip's reference-frame pose over time (3 rows per env).
 
-    Produces a 4-row figure per env:
-      1-3. World-frame x/y/z of the current reference frame.
-      4. Which reference frame is in use (step plot, y-ticks labelled with frame names).
+    ``ref_poses`` is the clip WORLD-PLACEMENT pose the teacher/tracker writes each step, so this
+    tracks where the reference is being placed.
 
-    Background spans in the top three rows are colour-coded by the active
-    frame, so transitions show up as a colour change at a stance boundary.
-    This makes it easy to spot weird switches (e.g. left-foot ref becoming
-    right-foot mid-swing after a skill change).
+    There used to be a 4th row (which reference frame is in use) plus colour-coded background
+    spans keyed to it, for spotting stance swaps (e.g. left-foot ref becoming right-foot
+    mid-swing). Both are gone with the foot-stance paradigm: a single non-contact frame
+    (``pelvis_link``) is used throughout, so there is no identity to switch.
     """
-    if "ref_poses" not in data or "cur_ref_frame_idx" not in data:
-        print("[WARN plot_reference_frame] Missing ref_poses or cur_ref_frame_idx, skipping.")
+    if "ref_poses" not in data:
+        print("[WARN plot_reference_frame] Missing ref_poses, skipping.")
         return
 
     ref_poses = data["ref_poses"]            # [T, N_envs, 7]
-    ref_idx = data["cur_ref_frame_idx"]      # [T, N_envs]
     dt = metadata.get("dt", 1.0)
     time_s = np.arange(ref_poses.shape[0]) * dt + metadata.get("t_offset", 0.0)
-    frame_names = metadata.get("ref_frames", [])
-    n_frames = max(int(ref_idx.max()) + 1, len(frame_names), 1)
     axis_labels = ("X", "Y", "Z")
-    cmap = plt.cm.tab10
 
     for env_id in env_ids:
-        idx_env = ref_idx[:, env_id].astype(int)
         pos_env = ref_poses[:, env_id, :3]
 
-        fig, axs = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
+        fig, axs = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
         fig.suptitle(f"Reference Frame (Env {env_id})", fontsize=16)
 
-        # Identify frame-change boundaries for axvspan shading
-        changes = np.where(np.diff(idx_env) != 0)[0] + 1
-        segment_starts = np.concatenate([[0], changes])
-        segment_ends = np.concatenate([changes, [len(idx_env)]])
-
-        # Top 3 rows: x, y, z over time with colour-shaded spans per segment
         for i in range(3):
             ax = axs[i]
-            for s, e in zip(segment_starts, segment_ends):
-                ax.axvspan(time_s[s], time_s[min(e, len(time_s) - 1)],
-                           color=cmap(idx_env[s] % 10), alpha=0.15, linewidth=0)
             ax.plot(time_s, pos_env[:, i], color="black", linewidth=1.5)
             ax.set_ylabel(f"{axis_labels[i]} (m)")
             ax.set_title(f"Ref Frame Position — {axis_labels[i]}", fontsize=10)
             ax.grid(True, alpha=0.3)
-
-        # Bottom row: ref frame identity step plot
-        ax = axs[3]
-        ax.step(time_s, idx_env, where="post", color="black", linewidth=1.5)
-        # Colour each segment
-        for s, e in zip(segment_starts, segment_ends):
-            ax.axvspan(time_s[s], time_s[min(e, len(time_s) - 1)],
-                       color=cmap(idx_env[s] % 10), alpha=0.3, linewidth=0)
-        ax.set_yticks(range(n_frames))
-        if frame_names:
-            ax.set_yticklabels(frame_names[:n_frames])
-        ax.set_ylim(-0.5, n_frames - 0.5)
-        ax.set_ylabel("Ref Frame")
-        ax.set_xlabel("Time (s)")
-        ax.set_title("Reference Frame In Use", fontsize=10)
-        ax.grid(True, alpha=0.3)
+        axs[-1].set_xlabel("Time (s)")
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(save_dir, f"reference_frame_env{env_id}.png"),

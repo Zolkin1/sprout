@@ -140,8 +140,10 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         via the per-DOF anchor mask), so the clip's ``ref_frame`` need not be a contact body -- it
         is just the clip's base/world frame (e.g. ``pelvis_link``).
 
-        TODO(foot-ref-frame removal / "scope 2"): once the foot-stance paradigm is deleted (see the
-        TODO in base_trajectory_cmd.py), the clip ``ref_frame`` meta and this hook go away entirely.
+        Kept as an explicit no-op so the reason is recorded at the override site. NOTE the base
+        ``_verify_contact_frames`` is itself an empty extension-point hook, so nothing anywhere
+        currently validates contact frames -- this override is documentation, not a behaviour
+        change, and both could go if the hook is ever removed from the base class.
         """
         return
 
