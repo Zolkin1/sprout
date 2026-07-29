@@ -333,8 +333,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         total_time: Stop after this many seconds (``<= 0`` runs until the viewer closes).
         headless: Run without the viewer.
         log_path: CSV path for per-step metrics, or ``None`` to skip logging.
-        warmup_time: Seconds to PD-hold the stand before live control (``<= 0`` skips
-            the hold and falls back to a static warm-start fill).
+        warmup_time: Seconds to PD-hold the stand before live control. DEFAULTS TO 0 (skip the
+            hold; fall back to a static warm-start fill), because ``null_history_warmup``
+            makes the FM valid at step 0 without needing real snapshots in the window, so the
+            hold only delays the thing you launched the runner to see. A positive value also
+            arms the joystick start-button gate in viewer runs.
         rt_factor: Real-time speed multiple for viewer playback (``1.0`` = real time,
             ``0.5`` = half speed; ``<= 0`` disables pacing).
         standing_config: Path to a standing ``config_solution.yaml`` to spawn + hold; if
@@ -831,11 +834,17 @@ def main() -> None:
                              "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
                              "standing joint pose is kept; only the support height changes. "
                              "Pair with --warmup_time 0 to hand straight to the FM on the box.")
-    parser.add_argument("--warmup_time", type=float, default=1.0,
-                        help="Seconds to PD-hold a stand before live control. Pass 0 to spawn "
+    parser.add_argument("--warmup_time", type=float, default=0.0,
+                        help="Seconds to PD-hold a stand before live control. DEFAULT 0 = spawn "
                              "DIRECTLY into FM+tracker control: the FM history is warm-started "
                              "from the spawn state, the leg hold-gain stiffening is skipped, and "
-                             "the joystick start-button gate is disabled.")
+                             "the joystick start-button gate is disabled. The FM is valid at step "
+                             "0 regardless, because --null_history_warmup (also default on) "
+                             "samples it through the learned null-history embedding. Pass a "
+                             "POSITIVE value (e.g. 1.0, the old default) to get the stand hold "
+                             "back -- and, in a joystick viewer run, the start-button gate that "
+                             "holds until you press start. Ignored in --clip mode, which always "
+                             "spawns on the clip pose with RL gains.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
     parser.add_argument("--headless", action="store_true", default=False)
