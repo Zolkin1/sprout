@@ -145,6 +145,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "tau >= this (velocity/joint-velocity stay ungated).")
     parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
                         help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
+    parser.add_argument("--skip_distractors", action="store_true", default=_wc.skip_distractors,
+                        help="Drop DISTRACTOR-family windows (boxes the robot walks AROUND, not "
+                             "onto). Train-time switch -- recordings tag every window with "
+                             "'is_distractor', so A/B-ing needs no re-record. Errors if the "
+                             "recording predates the tag.")
     # Observation noise (train-time augmentation on the conditioning/history tokens only;
     # mirrors the RL teacher/tracker obs corruption). Defaults to ON. Amplitudes are
     # physical uniform half-widths; the command (target_vel) is never noised.
@@ -184,6 +189,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
         fk_pose_weight=args.fk_pose_weight, fk_vel_weight=args.fk_vel_weight,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
+        skip_distractors=args.skip_distractors,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,

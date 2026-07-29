@@ -43,20 +43,18 @@ from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_raw_motion, raw_to_world           # noqa: E402
 from motion_gen.motionbricks.distractor_plan import profile_segs, request_key  # noqa: E402
 from motion_gen.library_metadata import read_library_metadata
-from motion_gen.world_lift import anchor_mask_from_free                      # noqa: E402
+from motion_gen.world_lift import _ANCHOR_MASK_FLAT                          # noqa: E402
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
-_PINNED = int(anchor_mask_from_free(set()))       # world-pinned, exactly as the DP distractors are
-# TODO(distractor-ego-mask): distractors are FLAT walking that merely happens to route around
-# obstacle boxes, so their anchor mask should be the FLAT one (x, y, yaw FREE; z clip-fixed) --
-# NOT fully world-pinned. Pinned means no root DOF ever re-anchors onto the robot, so a
-# distractor env is never a re-anchor event: with the snap mask now tied to ego re-anchoring
-# (resets.py), these clips emit no FM windows at all, and under the old
-# ``ego_mask | ~is_flat`` they emitted windows that were pure tracking drift. The boxes are
-# obstacles to avoid, not surfaces to land on, so nothing needs world-pinning here.
-# Fix = use ``anchor_mask_from_free({"x", "y", "yaw"})`` (== _ANCHOR_MASK_FLAT) here and in
-# generate_distractor_clips.py, then regenerate the distractor family.
-# Until then, EXCLUDE the distractor family from FM recording libraries.
+# FLAT mask (downrange/lateral/yaw FREE, height clip-fixed) -- ego-anchored like flat walking, and
+# identical to the DP distractors in ``generate_distractor_clips._DISTRACTOR_MASK``. See that
+# module's ANCHOR docstring for the trade-off and for the per-step mask that would do better.
+#
+# DO NOT pin this. Both generators are held to this value by
+# ``source/robot_rl/tests/test_distractor_anchor_mask.py``; a pinned distractor silently poisons FM
+# recording (the snap fires but the placement cannot move, so the window's target is tracking
+# drift). To disable distractors for the FM, use ``train.py --skip_distractors`` instead.
+_DISTRACTOR_MASK = int(_ANCHOR_MASK_FLAT)
 _SHARED: dict = {}
 
 
@@ -140,7 +138,7 @@ def _assemble(args) -> int:
             "stride_idx": torch.full((1, T), -1, dtype=torch.int32),
             "terrain_id": torch.tensor([int(r["terrain_id"])], dtype=torch.int32),
             "terrain_type": "box",
-            "anchor_mask": torch.tensor([_PINNED], dtype=torch.uint8),
+            "anchor_mask": torch.tensor([_DISTRACTOR_MASK], dtype=torch.uint8),
             "clip_len": torch.tensor([int(r["n"])], dtype=torch.int32),
         })
     writer.close()

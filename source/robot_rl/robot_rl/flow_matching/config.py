@@ -65,6 +65,13 @@ class FlowMatchingConfig:
     # ``perturb_active`` array fall back to "all" regardless.
     recovery_mode: str = "clean_prediction"
 
+    # Drop the DISTRACTOR-family windows (boxes the robot walks AROUND, not onto). Those clips
+    # are ego-anchored like flat walking, so they do produce honest snap windows -- but whether
+    # they help the generator or just add obstacle-shaped noise is unresolved. Recordings carry a
+    # per-window ``is_distractor`` tag, so this is a train-time switch: no re-recording needed to
+    # A/B it. Errors (rather than silently training on them) if the recording has no tag.
+    skip_distractors: bool = False
+
     # Dedicated recorded command array (e.g. "target_vel") giving the per-step
     # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
     # (indices 0, cmd_stride, ...) and each sample becomes its own conditioning token
