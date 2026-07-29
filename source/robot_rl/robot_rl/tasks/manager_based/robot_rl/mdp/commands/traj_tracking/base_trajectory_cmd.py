@@ -3,9 +3,13 @@
 """Abstract base class for trajectory command terms.
 
 Holds the manager-agnostic, phase-free shared logic.  Concrete commands
-extend either this class directly (multi-skill, no phase state) or the
-:class:`PhasedTrajectoryCommand` subclass (single-skill, phase variable
-exposed as observation with hold-phi logic).
+(:class:`MotionSequenceCommand`, :class:`FmTrackingCommand`) extend it directly.
+
+There is NO phase-as-observation subclass: the single-skill
+``PhasedTrajectoryCommand`` (phase obs + hold-phi logic) and its
+``_phased_cmd`` / ``ref_sin_phase`` / ``ref_cos_phase`` observation terms were
+deleted with the single-skill stack.  Clip phase is now carried as
+``manager.phase`` (see :meth:`_update_command`), advanced from the clip step.
 """
 
 from __future__ import annotations
@@ -37,9 +41,10 @@ class BaseTrajectoryCommand(CommandTerm):
 
     Handles measured/desired output computation, CLF tracking, ref-frame
     bookkeeping, and metrics logging.  Trajectory advancement is time-based
-    only; no phasing variable is stored on this class.  Subclasses that
-    want phase-as-observation or hold-phi logic should extend
-    :class:`PhasedTrajectoryCommand` instead.
+    only; no phasing variable is stored on this class -- subclasses publish
+    progress as ``manager.phase`` instead (``MotionSequenceCommand`` sets it
+    from the clip step).  The old phase-as-observation / hold-phi subclass is
+    gone; see the module docstring.
 
     Subclasses must implement ``_create_manager`` and
     ``_verify_contact_frames``.
