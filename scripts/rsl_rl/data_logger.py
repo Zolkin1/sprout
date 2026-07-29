@@ -28,11 +28,13 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
 # Trajectory command term names to search for (in priority order)
 _TRAJ_TERM_NAMES = ("traj_ref", "hlip_ref")
 
-# Attributes to pull from the trajectory command term each step
+# Attributes to pull from the trajectory command term each step.
+# ``current_domain`` / ``cur_ref_frame_idx`` used to be logged here; the foot-stance path that
+# updated them is gone, so they were constants and are no longer allocated at all.
 _TRAJ_ATTRS = (
     "y_des", "y_act", "dy_des", "dy_act",
-    "v", "vdot", "current_domain", "phasing_var",
-    "ref_poses", "cur_ref_frame_idx",
+    "v", "vdot", "phasing_var",
+    "ref_poses",
 )
 
 
