@@ -600,7 +600,30 @@ class GenTrackerPolicy:
         return self._assemble(values)
 
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:
-        """Order, scale, and clip the terms per the embedded observation_terms.policy."""
+        """Order, scale, and clip the terms per the embedded observation_terms.policy.
+
+        TODO(deploy): this does NOT implement observation history, so a policy trained
+        with ``history_length`` on any term fails the dim check below on the first
+        control step (loudly, which is the intent -- the alternative is a silently
+        misaligned observation vector). The current teacher does exactly that, so this
+        path is broken until ported. What it owes, in order:
+
+        1. per-term ring buffers keyed on ``term["history_length"]`` (already parsed by
+           ``TrackerSession._resolve_obs_terms``), flattened OLDEST-FIRST and warm-started
+           by replicating the first sample into every slot -- Isaac Lab's
+           ``CircularBuffer`` semantics; ``transfer/sim/rl_policy.py:_update_history`` is
+           a correct reference port;
+        2. clip and scale applied PER TIMESTEP before stacking, not once over the stacked
+           slice -- Isaac Lab bakes them into each slot, and ``scale`` may be a vector, so
+           it needs tiling across the history (see ``rl_policy.py``'s ``np.tile``);
+        3. the new merged ``reference_window`` / ``command_window`` terms built in
+           ``_build_obs``, replacing the retired ``joint_pos_ref`` / ``ee_ref`` /
+           ``future_base_*`` terms;
+        4. ``GenTrackerPolicy.reset()`` clearing the new buffers.
+
+        See also the two blocked FM look-ahead accessors in ``fm_tracking_cmd.py``, which
+        must land before the generator can serve the window at all.
+        """
         out = np.zeros(self.get_num_obs(), dtype=np.float32)
         idx = 0
         for term in self._trk.get_obs_terms():

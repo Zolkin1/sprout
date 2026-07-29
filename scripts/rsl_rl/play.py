@@ -529,7 +529,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Export policy parameters (YAML with joint info, gains, obs terms, etc.)
         with torch.inference_mode():
             actions = policy(obs)
-        export_policy_parameters(env, obs, actions, log_dir)
+        # Pass the actor's group list: the actor concatenates several observation groups
+        # (proprioception + reference), and the exported term table has to enumerate them
+        # in that order for the deploy to rebuild the flat input vector.
+        export_policy_parameters(
+            env, obs, actions, log_dir, actor_obs_groups=agent_cfg.obs_groups.get("actor")
+        )
 
         # Deploy artifacts for the MuJoCo / hardware runners: exactly two ONNX files, the RL
         # tracker and (when an FM is loaded) the FM generator. Both carry their metadata

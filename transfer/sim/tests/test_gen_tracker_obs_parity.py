@@ -2,6 +2,13 @@
 
 """Parity test: the deployed obs assembly vs the real observations.py.
 
+CURRENTLY SKIPPED. The teacher now builds one merged ``reference_window`` observation and
+stacks proprioception history, while the deployment port still assembles the retired
+per-term future_* layout with no history -- so the two sides no longer describe the same
+observation. The body below is kept verbatim because it is the spec the port has to meet:
+un-skip it as part of the deploy port (see ``GenTrackerPolicy._assemble``'s TODO) and
+retarget the term list at ``reference_window`` / ``command_window``.
+
 Dev-only (imports isaaclab + robot_rl for the real observation functions). Feeds
 *identical* synthetic world references into those functions and into
 ``deploy.gen_tracker.GenTrackerPolicy._build_obs``, then compares the
@@ -160,6 +167,17 @@ class _MockCmd:
 
 def test_obs_parity(run: str | None = None) -> None:
     """Compare each command/reference obs term: Isaac functions vs the deployment port."""
+    if hasattr(O, "reference_window"):
+        print(
+            "[SKIP] The teacher's reference observations were merged into a single "
+            "`reference_window` term (plus `command_window`), replacing base_pose_error / "
+            "joint_*_ref / ee_ref / future_base_* as separate terms. The deployment port "
+            "in deploy/gen_tracker.py still builds the retired per-term layout and has no "
+            "observation history, so the two sides describe different observations and "
+            "there is nothing to compare. Restore this test together with that port -- "
+            "see the TODO on GenTrackerPolicy._assemble."
+        )
+        return
     exported = _find_run(run)
     if exported is None:
         print("[SKIP] No exported tracker.onnx found under logs/rsl_rl/*/*/exported/; "

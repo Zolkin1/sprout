@@ -222,20 +222,53 @@ flat task.
 | `G1-teacher-clf-terrain-play` | Play / record / export the teacher. One env per terrain tile. |
 | `G1-teacher-clf-terrain-sym` | Symmetry-augmented training. **Currently broken — see below.** |
 | `G1-teacher-clf-terrain-sym-play` | Play variant of the above. **Currently broken.** |
-| `G1-tracker-clf-fm-terrain-play` | Closed-loop deploy: the teacher tracks the FM predicted from live robot state. |
+| `G1-tracker-clf-fm-terrain-play` | Closed-loop deploy: the teacher tracks the FM predicted from live robot state. **Currently broken — see below.** |
 
 There is no separate tracker *training* task — the tracker policy **is** the teacher.
 
+### Teacher observations
+
+The teacher's actor takes **two** observation groups and routes them to two branches:
+
+| Group | Contents | Path |
+|---|---|---|
+| `policy` | 5 proprioception terms, each stacked over `PROPRIO_HISTORY_LENGTH` = 10 consecutive 50 Hz control steps (current + 9 back), plus the height scan (no history) | straight to the trunk |
+| `reference` | `reference_window` (base pose/vel + joint pos/vel + ee positions at `REFERENCE_NUM_STEPS` = 11 samples, `REFERENCE_STRIDE` = 5 steps apart → 0.0 … 1.0 s) and the clean `command_window` | through a `[1024, 512, 512]` MLP encoder |
+
+The three constants live at the top of `g1_teacher_env_cfg.py`; setting either count to 1
+degenerates to current-step-only. The critic sees the same history and the same
+(uncorrupted) window, plus the privileged world-frame CLF vectors.
+
+An **optional** auxiliary loss reconstructs the reference window from the encoder latent.
+It is off by default so it can be ablated, and needs no code change to turn on:
+
+```bash
+python scripts/rsl_rl/train.py --task=G1-teacher-clf-terrain --headless --clip <lib.h5> \
+    agent.actor.reconstruction=true agent.algorithm.reference_reconstruction_coeff=0.1
+```
+
+`AuxPPO` raises if the coefficient is non-zero without `actor.reconstruction=true`.
+
+> **`G1-tracker-clf-fm-terrain-play` does not currently run.** It shares the teacher's
+> observation config, and `reference_window` calls two `FmTrackingCommand` accessors that
+> deliberately raise (`get_future_joint_state` / `get_future_world_frames`) because they
+> would return clip data while the FM drives. Separately, the FM only predicts 0.78 s
+> (`FlowMatchingConfig.future_len = 40`) versus the teacher's 1.0 s window. Reviving it
+> needs both: implement the per-env FM/clip select in `fm_tracking_cmd.py`, then raise
+> `future_len` to ≥ 51 and **re-record + retrain** the FM (windows are cut at record time).
+> The MuJoCo/hardware deploy is blocked on the same change plus observation history in
+> `transfer/deploy/gen_tracker.py:_assemble` — see the TODO there.
+
 > **The two `-sym` tasks do not currently run.** They raise
-> `ValueError: Symmetry augmentation has no handler for obs term 'base_vel_ref'` at the first
-> PPO update. The teacher's reference observations (`base_vel_ref`, `ee_ref`,
-> `future_base_pose`, `future_base_vel`, ...) were added without registering reflection rules
-> in `motion_gen.sagittal_reflector.SagittalReflectionConfig`, and the augmentation
-> deliberately refuses to run rather than silently identity-copying the mirrored half of the
-> batch. This pre-dates the repo slim-down. To revive them, add each unhandled term with its
-> correct reflection (e.g. `base_vel_ref` negates vy + wz; `ee_ref` must swap the left/right
-> frames *and* negate y), extend `source/robot_rl/tests/test_sagittal_reflector.py`, then
-> smoke-train.
+> `ValueError: Symmetry augmentation has no handler for obs term ...` at the first PPO
+> update. The teacher's reference observations (now `reference_window` / `command_window`)
+> have no reflection rules in `motion_gen.sagittal_reflector.SagittalReflectionConfig`, and
+> the augmentation deliberately refuses to run rather than silently identity-copying the
+> mirrored half of the batch. This pre-dates the repo slim-down. To revive them, add both
+> terms with their correct reflection — `reference_window` is `[step0(D), step1(D), ...]`
+> and must be reflected per block within each step, using
+> `mdp.observations.reference_window_layout` for the widths — extend
+> `source/robot_rl/tests/test_sagittal_reflector.py`, then smoke-train.
 
 ## Deprecated: motion-matching / DP clip generation
 

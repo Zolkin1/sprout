@@ -55,15 +55,21 @@ if not _registered:
     #
     # !! CURRENTLY BROKEN -- these two raise at the first PPO update:
     #      ValueError: Symmetry augmentation has no handler for obs term 'base_vel_ref'
-    #    The teacher's reference observations (base_vel_ref, ee_ref, future_base_pose,
-    #    future_base_vel, ...) were added without registering reflection rules in
-    #    motion_gen.sagittal_reflector.SagittalReflectionConfig, and the augmentation
-    #    deliberately refuses to run rather than silently identity-copying the mirrored half
-    #    of the batch (which would poison training). Pre-dates the repo slim-down: the same
-    #    error reproduces on the old G1-teacher-clf-sym at 681a624.
-    #    To revive: add each unhandled term to SagittalReflectionConfig with the correct
-    #    reflection (e.g. base_vel_ref negates vy + wz; ee_ref must swap the left/right
-    #    frames AND negate y), extend tests/test_sagittal_reflector.py, then smoke-train.
+    #    The teacher's reference observations were added without registering reflection
+    #    rules in motion_gen.sagittal_reflector.SagittalReflectionConfig, and the
+    #    augmentation deliberately refuses to run rather than silently identity-copying the
+    #    mirrored half of the batch (which would poison training). Pre-dates the repo
+    #    slim-down: the same error reproduces on the old G1-teacher-clf-sym at 681a624.
+    #    The unhandled terms are now `reference_window` and `command_window` (the merged
+    #    look-ahead that replaced base_vel_ref / ee_ref / future_base_*). reference_window
+    #    is the harder one: it is [step0(D), step1(D), ...] where each step packs
+    #    base_pose(6) + base_vel(6) + joint_pos(nj) + joint_vel(nj) + ee_pos(3*n_ee), so
+    #    the handler must reflect per BLOCK within each step -- reuse
+    #    mdp.observations.reference_window_layout for the widths, and note the joint block
+    #    is in ROBOT joint order (so the existing joint reflection permutation applies
+    #    directly, unlike the clip-output-ordered joint_pos_ref).
+    #    To revive: add both terms to SagittalReflectionConfig, extend
+    #    tests/test_sagittal_reflector.py, then smoke-train.
     gym.register(
         id="G1-teacher-clf-terrain-sym",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
