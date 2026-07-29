@@ -368,6 +368,37 @@ class FmTrackingCommand(MotionSequenceCommand):
             torch.where(use_fm, self._pred_root_ang[ar, idx], ang_c),
         )
 
+    # The other two look-ahead accessors are NOT source-selected, so they are blocked rather
+    # than silently inherited. The base implementations gather the CLIP library, which is right
+    # for the teacher (the FM is trained to predict the clip future, so the recorder must read
+    # the clip) but would be a silent lie here: they would hand back clip data while
+    # ``use_fm`` is set, with nothing in the shapes or values to reveal it.
+    #
+    # Nothing calls them on this class today -- their only callers are ``record_data.py``, which
+    # records from the TEACHER task -- so these raise instead of guessing. If you need them,
+    # they ARE implementable: ``_run_fm`` predicts the full window including joints and the
+    # extra frames, so mirror ``get_future_world_base`` above and select per env on
+    # ``_pred_valid``. Do that rather than deleting the guard.
+    def get_future_joint_state(self, offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Blocked: would return CLIP joint futures while the FM drives. See the note above."""
+        raise NotImplementedError(
+            "FmTrackingCommand.get_future_joint_state is not source-selected: the inherited "
+            "implementation gathers the CLIP library, so in FM mode it would silently return "
+            "clip joint futures for envs the FM is driving. Record FM training data from the "
+            "TEACHER task (G1-teacher-clf-*), where the clip is the intended source. To use it "
+            "here, implement the per-env FM/clip select like get_future_world_base."
+        )
+
+    def get_future_world_frames(self, frame_names: list[str], offsets: torch.Tensor) -> torch.Tensor:
+        """Blocked: would return CLIP ee futures while the FM drives. See the note above."""
+        raise NotImplementedError(
+            "FmTrackingCommand.get_future_world_frames is not source-selected: the inherited "
+            "implementation lifts the CLIP library, so in FM mode it would silently return clip "
+            "end-effector futures for envs the FM is driving. Record FM training data from the "
+            "TEACHER task (G1-teacher-clf-*). To use it here, implement the per-env FM/clip "
+            "select like get_future_world_base."
+        )
+
     # ------------------------------------------------------------------
     # Debug visualization (FM-prediction ribbon + source marker on the clip ribbon)
     # ------------------------------------------------------------------

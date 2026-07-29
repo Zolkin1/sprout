@@ -7,7 +7,7 @@ import warp as wp
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_box_minus
+from isaaclab.utils.math import euler_xyz_from_quat, quat_box_minus, wrap_to_pi
 
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
@@ -81,6 +81,43 @@ def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
     clip_len = cmd.manager.clip_len
     last_step = clip_len[cmd.clip_id.to(clip_len.device)].to(cmd.start_step.device) - 1
     return (cmd.start_step + env.episode_length_buf) >= last_step
+
+def base_orientation_from_upright(
+    env,
+    roll_limit_deg: float = 70.0,
+    pitch_limit_deg: float = 70.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """True where the base roll or pitch deviates from world upright by more than the limits.
+
+    The reference is the world-frame upright (identity rotation), so YAW IS IGNORED: this is a
+    face-plant / fallen detector that does not depend on the tracking reference, and so is not
+    subject to whatever grace gating :func:`base_pose_error_termination` uses.
+
+    Restored 2026-07-29: this was deleted in ``a754728`` (the online reference-engine removal)
+    while :func:`base_fallen` kept calling it, leaving that termination -- and therefore the
+    whole ``G1-tracker-clf-fm-*`` task -- raising ``NameError`` on its first step. Implementation
+    is the pre-deletion one verbatim, so termination behaviour is unchanged from when it worked.
+
+    Args:
+        env: IsaacLab environment.
+        roll_limit_deg: Maximum allowed |roll| from upright in degrees.
+        pitch_limit_deg: Maximum allowed |pitch| from upright in degrees.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean tensor of shape ``[num_envs]`` -- ``True`` for envs that should terminate.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    act_quat = wp.to_torch(asset.data.root_quat_w)  # (x, y, z, w)
+    roll, pitch, _ = euler_xyz_from_quat(act_quat, wrap_to_2pi=False)
+    roll = wrap_to_pi(roll)
+    pitch = wrap_to_pi(pitch)
+
+    roll_limit = torch.deg2rad(torch.tensor(roll_limit_deg, device=act_quat.device))
+    pitch_limit = torch.deg2rad(torch.tensor(pitch_limit_deg, device=act_quat.device))
+    return (roll.abs() > roll_limit) | (pitch.abs() > pitch_limit)
+
 
 def base_fallen(
     env,
