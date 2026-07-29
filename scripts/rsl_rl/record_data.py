@@ -27,6 +27,7 @@ import argparse
 import contextlib
 import importlib.metadata as metadata
 import math
+import json
 import os
 import sys
 from datetime import datetime
@@ -239,6 +240,89 @@ def _resolve_ref_command(env: RslRlVecEnvWrapper, explicit_name: str | None):
         if hasattr(term, "get_reference_world_state"):
             return name, term
     return None, None
+
+
+def _audit_anchor_masks(ref_cmd) -> None:
+    """Warn LOUDLY if any clip in the library frees no root DOF.
+
+    FM training windows are cut at re-anchor (snap) events, and recording runs with
+    ``ego_anchor_fraction=1.0`` so the snap fires for EVERY env. A clip whose anchor mask frees
+    nothing still snaps, but its placement cannot move onto the robot -- so the dataset's
+    ego-anchored target encodes accumulated robot-vs-clip TRACKING DRIFT instead of a placement
+    decision. Nothing downstream can distinguish those windows from good ones, which is why this
+    is a shouted warning at record time rather than a quiet metric.
+
+    Checks the per-STEP schedule, so a clip that is pinned for only part of its length (the box
+    family's mount phase, legitimately) is NOT flagged -- only clips pinned at every step.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (``None`` -> nothing to check).
+    """
+    mgr = getattr(ref_cmd, "manager", None)
+    amt = getattr(mgr, "anchor_mask_t", None)
+    if amt is None or amt.numel() == 0:
+        return
+    pinned = (amt == 0).all(dim=1)                       # [num_clips] bool: no free DOF, ever
+    n_pinned = int(pinned.sum())
+    if n_pinned == 0:
+        return
+    n_total = int(pinned.numel())
+    ids = pinned.nonzero(as_tuple=False).squeeze(-1)[:10].tolist()
+    bar = "!" * 100
+    print(f"\n{bar}")
+    print(f"[WARN] {n_pinned}/{n_total} clips in this library free NO root DOF at ANY step "
+          f"(anchor_mask == 0).")
+    print(f"[WARN] first ids: {ids}{' ...' if n_pinned > len(ids) else ''}")
+    print("[WARN] These clips are NEVER re-anchored, but the FM snap still fires for them, so "
+          "every window")
+    print("[WARN] they contribute has a target made of robot-vs-clip TRACKING DRIFT rather than a "
+          "placement")
+    print("[WARN] decision -- and the dataset cannot tell those windows from good ones.")
+    print("[WARN] Regenerate the offending family with a mask that frees at least one root DOF "
+          "(e.g.")
+    print("[WARN] _ANCHOR_MASK_FLAT), or exclude it from this library before recording.")
+    print(f"{bar}\n")
+
+
+def _distractor_clip_mask(ref_cmd):
+    """Per-clip bool tensor: is this clip from the distractor family?
+
+    Read from the library's ``terrain_manifest`` ``family`` field (the composer stamps it per
+    tile), NOT from the anchor mask -- distractors are ego-anchored like flat clips now, so the
+    mask no longer distinguishes them. Recorded per step so
+    ``scripts/flow_matching/train.py --skip_distractors`` can drop those windows without a
+    re-record.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (``None`` -> no clips).
+
+    Returns:
+        ``[num_clips]`` bool tensor, or ``None`` if the library carries no manifest / terrain ids
+        (a pre-terrain or flat-only library has no distractors by construction).
+    """
+    mgr = getattr(ref_cmd, "manager", None)
+    lib = getattr(mgr, "lib", None)
+    if lib is None or getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
+        return None
+    manifest = lib.attrs.get("terrain_manifest") if hasattr(lib, "attrs") else None
+    if not manifest:
+        return None
+    if isinstance(manifest, str):
+        manifest = json.loads(manifest)
+    distractor_tids = {
+        int(e["terrain_id"]) for e in manifest
+        if "terrain_id" in e and "distractor" in str(e.get("family", "")).lower()
+    }
+    if not distractor_tids:
+        return None
+    tid = lib.terrain_id.to(torch.long)
+    flags = torch.zeros(tid.shape[0], dtype=torch.bool, device=tid.device)
+    for t in distractor_tids:
+        flags |= tid == t
+    print(f"[INFO] distractor family: {int(flags.sum())}/{int(flags.numel())} clips over "
+          f"{len(distractor_tids)} tiles -> recording per-step 'is_distractor' so "
+          f"train.py --skip_distractors can drop them later.")
+    return flags
 
 
 def _build_recording_meta(
@@ -590,6 +674,7 @@ def collect_windows(
     future_len: int,
     writer,
     max_steps: int | None = None,
+    distractor_clips=None,
 ) -> int:
     """Roll out and STREAM pre-formed FM snap windows to ``writer`` (bounded RAM).
 
@@ -706,6 +791,15 @@ def collect_windows(
                 "cmd_future": cmd_future_t[idx].detach().cpu().numpy(),
                 "episode_id": episode_id[idx].detach().cpu().numpy(),
             }
+            # Per-window distractor tag (see _distractor_clip_mask): recorded so training can
+            # drop these windows via --skip_distractors without re-recording. All-zero when the
+            # library has no distractor family, so the field is always present and unambiguous.
+            cid = ref_cmd.clip_id[idx]
+            batch["is_distractor"] = (
+                distractor_clips[cid.to(distractor_clips.device)].to(torch.uint8).cpu().numpy()
+                if distractor_clips is not None
+                else np.zeros(idx.numel(), dtype=np.uint8)
+            )
             if has_scan:
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
@@ -864,6 +958,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if state_frames:
             print(f"[INFO] Recording {len(state_frames)} extra state frames: {state_frames}")
 
+        # Anchor-mask audit: a clip with NO free root DOF can never be re-anchored, but the snap
+        # still fires, so its FM windows are tracking drift. Warn loudly rather than silently
+        # poisoning the recording (see _audit_anchor_masks).
+        _audit_anchor_masks(ref_cmd)
+        # Per-clip distractor flag, recorded so `train.py --skip_distractors` can drop those
+        # windows later without re-recording.
+        distractor_clips = _distractor_clip_mask(ref_cmd)
+
         meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_records, state_frames)
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
@@ -950,11 +1052,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             with RecordedWindowWriter(
                 out_path, num_records, H, node_dim, rf_len, K, cmd_dim, meta,
                 depth_shape=depth_shape,
+                # Always tag, even for a library with no distractor family (then all-zero): the
+                # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
+                # drop" from "this recording predates the tag" and refuse the latter.
+                tag_distractors=True,
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
                     ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
                     state_frames=state_frames, future_len=rf_len, writer=writer,
+                    distractor_clips=distractor_clips,
                 )
             prov_dir = os.path.splitext(out_path)[0] + ".provenance"
             git_snapshot(prov_dir)
