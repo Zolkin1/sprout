@@ -315,12 +315,10 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
         hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
-        cmd_max_acc: float, fm_traj_points: int,
-        clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
-        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
         clip_spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
-        clip: ClipReference | None = None, clip_handoff_time: float = -1.0) -> bool:
+        clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
+        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
@@ -364,6 +362,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         fm_traj_points: Number of evenly-spaced spheres drawn along the FM predicted root
             (and feet) trajectory in the viewer; ``<= 0`` draws every predicted node (a
             dense ribbon, matching the IsaacLab debug viz).
+        spawn_on_box: Name or index of a scene box to spawn standing on TOP of, instead of
+            the floor (``None`` -> floor). Only the support height changes; the standing
+            joint pose is kept. Warns and falls back to the floor if the box is not found.
         clip: Optional baked-clip reference source. When given, the robot spawns on the
             clip's step-0 pose and the tracker is driven by the clip reference (no FM)
             instead of the standing warmup + FM path.
@@ -1043,8 +1044,6 @@ def main() -> None:
                   args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
                   args.cmd_max_acc, args.fm_traj_points,
                   spawn_on_box=args.spawn_on_box,
-                  clip=clip, clip_handoff_time=clip_handoff_time)
-                  args.hold_kv_scale, args.spawn_z_offset, args.cmd_max_acc, args.fm_traj_points,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)
     print(f"[INFO] Run finished. Survived: {success}")
