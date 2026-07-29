@@ -633,7 +633,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     checkpoint, so a ``.pt`` is self-describing without the separate params YAML.
 
     The predicted extra-frame order is injected into the saved ``meta`` so
-    ``online.load_fm_context`` (and the deployment-side ``transfer/fm/online.py``)
+    ``online.load_fm_context`` (and the deploy-side ``transfer/deploy/fm_session.py``)
     reconstruct the exact token layout.
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))

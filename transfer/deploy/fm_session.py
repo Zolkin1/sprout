@@ -2,7 +2,7 @@
 
 """onnxruntime flow-matching generator session (numpy glue + ORT net).
 
-Numpy + onnxruntime counterpart of ``transfer/fm/online.py`` (robot-state
+Numpy + onnxruntime counterpart of ``robot_rl.flow_matching.online`` (robot-state
 conditioned). The ONNX (``fm.onnx``, exported by
 ``scripts/flow_matching/export_fm_onnx.py``) folds in the normalizers and the
 unrolled Euler sampler, so this builds the **raw** N history (phase) tokens (numpy
@@ -27,7 +27,7 @@ from .transforms_np import relative_state, state_to_absolute
 
 @dataclass
 class FmContext:
-    """Loaded ``fm.onnx`` session + metadata (mirrors ``transfer/fm`` FmOnlineContext)."""
+    """Loaded ``fm.onnx`` session + metadata (mirrors ``flow_matching.online`` FmOnlineContext)."""
 
     sess: ort.InferenceSession
     N: int
@@ -101,7 +101,7 @@ def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, j
                          frames=None) -> np.ndarray:
     """Build the **raw** ``N`` history (phase) tokens ``(V, N, D)`` (relative-state).
 
-    Unlike the torch ``transfer/fm`` builder, this does NOT normalize -- the
+    Unlike the torch ``flow_matching.online`` builder, this does NOT normalize -- the
     ``fm.onnx`` graph folds in the state normalization. Inputs are the ``N``
     most-recent real-robot steps ``(V, N, ·)`` in FM joint/frame order, world frame,
     xyzw quats; ``frames`` is ``(V,N,K,13)`` (required when the model predicts extra
@@ -201,7 +201,7 @@ def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, nois
             a graph exported without the ``history_null`` input.
 
     Returns:
-        World-frame prediction dict (same keys as ``transfer/fm`` ``sample_world``).
+        World-frame prediction dict (same keys as ``flow_matching.online.sample_world``).
     """
     feed = {
         "history": history.astype(np.float32),

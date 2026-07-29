@@ -2,9 +2,18 @@
 
 """Parity: numpy deploy core (quat_math_np / transforms_np) vs the torch oracle.
 
-Dev-only (imports torch via ``transfer/fm``). Asserts the numpy ports reproduce
-``transfer/fm/quat_math`` + ``transfer/fm/transforms`` numerically, so the
-torch-free deployment runtime stays faithful to the validated torch path.
+Dev-only (imports torch). Asserts the numpy ports reproduce their torch counterparts
+numerically, so the torch-free deployment runtime stays faithful to the validated path.
+
+The two oracles differ on purpose:
+
+* quaternion math -> ``transfer/torch_math/quat_math`` (isaaclab-free, so this half runs
+  in a torch-only env), itself pinned against ``isaaclab.utils.math`` in that package's
+  own parity test;
+* frame transforms -> ``robot_rl.flow_matching.transforms``, the REAL implementation the
+  training side uses. It pulls in isaaclab, so it is behind ``importorskip`` and this half
+  skips where IsaacSim is not installed. Previously this came from a vendored copy in
+  ``transfer/fm``; testing against the original removes the lock-step drift risk.
 
 Run: ``python transfer/deploy/tests/test_deploy_parity.py``
 """
@@ -15,6 +24,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 import torch
 
 _TRANSFER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,8 +32,7 @@ sys.path.insert(0, _TRANSFER)
 
 from deploy import quat_math_np as qn  # noqa: E402
 from deploy import transforms_np as tn  # noqa: E402
-from fm import quat_math as qt  # noqa: E402
-from fm import transforms as tt  # noqa: E402
+from torch_math import quat_math as qt  # noqa: E402
 
 
 def _rand_quat(n, g):
@@ -37,10 +46,13 @@ def _close(name, a_np, b_torch, atol=1e-10):
     print(f"  ok  {name:34s} max_err={err:.2e}")
 
 
-def test_deploy_parity() -> None:
-    """All numpy core ops match the torch versions on random inputs."""
+def test_deploy_parity_quat_math() -> None:
+    """The numpy quaternion ops match ``torch_math.quat_math`` on random inputs.
+
+    Isaaclab-free on both sides, so this runs in a torch-only environment.
+    """
     g = torch.Generator().manual_seed(0)
-    n, nj, K = 512, 21, 4
+    n = 512
     q1, q2 = _rand_quat(n, g), _rand_quat(n, g)
     v = torch.randn(n, 3, generator=g, dtype=torch.float64)
     p1, p2 = torch.randn(n, 3, generator=g, dtype=torch.float64), torch.randn(n, 3, generator=g, dtype=torch.float64)
@@ -62,6 +74,26 @@ def test_deploy_parity() -> None:
     R = qt.matrix_from_quat(q1)
     _close("quat_from_matrix(asR)", qn.matrix_from_quat(qn.quat_from_matrix(np_(R))),
            qt.matrix_from_quat(qt.quat_from_matrix(R)), atol=1e-8)
+    print("QUAT-MATH PARITY CHECKS PASSED")
+
+
+def test_deploy_parity_transforms() -> None:
+    """``transforms_np`` matches the REAL ``robot_rl.flow_matching.transforms``.
+
+    Skipped where isaaclab / IsaacSim is not installed (the training-side module imports
+    ``isaaclab.utils.math``).
+    """
+    # ``exc_type`` is required to skip (rather than error) when the module is FOUND but its
+    # own ``import isaaclab`` fails -- which is exactly the no-IsaacSim case. Without it
+    # pytest >= 9.1 turns this into a hard error.
+    tt = pytest.importorskip(
+        "robot_rl.flow_matching.transforms",
+        reason="needs the isaaclab env for the training-side transforms oracle",
+        exc_type=ImportError,
+    )
+    g = torch.Generator().manual_seed(0)
+    n, nj, K = 512, 21, 4
+    np_ = lambda t: t.detach().numpy()
 
     # --- transforms: relative_state round-trips through state_to_absolute ---
     pw, qw = torch.randn(n, 3, generator=g, dtype=torch.float64), _rand_quat(n, g)
@@ -84,8 +116,10 @@ def test_deploy_parity() -> None:
     # quat fields compared as rotation
     _close("state_to_absolute[root_quat asR]",
            qn.matrix_from_quat(abs_np["root_quat_w"]), qt.matrix_from_quat(abs_t["root_quat_w"]), atol=1e-7)
-    print("ALL DEPLOY-CORE PARITY CHECKS PASSED")
+    print("TRANSFORMS PARITY CHECKS PASSED")
 
 
 if __name__ == "__main__":
-    test_deploy_parity()
+    test_deploy_parity_quat_math()
+    test_deploy_parity_transforms()
+    print("ALL DEPLOY-CORE PARITY CHECKS PASSED")
