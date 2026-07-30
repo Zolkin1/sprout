@@ -360,7 +360,7 @@ class G1TeacherTerminationCfg:
     # The positional radii are being swept; the 0.8 rad bounds are unchanged.
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.4, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.3, "max_ori_rad": 0.8},
     )
     ee_pose_error = DoneTerm(
         func=mdp.tracked_frame_error_termination,
@@ -368,7 +368,7 @@ class G1TeacherTerminationCfg:
             "command_name": "traj_ref",
             "frame_names": ("left_ankle_roll_link", "right_ankle_roll_link",
                             "left_wrist_yaw_link", "right_wrist_yaw_link"),
-            "max_pos_dist": 0.4,
+            "max_pos_dist": 0.3,
             "max_ori_rad": 0.8,
         },
     )
@@ -410,8 +410,10 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         # half-reward at ~3x the V a live policy actually averages, which lands the
         # instantaneous reward near 8/10 in steady tracking and ~5/10 as an episode dies.
         #
-        # 1.6 goes with the eta_scales above, which cut mean V 16.89 -> 2.20 (and lambda_max
-        # 4.46 -> 3.96) by putting the four channel classes in one currency. History: 2.25
+        # 1.15 goes with the eta_scales above PLUS the reset fix and the now-GLOBAL base
+        # channels: measured mean V 1.12 on a live policy. Most of the drop from 2.20 is the
+        # reset fix (df7a1de) removing the spawn-step spikes that were inflating V, not the
+        # base change. History: 1.6 for eta_scales with the local base and the reset bug; 2.25
         # for ang_vel-only scaling at 0.3; 4.1 unscaled with _ROOT_Q_DEFAULT = [10.0, 0.1];
         # 3.5 for the old [1.0, 0.1] at a measured V ~= 41; 5.0 before that, where
         # half-reward sat at V ~= 77 and the policy only got there as it was dying.
@@ -425,7 +427,7 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         #     episodes are ~1.3 s of a 20 s window. It tracks SURVIVAL as much as quality.
         #   * ``Metrics/traj_ref/v`` is logged at reset, so it is V at the instant of
         #     FAILURE, not the episode average. Back the average out of the reward instead.
-        self.rewards.clf_reward.params["max_eta_err"] = 1.6
+        self.rewards.clf_reward.params["max_eta_err"] = 1.15
         self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
         self._apply_tracking_mode()

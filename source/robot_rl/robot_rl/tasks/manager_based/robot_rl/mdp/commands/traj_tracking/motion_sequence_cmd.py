@@ -590,7 +590,64 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.dy_des[:, self._wf_lin_flat] = frames[:, :, 7:10].reshape(n, -1)
         self.dy_des[:, self._wf_ang_flat] = frames[:, :, 10:13].reshape(n, -1)
         self._wf_world_frames = frames
+        # MUST precede the base rewrite below: the @root bodies are lifted through the
+        # ANCHORED base, which is what makes their error local.
         self._lift_root_frames_to_world(frames[:, 0, :])
+        self._write_global_base_des()
+
+    def _write_global_base_des(self) -> None:
+        """Re-point the BASE channels of ``y_des`` / ``dy_des`` at the GLOBAL clip.
+
+        Splits the CLF's job in two, which is the whole point of tracking body links:
+
+        * the BASE says WHERE the robot should be -- graded against the globally-placed
+          clip, which never moves;
+        * the body links and end effectors say WHAT SHAPE it should be in -- graded against
+          the re-datumed clip, so limb tracking is not punished for planar drift.
+
+        Without this the base term does nothing at all.  Every-step anchoring re-datums the
+        clip onto the robot in the mask's FREE root DOFs, so the base error in those DOFs is
+        ~0 by construction -- measured at 0.3-1.9% of V.  Yet
+        :func:`base_pose_error_termination` ends the episode on exactly that drift, so the
+        policy was being killed for a quantity no reward mentioned.  Now the reward and the
+        termination read the same reference.
+
+        On stair / box tiles the mask already pins downrange / height / yaw to the terrain
+        cell, so there the global and anchored bases coincide and this is a no-op; on flat
+        it is the only thing grading global position and heading.
+
+        Deliberately does NOT touch ``_wf_world_frames``: that cache is the ANCHORED
+        placement, and the recorder / FM window / debug viz read it back through
+        :meth:`reference_world_state`.  ``y_des`` being mutated past the cache is the
+        pre-existing contract here (see :meth:`_write_world_des`), not a new one.
+
+        FRAME.  The twist goes global with the position, because both come from the one
+        :func:`lift_base_world_state` call -- so it is world axes rotated by the GLOBAL
+        placement quaternion, not the anchored one.  That is required, not incidental: the
+        CLF pairs each position channel with its velocity channel as a double integrator,
+        and the ``2 * P12 * e * edot`` cross term only means anything if ``edot = d/dt e`` in
+        the SAME frame.  Consequence on flat, where the mask frees yaw: a heading error now
+        rotates the desired velocity vector (measured 0.046 rad mean, 0.67 rad max), so
+        heading error feeds the velocity term instead of being absorbed by the frame -- which
+        is the same reason the position term is global.  Exactly zero on stair / box tiles,
+        where yaw is pinned and the two placements are the same rotation.
+
+        Everything here stays in WORLD AXES on purpose.  Expressing the tracked links'
+        twists base-RELATIVE instead would drop the ``omega x r`` transport term, which
+        leaks base angular-velocity error into every link's linear-velocity error scaled by
+        its lever arm -- genuinely unwanted.  But it would also stop grading WHERE the limbs
+        are in space, and with the tracked set deduped to pelvis + the 13 ``@root`` frames
+        that would leave foot placement against the stair treads graded only through the
+        base pose and the anchor mask.  Terrain needs that signal, so the transport coupling
+        is accepted deliberately.  (Note rotating the error into the base frame does NOT
+        remove it -- rotation changes axes, and the transport term rotates with them.)
+        """
+        bi = self._base_idx
+        state = self.termination_reference_world_state()      # independent of y_des
+        self.y_des[:, bi["pos"]] = state[:, 0:3]
+        self.y_des[:, bi["ori"]] = state[:, 3:7]
+        self.dy_des[:, bi["lin_vel"]] = state[:, 7:10]
+        self.dy_des[:, bi["ang_vel"]] = state[:, 10:13]
 
     def _root_frame_maps(self) -> tuple[torch.Tensor, ...] | None:
         """Flat ``y_des`` / ``dy_des`` index maps for the ``@root`` body block (cached).
