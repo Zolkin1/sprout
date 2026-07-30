@@ -130,7 +130,8 @@ class FmOnlineContext:
         ground_z: World floor height for the terrain-penetration loss only (no longer feeds any FM token).
         N: Number of history (phase) conditioning tokens.
         F: Future window length (all F are predicted; node 0 = current step).
-        D: State width (= ``2*nj + 15*(1 + target_num_extra_frames)``); also history_dim.
+        D: State width (= ``2*nj + ROOT_BLOCK_DIM + EE_BLOCK_DIM*target_num_extra_frames``,
+            i.e. ``2*nj + 15 + 3*K`` -- the extra frames are position-only); also history_dim.
         nj: Number of joints.
         target_num_extra_frames: Extra body frames the generator predicts (and that
             the history carries).

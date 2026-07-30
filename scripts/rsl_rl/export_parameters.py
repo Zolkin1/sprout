@@ -56,6 +56,90 @@ def resolve_actor_obs_groups(obs, actor_obs_groups=None):
     return groups
 
 
+def _find_term_cfg(obs_manager, obs_group_names, term_name):
+    """Return the :class:`ObservationTermCfg` for ``term_name``, or None if absent.
+
+    Searches the actor's groups in order and stops at the first hit.  The exported term
+    table already rejects a name appearing in more than one group, so the first hit is
+    the only hit.
+
+    Args:
+        obs_manager: The environment's observation manager.
+        obs_group_names: Ordered observation groups the actor consumes.
+        term_name: Observation term to look up.
+
+    Returns:
+        The term's config object, or None when no actor group has that term.
+    """
+    for group_name in obs_group_names:
+        term_names = obs_manager.active_terms.get(group_name, [])
+        if term_name not in term_names:
+            continue
+        return obs_manager._group_obs_term_cfgs[group_name][term_names.index(term_name)]
+    return None
+
+
+def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
+    """Deploy contract for the ``reference_window`` / ``command_window`` observations.
+
+    The deploy has to rebuild both terms from the generator's prediction, which needs
+    the sample offsets and -- for the reference window -- the per-step block layout.
+    Neither is recoverable from the flat term width, so both are exported here.  The
+    layout comes from :func:`mdp.reference_window_layout`, the single source of truth
+    the observation itself uses, rather than being restated.
+
+    Args:
+        unwrapped_env: The unwrapped Isaac Lab environment.
+        obs_manager: The environment's observation manager.
+        obs_group_names: Ordered observation groups the actor consumes.
+        term_table: The exported ``observation_terms["policy"]`` mapping, used to
+            recover the command width from the term's own flat shape.
+
+    Returns:
+        ``(reference_window_spec, command_window_spec)``; either is None when the
+        actor does not observe that term.
+    """
+    ref_cfg = _find_term_cfg(obs_manager, obs_group_names, "reference_window")
+    cmd_cfg = _find_term_cfg(obs_manager, obs_group_names, "command_window")
+    if ref_cfg is None and cmd_cfg is None:
+        return None, None
+
+    def _offsets(cfg):
+        """Sample offsets ``[0, stride, ...]`` in CONTROL steps, matching _window_offsets."""
+        p = cfg.params or {}
+        n = max(1, int(p.get("num_steps", 1)))
+        s = max(1, int(p.get("stride", 1)))
+        return n, s, [i * s for i in range(n)]
+
+    ref_spec = None
+    if ref_cfg is not None:
+        n, s, offs = _offsets(ref_cfg)
+        cmd_term = unwrapped_env.command_manager.get_term((ref_cfg.params or {}).get("command_name", "traj_ref"))
+        ref_spec = {
+            "num_steps": n,
+            "stride": s,
+            "offsets": offs,
+            # [[block_name, width], ...] for ONE step; the term is these blocks
+            # concatenated, then the steps concatenated.
+            "blocks": [[name, int(width)] for name, width in mdp.reference_window_layout(cmd_term)],
+            # The window's joint blocks are in the ROBOT's own joint order (so they line
+            # up elementwise with the joint_pos / joint_vel / actions proprioception
+            # terms), NOT the `joint_out_names` order that joint_pos_ref used. Recorded
+            # explicitly because the two orders differ and nothing else here says which.
+            "joint_order": "isaac",
+            "ee_frame_names": list(cmd_term.resolve_ee_frames(None)),
+        }
+
+    cmd_spec = None
+    if cmd_cfg is not None:
+        n, s, offs = _offsets(cmd_cfg)
+        flat = term_table["command_window"]["shape"]
+        flat = int(np.prod(flat)) if isinstance(flat, (list, tuple)) else int(flat)
+        cmd_spec = {"num_steps": n, "stride": s, "offsets": offs, "cmd_dim": flat // n}
+
+    return ref_spec, cmd_spec
+
+
 def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None):
     """
     Export policy parameters and environment configuration to a YAML file.
@@ -108,14 +192,17 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     except KeyError:
         pass
 
-    # Get skill type
+    # Get skill type. AttributeError as well as KeyError: a command term that exists but
+    # carries no `trajectory_type` / `manager` raises the former, and letting it escape
+    # kills the whole parameter export over two optional fields.
     try:
-        # TODO: Test
-        params["skill_type"] = unwrapped_env.command_manager.get_term("traj_ref").trajectory_type.value
-        params["total_time"] = unwrapped_env.command_manager.get_term("traj_ref").manager.get_total_time()
-    except KeyError:
-        raise ValueError("Could not get skill_type and/or total_time while exporting parameters!")
-        # pass
+        traj = unwrapped_env.command_manager.get_term("traj_ref")
+        params["skill_type"] = traj.trajectory_type.value
+        params["total_time"] = traj.manager.get_total_time()
+    except (KeyError, AttributeError) as exc:
+        raise ValueError(
+            f"Could not get skill_type and/or total_time while exporting parameters ({exc})."
+        ) from exc
 
     # Add velocity command ranges
     try:
@@ -312,6 +399,16 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
             obs_info["policy"][term_name] = term_info
 
     params["observation_terms"] = obs_info
+
+    # Merged reference / command window contract.  `observation_terms` records these two
+    # only as a flat width (11 * 82 = 902) plus a per-channel scale vector, which is not
+    # enough for the deploy to REBUILD them: it also needs the sample offsets and the
+    # per-step block layout.  Both come from the sources the observation itself uses --
+    # the term's own params and mdp.reference_window_layout -- so nothing off-sim
+    # restates a width.  Absent (None) for a task without the window terms.
+    ref_spec, cmd_spec = _window_specs(unwrapped_env, obs_manager, obs_group_names, obs_info["policy"])
+    params["reference_window_spec"] = ref_spec
+    params["command_window_spec"] = cmd_spec
 
     # Height-scan sensor geometry so the MuJoCo / hardware deploy can REPLICATE the scan
     # that both the `height_scan` obs term and the FM height token consume. Read from the

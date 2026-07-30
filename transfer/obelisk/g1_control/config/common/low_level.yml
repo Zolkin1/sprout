@@ -65,9 +65,16 @@ control:
       hold_kd_scale: 1.5
 
       # ---- Logging ----
-      log: true
-      log_decimation: 1
-      config_name: "g1.yml"
+      # TODO(logging-refactor): `log`, `log_decimation` and `config_name` are NOT declared
+      # by the controller (see G1Controller._declare_params), and rclpy silently ignores an
+      # override for an undeclared parameter -- so `log: true` reads as "logging is on" and
+      # does nothing. The CSV writer they configured was deleted in f5bc1ad. Left in place,
+      # labelled, because the replacement is the MCAP work, not a revival of this: see
+      # "Observability" in transfer/obelisk/README.md for the full gap list.
+      log: true              # NON-FUNCTIONAL -- see above
+      log_decimation: 1      # NON-FUNCTIONAL -- see above
+      config_name: "g1.yml"  # NON-FUNCTIONAL -- see above
+      # This one IS live: promotes the 5 s latency line from warn-on-over-budget to always.
       verbose: false
     publishers:
       - ros_parameter: pub_ctrl_setting

@@ -245,7 +245,7 @@ def generate(exported_dir: str) -> dict[str, str]:
     """
     tracker = os.path.join(exported_dir, "tracker.onnx")
     if not os.path.exists(tracker):
-        raise FileNotFoundError(f"No tracker.onnx in {exported_dir}; run export_deploy_onnx.py.")
+        raise FileNotFoundError(f"No tracker.onnx in {exported_dir}; run play.py to export it.")
     session = TrackerSession(tracker)
     src = _describe_path(tracker)
 

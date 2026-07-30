@@ -41,6 +41,7 @@ import onnx
 import torch
 import torch.nn as nn
 
+from robot_rl.flow_matching.transforms import EE_BLOCK_DIM, ROOT_BLOCK_DIM
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
 
@@ -117,6 +118,13 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # off-distribution. ``fm_session.load_fm_context`` checks them.
         "history_source": str(ctx.history_source),
         "fm_snap_every": ctx.fm_snap_every,
+        # The state LAYOUT, which nothing else in the graph reveals: D, nj and the frame
+        # count are all unchanged by the position-only ee switch (block 15 -> 3), so a
+        # pre-switch graph otherwise loads into the current transforms with every frame
+        # offset wrong, every index still in range, and a silently garbage world lift.
+        # ``fm_session.load_fm_context`` checks D == 2*nj + root + ee*K against these.
+        "root_block_dim": int(ROOT_BLOCK_DIM),
+        "ee_block_dim": int(EE_BLOCK_DIM),
         # Signals to the deploy side that the graph accepts the history_null input, so it can
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.

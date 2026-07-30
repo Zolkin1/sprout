@@ -54,6 +54,11 @@ from deploy.hardware import build_hardware_state, load_gen_tracker_from_hf  # no
 #: "LOW_LEVEL_CONTROL"; this is the ONLY state in which the policy may drive the robot.
 EXEC_FSM_LOW_LEVEL_CONTROL = 3
 
+#: Consecutive non-finite commands before the controller disarms rather than keep holding
+#: the last good target. 10 ticks = 0.2 s at 50 Hz: long enough to ride out a one-off bad
+#: estimate, short enough that a dead input does not leave the robot frozen mid-stride.
+_NONFINITE_DISARM_TICKS = 10
+
 #: Depth frames arrive on their own clock and are not part of the control graph; best
 #: effort matches how they are produced and keeps a slow subscriber from stalling the camera.
 SENSOR_QOS = QoSProfile(
@@ -104,6 +109,10 @@ class G1Controller(ObeliskController):
         self._bad_quat_count = 0
         self._quat_samples = 0
 
+        # Non-finite-command guard (see _finite_targets).
+        self._last_good_targets: np.ndarray | None = None
+        self._nonfinite_streak = 0
+
         self._infer_ms: list[float] = []
         self._last_report = 0.0
         self.get_logger().info("g1_controller up, DISARMED (waiting for LOW_LEVEL_CONTROL).")
@@ -150,14 +159,21 @@ class G1Controller(ObeliskController):
                 f"(got {repo!r} / {folder!r}); set them in the controller config."
             )
         cache = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resource", "hf_cache"))
+        # `use_cuda` was declared and then read by nothing, so the config documented a GPU
+        # option the node could not take. It now reaches onnxruntime; resolve_providers
+        # appends CPU as the fallback, so a CUDA request on a CPU-only wheel raises at load
+        # (loudly, at bring-up) rather than silently running on the CPU it promised to leave.
+        providers = ["cuda"] if bool(self.get_parameter("use_cuda").value) else None
         policy = load_gen_tracker_from_hf(
             repo, folder, cache,
             fm_update_every=int(self.get_parameter("fm_update_every").value),
             num_threads=int(self.get_parameter("onnx_threads").value),
+            providers=providers,
         )
         self.get_logger().info(
             f"Policy {repo}/{folder}: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
-            f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())}"
+            f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())} "
+            f"providers={policy._trk.sess.get_providers()}"
         )
         return policy
 
@@ -220,6 +236,20 @@ class G1Controller(ObeliskController):
     def depth_callback(self, msg: Image, index: int) -> None:
         """Latch one camera's raw depth frame.
 
+        Non-finite pixels need no guard here: ``normalize_depth_np`` maps NaN/inf to
+        ``max_clip_val``, so depth cannot be the source of a non-finite command (see
+        ``_finite_targets``, which backstops everything that is not so protected).
+
+        TODO(logging-refactor): the single biggest blind spot for a depth-conditioned
+        policy. Nothing about the camera stream is recorded or health-checked beyond
+        staleness, so a silently degraded camera -- all-invalid frame, wrong exposure,
+        half the image saturated -- reads to this stack as perfectly healthy. Wants, on a
+        diagnostics topic: measured Hz, inter-arrival jitter, min/max/mean range, and the
+        invalid-pixel fraction (``depth_obs.invalid_depth_value`` already computes the
+        threshold and is currently used only by tests). Also unvalidated here:
+        ``msg.encoding`` / ``width`` / ``height`` / ``step`` -- a wrong-sized frame raises
+        out of ``normalize_camera_images`` inside the 50 Hz timer and kills the node.
+
         Args:
             msg: 32FC1 depth image, row-major, in METRES along the optical axis.
             index: Which camera, in contract order.
@@ -281,10 +311,23 @@ class G1Controller(ObeliskController):
         self.hold_pose = self.joint_pos.copy()
         self.arm_time = self.t
         self.armed = True
+        self._last_good_targets = None
+        self._nonfinite_streak = 0
         self.get_logger().info(
             f"ARMED. Holding pose and priming the generator for {self.warmup_time:.2f}s.")
 
     # --------------------------------------------------------------- watchdogs
+    #
+    # TODO(logging-refactor): two gaps in the watchdog set as a whole.
+    # 1. There is NO est_state watchdog. Every other input has a timeout; if the estimator
+    #    or the driver dies, the controller keeps commanding at 50 Hz off frozen arrays,
+    #    with no warning. `update_x_hat` does not even record a receipt time.
+    # 2. The dropout warnings are edge-triggered only, so a depth dropout at t=12 s prints
+    #    one line and nothing thereafter says the robot has been walking on a frozen image
+    #    for the last 90 s. Wants a periodic "degraded" heartbeat while any watchdog is
+    #    latched.
+    # Related, in estimator.py: odometry staleness is known there and structurally
+    # invisible here.
 
     def _depth_is_stale(self) -> bool:
         """Whether any camera has stopped delivering.
@@ -372,8 +415,9 @@ class G1Controller(ObeliskController):
         """The 50 Hz control tick.
 
         Returns:
-            The published command, or ``None`` when disarmed or not yet ready -- in which
-            case NOTHING is published and the robot interface keeps holding its pose.
+            The published command, or ``None`` when disarmed, not yet ready, or the
+            command was not finite -- in which case NOTHING is published and the robot
+            interface keeps holding its pose.
         """
         if not self.armed or not self.have_estimate:
             return None
@@ -396,7 +440,78 @@ class G1Controller(ObeliskController):
         self._record_latency((time.perf_counter() - t0) * 1e3)
         return self._publish(action, warmup=False)
 
-    def _publish(self, joint_targets: np.ndarray, warmup: bool) -> PDFeedForward:
+    def _diagnose_nonfinite(self) -> str:
+        """Name the latched inputs that are non-finite, for the guard's error message.
+
+        Only ever called on the failure path, so the cost does not matter -- but knowing
+        whether the NaN entered through the joints, the base pose or the base velocity is
+        the difference between "the estimator died" and "the policy diverged".
+
+        Returns:
+            A comma-separated list of bad inputs, or ``"none (the policy itself diverged)"``
+            when every input is clean.
+        """
+        checks = {
+            "q_base (base pos+quat)": self.q_base, "v_base (base lin+ang vel)": self.v_base,
+            "joint_pos": self.joint_pos, "joint_vel": self.joint_vel,
+            "vel_cmd": self.vel_cmd,
+        }
+        bad = [name for name, arr in checks.items()
+               if arr is not None and not np.isfinite(np.asarray(arr, dtype=np.float64)).all()]
+        # Depth NaNs are already absorbed by normalize_depth_np, so a camera can only
+        # contribute by going ENTIRELY invalid -- worth naming, but it is not the NaN source.
+        if any(d is not None and not np.isfinite(d).any() for d in getattr(self, "depth_raw", [])):
+            bad.append("depth (an all-invalid frame)")
+        return ", ".join(bad) if bad else "none (the policy itself diverged)"
+
+    def _finite_targets(self, joint_targets: np.ndarray) -> np.ndarray | None:
+        """Gate the command on being finite, substituting the last good one if it is not.
+
+        Nothing upstream validates proprioception: a NaN in ``msg.q_joints`` survives
+        ``update_x_hat``, ``build_hardware_state`` and the ``np.clip`` in ``_assemble``
+        (which propagates NaN unchanged), and would otherwise land in ``msg.pos_target`` on
+        a live robot. Depth is already safe -- ``normalize_depth_np`` maps NaN/inf to
+        ``max_clip_val`` -- so this is the backstop for everything else.
+
+        The fallback is the PREVIOUS tick's command rather than ``hold_pose``: it is the
+        nearest thing to what the robot is already tracking, whereas the arm-time pose can
+        be far away and would command a jump. A sustained fault escalates to a disarm
+        rather than freezing on a stale target forever, since holding one mid-stride is not
+        a safe state to sit in indefinitely.
+
+        Args:
+            joint_targets: Candidate targets, hardware order.
+
+        Returns:
+            Finite targets to publish, or None to publish nothing (the robot interface
+            then holds its pose -- the same passive state a disarm produces).
+        """
+        if joint_targets is not None and np.isfinite(joint_targets).all():
+            self._last_good_targets = np.asarray(joint_targets, dtype=np.float64).copy()
+            self._nonfinite_streak = 0
+            return joint_targets
+
+        self._nonfinite_streak += 1
+        fallback = self._last_good_targets if self._last_good_targets is not None else self.hold_pose
+        self.get_logger().error(
+            f"NON-FINITE COMMAND (tick {self._nonfinite_streak} of a run): refusing to "
+            f"publish it. Non-finite inputs: {self._diagnose_nonfinite()}. "
+            f"Holding {'the last good target' if self._last_good_targets is not None else 'the arm-time pose'}.",
+            throttle_duration_sec=1.0,
+        )
+        if self._nonfinite_streak >= _NONFINITE_DISARM_TICKS:
+            self.get_logger().error(
+                f"DISARMING: {self._nonfinite_streak} consecutive non-finite commands "
+                f"({self._nonfinite_streak * self.policy.get_dt():.2f}s). Fix the input "
+                "before re-entering LOW_LEVEL_CONTROL."
+            )
+            self.armed = False
+            return None
+        if fallback is None or not np.isfinite(fallback).all():
+            return None
+        return fallback
+
+    def _publish(self, joint_targets: np.ndarray, warmup: bool) -> PDFeedForward | None:
         """Send PD position targets in the hardware's joint order.
 
         Args:
@@ -404,8 +519,12 @@ class G1Controller(ObeliskController):
             warmup: Whether this is the stiffened hold command or the policy's output.
 
         Returns:
-            The published message.
+            The published message, or None when the command was not finite and no finite
+            fallback was available (nothing is published; the interface holds pose).
         """
+        joint_targets = self._finite_targets(joint_targets)
+        if joint_targets is None:
+            return None
         kp = np.asarray(self.policy.get_kp(), dtype=np.float64)
         kd = np.asarray(self.policy.get_kd(), dtype=np.float64)
         # Metadata gains are in the POLICY's joint order; the robot wants its own.
@@ -431,6 +550,12 @@ class G1Controller(ObeliskController):
 
         Two ONNX graphs run here and the generator's cadence makes the cost uneven tick to
         tick, so a mean would hide exactly the spikes that break a 50 Hz loop.
+
+        TODO(logging-refactor): this covers create_obs + get_action only. Unmeasured: the
+        actual timer period and its jitter (the pre-f5bc1ad controller tracked
+        `loop_period`), how stale est_state was when the tick used it, and the warm-up
+        path. `transfer/deploy/benchmark.py` reports the same percentiles off-robot, so
+        the two are directly comparable -- what is missing is the on-robot loop itself.
 
         Args:
             ms: Wall time of this tick's policy call, in milliseconds.

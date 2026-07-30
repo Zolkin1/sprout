@@ -113,14 +113,15 @@ def main() -> None:
         assert abs(cur["root_pos"][2] - base_pos_cf[2]) > 1e-3
 
         # --- Future window recedes from the re-anchored placement (same transform). ---
-        ref = ce.reference_at(step, [1, 2])
-        assert np.allclose(ref["current"]["root_pos"][:2], robot_pos[:2], atol=1e-9)
+        # Offset 0 is the current step and heads the window; [1, 2] are the look-ahead.
+        ref = ce.reference_at(step, [0, 1, 2])
+        assert np.allclose(ref["window"][0]["root_pos"][:2], robot_pos[:2], atol=1e-9)
         # Future step's planar offset from current == placement-rotated clip delta.
         yaw = _yaw_angle(robot_quat) - _yaw_angle(ce.y[step][ce._base_ori])
         c, sn = math.cos(yaw), math.sin(yaw)
         d_cf = ce.y[step + 1][ce._base_pos][:2] - base_pos_cf[:2]
         exp = np.array([c * d_cf[0] - sn * d_cf[1], sn * d_cf[0] + c * d_cf[1]])
-        got = ref["future"][0]["root_pos"][:2] - ref["current"]["root_pos"][:2]
+        got = ref["window"][1]["root_pos"][:2] - ref["window"][0]["root_pos"][:2]
         assert np.allclose(got, exp, atol=1e-9), "future must recede via the same placement"
 
         # Ego differs from world-anchored at the same step (sanity).

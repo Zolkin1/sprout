@@ -2,26 +2,25 @@
 
 """Parity test: the deployed obs assembly vs the real observations.py.
 
-CURRENTLY SKIPPED. The teacher now builds one merged ``reference_window`` observation and
-stacks proprioception history, while the deployment port still assembles the retired
-per-term future_* layout with no history -- so the two sides no longer describe the same
-observation. The body below is kept verbatim because it is the spec the port has to meet:
-un-skip it as part of the deploy port (see ``GenTrackerPolicy._assemble``'s TODO) and
-retarget the term list at ``reference_window`` / ``command_window``.
-
 Dev-only (imports isaaclab + robot_rl for the real observation functions). Feeds
 *identical* synthetic world references into those functions and into
 ``deploy.gen_tracker.GenTrackerPolicy._build_obs``, then compares the
-command/reference-derived obs terms term-by-term. This pins down the quaternion
-conventions, joint/frame orderings, and per-term formulas of the deployment port without
+reference-derived obs terms elementwise. This pins down the quaternion conventions,
+joint/frame orderings, and per-step block layout of the deployment port without
 launching the simulator.
 
-It also exercises the ``joint_out_names`` dependency (with the wrong CLF output order
-``joint_pos_ref``/``joint_vel_ref`` would mismatch) and, when the run has depth cameras,
-that each camera's image lands in its own slice of the observation vector.
+Three things it exists to catch, all of which are silent rather than loud:
 
-Everything comes from the exported ``tracker.onnx`` metadata, so the test needs only that
-artifact and skips cleanly without one. Run from ``transfer/sim``:
+* the ``reference_window`` joint blocks are in the ROBOT's joint order, while the
+  retired ``joint_pos_ref`` was in the CLF-output order -- swapping them still
+  produces a correctly-sized observation;
+* the window's ``ee_pos`` block is relative to *that step's* reference base, not the
+  robot's;
+* the proprioception terms are history-stacked oldest-first, and the per-channel
+  ``scale`` has to be tiled across that stack.
+
+Everything comes from the exported ``tracker.onnx`` metadata, so the test needs only
+that artifact and skips cleanly without one. Run from ``transfer/sim``:
 ``python tests/test_gen_tracker_obs_parity.py [--run <run dir>]``
 """
 
@@ -46,7 +45,7 @@ import robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations as O 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 BASE = "pelvis_link"
-HORIZON_S, STRIDE, DT = 0.5, 5, 0.02
+DT = 0.02
 N = 4  # synthetic envs
 
 
@@ -67,188 +66,140 @@ def _find_run(explicit: str | None) -> str | None:
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
 
 
-def _output_names(joint_out: list[str], ee_frames: list[str],
-                  root_bodies: list[str]) -> tuple[list[str], list[str]]:
-    """Synthesise the CLF output-name layout from the tracker's own metadata.
-
-    The observation functions index ``y_des`` / ``dy_des`` by NAME, so any consistent
-    ordering works as long as every channel is present. Building the layout from the
-    tracker's ``joint_out_names`` + ``ee_frame_names`` (rather than from a clip library)
-    keeps the test self-sufficient AND pins the ordering the deployment actually uses --
-    a clip whose joint set differs from the policy's would otherwise silently mis-scope
-    this comparison.
-
-    Args:
-        joint_out: CLF output joint order from the tracker metadata.
-        ee_frames: End-effector frame names from the tracker metadata.
-        root_bodies: Root-frame body links (``tracking_mode="body"``); empty otherwise.
-
-    Returns:
-        ``(ordered_pos_output_names, ordered_vel_output_names)``.
-    """
-    pos = [f"{BASE}:pos_{a}" for a in "xyz"] + [f"{BASE}:ori_{a}" for a in "xyzw"]
-    for frame in ee_frames:
-        pos += [f"{frame}:pos_{a}" for a in "xyz"]
-    pos += [f"joint:{n}" for n in joint_out]
-    vel = [f"{BASE}:pos_{a}" for a in "xyz"] + [f"{BASE}:ori_{a}" for a in "xyz"]
-    vel += [f"joint:{n}" for n in joint_out]
-    for body in root_bodies:
-        rf = f"{body}@root"
-        pos += [f"{rf}:pos_{a}" for a in "xyz"] + [f"{rf}:ori_{a}" for a in ("w", "x", "y", "z")]
-        vel += [f"{rf}:pos_{a}" for a in "xyz"] + [f"{rf}:ori_{a}" for a in "xyz"]
-    return pos, vel
-
-
 def _rand_quat(n: int, g: torch.Generator) -> torch.Tensor:
+    """``n`` uniformly-random unit quaternions ``[n, 4]`` (xyzw)."""
     q = torch.randn(n, 4, generator=g, dtype=torch.float64)
     return q / q.norm(dim=-1, keepdim=True)
 
 
 class _MockCmd:
-    """Minimal stand-in exposing what the observation functions read."""
+    """Minimal command-term stand-in exposing what the window observations read.
 
-    def __init__(self, pos_names, vel_names, ee_frames, joint_out, truth, root_bodies=()):
-        self.ordered_pos_output_names = pos_names
-        self.ordered_vel_output_names = vel_names
-        self._ee_frames = ee_frames
-        self._joint_out = joint_out
-        # What mdp.body_pos_ref_root / body_vel_ref_root read to locate their block.
-        self.root_body_frames = [f"{b}@root" for b in root_bodies]
+    ``reference_window`` / ``command_window`` reach the reference only through the
+    ``get_future_*`` accessors and ``robot.data``, so serving those from a fixed truth
+    dict is enough to drive the real observation functions with no simulator.
+    """
+
+    def __init__(self, ee_frames, joint_names, truth):
+        """Wire the accessors to ``truth``.
+
+        Args:
+            ee_frames: End-effector frame names, in reference order.
+            joint_names: The robot's joint names (the window's joint-block order).
+            truth: The synthetic reference tensors shared with the deployment side.
+        """
+        self._ee_frames = list(ee_frames)
         self.cfg = type("cfg", (), {"base_frame_name": BASE})
         self.manager = type("mgr", (), {"dt": DT})
         self.device = truth["root_quat"].device
         self.robot = type("robot", (), {})()
+        self.robot.joint_names = list(joint_names)
         self.robot.data = type("d", (), {})()
         self.robot.data.root_pos_w = truth["root_pos"]
         self.robot.data.root_quat_w = truth["root_quat"]
         self._t = truth
-        self.y_des = self._build_y_des()
-        self.dy_des = self._build_dy_des()
 
     def resolve_ee_frames(self, frame_names=None):
+        """The reference's ee frame names (all of them when ``frame_names`` is None)."""
         return list(frame_names) if frame_names is not None else list(self._ee_frames)
 
-    def _pos_idx(self, name):
-        return self.ordered_pos_output_names.index(name)
-
-    def _vel_idx(self, name):
-        return self.ordered_vel_output_names.index(name)
-
-    def _build_y_des(self) -> torch.Tensor:
-        t, P = self._t, len(self.ordered_pos_output_names)
-        y = torch.zeros(N, P, dtype=torch.float64, device=self.device)
-        for j, a in enumerate("xyz"):
-            y[:, self._pos_idx(f"{BASE}:pos_{a}")] = t["ref_pos"][:, j]
-        for j, a in enumerate("xyzw"):
-            y[:, self._pos_idx(f"{BASE}:ori_{a}")] = t["ref_quat"][:, j]
-        for kf, f in enumerate(self._ee_frames):
-            for j, a in enumerate("xyz"):
-                y[:, self._pos_idx(f"{f}:pos_{a}")] = t["ref_ee_pos"][:, kf, j]
-        for jj, jn in enumerate(self._joint_out):  # ref_jp is isaac order -> place by joint name
-            y[:, self._pos_idx(f"joint:{jn}")] = t["ref_jp_isaac"][:, t["isaac"].index(jn)]
-        # Root-frame body block, body-major [pos_xyz, ori_wxyz] -- the layout
-        # body_pos_ref_root stacks and the clip reference serves.
-        for kb, rf in enumerate(self.root_body_frames):
-            for j, a in enumerate("xyz"):
-                y[:, self._pos_idx(f"{rf}:pos_{a}")] = t["ref_body_pos"][:, kb, j]
-            for j, a in enumerate(("w", "x", "y", "z")):
-                y[:, self._pos_idx(f"{rf}:ori_{a}")] = t["ref_body_ori"][:, kb, j]
-        return y
-
-    def _build_dy_des(self) -> torch.Tensor:
-        t, V = self._t, len(self.ordered_vel_output_names)
-        dy = torch.zeros(N, V, dtype=torch.float64, device=self.device)
-        for j, a in enumerate("xyz"):
-            dy[:, self._vel_idx(f"{BASE}:pos_{a}")] = t["ref_lin"][:, j]
-            dy[:, self._vel_idx(f"{BASE}:ori_{a}")] = t["ref_ang"][:, j]
-        for jn in self._joint_out:
-            dy[:, self._vel_idx(f"joint:{jn}")] = t["ref_jv_isaac"][:, t["isaac"].index(jn)]
-        for kb, rf in enumerate(self.root_body_frames):
-            for j, a in enumerate("xyz"):
-                dy[:, self._vel_idx(f"{rf}:pos_{a}")] = t["ref_body_lin"][:, kb, j]
-                dy[:, self._vel_idx(f"{rf}:ori_{a}")] = t["ref_body_ang"][:, kb, j]
-        return dy
-
-    def reference_world_state(self):
+    def get_future_world_base(self, offs):
+        """World-frame reference base over the window: ``(pos, quat, lin, ang)``."""
         t = self._t
-        return torch.cat([t["ref_pos"], t["ref_quat"], t["ref_lin"], t["ref_ang"]], dim=-1)
+        return t["w_pos"], t["w_quat"], t["w_lin"], t["w_ang"]
 
-    def get_command_velocity(self):
-        return self._t["command"]
+    def get_future_joint_state(self, offs):
+        """Reference joint angles + velocities over the window, ``[N, K, nj]`` each."""
+        return self._t["w_jp"], self._t["w_jv"]
+
+    def get_future_world_frames(self, frames, offs):
+        """World-frame ee states over the window, ``[N, K, len(frames), 13]``."""
+        return self._t["w_ee"]
 
     def get_future_command_velocity(self, offs):
-        return self._t["fut_cmd"]  # [N, K, 3]
+        """Commanded base velocity over the window, ``[N, K, 3]``."""
+        return self._t["w_cmd"]
 
-    def get_future_world_base(self, offs):
-        t = self._t
-        return t["fut_pos"], t["fut_quat"], t["fut_lin"], t["fut_ang"]
+
+def _term_offsets(pol) -> dict[str, tuple[int, int]]:
+    """Map each obs term name to its ``[lo, hi)`` slice of the assembled vector."""
+    out, acc = {}, 0
+    for t in pol._trk.get_obs_terms():
+        out[t["name"]] = (acc, acc + t["shape"])
+        acc += t["shape"]
+    return out
+
+
+def _apply_export_postprocess(pol, name: str, raw: torch.Tensor) -> torch.Tensor:
+    """Clip and scale ``raw`` the way the exported term table says training did.
+
+    The Isaac observation functions return the raw quantity; ``_assemble`` applies the
+    term's ``clip`` then its ``scale``. Comparing against the raw value would let a
+    dropped clip or a mis-broadcast per-channel scale pass.
+
+    Args:
+        pol: The loaded :class:`GenTrackerPolicy`.
+        name: Observation term name.
+        raw: The Isaac function's output, ``[N, dim]``.
+
+    Returns:
+        The post-processed tensor, ``[N, dim]``.
+    """
+    term = next(t for t in pol._trk.get_obs_terms() if t["name"] == name)
+    out = raw
+    if term["clip"] is not None:
+        out = out.clamp(-term["clip"], term["clip"])
+    scale = term["scale"]
+    if isinstance(scale, (list, tuple, np.ndarray)):
+        scale = torch.as_tensor(np.asarray(scale, dtype=np.float64))
+    return out * scale
 
 
 def test_obs_parity(run: str | None = None) -> None:
-    """Compare each command/reference obs term: Isaac functions vs the deployment port."""
-    if hasattr(O, "reference_window"):
-        print(
-            "[SKIP] The teacher's reference observations were merged into a single "
-            "`reference_window` term (plus `command_window`), replacing base_pose_error / "
-            "joint_*_ref / ee_ref / future_base_* as separate terms. The deployment port "
-            "in deploy/gen_tracker.py still builds the retired per-term layout and has no "
-            "observation history, so the two sides describe different observations and "
-            "there is nothing to compare. Restore this test together with that port -- "
-            "see the TODO on GenTrackerPolicy._assemble."
-        )
-        return
+    """Compare the reference obs terms: Isaac functions vs the deployment port."""
     exported = _find_run(run)
     if exported is None:
         print("[SKIP] No exported tracker.onnx found under logs/rsl_rl/*/*/exported/; "
-              "export one with scripts/rsl_rl/export_tracker_onnx.py.")
+              "export one by running scripts/rsl_rl/play.py.")
         return
     print(f"[INFO] tracker: {exported}")
 
-    # Tracker-only: no fm.onnx, so the reference is injected directly (as clip playback does).
+    # Tracker-only: no fm.onnx, so the reference is injected directly (as clip playback
+    # does), and the FM->isaac joint permutation is the identity.
     pol = GenTrackerPolicy(os.path.join(exported, "tracker.onnx"), None)
     pol.load()
-    isaac_jn = pol.get_joint_names()  # robot/isaac joint order
-    K = len(pol.future_offsets)
-    depth_spec = pol.get_depth_camera_spec()
-
-    isaac = pol._trk.get_joint_out_names() or isaac_jn   # CLF output order
-    ee_frames = pol._trk.get_ee_frame_names() or []
-    # Non-empty only for a tracker trained with tracking_mode="body".
-    root_bodies = pol._trk.get_root_frame_bodies()
+    isaac_jn = pol.get_joint_names()
     nj = len(isaac_jn)
-    pos_names, vel_names = _output_names(isaac, ee_frames, root_bodies)
-    if sorted(isaac) != sorted(isaac_jn):
-        print(f"[SKIP] joint_out_names ({len(isaac)}) is not a permutation of the "
-              f"tracker's joint order ({nj}).")
-        return
+    ee_frames = pol._trk.get_ee_frame_names() or []
+    spec = pol.reference_window_spec
+    num_steps, stride = int(spec["num_steps"]), int(spec["stride"])
+    offs = pol.window_offsets
+    K = len(offs)
+    depth_spec = pol.get_depth_camera_spec()
+    term_dims = {t["name"]: t["shape"] for t in pol._trk.get_obs_terms()}
+    term_off = _term_offsets(pol)
+
+    print(f"window: num_steps={num_steps} stride={stride} offsets={offs}")
+    print(f"blocks: {spec['blocks']}  ee_frames={ee_frames}  joint_order={spec['joint_order']}")
 
     g = torch.Generator().manual_seed(3)
+    n_ee = len(ee_frames)
     truth = {
-        "isaac": isaac_jn,
         "root_pos": torch.randn(N, 3, generator=g, dtype=torch.float64),
         "root_quat": _rand_quat(N, g),
-        "ref_pos": torch.randn(N, 3, generator=g, dtype=torch.float64),
-        "ref_quat": _rand_quat(N, g),
-        "ref_lin": torch.randn(N, 3, generator=g, dtype=torch.float64),
-        "ref_ang": torch.randn(N, 3, generator=g, dtype=torch.float64),
-        "ref_jp_isaac": torch.randn(N, nj, generator=g, dtype=torch.float64),
-        "ref_jv_isaac": torch.randn(N, nj, generator=g, dtype=torch.float64),
-        "ref_ee_pos": torch.randn(N, len(ee_frames), 3, generator=g, dtype=torch.float64),
-        "command": torch.randn(N, 3, generator=g, dtype=torch.float64),
-        "fut_pos": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
-        "fut_quat": _rand_quat(N * K, g).reshape(N, K, 4),
-        "fut_lin": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
-        "fut_ang": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
+        "w_pos": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
+        "w_quat": _rand_quat(N * K, g).reshape(N, K, 4),
+        "w_lin": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
+        "w_ang": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
+        "w_jp": torch.randn(N, K, nj, generator=g, dtype=torch.float64),
+        "w_jv": torch.randn(N, K, nj, generator=g, dtype=torch.float64),
+        "w_cmd": torch.randn(N, K, 3, generator=g, dtype=torch.float64),
     }
-    # Held command over the horizon so future_command_vel matches the deployment path.
-    truth["fut_cmd"] = truth["command"][:, None, :].expand(N, K, 3).contiguous()
-    nb = len(root_bodies)
-    truth["ref_body_pos"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
-    truth["ref_body_ori"] = _rand_quat(max(N * nb, 1), g)[:N * nb].reshape(N, nb, 4)
-    truth["ref_body_lin"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
-    truth["ref_body_ang"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
+    # World ee states [N, K, n_ee, 13]; only the leading pos(3) is read, but fill it all
+    # so a port that grabbed the wrong 3 columns would be caught.
+    truth["w_ee"] = torch.randn(N, K, max(n_ee, 1), 13, generator=g, dtype=torch.float64)[:, :, :n_ee]
 
-    cmd = _MockCmd(pos_names, vel_names, ee_frames, isaac, truth, root_bodies)
+    cmd = _MockCmd(ee_frames, isaac_jn, truth)
     env = type("env", (), {"num_envs": N, "device": "cpu",
                            "command_manager": type("cm", (), {"get_term": lambda self, n: cmd})()})()
 
@@ -257,31 +208,14 @@ def test_obs_parity(run: str | None = None) -> None:
     wp.to_torch = lambda a: a if isinstance(a, torch.Tensor) else orig(a)
     try:
         isaac_terms = {
-            "base_pose_error": O.base_pose_error(env, "x"),
-            "ee_ref": O.ee_ref_relative_to_base(env, "x"),
-            "command_vel": O.command_velocity(env, "x"),
-            "future_command_vel": O.future_command_velocity(env, "x", HORIZON_S, STRIDE),
-            "future_base_pose": O.future_base_pose(env, "x", HORIZON_S, STRIDE),
-            "future_base_vel": O.future_base_velocity(env, "x", HORIZON_S, STRIDE),
+            "reference_window": O.reference_window(env, "x", num_steps, stride),
+            "command_window": O.command_window(env, "x", num_steps, stride),
         }
-        # The reference parameterization is mode-dependent: joint mode exposes the reference
-        # joint angles, body mode the root-frame body targets that replaced them.
-        if root_bodies:
-            isaac_terms["body_pos_ref"] = O.body_pos_ref_root(env, "x")
-            isaac_terms["body_vel_ref"] = O.body_vel_ref_root(env, "x").clamp(-20.0, 20.0)
-        else:
-            isaac_terms["joint_pos_ref"] = O.joint_pos_ref(env, "x")
-            isaac_terms["joint_vel_ref"] = O.joint_vel_ref(env, "x").clamp(-20.0, 20.0)
     finally:
         wp.to_torch = orig
+    isaac_terms = {k: _apply_export_postprocess(pol, k, v) for k, v in isaac_terms.items()}
 
     # --- The deployment port: same reference per env, then slice the assembled obs ---
-    offsets = list(range(STRIDE, int(round(HORIZON_S / DT)) + 1, STRIDE))
-    term_dims = {t["name"]: t["shape"] for t in pol._trk.get_obs_terms()}
-    term_off, acc = {}, 0
-    for t in pol._trk.get_obs_terms():
-        term_off[t["name"]] = (acc, acc + t["shape"]); acc += t["shape"]
-
     # Synthetic depth, one row per camera in contract order (what the caster returns), with
     # distinct content per camera so a swapped or misplaced image shows up.
     rng = np.random.default_rng(0)
@@ -292,55 +226,49 @@ def test_obs_parity(run: str | None = None) -> None:
     mine = {k: [] for k in isaac_terms}
     obs_last = None
     for e in range(N):
-        reference = {
-            "current": {
-                "root_pos": truth["ref_pos"][e], "root_quat": truth["ref_quat"][e],
-                "root_lin": truth["ref_lin"][e], "root_ang": truth["ref_ang"][e],
-                "jp": truth["ref_jp_isaac"][e], "jv": truth["ref_jv_isaac"][e],
-                "frame_pos": truth["ref_ee_pos"][e],
-                # Flattened body-major, exactly as ClipReference serves the block.
-                **({"body_pos_root": torch.cat(
-                        [torch.cat([truth["ref_body_pos"][e, k], truth["ref_body_ori"][e, k]])
-                         for k in range(nb)]),
-                    "body_vel_root": torch.cat(
-                        [torch.cat([truth["ref_body_lin"][e, k], truth["ref_body_ang"][e, k]])
-                         for k in range(nb)])} if root_bodies else {}),
-            },
-            "future": [{
-                "root_pos": truth["fut_pos"][e, o], "root_quat": truth["fut_quat"][e, o],
-                "root_lin": truth["fut_lin"][e, o], "root_ang": truth["fut_ang"][e, o],
-            } for o in range(K)],
-        }
+        reference = {"window": [{
+            "root_pos": truth["w_pos"][e, k], "root_quat": truth["w_quat"][e, k],
+            "root_lin": truth["w_lin"][e, k], "root_ang": truth["w_ang"][e, k],
+            "jp": truth["w_jp"][e, k], "jv": truth["w_jv"][e, k],
+            "frame_pos": truth["w_ee"][e, k, :, 0:3],
+            "command": truth["w_cmd"][e, k],
+        } for k in range(K)]}
         state = {
             "root_pos": truth["root_pos"][e].numpy(), "root_quat": truth["root_quat"][e].numpy(),
             "base_ang_vel": np.zeros(3), "joint_pos": np.zeros(nj), "joint_vel": np.zeros(nj),
-            "command": truth["command"][e].numpy(),
+            "command": truth["w_cmd"][e, 0].numpy(),
         }
         if depth_images is not None:
             state["depth"] = depth_images
         if "height_scan" in term_dims:
             state["height_scan"] = np.zeros(term_dims["height_scan"])
         pol._trk.action_isaac = np.zeros(nj)
+        # Each env is an independent comparison, so the history must not carry across them.
+        pol.reset()
         obs_last = pol._build_obs(state, reference)[0]
         for name in isaac_terms:
             lo, hi = term_off[name]
             mine[name].append(obs_last[lo:hi])
 
-    print(f"K (future offsets) = {K}, offsets = {offsets}, ee_frames = {ee_frames}")
     ok = True
     for name in isaac_terms:
         a = torch.tensor(np.stack(mine[name]), dtype=torch.float64)
         b = isaac_terms[name].to(torch.float64)
+        if a.shape != b.shape:
+            print(f"  FAIL {name:22s} shape {tuple(a.shape)} != isaac {tuple(b.shape)}")
+            ok = False
+            continue
         err = (a - b).abs().max().item()
         status = "ok " if err < 1e-5 else "FAIL"
-        if err >= 1e-5:
-            ok = False
+        ok = ok and err < 1e-5
         print(f"  {status} {name:22s} dim={term_dims[name]:<5} max_err={err:.2e}")
+
+    ok = _check_history(pol, term_off, term_dims, nj) and ok
 
     # Depth placement: each camera's image must occupy its own slice, clipped as trained
     # (the clip comes from the term's own exported metadata, like every other term's).
     term_clip = {t["name"]: t["clip"] for t in pol._trk.get_obs_terms()}
-    for i, cam in enumerate(depth_spec):
+    for i, cam in enumerate(depth_spec or []):
         term = cam["obs_term"]
         lo, hi = term_off[term]
         want = np.asarray(depth_images[i], dtype=np.float32)
@@ -349,8 +277,7 @@ def test_obs_parity(run: str | None = None) -> None:
             want = np.clip(want, -clip, clip)
         err = float(np.abs(obs_last[lo:hi] - want).max())
         status = "ok " if err < 1e-6 else "FAIL"
-        if err >= 1e-6:
-            ok = False
+        ok = ok and err < 1e-6
         print(f"  {status} {term:22s} dim={term_dims[term]:<5} max_err={err:.2e} "
               f"(slice {lo}:{hi}, {cam['width']}x{cam['height']} on {cam['mount_body']}, "
               f"clip {clip})")
@@ -359,6 +286,77 @@ def test_obs_parity(run: str | None = None) -> None:
 
     assert ok, "obs parity mismatch (see FAIL rows above)"
     print("ALL OBS PARITY CHECKS PASSED")
+
+
+def _check_history(pol, term_off, term_dims, nj) -> bool:
+    """Verify the observation-history stacking against Isaac Lab's CircularBuffer rules.
+
+    Two properties, both silent when wrong: the FIRST sample must fill the whole window
+    (so step 0 is a static window, not zero-padded), and the flattened window must read
+    OLDEST-first. A reversed window still has the right width and the right values.
+
+    Uses ``base_ang_vel`` (an unclipped, scale-1.0, 3-wide term) so the check is about
+    ordering rather than post-processing.
+
+    Args:
+        pol: The loaded :class:`GenTrackerPolicy`.
+        term_off: Term name -> ``[lo, hi)`` slice map.
+        term_dims: Term name -> flat width map.
+        nj: Joint count, for the synthetic state.
+
+    Returns:
+        True if the history behaves as Isaac Lab does.
+    """
+    term = next((t for t in pol._trk.get_obs_terms()
+                 if t["name"] == "base_ang_vel" and t["history_length"] > 0), None)
+    if term is None:
+        print("  --  no history_length on base_ang_vel; history stacking not exercised")
+        return True
+    hist = term["history_length"]
+    lo, hi = term_off["base_ang_vel"]
+    pol.reset()
+
+    def _obs_at(step: int) -> np.ndarray:
+        """One control step whose base_ang_vel is the constant ``step``."""
+        state = {
+            "root_pos": np.zeros(3), "root_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+            "base_ang_vel": np.full(3, float(step)),
+            "joint_pos": np.zeros(nj), "joint_vel": np.zeros(nj), "command": np.zeros(3),
+        }
+        if "height_scan" in term_dims:
+            state["height_scan"] = np.zeros(term_dims["height_scan"])
+        if pol.get_depth_camera_spec():
+            state["depth"] = np.stack([np.zeros(int(c["width"]) * int(c["height"]))
+                                       for c in pol.get_depth_camera_spec()])
+        ref = {"window": [{
+            "root_pos": np.zeros(3), "root_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+            "root_lin": np.zeros(3), "root_ang": np.zeros(3),
+            "jp": np.zeros(pol.ctx.nj), "jv": np.zeros(pol.ctx.nj),
+            "frame_pos": np.zeros((pol.ctx.target_num_extra_frames, 3)),
+        } for _ in pol.window_offsets]}
+        pol._trk.action_isaac = np.zeros(nj)
+        return pol._build_obs(state, ref)[0][lo:hi]
+
+    ok = True
+    first = _obs_at(1)
+    if not np.allclose(first, 1.0):
+        print(f"  FAIL history warm-start: first push must fill all {hist} slots, got {first}")
+        ok = False
+    else:
+        print(f"  ok  history warm-start     first push fills all {hist} slots")
+
+    for step in range(2, hist + 2):
+        got = _obs_at(step)
+    # After pushing 1..hist+1, the window holds the last `hist` values, oldest first.
+    want = np.repeat(np.arange(step - hist + 1, step + 1, dtype=np.float32), 3)
+    if not np.allclose(got, want):
+        print(f"  FAIL history order        got {got[:6]}... want {want[:6]}... "
+              "(must be OLDEST-first, matching CircularBuffer.buffer)")
+        ok = False
+    else:
+        print(f"  ok  history order         oldest-first over {hist} steps")
+    pol.reset()
+    return ok
 
 
 if __name__ == "__main__":

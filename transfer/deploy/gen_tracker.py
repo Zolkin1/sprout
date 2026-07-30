@@ -39,7 +39,7 @@ from .tracker_session import TrackerSession
 # Fallback clips for artifacts exported before the obs terms carried their own ``clip``
 # (``export_parameters.py`` now emits it per term, and the metadata value wins). Anything
 # clipped in the env cfg but absent here was silently unclipped on those older exports.
-_LEGACY_TERM_CLIP = {"actions": 20.0, "joint_vel_ref": 20.0, "height_scan": 1.0}
+_LEGACY_TERM_CLIP = {"actions": 20.0, "height_scan": 1.0}
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -86,13 +86,12 @@ class GenTrackerPolicy:
         tracker_onnx: str,
         fm_onnx: str | None,
         fm_update_every: int = 2,
-        future_horizon_s: float = 0.5,
-        future_stride: int = 5,
         base_frame_name: str = "pelvis_link",
         num_threads: int = 0,
         seed: int | None = 0,
         zero_noise: bool = False,
         null_history_warmup: bool = True,
+        providers=None,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
@@ -110,16 +109,20 @@ class GenTrackerPolicy:
         :meth:`_sample_noise`). It defaults to False here -- the training-matched
         stochastic sampling -- so hardware keeps that behaviour; the MuJoCo sim2sim
         runner opts in and defaults it on.
+
+        ``providers`` selects the onnxruntime execution providers for BOTH graphs (see
+        ``tracker_session.resolve_providers``); ``None`` = CPU, which is the deployment
+        default. Both sessions get the same list -- a split would be measurable only as
+        an inexplicable latency difference between the two nets.
         """
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
         self.fm_update_every = max(int(fm_update_every), 1)
-        self.future_horizon_s = future_horizon_s
-        self.future_stride = future_stride
         self.base_frame_name = base_frame_name
         self.num_threads = num_threads
         self.zero_noise = bool(zero_noise)
         self.null_history_warmup = bool(null_history_warmup)
+        self.providers = providers
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
         self._loaded = False
@@ -129,25 +132,36 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     def load(self) -> None:
         """Load the tracker + FM ONNX sessions and build the orderings/buffers."""
-        self._trk = TrackerSession(self.tracker_onnx, self.num_threads)
-        # Prefer the cadence baked into the tracker metadata (the value the policy trained
-        # with) over the constructor/CLI default, so sim2sim + hardware can't silently drift
-        # from training. Falls back to the constructor value when the export predates it.
-        meta_every = self._trk.params.get("fm_update_every")
-        if meta_every is not None:
-            self.fm_update_every = max(int(meta_every), 1)
-        print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} "
-              f"({'from tracker metadata' if meta_every is not None else 'from constructor default'})")
+        self._trk = TrackerSession(self.tracker_onnx, self.num_threads, self.providers)
         self.fm_enabled = self.fm_onnx is not None
         if self.fm_enabled:
-            self.ctx = load_fm_context(self.fm_onnx, self.num_threads)
+            self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+        # Re-plan cadence, most authoritative source first:
+        #   1. the tracker metadata -- the value the tracker task trained with;
+        #   2. the FM's own fm_snap_every -- the period its targets were CUT at during
+        #      recording, which is the cadence it is in-distribution for. A teacher export
+        #      has no fm_update_every at all (the field lives on FmTrackingCommandCfg, not
+        #      on the clip command), and falling through to the constructor default there
+        #      would silently re-plan at a cadence the FM never saw;
+        #   3. the constructor/CLI default.
+        # _check_horizon then rejects any pair that still disagrees.
+        meta_every = self._trk.params.get("fm_update_every")
+        snap_every = getattr(self.ctx, "fm_snap_every", None) if self.fm_enabled else None
+        if meta_every is not None:
+            self.fm_update_every, src = max(int(meta_every), 1), "tracker metadata"
+        elif snap_every is not None:
+            self.fm_update_every, src = max(int(snap_every), 1), "fm.onnx fm_snap_every"
+        else:
+            src = "constructor default"
+        print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} (from {src})")
+        if self.fm_enabled:
             if self.zero_noise:
                 print("[INFO GenTrackerPolicy] zero_noise=True: the flow is integrated from "
                       "x0 = 0 instead of x0 ~ N(0, I) -- one deterministic trajectory per "
                       "conditioning, not the stochastic sampling the FM was trained for.")
-        else:
+        else:  # noqa: PLR5501 -- mirrors the fm_enabled branch above for readability
             # Tracker-only (no FM): a clip reference drives the tracker directly. Build a
             # lightweight ctx from the tracker metadata so the shared obs assembly + the
             # runner's frame/ee bookkeeping work without a generator (clip-only playback).
@@ -156,7 +170,8 @@ class GenTrackerPolicy:
                   "drives the tracker; the generator is disabled.")
         self._resolve_depth_cameras()
         self._build_orderings()
-        self._build_future_offsets()
+        self._build_window()
+        self._check_horizon()
         F, nj, k = self.ctx.F, self.ctx.nj, self.ctx.target_num_extra_frames
         self._history = BatchedHistory(1, self.ctx.N)
         self._pred = {
@@ -170,6 +185,8 @@ class GenTrackerPolicy:
         self._pred_valid = False
         self._ctrl_step = -1
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
+        # Per-term observation-history windows, keyed by term name (see _push_history).
+        self._obs_history: dict[str, list[np.ndarray]] = {}
         self._reset_timing()
         self._loaded = True
 
@@ -274,8 +291,9 @@ class GenTrackerPolicy:
         The FM joint order (``ctx.joint_names``) need NOT equal the robot's isaac
         order -- a clip-conditioned FM is trained in the clip-library joint order.
         Mirrors the in-loop ``FmTrackingCommand`` (which permutes both ways):
-        measured joints are permuted isaac->FM for the robot-state history, and the
-        FM prediction is permuted FM->CLF-output for ``joint_pos_ref``/``joint_vel_ref``.
+        measured joints are permuted isaac->FM for the robot-state history, and the FM
+        prediction is permuted FM->isaac for the ``reference_window`` joint blocks (and
+        FM->CLF-output for the legacy ``joint_*_ref`` terms a clip reference may serve).
         """
         isaac = list(self._trk.get_joint_names())
         self.joint_names_isaac = isaac
@@ -283,8 +301,8 @@ class GenTrackerPolicy:
         if joint_out is None:
             print(
                 "[WARN GenTrackerPolicy] tracker.onnx metadata has no 'joint_out_names'; falling "
-                "back to joint_names_isaac for joint_pos_ref/joint_vel_ref (WRONG if the CLF output "
-                "joint order differs). Re-export the tracker with the updated export_parameters.py."
+                "back to joint_names_isaac for the CLF output order (WRONG if it differs). "
+                "Re-export the tracker with the updated export_parameters.py."
             )
             joint_out = list(isaac)
         self.joint_out_names = joint_out
@@ -292,20 +310,98 @@ class GenTrackerPolicy:
             fm = list(self.ctx.joint_names)
             # Measured (isaac order) -> FM order, for the robot-state history input.
             self._isaac_to_fm = np.array([isaac.index(n) for n in fm], dtype=np.int64)
-            # FM prediction (FM order) -> CLF output joint order, for joint_*_ref.
+            # FM prediction (FM order) -> CLF output joint order.
             self._fm_to_out = np.array([fm.index(n) for n in joint_out], dtype=np.int64)
+            # FM prediction (FM order) -> robot/isaac order. What `reference_window` wants:
+            # its joint blocks line up elementwise with the joint_pos / joint_vel / actions
+            # proprioception terms, which is a DIFFERENT order from joint_*_ref's.
+            self._fm_to_isaac = np.array([fm.index(n) for n in isaac], dtype=np.int64)
         else:
             # Tracker-only (no FM): the clip reference (in isaac order) drives directly.
             self._isaac_to_fm = None
             self._fm_to_out = np.array([isaac.index(n) for n in joint_out], dtype=np.int64)
+            self._fm_to_isaac = np.arange(len(isaac), dtype=np.int64)
 
-    def _build_future_offsets(self) -> None:
-        """Strided future step offsets covering the look-ahead window (>=1 offset)."""
-        dt = self.get_dt()
-        horizon_steps = max(1, int(round(self.future_horizon_s / dt)))
-        stride = max(1, int(self.future_stride))
-        offs = list(range(stride, horizon_steps + 1, stride))
-        self.future_offsets = offs or [horizon_steps]
+    def _build_window(self) -> None:
+        """Resolve the reference/command window offsets from the tracker metadata.
+
+        The window is ``[0, stride, ..., (num_steps-1)*stride]`` control steps, offset 0
+        being the CURRENT step -- see ``mdp/observations/observations.py:_window_offsets``.
+        Read from the exported ``reference_window_spec`` rather than derived from a
+        runner default, so the deploy samples the reference at exactly the offsets the
+        policy trained on.
+
+        Raises:
+            ValueError: If the tracker observes a window term whose contract the export
+                did not record, or if the two windows disagree on their offsets.
+        """
+        terms = {t["name"] for t in self._trk.get_obs_terms()}
+        if "reference_window" not in terms:
+            raise ValueError(
+                "tracker.onnx has no 'reference_window' observation term. This runtime "
+                "builds the merged window layout only; the retired per-term layout "
+                "(base_pose_error / joint_*_ref / ee_ref / future_base_*) is gone. "
+                f"Its terms are: {sorted(terms)}."
+            )
+        ref_spec = self._trk.get_reference_window_spec()
+        cmd_spec = self._trk.get_command_window_spec()
+        missing = [n for n in ("reference_window", "command_window") if n in terms and (
+            (ref_spec if n == "reference_window" else cmd_spec) is None)]
+        if missing:
+            raise ValueError(
+                f"tracker.onnx observes {missing} but its metadata carries no "
+                f"{'/'.join(n + '_spec' for n in missing)}. The flat term width does not "
+                "describe the sample offsets or the per-step block layout, so the "
+                "reference cannot be rebuilt. Re-export with the updated "
+                "scripts/rsl_rl/export_parameters.py."
+            )
+        self.reference_window_spec = ref_spec
+        self.command_window_spec = cmd_spec
+        if cmd_spec is not None and list(ref_spec["offsets"]) != list(cmd_spec["offsets"]):
+            raise ValueError(
+                f"reference_window offsets {ref_spec['offsets']} != command_window offsets "
+                f"{cmd_spec['offsets']}; they index the same reference and must agree."
+            )
+        self.window_offsets = [int(o) for o in ref_spec["offsets"]]
+
+    def _check_horizon(self) -> None:
+        """Refuse a generator whose horizon cannot cover the window at maximum staleness.
+
+        The deploy half of ``FmTrackingCommand._check_horizon``. The prediction cursor is
+        at most ``fm_update_every - 1`` nodes past the last re-plan, so serving offset
+        ``o`` reads node ``o + fm_update_every - 1`` and needs ``F >= o +
+        fm_update_every``. Without this, ``_pred_at`` clamps to ``F - 1`` and the far end
+        of the window silently freezes -- the policy then tracks a reference that stops
+        advancing, which looks like a tracking bug rather than a horizon one.
+
+        Also cross-checks the FM's own re-plan period: the targets were cut at
+        ``fm_snap_every`` during recording, so re-planning at a different cadence puts the
+        generator off-distribution in a way no shape reveals.
+
+        Raises:
+            ValueError: If the horizon is too short for the window, or the two artifacts
+                disagree on the re-plan period.
+        """
+        if not self.fm_enabled:
+            return
+        max_off = max(self.window_offsets)
+        required = max_off + self.fm_update_every
+        if required > self.ctx.F:
+            raise ValueError(
+                f"The FM predicts F={self.ctx.F} nodes, but serving a look-ahead offset of "
+                f"{max_off} steps at a re-plan period of {self.fm_update_every} needs "
+                f"F >= {required} (the cursor is up to {self.fm_update_every - 1} nodes "
+                "stale when the furthest sample is read). Re-record with "
+                f"--ref_future_len {required} and retrain the FM with --future_len {required}."
+            )
+        snap = getattr(self.ctx, "fm_snap_every", None)
+        if snap is not None and int(snap) != self.fm_update_every:
+            raise ValueError(
+                f"fm.onnx was recorded at fm_snap_every={int(snap)} but the tracker runs the "
+                f"generator every {self.fm_update_every} steps. The FM's targets were cut at "
+                "the recording cadence, so re-planning at another one is off-distribution. "
+                "Re-record/retrain the FM, or re-export the tracker, so the two agree."
+            )
 
     # ------------------------------------------------------------------
     # Snapshot + generator inference
@@ -496,10 +592,14 @@ class GenTrackerPolicy:
         return {k: v[0, idx] for k, v in self._pred.items()}
 
     def _reference_from_fm(self) -> dict:
-        """Assemble the current + future world reference from the FM prediction buffers."""
-        cur = self._pred_at(self._pred_idx)
-        fut = [self._pred_at(self._pred_idx + o) for o in self.future_offsets]
-        return {"current": cur, "future": fut}
+        """Assemble the world reference over the window from the FM prediction buffers.
+
+        ``window[i]`` is the prediction at ``window_offsets[i]`` control steps ahead of
+        the cursor; index 0 is the CURRENT step, matching ``_window_offsets`` on the RL
+        side. A clip reference supplies the same structure (see
+        ``transfer/sim/clip_reference.py``).
+        """
+        return {"window": [self._pred_at(self._pred_idx + o) for o in self.window_offsets]}
 
     # ------------------------------------------------------------------
     # Observation construction
@@ -516,13 +616,68 @@ class GenTrackerPolicy:
         self._update_generator(state)
         return self._build_obs(state, reference=None)
 
+    def _reference_window(self, window: list[dict], root_pos, root_quat, inv_root) -> np.ndarray:
+        """Pack the reference window, mirroring ``mdp.observations.reference_window``.
+
+        Per step, in ``reference_window_layout`` order: ``base_pose`` (6) -- reference
+        base position + orientation error against the robot's CURRENT actual base;
+        ``base_vel`` (6) -- reference base lin+ang velocity rotated into that same
+        current base frame; ``joint_pos`` / ``joint_vel`` (nj each) -- **in the robot's
+        own joint order**, so they line up elementwise with the proprioception terms;
+        ``ee_pos`` (3 per frame) -- reference end-effector positions in *that step's*
+        reference base frame. Flattened ``[step0(D), step1(D), ...]``.
+
+        Every block is relative, so no world coordinate reaches the policy.
+
+        Args:
+            window: One reference state per window offset, offset 0 first.
+            root_pos: The robot's measured base position, world frame.
+            root_quat: The robot's measured base orientation, world xyzw.
+            inv_root: ``quat_inv(root_quat)``, precomputed by the caller.
+
+        Returns:
+            The flat window, ``[num_steps * (12 + 2*nj + 3*n_ee)]``.
+        """
+        f64 = lambda x: np.asarray(x, dtype=np.float64)
+        n_ee = self.ctx.target_num_extra_frames
+        steps = []
+        for ref in window:
+            ref_pos, ref_quat = f64(ref["root_pos"]), f64(ref["root_quat"])
+            base_pose = np.concatenate([
+                quat_apply(inv_root, ref_pos - root_pos),
+                # actual box-minus reference in WORLD, then re-expressed in the base frame
+                quat_apply(inv_root, quat_box_minus(root_quat, ref_quat)),
+            ], axis=-1)
+            base_vel = np.concatenate([
+                quat_apply(inv_root, f64(ref["root_lin"])),
+                quat_apply(inv_root, f64(ref["root_ang"])),
+            ], axis=-1)
+            jp, jv = f64(ref["jp"])[self._fm_to_isaac], f64(ref["jv"])[self._fm_to_isaac]
+            parts = [base_pose, base_vel, jp, jv]
+            if n_ee > 0:
+                # Relative to the reference base AT THE SAME STEP: the world lift is rigid,
+                # so differencing and unrotating recovers the clip-frame posture exactly.
+                inv_ref = quat_inv(ref_quat)
+                frame_pos = f64(ref["frame_pos"])
+                parts += [quat_apply(inv_ref, frame_pos[i] - ref_pos) for i in range(n_ee)]
+            steps.append(np.concatenate(parts, axis=-1))
+        return np.concatenate(steps, axis=-1)
+
     def _build_obs(self, state: dict, reference: dict | None) -> np.ndarray:
         """Build the policy obs from proprioception + the world reference (numpy).
 
-        Mirrors ``mdp/observations/observations.py`` exactly (base-frame-rotated
-        orientation errors; futures from the FM horizon; held future command).
+        Mirrors ``mdp/observations/observations.py`` exactly. The reference half is the
+        merged ``reference_window`` + ``command_window`` pair; the proprioception half is
+        the raw current step, which :meth:`_assemble` then stacks into each term's
+        history window.
         """
         ref = reference if reference is not None else self._reference_from_fm()
+        window = ref["window"]
+        if len(window) != len(self.window_offsets):
+            raise ValueError(
+                f"Reference window has {len(window)} samples but the tracker was exported "
+                f"for {len(self.window_offsets)} (offsets {self.window_offsets})."
+            )
         f64 = lambda x: np.asarray(x, dtype=np.float64)
         root_pos = f64(state["root_pos"])
         root_quat = f64(state["root_quat"])
@@ -530,74 +685,29 @@ class GenTrackerPolicy:
         default = self._trk.default_joint_angles
         inv_root = quat_inv(root_quat)
 
-        cur = ref["current"]
-        ref_pos = f64(cur["root_pos"]); ref_quat = f64(cur["root_quat"])
-        ref_jp = f64(cur["jp"]); ref_jv = f64(cur["jv"])
-
-        pos_err_b = quat_apply(inv_root, ref_pos - root_pos)
-        ori_err_b = quat_apply(inv_root, quat_box_minus(root_quat, ref_quat))
-        base_pose_error = np.concatenate([pos_err_b, ori_err_b], axis=-1)
-
-        joint_pos_ref = ref_jp[self._fm_to_out]
-        joint_vel_ref = ref_jv[self._fm_to_out]
-
-        ee_parts = []
-        if self.ctx.target_num_extra_frames > 0:
-            inv_ref = quat_inv(ref_quat)
-            frame_pos = f64(cur["frame_pos"])
-            for kf in range(self.ctx.target_num_extra_frames):
-                ee_parts.append(quat_apply(inv_ref, frame_pos[kf] - ref_pos))
-        ee_ref = np.concatenate(ee_parts, axis=-1) if ee_parts else np.zeros(0)
-
-        # Reference base velocity (lin+ang, world frame) rotated into the current base
-        # frame -- the deployable, heading-invariant base_vel_ref (observations
-        # .ref_base_velocity_local). Guarded so an injected reference without the
-        # velocity channels (parity tests) simply omits the term.
-        base_vel_ref = None
-        if "root_lin" in cur:
-            ref_lin, ref_ang = f64(cur["root_lin"]), f64(cur["root_ang"])
-            base_vel_ref = np.concatenate(
-                [quat_apply(inv_root, ref_lin), quat_apply(inv_root, ref_ang)], axis=-1
-            )
-
-        fcmd, fpose, fvel = [], [], []
-        for step in ref["future"]:
-            # Held current command (FM: no per-step command) or the clip's actual
-            # future target_vel when the reference source supplies it (parity with
-            # IsaacLab's future_command_velocity, which reads the clip lookahead).
-            fcmd.append(f64(step["command"]) if "command" in step else command)
-            fp = f64(step["root_pos"]); fq = f64(step["root_quat"])
-            fl = f64(step["root_lin"]); fa = f64(step["root_ang"])
-            fpose.append(np.concatenate(
-                [quat_apply(inv_root, fp - root_pos), quat_apply(inv_root, quat_box_minus(root_quat, fq))], axis=-1
-            ))
-            fvel.append(np.concatenate([quat_apply(inv_root, fl), quat_apply(inv_root, fa)], axis=-1))
-
         values = {
             "base_ang_vel": f64(state["base_ang_vel"]),
             "projected_gravity": quat_apply(inv_root, np.array([0.0, 0.0, -1.0])),
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "base_pose_error": base_pose_error,
-            "joint_pos_ref": joint_pos_ref,
-            "joint_vel_ref": joint_vel_ref,
-            "ee_ref": ee_ref,
-            "command_vel": command,
-            "future_command_vel": np.concatenate(fcmd, axis=-1),
-            "future_base_pose": np.concatenate(fpose, axis=-1),
-            "future_base_vel": np.concatenate(fvel, axis=-1),
+            "reference_window": self._reference_window(window, root_pos, root_quat, inv_root),
+            # The joystick-level command over the same offsets. Deliberately separate from
+            # the reference window so it stays clean: at deploy it comes from the joystick
+            # or a scripted profile, not the generator. A clip reference supplies each
+            # step's actual target_vel; the FM has no per-step command, so hold the
+            # current one -- which is what the deployed joystick does anyway.
+            "command_window": np.concatenate(
+                [f64(s["command"]) if "command" in s else command for s in window], axis=-1),
         }
-        if base_vel_ref is not None:
-            values["base_vel_ref"] = base_vel_ref
-        # Root-frame body-link targets (tracker trained with tracking_mode="body").  These
-        # are pelvis-relative already, so they pass through untransformed.  Only a clip
+        # Root-frame body-link targets (tracker trained with tracking_mode="body"). These
+        # are pelvis-relative already, so they pass through untransformed. Only a clip
         # reference supplies them today -- see the guard in _assemble for the FM case.
-        if "body_pos_root" in cur:
-            values["body_pos_ref"] = f64(cur["body_pos_root"])
-            values["body_vel_ref"] = f64(cur["body_vel_root"])
+        if "body_pos_root" in window[0]:
+            values["body_pos_ref"] = f64(window[0]["body_pos_root"])
+            values["body_vel_ref"] = f64(window[0]["body_vel_root"])
         # Height-scan obs term (only if the tracker was trained with it). The runner puts
-        # the per-ray clearance in state["height_scan"]; _assemble clips it via _TERM_CLIP.
+        # the per-ray clearance in state["height_scan"]; _assemble applies the exported clip.
         if "height_scan" in state:
             values["height_scan"] = f64(state["height_scan"])
         # Depth: one normalised row per camera, in contract order. Keyed here by the term
@@ -607,35 +717,51 @@ class GenTrackerPolicy:
             values[cam["obs_term"]] = f64(image)
         return self._assemble(values)
 
+    def _push_history(self, name: str, v: np.ndarray, history_length: int) -> np.ndarray:
+        """Append ``v`` to term ``name``'s window and return it flattened oldest-first.
+
+        Isaac Lab's :class:`CircularBuffer` semantics, which the policy trained against:
+        the FIRST push fills every slot with that sample (so step 0 is a static window,
+        not a zero-padded one), later pushes roll, and ``buffer`` reads oldest-at-index-0
+        with the most recent last. The manager then flattens it step-major, so the vector
+        is ``[v_{t-(H-1)}, ..., v_t]``.
+
+        The caller has already clipped ``v`` and must scale AFTER stacking: Isaac Lab
+        clips and scales each sample before it enters the buffer, and since both are
+        elementwise and constant that is identical to doing it to the stacked window --
+        as long as the scale is tiled across the history when it is a vector.
+
+        Args:
+            name: Observation term name (the buffer key).
+            v: This step's single-sample value, already clipped.
+            history_length: Window length in control steps.
+
+        Returns:
+            The flattened window, ``[history_length * v.size]``.
+        """
+        buf = self._obs_history.get(name)
+        if buf is None or len(buf) != history_length or buf[0].shape != v.shape:
+            buf = [v.copy() for _ in range(history_length)]      # first push fills the window
+            self._obs_history[name] = buf
+        else:
+            buf.append(v.copy())
+            buf.pop(0)
+        return np.concatenate(buf, axis=-1)
+
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:
-        """Order, scale, and clip the terms per the embedded observation_terms.policy.
+        """Order, clip, stack and scale the terms per the embedded observation_terms.policy.
 
-        TODO(deploy): this does NOT implement observation history, so a policy trained
-        with ``history_length`` on any term fails the dim check below on the first
-        control step (loudly, which is the intent -- the alternative is a silently
-        misaligned observation vector). The current teacher does exactly that, so this
-        path is broken until ported. What it owes, in order:
-
-        1. per-term ring buffers keyed on ``term["history_length"]`` (already parsed by
-           ``TrackerSession._resolve_obs_terms``), flattened OLDEST-FIRST and warm-started
-           by replicating the first sample into every slot -- Isaac Lab's
-           ``CircularBuffer`` semantics; ``transfer/sim/rl_policy.py:_update_history`` is
-           a correct reference port;
-        2. clip and scale applied PER TIMESTEP before stacking, not once over the stacked
-           slice -- Isaac Lab bakes them into each slot, and ``scale`` may be a vector, so
-           it needs tiling across the history (see ``rl_policy.py``'s ``np.tile``);
-        3. the new merged ``reference_window`` / ``command_window`` terms built in
-           ``_build_obs``, replacing the retired ``joint_pos_ref`` / ``ee_ref`` /
-           ``future_base_*`` terms;
-        4. ``GenTrackerPolicy.reset()`` clearing the new buffers.
-
-        See also the two blocked FM look-ahead accessors in ``fm_tracking_cmd.py``, which
-        must land before the generator can serve the window at all.
+        The exported term table is the single authority on the vector: its order is the
+        concatenation order, its ``shape`` is the FLAT width (history already multiplied
+        in), and its ``clip`` / ``scale`` / ``history_length`` are what training applied.
+        Per term, in Isaac Lab's order: clip the raw sample, push it through the term's
+        history window (if any), then scale.
         """
         out = np.zeros(self.get_num_obs(), dtype=np.float32)
         idx = 0
         for term in self._trk.get_obs_terms():
             name, shape, scale = term["name"], term["shape"], term["scale"]
+            hist = term["history_length"]
             if name not in values:
                 if name in ("body_pos_ref", "body_vel_ref"):
                     raise NotImplementedError(
@@ -651,11 +777,24 @@ class GenTrackerPolicy:
                     "means the caller supplied no state['depth'] rows)."
                 )
             v = np.atleast_1d(values[name].astype(np.float32))
-            if v.shape[0] != shape:
-                raise ValueError(f"Term '{name}': built dim {v.shape[0]} != metadata dim {shape}.")
+            # `shape` is the flat width INCLUDING the history stack, so the single-sample
+            # value is that divided by the window length.
+            step_dim = shape // hist if hist > 0 else shape
+            if v.shape[0] != step_dim:
+                raise ValueError(
+                    f"Term '{name}': built dim {v.shape[0]} != metadata dim {step_dim}"
+                    + (f" (= {shape} / history_length {hist})" if hist > 0 else "") + "."
+                )
             clip = term["clip"] if term["clip"] is not None else _LEGACY_TERM_CLIP.get(name)
             if clip is not None:
                 v = np.clip(v, -clip, clip)
+            if hist > 0:
+                v = self._push_history(name, v, hist)
+                # A per-channel scale describes ONE sample, so it repeats across the window.
+                if isinstance(scale, (list, tuple, np.ndarray)):
+                    scale = np.tile(np.asarray(scale, dtype=np.float32).ravel(), hist)
+            elif isinstance(scale, (list, tuple)):
+                scale = np.asarray(scale, dtype=np.float32)
             out[idx:idx + shape] = v * scale
             idx += shape
         return out[None]
@@ -694,9 +833,16 @@ class GenTrackerPolicy:
         self._future_cmd_override = None if future_cmd is None else np.asarray(future_cmd, dtype=np.float64)
 
     def reset(self) -> None:
-        """Reset the rolling history + prediction state (the tracker is stateless)."""
+        """Reset the rolling histories + prediction state (the tracker net is stateless).
+
+        Both windows go: the FM's conditioning history AND the per-term observation
+        history. Clearing the latter makes the next ``create_obs`` re-fill each window
+        with its first sample, which is what Isaac Lab does on an env reset -- keeping a
+        stale window would feed the policy motion that happened before the reset.
+        """
         if self._loaded:
             self._history = BatchedHistory(1, self.ctx.N)
+            self._obs_history = {}
             self._pred_idx = 0
             self._pred_valid = False
             self._ctrl_step = -1

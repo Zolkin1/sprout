@@ -539,7 +539,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         if not writer:
             return
         ref = ref if ref is not None else policy._reference_from_fm()
-        cur = ref["current"]
+        cur = ref["window"][0]          # offset 0 = the current step
         rq = np.asarray(state["root_quat"], dtype=np.float64)
         root_pos = np.asarray(state["root_pos"], dtype=np.float64)
         ref_pos = np.asarray(cur["root_pos"], dtype=np.float64)
@@ -751,7 +751,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 if clip.ego_anchor and (clip_step - clip.start_step) % max(clip.ego_anchor_every, 1) == 0:
                     clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
                 policy.observe(state)            # keep the FM history warm for handoff
-                ref = clip.reference_at(s, policy.future_offsets)
+                ref = clip.reference_at(s, policy.window_offsets)
                 obs = policy._build_obs(state, reference=ref)
             action = policy.get_action(obs, robot.joint_names)
             robot.apply_action(action)

@@ -552,20 +552,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # embedded, so the runner needs no YAML. Done here rather than in a separate step
         # because tracker.onnx needs the policy.pt + policy_parameters.yaml this run just
         # wrote -- exporting them together is what keeps the three in sync.
+        #
+        # NOT wrapped in a try/except. It used to be, and a failure printed a [WARN] and
+        # left a run directory that looks complete but holds a stale fm.onnx (or none) --
+        # which is then what gets benchmarked, sim2sim'd, and uploaded to the robot. A
+        # broken export is a broken export; fail here where it is one line to read.
         if not args_cli.no_deploy_onnx:
-            try:
-                export_tracker_onnx(export_model_dir)
-                _trk = os.path.join(export_model_dir, "tracker.onnx")
-                print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
-                if args_cli.fm_checkpoint is not None:
-                    fm_out = os.path.join(export_model_dir, "fm.onnx")
-                    export_fm_onnx(args_cli.fm_checkpoint, fm_out)
-                    print(f"[INFO] wrote {fm_out}")
-                else:
-                    print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
-            except Exception as exc:                                        # noqa: BLE001
-                print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
-                      f"Re-run export_tracker_onnx.py / export_fm_onnx.py by hand if needed.")
+            export_tracker_onnx(export_model_dir)
+            _trk = os.path.join(export_model_dir, "tracker.onnx")
+            print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
+            if args_cli.fm_checkpoint is not None:
+                fm_out = os.path.join(export_model_dir, "fm.onnx")
+                export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                print(f"[INFO] wrote {fm_out}")
+            else:
+                print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""

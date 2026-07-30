@@ -8,8 +8,8 @@ in their metadata, so there is no sidecar YAML to keep in sync (and no ``policy.
 hardware runtime is torch-free).  ``transfer/deploy/hardware.load_gen_tracker_from_hf``
 is the consumer, and it expects exactly this ``<folder>/{tracker.onnx,fm.onnx}`` layout.
 
-Produce the artifacts first with ``export_deploy_onnx.py`` (which itself wants a
-``play.py``-exported ``policy.pt``), then::
+Produce the artifacts first with ``play.py`` (which writes ``exported/tracker.onnx``,
+and ``exported/fm.onnx`` when given ``--fm_checkpoint``), then::
 
     python scripts/rsl_rl/export_to_hardware.py \\
         --run_dir logs/rsl_rl/g1/<run> --hf_repo_id user/repo --folder_name <name>
@@ -52,8 +52,8 @@ def validate_pair(exported_dir: str) -> GenTrackerPolicy:
     missing = [n for n in ARTIFACTS if not os.path.exists(os.path.join(exported_dir, n))]
     if missing:
         raise FileNotFoundError(
-            f"{exported_dir} is missing {missing}. Run export_deploy_onnx.py first "
-            "(and play.py before that, to produce exported/policy.pt)."
+            f"{exported_dir} is missing {missing}. Run play.py --fm_checkpoint <ckpt> "
+            "first; it writes both files into <run>/exported/."
         )
     policy = GenTrackerPolicy(*(os.path.join(exported_dir, n) for n in ARTIFACTS))
     policy.load()

@@ -80,6 +80,14 @@ if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
 fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
+# TODO(logging-refactor): a hardware run currently records NOTHING. obk-launch takes
+# `bag=True` (ros2 bag record, obelisk_bringup.launch.py) and no launcher here passes it,
+# so if the robot does something wrong the entire forensic record is tmux scrollback -- in
+# a container whose ROS_LOG_DIR is not even bind-mounted, so `stop.sh --down` destroys it.
+# Also: the `dbg` pane below is a bare shell where every other pane gets its command
+# pre-seeded; it wants `ros2 topic hz` on /depth/image_processed, /obelisk/g1/est_state,
+# /obelisk/g1/ctrl and /Odometry -- the four rates that say the stack is alive.
+# See "Observability" in transfer/obelisk/README.md.
 tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run ctrl "obk-launch config=$CTRL_CFG")"
 tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_shell dbg)"
 if [ "$SENSORS" = 1 ]; then

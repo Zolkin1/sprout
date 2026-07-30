@@ -137,6 +137,7 @@ def load_gen_tracker_from_hf(
     fm_update_every: int = 2,
     num_threads: int = 0,
     refresh: bool = False,
+    providers=None,
 ) -> GenTrackerPolicy:
     """Resolve ``tracker.onnx`` + ``fm.onnx`` from HF (cached) and load the policy.
 
@@ -148,12 +149,15 @@ def load_gen_tracker_from_hf(
             overridden by 'fm_update_every' in the tracker metadata if present.
         num_threads: onnxruntime intra-op threads (0 = auto).
         refresh: Re-download even on a cache hit.
+        providers: onnxruntime execution providers (see
+            ``tracker_session.resolve_providers``). None = CPU.
 
     Returns:
         A loaded :class:`GenTrackerPolicy`.
     """
     tracker, fm = fetch_artifacts(hf_repo_id, hf_policy_folder, cache_root, refresh=refresh)
-    policy = GenTrackerPolicy(tracker, fm, fm_update_every=fm_update_every, num_threads=num_threads)
+    policy = GenTrackerPolicy(tracker, fm, fm_update_every=fm_update_every,
+                              num_threads=num_threads, providers=providers)
     policy.load()
     return policy
 

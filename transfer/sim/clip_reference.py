@@ -5,7 +5,8 @@
 Loads a dense motion-clip library (the HDF5 produced by
 ``scripts/rsl_rl/generate_mb_library.py``) with numpy
 and serves, per control step, the same world-frame reference dict the online
-flow-matching generator emits -- ``{"current": {...}, "future": [...]}`` -- so it
+flow-matching generator emits -- ``{"window": [{...}, ...]}``, one entry per
+look-ahead offset with offset 0 (the current step) first -- so it
 drops straight into ``GenTrackerPolicy._build_obs(state, reference=...)``.  This
 lets the MuJoCo runner play a fixed clip through the tracker with **no FM**
 (deterministic), and is the counterpart of IsaacLab's ``MotionSequenceCommand``
@@ -266,20 +267,31 @@ class ClipReference:
         idx = np.minimum(step + 1 + np.arange(num_future), self.num_steps - 1)
         return self.tv[idx].copy()
 
-    def reference_at(self, step: int, future_offsets: list[int]) -> dict:
-        """Assemble the ``{"current", "future"}`` reference dict for ``_build_obs``.
+    def reference_at(self, step: int, window_offsets: list[int]) -> dict:
+        """Assemble the ``{"window": [...]}`` reference dict for ``_build_obs``.
 
-        Each future step carries its actual ``target_vel`` under ``"command"`` so
-        ``_build_obs`` reproduces IsaacLab's lookahead ``future_command_velocity``.
-        Future steps clamp to the clip end (matching the IsaacLab convention).
+        One entry per offset, in the order given -- offset 0 is the current step, which
+        is part of the window rather than a separate ``current`` entry (matching
+        ``mdp.observations._window_offsets``, where the window starts at 0).
+
+        Each entry carries its actual ``target_vel`` under ``"command"``, so
+        ``_build_obs`` reproduces IsaacLab's ``command_window`` from the clip rather
+        than holding the current command. Steps clamp to the clip end (the IsaacLab
+        convention).
+
+        Args:
+            step: Current clip step.
+            window_offsets: Offsets in control steps, e.g. ``[0, 5, ..., 50]``.
+
+        Returns:
+            ``{"window": [state, ...]}``, one state per offset.
         """
-        cur = self._frame_state(step)
-        fut = []
-        for o in future_offsets:
+        window = []
+        for o in window_offsets:
             fs = self._frame_state(step + o)
             fs["command"] = self.command_at(step + o)
-            fut.append(fs)
-        return {"current": cur, "future": fut}
+            window.append(fs)
+        return {"window": window}
 
     def spawn_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Spawn state at ``start_step``.

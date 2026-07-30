@@ -22,7 +22,7 @@ import onnxruntime as ort
 
 from .depth_obs import parse_depth_spec, sanitize_extero_np
 from .tracker_session import make_session
-from .transforms_np import relative_state, state_to_absolute
+from .transforms_np import EE_BLOCK_DIM, ROOT_BLOCK_DIM, relative_state, state_to_absolute
 
 
 @dataclass
@@ -80,9 +80,50 @@ class FmContext:
 _WARNED_NO_NULL = False
 
 
-def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
+def _check_state_layout(onnx_path: str, meta: dict) -> None:
+    """Refuse a graph whose state vector is not laid out the way this runtime slices it.
+
+    ``state_to_absolute`` reads frame blocks at fixed offsets derived from
+    :data:`transforms_np.ROOT_BLOCK_DIM` / :data:`transforms_np.EE_BLOCK_DIM`.  When the
+    extra frames went position-only those offsets moved, but nothing observable in the
+    graph did: ``D``, ``nj`` and ``len(target_frame_names)`` are identical between a
+    15-wide and a 3-wide ee block for a different joint count, so a stale ``fm.onnx``
+    loads clean, indexes in range, and produces a garbage world lift.  The torch side
+    raises on the same mismatch (``flow_matching.online``); this is the deploy half.
+
+    Args:
+        onnx_path: Path of the graph being loaded, for the error message.
+        meta: The parsed ``fm_meta`` mapping.
+
+    Raises:
+        ValueError: If ``D`` disagrees with the advertised (or assumed) block widths.
+    """
+    nj, K, d = int(meta["nj"]), len(meta["target_frame_names"]), int(meta["D"])
+    # Absent on graphs exported before the layout was recorded. Assume the CURRENT
+    # widths: that is exactly the case worth catching, and a pre-switch graph then
+    # fails the arithmetic below instead of loading silently.
+    root = int(meta.get("root_block_dim", ROOT_BLOCK_DIM))
+    ee = int(meta.get("ee_block_dim", EE_BLOCK_DIM))
+    expected = 2 * nj + root + ee * K
+    if d != expected:
+        raise ValueError(
+            f"{onnx_path}: fm_meta D={d} but its layout implies {expected} "
+            f"(2*nj={2 * nj} + root_block={root} + {K}*ee_block={ee * K}). "
+            f"This runtime slices frames at ROOT_BLOCK_DIM={ROOT_BLOCK_DIM} / "
+            f"EE_BLOCK_DIM={EE_BLOCK_DIM}; a graph exported before the extra frames "
+            "went position-only does not match. Re-export the FM checkpoint."
+        )
+    if root != ROOT_BLOCK_DIM or ee != EE_BLOCK_DIM:
+        raise ValueError(
+            f"{onnx_path}: fm_meta declares root_block_dim={root}, ee_block_dim={ee}, "
+            f"but this runtime slices at {ROOT_BLOCK_DIM} / {EE_BLOCK_DIM} "
+            "(transfer/deploy/transforms_np.py). Re-export, or port transforms_np."
+        )
+
+
+def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmContext:
     """Load ``fm.onnx`` and parse its ``fm_meta`` metadata into an :class:`FmContext`."""
-    sess = make_session(onnx_path, num_threads)
+    sess = make_session(onnx_path, num_threads, providers)
     raw = sess.get_modelmeta().custom_metadata_map
     if "fm_meta" not in raw:
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
@@ -102,6 +143,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
             "listed in gen_tracker._assemble's TODO. Export a history_source='measured' "
             "checkpoint for deployment."
         )
+    _check_state_layout(onnx_path, m)
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         target_num_extra_frames=len(m["target_frame_names"]),

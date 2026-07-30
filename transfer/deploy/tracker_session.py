@@ -16,12 +16,91 @@ import numpy as np
 import onnxruntime as ort
 
 
-def make_session(onnx_path: str, num_threads: int = 0) -> ort.InferenceSession:
-    """Create an ORT CPU session with full graph optimization.
+#: Short provider aliases accepted by :func:`resolve_providers` and the benchmark CLI.
+PROVIDER_ALIASES = {
+    "cpu": "CPUExecutionProvider",
+    "cuda": "CUDAExecutionProvider",
+    "trt": "TensorrtExecutionProvider",
+    "tensorrt": "TensorrtExecutionProvider",
+}
+
+
+_GPU_DLLS_PRELOADED = False
+
+
+def _preload_gpu_dlls() -> None:
+    """Make pip-installed CUDA/cuDNN visible to onnxruntime, once per process.
+
+    When the CUDA stack comes from the ``nvidia-*`` wheels rather than a system install,
+    onnxruntime cannot find ``libcublasLt.so`` / ``libcudnn.so`` on its own: it logs a
+    load failure and **silently falls back to CPU**, so a GPU run reports plausible
+    numbers that are really CPU numbers. ``preload_dlls`` loads them from the installed
+    wheels. Absent on older onnxruntime builds, where a system CUDA on the loader path is
+    the only option -- hence the guard.
+    """
+    global _GPU_DLLS_PRELOADED                                        # noqa: PLW0603
+    if _GPU_DLLS_PRELOADED:
+        return
+    _GPU_DLLS_PRELOADED = True
+    preload = getattr(ort, "preload_dlls", None)
+    if preload is not None:
+        try:
+            preload()
+        except Exception as exc:                                      # noqa: BLE001
+            print(f"[WARN deploy] onnxruntime.preload_dlls() failed ({exc}); a CUDA "
+                  "provider may fall back to CPU.")
+
+
+def resolve_providers(providers=None) -> list:
+    """Normalise a provider request into an onnxruntime provider list.
+
+    Args:
+        providers: ``None`` for CPU only (the deployment default -- a GPU is opt-in, so
+            nothing silently starts using one); a list of names or short aliases
+            (``cpu`` / ``cuda`` / ``trt``); or a list of ``(name, options)`` tuples,
+            which pass through untouched.
+
+    Returns:
+        A provider list suitable for :class:`onnxruntime.InferenceSession`. Aliases are
+        expanded and CPU is appended as the final fallback, which is what makes a GPU
+        request degrade rather than fail on a box without one.
+
+    Raises:
+        ValueError: If a requested provider is not one onnxruntime was built with.
+    """
+    if providers is None:
+        return ["CPUExecutionProvider"]
+    names = [p[0] if isinstance(p, tuple) else PROVIDER_ALIASES.get(str(p).lower(), str(p))
+             for p in providers]
+    if any(n != "CPUExecutionProvider" for n in names):
+        _preload_gpu_dlls()
+    available = set(ort.get_available_providers())
+    out = []
+    for p in providers:
+        if isinstance(p, tuple):
+            out.append(p)
+            continue
+        name = PROVIDER_ALIASES.get(str(p).lower(), str(p))
+        if name not in available:
+            raise ValueError(
+                f"onnxruntime has no '{name}'. Built-in providers here: "
+                f"{sorted(available)}. A CUDA/TensorRT provider needs the "
+                "'onnxruntime-gpu' wheel (and on Jetson, NVIDIA's JetPack-matched build "
+                "-- the PyPI aarch64 wheel targets SBSA, not L4T)."
+            )
+        out.append(name)
+    if "CPUExecutionProvider" not in [p[0] if isinstance(p, tuple) else p for p in out]:
+        out.append("CPUExecutionProvider")   # fallback for any op the accelerator lacks
+    return out
+
+
+def make_session(onnx_path: str, num_threads: int = 0, providers=None) -> ort.InferenceSession:
+    """Create an ORT session with full graph optimization.
 
     Args:
         onnx_path: Path to the ``.onnx`` file.
-        num_threads: Intra-op threads (0 lets ORT choose).
+        num_threads: Intra-op threads (0 lets ORT choose). CPU-side only.
+        providers: Execution providers; see :func:`resolve_providers`. ``None`` = CPU.
 
     Returns:
         A configured :class:`onnxruntime.InferenceSession`.
@@ -30,15 +109,15 @@ def make_session(onnx_path: str, num_threads: int = 0) -> ort.InferenceSession:
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     if num_threads > 0:
         so.intra_op_num_threads = num_threads
-    return ort.InferenceSession(onnx_path, so, providers=["CPUExecutionProvider"])
+    return ort.InferenceSession(onnx_path, so, providers=resolve_providers(providers))
 
 
 class TrackerSession:
     """onnxruntime RL-tracker policy + its embedded deployment parameters."""
 
-    def __init__(self, onnx_path: str, num_threads: int = 0):
+    def __init__(self, onnx_path: str, num_threads: int = 0, providers=None):
         """Load the tracker ONNX and parse its ``policy_parameters`` metadata."""
-        self.sess = make_session(onnx_path, num_threads)
+        self.sess = make_session(onnx_path, num_threads, providers)
         meta = self.sess.get_modelmeta().custom_metadata_map
         if "policy_parameters" not in meta:
             raise ValueError(f"{onnx_path} has no 'policy_parameters' metadata; re-export with metadata.")
@@ -163,6 +242,25 @@ class TrackerSession:
         root-frame body targets -- see ``transfer/sim/clip_reference.py``.
         """
         return list(self.params.get("root_frame_bodies") or [])
+
+    def get_reference_window_spec(self) -> dict | None:
+        """Contract for the merged ``reference_window`` observation, or None.
+
+        ``{num_steps, stride, offsets, blocks, joint_order, ee_frame_names}`` -- the
+        sample offsets in control steps and the per-step block layout
+        (``[[name, width], ...]``), which the flat term width alone cannot express.
+        The joint blocks are in the ROBOT's joint order, not ``joint_out_names``.
+        None when the tracker has no such term, or on an export predating the key.
+        """
+        return self.params.get("reference_window_spec")
+
+    def get_command_window_spec(self) -> dict | None:
+        """Contract for the ``command_window`` observation, or None.
+
+        ``{num_steps, stride, offsets, cmd_dim}``; index 0 is the current command and
+        the rest is the look-ahead, at the same offsets the reference window uses.
+        """
+        return self.params.get("command_window_spec")
 
     def get_joint_out_names(self) -> list[str] | None:
         """CLF output joint order, if exported (else None -> caller falls back)."""

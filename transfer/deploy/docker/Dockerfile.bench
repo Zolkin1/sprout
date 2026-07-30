@@ -1,0 +1,125 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Benchmark image for the ONNX deploy path (transfer/deploy/benchmark.py).
+#
+# Deliberately separate from transfer/obelisk/docker: that image is a full ROS 2 + Obelisk
+# build, targets x86, and pins the CPU-only onnxruntime. Benchmarking wants the opposite --
+# something small enough to drop on any candidate deploy box, and able to carry a GPU wheel.
+#
+# Three targets, one wheel source per platform. The repo is BIND-MOUNTED rather than COPYed
+# (the same convention as transfer/obelisk/docker/docker-compose.yml), so editing the
+# benchmark needs no rebuild.
+#
+#   cpu     -- x86_64 or aarch64, CPU only.        The System76 Meerkat (no NVIDIA GPU).
+#   cuda    -- x86_64 + discrete NVIDIA.           This dev box.
+#   jetson  -- aarch64 + integrated NVIDIA (L4T).  Orin now, Thor by changing ORT_WHEEL.
+#
+# --- build ------------------------------------------------------------------------------
+#   docker build -f transfer/deploy/docker/Dockerfile.bench --target cpu  -t fmbench:cpu  .
+#   docker build -f transfer/deploy/docker/Dockerfile.bench --target cuda -t fmbench:cuda .
+#
+#   # Jetson: the wheel is NOT on PyPI. PyPI's aarch64 onnxruntime-gpu targets SBSA/Grace
+#   # with datacenter CUDA, not L4T; installing it yields an import that works and reports
+#   # no CUDA provider. Take NVIDIA's JetPack-matched build and pin it to the JetPack the
+#   # box runs (`cat /etc/nv_tegra_release`); JP 6.2 = CUDA 12.6 / TensorRT 10.3, matching
+#   # transfer/jetson/zed/docker/Dockerfile.jp6.2.
+#   #   https://elinux.org/Jetson_Zoo#ONNX_Runtime   |   https://pypi.jetson-ai-lab.dev
+#   # Either a direct wheel URL:
+#   docker build -f transfer/deploy/docker/Dockerfile.bench --target jetson \
+#       --build-arg L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0 \
+#       --build-arg ORT_WHEEL=<direct .whl URL> -t fmbench:jetson .
+#   # ...or the index, letting pip resolve it:
+#   docker build -f transfer/deploy/docker/Dockerfile.bench --target jetson \
+#       --build-arg ORT_INDEX_URL=https://pypi.jetson-ai-lab.dev/jp6/cu126 -t fmbench:jetson .
+#
+#   # If building is a hassle, the ZED image already has the whole JetPack CUDA stack, so
+#   # `pip3 install <the same wheel>` inside it works as a base too -- and puts the
+#   # benchmark next to the thing you want to measure contention against.
+#
+#   The build FAILS if the installed wheel reports no GPU provider, so a JetPack mismatch
+#   surfaces at build time rather than as a plausible-looking CPU measurement.
+#
+# --- run --------------------------------------------------------------------------------
+#   REPO=$(git rev-parse --show-toplevel)
+#   docker run --rm -v $REPO:$REPO -w $REPO fmbench:cpu \
+#       python3 transfer/deploy/benchmark.py --run_dir logs/rsl_rl/g1/<run> \
+#               --threads 1,2,4,0 --json bench_$(hostname)_cpu.json
+#
+#   docker run --rm --gpus all -v $REPO:$REPO -w $REPO fmbench:cuda \
+#       python3 transfer/deploy/benchmark.py --run_dir logs/rsl_rl/g1/<run> \
+#               --providers cpu,cuda --json bench_$(hostname)_gpu.json
+#
+#   # Jetson needs --runtime nvidia (not --gpus) and benefits from --sample-gpu, which
+#   # reads tegrastats -- the integrated GPU does not show up in nvidia-smi.
+#   docker run --rm --runtime nvidia -v $REPO:$REPO -w $REPO fmbench:jetson \
+#       python3 transfer/deploy/benchmark.py --run_dir logs/rsl_rl/g1/<run> \
+#               --providers cpu,cuda,trt --sample-gpu --json bench_orin.json
+#
+# --- before you trust a Jetson number -----------------------------------------------------
+#   sudo nvpmodel -q          # which power mode (MAXN / 30W / 15W) is active
+#   sudo jetson_clocks        # lock clocks, or the governor makes runs unrepeatable
+# The benchmark prints the CPU scaling governor for the same reason on x86: a 'powersave'
+# box reads far slower than the same box under 'performance', which would send a
+# device comparison the wrong way.
+#
+# --- the contention question ---------------------------------------------------------------
+# On a Jetson the GPU is shared with the ZED depth pipeline, so an idle-GPU number answers
+# the wrong question. Run it twice -- once idle, once with the ZED node live
+# (transfer/jetson/zed) -- and compare step_worst p99.
+
+
+# An ARG used in a FROM must be declared BEFORE the first FROM (global scope); declaring it
+# next to the jetson stage puts it in that stage's scope, where the FROM cannot see it.
+#
+# l4t-jetpack carries the full CUDA/cuDNN/TensorRT stack, which is what the ORT GPU wheel
+# links against; l4t-base does NOT on JP6 and would need them layered in. Match the tag to
+# the board's JetPack (`cat /etc/nv_tegra_release`); r36.4.0 = JP 6.2, the version
+# transfer/jetson/zed/docker/Dockerfile.jp6.2 targets. Verified to resolve on nvcr.io:
+#   nvcr.io/nvidia/l4t-jetpack:r36.4.0   nvcr.io/nvidia/l4t-jetpack:r36.3.0
+#   nvcr.io/nvidia/l4t-cuda:12.6.11-runtime      nvcr.io/nvidia/l4t-base:r36.2.0
+# (`nvcr.io/nvidia/l4t-base:r36.4.0` does NOT exist -- l4t-base stopped at r36.2.0.)
+ARG L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+
+
+# ==========================================================================================
+FROM python:3.10-slim AS cpu
+# PyPI ships manylinux wheels for both x86_64 and aarch64, so this target covers the
+# Meerkat and a CPU-only baseline on the Jetson from the same Dockerfile.
+RUN pip install --no-cache-dir numpy onnxruntime
+CMD ["python3", "-c", "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers())"]
+
+
+# ==========================================================================================
+FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04 AS cuda
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+# The [cuda,cudnn] extras pull the nvidia-* wheels ORT needs. They still have to be on the
+# loader path at session-creation time: transfer/deploy/tracker_session._preload_gpu_dlls
+# calls onnxruntime.preload_dlls() whenever a non-CPU provider is requested, because
+# without it ORT fails to load libcublasLt and SILENTLY falls back to CPU.
+RUN pip3 install --no-cache-dir numpy "onnxruntime-gpu[cuda,cudnn]"
+CMD ["python3", "-c", "import onnxruntime as ort; ort.preload_dlls(); print(ort.__version__, ort.get_available_providers())"]
+
+
+# ==========================================================================================
+FROM ${L4T_BASE} AS jetson
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+# JetPack-matched wheel, supplied at build time -- there is no correct default, and a wrong
+# one fails silently rather than loudly. Thor is this same target with a JP7 URL.
+ARG ORT_WHEEL
+ARG ORT_INDEX_URL
+RUN test -n "$ORT_WHEEL" -o -n "$ORT_INDEX_URL" || (echo "ERROR: pass ONE of --build-arg ORT_WHEEL=<direct .whl URL> or --build-arg ORT_INDEX_URL=<pip index>; see the header." && false)
+RUN pip3 install --no-cache-dir numpy && \
+    if [ -n "$ORT_WHEEL" ]; then pip3 install --no-cache-dir "$ORT_WHEEL"; \
+    else pip3 install --no-cache-dir --index-url "$ORT_INDEX_URL" onnxruntime-gpu; fi
+# Fail the BUILD if the wheel cannot actually see the GPU. A JetPack mismatch otherwise
+# imports fine, reports CPU-only, and the benchmark silently measures the wrong thing --
+# better to find out here than after a run that looks plausible.
+RUN python3 -c "import onnxruntime as ort, sys; p=ort.get_available_providers(); print(p); \
+sys.exit(0 if 'CUDAExecutionProvider' in p or 'TensorrtExecutionProvider' in p else 'no GPU provider: wrong wheel for this JetPack')"
+# CUDA / cuDNN / TensorRT come from the L4T base image and the nvidia container runtime,
+# so there are no extras to install here -- unlike the x86 cuda target above.
+CMD ["python3", "-c", "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers())"]

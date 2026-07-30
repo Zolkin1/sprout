@@ -277,7 +277,84 @@ To check running containers
 To open a new bash terminal for running container
 ```docker exec -it <container_id or container_name> /bin/bash```
 
+# Observability — known gaps (deferred to the MCAP refactor)
+
+**A hardware run currently records nothing.** This section is the inventory, so it does
+not have to be re-derived. The plan is to replace the whole story with MCAP logging
+rather than revive the deleted CSV writer; until then, treat everything below as
+outstanding. Greppable in the code as `TODO(logging-refactor)`.
+
+**What exists today.** ROS 2 logger lines only, and almost all of them are one-shot or
+edge-triggered: policy identity and camera wiring at configure; arm/disarm; dropout
+edges for depth, velocity command and odometry; a degenerate-quaternion warning every
+50th bad sample; and a 5 s p50/p95/p99 policy-latency line that is only printed when it
+exceeds budget unless `verbose: true`. Text goes to the tmux pane and to obelisk's
+`ROS_LOG_DIR`. There are no first-party debug topics.
+
+### Blocking, in the order I'd fix them
+
+1. **Nothing is recorded.** No bag, no CSV, no ring buffer. `obk-launch` accepts
+   `bag=True` (record-all, via `obelisk_bringup.launch.py`) and no launcher passes it.
+   Cheapest real win: pass it in `scripts/run_hardware_low.sh` with an explicit topic
+   list rather than `-a`, which would otherwise pull the full `/depth/image_processed`
+   stream.
+2. **The obelisk log dir is not bind-mounted.** `docker-compose.yml` mounts only
+   `$REPO_ROOT` and a few dotfiles, so `ROS_LOG_DIR` lives in the container's writable
+   layer and `stop.sh --down` destroys it. Mount it, or set `ROS_HOME` into `$REPO_ROOT`.
+3. **Nothing about the depth cameras is recorded or health-checked** beyond staleness, so
+   a silently degraded camera reads as healthy. Wants measured Hz, inter-arrival jitter,
+   min/max/mean range, and invalid-pixel fraction on a diagnostics topic
+   (`depth_obs.invalid_depth_value` already computes the threshold).
+4. ~~**No finite check on the action before publish.**~~ **DONE** — `_finite_targets`
+   gates every command, falls back to the previous tick's target (not `hold_pose`, which
+   can be far away and would command a jump), names which input went non-finite, and
+   disarms after 10 consecutive bad ticks rather than freezing on a stale target.
+5. **No `est_state` watchdog.** Every other input has a timeout. If the estimator or the
+   driver dies, the controller commands at 50 Hz off frozen arrays, forever, silently.
+6. **Odometry staleness is invisible to the controller.** The estimator knows;
+   `EstimatedState` carries no validity flag; `low_level.yml` claims the controller acts
+   on it and nothing does. The FM history is built from base position and world velocity,
+   so a FAST-LIO dropout corrupts the reference the tracker chases.
+7. **Motor temperatures and error states are not published.** The upstream robot node has
+   `pub_motor_temp` (default false), so `motor_surface_temps` / `motor_winding_temps` /
+   `motor_states` are empty in every `ObkJointEncoders` message. One line in
+   `g1_robot_hw.yml`. Likewise its `logging: true` motor CSV — which additionally needs a
+   `timer_logging` entry under `timers:`, or you get a header-only file.
+
+### Also outstanding
+
+- **`log: true` / `log_decimation` / `config_name` in `low_level.yml` do nothing** — they
+  are undeclared parameters, which rclpy silently ignores. Labelled in place.
+- **Dropout warnings are edge-triggered only**; wants a periodic "degraded" heartbeat.
+- **No loop-period / jitter measurement.** The latency line covers `create_obs` +
+  `get_action` only, not timer overrun, executor contention, or estimate age.
+  `transfer/deploy/benchmark.py` reports the same percentiles off-robot, so the two are
+  directly comparable — what is missing is the on-robot loop itself.
+- **Arm / warm-up state is not observable off-node**, only as three log lines.
+- **The `dbg` tmux pane is empty** while every other pane gets a seeded command.
+- **No FAST-LIO pane in `run_hardware_low.sh`.** The estimator subscribes `/Odometry` and
+  nothing in the hardware launcher starts `lidar_scan/launch/localization.launch.py`, so a
+  run comes up with `base_pos`/`base_lin_vel` pinned at zero and the odom watchdog inert
+  (it returns False until the first message ever arrives). `scripts/launch_lidar_odom.sh`
+  also points at workspaces the current Dockerfile does not build.
+- **`/obelisk/g1/odom` from the driver is published and subscribed by nobody** — a free
+  cross-check against FAST-LIO, discarded.
+- **`obk_mark_jetson` is defined and never called**, so `/tmp/obk_jetson_active` never
+  exists and `stop.sh --zed` can never tear the Jetson node down.
+- **Dead tooling that will mislead the next operator:** `plot_utils/plot_ctrl.py`,
+  `plot_odom.py`, `plot_trajectory_video.py` and `transfer/g1_log_analysis.py` all read
+  log formats nothing writes; the two plotting sections below document them as live. The
+  Optitrack section references a `optitrack_forwarding` entry point that no longer exists.
+- **Obelisk is pinned to a commit SHA, not a release tag**, with the Dockerfile's own TODO
+  saying that is not acceptable on the robot — and the pin is duplicated by hand in the
+  Jetson image.
+
 # Plotting Odomety
+
+> **Note:** nothing in the current stack writes the CSVs this and the next section read
+> (the controller's writer was removed in `f5bc1ad`, and no node has ever written
+> `odom_logs/`). See "Observability" above.
+
 To plot the odometry run
 ```
 python plot_odom.py
