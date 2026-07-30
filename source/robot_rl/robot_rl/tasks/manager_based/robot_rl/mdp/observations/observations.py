@@ -14,25 +14,52 @@ from isaaclab.utils.noise.noise_cfg import NoiseCfg
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def ref_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    ref_traj = cmd.y_des.clone()
-    return ref_traj
+def tracking_error_local(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """The per-channel tracking error the CLF actually grades (``[N, 2 * n_tracked]``).
 
-def act_traj(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
-    cmd = env.command_manager.get_term(command_name)
-    act_traj = cmd.y_act.clone()
-    return act_traj
+    Exactly the CLF's ``eta``: position error (``quat_box_minus`` on the orientation
+    channels) interleaved with velocity error, over the TRACKED channel subset only.
+    Measured in the anchored frame, so the clip's free root DOFs have already been
+    re-datumed onto the robot and this is local error, not accumulated drift.
 
-def ref_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+    Privileged (critic-only): it is a function of the reward's own arguments, so it hands
+    the value function the quantity it has to predict instead of making it re-derive that
+    from a reference and a measurement separately.  Replaces the old ``ref_traj`` /
+    ``act_traj`` pair, and is strictly more informative than either.
+    """
     cmd = env.command_manager.get_term(command_name)
-    ref_traj_vel = cmd.dy_des
-    return ref_traj_vel
+    clf = cmd.clf
+    if getattr(clf, "_subset", False):
+        y_act, y_des = cmd.y_act[:, clf.pos_gather], cmd.y_des[:, clf.pos_gather]
+        dy_act, dy_des = cmd.dy_act[:, clf.vel_gather], cmd.dy_des[:, clf.vel_gather]
+    else:
+        y_act, y_des, dy_act, dy_des = cmd.y_act, cmd.y_des, cmd.dy_act, cmd.dy_des
+    y_err = clf.compute_y_err(y_act, y_des)
+    eta = torch.zeros(y_err.shape[0], 2 * y_err.shape[1], device=y_err.device)
+    eta[:, 0::2] = y_err
+    eta[:, 1::2] = dy_act - dy_des
+    return eta
 
-def act_traj_vel(env: ManagerBasedRLEnv, command_name:str = "hlip_ref") -> torch.Tensor:
+
+def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Base pose error against the GLOBALLY-placed clip (``[N, 6]``).
+
+    Position error (3) plus the ``quat_box_minus`` rotation vector (3), both in the world
+    frame, measured against the clip on its reset-time terrain cell -- the same reference
+    the pose-drift termination uses.
+
+    This is the drift :func:`tracking_error_local` deliberately cannot see: the reward
+    forgives planar drift, but the episode still ends on it, so without this the critic
+    would be predicting a termination it has no way to anticipate.
+    """
     cmd = env.command_manager.get_term(command_name)
-    act_traj_vel = cmd.dy_act
-    return act_traj_vel
+    state = cmd.termination_reference_world_state()
+    root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
+    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)
+    return torch.cat([
+        state[:, 0:3] - root_pos_w,
+        quat_box_minus(root_quat_w, state[:, 3:7]),
+    ], dim=-1)
 
 
 # ----------------------------------------------------------------------

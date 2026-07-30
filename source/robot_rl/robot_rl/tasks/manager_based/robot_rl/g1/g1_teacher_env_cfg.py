@@ -264,17 +264,22 @@ class G1TeacherObservationsCfg:
                                    clip=(-20.0, 20.0), scale=_REF_SCALE)
         command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
-        # Full world-frame tracking vector (privileged -- absolute coords). NOT
-        # redundant with reference_window: act_traj/act_traj_vel are the only MEASURED
-        # Cartesian ee state anywhere in the observations, ref_traj carries ee
-        # reference ORIENTATION and velocity (the window keeps ee positions only), and
-        # the four together are exactly the CLF's arguments
-        # (clf.compute_vdot(y_act, y_des, dy_act, dy_des)) -- i.e. the arguments of the
-        # reward this critic has to predict.
-        ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
-        act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
-        ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
-        act_traj_vel = ObsTerm(func=mdp.act_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        # The two errors, privileged. Together they are what the value function has to
+        # predict, and they are deliberately in DIFFERENT frames because the reward and
+        # the termination are:
+        #
+        #  * LOCAL -- the CLF's own eta, in the anchored frame, so planar drift is already
+        #    forgiven. This is the reward's argument.
+        #  * GLOBAL -- base pose error against the clip on its reset-time terrain cell.
+        #    This is the drift the reward ignores and the TERMINATION fires on, so without
+        #    it the critic would be predicting an episode end it cannot see coming.
+        #
+        # These replace the old ref_traj / act_traj / *_vel quadruple, which handed over
+        # both raw sides in absolute world coords and made the critic re-derive the error.
+        tracking_error_local = ObsTerm(func=mdp.tracking_error_local,
+                                       params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
+        tracking_error_global = ObsTerm(func=mdp.tracking_error_global,
+                                        params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
 
         # Terrain height scan (clean; critic corruption is off).
         height_scan = ObsTerm(

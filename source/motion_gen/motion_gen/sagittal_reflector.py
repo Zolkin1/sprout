@@ -93,8 +93,14 @@ class SagittalReflectionConfig:
     ee_pos_obs_terms: tuple[str, ...] = ("ee_ref",)
 
     # Observation terms that are position / velocity trajectories.
-    pos_traj_obs_terms: tuple[str, ...] = ("ref_traj", "act_traj")
-    vel_traj_obs_terms: tuple[str, ...] = ("ref_traj_vel", "act_traj_vel")
+    #
+    # Empty since the critic stopped observing raw trajectory vectors: ``ref_traj`` /
+    # ``act_traj`` / ``*_vel`` were replaced by ``tracking_error_local`` (the CLF's own
+    # eta) and ``tracking_error_global``.  The hooks and ``get_symmetric_traj`` stay --
+    # they are the right machinery for a full-width trajectory vector and are still
+    # covered by ``test_sagittal_reflector`` -- but nothing is routed through them today.
+    pos_traj_obs_terms: tuple[str, ...] = ()
+    vel_traj_obs_terms: tuple[str, ...] = ()
 
     # Observation terms that are contact states.
     contact_obs_terms: tuple[str, ...] = ("contact_state",)
