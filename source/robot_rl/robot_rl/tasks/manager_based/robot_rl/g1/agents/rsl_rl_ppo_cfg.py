@@ -126,6 +126,34 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class FmTrackerPlayRunnerCfg(PPORunnerCfg):
+    """Play-only runner for the flow-matching tracker: **the critic is vestigial**.
+
+    Nothing trains in that task -- the policy is the teacher, already trained -- so the
+    value function is never evaluated, and ``play.py`` does not load its weights. Its
+    observation set is pointed at ``policy`` purely so rsl-rl can still construct one; the
+    tracker env has no privileged ``critic`` group to give it (see
+    :class:`~..g1_tracker_env_cfg.G1TrackerObservationsCfg`).
+
+    That is what makes this task teacher-agnostic. The actor's two groups have the same
+    layout under either ``tracking_mode``, so with the critic out of the shape contract, a
+    body-mode teacher and a joint-mode teacher both load here unchanged -- where before, a
+    body-mode checkpoint was rejected on the critic's width alone.
+    """
+
+    load_critic = False
+    """Skip restoring ``critic_state_dict`` (``play.py`` honours this).
+
+    A plain attribute rather than a field of the rsl-rl base cfg, which has no such knob.
+    """
+
+    obs_groups = {
+        "actor": ["policy", "reference"],
+        "critic": ["policy"],
+    }
+
+
+@configclass
 class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
     """As :class:`PPORunnerCfg`, plus sagittal-reflection data augmentation.
 

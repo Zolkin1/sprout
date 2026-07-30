@@ -49,6 +49,11 @@ class FmContext:
     """Number of exteroception tokens: 1 for the scan, one per camera for depth."""
     extero_spec: list[dict] = field(default_factory=list)
     """Camera contract behind those tokens (depth only); see ``depth_obs.py``."""
+    fm_snap_every: int | None = None
+    """Re-plan period (control steps) the model's training targets were cut at.
+
+    ``GenTrackerPolicy`` must use the same ``fm_update_every``: the horizon ``F`` is sized
+    from this period. ``None`` for a graph exported before the field existed."""
 
     @property
     def extero_dim(self) -> int:
@@ -83,6 +88,20 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
     m = json.loads(raw["fm_meta"])
     source = str(m.get("extero_source", "height_scan"))
+    history_source = str(m.get("history_source", "measured"))
+    if history_source != "measured":
+        # The deploy runtime builds its history from the MEASURED robot only
+        # (``GenTrackerPolicy._make_snapshot``). Serving a partially autoregressive model
+        # from it would feed conditioning the model never saw, with nothing in the shapes to
+        # reveal it -- so refuse rather than run off-distribution.
+        raise ValueError(
+            f"{onnx_path} was trained with history_source={history_source!r}, which the "
+            "torch-free deploy runtime does not implement: it would need the reference it "
+            "applied last step fed back as history (see FmTrackingCommand."
+            "_stash_applied_reference), alongside the observation-history port already "
+            "listed in gen_tracker._assemble's TODO. Export a history_source='measured' "
+            "checkpoint for deployment."
+        )
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         target_num_extra_frames=len(m["target_frame_names"]),
@@ -92,6 +111,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0) -> FmContext:
         ground_z=float(m.get("ground_z", 0.0)), height_dim=int(m.get("height_dim", 1)),
         extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
         extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
+        fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
     )
@@ -114,18 +134,19 @@ def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, j
     p_ref = np.broadcast_to(root_pos[:, n - 1 : n], (v, n, 3)).reshape(m, 3)
     q_ref = np.broadcast_to(root_quat[:, n - 1 : n], (v, n, 4)).reshape(m, 4)
 
-    fpos = fquat = flin = fang = None
+    fpos = None
     if k > 0:
         if frames is None:
             raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
-        fr = frames.reshape(m, k, 13)
-        fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
+        # Callers hand over the full 13-wide per-frame state; only the position is read
+        # (the state vector's extra frames are position-only).
+        fpos = frames.reshape(m, k, 13)[..., 0:3]
 
     return relative_state(
         root_pos.reshape(m, 3), root_quat.reshape(m, 4),
         root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
         joint_pos.reshape(m, nj), joint_vel.reshape(m, nj), p_ref, q_ref,
-        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+        frame_pos_w=fpos,
     ).reshape(v, n, ctx.D)
 
 
@@ -237,7 +258,4 @@ def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, nois
     }
     if k > 0:
         out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-        out["frame_quat_w"] = world["frame_quat_w"].reshape(v, f, k, 4)
-        out["frame_lin_vel_w"] = world["frame_lin_vel_w"].reshape(v, f, k, 3)
-        out["frame_ang_vel_w"] = world["frame_ang_vel_w"].reshape(v, f, k, 3)
     return out

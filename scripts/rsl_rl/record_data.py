@@ -47,6 +47,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_de
 
 import isaaclab_tasks  # noqa: F401
 import robot_rl  # noqa: F401 — register gym environments
+from robot_rl.flow_matching.config import FlowMatchingConfig  # noqa: E402  --ref_future_len default
 from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402  height_scan obs fn
 from isaaclab_tasks.utils import add_launcher_args, get_checkpoint_path, launch_simulation
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -127,9 +128,11 @@ parser.add_argument(
          "root+joints only.",
 )
 parser.add_argument(
-    "--ref_future_len", type=int, default=40,
+    "--ref_future_len", type=int, default=FlowMatchingConfig().future_len,
     help="Number of FUTURE nodes F to record per step in 'ref_future' (the ego-anchored "
-         "clip future = the robot-state-conditioned FM target). Match the FM future_len.",
+         "clip future = the robot-state-conditioned FM target). Defaults to (and MUST "
+         "match) FlowMatchingConfig.future_len -- the dataset hard-errors on a mismatch, "
+         "since windows are cut here and cannot be re-cut at train time.",
 )
 parser.add_argument(
     "--no_ref_future", action="store_true", default=False,
@@ -423,6 +426,63 @@ def _assemble_state(robot, state_frames, frame_body_idx, n_envs) -> torch.Tensor
     return torch.cat(parts, dim=-1)
 
 
+def _assemble_ref_state(ref_cmd, ref_base_frame: str, state_frames, n_envs) -> torch.Tensor:
+    """The APPLIED reference in the ``_assemble_state`` layout ``[N, node]``.
+
+    The world-frame desired root + joints, plus the same extra body frames the measured
+    state carries, so a reference row is interchangeable with a measured one column-for-
+    column. That is what lets the FM dataset build a MIXED history (measured root, reference
+    joints/ee) by slicing both with one term table -- see
+    ``FlowMatchingConfig.history_source``.
+
+    Timing: ``y_des``/``dy_des`` hold the value written during the previous ``env.step``, so
+    reading this pre-step yields the reference applied at step ``t-1`` -- aligned with the
+    pre-step ``state``/``obs`` snapshot, and matching what the runtime snapshot sees.
+    """
+    ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
+    if state_frames:
+        ref_frames = ref_cmd.reference_world_frames(state_frames)  # [N, K, 13]
+        ref_state = torch.cat([ref_state, ref_frames.reshape(n_envs, -1)], dim=-1)
+    return ref_state
+
+
+def _future_fits_fn(ref_cmd, max_offset: int):
+    """Per-env predicate: is the whole F-node future window inside the clip's REAL frames?
+
+    Short clips are padded into the library by repeating their last frame, and the
+    look-ahead gather clamps to the library length, so a window opened within F steps of
+    ``clip_len - 1`` has a partly FROZEN target. Training on those teaches "the reference
+    stops moving" for conditioning that otherwise means "keep going", and because the FM is
+    multi-modal it would then sample that frozen mode occasionally at deploy. Cheaper to
+    drop those windows than to un-learn the mode -- and it is the record-time half of the
+    no-clamping rule the tracker enforces at inference.
+
+    ``clip_len`` lives on the clip-library device (CPU under ``--clip_device cpu``), so
+    gather there and move the verdict back.
+
+    Args:
+        ref_cmd: The trajectory command (needs ``manager.clip_len``, ``_step``, ``clip_id``).
+        max_offset: Largest future offset the recording will gather.
+
+    Returns:
+        A zero-arg callable returning a ``[N]`` bool tensor, or ``None`` when the command
+        exposes no clip step / length (e.g. an FM-generated reference) and no gate is possible.
+    """
+    clip_len_all = getattr(getattr(ref_cmd, "manager", None), "clip_len", None)
+    if clip_len_all is None or not (hasattr(ref_cmd, "_step") and hasattr(ref_cmd, "clip_id")):
+        print("[WARN] cannot gate on clip length (no clip step/len on the command); "
+              "windows near a clip end may carry a partly frozen future.")
+        return None
+
+    def fut_ok_fn():
+        """True per env when ``step + max_offset`` is still a real (unpadded) clip frame."""
+        cid = ref_cmd.clip_id.to(clip_len_all.device)
+        cl = clip_len_all[cid].to(ref_cmd._step.device)
+        return (ref_cmd._step + max_offset) <= (cl - 1)
+
+    return fut_ok_fn
+
+
 def _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs) -> torch.Tensor:
     """Ego-anchored clip future ``[N, F, node_dim]`` (node layout == state).
 
@@ -531,6 +591,11 @@ def collect_pairs(
         buf["ref_future"] = []
         buf["cmd_future"] = []
         buf["reanchor_active"] = []
+        # Same frozen-future gate the windowed path applies (see _future_fits_fn). Here it
+        # is folded into the recorded snap flag, because ``snap_windows`` cuts training
+        # windows from exactly that flag -- clearing it drops the window at train time.
+        fut_ok_fn = _future_fits_fn(ref_cmd, int(future_offsets.max().item()))
+        n_short = 0
     if has_scan:
         buf["height_scan"] = []
     if has_depth:
@@ -584,12 +649,7 @@ def collect_pairs(
         # obs (last computed during the previous env.step), so this stays aligned
         # with the pre-step ``state``/``obs`` snapshot above.
         if ref_cmd is not None:
-            ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
-            # Append the same extra frames (world-lifted clip reference) so ref_state
-            # shares the state layout (state_term_names) when a 'reference' target is used.
-            if state_frames:
-                ref_frames = ref_cmd.reference_world_frames(state_frames)  # [N, K, 13]
-                ref_state = torch.cat([ref_state, ref_frames.reshape(n_envs, -1)], dim=-1)
+            ref_state = _assemble_ref_state(ref_cmd, ref_base_frame, state_frames, n_envs)
             buf["ref_state"].append(ref_state.detach().cpu().clone())
         if record_cmd_vel:
             buf["target_vel"].append(ref_cmd.get_command_velocity().detach().cpu().clone())
@@ -604,7 +664,12 @@ def collect_pairs(
             buf["cmd_future"].append(
                 ref_cmd.get_future_command_velocity(future_offsets).detach().cpu().clone()
             )
-            buf["reanchor_active"].append(ref_cmd._reanchor_active.detach().cpu().clone())
+            snap = ref_cmd._reanchor_active.to(torch.bool)
+            if fut_ok_fn is not None:
+                fits = fut_ok_fn()
+                n_short += int((snap & ~fits).sum().item())
+                snap = snap & fits
+            buf["reanchor_active"].append(snap.detach().cpu().clone())
         buf["episode_id"].append(episode_id.detach().cpu().clone())
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
@@ -648,6 +713,12 @@ def collect_pairs(
         if (step + 1) % 100 == 0:
             print(f"  step {step + 1}/{num_steps}")
 
+    if record_ref_future and n_short:
+        print(f"[INFO] Cleared the snap flag on {n_short} step(s) whose "
+              f"{int(future_offsets.max().item())}-step future would have crossed the clip "
+              "end: those targets are partly the clip's frozen last frame, which the FM "
+              "would learn as a stop-moving mode.")
+
     # Stack to [T, N, ...], flatten time and env into one sample axis, trim.
     out: dict[str, np.ndarray] = {}
     for key, tensors in buf.items():
@@ -686,6 +757,11 @@ def collect_windows(
     (proven by ``tests/test_record_windows.py``), but never holds more than a per-env
     ring of the last ``H`` states plus one flush batch in memory.
 
+    TWO history rings are kept per env, both ``[N, H, node]``: the MEASURED robot state, and
+    the reference that was APPLIED at each of those steps (``history_ref``). The second one
+    is what ``history_source="reference_partial"`` trains on; recording it unconditionally
+    keeps that a train-time A/B rather than a second multi-hour recording.
+
     Args:
         env, policy, policy_nn, initial_obs, stochastic: as in :func:`collect_pairs`.
         num_windows: Stop after streaming this many windows.
@@ -717,9 +793,11 @@ def collect_windows(
 
     obs = initial_obs
     H = int(history_len)
-    # Per-env history ring ([N, H, node]; row H-1 = most recent) + a consecutive-valid
-    # counter reset to 0 on episode end so a window can never span a reset.
+    # Per-env history rings ([N, H, node]; row H-1 = most recent) + a consecutive-valid
+    # counter reset to 0 on episode end so a window can never span a reset. ``hist`` is the
+    # measured robot state; ``hist_ref`` is the reference applied at the same steps.
     hist: torch.Tensor | None = None
+    hist_ref: torch.Tensor | None = None
     valid = torch.zeros(n_envs, dtype=torch.long, device=device)
     # Distinct episode ids per env so the FM's by-episode train/val split has no leakage.
     episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
@@ -734,23 +812,7 @@ def collect_windows(
           f"on {n_envs} envs; max_steps={max_steps}...")
     written = 0
     step = 0
-    # Gate: does this env's whole future window still fall inside the clip's real frames?
-    # ``clip_len`` lives on the clip-library device (CPU under --clip_device cpu), so gather
-    # there and move the verdict back. None when the command exposes no clip step / length
-    # (e.g. an FM-generated reference), in which case no gating is possible.
-    max_off = int(future_offsets.max().item())
-    clip_len_all = getattr(getattr(ref_cmd, "manager", None), "clip_len", None)
-    have_step = hasattr(ref_cmd, "_step") and hasattr(ref_cmd, "clip_id")
-    fut_ok_fn = None
-    if clip_len_all is not None and have_step:
-        def fut_ok_fn():
-            """True per env when ``step + max_offset`` is still a real (unpadded) clip frame."""
-            cid = ref_cmd.clip_id.to(clip_len_all.device)
-            cl = clip_len_all[cid].to(ref_cmd._step.device)
-            return (ref_cmd._step + max_off) <= (cl - 1)
-    else:
-        print("[WARN] cannot gate on clip length (no clip step/len on the command); "
-              "windows near a clip end may carry a partly frozen future.")
+    fut_ok_fn = _future_fits_fn(ref_cmd, int(future_offsets.max().item()))
     n_short = 0
     while written < num_windows and step < max_steps:
         with torch.inference_mode():
@@ -758,13 +820,23 @@ def collect_windows(
 
         # Pre-step snapshot (aligned with obs), matching collect_pairs' snap timing.
         state_t = _assemble_state(robot, state_frames, frame_body_idx, n_envs)  # [N, node]
+        # The reference the policy was tracking when it chose this step's action. ``y_des``
+        # was last written during the PREVIOUS env.step, so a pre-step read gives the
+        # reference applied at step t-1 -- which is exactly the convention the runtime
+        # snapshot uses (``FmTrackingCommand._robot_snapshot`` also runs before this step's
+        # reference is resolved). The two must agree or the partially autoregressive history
+        # is off by one.
+        ref_t = _assemble_ref_state(ref_cmd, ref_base_frame, state_frames, n_envs)
         if hist is None:
             hist = torch.zeros(n_envs, H, state_t.shape[1], device=device)
+            hist_ref = torch.zeros(n_envs, H, ref_t.shape[1], device=device)
         reanchor_t = ref_cmd._reanchor_active.to(torch.bool)                    # [N]
 
-        # Push this step's state into the ring; mark the row valid.
+        # Push this step's rows into the rings; mark the row valid.
         hist = torch.roll(hist, shifts=-1, dims=1)
         hist[:, H - 1] = state_t
+        hist_ref = torch.roll(hist_ref, shifts=-1, dims=1)
+        hist_ref[:, H - 1] = ref_t
         valid = torch.clamp(valid + 1, max=H)
 
         # Emit a window for each env that snaps AND has a full valid ring AND whose whole
@@ -787,6 +859,7 @@ def collect_windows(
             cmd_future_t = ref_cmd.get_future_command_velocity(future_offsets)  # [N, F, 3]
             batch = {
                 "history_state": hist[idx].detach().cpu().numpy(),
+                "history_ref": hist_ref[idx].detach().cpu().numpy(),
                 "ref_future": ref_future_t[idx].detach().cpu().numpy(),
                 "cmd_future": cmd_future_t[idx].detach().cpu().numpy(),
                 "episode_id": episode_id[idx].detach().cpu().numpy(),
@@ -838,8 +911,9 @@ def collect_windows(
         print(f"[WARN] Reached max_steps={max_steps} with {written}/{num_windows} windows "
               f"(snaps sparser than expected); saving what was collected.")
     if n_short:
-        print(f"[INFO] Dropped {n_short} snap window(s) whose {max_off}-step future would have "
-              f"crossed the clip end ({100.0 * n_short / max(n_short + written, 1):.1f}% of "
+        print(f"[INFO] Dropped {n_short} snap window(s) whose {int(future_offsets.max().item())}"
+              f"-step future would have crossed the clip end "
+              f"({100.0 * n_short / max(n_short + written, 1):.1f}% of "
               f"otherwise-eligible snaps): those targets are partly the clip's frozen last "
               f"frame, which the FM would learn as a stop-moving mode.")
     return written
@@ -980,8 +1054,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             meta.ref_future_len = rf_len
             meta.ref_future_term_names = list(meta.state_term_names)  # node layout == state
             meta.ref_future_term_dims = list(meta.state_term_dims)
+            # The snap period the windows were cut at. The FM tracker's fm_update_every must
+            # match it: the horizon is sized from the re-plan period, so a tracker running a
+            # different one is both off-distribution and possibly short of horizon.
+            meta.fm_snap_every = int(getattr(ref_cmd.cfg, "fm_snap_every", 0))
             print(f"[INFO] Recording ego-anchored clip future (ref_future): F={rf_len} nodes/step "
-                  f"+ cmd_future + reanchor_active (snap events).")
+                  f"+ cmd_future + reanchor_active (snap every {meta.fm_snap_every} steps).")
         elif ref_cmd is not None:
             meta.ref_source = "reference"
 
@@ -1056,6 +1134,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
                 # drop" from "this recording predates the tag" and refuse the latter.
                 tag_distractors=True,
+                # Same reasoning for the applied-reference ring: recording it always makes
+                # `history_source=reference_partial` a train-time A/B, and its absence
+                # unambiguously means "this recording predates the mode".
+                record_history_ref=True,
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,

@@ -294,6 +294,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._last_reanchor_step = -1
         # True only while _resample_command is running -- see _reanchor_ego_envs.
         self._resampling = False
+        # CLF outputs. Initialised here because ``CommandTerm.compute`` calls
+        # ``_update_metrics`` (which reads them) BEFORE ``_update_command`` (which writes
+        # them), so the very first step of a run would otherwise hit an unset attribute.
+        self.v = torch.zeros(n, device=dev)
+        self.vdot = torch.zeros(n, device=dev)
 
     def _resample_command(self, env_ids) -> None:
         """Reset-time refresh, flagged so the re-anchor sits it out.
@@ -1274,11 +1279,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         )
         return self._tb_idx
 
-    def _obs_window_offsets(self) -> torch.Tensor | None:
+    def obs_window_offsets(self) -> torch.Tensor | None:
         """Step offsets of the ``reference_window`` observation, read from the obs manager.
 
-        Read from the live term rather than restated in this cfg, so the drawn ribbon cannot
-        drift from the window the policy is actually fed.  ``None`` if no such term exists.
+        Read from the live term rather than restated in a cfg, so no consumer can drift from
+        the window the policy is actually fed.  ``None`` if no such term exists.
+
+        Two consumers: the debug ribbon, and ``mdp.clip_end_reached``, which truncates this
+        far before the clip's last frame so the observed window never saturates on it.
         """
         cached = getattr(self, "_obs_win_offsets", "unset")
         if cached != "unset":
@@ -1325,27 +1333,27 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             self._debug_markers.set_visibility(True)
             self._debug_vis_pending = False
 
-        # Optionally restrict the ribbon to a subset of envs (e.g. drop envs that
-        # are tracking a different reference). Subselect every per-env quantity so
-        # the batched lift stays aligned; hide the markers if no env qualifies.
+        # Optionally restrict the CLIP ribbon to a subset of envs (e.g. drop envs that are
+        # tracking a different reference). Subselect every per-env quantity so the batched
+        # lift stays aligned. An empty selection suppresses the clip cylinders ONLY -- the
+        # observed-window ribbon and the tracked-body spheres below are about what the policy
+        # sees and what the reward grades, which exist whatever the reference source is.
         mask = self._clip_ribbon_env_mask()
-        if mask is not None:
-            env_ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-            if env_ids.numel() == 0:
-                self._debug_markers.set_visibility(False)
-                return
-            self._debug_markers.set_visibility(True)
-            step, clip_id = self._step[env_ids], self.clip_id[env_ids]
-        else:
-            env_ids = None
-            step, clip_id = self._step, self.clip_id
+        env_ids = None if mask is None else torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        sub = slice(None) if env_ids is None else env_ids
+        step, clip_id = self._step[sub], self.clip_id[sub]
+        self._debug_markers.set_visibility(True)
 
         n = step.shape[0]
         T = self.manager.num_steps
         F = len(self._debug_frame_pos_idx)
+        if F == 0:
+            return
         steps = (step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)          # [n, Ns]
         ns = steps.shape[1]
-        if F == 0 or n == 0 or ns < 2:
+        draw_clip = n > 0 and ns >= 2
+        if not draw_clip:
+            self._draw_obs_and_bodies(F, None)
             return
         cid = clip_id[:, None].expand(n, ns)                                            # [n, Ns]
 
@@ -1401,27 +1409,43 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         )
         centers, quats = centers.reshape(-1, 3), quats
         scales, marker_indices = scales.reshape(-1, 3), marker_indices
+        self._draw_obs_and_bodies(F, (centers, quats, scales, marker_indices))
+
+    def _draw_obs_and_bodies(self, num_frames: int, clip_ribbon) -> None:
+        """Append the observed-window ribbon to the clip ribbon, visualize, draw the bodies.
+
+        Split out of :meth:`_debug_vis_callback` so it still runs when the clip ribbon is
+        suppressed (see ``_clip_ribbon_env_mask``): the observed window and the tracked-body
+        pairs describe the policy and the reward, not the clip, and are exactly what you want
+        to see on a generator-driven env. Both are drawn for EVERY env -- unlike the clip
+        ribbon they are per-env independent, so there is nothing to subselect for alignment.
+
+        Args:
+            num_frames: Reference-frame count; also the observed-ribbon prototype index.
+            clip_ribbon: ``(centers, quats, scales, marker_indices)`` from the clip ribbon,
+                or ``None`` when it was not drawn.
+        """
+        parts = list(clip_ribbon) if clip_ribbon is not None else None
 
         # The policy's observed reference-window base, as a second ribbon. Anchored, so it
         # rides the robot; its offset from the global clip ribbon is the drift.
-        obs_off = self._obs_window_offsets() if self.cfg.debug_vis_obs_window else None
+        obs_off = self.obs_window_offsets() if self.cfg.debug_vis_obs_window else None
         if obs_off is not None and obs_off.numel() >= 2:
             opos, _, _, _ = self.get_future_world_base(obs_off)                     # [N, K, 3]
-            if env_ids is not None:
-                opos = opos[env_ids]
-            oc, oq, os_, oi = self._ribbon_segments(opos, F)                        # prototype F
-            centers = torch.cat([centers, oc], dim=0)
-            quats = torch.cat([quats, oq], dim=0)
-            scales = torch.cat([scales, os_], dim=0)
-            marker_indices = torch.cat([marker_indices, oi], dim=0)
+            oc, oq, os_, oi = self._ribbon_segments(opos, num_frames)               # prototype F
+            if parts is None:
+                parts = [oc, oq, os_, oi]
+            else:
+                parts = [torch.cat([a, b], dim=0) for a, b in zip(parts, (oc, oq, os_, oi))]
 
-        self._debug_markers.visualize(
-            translations=centers,
-            orientations=quats,
-            scales=scales,
-            marker_indices=marker_indices,
-        )
-        self._draw_body_spheres(env_ids)
+        if parts is None:
+            self._debug_markers.set_visibility(False)
+        else:
+            self._debug_markers.visualize(
+                translations=parts[0], orientations=parts[1],
+                scales=parts[2], marker_indices=parts[3],
+            )
+        self._draw_body_spheres(None)
 
     def _ribbon_segments(self, pts: torch.Tensor, proto: int):
         """Cylinder segments joining consecutive points of a ``[n, K, 3]`` polyline.

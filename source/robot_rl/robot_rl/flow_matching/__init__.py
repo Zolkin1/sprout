@@ -8,7 +8,7 @@ measured states (dropped in as clean tokens, inpainting) and a strided
 commanded-velocity profile, generating a future trajectory in the current root frame.
 """
 
-from .config import FlowMatchingConfig
+from .config import EXTERO_SOURCES, HISTORY_SOURCES, FlowMatchingConfig
 from .dataset import (
     FutureStateDataset,
     build_train_val,
@@ -28,7 +28,8 @@ from .flow import (
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import (
-    FRAME_BLOCK_DIM,
+    EE_BLOCK_DIM,
+    ROOT_BLOCK_DIM,
     frame_block_start,
     matrix_from_quat,
     matrix_to_rot6d,
@@ -47,6 +48,8 @@ from .transforms import (
 
 __all__ = [
     "FlowMatchingConfig",
+    "EXTERO_SOURCES",
+    "HISTORY_SOURCES",
     "FlowMatchingTransformer",
     "FutureStateDataset",
     "snap_windows",
@@ -74,6 +77,7 @@ __all__ = [
     "orientation_slice",
     "orientation_slices",
     "frame_block_start",
-    "FRAME_BLOCK_DIM",
+    "ROOT_BLOCK_DIM",
+    "EE_BLOCK_DIM",
     "target_state_dim",
 ]

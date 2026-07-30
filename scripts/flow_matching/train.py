@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
+    HISTORY_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
     build_train_val,
@@ -80,7 +81,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "F - num_history_states (default from config.py, sized to cover the "
                              "deploy-time policy lookahead; see FlowMatchingConfig.future_len).")
     parser.add_argument("--num_history_states", type=int, default=2,
-                        help="N most-recent real-robot states used as history (phase) conditioning tokens.")
+                        help="N most-recent states used as history (phase) conditioning tokens.")
+    parser.add_argument("--history_source", type=str, default=FlowMatchingConfig().history_source,
+                        choices=list(HISTORY_SOURCES),
+                        help="What the history tokens are made of. 'measured' (default) = the "
+                             "robot's actual state. 'reference_partial' = PARTIALLY "
+                             "AUTOREGRESSIVE: measured root pose/twist, but joints and ee "
+                             "positions from the reference applied at those steps. A train-time "
+                             "A/B over the same recording.")
     parser.add_argument("--null_cond_prob", type=float, default=FlowMatchingConfig().null_cond_prob,
                         help="Probability a training sample's history (phase) tokens are replaced by "
                              "the model's learned null embedding (classifier-free guidance / phase-agnostic).")
@@ -135,11 +143,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="Weight on the joint-velocity finite-difference consistency "
                              "(predicted joint_pos d/dt vs predicted joint_vel). Ungated.")
     parser.add_argument("--fk_pose_weight", type=float, default=_wc.fk_pose_weight,
-                        help="Weight on the FK pose consistency (predicted ee pose vs FK of "
-                             "predicted joints). tau-gated.")
-    parser.add_argument("--fk_vel_weight", type=float, default=_wc.fk_vel_weight,
-                        help="Weight on the FK velocity consistency (predicted ee velocity vs "
-                             "J(q)*qdot of predicted joints/joint-vels). tau-gated.")
+                        help="Weight on the FK position consistency (predicted ee position, "
+                             "base-relative, vs FK of predicted joints). tau-gated.")
     parser.add_argument("--consistency_tau_min", type=float, default=FlowMatchingConfig().consistency_tau_min,
                         help="Only score the acceleration + FK terms on samples with flow-time "
                              "tau >= this (velocity/joint-velocity stay ungated).")
@@ -177,6 +182,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         future_len=args.future_len, num_history_states=args.num_history_states,
+        history_source=args.history_source,
         null_cond_prob=args.null_cond_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
         recovery_mode=args.recovery_mode,
@@ -187,7 +193,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         vel_consistency_weight=args.vel_consistency_weight,
         accel_consistency_weight=args.accel_consistency_weight,
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
-        fk_pose_weight=args.fk_pose_weight, fk_vel_weight=args.fk_vel_weight,
+        fk_pose_weight=args.fk_pose_weight,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         skip_distractors=args.skip_distractors,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -207,8 +213,9 @@ def channel_metrics(
 
     The base (root) + joint channels occupy a fixed prefix unchanged by extra
     frames, so their offsets are stable. When ``num_extra_frames > 0`` the extra
-    body-frame position RMSE and orientation geodesic are aggregated (mean over
-    frames) into ``rmse_frame_pos`` / ``frame_ori_geodesic_rad``.
+    body-frame position RMSE is aggregated (mean over frames) into
+    ``rmse_frame_pos``; extra frames are position-only, so there is no per-frame
+    orientation geodesic.
 
     Args:
         pred: Predicted future states (denormalized), shape ``(B, F, D)``.
@@ -241,17 +248,15 @@ def channel_metrics(
         "ori_geodesic_rad": _geodesic(bo0, bo1),
     }
     if num_extra_frames > 0:
-        pos_rmse, geo = 0.0, 0.0
+        pos_rmse = 0.0
         for k in range(num_extra_frames):
             b = frame_block_start(nj, 1 + k)
             pos_rmse += _rmse(pred[..., b:b + 3], tgt[..., b:b + 3])
-            geo += _geodesic(b + 6, b + 12)
         out["rmse_frame_pos"] = pos_rmse / num_extra_frames
-        out["frame_ori_geodesic_rad"] = geo / num_extra_frames
     return out
 
 
-_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel")
+_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose")
 
 
 @torch.no_grad()
@@ -291,7 +296,7 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk) -> dict:
         dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
         vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
         joint_vel_weight=cfg.joint_vel_consistency_weight,
-        fk=fk, fk_pose_weight=cfg.fk_pose_weight, fk_vel_weight=cfg.fk_vel_weight,
+        fk=fk, fk_pose_weight=cfg.fk_pose_weight,
         tau_min=cfg.consistency_tau_min,
     )
 
@@ -444,10 +449,10 @@ def main() -> None:
 
     # Forward-kinematics chain for the FK consistency losses (only when weighted).
     fk = None
-    if cfg.fk_pose_weight > 0.0 or cfg.fk_vel_weight > 0.0:
+    if cfg.fk_pose_weight > 0.0:
         if train_ds.num_extra_frames == 0:
-            print("[WARN] fk_pose_weight/fk_vel_weight set but the dataset has no extra (ee) "
-                  "frames; skipping the FK losses.")
+            print("[WARN] fk_pose_weight set but the dataset has no extra (ee) "
+                  "frames; skipping the FK loss.")
         else:
             fk_path = cfg.fk_model_path if os.path.isabs(cfg.fk_model_path) else os.path.join(_REPO_ROOT, cfg.fk_model_path)
             fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)

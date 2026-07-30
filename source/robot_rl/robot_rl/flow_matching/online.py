@@ -172,6 +172,22 @@ class FmOnlineContext:
     checkpoint rather than on whatever the task config happens to say.  Defaults to the
     height scan, which is also what a checkpoint predating the selector resolves to.
     """
+    history_source: str = "measured"
+    """What the history tokens the model was TRAINED on are made of.
+
+    ``"measured"`` = the robot's actual state; ``"reference_partial"`` = measured root
+    pose/twist plus the applied reference's joints and ee positions (partially
+    autoregressive). Carried on the context -- like :attr:`extero_source` -- so the runtime
+    feeds what the checkpoint expects rather than what the task config happens to say.
+    """
+    fm_snap_every: int | None = None
+    """Control steps between snap (re-plan) events in the recording this model trained on.
+
+    Carried so a tracker can verify its own ``fm_update_every`` matches: the horizon ``F`` is
+    sized from the re-plan period and the training targets were cut at that cadence, so a
+    mismatch is both off-distribution and possibly short of horizon. ``None`` for a
+    checkpoint recorded before the field existed.
+    """
     extero_spec: list[dict] | None = None
     """Camera contract behind the exteroception tokens, when :attr:`extero_source` is depth.
 
@@ -268,6 +284,8 @@ def load_fm_context(
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
         zero_noise=bool(zero_noise),
+        history_source=str(cfg.history_source),
+        fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
         extero_spec=(meta.get("extero_spec") or None),
     )
@@ -310,19 +328,19 @@ def build_history_tokens(
     p_ref = root_pos[:, n - 1 : n].expand(v, n, 3).reshape(m, 3)
     q_ref = root_quat[:, n - 1 : n].expand(v, n, 4).reshape(m, 4)
 
-    fpos = fquat = flin = fang = None
+    fpos = None
     if k > 0:
         if frames is None:
             raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
-        fr = frames.reshape(m, k, 13)
-        fpos, fquat, flin, fang = fr[..., 0:3], fr[..., 3:7], fr[..., 7:10], fr[..., 10:13]
+        # Callers hand over the full 13-wide per-frame state; only the position is read
+        # (the state vector's extra frames are position-only).
+        fpos = frames.reshape(m, k, 13)[..., 0:3]
 
     rel = _relative_state(
         root_pos.reshape(m, 3), root_quat.reshape(m, 4),
         root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
         joint_pos.reshape(m, nj), joint_vel.reshape(m, nj),
-        p_ref, q_ref,
-        frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang,
+        p_ref, q_ref, frame_pos_w=fpos,
     ).reshape(v, n, ctx.D)
     return ctx.state_norm.normalize(rel)
 
@@ -413,8 +431,7 @@ def sample_world(
         ``root_quat_w (V,F,4)``, ``root_link_lin_vel_w (V,F,3)``,
         ``root_link_ang_vel_w (V,F,3)``, ``joint_pos (V,F,nj)``,
         ``joint_vel (V,F,nj)`` and, when the model predicts extra frames,
-        ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``
-        each ``(V,F,K_target,·)``.
+        ``frame_pos_w (V,F,K_target,3)`` (extra frames are position-only).
     """
     v = history.shape[0]
     f, d, nj, k = ctx.F, ctx.D, ctx.nj, ctx.target_num_extra_frames
@@ -440,7 +457,4 @@ def sample_world(
     }
     if k > 0:
         out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-        out["frame_quat_w"] = world["frame_quat_w"].reshape(v, f, k, 4)
-        out["frame_lin_vel_w"] = world["frame_lin_vel_w"].reshape(v, f, k, 3)
-        out["frame_ang_vel_w"] = world["frame_ang_vel_w"].reshape(v, f, k, 3)
     return out

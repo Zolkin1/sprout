@@ -100,8 +100,9 @@ class GenTrackerPolicy:
         clip reference then drives the tracker directly (see :class:`_TrackerOnlyCtx`).
 
         ``null_history_warmup=True`` (default) samples the generator from control step 0 using
-        the model's learned ``null_history`` embedding while the N-step history window fills,
-        matching ``FmTrackingCommandCfg.fm_null_history_warmup`` on the RL side. It needs an
+        the model's learned ``null_history`` embedding while the N-step history window fills.
+        The RL side (``FmTrackingCommand``) does the same unconditionally -- it has no clip
+        fallback either -- so the two agree from step 0. It needs an
         ``fm.onnx`` exported with the ``history_null`` input; without one the policy falls back to
         withholding the generator until the window is full (and warns once).
 
@@ -458,10 +459,11 @@ class GenTrackerPolicy:
         self._pred["jp"] = world["joint_pos"]
         self._pred["jv"] = world["joint_vel"]
         if ctx.target_num_extra_frames > 0:
+            # Position only: the FM's extra frames no longer carry orientation or twist
+            # (see robot_rl.flow_matching.transforms). The zero-initialised
+            # frame_quat/frame_lin/frame_ang buffers stay zero -- nothing on the deploy
+            # side may read them for an FM-sourced reference.
             self._pred["frame_pos"] = world["frame_pos_w"]
-            self._pred["frame_quat"] = world["frame_quat_w"]
-            self._pred["frame_lin"] = world["frame_lin_vel_w"]
-            self._pred["frame_ang"] = world["frame_ang_vel_w"]
         # Node 0 = "now" (base offset ~= 0); the applied index advances from here.
         self._pred_idx = 0
         self._pred_valid = True

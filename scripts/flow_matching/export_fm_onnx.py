@@ -110,6 +110,13 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "extero_source": str(ctx.extero_source),
         "extero_tokens": int(ctx.model.extero_tokens),
         "extero_spec": ctx.extero_spec,
+        # What the history tokens must be built from, and the re-plan period the targets
+        # were cut at. Both are contracts the runtime has to honour, not descriptions: a
+        # deployment feeding a measured history to a partially autoregressive model, or
+        # re-planning at a different period than the horizon was sized for, is silently
+        # off-distribution. ``fm_session.load_fm_context`` checks them.
+        "history_source": str(ctx.history_source),
+        "fm_snap_every": ctx.fm_snap_every,
         # Signals to the deploy side that the graph accepts the history_null input, so it can
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.

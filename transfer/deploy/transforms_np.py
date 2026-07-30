@@ -29,7 +29,8 @@ from .quat_math_np import (
     yaw_quat,
 )
 
-FRAME_BLOCK_DIM = 3 + 3 + 6 + 3  # [pos(3), lin_vel(3), ori6d(6), ang_vel(3)] = 15
+ROOT_BLOCK_DIM = 3 + 3 + 6 + 3  # [pos(3), lin_vel(3), ori6d(6), ang_vel(3)] = 15
+EE_BLOCK_DIM = 3                # [pos(3)] -- extra frames are position-only
 
 
 def _normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -62,13 +63,15 @@ def rot6d_to_quat(d6: np.ndarray) -> np.ndarray:
 
 
 def target_state_dim(num_joints: int, num_extra_frames: int = 0) -> int:
-    """Width of the relative-frame state vector ``2*nj + 15*(1 + K)``."""
-    return 2 * num_joints + FRAME_BLOCK_DIM * (1 + num_extra_frames)
+    """Width of the relative-frame state vector ``2*nj + 15 + 3*K``."""
+    return 2 * num_joints + ROOT_BLOCK_DIM + EE_BLOCK_DIM * num_extra_frames
 
 
 def frame_block_start(num_joints: int, frame_index: int) -> int:
     """Start offset of a frame block within the state vector (0 = root/base)."""
-    return 2 * num_joints + FRAME_BLOCK_DIM * frame_index
+    if frame_index == 0:
+        return 2 * num_joints
+    return 2 * num_joints + ROOT_BLOCK_DIM + EE_BLOCK_DIM * (frame_index - 1)
 
 
 def height_above_ground(p_ref: np.ndarray, ground_z: float = 0.0) -> np.ndarray:
@@ -97,15 +100,19 @@ def _frame_relative_block(p_ref, q_ref, p_w, q_w, v_w, w_w) -> np.ndarray:
     return np.concatenate([p_rel, v_rel, ori6d, w_rel], axis=-1)
 
 
+def _frame_relative_position(p_ref, q_ref, p_w) -> np.ndarray:
+    """Express a world position in the anchor's **xyz + yaw** ground frame."""
+    return quat_apply_inverse(yaw_quat(q_ref), p_w - p_ref)
+
+
 def relative_state(
-    p_w, q_w, v_w, w_w, joint_pos, joint_vel, p_ref, q_ref,
-    frame_pos_w=None, frame_quat_w=None, frame_lin_vel_w=None, frame_ang_vel_w=None,
+    p_w, q_w, v_w, w_w, joint_pos, joint_vel, p_ref, q_ref, frame_pos_w=None,
 ) -> np.ndarray:
     """Build the relative-frame state vector for a batch of steps ``(M, ·)``.
 
-    The root pose (and each extra frame) is expressed relative to the per-step
-    reference ``(p_ref, q_ref)``; velocities are pure-rotated into that frame.
-    Returns ``(M, 2*nj + 15*(1 + K))``.
+    The root pose (and each extra frame's position) is expressed relative to the
+    per-step reference ``(p_ref, q_ref)``; velocities are pure-rotated into that frame.
+    Extra frames are position-only. Returns ``(M, 2*nj + 15 + 3*K)``.
     """
     root_block = _frame_relative_block(p_ref, q_ref, p_w, q_w, v_w, w_w)
     parts = [joint_pos, joint_vel, root_block]
@@ -113,11 +120,9 @@ def relative_state(
         m, k = frame_pos_w.shape[0], frame_pos_w.shape[1]
         pr = np.broadcast_to(p_ref[:, None, :], (m, k, 3)).reshape(m * k, 3)
         qr = np.broadcast_to(q_ref[:, None, :], (m, k, 4)).reshape(m * k, 4)
-        block = _frame_relative_block(
-            pr, qr,
-            frame_pos_w.reshape(m * k, 3), frame_quat_w.reshape(m * k, 4),
-            frame_lin_vel_w.reshape(m * k, 3), frame_ang_vel_w.reshape(m * k, 3),
-        ).reshape(m, k * FRAME_BLOCK_DIM)
+        block = _frame_relative_position(
+            pr, qr, frame_pos_w.reshape(m * k, 3)
+        ).reshape(m, k * EE_BLOCK_DIM)
         parts.append(block)
     return np.concatenate(parts, axis=-1)
 
@@ -140,32 +145,36 @@ def _block_to_absolute(block, p_ref, q_ref):
     return p_w, q_w, v_w, w_w
 
 
+def _position_to_absolute(p_rel, p_ref, q_ref) -> np.ndarray:
+    """Invert :func:`_frame_relative_position` back to a world position."""
+    return p_ref + quat_apply(yaw_quat(q_ref), p_rel)
+
+
 def state_to_absolute(rel_state, p_ref, q_ref, num_joints, num_extra_frames=0) -> dict:
     """Invert :func:`relative_state` back to world-frame quantities.
 
     Returns a dict with ``joint_pos``, ``joint_vel``, ``root_pos_w``,
     ``root_quat_w``, ``root_link_lin_vel_w``, ``root_link_ang_vel_w`` and, when
-    ``num_extra_frames > 0``, ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/
-    ``frame_ang_vel_w`` each ``(..., K, ·)``.
+    ``num_extra_frames > 0``, ``frame_pos_w`` ``(..., K, 3)`` (extra frames are
+    position-only).
     """
     nj = num_joints
     joint_pos = rel_state[..., 0:nj]
     joint_vel = rel_state[..., nj : 2 * nj]
     base = frame_block_start(nj, 0)
-    p_w, q_w, v_w, w_w = _block_to_absolute(rel_state[..., base : base + FRAME_BLOCK_DIM], p_ref, q_ref)
+    p_w, q_w, v_w, w_w = _block_to_absolute(rel_state[..., base : base + ROOT_BLOCK_DIM], p_ref, q_ref)
     out = {
         "joint_pos": joint_pos, "joint_vel": joint_vel,
         "root_pos_w": p_w, "root_quat_w": q_w,
         "root_link_lin_vel_w": v_w, "root_link_ang_vel_w": w_w,
     }
     if num_extra_frames > 0:
-        fp, fq, fv, fw = [], [], [], []
-        for k in range(num_extra_frames):
-            b = frame_block_start(nj, 1 + k)
-            kp, kq, kv, kw = _block_to_absolute(rel_state[..., b : b + FRAME_BLOCK_DIM], p_ref, q_ref)
-            fp.append(kp); fq.append(kq); fv.append(kv); fw.append(kw)
+        fp = [
+            _position_to_absolute(
+                rel_state[..., frame_block_start(nj, 1 + k) : frame_block_start(nj, 1 + k) + EE_BLOCK_DIM],
+                p_ref, q_ref,
+            )
+            for k in range(num_extra_frames)
+        ]
         out["frame_pos_w"] = np.stack(fp, axis=-2)
-        out["frame_quat_w"] = np.stack(fq, axis=-2)
-        out["frame_lin_vel_w"] = np.stack(fv, axis=-2)
-        out["frame_ang_vel_w"] = np.stack(fw, axis=-2)
     return out

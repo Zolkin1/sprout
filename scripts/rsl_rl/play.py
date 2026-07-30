@@ -434,7 +434,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        # Playing never evaluates the value function, so a runner cfg can opt out of
+        # restoring it (``load_critic = False``). The FM tracker does: it has no privileged
+        # observation group to build a matching critic from, and skipping the load is what
+        # lets ANY teacher checkpoint drive it -- the actor's observation groups are
+        # identical across tracking modes, only the critic's width moves. Actor weights are
+        # still loaded strictly, so a genuine policy mismatch still fails loudly.
+        if getattr(agent_cfg, "load_critic", True):
+            runner.load(resume_path)
+        else:
+            print("[INFO] Skipping the critic (play-only runner): loading actor weights only.")
+            runner.load(resume_path, load_cfg={"actor": True, "critic": False,
+                                               "optimizer": False, "iteration": True, "rnd": True})
 
         # print parameter counts
         if isinstance(runner, DistillationRunner):

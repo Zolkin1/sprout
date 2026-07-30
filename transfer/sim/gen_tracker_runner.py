@@ -880,8 +880,8 @@ def main() -> None:
     nh.add_argument("--null_history_warmup", dest="null_history_warmup", action="store_true",
                     default=True,
                     help="Sample the FM from step 0 using its learned null-history embedding "
-                         "while the N-step window fills (default; matches the RL side's "
-                         "fm_null_history_warmup). Needs an fm.onnx exported with the "
+                         "while the N-step window fills (default; the RL side does the "
+                         "same unconditionally). Needs an fm.onnx exported with the "
                          "history_null input.")
     nh.add_argument("--no_null_history_warmup", dest="null_history_warmup",
                     action="store_false",

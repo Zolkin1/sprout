@@ -57,16 +57,16 @@ def frame_consistency_terms(
     data_phys: torch.Tensor,
     dt: float,
     num_joints: int,
-    num_extra_frames: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample velocity + acceleration finite-difference consistency over frame blocks.
+    """Per-sample velocity + acceleration finite-difference consistency for the ROOT block.
 
-    Operates on the root + each extra (end-effector) frame block (joints handled
-    separately), in DENORMALIZED (physical) relative-frame units, over the pure F-step
-    future prediction (no clean-history stitch -- the history is separate conditioning
-    tokens, not part of the denoised window).
+    Operates on the root block only (joints are handled separately, and the extra
+    end-effector frames are position-only so they carry no velocity to tie), in
+    DENORMALIZED (physical) relative-frame units, over the pure F-step future prediction
+    (no clean-history stitch -- the history is separate conditioning tokens, not part of
+    the denoised window).
 
-    - velocity: forward finite difference of the frame **pose** (positions, and a proper
+    - velocity: forward finite difference of the root **pose** (position, and a proper
       SO(3) difference of orientations) vs the predicted linear/angular velocities.
     - acceleration: forward finite difference of the predicted velocities vs the same
       finite difference of the **data** velocities.
@@ -75,26 +75,20 @@ def frame_consistency_terms(
         ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
     """
     x = pred_phys
-    b_ = x.shape[0]
-    vel = x.new_zeros(b_)
-    accel = x.new_zeros(b_)
-    n = 0
-    for fi in range(1 + num_extra_frames):
-        b = frame_block_start(num_joints, fi)
-        pos, lin = x[..., b:b + 3], x[..., b + 3:b + 6]
-        ori, ang = x[..., b + 6:b + 12], x[..., b + 12:b + 15]
-        data_lin, data_ang = data_phys[..., b + 3:b + 6], data_phys[..., b + 12:b + 15]
+    b = frame_block_start(num_joints, 0)
+    pos, lin = x[..., b:b + 3], x[..., b + 3:b + 6]
+    ori, ang = x[..., b + 6:b + 12], x[..., b + 12:b + 15]
+    data_lin, data_ang = data_phys[..., b + 3:b + 6], data_phys[..., b + 12:b + 15]
 
-        lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
-        vel = vel + ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
-        rmat = rot6d_to_matrix(ori)  # (B, F, 3, 3)
-        ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
-        vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
+    lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
+    vel = ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
+    rmat = rot6d_to_matrix(ori)  # (B, F, 3, 3)
+    ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
+    vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
 
-        accel = accel + (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
-        accel = accel + (((ang[:, 1:] - ang[:, :-1]) / dt - (data_ang[:, 1:] - data_ang[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
-        n += 2
-    return vel / n, accel / n
+    accel = (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
+    accel = accel + (((ang[:, 1:] - ang[:, :-1]) / dt - (data_ang[:, 1:] - data_ang[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
+    return vel / 2, accel / 2
 
 
 def joint_vel_consistency_term(
@@ -113,69 +107,48 @@ def joint_vel_consistency_term(
 
 def fk_consistency_terms(
     pred_phys: torch.Tensor,
-    dt: float,
     num_joints: int,
     num_extra_frames: int,
     fk: object,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample forward-kinematics pose + velocity consistency for the EE frames.
+) -> torch.Tensor:
+    """Per-sample forward-kinematics POSITION consistency for the EE frames.
 
-    Ties each predicted end-effector frame to the FK of the predicted joints:
+    Ties each predicted end-effector position, expressed relative to the predicted root
+    (base frame), to the FK of the predicted joints. This is what couples the two halves
+    of the prediction: without it the joints and the ee positions are free to describe
+    different postures.
 
-    - pose: EE pose expressed relative to the predicted root (base frame) vs ``FK(q)`` --
-      position + SO(3) orientation residual.
-    - velocity: the joint-induced EE velocity (the FM EE twist with the predicted base
-      motion removed, rotated into the base frame) vs ``J(q)·q̇``.
+    Position-only, because the state vector's extra frames are position-only (see
+    :mod:`~robot_rl.flow_matching.transforms`). The orientation residual and the
+    ``J(q)·q̇`` velocity residual that used to live here went with the ee orientation and
+    twist channels.
 
-    All on the DENORMALIZED F-step prediction. ``fk`` is a
-    :class:`~robot_rl.flow_matching.fk.FKChain` exposing ``pose_and_jacobian``.
+    On the DENORMALIZED F-step prediction. ``fk`` is a
+    :class:`~motion_gen.fk.FKChain` exposing ``pose_and_jacobian``.
 
     Returns:
-        ``(fk_pose_per_sample, fk_vel_per_sample)`` each ``(B,)``.
+        ``fk_pose_per_sample``, shape ``(B,)``.
     """
     x = pred_phys
     b_, f_, _ = x.shape
     nj, k = num_joints, num_extra_frames
 
     q = x[..., 0:nj].reshape(b_ * f_, nj)
-    qd = x[..., nj:2 * nj].reshape(b_ * f_, nj)
-    fk_pos, fk_rot, jv, jw = fk.pose_and_jacobian(q)               # (M,K,3),(M,K,3,3),(M,K,3,nj)x2
+    fk_pos, _fk_rot, _jv, _jw = fk.pose_and_jacobian(q)            # (M,K,3), ...
     fk_pos = fk_pos.reshape(b_, f_, k, 3)
-    fk_rot = fk_rot.reshape(b_, f_, k, 3, 3)
-    v_fk = torch.einsum("mkij,mj->mki", jv, qd).reshape(b_, f_, k, 3)
-    w_fk = torch.einsum("mkij,mj->mki", jw, qd).reshape(b_, f_, k, 3)
 
     rb = frame_block_start(nj, 0)
     p_root = x[..., rb:rb + 3]
-    v_root = x[..., rb + 3:rb + 6]
     R_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])               # (B,F,3,3) base->ref
-    w_root = x[..., rb + 12:rb + 15]
 
     pose_ps = x.new_zeros(b_)
-    vel_ps = x.new_zeros(b_)
     for kf in range(k):
         eb = frame_block_start(nj, 1 + kf)
-        p_ee = x[..., eb:eb + 3]
-        v_ee = x[..., eb + 3:eb + 6]
-        R_ee = rot6d_to_matrix(x[..., eb + 6:eb + 12])
-        w_ee = x[..., eb + 12:eb + 15]
-
-        rel = p_ee - p_root
-        # EE pose relative to the (predicted) base; R_rootᵀ via "...ji,...j->...i".
+        rel = x[..., eb:eb + 3] - p_root
+        # EE position relative to the (predicted) base; R_rootᵀ via "...ji,...j->...i".
         p_ee_base = torch.einsum("bfji,bfj->bfi", R_root, rel)
-        R_ee_base = R_root.transpose(-1, -2) @ R_ee
         pose_ps = pose_ps + ((p_ee_base - fk_pos[:, :, kf]) ** 2).mean(dim=(1, 2))
-        rot_res = so3_log(R_ee_base.transpose(-1, -2) @ fk_rot[:, :, kf])
-        pose_ps = pose_ps + (rot_res ** 2).mean(dim=(1, 2))
-
-        # Joint-induced EE twist (remove base motion), expressed in the base frame.
-        v_joints = v_ee - v_root - torch.linalg.cross(w_root, rel)
-        w_joints = w_ee - w_root
-        v_base = torch.einsum("bfji,bfj->bfi", R_root, v_joints)
-        w_base = torch.einsum("bfji,bfj->bfi", R_root, w_joints)
-        vel_ps = vel_ps + ((v_base - v_fk[:, :, kf]) ** 2).mean(dim=(1, 2))
-        vel_ps = vel_ps + ((w_base - w_fk[:, :, kf]) ** 2).mean(dim=(1, 2))
-    return pose_ps / max(k, 1), vel_ps / max(k, 1)
+    return pose_ps / max(k, 1)
 
 
 def flow_matching_loss(
@@ -196,7 +169,6 @@ def flow_matching_loss(
     joint_vel_weight: float = 0.0,
     fk: object | None = None,
     fk_pose_weight: float = 0.0,
-    fk_vel_weight: float = 0.0,
     tau_min: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
@@ -221,14 +193,14 @@ def flow_matching_loss(
         dt: Control step period (seconds) for the finite differences.
         num_joints: ``nj``; num_extra_frames: ``K``.
         vel_weight / accel_weight / joint_vel_weight: consistency weights.
-        fk: An :class:`~robot_rl.flow_matching.fk.FKChain` (or ``None``).
-        fk_pose_weight / fk_vel_weight: FK consistency weights.
+        fk: An :class:`~motion_gen.fk.FKChain` (or ``None``).
+        fk_pose_weight: FK position-consistency weight.
         tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
         ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` /
-        ``joint_vel_consistency`` / ``fk_pose`` / ``fk_vel``.
+        ``joint_vel_consistency`` / ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
     v = model(x_tau, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
@@ -236,7 +208,7 @@ def flow_matching_loss(
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
 
     do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
-    do_fk = fk is not None and state_norm is not None and (fk_pose_weight > 0.0 or fk_vel_weight > 0.0)
+    do_fk = fk is not None and state_norm is not None and fk_pose_weight > 0.0
     if (aux_weight > 0.0 and ori_slice is not None) or do_frame or do_fk:
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
@@ -250,7 +222,7 @@ def flow_matching_loss(
             data_phys = state_norm.denormalize(x1)
             gate = tau >= tau_min  # (B,) bool; gates the accel + FK terms
         if do_frame:
-            vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, dt, num_joints, num_extra_frames)
+            vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, dt, num_joints)
             jvel_ps = joint_vel_consistency_term(pred_phys, dt, num_joints)
             vel, jvel = vel_ps.mean(), jvel_ps.mean()           # ungated
             accel = _masked_mean(accel_ps, gate)                # τ-gated
@@ -262,15 +234,11 @@ def flow_matching_loss(
             # Run FK only on the τ-gated samples (it is the expensive term).
             idx = gate.nonzero(as_tuple=True)[0]
             if idx.numel() > 0:
-                fkp_ps, fkv_ps = fk_consistency_terms(
-                    pred_phys[idx], dt, num_joints, num_extra_frames, fk
-                )
-                fkp, fkv = fkp_ps.mean(), fkv_ps.mean()
+                fkp = fk_consistency_terms(pred_phys[idx], num_joints, num_extra_frames, fk).mean()
             else:
-                fkp = fkv = flow_mse.new_zeros(())
+                fkp = flow_mse.new_zeros(())
             out["fk_pose"] = fkp.detach()
-            out["fk_vel"] = fkv.detach()
-            out["loss"] = out["loss"] + fk_pose_weight * fkp + fk_vel_weight * fkv
+            out["loss"] = out["loss"] + fk_pose_weight * fkp
     return out
 
 

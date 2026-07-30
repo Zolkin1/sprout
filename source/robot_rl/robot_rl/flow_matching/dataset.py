@@ -36,7 +36,8 @@ from torch.utils.data import Dataset
 from .config import FlowMatchingConfig
 from .normalizer import Normalizer
 from .transforms import (
-    FRAME_BLOCK_DIM,
+    EE_BLOCK_DIM,
+    ROOT_BLOCK_DIM,
     frame_block_start,
     orientation_slices,
     relative_state,
@@ -64,29 +65,29 @@ def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str)
     raise KeyError(f"term {target!r} not found in {term_names}")
 
 
-def _stack_frame_tensors(
+def _stack_frame_positions(
     split_fn, frame_names: list[str], rows: int
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Gather extra-frame world tensors and flatten to ``(rows, K, ·)`` for relative_state.
+) -> torch.Tensor | None:
+    """Gather extra-frame world POSITIONS and flatten to ``(rows, K, 3)`` for relative_state.
+
+    The recording carries each frame's full ``pos/quat/lin_vel/ang_vel``, but the state
+    vector's extra frames are position-only (see
+    :mod:`~robot_rl.flow_matching.transforms`), so the other three are simply not read --
+    which is why widening the ee block back out needs no re-record.
 
     Args:
         split_fn: ``name -> (..., dim)`` slicer over the windowed state (the local
             ``_split``), where ``...`` flattens to ``rows``.
-        frame_names: Ordered extra body-frame names; ``[]`` returns all ``None``.
+        frame_names: Ordered extra body-frame names; ``[]`` returns ``None``.
         rows: Flattened leading dimension.
 
     Returns:
-        ``(frame_pos_w, frame_quat_w, frame_lin_vel_w, frame_ang_vel_w)`` each
-        ``(rows, K, ·)``, or all ``None`` when ``frame_names`` is empty.
+        ``frame_pos_w`` ``(rows, K, 3)``, or ``None`` when ``frame_names`` is empty.
     """
     if not frame_names:
-        return None, None, None, None
+        return None
     k = len(frame_names)
-    fp = torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
-    fq = torch.stack([split_fn(f"{f}:quat_w") for f in frame_names], dim=-2).reshape(rows, k, 4)
-    fl = torch.stack([split_fn(f"{f}:lin_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
-    fa = torch.stack([split_fn(f"{f}:ang_vel_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
-    return fp, fq, fl, fa
+    return torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
 
 
 def snap_windows(
@@ -260,6 +261,10 @@ class FutureStateDataset(Dataset):
             tw = rf_t[sel]                    # (Nw, F, node)
             p_anchor = hw[:, -1, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3) snap root pose
             q_anchor = hw[:, -1, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
+            hw_ref = None
+            if data.get("history_ref") is not None:
+                hr = torch.from_numpy(np.ascontiguousarray(data["history_ref"])).float()
+                hw_ref = hr[sel][:, H - n:, :]
         else:
             idx_hist = np.stack(windows).astype(np.int64)  # (Nw, N) history rows; last = snap
             snap_rows = idx_hist[:, -1]                    # (Nw,)
@@ -270,20 +275,44 @@ class FutureStateDataset(Dataset):
             q_anchor = state_t[snap_rows, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
             hw = state_t[idx_hist]  # (Nw, N, state_raw)
             tw = rf_t[snap_rows]    # (Nw, F, node)
+            hw_ref = None
+            if data.get("ref_state") is not None:
+                hw_ref = torch.from_numpy(np.ascontiguousarray(data["ref_state"])).float()[idx_hist]
+
+        # -- history: measured, or (partially autoregressive) measured root + reference
+        #    joints/ee. The reference rows share the measured layout column-for-column
+        #    (``record_data._assemble_ref_state``), so the mix is a per-block source choice
+        #    over one term table -- and the ANCHOR stays the measured root either way, since
+        #    it is also what the prediction is lifted through at deploy.
+        cfg.check_history_source()
+        self.history_source = cfg.history_source
+        partial_ar = cfg.history_source == "reference_partial"
+        if partial_ar and hw_ref is None:
+            raise ValueError(
+                "history_source='reference_partial' needs the applied-reference history "
+                "(the windowed 'history_ref' array, or per-step 'ref_state'), which this "
+                "recording does not have. Re-record with the current record_data.py."
+            )
 
         def _split_hist(name: str) -> torch.Tensor:
+            """Slice a history block, from the measured rows or the reference rows.
+
+            Root pose/twist always measured; joints and extra-frame positions follow
+            ``history_source``.
+            """
             a, b = s_slc[name]
-            return hw[..., a:b]
+            src = hw_ref if (partial_ar and not name.startswith("root_")) else hw
+            return src[..., a:b]
 
         m_h = n_win * n
         pr_h = p_anchor[:, None, :].expand(n_win, n, 3).reshape(m_h, 3)
         qr_h = q_anchor[:, None, :].expand(n_win, n, 4).reshape(m_h, 4)
-        fp, fq, fl, fa = _stack_frame_tensors(_split_hist, self.target_frame_names, m_h)
+        fp = _stack_frame_positions(_split_hist, self.target_frame_names, m_h)
         history = relative_state(
             _split_hist("root_pos_w").reshape(m_h, 3), _split_hist("root_quat_w").reshape(m_h, 4),
             _split_hist("root_link_lin_vel_w").reshape(m_h, 3), _split_hist("root_link_ang_vel_w").reshape(m_h, 3),
             _split_hist("joint_pos").reshape(m_h, nj), _split_hist("joint_vel").reshape(m_h, nj),
-            pr_h, qr_h, frame_pos_w=fp, frame_quat_w=fq, frame_lin_vel_w=fl, frame_ang_vel_w=fa,
+            pr_h, qr_h, frame_pos_w=fp,
         ).reshape(n_win, n, self.state_dim).contiguous()
 
         # -- target: the F-node ego-anchored clip future at the snap, in the same frame --
@@ -296,21 +325,27 @@ class FutureStateDataset(Dataset):
         m_t = n_win * f
         pr_t = p_anchor[:, None, :].expand(n_win, f, 3).reshape(m_t, 3)
         qr_t = q_anchor[:, None, :].expand(n_win, f, 4).reshape(m_t, 4)
-        fpt, fqt, flt, fat = _stack_frame_tensors(_split_tgt, self.target_frame_names, m_t)
+        fpt = _stack_frame_positions(_split_tgt, self.target_frame_names, m_t)
         target = relative_state(
             _split_tgt("root_pos_w").reshape(m_t, 3), _split_tgt("root_quat_w").reshape(m_t, 4),
             _split_tgt("root_link_lin_vel_w").reshape(m_t, 3), _split_tgt("root_link_ang_vel_w").reshape(m_t, 3),
             _split_tgt("joint_pos").reshape(m_t, nj), _split_tgt("joint_vel").reshape(m_t, nj),
-            pr_t, qr_t, frame_pos_w=fpt, frame_quat_w=fqt, frame_lin_vel_w=flt, frame_ang_vel_w=fat,
+            pr_t, qr_t, frame_pos_w=fpt,
         ).reshape(n_win, f, self.state_dim).contiguous()
 
-        # node-0 invariant: the clip ego-anchored at the snap sits on the robot root,
-        # so target node 0's root position ≈ 0 in the robot frame. Warn if it drifts.
+        # node-0 invariant: the clip ego-anchored at the snap sits on the robot root, so
+        # target node 0's root position ≈ 0 in the robot frame. This is the whole premise of
+        # the paradigm -- deployment lifts the prediction through the robot's own pose and
+        # assumes node 0 lands on it. A recording that violates it trains a generator whose
+        # every prediction starts displaced, so fail rather than print.
         rb = frame_block_start(nj, 0)
         node0_off = target[:, 0, rb:rb + 3].norm(dim=-1).mean().item()
         if node0_off > 0.15:
-            print(f"[fm-data][WARN] target node-0 root offset mean={node0_off:.3f} m (> 0.15); "
-                  "the recorded ref_future may not be ego-anchored onto the robot at the snap.")
+            raise ValueError(
+                f"target node-0 root offset mean={node0_off:.3f} m (> 0.15): the recorded "
+                "ref_future is not ego-anchored onto the robot at the snap. Re-record with "
+                "ego_anchor_fraction=1.0 on the teacher command."
+            )
 
         # Exteroception tokens at the snap row. The recording carries either
         # ``height_scan`` (P|W, K) -- one token -- or ``depth`` (P|W, T, K) with one token
@@ -351,7 +386,7 @@ class FutureStateDataset(Dataset):
 
         # -- normalizers (fit on train; ori6d blocks left raw) --
         state_mask = torch.ones(self.state_dim, dtype=torch.bool)
-        for o0, o1 in orientation_slices(nj, self.num_extra_frames):
+        for o0, o1 in orientation_slices(nj):
             state_mask[o0:o1] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
@@ -442,21 +477,23 @@ class FutureStateDataset(Dataset):
         """Per-channel uniform noise half-width (normalized space) for a history token.
 
         Maps the config's physical per-group amplitudes onto the state layout
-        ``[joint_pos | joint_vel | frame blocks x (1+K)]``, scales by ``cfg.noise_scale``,
-        then divides by the normalizer std (ori6d channels have std==1, so their noise
-        stays in raw 6D units).
+        ``[joint_pos | joint_vel | root block | ee positions x K]``, scales by
+        ``cfg.noise_scale``, then divides by the normalizer std (ori6d channels have
+        std==1, so their noise stays in raw 6D units).
         """
         cfg = self.cfg
         nj = self.num_joints
         amp = torch.zeros(self.state_dim, dtype=self.state.dtype)
         amp[0:nj] = cfg.noise_joint_pos
         amp[nj : 2 * nj] = cfg.noise_joint_vel
-        for fi in range(1 + self.num_extra_frames):
-            b = frame_block_start(nj, fi)
-            amp[b : b + 3] = cfg.noise_pos              # pos(3)
-            amp[b + 3 : b + 6] = cfg.noise_lin_vel      # lin_vel(3)
-            amp[b + 6 : b + 12] = cfg.noise_ori         # ori6d(6)
-            amp[b + 12 : b + FRAME_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
+        rb = frame_block_start(nj, 0)
+        amp[rb : rb + 3] = cfg.noise_pos                    # pos(3)
+        amp[rb + 3 : rb + 6] = cfg.noise_lin_vel            # lin_vel(3)
+        amp[rb + 6 : rb + 12] = cfg.noise_ori               # ori6d(6)
+        amp[rb + 12 : rb + ROOT_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
+        for kf in range(self.num_extra_frames):
+            b = frame_block_start(nj, 1 + kf)
+            amp[b : b + EE_BLOCK_DIM] = cfg.noise_pos       # ee pos(3)
         return (amp * cfg.noise_scale) / state_normalizer.std
 
     def __len__(self) -> int:

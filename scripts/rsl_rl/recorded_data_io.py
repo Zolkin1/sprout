@@ -106,6 +106,10 @@ class RecordingMeta:
     content_sha256: str = ""
     format: str = "per_step_npz"
     history_len: int = 0
+    fm_snap_every: int = 0
+    """Control steps between snap (re-plan) events in this recording, from the command's
+    ``fm_snap_every``. The FM tracker's ``fm_update_every`` must equal it -- the horizon is
+    sized from the period and the targets were cut at that cadence. 0 = not recorded."""
 
 
 def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
@@ -365,8 +369,11 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
 # byte is used) and streams to a chunked, compressed HDF5 with bounded RAM (np.savez
 # cannot append). Layout per window (raw world-frame; the dataset applies relative_state
 # + normalization at build time):
-#   history_state [W, H, node]  the H most-recent state rows (last row == the snap; its
-#                               root pose is the ego-anchor). H >= trainable N.
+#   history_state [W, H, node]  the H most-recent MEASURED state rows (last row == the
+#                               snap; its root pose is the ego-anchor). H >= trainable N.
+#   history_ref   [W, H, node]  the reference APPLIED at each of those H steps, same
+#                               layout. Feeds ``history_source="reference_partial"``;
+#                               stored unconditionally so that stays a train-time A/B.
 #   ref_future    [W, F, node]  the ego-anchored clip future at the snap.
 #   height_scan   [W, K]        the snap-row height scan (optional).
 #   cmd_future    [W, F, cmd]   the snap-row future command (optional; dataset strides it).
@@ -374,6 +381,7 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
 
 _WINDOW_DTYPES: dict[str, str] = {
     "history_state": "float32",
+    "history_ref": "float32",
     "ref_future": "float32",
     "height_scan": "float32",
     "depth": "float32",
@@ -428,13 +436,15 @@ class RecordedWindowWriter:
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
         meta: Provenance/layout metadata (stored as JSON attrs).
         compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
+        record_history_ref: Also store the applied-reference history ring (``history_ref``),
+            which ``history_source="reference_partial"`` trains on.
     """
 
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
-        tag_distractors: bool = False,
+        tag_distractors: bool = False, record_history_ref: bool = False,
     ) -> None:
         import h5py
 
@@ -445,6 +455,11 @@ class RecordedWindowWriter:
             "ref_future": (num_windows, future_len, node_dim),
             "episode_id": (num_windows,),
         }
+        # The applied-reference history ring, for history_source="reference_partial".
+        # ~H/F extra bytes per window (12% at H=8, F=65) buys a train-time A/B instead of
+        # a second multi-hour recording, so it is not made optional.
+        if record_history_ref:
+            shapes["history_ref"] = (num_windows, history_len, node_dim)
         # Opt-in per-window distractor tag: declared only when the caller will supply it every
         # batch (``write_batch`` requires every declared key), so older writers and the window
         # tests stay valid. ``load_recorded_windows`` treats it as optional on read.

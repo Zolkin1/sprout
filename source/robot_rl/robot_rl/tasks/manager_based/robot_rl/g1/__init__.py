@@ -178,7 +178,9 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+            # Play-only runner: no privileged critic group, and its weights are not loaded,
+            # so any teacher checkpoint drives this task regardless of tracking_mode.
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
         },
     )
     _registered = True

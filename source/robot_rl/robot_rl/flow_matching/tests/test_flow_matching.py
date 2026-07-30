@@ -113,28 +113,24 @@ def test_relative_state_invertible():
 
 
 def test_relative_state_invertible_with_frames():
+    """Extra frames are position-only: 3 channels each, and only the root has an ori6d."""
     torch.manual_seed(12)
     nj, w, k = 21, 30, 4
     p, q = torch.randn(w, 3, dtype=torch.float64), _rand_unit_quat(w)
     v, om = torch.randn(w, 3, dtype=torch.float64), torch.randn(w, 3, dtype=torch.float64)
     jp, jv = torch.randn(w, nj, dtype=torch.float64), torch.randn(w, nj, dtype=torch.float64)
     fpos = torch.randn(w, k, 3, dtype=torch.float64)
-    fquat = _rand_unit_quat(w * k).reshape(w, k, 4)
-    flin, fang = torch.randn(w, k, 3, dtype=torch.float64), torch.randn(w, k, 3, dtype=torch.float64)
     ref = w // 2
     p_ref = p[ref : ref + 1].expand(w, -1)
     q_ref = q[ref : ref + 1].expand(w, -1)
-    rel = relative_state(p, q, v, om, jp, jv, p_ref, q_ref,
-                         frame_pos_w=fpos, frame_quat_w=fquat, frame_lin_vel_w=flin, frame_ang_vel_w=fang)
+    rel = relative_state(p, q, v, om, jp, jv, p_ref, q_ref, frame_pos_w=fpos)
     assert rel.shape == (w, target_state_dim(nj, k))
-    assert len(orientation_slices(nj, k)) == k + 1
+    assert rel.shape[1] == 2 * nj + 15 + 3 * k
+    # Only the root carries an orientation now.
+    assert orientation_slices(nj) == [orientation_slice(nj)]
     rec = state_to_absolute(rel, p_ref, q_ref, nj, num_extra_frames=k)
     assert torch.allclose(rec["frame_pos_w"], fpos, atol=1e-5)
-    assert torch.allclose(rec["frame_lin_vel_w"], flin, atol=1e-5)
-    assert torch.allclose(
-        matrix_from_quat(rec["frame_quat_w"].reshape(w * k, 4)),
-        matrix_from_quat(fquat.reshape(w * k, 4)), atol=1e-5,
-    )
+    assert "frame_quat_w" not in rec and "frame_lin_vel_w" not in rec
 
 
 def test_relative_frame_is_yaw_only():
@@ -309,28 +305,40 @@ def test_so3_log_recovers_rotation_vector():
 
 
 def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> torch.Tensor:
-    """Self-consistent ``(1, F, D)`` traj: pos integrates lin vel, ori integrates ang vel."""
+    """Self-consistent ``(1, F, D)`` traj: root pos integrates lin vel, ori integrates ang vel.
+
+    Only the ROOT block is velocity-consistent -- the extra frames are position-only, so
+    they carry nothing for :func:`frame_consistency_terms` to tie and are filled with a
+    plain ramp.
+    """
     g = torch.Generator().manual_seed(seed)
     d = target_state_dim(nj, k)
     x = torch.zeros(1, nf, d, dtype=torch.float64)
-    for fi in range(1 + k):
-        b = frame_block_start(nj, fi)
-        pos0 = torch.randn(3, generator=g, dtype=torch.float64)
-        vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
-        omega = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+
+    b = frame_block_start(nj, 0)
+    pos0 = torch.randn(3, generator=g, dtype=torch.float64)
+    vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+    omega = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+    for t in range(nf):
+        r = _rodrigues((omega * (t * dt)).unsqueeze(0))[0]
+        x[0, t, b:b + 3] = pos0 + vel * (t * dt)
+        x[0, t, b + 3:b + 6] = vel
+        x[0, t, b + 6:b + 12] = matrix_to_rot6d(r)
+        x[0, t, b + 12:b + 15] = omega
+
+    for kf in range(k):
+        eb = frame_block_start(nj, 1 + kf)
+        ee0 = torch.randn(3, generator=g, dtype=torch.float64)
+        ee_vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
         for t in range(nf):
-            r = _rodrigues((omega * (t * dt)).unsqueeze(0))[0]
-            x[0, t, b:b + 3] = pos0 + vel * (t * dt)
-            x[0, t, b + 3:b + 6] = vel
-            x[0, t, b + 6:b + 12] = matrix_to_rot6d(r)
-            x[0, t, b + 12:b + 15] = omega
+            x[0, t, eb:eb + 3] = ee0 + ee_vel * (t * dt)
     return x
 
 
 def test_frame_consistency_zero_for_consistent_traj():
     nf, nj, k, dt = 6, 2, 1, 0.05
     x = _consistent_frame_traj(nf, nj, k, dt, seed=1)
-    vel, accel = frame_consistency_terms(x, x, dt, nj, k)
+    vel, accel = frame_consistency_terms(x, x, dt, nj)
     jvel = joint_vel_consistency_term(x, dt, nj)
     assert vel.max().item() < 1e-10 and accel.max().item() < 1e-10 and jvel.max().item() < 1e-10
 
@@ -340,7 +348,7 @@ def test_frame_consistency_penalizes_jump():
     x = _consistent_frame_traj(nf, nj, k, dt, seed=2)
     pred = x.clone()
     pred[0, 3, frame_block_start(nj, 0):frame_block_start(nj, 0) + 3] += 1.0
-    vel, _ = frame_consistency_terms(pred, x, dt, nj, k)
+    vel, _ = frame_consistency_terms(pred, x, dt, nj)
     assert vel.max().item() > 1e-2
 
 
@@ -405,10 +413,8 @@ def test_fk_consistency_zero_for_fk_consistent_state():
     rng = np.random.default_rng(1)
     q = torch.tensor(rng.uniform(-0.5, 0.5, size=(1, nf, nj)), dtype=torch.float64)
     qd = torch.tensor(rng.standard_normal((1, nf, nj)) * 0.3, dtype=torch.float64)
-    fk_pos, fk_rot, jv, jw = chain.pose_and_jacobian(q.reshape(nf, nj))
-    fk_pos, fk_rot = fk_pos.reshape(1, nf, k, 3), fk_rot.reshape(1, nf, k, 3, 3)
-    v_fk = torch.einsum("mkij,mj->mki", jv, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
-    w_fk = torch.einsum("mkij,mj->mki", jw, qd.reshape(nf, nj)).reshape(1, nf, k, 3)
+    fk_pos, _fk_rot, _jv, _jw = chain.pose_and_jacobian(q.reshape(nf, nj))
+    fk_pos = fk_pos.reshape(1, nf, k, 3)
     x = torch.zeros(1, nf, d, dtype=torch.float64)
     x[..., 0:nj], x[..., nj:2 * nj] = q, qd
     rb = frame_block_start(nj, 0)
@@ -416,14 +422,10 @@ def test_fk_consistency_zero_for_fk_consistent_state():
     for kf in range(k):
         eb = frame_block_start(nj, 1 + kf)
         x[..., eb:eb + 3] = fk_pos[:, :, kf]
-        x[..., eb + 3:eb + 6] = v_fk[:, :, kf]
-        x[..., eb + 6:eb + 12] = matrix_to_rot6d(fk_rot[:, :, kf])
-        x[..., eb + 12:eb + 15] = w_fk[:, :, kf]
-    pose_ps, vel_ps = fk_consistency_terms(x, 0.05, nj, k, chain)
-    assert pose_ps.max().item() < 1e-8 and vel_ps.max().item() < 1e-8
+    pose_ps = fk_consistency_terms(x, nj, k, chain)
+    assert pose_ps.max().item() < 1e-8
     xb = x.clone(); xb[0, 1, frame_block_start(nj, 1):frame_block_start(nj, 1) + 3] += 0.1
-    pose_b, _ = fk_consistency_terms(xb, 0.05, nj, k, chain)
-    assert pose_b.max().item() > 1e-4
+    assert fk_consistency_terms(xb, nj, k, chain).max().item() > 1e-4
 
 
 @pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
@@ -437,14 +439,15 @@ def test_flow_loss_fk_terms_and_tau_gate():
     norm = _norm(x1)
     ckw = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k,
                vel_weight=0.1, accel_weight=0.01, joint_vel_weight=0.1,
-               fk=chain, fk_pose_weight=0.1, fk_vel_weight=0.01)
+               fk=chain, fk_pose_weight=0.1)
     out = flow_matching_loss(model, x1, hist, height, None, tau_min=0.0, **ckw)
-    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose", "fk_vel"):
+    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose"):
         assert key in out
+    assert "fk_vel" not in out
     assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
     out_g = flow_matching_loss(model, x1, hist, height, None, tau_min=2.0, **ckw)
     assert out_g["accel_consistency"].item() == 0.0
-    assert out_g["fk_pose"].item() == 0.0 and out_g["fk_vel"].item() == 0.0
+    assert out_g["fk_pose"].item() == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -465,15 +468,29 @@ def test_snap_windows():
 
 
 def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, Ksc=6, seed=0):
+    """Synthesize a per-step recording plus its layout meta.
+
+    Returns ``(data, meta, nj, K, F, state_dim)``. Note the two DIFFERENT widths:
+    ``raw_node`` = ``sum(state_term_dims)`` is what ``state``/``ref_future`` rows are
+    (world-frame, full 13 per extra frame), while ``state_dim`` is the narrower
+    relative-frame vector the dataset builds from them (extra frames position-only).
+    """
     rng = np.random.default_rng(seed)
-    node = target_state_dim(nj, K)
+    stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel"]
+    std = [3, 4, 3, 3, nj, nj]
+    frames = [f"f{i}" for i in range(K)]
+    for fr in frames:
+        stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
+        std += [3, 4, 3, 3]
+    raw_node = sum(std)
+
     parts = []
     for e in range(n_ep):
         rows = [np.concatenate([rng.standard_normal(3), [0, 0, 0, 1.0], rng.standard_normal(3),
                                 rng.standard_normal(3), rng.standard_normal(2 * nj), rng.standard_normal(K * 13)])
                 for _ in range(L)]
         s = np.stack(rows).astype(np.float32)
-        rfu = rng.standard_normal((L, F, node)).astype(np.float32)
+        rfu = rng.standard_normal((L, F, raw_node)).astype(np.float32)
         rfu[:, 0, 0:3] = s[:, 0:3]; rfu[:, 0, 3:7] = s[:, 3:7]  # node-0 ego-anchored on the robot
         cf = rng.standard_normal((L, F, 3)).astype(np.float32)
         hs = rng.standard_normal((L, Ksc)).astype(np.float32)  # per-step height scan (Ksc rays)
@@ -483,42 +500,39 @@ def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, Ksc=6, seed=0):
     keys = ["state", "ref_future", "cmd_future", "height_scan", "reanchor_active",
             "episode_id", "step_in_episode", "done"]
     data = {k: np.concatenate([p[i] for p in parts]) for i, k in enumerate(keys)}
-    stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel"]
-    std = [3, 4, 3, 3, nj, nj]
-    frames = [f"f{i}" for i in range(K)]
-    for fr in frames:
-        stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
-        std += [3, 4, 3, 3]
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
                            state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F)
-    return data, meta, nj, K, F, node
+    return data, meta, nj, K, F, target_state_dim(nj, K)
 
 
 def test_dataset_snap_windows_build():
     torch.manual_seed(0)
-    data, meta, nj, K, F, node = _synthetic_recording()
+    data, meta, nj, K, F, state_dim = _synthetic_recording()
     cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
                              target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
     train, val = build_train_val(data, meta, cfg)
     it = train[0]
     ksc = data["height_scan"].shape[1]
-    assert it["history"].shape == (2, node)
-    assert it["state"].shape == (F, node)
+    # The built vector is NARROWER than the recorded row: the extra frames' quat/lin/ang
+    # columns are recorded but not read (position-only ee blocks).
+    assert state_dim < data["state"].shape[1]
+    assert it["history"].shape == (2, state_dim)
+    assert it["state"].shape == (F, state_dim)
     assert it["height"].shape == (ksc,)
     assert it["cmd_tokens"].shape == (cfg.num_cmd_tokens, 3)
-    assert cfg.state_dim == node and cfg.history_dim == node and cfg.cmd_dim == 3
+    assert cfg.state_dim == state_dim and cfg.history_dim == state_dim and cfg.cmd_dim == 3
     assert cfg.height_dim == ksc
     assert val is not None and len(val) > 0
     assert isinstance(train.val_episode_ids, list)
     # node-0 target offset ~ 0 in the robot frame (ego-anchored), so the raw target root pos is small.
     tgt = train.state_normalizer.denormalize(train.state)  # (Nw, F, D)
-    rb = frame_block_start(nj, K if False else 0)
+    rb = frame_block_start(nj, 0)
     assert tgt[:, 0, rb:rb + 3].norm(dim=-1).mean().item() < 0.15
 
 
 def test_online_roundtrip():
     torch.manual_seed(0)
-    data, meta, nj, K, F, node = _synthetic_recording()
+    data, meta, nj, K, F, state_dim = _synthetic_recording()
     N = 2
     cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
                              target_source="ego_anchored_clip_future", val_fraction=0.2, seed=0,
@@ -540,7 +554,7 @@ def test_online_roundtrip():
         "model": model.state_dict(),
     }
     ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
-    assert ctx.N == N and ctx.F == F and ctx.D == node and ctx.num_extra_frames == K
+    assert ctx.N == N and ctx.F == F and ctx.D == state_dim and ctx.num_extra_frames == K
     V = 5
     rp = torch.randn(V, N, 3)
     rq = torch.nn.functional.normalize(torch.randn(V, N, 4), dim=-1)
@@ -548,10 +562,111 @@ def test_online_roundtrip():
                                 torch.randn(V, N, nj), torch.randn(V, N, nj), frames=torch.randn(V, N, K, 13))
     height = build_height_token(ctx, torch.randn(V, cfg.height_dim))
     cmd = build_cmd_tokens(ctx, torch.randn(V, F, 3))
-    assert (hist.shape == (V, N, node) and height.shape == (V, cfg.height_dim)
+    assert (hist.shape == (V, N, state_dim) and height.shape == (V, cfg.height_dim)
             and cmd.shape == (V, ctx.num_cmd_tokens, 3))
     world = sample_world(ctx, hist, height, cmd, p_ref=torch.randn(V, 3),
                          q_ref=torch.nn.functional.normalize(torch.randn(V, 4), dim=-1))
     assert world["root_pos_w"].shape == (V, F, 3)
     assert world["frame_pos_w"].shape == (V, F, K, 3)
     assert torch.isfinite(world["root_pos_w"]).all() and torch.isfinite(world["joint_pos"]).all()
+
+
+# ---------------------------------------------------------------------------
+# 11. Partially autoregressive history (history_source="reference_partial")
+# ---------------------------------------------------------------------------
+def _recording_with_ref_history(**kw):
+    """A synthetic recording plus a DISTINCT ``ref_state`` array, for the mixed history.
+
+    The reference rows are the measured rows plus a constant offset, so a mixed history is
+    unambiguous: each block can be attributed to its source by inspection.
+    """
+    data, meta, nj, K, F, state_dim = _synthetic_recording(**kw)
+    data["ref_state"] = data["state"] + 7.0
+    # Keep the reference quaternion a unit quaternion (offsetting it would not be one), and
+    # keep the reference ROOT equal to the measured root -- the mixed history must ignore the
+    # reference's root block entirely, so making them equal would hide a bug. Offset it too.
+    q = data["ref_state"][:, 3:7]
+    data["ref_state"][:, 3:7] = q / np.linalg.norm(q, axis=-1, keepdims=True)
+    return data, meta, nj, K, F, state_dim
+
+
+def _built_history(history_source: str, data, meta, F):
+    """Build a dataset with the given history source and return its RAW history tensor."""
+    cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel",
+                             cmd_stride=4, target_source="ego_anchored_clip_future",
+                             val_fraction=0.34, seed=0, obs_noise=False,
+                             history_source=history_source)
+    train, _ = build_train_val(data, meta, cfg)
+    return train.state_normalizer.denormalize(train.history), train
+
+
+def test_partial_ar_history_mixes_measured_root_with_reference_joints():
+    torch.manual_seed(0)
+    data, meta, nj, K, F, state_dim = _recording_with_ref_history()
+    measured, _ = _built_history("measured", data, meta, F)
+    partial, ds = _built_history("reference_partial", data, meta, F)
+    assert ds.history_source == "reference_partial"
+    assert measured.shape == partial.shape
+
+    rb = frame_block_start(nj, 0)
+    # Root block (pos / lin_vel / ori6d / ang_vel) is measured in BOTH -- it is also the
+    # anchor, so it must not move.
+    assert torch.allclose(measured[..., rb:rb + 15], partial[..., rb:rb + 15], atol=1e-5)
+    # Joints come from the reference, which is offset by +7 -- so they must differ.
+    assert not torch.allclose(measured[..., 0:2 * nj], partial[..., 0:2 * nj], atol=1e-3)
+    assert torch.allclose(partial[..., 0:2 * nj], measured[..., 0:2 * nj] + 7.0, atol=1e-4)
+    # Extra-frame positions also come from the reference.
+    eb = frame_block_start(nj, 1)
+    assert not torch.allclose(measured[..., eb:], partial[..., eb:], atol=1e-3)
+
+
+def test_partial_ar_leaves_the_target_alone():
+    """Only the CONDITIONING changes; the prediction target is the same either way."""
+    torch.manual_seed(0)
+    data, meta, nj, K, F, _ = _recording_with_ref_history()
+    _, ds_m = _built_history("measured", data, meta, F)
+    _, ds_p = _built_history("reference_partial", data, meta, F)
+    assert torch.allclose(ds_m.state, ds_p.state, atol=1e-6)
+
+
+def test_partial_ar_without_the_reference_array_raises():
+    torch.manual_seed(0)
+    data, meta, nj, K, F, _ = _synthetic_recording()   # no ref_state
+    with pytest.raises(ValueError, match="applied-reference history"):
+        _built_history("reference_partial", data, meta, F)
+
+
+def test_unknown_history_source_raises():
+    with pytest.raises(ValueError, match="history_source"):
+        FlowMatchingConfig(history_source="autoregressive").check_history_source()
+
+
+def test_history_source_travels_on_the_context():
+    """The runtime must read the mode off the CHECKPOINT, not the task config."""
+    torch.manual_seed(0)
+    data, meta, nj, K, F, state_dim = _recording_with_ref_history()
+    N = 2
+    cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
+                             cmd_stride=4, target_source="ego_anchored_clip_future",
+                             val_fraction=0.2, seed=0, d_model=32, nhead=4, num_layers=2,
+                             dim_feedforward=64, history_source="reference_partial")
+    train, _ = build_train_val(data, meta, cfg)
+    model = FlowMatchingTransformer(
+        state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
+        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
+        d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
+        dim_feedforward=cfg.dim_feedforward,
+    ).eval()
+    ckpt = {
+        "config": cfg.to_dict(),
+        "meta": {"state_joint_names": meta.state_joint_names,
+                 "target_frame_names": meta.state_frame_names, "fm_snap_every": 12},
+        "num_joints": nj,
+        "state_normalizer": train.state_normalizer.state_dict(),
+        "cmd_normalizer": train.cmd_normalizer.state_dict(),
+        "height_normalizer": train.height_normalizer.state_dict(),
+        "model": model.state_dict(),
+    }
+    ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
+    assert ctx.history_source == "reference_partial"
+    assert ctx.fm_snap_every == 12

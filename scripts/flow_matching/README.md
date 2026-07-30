@@ -2,10 +2,15 @@
 
 # Flow-Matching Workflow
 
-A conditional flow-matching transformer that predicts a robot's **future references**
-(base position, joint pos/vel, base lin/ang velocity, and optionally end-effector
-frames — all in the robot's current local base frame) from **state history + a
-velocity command**. Built on the open-loop motion-sequence task.
+A conditional flow-matching transformer that predicts a robot's **future references** —
+base pose + twist, joint pos/vel, and end-effector **positions**, all in the robot's current
+xyz+yaw ground frame — from **state history + exteroception + a velocity command**. Built on
+the open-loop motion-sequence task.
+
+What it predicts is exactly what the teacher's `reference_window` observation consumes, no
+more: the end-effector frames are position-only, because that observation's `ee_pos` block
+is a position and the tracker's CLF no longer grades ee frames. See
+`robot_rl/flow_matching/transforms.py` for the state layout.
 
 Pipeline: **record data → train → deploy**. Recording needs Isaac Sim; training is pure
 PyTorch (no Isaac). You **record once and train many** FM variants on the same recording —
@@ -61,12 +66,14 @@ python scripts/flow_matching/train.py --data <run-dir-or-.npz> --wandb
 
 - **`--data`** accepts a `.npz` **or a run directory** (→ newest `recorded_*.npz` under it).
 - **Auto-configured from the recording** (printed as `[auto] target_source=…, cmd_array=…`):
-  - `--target_source` → `reference` if the recording has `ref_state`, else `actual`. Override explicitly.
+  - `--target_source` → `ego_anchored_clip_future` (the only mode the dataset accepts) when the recording has `ref_future`.
   - `--cmd_array` → `target_vel` if that array was recorded, else no command (future-horizon conditioning: past command in the encoder, future in the decoder). Override with an array name or `none`.
 - **`--eval_data <run-or-.npz>`** — a *separate* held-out recording (never trained on); metrics logged under `eval/*`, distinct from the within-recording `val/*`. Must share the train layout. See "Held-out evaluation" below.
 - **`--run_name`** — run dir is `logs/flow_matching/<timestamp>_<run_name>` (defaults to just the timestamp).
-- **`--history_frames`** — extra body frames the history/encoder token consumes. Default (omit / `none` / bare flag) is an **empty set**: the generator needs **no** measured end-effectors at deployment, while the target still predicts every recorded frame for the tracker's `ee_ref`. Pass `all` for symmetric (history uses every recorded frame), or a space-separated subset.
-- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--history_len` / `--future_len` (25), `--lr`, `--cosine`.
+- **`--history_source`** — what the `N` history tokens are made of. `measured` (default) is the robot's actual state. `reference_partial` is **partially autoregressive**: measured root pose/twist, but joints and end-effector positions taken from the reference applied at those steps — the generator conditioning on its own recent output for posture while the root stays grounded in reality. Both train from the same recording (the applied-reference ring is always stored), so it is a free A/B.
+- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--num_history_states` (2), `--future_len` (65 — sized to the deploy look-ahead; see `FlowMatchingConfig.future_len`), `--lr`, `--cosine`.
+
+**Horizon and re-recording.** `--future_len` must equal the recording's `--ref_future_len`: windows are cut at record time and the dataset hard-errors on a mismatch. Both default to `FlowMatchingConfig.future_len`, so leaving them alone is correct.
 - **Output:** `logs/flow_matching/<ts>_<run_name>/{best.pt, ckpt_<N>.pt}`. wandb logs per epoch (val every `--val_every`=5); per-step loss → TensorBoard.
 - **Provenance (parity with RL):** each run writes `git/sprout.diff` + `params/fm_config.yaml` (the resolved config) + `params/data.yaml` (train/eval `.npz` paths + their `sha256` + the recording's metadata), and every `.pt` records `data_path`/`data_sha256` — so a run is fully self-describing.
 

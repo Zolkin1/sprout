@@ -131,6 +131,10 @@ def _synthetic_per_step(seed=0):
     reanchor = np.isin(step_in_episode, [5, 10, 15]).astype(np.uint8)
     state = _norm_quats(rng.standard_normal((P, _NODE)).astype(np.float32))
     ref_future = _norm_quats(rng.standard_normal((P, F, _NODE)).astype(np.float32))
+    # Node 0 of the future sits ON the robot -- the ego-anchor invariant the dataset
+    # enforces. Without it the build raises before it can be compared.
+    ref_future[:, 0, 0:3] = state[:, 0:3]
+    ref_future[:, 0, 3:7] = state[:, 3:7]
     data = {
         "state": state,
         "ref_future": ref_future,
@@ -150,13 +154,19 @@ def _to_windowed(data, N):
                         data["reanchor_active"], N, 1)
     idx = np.stack(wins).astype(np.int64)   # (W, N)
     snap = idx[:, -1]
-    return {
+    out = {
         "history_state": data["state"][idx],        # (W, N, node)  -> H == N
         "ref_future": data["ref_future"][snap],      # (W, F, node)
         "height_scan": data["height_scan"][snap],    # (W, K)
         "cmd_future": data["cmd_future"][snap],       # (W, F, 3)
         "episode_id": data["episode_id"][snap],       # (W,)
     }
+    # The applied-reference ring, gathered at the SAME rows as the measured one -- that
+    # alignment is what makes history_source="reference_partial" equivalent across the two
+    # recording formats.
+    if data.get("ref_state") is not None:
+        out["history_ref"] = data["ref_state"][idx]  # (W, N, node)
+    return out
 
 
 def test_windowed_dataset_matches_per_step():
@@ -181,6 +191,37 @@ def test_windowed_dataset_matches_per_step():
     if vl is not None:
         assert len(vl) == len(vw)
         _same(vl, vw)
+
+
+def test_windowed_matches_per_step_with_a_partially_autoregressive_history():
+    """The mixed history is built identically from ``history_ref`` and from ``ref_state``.
+
+    Both formats have to produce the same conditioning, or an A/B between them would be
+    comparing recording formats rather than history sources.
+    """
+    data = _synthetic_per_step()
+    rng = np.random.default_rng(1)
+    data["ref_state"] = _norm_quats(rng.standard_normal(data["state"].shape).astype(np.float32))
+    meta = _meta()
+    N = 2
+
+    cfg_m, cfg_p = _cfg(), _cfg()
+    cfg_p.history_source = "reference_partial"
+
+    tl, _ = build_train_val(data, meta, cfg_p)                       # legacy per-step
+    tw, _ = build_train_val(_to_windowed(data, N), meta, _cfg_partial())  # windowed
+    assert torch.allclose(tl.history, tw.history, atol=1e-5)
+
+    # And it is genuinely a different history than the measured one.
+    tm, _ = build_train_val(data, meta, cfg_m)
+    assert not torch.allclose(tm.history, tl.history, atol=1e-3)
+
+
+def _cfg_partial():
+    """``_cfg()`` with the partially autoregressive history source."""
+    cfg = _cfg()
+    cfg.history_source = "reference_partial"
+    return cfg
 
 
 def test_windowed_rejects_too_short_history():

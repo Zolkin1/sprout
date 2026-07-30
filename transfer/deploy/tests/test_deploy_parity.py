@@ -100,18 +100,18 @@ def test_deploy_parity_transforms() -> None:
     vw, ww = torch.randn(n, 3, generator=g, dtype=torch.float64), torch.randn(n, 3, generator=g, dtype=torch.float64)
     jp, jv = torch.randn(n, nj, generator=g, dtype=torch.float64), torch.randn(n, nj, generator=g, dtype=torch.float64)
     p_ref, q_ref = torch.randn(n, 3, generator=g, dtype=torch.float64), _rand_quat(n, g)
+    # Extra frames are position-only in the state vector (see flow_matching.transforms).
     fp = torch.randn(n, K, 3, generator=g, dtype=torch.float64)
-    fq = _rand_quat(n * K, g).reshape(n, K, 4)
-    fl, fa = torch.randn(n, K, 3, generator=g, dtype=torch.float64), torch.randn(n, K, 3, generator=g, dtype=torch.float64)
 
-    rel_t = tt.relative_state(pw, qw, vw, ww, jp, jv, p_ref, q_ref, fp, fq, fl, fa)
+    rel_t = tt.relative_state(pw, qw, vw, ww, jp, jv, p_ref, q_ref, fp)
     rel_np = tn.relative_state(np_(pw), np_(qw), np_(vw), np_(ww), np_(jp), np_(jv), np_(p_ref), np_(q_ref),
-                               np_(fp), np_(fq), np_(fl), np_(fa))
+                               np_(fp))
     _close("relative_state", rel_np, rel_t, atol=1e-9)
+    assert rel_t.shape[-1] == tn.target_state_dim(nj, K) == 2 * nj + 15 + 3 * K
 
     abs_t = tt.state_to_absolute(rel_t, p_ref, q_ref, nj, num_extra_frames=K)
     abs_np = tn.state_to_absolute(rel_np, np_(p_ref), np_(q_ref), nj, num_extra_frames=K)
-    for key in ("root_pos_w", "root_link_lin_vel_w", "frame_pos_w", "frame_lin_vel_w", "joint_pos"):
+    for key in ("root_pos_w", "root_link_lin_vel_w", "frame_pos_w", "joint_pos"):
         _close(f"state_to_absolute[{key}]", abs_np[key], abs_t[key], atol=1e-8)
     # quat fields compared as rotation
     _close("state_to_absolute[root_quat asR]",

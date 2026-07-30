@@ -13,6 +13,9 @@ from typing import Any
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 
+#: Recognised :attr:`FlowMatchingConfig.history_source` values.
+HISTORY_SOURCES: tuple[str, ...] = ("measured", "reference_partial")
+
 
 @dataclass
 class FlowMatchingConfig:
@@ -37,20 +40,57 @@ class FlowMatchingConfig:
     # Future window length F: the full denoised state sequence (node 0 = the current /
     # anchor step, ego-anchored onto the robot so its base offset ≈ 0; nodes 1..F-1 are
     # the future). The relative-frame anchor is the robot base at the most recent history
-    # step. F=40 = 0.8 s at dt=0.02, a multiple of cmd_stride (=5) -> 8 evenly-spaced
-    # command tokens. Raising F grows per-window memory; bump --stride / --num_workers if
-    # training OOMs.
+    # step.
     #
-    # TOO SHORT for the current teacher. The policy's reference window now reaches
-    # REFERENCE_NUM_STEPS=11 samples at stride 5 = step +50 = 1.0 s
-    # (g1_teacher_env_cfg.py), so a generator serving it needs F >= 51 plus the re-plan
-    # block. Bumping F requires RE-RECORDING (record_data.py cuts windows at this length)
-    # and retraining. Until then the FM tracker task cannot serve the teacher's
-    # observation at all -- see the two blocked accessors in fm_tracking_cmd.py.
-    future_len: int = 40
-    # N real-robot-state history (phase) conditioning tokens. Default 2: enough to read
-    # gait phase (the FM predicts nominal phase-dependent motion, not recovery).
+    # F is set by what the POLICY asks of one prediction. ``FmTrackingCommand`` re-plans
+    # every ``fm_update_every`` steps and walks a cursor one node per step in between, so a
+    # prediction must still cover the teacher's whole look-ahead window on the LAST step
+    # before the next re-plan:
+    #
+    #     F_min = (fm_update_every - 1) + (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
+    #           = (12 - 1)             + (11 - 1) * 5                                 + 1
+    #           = 62                                              # 1.24 s at dt = 0.02
+    #
+    # (``fm_update_every`` = the tracker's re-plan period and the recording's
+    # ``fm_snap_every``; ``REFERENCE_NUM_STEPS`` / ``REFERENCE_STRIDE`` are the teacher's
+    # reference-window knobs in ``g1_teacher_env_cfg.py``.)  65 rounds that up to a multiple
+    # of cmd_stride (=5) -> 13 evenly-spaced command tokens, with 3 steps of slack.
+    # ``FmTrackingCommand`` re-derives F_min from the offsets it is actually asked for and
+    # raises if the checkpoint is short, so this never degrades into a silent clamp.
+    #
+    # Raising F grows per-window memory and the recorded ``ref_future`` array; bump
+    # --stride / --num_workers if training OOMs.  It also requires RE-RECORDING
+    # (record_data.py cuts windows at this length) and retraining.
+    future_len: int = 65
+    # N history (phase) conditioning tokens. Default 2: enough to read gait phase (the FM
+    # predicts nominal phase-dependent motion, not recovery).
     num_history_states: int = 2
+
+    # What the history tokens are made of.
+    #
+    #   "measured"          -- the robot's ACTUAL state at each of the N steps. The default,
+    #                          and the paradigm that fixed the autoregressive z-drift: the
+    #                          generator is re-grounded in reality every re-plan.
+    #   "reference_partial" -- PARTIALLY AUTOREGRESSIVE. The root pose/twist still comes from
+    #                          the measured robot, but the joints and the extra-frame
+    #                          positions come from the reference that was actually APPLIED at
+    #                          those steps -- i.e. the generator's own recent output, closing
+    #                          the loop on the posture channels while the root stays honest.
+    #
+    # The frame is unchanged either way: everything is expressed relative to the measured
+    # robot base at the newest history row, which is also the anchor the prediction is lifted
+    # through, so node 0 still lands on the robot.
+    #
+    # Both are train-time choices over the SAME recording -- ``record_data.py`` stores the
+    # applied-reference history ring unconditionally -- so this is an A/B with no re-record.
+    # The runtime reads it off the CHECKPOINT, not the task config, so a partially
+    # autoregressive model cannot silently be fed a measured history.
+    #
+    # Caveat worth knowing before reading a bad result as a bug: with the root measured and
+    # the ee positions taken from the reference, the ee block sits relative to an anchor the
+    # reference has drifted from. Over the <= fm_update_every stale steps that drift is small,
+    # but it is not zero.
+    history_source: str = "measured"
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
@@ -161,22 +201,26 @@ class FlowMatchingConfig:
 
     # -- consistency / forward-kinematics regularization (finite-difference + FK) --
     # ``dt`` is the control step period (seconds), resolved from the recording meta at
-    # train time. ``vel_consistency_weight`` ties each frame's predicted velocity to the
-    # finite difference of its predicted pose; ``joint_vel_consistency_weight`` does the
-    # same for joints; ``accel_consistency_weight`` matches the finite difference of the
-    # predicted velocity to that of the data velocity. The FK terms tie the predicted
-    # end-effector pose/velocity to the forward kinematics (``fk_pose_weight``) and
-    # Jacobian (``fk_vel_weight``) of the predicted joints, using ``fk_model_path``
-    # (a MuJoCo MJCF). ``consistency_tau_min`` gates the acceleration + FK terms to
-    # samples with flow-time ``tau >= consistency_tau_min`` (where the predicted
-    # endpoint is a faithful estimate of the clean target); velocity/joint-velocity
-    # stay ungated. All weights default off.
+    # train time. ``vel_consistency_weight`` ties the predicted ROOT velocity to the
+    # finite difference of the predicted root pose; ``joint_vel_consistency_weight`` does
+    # the same for joints; ``accel_consistency_weight`` matches the finite difference of
+    # the predicted velocity to that of the data velocity. ``fk_pose_weight`` ties each
+    # predicted end-effector POSITION (base-relative) to the forward kinematics of the
+    # predicted joints, using ``fk_model_path`` (a MuJoCo MJCF) -- this is what stops the
+    # joints and the ee positions describing different postures.
+    # ``consistency_tau_min`` gates the acceleration + FK terms to samples with flow-time
+    # ``tau >= consistency_tau_min`` (where the predicted endpoint is a faithful estimate
+    # of the clean target); velocity/joint-velocity stay ungated.
+    #
+    # The frame terms cover the ROOT only and the FK residual is position-only, because
+    # the extra frames are position-only in the state vector (see ``transforms.py``). The
+    # ee-orientation FK residual and the ``J(q)·q̇`` term (the old ``fk_vel_weight``) went
+    # with those channels.
     dt: float = 0.02
     vel_consistency_weight: float = 0.01 #0.0
     accel_consistency_weight: float = 0.0
     joint_vel_consistency_weight: float = 0.01 #0.0
     fk_pose_weight: float = 0.01 #0.0
-    fk_vel_weight: float = 0.001 #0.0
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
 
@@ -222,6 +266,17 @@ class FlowMatchingConfig:
         if self.extero_source not in EXTERO_SOURCES:
             raise ValueError(
                 f"extero_source={self.extero_source!r} is not one of {list(EXTERO_SOURCES)}."
+            )
+
+    def check_history_source(self) -> None:
+        """Raise if :attr:`history_source` is not a recognised source.
+
+        Raises:
+            ValueError: On an unknown source name.
+        """
+        if self.history_source not in HISTORY_SOURCES:
+            raise ValueError(
+                f"history_source={self.history_source!r} is not one of {list(HISTORY_SOURCES)}."
             )
 
     def to_dict(self) -> dict[str, Any]:
