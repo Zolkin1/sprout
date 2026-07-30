@@ -56,10 +56,22 @@ _DEBUG_FRAME_COLOR_MAP: dict[str, tuple[float, float, float]] = {
     "right_wrist_yaw_link": (0.80, 0.30, 0.90),
 }
 _DEBUG_FRAME_FALLBACK_COLOR: tuple[float, float, float] = (0.6, 0.6, 0.6)
+
+# Tracked-body spheres: what the robot IS vs what it is REWARDED AGAINST.  Two spheres per
+# tracked body per env, so the reward's own error is visible as the gap between them.  The
+# reference here is the clip AFTER the per-step re-datum onto the robot, which is the whole
+# point -- against the global clip the pair would separate as the robot drifts even while
+# tracking perfectly.
+_DEBUG_ACTUAL_COLOR: tuple[float, float, float] = (0.15, 0.95, 0.35)      # green  = measured
+_DEBUG_REWARDED_COLOR: tuple[float, float, float] = (1.00, 0.15, 0.85)    # magenta = reference
+# The obs look-ahead ribbon: the base of the reference window the POLICY sees, which rides
+# the robot (anchored) and so separates from the global clip ribbon exactly by the drift.
+_DEBUG_OBS_WINDOW_COLOR: tuple[float, float, float] = (1.00, 0.95, 0.20)  # yellow
 # Frame-name substrings treated as "hand" end-effectors (filtered out of the
 # debug ribbon unless cfg.debug_vis_show_hands is True).
 _DEBUG_HAND_FRAME_KEYS: tuple[str, ...] = ("wrist", "hand")
 _DEBUG_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_ref"
+_DEBUG_BODY_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_bodies"
 _DEBUG_VIZ_EPS: float = 1e-6  # guard against zero-length segments / degenerate axes
 
 
@@ -71,6 +83,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     # Lazily built once the simulator is up (CommandTerm may call
     # ``_set_debug_vis_impl`` before ``_post_init``).  See the debug-vis block.
     _debug_markers: object | None = None
+    _debug_body_markers: object | None = None
     _debug_vis_pending: bool = False
 
     # ------------------------------------------------------------------
@@ -1000,24 +1013,39 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     # ------------------------------------------------------------------
 
     def _set_debug_vis_impl(self, debug_vis: bool) -> None:
-        """Toggle the reference-trajectory marker visualizer.
+        """Toggle the reference-trajectory marker visualizers.
 
-        Draws, per env, a forward window of each reference frame's world
-        position as colored cylinder segments -- a "ribbon" of where the clip
-        says each body should go (matching the online command's marker style).
-        Per-step update is in :meth:`_debug_vis_callback`.
+        Four things are drawn, and the point is the RELATIVE motion between them -- each
+        pair isolates one frame the system uses:
+
+        * **Clip ribbon** (per-frame colours) -- the clip at its GLOBAL placement, welded to
+          the terrain cell. Where the motion was authored.
+        * **Obs-window ribbon** (yellow) -- the base of the reference window the POLICY
+          sees, which is anchored and therefore rides the robot. Its separation from the
+          clip ribbon IS the accumulated drift: forgiven by the reward, fired on by the
+          termination.
+        * **Body spheres** -- measured (green) vs the reference the reward grades against
+          (magenta). The gap in each pair is the reward's per-body error.
+
+        So: green-vs-magenta = what the reward sees; yellow-vs-clip = what the termination
+        sees. Per-step update is in :meth:`_debug_vis_callback`.
         """
         if debug_vis:
             if self._debug_markers is None and hasattr(self, "_debug_frame_pos_idx"):
                 self._debug_markers = self._create_debug_markers()
+            if self._debug_body_markers is None and self.cfg.debug_vis_body_spheres:
+                self._debug_body_markers = self._create_debug_body_markers()
             if self._debug_markers is not None:
                 self._debug_markers.set_visibility(True)
             else:
                 self._debug_vis_pending = True
+            if self._debug_body_markers is not None:
+                self._debug_body_markers.set_visibility(True)
         else:
             self._debug_vis_pending = False
-            if self._debug_markers is not None:
-                self._debug_markers.set_visibility(False)
+            for m in (self._debug_markers, self._debug_body_markers):
+                if m is not None:
+                    m.set_visibility(False)
 
     def _create_debug_markers(self):
         """Build a :class:`VisualizationMarkers` with one cylinder prototype per frame.
@@ -1043,12 +1071,89 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             )
             for name, color in zip(self._debug_frame_names, self._debug_frame_colors)
         }
+        # Extra prototype, always last, for the policy's observed reference-window base.
+        prototypes["obs_window_base"] = sim_utils.CylinderCfg(
+            radius=radius * 1.5,
+            height=1.0,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=_DEBUG_OBS_WINDOW_COLOR),
+        )
         cfg = VisualizationMarkersCfg(prim_path=_DEBUG_VIZ_PRIM_PATH, markers=prototypes)
         try:
             return VisualizationMarkers(cfg)
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not create VisualizationMarkers: {exc}")
             return None
+
+    def _create_debug_body_markers(self):
+        """Build the tracked-body sphere markers: prototype 0 = measured, 1 = reference."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN MotionSequenceCommand] could not import VisualizationMarkers: {exc}")
+            return None
+        r = float(self.cfg.debug_vis_body_sphere_radius)
+        prototypes = {
+            name: sim_utils.SphereCfg(
+                radius=r,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+            )
+            for name, color in (("actual", _DEBUG_ACTUAL_COLOR), ("rewarded", _DEBUG_REWARDED_COLOR))
+        }
+        cfg = VisualizationMarkersCfg(prim_path=_DEBUG_BODY_VIZ_PRIM_PATH, markers=prototypes)
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not create body markers: {exc}")
+            return None
+
+    def _tracked_body_pos_idx(self) -> torch.Tensor | None:
+        """``[B, 3]`` ``y_des``/``y_act`` column indices of every TRACKED frame's position.
+
+        Derived from ``tracked_vel_names`` rather than a restated body list, so the spheres
+        follow ``tracking_mode`` automatically: joint mode shows the world skeleton, body
+        mode the 13 links.  Cached.
+        """
+        cached = getattr(self, "_tb_idx", "unset")
+        if cached != "unset":
+            return cached
+        frames: list[str] = []
+        for n in self.tracked_vel_names:
+            if ":pos_" not in n:
+                continue
+            f = n.split(":", 1)[0]
+            if f not in frames:
+                frames.append(f)
+        pos_names = self.ordered_pos_output_names
+        self._tb_idx = (
+            torch.tensor([[pos_names.index(f"{f}:pos_{a}") for a in "xyz"] for f in frames],
+                         dtype=torch.long, device=self.device)
+            if frames else None
+        )
+        return self._tb_idx
+
+    def _obs_window_offsets(self) -> torch.Tensor | None:
+        """Step offsets of the ``reference_window`` observation, read from the obs manager.
+
+        Read from the live term rather than restated in this cfg, so the drawn ribbon cannot
+        drift from the window the policy is actually fed.  ``None`` if no such term exists.
+        """
+        cached = getattr(self, "_obs_win_offsets", "unset")
+        if cached != "unset":
+            return cached
+        self._obs_win_offsets = None
+        try:
+            om = self.env.observation_manager
+            for group, terms in om.active_terms.items():
+                if "reference_window" in terms:
+                    p = om._group_obs_term_cfgs[group][list(terms).index("reference_window")].params
+                    ns = max(1, int(p.get("num_steps", 11)))
+                    st = max(1, int(p.get("stride", 5)))
+                    self._obs_win_offsets = torch.arange(ns, device=self.device, dtype=torch.long) * st
+                    break
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not read reference_window params: {exc}")
+        return self._obs_win_offsets
 
     def _clip_ribbon_env_mask(self) -> torch.Tensor | None:
         """Per-env bool mask of which envs draw the clip ribbon (``None`` => all).
@@ -1108,7 +1213,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # with the approach, which is what made the reference look detached from the stairs / box).
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
         rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3] clip-world
-        wpos, wquat = self._window_placement(cid, steps, env_ids=env_ids)                 # [n, Ns, .]
+        # GLOBAL placement (the reset-time terrain-cell anchor), NOT the anchored one. Under
+        # per-step anchoring the anchored ribbon sits on the robot by construction and shows
+        # nothing; the global ribbon is where the motion was authored, so the gap to the
+        # yellow obs-window ribbon below reads as the accumulated drift.
+        sl = slice(None) if env_ids is None else env_ids
+        gpos = self._reset_world_pos[sl][:, None, :].expand(n, ns, 3)
+        gyaw = self._reset_world_yaw[sl]
+        gquat = quat_from_angle_axis(
+            gyaw, self._world_z.expand(gyaw.shape[0], 3)
+        )[:, None, :].expand(n, ns, 4)
+        wpos, wquat = gpos, gquat
         # One placement per (frame), shared by that frame's F reference bodies.
         wpos_f = wpos.unsqueeze(2).expand(n, ns, F, 3).reshape(n, ns * F, 3)
         wquat_f = wquat.unsqueeze(2).expand(n, ns, F, 4).reshape(n, ns * F, 4)
@@ -1142,10 +1257,77 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             torch.arange(F, device=self.device, dtype=torch.long)
             .view(1, 1, F).expand(n, ns - 1, F).reshape(-1)
         )
+        centers, quats = centers.reshape(-1, 3), quats
+        scales, marker_indices = scales.reshape(-1, 3), marker_indices
+
+        # The policy's observed reference-window base, as a second ribbon. Anchored, so it
+        # rides the robot; its offset from the global clip ribbon is the drift.
+        obs_off = self._obs_window_offsets() if self.cfg.debug_vis_obs_window else None
+        if obs_off is not None and obs_off.numel() >= 2:
+            opos, _, _, _ = self.get_future_world_base(obs_off)                     # [N, K, 3]
+            if env_ids is not None:
+                opos = opos[env_ids]
+            oc, oq, os_, oi = self._ribbon_segments(opos, F)                        # prototype F
+            centers = torch.cat([centers, oc], dim=0)
+            quats = torch.cat([quats, oq], dim=0)
+            scales = torch.cat([scales, os_], dim=0)
+            marker_indices = torch.cat([marker_indices, oi], dim=0)
 
         self._debug_markers.visualize(
-            translations=centers.reshape(-1, 3),
+            translations=centers,
             orientations=quats,
-            scales=scales.reshape(-1, 3),
+            scales=scales,
             marker_indices=marker_indices,
         )
+        self._draw_body_spheres(env_ids)
+
+    def _ribbon_segments(self, pts: torch.Tensor, proto: int):
+        """Cylinder segments joining consecutive points of a ``[n, K, 3]`` polyline.
+
+        Args:
+            pts: ``[n, K, 3]`` world points, one polyline per env.
+            proto: Marker prototype index to tag every segment with.
+
+        Returns:
+            ``(centers, quats, scales, indices)`` flattened over ``n * (K - 1)``.
+        """
+        starts, ends = pts[:, :-1], pts[:, 1:]
+        centers = 0.5 * (starts + ends)
+        vecs = ends - starts
+        lens = torch.linalg.norm(vecs, dim=-1).clamp(min=_DEBUG_VIZ_EPS)
+        dirs = vecs / lens.unsqueeze(-1)
+        angle = torch.acos(dirs[..., 2].clamp(-1.0, 1.0))
+        axis = torch.stack([-dirs[..., 1], dirs[..., 0], torch.zeros_like(dirs[..., 0])], dim=-1)
+        norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
+        axis = torch.where(norm > _DEBUG_VIZ_EPS,
+                           axis, torch.tensor([1.0, 0.0, 0.0], device=self.device).expand_as(axis))
+        quats = quat_from_angle_axis(angle.reshape(-1), axis.reshape(-1, 3))
+        scales = torch.ones_like(dirs)
+        scales[..., 2] = lens
+        idx = torch.full((centers.shape[0] * centers.shape[1],), proto,
+                         dtype=torch.long, device=self.device)
+        return centers.reshape(-1, 3), quats, scales.reshape(-1, 3), idx
+
+    def _draw_body_spheres(self, env_ids: torch.Tensor | None) -> None:
+        """Spheres at each tracked body: measured (green) vs the rewarded reference (magenta).
+
+        Both are read straight out of ``y_act`` / ``y_des``, i.e. the exact tensors the CLF
+        differences -- so the visualisation cannot disagree with the reward, and it follows
+        ``tracking_mode`` without restating a body list.
+        """
+        if self._debug_body_markers is None or not self.cfg.debug_vis_body_spheres:
+            return
+        idx = self._tracked_body_pos_idx()
+        if idx is None:
+            return
+        flat = idx.reshape(-1)
+        sl = slice(None) if env_ids is None else env_ids
+        act = self.y_act[sl][:, flat].reshape(-1, idx.shape[0], 3)      # [n, B, 3]
+        des = self.y_des[sl][:, flat].reshape(-1, idx.shape[0], 3)
+        n, b = act.shape[0], act.shape[1]
+        pts = torch.cat([act.reshape(-1, 3), des.reshape(-1, 3)], dim=0)
+        proto = torch.cat([
+            torch.zeros(n * b, dtype=torch.long, device=self.device),
+            torch.ones(n * b, dtype=torch.long, device=self.device),
+        ])
+        self._debug_body_markers.visualize(translations=pts, marker_indices=proto)

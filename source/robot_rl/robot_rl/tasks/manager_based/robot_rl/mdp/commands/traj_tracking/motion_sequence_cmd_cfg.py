@@ -106,6 +106,24 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     segments (thin = line-like, matching the online command's marker style)."""
 
     debug_vis_show_hands: bool = False
+
+    debug_vis_body_spheres: bool = True
+    """Draw a sphere pair per TRACKED body: measured (green) vs the reference the reward
+    grades against (magenta), i.e. the clip after the per-step re-datum onto the robot.
+
+    The gap between each pair IS the reward's per-body error, so this is the direct read on
+    whether body-link tracking is working.  Follows ``tracking_mode`` automatically -- it
+    reads the tracked channels out of ``y_act``/``y_des`` rather than restating a body list."""
+
+    debug_vis_body_sphere_radius: float = 0.03
+    """Radius (m) of the tracked-body spheres."""
+
+    debug_vis_obs_window: bool = True
+    """Draw a ribbon along the base of the reference window the POLICY observes.
+
+    Distinct from the clip ribbon, which is drawn at the clip's GLOBAL placement: this one
+    is anchored, so it rides the robot.  The separation between the two ribbons is exactly
+    the accumulated drift -- the thing the reward forgives and the termination fires on."""
     """Whether to draw the hand/wrist end-effector frames in the debug ribbon.
     Off by default (pelvis + feet are usually what matters); set True to also
     visualize the wrist trajectories."""
