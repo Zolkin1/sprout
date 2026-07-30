@@ -165,10 +165,21 @@ WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
 # Root-frame body-link weights (``tracking_mode="body"``)
 ##
 
-# Defaults mirror the world end-effector weights above -- position and orientation treated
-# alike, modest control weight.  Deliberately uniform: the point of the joint-vs-body A/B is
-# the parameterization, so starting with a hand-tuned per-link profile would confound it.
-_ROOT_Q_DEFAULT = [1.0, 1.0]
+# ``[q_pose, q_twist]`` per channel: for a ``pos_`` channel that is (position, linear
+# velocity); for an ``ori_`` channel it is (orientation, angular velocity).
+#
+# Deliberately uniform ACROSS LINKS -- the point of the joint-vs-body A/B is the
+# parameterization, so a hand-tuned per-link profile would confound it.  But pose and twist
+# are NOT treated alike: measured on a rollout with the twist weight at 1.0, the unweighted
+# error energy split was
+#
+#     root_body_ang_vel 150.97 | root_body_lin_vel 10.51 | root_body_ori 5.38 | root_body_pos 0.30
+#
+# i.e. link angular velocity outweighed link POSITION by ~500x, so "body-link tracking"
+# was in practice "match the links' angular velocities".  Velocities are inherently larger
+# and noisier than the positions they differentiate, so the twist weight is 0.1 -- a 10x
+# cut -- to put pose back in charge of the reward.
+_ROOT_Q_DEFAULT = [1.0, 0.1]
 _ROOT_R_DEFAULT = [0.05]
 
 
