@@ -357,9 +357,10 @@ class G1TeacherTerminationCfg:
     clip_end = DoneTerm(
         func=mdp.clip_end_reached, params={"command_name": "traj_ref"}, time_out=True
     )
+    # The positional radii are being swept; the 0.8 rad bounds are unchanged.
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.25, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.4, "max_ori_rad": 0.8},
     )
     ee_pose_error = DoneTerm(
         func=mdp.tracked_frame_error_termination,
@@ -367,7 +368,7 @@ class G1TeacherTerminationCfg:
             "command_name": "traj_ref",
             "frame_names": ("left_ankle_roll_link", "right_ankle_roll_link",
                             "left_wrist_yaw_link", "right_wrist_yaw_link"),
-            "max_pos_dist": 0.25,
+            "max_pos_dist": 0.4,
             "max_ori_rad": 0.8,
         },
     )
