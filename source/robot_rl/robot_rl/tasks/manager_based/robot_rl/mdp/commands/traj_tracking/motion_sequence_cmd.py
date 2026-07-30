@@ -29,6 +29,7 @@ import warp as wp
 from isaaclab.utils.math import quat_from_angle_axis
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
+from motion_gen.joint_names import is_root_frame
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
@@ -234,8 +235,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._record_clip_fingerprint(self.cfg)
 
         # --- Debug-viz setup (per reference frame: pos indices + color) ---
+        # WORLD frames only -- the ribbon draws world-space polylines, and a root-frame
+        # channel would be drawn as if it were a world position (a blob at the origin).
         self._debug_frame_names = [
-            n[: -len(":pos_x")] for n in self.ordered_pos_output_names if n.endswith(":pos_x")
+            n[: -len(":pos_x")] for n in self.ordered_pos_output_names
+            if n.endswith(":pos_x") and not is_root_frame(n)
         ]
         # Optionally drop hand/wrist end-effector frames from the ribbon.
         if not self.cfg.debug_vis_show_hands:
@@ -819,17 +823,26 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         output frame that exposes a position, except the base frame, sorted
         alphabetically (matching the obs default).
 
+        Root-frame (``@root``) frames are excluded: this is the WORLD end-effector
+        set.  Keeping it stable as the clip layout widened is load-bearing -- it
+        sizes the ``ee_ref`` observation, drives ``_build_world_frame_maps`` (so a
+        root-frame body would otherwise be pointlessly lifted through the placement
+        every step), and is what :class:`FmTrackingCommand` checks an FM checkpoint's
+        ``frame_names`` against, so growing it would invalidate every existing
+        checkpoint.
+
         Args:
             frame_names: Explicit frame list, or ``None`` for the default.
 
         Returns:
-            Ordered end-effector frame names.
+            Ordered world end-effector frame names.
         """
         if frame_names is not None:
             return list(frame_names)
         base = self.cfg.base_frame_name
         return sorted(
-            {n.split(":", 1)[0] for n in self.ordered_pos_output_names if ":pos_" in n} - {base}
+            {n.split(":", 1)[0] for n in self.ordered_pos_output_names
+             if ":pos_" in n and not is_root_frame(n)} - {base}
         )
 
     def get_symmetric_ee(

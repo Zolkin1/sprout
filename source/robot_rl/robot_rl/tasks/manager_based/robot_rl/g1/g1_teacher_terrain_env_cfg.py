@@ -129,3 +129,34 @@ class G1TeacherTerrainEnvCfgPlay(G1TeacherTerrainEnvCfg):
         # Draw the reference-trajectory markers + the height-scan ray hits.
         self.commands.traj_ref.debug_vis = True
         self.scene.height_scanner.debug_vis = True
+
+
+@configclass
+class G1TeacherTerrainBodyEnvCfg(G1TeacherTerrainEnvCfg):
+    """Body-link tracking variant: root-frame body links instead of joint angles.
+
+    The DeepMimic / Sonic style parameterization.  Identical to
+    :class:`G1TeacherTerrainEnvCfg` except that the CLF grades -- and the policy observes --
+    each tracked link's pose and twist in the pelvis frame rather than the reference joint
+    angles.  The world-frame skeleton (``pelvis_link`` + the four end-effectors) is tracked in
+    both modes, so global foot placement stays penalised against the terrain.
+
+    Requires a clip library carrying root-frame channels; widen an existing one with
+    ``scripts/rsl_rl/backfill_root_frames.py``.  Both modes read the SAME library, which is
+    what makes the A/B a controlled comparison.
+    """
+
+    def __post_init__(self):
+        # Set BEFORE super(): G1TeacherEnvCfg.__post_init__ reads this to swap the reference
+        # observation terms, and the command reads it to build the CLF channel subset.
+        self.commands.traj_ref.tracking_mode = "body"
+        super().__post_init__()
+
+
+@configclass
+class G1TeacherTerrainBodyEnvCfgPlay(G1TeacherTerrainEnvCfgPlay):
+    """Play / debug variant of :class:`G1TeacherTerrainBodyEnvCfg`."""
+
+    def __post_init__(self):
+        self.commands.traj_ref.tracking_mode = "body"
+        super().__post_init__()

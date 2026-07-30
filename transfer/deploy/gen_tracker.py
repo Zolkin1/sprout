@@ -588,6 +588,12 @@ class GenTrackerPolicy:
         }
         if base_vel_ref is not None:
             values["base_vel_ref"] = base_vel_ref
+        # Root-frame body-link targets (tracker trained with tracking_mode="body").  These
+        # are pelvis-relative already, so they pass through untransformed.  Only a clip
+        # reference supplies them today -- see the guard in _assemble for the FM case.
+        if "body_pos_root" in cur:
+            values["body_pos_ref"] = f64(cur["body_pos_root"])
+            values["body_vel_ref"] = f64(cur["body_vel_root"])
         # Height-scan obs term (only if the tracker was trained with it). The runner puts
         # the per-ray clearance in state["height_scan"]; _assemble clips it via _TERM_CLIP.
         if "height_scan" in state:
@@ -606,6 +612,15 @@ class GenTrackerPolicy:
         for term in self._trk.get_obs_terms():
             name, shape, scale = term["name"], term["shape"], term["scale"]
             if name not in values:
+                if name in ("body_pos_ref", "body_vel_ref"):
+                    raise NotImplementedError(
+                        f"Obs term '{name}': this tracker was trained with "
+                        "tracking_mode='body', so its reference must carry root-frame body "
+                        "targets. Clip playback supplies them (ClipReference with "
+                        "root_frame_bodies set); the FM path does NOT yet -- the generator "
+                        "predicts joint angles, and turning those into root-frame link poses "
+                        "needs a torch-free FK, which is not implemented here."
+                    )
                 raise NotImplementedError(
                     f"Generator-tracker obs term '{name}' not implemented (a depth term "
                     "means the caller supplied no state['depth'] rows)."

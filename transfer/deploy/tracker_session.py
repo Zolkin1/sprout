@@ -155,6 +155,15 @@ class TrackerSession:
         names = self.params.get("ee_frame_names")
         return list(names) if names is not None else None
 
+    def get_root_frame_bodies(self) -> list[str]:
+        """Body links tracked in the ROOT frame, in ``body_*_ref`` stacking order.
+
+        Empty for a tracker trained with ``tracking_mode="joint"`` (the default) and for any
+        export predating the metadata key.  Non-empty means the reference source must supply
+        root-frame body targets -- see ``transfer/sim/clip_reference.py``.
+        """
+        return list(self.params.get("root_frame_bodies") or [])
+
     def get_joint_out_names(self) -> list[str] | None:
         """CLF output joint order, if exported (else None -> caller falls back)."""
         if "joint_out_names" in self.params:

@@ -49,6 +49,36 @@ if not _registered:
         },
     )
 
+    ## =========================================
+    # Body-link tracking variant (DeepMimic / Sonic style).  Same env as above, but the CLF
+    # grades -- and the policy observes -- each tracked link's pose + twist in the PELVIS
+    # frame instead of the reference joint angles.  The world-frame skeleton (pelvis + the
+    # four end-effectors) is tracked in both, so global foot placement stays penalised.
+    #
+    # Needs a clip library carrying root-frame channels; widen one with
+    # ``scripts/rsl_rl/backfill_root_frames.py``.  Point BOTH tasks at the SAME widened
+    # library to keep the joint-vs-body comparison controlled.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain-body",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainBodyEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-terrain-body-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_teacher_terrain_env_cfg:G1TeacherTerrainBodyEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     # Symmetry-augmented variant (sagittal-plane data augmentation).  The clips are full
     # episodic motions with no gait-phase obs, so the Episodic runner is the correct
     # choice (phase negation would be a no-op here).

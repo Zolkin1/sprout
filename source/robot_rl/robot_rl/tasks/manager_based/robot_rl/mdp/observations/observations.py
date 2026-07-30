@@ -91,6 +91,64 @@ def joint_vel_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
     return cmd.dy_des[:, idx].clone()
 
 
+def _root_frame_indices(cmd, names: list[str], kinds: tuple[str, ...]) -> list[int]:
+    """Channel indices of the root-frame body block, body-major then ``kinds`` order.
+
+    Args:
+        cmd: The trajectory command (supplies ``root_body_frames``).
+        names: ``ordered_pos_output_names`` or ``ordered_vel_output_names``.
+        kinds: Channel suffixes per body, e.g. ``("pos_x", ..., "ori_w")``.
+
+    Returns:
+        Indices into ``names``.
+
+    Raises:
+        ValueError: If the command tracks no root-frame bodies.
+    """
+    frames = getattr(cmd, "root_body_frames", None)
+    if not frames:
+        raise ValueError(
+            "body_*_ref_root observations need a clip library carrying root-frame body "
+            "channels; widen it with scripts/rsl_rl/backfill_root_frames.py."
+        )
+    return [names.index(f"{f}:{k}") for f in frames for k in kinds]
+
+
+def body_pos_ref_root(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference body-link poses in the reference ROOT frame (``[N, 7 * B]``).
+
+    The DeepMimic / Sonic style target: each tracked link's position + orientation expressed
+    in the pelvis frame, straight off the stored ``<body>@root:*`` channels.  Already
+    heading-invariant and free of world coordinates, so no transform is needed here and the
+    observation is deployable as-is.
+
+    Laid out body-major as ``[pos_xyz, ori_wxyz]`` per body, in ``cmd.root_body_frames``
+    order.  Replaces :func:`joint_pos_ref` under ``tracking_mode="body"``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    idx = _root_frame_indices(
+        cmd, cmd.ordered_pos_output_names,
+        ("pos_x", "pos_y", "pos_z", "ori_w", "ori_x", "ori_y", "ori_z"),
+    )
+    return cmd.y_des[:, idx].clone()
+
+
+def body_vel_ref_root(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Reference body-link twists in the reference ROOT frame (``[N, 6 * B]``).
+
+    The velocity counterpart of :func:`body_pos_ref_root`: each tracked link's linear and
+    angular velocity relative to the pelvis, expressed in the pelvis frame.  Laid out
+    body-major as ``[lin_xyz, ang_xyz]``.  Replaces :func:`joint_vel_ref` under
+    ``tracking_mode="body"``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    idx = _root_frame_indices(
+        cmd, cmd.ordered_vel_output_names,
+        ("pos_x", "pos_y", "pos_z", "ori_x", "ori_y", "ori_z"),
+    )
+    return cmd.dy_des[:, idx].clone()
+
+
 def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
     """Reference base linear+angular velocity rotated into the current base frame.
 

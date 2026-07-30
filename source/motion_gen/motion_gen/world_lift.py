@@ -26,6 +26,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from motion_gen.joint_names import world_frame_names
 from motion_gen.math_utils import quat_apply, quat_inv, quat_mul, yaw_quat
 
 
@@ -525,11 +526,12 @@ def bake_outputs_to_world(
     runtime/placement applies (:func:`lift_position` / :func:`lift_orientation`
     / :func:`lift_vector`).
 
-    Per output frame ``f``: position channels (``{f}:pos_{x,y,z}``) are
+    Per WORLD output frame ``f``: position channels (``{f}:pos_{x,y,z}``) are
     translated+rotated, orientation channels (``{f}:ori_{x,y,z,w}``, xyzw) are
     quat-composed, and velocity channels (linear ``{f}:pos_*`` and angular
     ``{f}:ori_*`` in ``vel_output_names``) are rotated only.  ``joint:*``
-    channels are frame-invariant and pass through untouched.
+    channels and root-frame (``@root``) channels are frame-invariant and pass
+    through untouched.
 
     Args:
         y_des: ``[n, T, P]`` anchor-relative position outputs (mutated in place).
@@ -554,8 +556,13 @@ def bake_outputs_to_world(
             [names.index(f"{frame}:{kind}_{a}") for a in comps], dtype=torch.long, device=dev
         )
 
+    # WORLD frames only: ``@root`` channels are pelvis-relative, so lifting them through the
+    # anchor would corrupt the pose.
+    world_pos = set(world_frame_names(pos_output_names))
+    world_vel = set(world_frame_names(vel_output_names))
+
     # Position blocks (translate + rotate), plus orientation where present.
-    for f in sorted({nm.split(":", 1)[0] for nm in pos_output_names if ":pos_" in nm}):
+    for f in sorted(f for f in world_pos if f"{f}:pos_x" in pos_output_names):
         pos_i = _idx(pos_output_names, f, ("x", "y", "z"), "pos")
         yf[:, pos_i] = lift_position(ap, aq, yf[:, pos_i])
         if f"{f}:ori_w" in pos_output_names:
@@ -563,10 +570,10 @@ def bake_outputs_to_world(
             yf[:, ori_i] = lift_orientation(aq, yf[:, ori_i])
 
     # Velocity blocks (rotate only): linear (pos_*) and angular (ori_*).
-    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":pos_" in nm}):
+    for f in sorted(f for f in world_vel if f"{f}:pos_x" in vel_output_names):
         lin_i = _idx(vel_output_names, f, ("x", "y", "z"), "pos")
         dyf[:, lin_i] = lift_vector(aq, dyf[:, lin_i])
-    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":ori_" in nm}):
+    for f in sorted(f for f in world_vel if f"{f}:ori_x" in vel_output_names):
         ang_i = _idx(vel_output_names, f, ("x", "y", "z"), "ori")
         dyf[:, ang_i] = lift_vector(aq, dyf[:, ang_i])
 

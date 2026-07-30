@@ -26,6 +26,7 @@ from isaaclab.utils.math import (
 )
 
 from .clf import CLF
+from motion_gen.joint_names import ROOT_FRAME_MARKER, is_root_frame, strip_root_marker
 from motion_gen.manager_base import ManagerBase
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from motion_gen.manager_base import TrajectoryType
@@ -173,7 +174,16 @@ class BaseTrajectoryCommand(CommandTerm):
         result = self._parse_outputs(self.manager.get_pos_output_names)
         (self.joint_idx, self.body_idx, self.use_com,
          self.ordered_pos_output_names, self.ordered_vel_output_names,
-         self.body_type) = result
+         self.body_type, self.root_body_idx, self.root_body_frames) = result
+
+        # Articulation index of the frame the root-frame channels are expressed in.  Read from
+        # ``body_pos_w`` / ``body_link_vel_w`` rather than ``root_pos_w`` / ``root_lin_vel_w`` so
+        # the base and the tracked bodies come from the SAME arrays -- ``root_*_vel_w`` is a
+        # centre-of-mass quantity in Isaac Lab, which would put a lever-arm error into the
+        # relative velocity.
+        self._root_base_body_idx = self.robot.body_names.index(
+            getattr(self.cfg, "base_frame_name", "pelvis_link")
+        )
 
         # --- State tensors ------------------------------------------------
         self.y_act = torch.zeros((self.num_envs, len(self.ordered_pos_output_names)), device=self.device)
@@ -226,6 +236,7 @@ class BaseTrajectoryCommand(CommandTerm):
         self.cur_ref_frame_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # --- CLF ----------------------------------------------------------
+        self.tracked_vel_names = self._resolve_tracked_vel_names()
         self.clf = CLF(
             sim_dt=self.env.cfg.sim.dt,
             batch_size=self.num_envs,
@@ -233,6 +244,7 @@ class BaseTrajectoryCommand(CommandTerm):
             ordered_pos_output_names=self.ordered_pos_output_names,
             Q_weights=self.cfg.Q_weights,
             R_weights=self.cfg.R_weights,
+            tracked_vel_names=self.tracked_vel_names,
             device=self.device,
         )
 
@@ -359,6 +371,50 @@ class BaseTrajectoryCommand(CommandTerm):
                 body_ang_vel_local[:, ori_bodies, :].flatten(1))
             pos_output_idx += (4 * num_ori_bodies.item())
             vel_output_idx += (3 * num_ori_bodies.item())
+
+        # --- Root-frame bodies ---
+        # The DeepMimic / Sonic parameterization: each link's pose and twist relative to the
+        # robot's own root, expressed in the root frame.  Note this uses the FULL inverse root
+        # rotation, not the yaw-only ``_align_yaw_batched`` the world block above uses -- so the
+        # result is exactly FK(q) and pelvis roll/pitch error is charged only to the pelvis
+        # channels instead of being smeared across every body.
+        if self.root_body_idx is not None:
+            body_pos_w = wp.to_torch(self.robot.data.body_pos_w)
+            body_quat_w = wp.to_torch(self.robot.data.body_quat_w)
+            body_vel_w = wp.to_torch(self.robot.data.body_link_vel_w)
+
+            b = self._root_base_body_idx
+            base_pos_w = body_pos_w[:, b, :]                      # [N, 3]
+            base_quat_w = body_quat_w[:, b, :]                    # [N, 4] xyzw
+            base_lin_w = body_vel_w[:, b, :3]                     # [N, 3]
+            base_ang_w = body_vel_w[:, b, 3:]                     # [N, 3]
+            inv_base = quat_inv(base_quat_w)
+
+            p_w = body_pos_w[:, self.root_body_idx, :]            # [N, B, 3]
+            q_w = body_quat_w[:, self.root_body_idx, :]           # [N, B, 4]
+            v_w = body_vel_w[:, self.root_body_idx, :3]
+            w_w = body_vel_w[:, self.root_body_idx, 3:]
+
+            p_r = _rotate_by_inv_batched(p_w - base_pos_w.unsqueeze(1), base_quat_w)
+            q_r = _quat_mul_inv_batched(q_w, base_quat_w)
+            w_r = _rotate_by_inv_batched(w_w - base_ang_w.unsqueeze(1), base_quat_w)
+            # d/dt (R^T (p - p0)) = R^T (v - v0) - omega_base x p_r, with omega_base expressed in
+            # the base frame.  The cross term is what makes this the true derivative of ``p_r``
+            # (and what makes it match the generator's ``jv @ qdot``).
+            base_ang_b = quat_apply(inv_base, base_ang_w)         # [N, 3]
+            v_r = (_rotate_by_inv_batched(v_w - base_lin_w.unsqueeze(1), base_quat_w)
+                   - torch.linalg.cross(base_ang_b.unsqueeze(1).expand_as(p_r), p_r))
+
+            nb = len(self.root_body_idx)
+            self.y_act[:, pos_output_idx:pos_output_idx + 3 * nb] = p_r.flatten(1)
+            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = v_r.flatten(1)
+            pos_output_idx += 3 * nb
+            vel_output_idx += 3 * nb
+
+            self.y_act[:, pos_output_idx:pos_output_idx + 4 * nb] = q_r.flatten(1)
+            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = w_r.flatten(1)
+            pos_output_idx += 4 * nb
+            vel_output_idx += 3 * nb
 
         # --- Joints ---
         if self.joint_idx is not None:
@@ -569,9 +625,22 @@ class BaseTrajectoryCommand(CommandTerm):
         self.manager.invalidate_cache()
 
     def _update_metrics(self):
-        """Log tracking errors and CLF values."""
+        """Log CLF values, the per-subgroup error split, and (optionally) every channel.
+
+        The per-channel breakdown is one ``abs()`` tensor per channel per step -- 123 of them
+        for the world+joint layout and 292 once root-frame body channels are added.  That is
+        a lot of logging traffic for something only useful when debugging a specific channel,
+        so it is gated behind ``cfg.log_per_channel_metrics``.  The per-subgroup CLF energies
+        are always logged and are what you normally want.
+        """
         self.metrics["v"] = self.v
         self.metrics["vdot"] = self.vdot
+
+        for name, value in self.clf.v_subgroups.items():
+            self.metrics[f"v_{name}"] = value
+
+        if not getattr(self.cfg, "log_per_channel_metrics", False):
+            return
 
         for i, output in enumerate(self.ordered_pos_output_names):
             self.metrics[output] = torch.abs(self.y_des[:, i] - self.y_act[:, i])
@@ -613,20 +682,30 @@ class BaseTrajectoryCommand(CommandTerm):
 
     def _parse_outputs(
         self, pos_output_names: list[str]
-    ) -> tuple[list[int] | None, list[int] | None, bool, list[str], list[str], list[int]]:
+    ) -> tuple[list[int] | None, list[int] | None, bool, list[str], list[str], list[int],
+               list[int] | None, list[str]]:
         """Parse output names into robot-data indices and ordered name lists.
+
+        Frames carrying the ``@root`` marker (see
+        :data:`~motion_gen.joint_names.ROOT_FRAME_MARKER`) are collected into a SEPARATE
+        group: their channels hold the body pose expressed in the robot's own root (pelvis)
+        frame rather than the world/clip frame, so :meth:`compute_measured_output` fills them
+        with a different transform.  The underlying body is resolved by stripping the marker.
 
         Args:
             pos_output_names: Position output names (the superset including ``ori_w``).
 
         Returns:
-            ``(joint_idx, body_idx, use_com, ordered_pos_names, ordered_vel_names, body_type_list)``
+            ``(joint_idx, body_idx, use_com, ordered_pos_names, ordered_vel_names,
+            body_type_list, root_body_idx, root_body_names)``
         """
         output_names = pos_output_names
         joint_indices: list[int] = []
         joint_names_list: list[str] = []
         body_indices: list[int] = []
         body_names_list: list[str] = []
+        root_indices: list[int] = []
+        root_names_list: list[str] = []          # marked names, e.g. "left_knee_link@root"
         use_com = False
         com_axes: list[str] = []
         body_type: dict[str, list[str]] = {}
@@ -657,15 +736,33 @@ class BaseTrajectoryCommand(CommandTerm):
 
                 if frame_name in added_bodies:
                     continue
-                if frame_name in self.robot.body_names:
-                    body_idx = self.robot.body_names.index(frame_name)
-                    body_indices.append(body_idx)
-                    body_names_list.append(frame_name)
-                    added_bodies.add(frame_name)
+                body_name = strip_root_marker(frame_name)
+                if body_name not in self.robot.body_names:
+                    raise ValueError(f"Body frame '{body_name}' not found in robot body names.")
+                idx = self.robot.body_names.index(body_name)
+                if is_root_frame(frame_name):
+                    root_indices.append(idx)
+                    root_names_list.append(frame_name)
                 else:
-                    raise ValueError(f"Body frame '{frame_name}' not found in robot body names.")
+                    body_indices.append(idx)
+                    body_names_list.append(frame_name)
+                added_bodies.add(frame_name)
 
-        # Build ordered output names: COM → body positions → body orientations → joints
+        # Root-frame channels are generated as a pose + a twist, always together.  Anything
+        # else would silently mis-align the blocked write in compute_measured_output.
+        for frame_name in root_names_list:
+            have = set(body_type[frame_name])
+            want = {"pos_x", "pos_y", "pos_z", "ori_w", "ori_x", "ori_y", "ori_z"}
+            if have != want:
+                raise ValueError(
+                    f"Root-frame '{frame_name}' must expose exactly {sorted(want)}; got "
+                    f"{sorted(have)}."
+                )
+
+        # Build ordered output names:
+        #   COM -> world body positions -> world body orientations
+        #       -> root body positions -> root body orientations -> joints
+        # compute_measured_output writes in exactly this order.
         ordered_pos_output_names: list[str] = []
         ordered_vel_output_names: list[str] = []
 
@@ -689,6 +786,16 @@ class BaseTrajectoryCommand(CommandTerm):
                 if "ori_w" not in btype:
                     ordered_vel_output_names.append(f"{body_name}:{btype}")
 
+        for frame_name in root_names_list:
+            for a in ("x", "y", "z"):
+                ordered_pos_output_names.append(f"{frame_name}:pos_{a}")
+                ordered_vel_output_names.append(f"{frame_name}:pos_{a}")
+        for frame_name in root_names_list:
+            for a in ("x", "y", "z", "w"):
+                ordered_pos_output_names.append(f"{frame_name}:ori_{a}")
+                if a != "w":
+                    ordered_vel_output_names.append(f"{frame_name}:ori_{a}")
+
         for body_name in body_names_list:
             ori = any("ori" in b for b in body_type[body_name])
             pos = any("pos" in b for b in body_type[body_name])
@@ -705,8 +812,40 @@ class BaseTrajectoryCommand(CommandTerm):
 
         joint_idx_result = joint_indices if len(joint_indices) > 0 else None
         body_idx_result = body_indices if len(body_indices) > 0 else None
+        root_idx_result = root_indices if len(root_indices) > 0 else None
 
-        return joint_idx_result, body_idx_result, use_com, ordered_pos_output_names, ordered_vel_output_names, body_type_list
+        return (joint_idx_result, body_idx_result, use_com, ordered_pos_output_names,
+                ordered_vel_output_names, body_type_list, root_idx_result, root_names_list)
+
+    def _resolve_tracked_vel_names(self) -> list[str]:
+        """Velocity channels that form the CLF's eta, per ``cfg.tracking_mode``.
+
+        ``y``/``dy`` always carry every channel; this picks the graded subset.  ``"joint"``
+        keeps the world frames and the joints (the original behaviour, so the returned list is
+        the full one minus nothing when the library carries no root-frame channels).
+        ``"body"`` swaps the joints for the root-frame body links, keeping the world-frame
+        skeleton so global placement stays penalised.
+
+        Returns:
+            Channel names, a subset of ``self.ordered_vel_output_names``.
+
+        Raises:
+            ValueError: On an unknown mode, or on ``"body"`` against a library that carries no
+                root-frame channels.
+        """
+        mode = getattr(self.cfg, "tracking_mode", "joint")
+        names = self.ordered_vel_output_names
+        if mode == "joint":
+            return [n for n in names if not is_root_frame(n)]
+        if mode != "body":
+            raise ValueError(f"tracking_mode must be 'joint' or 'body'; got {mode!r}.")
+        if not self.root_body_frames:
+            raise ValueError(
+                "tracking_mode='body' needs a clip library carrying root-frame body channels "
+                f"({ROOT_FRAME_MARKER}), but this library has none. Widen it with "
+                "scripts/rsl_rl/backfill_root_frames.py, or use tracking_mode='joint'."
+            )
+        return [n for n in names if not n.startswith("joint:")]
 
     def _parse_ref_frames(self, reference_frames: list[str]) -> tuple[list[int], list[str]]:
         """Parse reference frame names to body indices, adding left/right pairs.
@@ -787,6 +926,38 @@ def _align_yaw_batched(vecs: torch.Tensor, root_quat: torch.Tensor) -> torch.Ten
 def _align_quat_to_yaw(quat: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:
     """Align a quaternion to the yaw-aligned frame."""
     return quat_mul(yaw_quat(quat_inv(root_quat)), quat)
+
+
+def _rotate_by_inv_batched(vecs: torch.Tensor, frame_quat: torch.Tensor) -> torch.Tensor:
+    """Rotate batched vectors ``[N, B, 3]`` into ``frame_quat``'s frame (FULL rotation).
+
+    The root-frame counterpart of :func:`_align_yaw_batched`, which drops roll/pitch.
+
+    Args:
+        vecs: ``[N, B, 3]`` world-frame vectors.
+        frame_quat: ``[N, 4]`` frame orientations (xyzw).
+
+    Returns:
+        ``[N, B, 3]`` vectors in the frame.
+    """
+    n, b, _ = vecs.shape
+    inv = quat_inv(frame_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
+    return quat_apply(inv, vecs.reshape(n * b, 3)).reshape(n, b, 3)
+
+
+def _quat_mul_inv_batched(quats: torch.Tensor, frame_quat: torch.Tensor) -> torch.Tensor:
+    """Express batched orientations ``[N, B, 4]`` relative to ``frame_quat`` (FULL rotation).
+
+    Args:
+        quats: ``[N, B, 4]`` world-frame orientations (xyzw).
+        frame_quat: ``[N, 4]`` frame orientations (xyzw).
+
+    Returns:
+        ``[N, B, 4]`` orientations relative to the frame.
+    """
+    n, b, _ = quats.shape
+    inv = quat_inv(frame_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
+    return quat_mul(inv, quats.reshape(n * b, 4)).reshape(n, b, 4)
 
 
 def _align_quat_to_yaw_batched(quats: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:

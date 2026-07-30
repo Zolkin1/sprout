@@ -31,6 +31,11 @@ import numpy as np
 
 from deploy.quat_math_np import quat_apply, quat_inv, quat_mul
 
+# Marker on a clip output frame whose channels are expressed in the ROOT (pelvis) frame.
+# Vendored rather than imported: this package deliberately depends only on numpy/h5py plus
+# the torch-free ``deploy`` helpers.  Source of truth: ``motion_gen.joint_names``.
+ROOT_FRAME_MARKER = "@root"
+
 
 def _yaw_angle(q: np.ndarray) -> float:
     """Yaw angle (rad) about world z of an ``(x, y, z, w)`` quaternion."""
@@ -72,6 +77,10 @@ class ClipReference:
             fixed world placement (world-anchored playback).
         ego_anchor_every: Re-anchor cadence in control steps (only meaningful when
             ``ego_anchor`` is True); should match the teacher's ``ego_anchor_every``.
+        root_frame_bodies: Body links whose ROOT-frame pose/twist the clip carries
+            (``<body>@root:*``), in the tracker's order -- needed only by a tracker trained
+            with ``tracking_mode="body"``; empty otherwise.  Comes from the exported
+            ``root_frame_bodies`` metadata.
     """
 
     def __init__(
@@ -84,6 +93,7 @@ class ClipReference:
         start_time: float = 0.0,
         ego_anchor: bool = False,
         ego_anchor_every: int = 10,
+        root_frame_bodies: list[str] | None = None,
     ) -> None:
         with h5py.File(str(path), "r") as f:
             self.y = np.asarray(f["y_des"][clip_id], dtype=np.float64)    # [T, P] clip-world
@@ -118,6 +128,19 @@ class ClipReference:
         self._ee_lin = [[vi(f"{fr}:pos_{a}") for a in ("x", "y", "z")] for fr in ee_frame_names]
         self._ee_ang = [[vi(f"{fr}:ori_{a}") for a in ("x", "y", "z")] for fr in ee_frame_names]
         self._num_ee = len(ee_frame_names)
+
+        # Root-frame body-link channels, for a tracker trained with tracking_mode="body".
+        # These are ALREADY pelvis-relative in the clip, so unlike everything above they are
+        # served raw -- no placement lift.  Laid out to match the IsaacLab observations
+        # (body-major: pos_xyz + ori_wxyz, and lin_xyz + ang_xyz).
+        self.root_frame_bodies = list(root_frame_bodies or [])
+        self._rf_pos, self._rf_vel = [], []
+        for body in self.root_frame_bodies:
+            rf = f"{body}{ROOT_FRAME_MARKER}"
+            self._rf_pos += [pi(f"{rf}:pos_{a}") for a in ("x", "y", "z")]
+            self._rf_pos += [pi(f"{rf}:ori_{a}") for a in ("w", "x", "y", "z")]
+            self._rf_vel += [vi(f"{rf}:pos_{a}") for a in ("x", "y", "z")]
+            self._rf_vel += [vi(f"{rf}:ori_{a}") for a in ("x", "y", "z")]
 
         # Ego-centric (receding-horizon) re-anchoring config (see reanchor_ego).
         self.ego_anchor = bool(ego_anchor)
@@ -205,6 +228,11 @@ class ClipReference:
             state["frame_quat"] = np.zeros((0, 4))
             state["frame_lin"] = np.zeros((0, 3))
             state["frame_ang"] = np.zeros((0, 3))
+        # Root-frame body block: served RAW.  These channels are pelvis-relative, so the
+        # placement lift that every world quantity above goes through must not touch them.
+        if self._rf_pos:
+            state["body_pos_root"] = y[self._rf_pos].copy()
+            state["body_vel_root"] = dy[self._rf_vel].copy()
         return state
 
     def state_at(self, step: int) -> dict:

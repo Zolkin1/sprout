@@ -54,6 +54,7 @@ from motion_gen.terrain.box_clip import _quat_yaw_wxyz, se2z_align
 from motion_gen.clip_output import ClipOutputBuilder
 from motion_gen.terrain.distractor import occupancy_grid
 from motion_gen.gen_parallel import default_workers, unit_pool
+from motion_gen.joint_names import world_position_channels
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
@@ -191,8 +192,10 @@ def _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev, gen=No
     pos = builder.pos_names
     pxy = [pos.index("pelvis_link:pos_x"), pos.index("pelvis_link:pos_y")]
     fxy = [[pos.index(f"{l}:pos_x"), pos.index(f"{l}:pos_y")] for l in _FEET]
-    x_ch = [i for i, nm in enumerate(pos) if nm.endswith(":pos_x")]
-    y_ch = [i for i, nm in enumerate(pos) if nm.endswith(":pos_y")]
+    # WORLD position channels only -- root-frame channels are pelvis-relative and are unchanged
+    # by translating the clip (see ``joint_names.world_position_channels``).
+    x_ch = world_position_channels(pos, "x")
+    y_ch = world_position_channels(pos, "y")
     bx, by, bz = box_xyz
 
     clips, tvels, foot_pts, turn_x = [], [], [], []

@@ -165,17 +165,29 @@ def test_deploy_path_is_torch_free() -> None:
 
 
 def _clip_like_reference(policy, state, rng) -> dict:
-    """A synthetic reference in the shape the clip source supplies (tracker-only mode)."""
+    """A synthetic reference in the shape the clip source supplies (tracker-only mode).
+
+    A tracker trained with ``tracking_mode="body"`` additionally needs the root-frame body
+    block, which real playback gets from ``ClipReference(root_frame_bodies=...)``.
+    """
     nj, k = policy.ctx.nj, policy.ctx.target_num_extra_frames
-    node = lambda: {
-        "root_pos": np.asarray(state["root_pos"]) + rng.standard_normal(3) * 0.01,
-        "root_quat": np.array([0.0, 0.0, 0.0, 1.0]),
-        "root_lin": rng.standard_normal(3) * 0.05,
-        "root_ang": rng.standard_normal(3) * 0.05,
-        "jp": rng.standard_normal(nj) * 0.1,
-        "jv": rng.standard_normal(nj) * 0.1,
-        "frame_pos": rng.standard_normal((k, 3)) * 0.1,
-    }
+    nb = len(policy._trk.get_root_frame_bodies())
+
+    def node():
+        n = {
+            "root_pos": np.asarray(state["root_pos"]) + rng.standard_normal(3) * 0.01,
+            "root_quat": np.array([0.0, 0.0, 0.0, 1.0]),
+            "root_lin": rng.standard_normal(3) * 0.05,
+            "root_ang": rng.standard_normal(3) * 0.05,
+            "jp": rng.standard_normal(nj) * 0.1,
+            "jv": rng.standard_normal(nj) * 0.1,
+            "frame_pos": rng.standard_normal((k, 3)) * 0.1,
+        }
+        if nb:
+            n["body_pos_root"] = rng.standard_normal(7 * nb) * 0.1
+            n["body_vel_root"] = rng.standard_normal(6 * nb) * 0.1
+        return n
+
     return {"current": node(), "future": [node() for _ in range(len(policy.future_offsets))]}
 
 

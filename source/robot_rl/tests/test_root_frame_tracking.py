@@ -1,0 +1,370 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""RL-side root-frame body tracking, without IsaacLab's simulator.
+
+Three things are pinned here:
+
+* **The CLF channel subset.** ``y``/``dy`` always carry every channel; ``tracking_mode``
+  selects what enters eta.  ``"joint"`` must reproduce the pre-existing behaviour EXACTLY
+  (same P, same eta, same subgroups) or the A/B's control arm is not a control.
+* **The measured root-frame block.** ``compute_measured_output`` must produce the same
+  quantity the generator writes -- pose in the full pelvis frame, and a twist that is the
+  true derivative of that pose (the ``omega x p`` term is easy to omit and hard to notice).
+* **Frame-list stability.** ``resolve_ee_frames`` must keep returning only the WORLD
+  end-effectors: it sizes ``ee_ref``, drives the per-step world lift, and gates FM checkpoint
+  compatibility.
+
+The real classes are driven on a ``SimpleNamespace`` robot carrying only the attributes the
+methods under test touch, following ``test_segment_placement.py``.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from isaaclab.utils.math import quat_apply, quat_inv, quat_mul
+
+from motion_gen.joint_names import (
+    G1_BODY_TRACK_FRAMES,
+    G1_JOINT_NAMES,
+    is_root_frame,
+    root_frame_name,
+)
+from robot_rl.tasks.manager_based.robot_rl.g1.clf_weights import (
+    WALKING_Q_weights,
+    WALKING_R_weights,
+)
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking import (
+    base_trajectory_cmd as btc,
+)
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.base_trajectory_cmd import (
+    BaseTrajectoryCommand,
+)
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.clf import CLF
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
+    MotionSequenceCommand,
+)
+
+DEVICE = "cpu"
+WORLD_FRAMES = ["pelvis_link", "left_ankle_roll_link", "right_ankle_roll_link",
+                "right_wrist_yaw_link", "left_wrist_yaw_link"]
+# Real joint names: the CLF looks every tracked channel up in the Q/R weight dicts.
+JOINTS = list(G1_JOINT_NAMES)
+# Distinct body names so a body-index mix-up cannot pass by coincidence.
+BODY_NAMES = ["pelvis_link"] + [f for f in WORLD_FRAMES if f != "pelvis_link"] + [
+    b for b in G1_BODY_TRACK_FRAMES if b not in WORLD_FRAMES
+]
+
+
+def _clip_pos_names(with_root: bool) -> list[str]:
+    """The clip's ``pos_output_names``, optionally widened with root-frame channels."""
+    names = []
+    for f in WORLD_FRAMES:
+        names += [f"{f}:pos_{a}" for a in "xyz"] + [f"{f}:ori_{a}" for a in ("w", "x", "y", "z")]
+    names += [f"joint:{j}" for j in JOINTS]
+    if with_root:
+        for b in G1_BODY_TRACK_FRAMES:
+            rf = root_frame_name(b)
+            names += [f"{rf}:pos_{a}" for a in "xyz"]
+            names += [f"{rf}:ori_{a}" for a in ("w", "x", "y", "z")]
+    return names
+
+
+def _fake_cmd(with_root: bool, tracking_mode: str = "joint") -> SimpleNamespace:
+    """A command stub with the real ``_parse_outputs`` / ``_resolve_tracked_vel_names`` bound."""
+    cmd = SimpleNamespace(
+        robot=SimpleNamespace(body_names=BODY_NAMES, joint_names=JOINTS),
+        cfg=SimpleNamespace(base_frame_name="pelvis_link", tracking_mode=tracking_mode),
+        device=DEVICE,
+        num_envs=4,
+    )
+    result = BaseTrajectoryCommand._parse_outputs(cmd, _clip_pos_names(with_root))
+    (cmd.joint_idx, cmd.body_idx, cmd.use_com, cmd.ordered_pos_output_names,
+     cmd.ordered_vel_output_names, cmd.body_type, cmd.root_body_idx,
+     cmd.root_body_frames) = result
+    cmd._root_base_body_idx = BODY_NAMES.index("pelvis_link")
+    cmd.tracked_vel_names = BaseTrajectoryCommand._resolve_tracked_vel_names(cmd)
+    return cmd
+
+
+# ----------------------------------------------------------------------------------
+# Output parsing
+# ----------------------------------------------------------------------------------
+
+def test_parse_splits_world_and_root_groups():
+    """Root-frame frames land in their own group, resolved to the underlying body index."""
+    cmd = _fake_cmd(with_root=True)
+    assert cmd.root_body_frames == [root_frame_name(b) for b in G1_BODY_TRACK_FRAMES]
+    assert cmd.root_body_idx == [BODY_NAMES.index(b) for b in G1_BODY_TRACK_FRAMES]
+    # The world group is untouched by the widening.
+    assert cmd.body_idx == [BODY_NAMES.index(f) for f in WORLD_FRAMES]
+
+
+def test_parse_without_root_channels_is_unchanged():
+    """A pre-widening library parses exactly as before, with no root group."""
+    cmd = _fake_cmd(with_root=False)
+    assert cmd.root_body_idx is None
+    assert cmd.root_body_frames == []
+    assert not any(is_root_frame(n) for n in cmd.ordered_pos_output_names)
+
+
+def test_parse_rejects_a_partial_root_frame():
+    """A root frame missing channels is an error, not a silently misaligned block write."""
+    names = _clip_pos_names(with_root=False)
+    names += [f"{root_frame_name('left_knee_link')}:pos_{a}" for a in "xyz"]   # no ori
+    cmd = SimpleNamespace(
+        robot=SimpleNamespace(body_names=BODY_NAMES, joint_names=JOINTS),
+        cfg=SimpleNamespace(base_frame_name="pelvis_link"), device=DEVICE, num_envs=1,
+    )
+    with pytest.raises(ValueError, match="must expose exactly"):
+        BaseTrajectoryCommand._parse_outputs(cmd, names)
+
+
+# ----------------------------------------------------------------------------------
+# tracking_mode -> tracked channel selection
+# ----------------------------------------------------------------------------------
+
+def test_joint_mode_selects_world_and_joints():
+    """``joint`` grades the world skeleton + every joint, and no root-frame channel."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="joint")
+    tracked = cmd.tracked_vel_names
+    assert not any(is_root_frame(n) for n in tracked)
+    assert sum(n.startswith("joint:") for n in tracked) == len(JOINTS)
+    assert len(tracked) == 6 * len(WORLD_FRAMES) + len(JOINTS)
+
+
+def test_body_mode_swaps_joints_for_root_frames():
+    """``body`` keeps the world skeleton, drops the joints, adds the root-frame links."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    tracked = cmd.tracked_vel_names
+    assert not any(n.startswith("joint:") for n in tracked)
+    assert sum(is_root_frame(n) for n in tracked) == 6 * len(G1_BODY_TRACK_FRAMES)
+    # The world end-effectors stay tracked, so global foot placement is still penalised.
+    for f in WORLD_FRAMES:
+        assert f"{f}:pos_x" in tracked
+    assert len(tracked) == 6 * len(WORLD_FRAMES) + 6 * len(G1_BODY_TRACK_FRAMES)
+
+
+def test_body_mode_needs_a_widened_library():
+    """Asking for body mode against a narrow library fails loudly with the fix in the message."""
+    with pytest.raises(ValueError, match="backfill_root_frames"):
+        _fake_cmd(with_root=False, tracking_mode="body")
+
+
+def test_unknown_mode_rejected():
+    """A typo in tracking_mode is an error, not a silent fallback."""
+    with pytest.raises(ValueError, match="must be 'joint' or 'body'"):
+        _fake_cmd(with_root=True, tracking_mode="bodies")
+
+
+# ----------------------------------------------------------------------------------
+# CLF channel subsetting
+# ----------------------------------------------------------------------------------
+
+def _clf(cmd) -> CLF:
+    """The real CLF over a stub command's tracked subset."""
+    return CLF(sim_dt=0.02, batch_size=cmd.num_envs,
+               ordered_vel_output_names=cmd.ordered_vel_output_names,
+               ordered_pos_output_names=cmd.ordered_pos_output_names,
+               Q_weights=WALKING_Q_weights, R_weights=WALKING_R_weights,
+               tracked_vel_names=cmd.tracked_vel_names, device=DEVICE)
+
+
+def test_joint_mode_reproduces_the_unwidened_clf_exactly():
+    """The control arm is a true control: same P and same V on a widened library."""
+    narrow = _fake_cmd(with_root=False, tracking_mode="joint")
+    wide = _fake_cmd(with_root=True, tracking_mode="joint")
+    clf_n, clf_w = _clf(narrow), _clf(wide)
+
+    assert clf_n.n_outputs == clf_w.n_outputs
+    torch.testing.assert_close(clf_n.P, clf_w.P)
+    assert clf_w.ordered_vel_output_names == clf_n.ordered_vel_output_names
+
+    torch.manual_seed(0)
+    n = narrow.num_envs
+    y_n = torch.randn(n, len(narrow.ordered_pos_output_names))
+    dy_n = torch.randn(n, len(narrow.ordered_vel_output_names))
+    # Embed the narrow vectors into the wide layout; the extra columns are pure noise the
+    # CLF must ignore.
+    idx_p = [wide.ordered_pos_output_names.index(nm) for nm in narrow.ordered_pos_output_names]
+    idx_v = [wide.ordered_vel_output_names.index(nm) for nm in narrow.ordered_vel_output_names]
+    y_w = torch.randn(n, len(wide.ordered_pos_output_names))
+    dy_w = torch.randn(n, len(wide.ordered_vel_output_names))
+    y_w[:, idx_p] = y_n
+    dy_w[:, idx_v] = dy_n
+
+    zeros_p_n = torch.zeros_like(y_n)
+    zeros_v_n = torch.zeros_like(dy_n)
+    zeros_p_w = torch.zeros_like(y_w)
+    zeros_v_w = torch.zeros_like(dy_w)
+    zeros_p_w[:, idx_p] = zeros_p_n
+    zeros_v_w[:, idx_v] = zeros_v_n
+
+    v_n = clf_n.compute_v(y_n, zeros_p_n, dy_n, zeros_v_n)
+    v_w = clf_w.compute_v(y_w, zeros_p_w, dy_w, zeros_v_w)
+    torch.testing.assert_close(v_n, v_w)
+    assert set(clf_n.v_subgroups) == set(clf_w.v_subgroups)
+    for k in clf_n.v_subgroups:
+        torch.testing.assert_close(clf_n.v_subgroups[k], clf_w.v_subgroups[k], msg=k)
+
+
+def test_body_mode_clf_has_no_joint_energy_and_a_root_group():
+    """Body-mode eta contains the root-frame links and no joint channel."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    clf = _clf(cmd)
+    assert clf.n_outputs == 2 * (6 * len(WORLD_FRAMES) + 6 * len(G1_BODY_TRACK_FRAMES))
+    assert clf.subgroup_indices["joint_pos"].numel() == 0
+    assert clf.subgroup_indices["root_body_pos"].numel() == 3 * len(G1_BODY_TRACK_FRAMES)
+    assert clf.subgroup_indices["root_body_ori"].numel() == 3 * len(G1_BODY_TRACK_FRAMES)
+
+    torch.manual_seed(1)
+    y = torch.randn(cmd.num_envs, len(cmd.ordered_pos_output_names))
+    dy = torch.randn(cmd.num_envs, len(cmd.ordered_vel_output_names))
+    v = clf.compute_v(y, torch.zeros_like(y), dy, torch.zeros_like(dy))
+    assert torch.isfinite(v).all() and (v > 0).all()
+    assert float(clf.v_subgroups["root_body_pos"].sum()) > 0.0
+    # Perturbing ONLY joint channels must not move V in body mode.
+    jcols = [i for i, n in enumerate(cmd.ordered_pos_output_names) if n.startswith("joint:")]
+    y2 = y.clone()
+    y2[:, jcols] += 5.0
+    torch.testing.assert_close(clf.compute_v(y2, torch.zeros_like(y2), dy, torch.zeros_like(dy)), v)
+
+
+def test_clf_weights_cover_every_root_channel():
+    """Every tracked channel needs a Q/R entry or CLF construction KeyErrors."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    for name in cmd.tracked_vel_names:
+        assert name in WALKING_Q_weights, name
+        assert name in WALKING_R_weights, name
+
+
+def test_batched_box_minus_matches_per_body():
+    """The batched quaternion error equals the per-body loop it replaced.
+
+    ``compute_y_err`` operates on the TRACKED channel width (it runs after the gather in
+    ``compute_v``), so the inputs here are built at that width, not the command's full one.
+    """
+    from isaaclab.utils.math import quat_box_minus
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    clf = _clf(cmd)
+    torch.manual_seed(2)
+    n, p = cmd.num_envs, len(clf.ordered_pos_output_names)
+    y_a, y_d = torch.randn(n, p), torch.randn(n, p)
+    # Normalise the quaternion blocks so box-minus is well posed.
+    for cols in clf.ori_body_indices_manifold.values():
+        for tensor in (y_a, y_d):
+            tensor[:, cols] = torch.nn.functional.normalize(tensor[:, cols], dim=-1)
+    got = clf.compute_y_err(y_a, y_d)
+    assert len(clf.ori_body_indices_manifold) == len(WORLD_FRAMES) + len(G1_BODY_TRACK_FRAMES)
+    for body, cols in clf.ori_body_indices_manifold.items():
+        tan = clf.ori_body_indices_tangent[body]
+        torch.testing.assert_close(got[:, tan], quat_box_minus(y_a[:, cols], y_d[:, cols]),
+                                   msg=body)
+
+
+# ----------------------------------------------------------------------------------
+# Measured root-frame block
+# ----------------------------------------------------------------------------------
+
+@pytest.fixture
+def plain_tensors(monkeypatch):
+    """Let ``compute_measured_output`` read plain torch tensors off the stub robot.
+
+    The real method pulls articulation buffers through ``wp.to_torch``; there is no Warp
+    array here, so the conversion is the identity for this test.
+    """
+    monkeypatch.setattr(btc.wp, "to_torch", lambda a: a)
+
+
+def _random_body_state(n: int, nb: int, seed: int = 0):
+    """Random world poses/twists for ``nb`` bodies over ``n`` envs."""
+    torch.manual_seed(seed)
+    pos = torch.randn(n, nb, 3)
+    quat = torch.nn.functional.normalize(torch.randn(n, nb, 4), dim=-1)   # xyzw
+    vel = torch.randn(n, nb, 6)
+    return pos, quat, vel
+
+
+def test_measured_root_block_matches_hand_rolled_transform(plain_tensors):
+    """The measured block is the full-pelvis-frame pose and its TRUE derivative."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    n, nb_all = cmd.num_envs, len(BODY_NAMES)
+    pos_w, quat_w, vel_w = _random_body_state(n, nb_all, seed=3)
+
+    cmd.robot.data = SimpleNamespace(
+        body_pos_w=pos_w, body_quat_w=quat_w, body_link_vel_w=vel_w,
+        joint_pos=torch.randn(n, len(JOINTS)), joint_vel=torch.randn(n, len(JOINTS)),
+    )
+    cmd.y_act = torch.zeros(n, len(cmd.ordered_pos_output_names))
+    cmd.dy_act = torch.zeros(n, len(cmd.ordered_vel_output_names))
+    cmd.body_type = torch.full((len(WORLD_FRAMES),), 2, dtype=torch.int)
+
+    BaseTrajectoryCommand.compute_measured_output(
+        cmd, torch.zeros(n, 3), torch.tensor([[0.0, 0.0, 0.0, 1.0]]).expand(n, 4)
+    )
+
+    b = BODY_NAMES.index("pelvis_link")
+    base_p, base_q = pos_w[:, b], quat_w[:, b]
+    base_v, base_w = vel_w[:, b, :3], vel_w[:, b, 3:]
+    inv = quat_inv(base_q)
+    omega_b = quat_apply(inv, base_w)
+
+    names = cmd.ordered_pos_output_names
+    vnames = cmd.ordered_vel_output_names
+    for body in G1_BODY_TRACK_FRAMES:
+        i = BODY_NAMES.index(body)
+        rf = root_frame_name(body)
+        p_r = quat_apply(inv, pos_w[:, i] - base_p)
+        q_r = quat_mul(inv, quat_w[:, i])
+        w_r = quat_apply(inv, vel_w[:, i, 3:] - base_w)
+        v_r = quat_apply(inv, vel_w[:, i, :3] - base_v) - torch.linalg.cross(omega_b, p_r)
+
+        got_p = cmd.y_act[:, [names.index(f"{rf}:pos_{a}") for a in "xyz"]]
+        got_q = cmd.y_act[:, [names.index(f"{rf}:ori_{a}") for a in ("x", "y", "z", "w")]]
+        got_v = cmd.dy_act[:, [vnames.index(f"{rf}:pos_{a}") for a in "xyz"]]
+        got_w = cmd.dy_act[:, [vnames.index(f"{rf}:ori_{a}") for a in "xyz"]]
+        torch.testing.assert_close(got_p, p_r, msg=f"{body} pos")
+        torch.testing.assert_close(got_q, q_r, msg=f"{body} ori")
+        torch.testing.assert_close(got_v, v_r, msg=f"{body} lin vel")
+        torch.testing.assert_close(got_w, w_r, msg=f"{body} ang vel")
+
+
+def test_measured_root_block_is_pose_invariant(plain_tensors):
+    """Rigidly moving the whole robot in the world leaves the root-frame block unchanged."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    n, nb_all = cmd.num_envs, len(BODY_NAMES)
+    pos_w, quat_w, vel_w = _random_body_state(n, nb_all, seed=4)
+
+    def measured(p, q, v):
+        cmd.robot.data = SimpleNamespace(
+            body_pos_w=p, body_quat_w=q, body_link_vel_w=v,
+            joint_pos=torch.zeros(n, len(JOINTS)), joint_vel=torch.zeros(n, len(JOINTS)),
+        )
+        cmd.y_act = torch.zeros(n, len(cmd.ordered_pos_output_names))
+        cmd.dy_act = torch.zeros(n, len(cmd.ordered_vel_output_names))
+        cmd.body_type = torch.full((len(WORLD_FRAMES),), 2, dtype=torch.int)
+        BaseTrajectoryCommand.compute_measured_output(
+            cmd, torch.zeros(n, 3), torch.tensor([[0.0, 0.0, 0.0, 1.0]]).expand(n, 4)
+        )
+        rp = [i for i, nm in enumerate(cmd.ordered_pos_output_names) if is_root_frame(nm)]
+        return cmd.y_act[:, rp].clone()
+
+    base = measured(pos_w, quat_w, vel_w)
+    shifted = measured(pos_w + torch.tensor([2.0, -1.0, 0.5]), quat_w, vel_w)
+    torch.testing.assert_close(base, shifted)
+
+
+# ----------------------------------------------------------------------------------
+# Frame-list stability
+# ----------------------------------------------------------------------------------
+
+def test_resolve_ee_frames_excludes_root_frames():
+    """``ee_ref`` / the world lift / FM checkpoint compat must not see the new frames."""
+    cmd = _fake_cmd(with_root=True)
+    frames = MotionSequenceCommand.resolve_ee_frames(cmd)
+    assert frames == sorted(f for f in WORLD_FRAMES if f != "pelvis_link")
+    assert len(frames) == 4
+    # Same answer with and without the widening -- that is the invariant.
+    assert frames == MotionSequenceCommand.resolve_ee_frames(_fake_cmd(with_root=False))

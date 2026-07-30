@@ -53,6 +53,7 @@ import math
 
 import torch
 
+from ..joint_names import world_frame_names
 from ..math_utils import quat_apply, quat_mul
 
 
@@ -92,7 +93,9 @@ def rotate_clip_to_slope(
             the step-0 stance foot stays grounded. Typically the step-0 pelvis ``xy``.
 
     Returns:
-        ``(y_des', dy_des')`` new tensors with every frame rotated; joints untouched.
+        ``(y_des', dy_des')`` new tensors with every WORLD frame rotated; joints and
+        root-frame (``@root``) channels untouched -- both are invariant under a rigid
+        rotation of the clip, so rotating them would corrupt the pose.
         ``contact`` is not an argument (invariant) -- keep the flat build's contact.
     """
     y = y_des.clone()
@@ -107,9 +110,14 @@ def rotate_clip_to_slope(
             [names.index(f"{frame}:{kind}_{a}") for a in comps], dtype=torch.long, device=dev
         )
 
+    # WORLD frames only -- ``@root`` channels are pelvis-relative and invariant under this
+    # rigid rotation, so touching them would corrupt the pose.
+    world_pos_frames = set(world_frame_names(pos_output_names))
+    world_vel_frames = set(world_frame_names(vel_output_names))
+
     # Position frames: rotate the position about the ground pivot, left-multiply the
     # orientation by the pitch quat (both read/written wxyz, as build stored them).
-    for f in sorted({nm.split(":", 1)[0] for nm in pos_output_names if ":pos_" in nm}):
+    for f in sorted(f for f in world_pos_frames if f"{f}:pos_x" in pos_output_names):
         pos_i = _idx(pos_output_names, f, ("x", "y", "z"), "pos")
         y[:, pos_i] = pivot + quat_apply(q, y[:, pos_i] - pivot)
         if f"{f}:ori_w" in pos_output_names:
@@ -117,10 +125,10 @@ def rotate_clip_to_slope(
             y[:, ori_i] = quat_mul(q, y[:, ori_i])
 
     # Velocity frames: rotate only (linear pos_*, angular ori_*).
-    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":pos_" in nm}):
+    for f in sorted(f for f in world_vel_frames if f"{f}:pos_x" in vel_output_names):
         lin_i = _idx(vel_output_names, f, ("x", "y", "z"), "pos")
         dy[:, lin_i] = quat_apply(q, dy[:, lin_i])
-    for f in sorted({nm.split(":", 1)[0] for nm in vel_output_names if ":ori_" in nm}):
+    for f in sorted(f for f in world_vel_frames if f"{f}:ori_x" in vel_output_names):
         ang_i = _idx(vel_output_names, f, ("x", "y", "z"), "ori")
         dy[:, ang_i] = quat_apply(q, dy[:, ang_i])
 

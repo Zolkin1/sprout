@@ -141,7 +141,6 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
         export_params=True, opset_version=opset, dynamo=False,
         input_names=["history", "extero", "cmd_tokens", "noise", "history_null"], output_names=["trajectory"],
         dynamic_axes={k: {0: "V"} for k in ("history", "extero", "cmd_tokens", "noise", "trajectory", "history_null")},
-        output_names=["trajectory"],
     )
 
     meta = _fm_meta(ctx)

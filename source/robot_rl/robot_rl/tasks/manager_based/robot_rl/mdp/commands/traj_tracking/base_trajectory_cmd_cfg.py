@@ -38,6 +38,14 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     recorded alongside :attr:`library_fingerprint` for human-readable provenance
     in ``params/env.yaml``."""
 
+    log_per_channel_metrics: bool = False
+    """If True, log a per-output-channel absolute tracking error every step.
+
+    Off by default: it is one tensor per channel per step (292 with root-frame body tracking
+    on), which is heavy logging traffic for something only useful when chasing one specific
+    channel.  The per-subgroup CLF energies (``v_pelvis_pos``, ``v_joint_pos``,
+    ``v_root_body_pos``, ...) are always logged and cover the usual need."""
+
     strict_fingerprint: bool = False
     """If True, a trajectory/clip library fingerprint mismatch at construction *raises*
     instead of warning -- a guardrail for deploy / cross-machine runs where the loaded

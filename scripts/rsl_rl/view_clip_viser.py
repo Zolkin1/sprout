@@ -32,6 +32,7 @@ import numpy as np
 import viser
 from viser.extras import ViserUrdf
 
+from motion_gen.joint_names import is_root_frame
 from motion_gen.clips.clip_io import (
     load_clip_library,
 )
@@ -91,10 +92,14 @@ def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
 
 
 def _frame_pos_indices(pos_names: list[str]) -> dict[str, list[int]]:
-    """Map each frame name -> its [pos_x, pos_y, pos_z] indices in ``pos_names``."""
+    """Map each WORLD frame name -> its [pos_x, pos_y, pos_z] indices in ``pos_names``.
+
+    Root-frame (``@root``) channels are skipped: they are pelvis-relative, so plotting them
+    in the world scene would draw a cluster of meaningless points around the origin.
+    """
     frames: dict[str, list[int]] = {}
     for axis_i, name in enumerate(pos_names):
-        if ":pos_" in name:
+        if ":pos_" in name and not is_root_frame(name):
             frame, axis = name.split(":pos_")
             frames.setdefault(frame, [None, None, None])
             frames[frame]["xyz".index(axis)] = axis_i

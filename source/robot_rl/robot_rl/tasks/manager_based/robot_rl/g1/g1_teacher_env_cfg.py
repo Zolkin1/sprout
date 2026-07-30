@@ -310,3 +310,39 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         self.rewards.clf_reward.params["max_eta_err"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
+        self._apply_tracking_mode()
+
+    def _apply_tracking_mode(self) -> None:
+        """Swap the reference observation terms to match ``commands.traj_ref.tracking_mode``.
+
+        The reward side needs nothing here -- the command reads ``tracking_mode`` itself and
+        builds the CLF over the matching channel subset.  This is only the observation half:
+        under ``"body"`` the policy and critic see the root-frame body targets instead of the
+        reference joint angles, so the two arms of the A/B differ in *both* what is graded and
+        what is observed, which is the comparison being made.
+
+        ``ee_ref`` stays in both modes: the world end-effector frames are tracked either way.
+        Proprioception (``joint_pos`` / ``joint_vel`` / ``actions``) also stays -- the action
+        space is joint PD targets and joint encoders are what the hardware measures.
+        """
+        mode = self.commands.traj_ref.tracking_mode
+        if mode == "joint":
+            return
+        if mode != "body":
+            raise ValueError(f"tracking_mode must be 'joint' or 'body'; got {mode!r}.")
+
+        for group, pos_noise, vel_noise in (
+            (self.observations.policy, Unoise(n_min=-0.02, n_max=0.02),
+             Unoise(n_min=-0.5, n_max=0.5)),
+            (self.observations.critic, None, None),
+        ):
+            group.joint_pos_ref = None
+            group.joint_vel_ref = None
+            group.body_pos_ref = ObsTerm(
+                func=mdp.body_pos_ref_root, params={"command_name": "traj_ref"},
+                noise=pos_noise,
+            )
+            group.body_vel_ref = ObsTerm(
+                func=mdp.body_vel_ref_root, params={"command_name": "traj_ref"},
+                noise=vel_noise, clip=(-20.0, 20.0),
+            )

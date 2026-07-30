@@ -1,5 +1,16 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
+"""Per-channel CLF weights.
+
+``CLF.__init__`` indexes these dicts by channel name, so a channel the command tracks but the
+dict does not name is a ``KeyError`` at env construction.  The world-frame + joint channels are
+written out explicitly below; the root-frame body channels are filled programmatically by
+:func:`add_root_frame_weights` (13 bodies x 6 channels would otherwise be 156 near-identical
+lines to hand-maintain).
+"""
+
+from motion_gen.joint_names import G1_BODY_TRACK_FRAMES, root_frame_name
+
 ##
 # Lyapunov Weights
 ##
@@ -148,6 +159,50 @@ WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+
+
+##
+# Root-frame body-link weights (``tracking_mode="body"``)
+##
+
+# Defaults mirror the world end-effector weights above -- position and orientation treated
+# alike, modest control weight.  Deliberately uniform: the point of the joint-vs-body A/B is
+# the parameterization, so starting with a hand-tuned per-link profile would confound it.
+_ROOT_Q_DEFAULT = [1.0, 1.0]
+_ROOT_R_DEFAULT = [0.05]
+
+
+def add_root_frame_weights(
+    q_weights: dict,
+    r_weights: dict,
+    bodies: list[str] | None = None,
+    q_overrides: dict | None = None,
+    r_overrides: dict | None = None,
+) -> None:
+    """Fill in Q/R entries for every root-frame body channel, in place.
+
+    Args:
+        q_weights: Q dict to extend (channel name -> ``[q_pos, q_vel]``).
+        r_weights: R dict to extend (channel name -> ``[r]``).
+        bodies: Body names to add channels for; defaults to
+            :data:`~motion_gen.joint_names.G1_BODY_TRACK_FRAMES`.
+        q_overrides: Per-BODY Q override, e.g. ``{"torso_link": [3.0, 1.0]}``.
+        r_overrides: Per-BODY R override.
+    """
+    bodies = list(G1_BODY_TRACK_FRAMES if bodies is None else bodies)
+    q_overrides = q_overrides or {}
+    r_overrides = r_overrides or {}
+    for body in bodies:
+        rf = root_frame_name(body)
+        q = list(q_overrides.get(body, _ROOT_Q_DEFAULT))
+        r = list(r_overrides.get(body, _ROOT_R_DEFAULT))
+        for kind in ("pos", "ori"):
+            for axis in ("x", "y", "z"):
+                q_weights[f"{rf}:{kind}_{axis}"] = list(q)
+                r_weights[f"{rf}:{kind}_{axis}"] = list(r)
+
+
+add_root_frame_weights(WALKING_Q_weights, WALKING_R_weights)
 
 
 # ##

@@ -25,6 +25,22 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     base_frame_name: str = "pelvis_link"
     """Trajectory output frame used as the robot root (must expose pos/ori)."""
 
+    tracking_mode: str = "joint"
+    """Which reference parameterization the CLF grades -- the joint-vs-body A/B switch.
+
+    ``y_des`` / ``y_act`` always carry every channel (the reset, the world-state
+    reconstruction and the FM path all read ``joint:*`` regardless); this only selects
+    what enters eta:
+
+    * ``"joint"`` -- ``pelvis_link:*`` + the world end-effector frames + all ``joint:*``.
+      The original parameterization.
+    * ``"body"`` -- ``pelvis_link:*`` + the world end-effector frames + the root-frame body
+      links (``<body>@root:*``), with ``joint:*`` dropped.  The DeepMimic / Sonic style
+      Cartesian error metric.  Requires a clip library carrying root-frame channels (see
+      ``scripts/rsl_rl/backfill_root_frames.py``); the world-frame skeleton is kept so
+      global foot placement is still penalised against the terrain.
+    """
+
     random_start_phase: bool = False
     """If True, episodes start at a random step within the clip (else step 0)."""
 

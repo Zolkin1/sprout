@@ -117,6 +117,18 @@ def export_policy_parameters(env, obs, actions, save_dir):
         # come from the FM context; matches the FM ctx.target_frame_names when an FM is used.
         if hasattr(traj_cmd, "resolve_ee_frames"):
             params["ee_frame_names"] = list(traj_cmd.resolve_ee_frames())
+        # Body links whose ROOT-frame targets the POLICY OBSERVES, in the order the
+        # body_pos_ref / body_vel_ref terms stack them -- what deploy must serve
+        # (transfer/sim/clip_reference.py).  Gated on the mode, not on what the clip
+        # happens to carry: a joint-mode policy trained on a widened library still has the
+        # channels available but never looks at them, and advertising them would make the
+        # runner build reference blocks no obs term consumes.
+        mode = getattr(traj_cmd.cfg, "tracking_mode", "joint")
+        params["tracking_mode"] = mode
+        params["root_frame_bodies"] = (
+            [f.split("@", 1)[0] for f in getattr(traj_cmd, "root_body_frames", [])]
+            if mode == "body" else []
+        )
     except (KeyError, AttributeError):
         pass
 

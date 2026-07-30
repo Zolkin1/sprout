@@ -6,12 +6,19 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 from isaaclab.utils.math import quat_box_minus
 
+from motion_gen.joint_names import is_root_frame
+
 class CLF:
     """
     Continuous-time Control Lyapunov Function (CLF) evaluator for relative-degree-2 outputs.
     Uses user-provided LIP dynamics (A_lip, B_lip) and augments with double-integrator channels
     for additional outputs. Solves the continuous-time ARE once via SciPy, caches P and LQR gain K
     on the specified torch device for efficient V, V_dot, and control-law evaluation.
+
+    The command's ``y``/``dy`` vectors may carry MORE channels than the CLF grades:
+    ``tracked_vel_names`` selects the subset that forms eta.  That is what makes the
+    joint-vs-body tracking A/B a config switch on one clip library -- the clip always stores
+    both the ``joint:*`` and the root-frame body channels, and only the selection changes.
     """
     def __init__(
         self,
@@ -22,11 +29,55 @@ class CLF:
         device: torch.device = None,
         Q_weights: Dict = None,
         R_weights: Dict = None,
+        tracked_vel_names: list[str] | None = None,
         # domain_scalar: list[float]|None = None
     ):
+        """Build P over the tracked channel subset and cache the gathers into the full vectors.
+
+        Args:
+            sim_dt: Simulation timestep.
+            batch_size: Number of environments.
+            ordered_vel_output_names: FULL velocity channel names of the command's ``dy``.
+            ordered_pos_output_names: FULL position channel names of the command's ``y``.
+            device: Torch device.
+            Q_weights: Per-channel ``[q_pos, q_vel]``, keyed by velocity channel name.
+            R_weights: Per-channel ``[r]``, keyed by velocity channel name.
+            tracked_vel_names: Velocity channels that form eta; ``None`` tracks all of them.
+                Order is normalised to ``ordered_vel_output_names`` order regardless of how it
+                is passed, which is what keeps the pos/vel channel correspondence that
+                :meth:`compute_y_err` relies on.
+        """
         # Initialize device and basic parameters
-        self.device = device 
+        self.device = device
         self.sim_dt = sim_dt
+
+        # --- Tracked-channel subset -------------------------------------------------
+        full_pos = list(ordered_pos_output_names)
+        full_vel = list(ordered_vel_output_names)
+        if tracked_vel_names is None:
+            tracked_pos, tracked_vel = full_pos, full_vel
+        else:
+            want = set(tracked_vel_names)
+            unknown = sorted(want - set(full_vel))
+            if unknown:
+                raise ValueError(f"tracked_vel_names not in the command's outputs: {unknown}")
+            # Filter the FULL lists to preserve their relative order.  A position list also
+            # keeps each tracked frame's ``ori_w`` (present in y, absent from dy).
+            tracked_vel = [n for n in full_vel if n in want]
+            tracked_pos = [
+                n for n in full_pos
+                if n in want or (n.endswith(":ori_w") and f"{n[:-1]}x" in want)
+            ]
+        self._subset = (tracked_pos != full_pos) or (tracked_vel != full_vel)
+        self.pos_gather = torch.tensor([full_pos.index(n) for n in tracked_pos],
+                                       dtype=torch.long, device=self.device)
+        self.vel_gather = torch.tensor([full_vel.index(n) for n in tracked_vel],
+                                       dtype=torch.long, device=self.device)
+
+        # From here on, "ordered_*_output_names" means the TRACKED set: P, the subgroup index
+        # maps and the quaternion maps are all built over it.
+        ordered_pos_output_names = tracked_pos
+        ordered_vel_output_names = tracked_vel
         self.n_outputs = 2*len(ordered_vel_output_names)
         self.ordered_pos_output_names = ordered_pos_output_names
         self.ordered_vel_output_names = ordered_vel_output_names
@@ -100,6 +151,12 @@ class CLF:
             "other_body_lin_vel": [],
             "other_body_ori": [],
             "other_body_ang_vel": [],
+            # Root-frame body links (``<body>@root:*``) are their own group so the logged
+            # error split separates local limb tracking from the world-frame skeleton.
+            "root_body_pos": [],
+            "root_body_lin_vel": [],
+            "root_body_ori": [],
+            "root_body_ang_vel": [],
         }
         for i, name in enumerate(ordered_vel_output_names):
             if name.startswith("pelvis_link:pos_"):
@@ -111,6 +168,12 @@ class CLF:
             elif name.startswith("joint:"):
                 pos_key = "joint_pos"
                 vel_key = "joint_vel"
+            elif is_root_frame(name) and ":pos_" in name:
+                pos_key = "root_body_pos"
+                vel_key = "root_body_lin_vel"
+            elif is_root_frame(name) and ":ori_" in name:
+                pos_key = "root_body_ori"
+                vel_key = "root_body_ang_vel"
             elif ":pos_" in name:
                 pos_key = "other_body_pos"
                 vel_key = "other_body_lin_vel"
@@ -157,9 +220,41 @@ class CLF:
                     else:
                         self.ori_body_indices_tangent[body_name] = [i]
 
+        # Stack the per-body quaternion index blocks so compute_y_err runs ONE batched
+        # quat_box_minus instead of one kernel launch per tracked body.  Body order is shared
+        # between the two so the manifold rows and the tangent rows line up.
+        self._ori_bodies = list(self.ori_body_indices_manifold)
+        if self._ori_bodies:
+            self._ori_manifold_idx = torch.tensor(
+                [self.ori_body_indices_manifold[b] for b in self._ori_bodies],
+                dtype=torch.long, device=self.device)                       # [B, 4]
+            self._ori_tangent_idx = torch.tensor(
+                [self.ori_body_indices_tangent[b] for b in self._ori_bodies],
+                dtype=torch.long, device=self.device)                       # [B, 3]
+        else:
+            self._ori_manifold_idx = torch.zeros((0, 4), dtype=torch.long, device=self.device)
+            self._ori_tangent_idx = torch.zeros((0, 3), dtype=torch.long, device=self.device)
+
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0
-        
+
+    def _select(self, y_act, y_nom, dy_act, dy_nom):
+        """Gather the tracked channel subset out of the command's full ``y``/``dy`` vectors.
+
+        Args:
+            y_act, y_nom: ``[B, P_full]`` measured / desired positions.
+            dy_act, dy_nom: ``[B, V_full]`` measured / desired velocities.
+
+        Returns:
+            The same four tensors restricted to the tracked channels (unchanged when the CLF
+            tracks everything, so the common path stays copy-free).
+        """
+        if not self._subset:
+            return y_act, y_nom, dy_act, dy_nom
+        return (y_act[:, self.pos_gather], y_nom[:, self.pos_gather],
+                dy_act[:, self.vel_gather], dy_nom[:, self.vel_gather])
+
+
     def _compute_PK_np(self, Q_np, R_np) -> tuple[np.ndarray, np.ndarray]:
         """
         Construct a pure double integrator system for all outputs,
@@ -203,7 +298,11 @@ class CLF:
     ) -> torch.Tensor:
         """
         Evaluate V = (y_act - y_nom)^T P (y_act - y_nom).
+
+        Inputs are the command's FULL ``y``/``dy`` vectors; only the tracked channel subset
+        (see ``tracked_vel_names``) enters eta.
         """
+        y_act, y_nom, dy_act, dy_nom = self._select(y_act, y_nom, dy_act, dy_nom)
 
         y_err = self.compute_y_err(y_act, y_nom)
 
@@ -290,6 +389,12 @@ class CLF:
         Returns:
             (vdot, v_curr): tuple of Vdot and V values, each shape [B].
         """
+        # Restrict to the tracked channel subset, exactly as compute_v does.  Accelerations
+        # follow the velocity layout.
+        y_act, y_nom, dy_act, dy_nom = self._select(y_act, y_nom, dy_act, dy_nom)
+        if self._subset:
+            ddy_act, ddy_nom = ddy_act[:, self.vel_gather], ddy_nom[:, self.vel_gather]
+
         # Compute errors
         y_err = y_act - y_nom
         dy_err = dy_act - dy_nom
@@ -351,15 +456,28 @@ class CLF:
         Compute the error between the measured values and the desired values.
 
         Must respect the quaternion orientation by using the box minus operator.
+
+        Args:
+            y_act: ``[B, P]`` measured positions over the TRACKED channels.
+            y_des: ``[B, P]`` desired positions over the TRACKED channels.
+
+        Returns:
+            ``[B, V]`` error in the tangent (velocity) channel layout.
         """
-        y_err = torch.zeros((y_act.shape[0], len(self.ordered_vel_output_names)), device=self.device)
+        b = y_act.shape[0]
+        y_err = torch.zeros((b, len(self.ordered_vel_output_names)), device=self.device)
 
         # Subtract all the non-quaternions normally
         y_err[:, self.not_quat_mask_tangent] = y_act[:, self.not_quat_mask_manifold] - y_des[:, self.not_quat_mask_manifold]
 
-        # Subtract quats with box minus operator
-        for body_name, indices in self.ori_body_indices_manifold.items():
-            tangent_indices = self.ori_body_indices_tangent[body_name]
-            y_err[:, tangent_indices] = quat_box_minus(y_act[:, indices], y_des[:, indices])
+        # Subtract quats with the box-minus operator.  ONE batched call over every tracked
+        # orientation frame -- body tracking pushes this from 5 frames to 18, and a Python
+        # loop would be 18 kernel launches on the critical path of every step.
+        nb = self._ori_manifold_idx.shape[0]
+        if nb:
+            act_q = y_act[:, self._ori_manifold_idx.reshape(-1)].reshape(b * nb, 4)
+            des_q = y_des[:, self._ori_manifold_idx.reshape(-1)].reshape(b * nb, 4)
+            box = quat_box_minus(act_q, des_q).reshape(b, nb * 3)
+            y_err[:, self._ori_tangent_idx.reshape(-1)] = box
 
         return y_err

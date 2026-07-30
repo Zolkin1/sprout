@@ -72,7 +72,10 @@ def main() -> None:
     from deploy.tracker_session import make_session
     sess = make_session(os.path.join(exp, "tracker.onnx"))
     jit = torch.jit.load(os.path.join(exp, "policy.pt"), map_location="cpu").eval()
-    obs_np = rng.standard_normal((1, 207)).astype(np.float32)
+    # Obs width from the graph, not a literal: it moves with the observation set (e.g.
+    # tracking_mode="body" swaps the joint refs for wider root-frame body targets).
+    num_obs = int(sess.get_inputs()[0].shape[-1])
+    obs_np = rng.standard_normal((1, num_obs)).astype(np.float32)
     obs_t = torch.from_numpy(obs_np)
     in_name, out_name = sess.get_inputs()[0].name, sess.get_outputs()[0].name
     ort_trk = _time(lambda: sess.run([out_name], {in_name: obs_np}), args.iters * 3)
