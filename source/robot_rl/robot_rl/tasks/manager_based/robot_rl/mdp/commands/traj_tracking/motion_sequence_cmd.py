@@ -277,6 +277,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # World +z, for rebuilding the global (pure-yaw) placement quaternion in
         # :meth:`termination_reference_world_state`.
         self._world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(1, 3)
+        # Once-per-step guard for the re-anchor snapshot; -1 so the first step always runs.
+        self._last_reanchor_step = -1
 
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
@@ -348,34 +350,47 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.manager.phase = self._step.float() / max(T - 1, 1)
 
     def _reanchor_ego_envs(self) -> None:
-        """Emit FM snap events on the cadence and re-place the clip for ego envs.
+        """Emit FM snap events and re-place the clip for ego envs, on SEPARATE cadences.
 
-        The re-anchor cadence timer (``cfg.ego_anchor_every``) fires for EVERY env; two
-        things are then keyed off it, and they are DECOUPLED:
+        Two things happen here and they run on **independent timers**, because the right
+        rate for each is different by an order of magnitude:
 
-        * **FM snap flag** (``_reanchor_active``): set for the ``_snap_mask`` envs on the
-          tick. The recorder logs it and the FM dataset builds one training window per
-          snap. ``_snap_mask == _ego_mask`` on flat AND terrain alike: a window is emitted
-          exactly when the clip is re-anchored, on whatever axes its per-step mask frees
-          (the dataset ego-anchors the recorded clip future to the robot base at each snap,
-          so the FM learns to place the non-free axes from the history + height scan).
-        * **Clip re-placement** (``_reanchor_clip_ids``): applied to ``_ego_mask`` envs on
-          the tick -- recompute the placement so the FREE root DOFs of the clip's
-          CURRENT-STEP anchor mask coincide with the robot's measured root, while FIXED
-          DOFs stay pinned to the reset-time terrain-cell anchor. Because the re-placement
-          is per-DOF MASKED, terrain envs can be ego too: a stair clip re-places only its
-          free y onto the robot, keeping x/z/yaw locked to the treads (it no longer
-          detaches), and a box clip's mask varies per step (y-free-pinned approach/jump,
-          then ego recovery). So all envs may be partial-ego; the mask governs which axes
-          float. Snapping matches the FM deploy anchor (:meth:`FmTrackingCommand._run_fm`).
+        * **Clip re-placement** (``_reanchor_clip_ids``, every ``cfg.ego_anchor_every``
+          steps for ``_ego_mask`` envs) -- recompute the placement so the FREE root DOFs of
+          the clip's CURRENT-STEP anchor mask coincide with the robot's measured root,
+          while FIXED DOFs stay pinned to the reset-time terrain-cell anchor. Because the
+          re-placement is per-DOF MASKED, terrain envs can be ego too: a stair clip
+          re-places only its free lateral onto the robot, keeping downrange/height/yaw
+          locked to the treads, and a box clip's mask varies per step. The teacher runs
+          this at **every step** so tracking error is measured locally and planar drift is
+          not double-counted (see ``termination_reference_world_state`` for the other half
+          of that split).
+        * **FM snap flag** (``_reanchor_active``, every ``cfg.fm_snap_every`` steps for
+          ``_snap_mask`` envs) -- the recorder logs it and the FM dataset builds one
+          training window per snap.
 
-        Naturally idempotent across Isaac Lab's twice-per-step compute (same tick, masks,
-        robot pose + clip step -> same flag + placement), so no once-per-step guard.
+        These USED to share ``ego_anchor_every``, which was fine while re-placement was
+        occasional. It is not fine at every step: the recorder would emit one window per
+        env per step (12x the dataset, consecutive windows overlapping in all but one
+        history row), and worse, the FM target would degenerate -- node 0 always coincides
+        with the robot, so the window would encode no placement decision at all, which is
+        the very thing the FM is being trained to predict.
+
+        Idempotency across Isaac Lab's twice-per-step compute used to be incidental (same
+        tick + same robot pose -> same result). At period 1 it is load-bearing on every
+        step rather than 1 step in 12, so it is now enforced explicitly: the snapshot is
+        taken at most once per ``common_step_counter``, matching the guard
+        :meth:`FmTrackingCommand._snapshot_and_infer` already uses.
         """
-        period = max(int(self.cfg.ego_anchor_every), 1)
-        tick = self.env.episode_length_buf % period == 0
-        self._reanchor_active = self._snap_mask & tick
-        ego_due = self._ego_mask & tick
+        step_counter = int(self.env.common_step_counter)
+        if step_counter == self._last_reanchor_step:
+            return
+        self._last_reanchor_step = step_counter
+
+        ego_period = max(int(self.cfg.ego_anchor_every), 1)
+        snap_period = max(int(getattr(self.cfg, "fm_snap_every", ego_period)), 1)
+        self._reanchor_active = self._snap_mask & (self.env.episode_length_buf % snap_period == 0)
+        ego_due = self._ego_mask & (self.env.episode_length_buf % ego_period == 0)
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:

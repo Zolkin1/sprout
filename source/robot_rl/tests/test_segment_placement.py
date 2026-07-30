@@ -70,8 +70,11 @@ def _fake_cmd(mask_t: torch.Tensor, base_traj: torch.Tensor):
     )
     base_idx = {"pos": torch.tensor([0, 1, 2]), "ori": torch.tensor([3, 4, 5, 6])}
     fake = SimpleNamespace(
-        cfg=SimpleNamespace(ego_anchor_every=PERIOD),
-        env=SimpleNamespace(episode_length_buf=torch.zeros(n, dtype=torch.long)),
+        cfg=SimpleNamespace(ego_anchor_every=PERIOD, fm_snap_every=PERIOD),
+        # ``common_step_counter`` drives the once-per-step guard on the re-anchor
+        # snapshot; ``_run`` advances it in lockstep with ``episode_length_buf``.
+        env=SimpleNamespace(episode_length_buf=torch.zeros(n, dtype=torch.long),
+                            common_step_counter=0),
         manager=manager,
         device=DEVICE,
         clip_id=torch.zeros(n, dtype=torch.long),
@@ -81,6 +84,7 @@ def _fake_cmd(mask_t: torch.Tensor, base_traj: torch.Tensor):
         _ego_mask=torch.ones(n, dtype=torch.bool),
         _snap_mask=torch.ones(n, dtype=torch.bool),
         _reanchor_active=torch.zeros(n, dtype=torch.bool),
+        _last_reanchor_step=-1,          # once-per-step guard state (see _post_init)
         clip_world_pos=CELL.clone(),
         clip_world_quat=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
         _reset_world_pos=CELL.clone(),
@@ -113,6 +117,7 @@ def _run(drift_per_step: float, mask_t: torch.Tensor | None = None):
     out = torch.zeros(T_CLIP, 3)
     for s in range(T_CLIP):
         fake.env.episode_length_buf = torch.tensor([s], dtype=torch.long)
+        fake.env.common_step_counter = s
         MotionSequenceCommand._advance_step(fake)
         # Robot = the current world reference, displaced downrange by the accumulated drift.
         ref_w = fake.clip_world_pos + base_traj[s:s + 1]

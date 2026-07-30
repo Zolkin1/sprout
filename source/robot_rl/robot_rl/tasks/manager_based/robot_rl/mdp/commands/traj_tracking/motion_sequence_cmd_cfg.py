@@ -75,7 +75,24 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Re-anchor cadence in control steps for ego-anchored envs: the clip is
     re-placed on the robot's root every this many steps (a receding-horizon
     re-plan).  Smaller = more frequent, smaller per-step reference jumps.  Only
-    used when ``ego_anchor_fraction > 0``."""
+    used when ``ego_anchor_fraction > 0``.
+
+    ``1`` (what the teacher uses) makes the reference fully LOCAL: the free root
+    DOFs coincide with the robot every step, so tracking error is measured
+    locally and planar drift is not double-counted.  Drift is still graded --
+    by the termination, against the globally-fixed clip.  See
+    :meth:`MotionSequenceCommand.termination_reference_world_state`."""
+
+    fm_snap_every: int = 12
+    """Cadence in control steps for the FM SNAP flag (``_reanchor_active``), which the
+    recorder logs and the flow-matching dataset turns into one training window each.
+
+    Deliberately SEPARATE from :attr:`ego_anchor_every`.  They used to share one timer,
+    which was fine when re-placement was occasional but breaks at every-step anchoring:
+    the recorder would emit a window per env per step, and the FM target would degenerate
+    to nothing (node 0 always coincides with the robot, so the window would encode no
+    placement decision -- the very thing the FM predicts).  Keep this at the value the FM
+    checkpoint was recorded with; it must match ``fm_update_every`` on the tracker."""
 
     # --- Debug visualization (set ``debug_vis = True`` to enable) ---
     debug_vis_horizon_s: float = 3.0

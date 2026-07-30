@@ -136,12 +136,21 @@ class G1TeacherCommandsCfg:
         debug_vis=False,  # training: off (enabled in the -play variant)
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
-        # Ego-centric receding-horizon reference: half the envs have their clip
-        # periodically re-placed onto the robot's root (planar pos + heading), so
-        # the reference looks like an MPC plan that re-plans every few steps. The
-        # rest keep the fixed world-frame clip. Set ego_anchor_fraction=0 to disable.
-        ego_anchor_fraction=0.5,
-        ego_anchor_every=12,  # re-plan every 12 control steps (0.24 s at dt=0.02)
+        # LOCAL reference frame (BeyondMimic / SONIC style). Every env, every step, the
+        # clip is re-datumed onto the robot's root in whatever root DOFs its anchor mask
+        # frees -- planar + yaw on flat, leaving z/roll/pitch at the clip's own value.
+        # So the reward measures the motion's SHAPE and does not double-count planar
+        # drift; on stairs/boxes the mask pins downrange/height/yaw, so drift there is
+        # still penalised against the terrain.
+        #
+        # Drift is not un-graded, it is graded ONCE, by the termination, against the
+        # globally-fixed clip -- see termination_reference_world_state.
+        ego_anchor_fraction=1.0,
+        ego_anchor_every=1,
+        # The FM snap flag keeps its own, much slower cadence; sharing this one would
+        # flood the recorder and collapse the FM's training target. Must match the
+        # tracker's fm_update_every.
+        fm_snap_every=12,
     )
 
 

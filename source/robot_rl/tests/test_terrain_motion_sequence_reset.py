@@ -136,11 +136,13 @@ def test_snap_decoupled_from_reanchor():
     # env: 0,1 = flat ego (snap + re-place); 2,3 = stair (snap, NO re-place);
     #      4 = flat non-ego (never snaps); 5 = stair off-tick (won't fire this step).
     fake = SimpleNamespace(
-        cfg=SimpleNamespace(ego_anchor_every=period),
-        env=SimpleNamespace(episode_length_buf=torch.tensor([0, 10, 0, 20, 0, 5])),
+        cfg=SimpleNamespace(ego_anchor_every=period, fm_snap_every=period),
+        env=SimpleNamespace(episode_length_buf=torch.tensor([0, 10, 0, 20, 0, 5]),
+                            common_step_counter=0),
         _snap_mask=torch.tensor([1, 1, 1, 1, 0, 1], dtype=torch.bool),
         _ego_mask=torch.tensor([1, 1, 0, 0, 0, 0], dtype=torch.bool),
         _reanchor_active=torch.zeros(n, dtype=torch.bool),
+        _last_reanchor_step=-1,
         _reanchor_clip_ids=_stub_reanchor_clip_ids,
     )
     MotionSequenceCommand._reanchor_ego_envs(fake)
@@ -154,6 +156,62 @@ def test_snap_decoupled_from_reanchor():
     # Stair envs 2,3 snap (FM window) but are NOT re-placed (stay world-locked).
     assert fake._reanchor_active[2] and fake._reanchor_active[3]
     assert 2 not in placed["ids"] and 3 not in placed["ids"]
+
+
+def _snap_fixture(ego_every: int, snap_every: int, step: int, counter: int = 0):
+    """Fake command with independent ego / snap cadences at a given episode step."""
+    n = 2
+    placed: dict[str, list[int]] = {}
+    fake = SimpleNamespace(
+        cfg=SimpleNamespace(ego_anchor_every=ego_every, fm_snap_every=snap_every),
+        env=SimpleNamespace(episode_length_buf=torch.full((n,), step, dtype=torch.long),
+                            common_step_counter=counter),
+        _snap_mask=torch.ones(n, dtype=torch.bool),
+        _ego_mask=torch.ones(n, dtype=torch.bool),
+        _reanchor_active=torch.zeros(n, dtype=torch.bool),
+        _last_reanchor_step=-1,
+        _reanchor_clip_ids=lambda ids: placed.setdefault("ids", ids.tolist()),
+    )
+    return fake, placed
+
+
+def test_snap_and_anchor_cadences_are_independent():
+    """The FM snap cadence must NOT follow the (now per-step) re-anchor cadence.
+
+    With every-step anchoring the two sharing a timer would emit one FM training window
+    per env per step -- 12x the dataset, and a target that encodes no placement decision
+    because node 0 always coincides with the robot.
+    """
+    # Step 3: the clip re-anchors (every step) but no snap fires (snap every 12).
+    fake, placed = _snap_fixture(ego_every=1, snap_every=12, step=3)
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert placed["ids"] == [0, 1], "per-step anchoring must re-place every env"
+    assert not fake._reanchor_active.any(), "no FM snap off the snap cadence"
+
+    # Step 12: both fire.
+    fake, placed = _snap_fixture(ego_every=1, snap_every=12, step=12)
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert placed["ids"] == [0, 1]
+    assert fake._reanchor_active.all()
+
+
+def test_reanchor_snapshot_is_once_per_step():
+    """Isaac Lab computes observations twice per step; the snapshot must not double-take.
+
+    At the old 1-in-12 cadence this was incidental; at every-step anchoring it is
+    load-bearing on every step, so it is enforced against ``common_step_counter``.
+    """
+    fake, placed = _snap_fixture(ego_every=1, snap_every=1, step=4, counter=7)
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert placed["ids"] == [0, 1]
+
+    placed.clear()
+    MotionSequenceCommand._reanchor_ego_envs(fake)      # same step -> must be a no-op
+    assert placed == {}
+
+    fake.env.common_step_counter = 8                     # next step -> runs again
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert placed["ids"] == [0, 1]
 
 
 def test_flat_bbox_centering_invariant():
