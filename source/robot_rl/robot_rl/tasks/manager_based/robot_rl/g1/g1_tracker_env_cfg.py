@@ -78,6 +78,12 @@ class G1FmTrackerCommandsCfg:
         debug_vis=False,
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
+        # Put every class in the same currency as metres -- see CLF.eta_scales. Unscaled,
+        # link angular velocity took 68% of V and link POSITION 5%, at comparable RELATIVE
+        # accuracy, so "body-link tracking" graded rates. ori is a characteristic length
+        # (m/rad), the velocities a characteristic time (s). Shared with the tracker so
+        # both grade tracking the same way. Re-derive with scripts/rsl_rl/clf_balance_check.
+        eta_scales={"pos": 1.0, "ori": 0.45, "lin_vel": 0.7, "ang_vel": 0.2},
         fm_checkpoint=DEFAULT_FM_ROBOT_CKPT,
         fm_update_every=12,          # 0.24 s -- MUST match the recording's ego_anchor_every
         # Warmup clip is robot-anchored on the FM re-plan cadence (matches the deploy regime).

@@ -181,13 +181,14 @@ def test_unknown_mode_rejected():
 # CLF channel subsetting
 # ----------------------------------------------------------------------------------
 
-def _clf(cmd) -> CLF:
+def _clf(cmd, eta_scales: dict[str, float] | None = None) -> CLF:
     """The real CLF over a stub command's tracked subset."""
     return CLF(sim_dt=0.02, batch_size=cmd.num_envs,
                ordered_vel_output_names=cmd.ordered_vel_output_names,
                ordered_pos_output_names=cmd.ordered_pos_output_names,
                Q_weights=WALKING_Q_weights, R_weights=WALKING_R_weights,
-               tracked_vel_names=cmd.tracked_vel_names, device=DEVICE)
+               tracked_vel_names=cmd.tracked_vel_names, eta_scales=eta_scales,
+               device=DEVICE)
 
 
 def test_joint_mode_reproduces_the_unwidened_clf_exactly():
@@ -445,3 +446,140 @@ def test_resolve_ee_frames_excludes_root_frames():
     assert len(frames) == 4
     # Same answer with and without the widening -- that is the invariant.
     assert frames == MotionSequenceCommand.resolve_ee_frames(_fake_cmd(with_root=False))
+
+
+# ----------------------------------------------------------------------------------
+# Per-class channel scaling (``eta_scales``)
+# ----------------------------------------------------------------------------------
+#
+# V sums raw squares over metres, radians, m/s and rad/s as though they were one quantity,
+# so the numerically biggest class wins by default regardless of how well it is tracked.
+# ``eta_scales`` is the missing unit conversion, folded into P as ``S^T P S``.  What has to
+# hold: each class moves only its own channels, V's share moves as the SQUARE of the factor,
+# and the result is still a genuine CARE solution (so V stays a valid CLF and
+# ``clf_decreasing_condition`` keeps its guarantee) rather than an ad-hoc reweighting.
+
+_SCALES = {"pos": 1.0, "ori": 0.45, "lin_vel": 0.7, "ang_vel": 0.2}
+
+
+def _class_eta_indices(clf: CLF, cls: str) -> list[int]:
+    """Eta indices belonging to one scale class, derived independently of the fold."""
+    out = []
+    for i, name in enumerate(clf.ordered_vel_output_names):
+        pose_key, twist_key = CLF._channel_classes(name)
+        if pose_key == cls:
+            out.append(2 * i)
+        if twist_key == cls:
+            out.append(2 * i + 1)
+    return out
+
+
+def test_eta_scales_default_is_a_no_op():
+    """The default must not perturb P, or every non-teacher caller silently changes."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    torch.testing.assert_close(_clf(cmd).P, _clf(cmd, eta_scales={}).P, rtol=0, atol=0)
+    torch.testing.assert_close(
+        _clf(cmd).P, _clf(cmd, eta_scales={"ori": 1.0}).P, rtol=0, atol=0)
+
+
+def test_eta_scales_hit_their_own_class_and_nothing_else():
+    """``P_scaled == outer(s, s) * P``, with s built independently of the implementation."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    base, scaled = _clf(cmd), _clf(cmd, eta_scales=_SCALES)
+
+    s_vec = torch.ones(base.n_outputs, device=base.P.device)
+    for cls, factor in _SCALES.items():
+        idx = _class_eta_indices(base, cls)
+        assert idx, f"body mode must track {cls} channels for this test to mean anything"
+        s_vec[idx] = factor
+    torch.testing.assert_close(scaled.P, base.P * torch.outer(s_vec, s_vec))
+
+    # Spelled out on the diagonal, which is what the V split is actually built from.
+    for cls, factor in _SCALES.items():
+        idx = _class_eta_indices(base, cls)
+        torch.testing.assert_close(scaled.P[idx, idx], base.P[idx, idx] * factor * factor)
+
+
+def test_eta_scales_leave_joint_channels_alone_by_default():
+    """The joint-vs-body A/B's control arm must not move unless scaled deliberately."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="joint")
+    base, scaled = _clf(cmd), _clf(cmd, eta_scales={"ori": 0.45, "ang_vel": 0.2})
+    joints = _class_eta_indices(base, "joint_pos") + _class_eta_indices(base, "joint_vel")
+    assert joints, "joint mode must track joint channels"
+    torch.testing.assert_close(
+        scaled.P[joints, joints], base.P[joints, joints], rtol=0, atol=0)
+
+
+def test_eta_scales_move_a_class_share_of_V_as_the_square():
+    """The tuning law the config comments quote, on a real V rather than on P alone."""
+    torch.manual_seed(0)
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    base, scaled = _clf(cmd), _clf(cmd, eta_scales={"ori": 0.45})
+    eta = torch.randn(4, base.n_outputs, device=base.P.device)
+
+    idx = _class_eta_indices(base, "ori")
+    share = lambda clf: torch.einsum(                                        # noqa: E731
+        "bi,ij,bj->b", eta[:, idx], clf.P[idx][:, idx], eta[:, idx])
+    torch.testing.assert_close(share(scaled), share(base) * 0.45**2)
+
+
+def test_eta_scales_stay_a_care_solution():
+    """``S^T P S`` solves the CARE for ``(a^3/b*q_p, a*b*q_v, b^3/a*r)`` -- V remains a CLF.
+
+    This is the whole justification for the knob: it is a reparameterization of the optimal
+    cost-to-go, not an arbitrary reweighting.  Checked on a channel whose two halves are
+    scaled by DIFFERENT factors, which is the general case.
+    """
+    import numpy as np
+    from scipy.linalg import solve_continuous_are
+
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    scaled = _clf(cmd, eta_scales=_SCALES)
+    i = _class_eta_indices(scaled, "ang_vel")[0]        # velocity half of an ori channel
+    a, b = _SCALES["ori"], _SCALES["ang_vel"]
+
+    name = scaled.ordered_vel_output_names[i // 2]
+    q_p, q_v = WALKING_Q_weights[name]
+    (r,) = WALKING_R_weights[name]
+
+    mat_a = np.array([[0.0, 1.0], [0.0, 0.0]])
+    mat_b = np.array([[0.0], [1.0]])
+    expect = solve_continuous_are(
+        mat_a, mat_b, np.diag([a**3 / b * q_p, a * b * q_v]), np.diag([b**3 / a * r]))
+    np.testing.assert_allclose(
+        scaled.P[i - 1:i + 1, i - 1:i + 1].cpu().numpy(), expect, rtol=1e-5, atol=1e-6)
+
+
+def test_eta_scales_keep_P_positive_definite():
+    """V must stay a valid CLF, i.e. P symmetric positive definite.
+
+    ``S^T P S`` is a congruence transform, so by Sylvester's law of inertia a NONSINGULAR S
+    preserves inertia and P stays SPD however lopsided the factors get.  Cholesky is the
+    check that actually fails when it does not.
+    """
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    for scales in ({}, _SCALES, {"ori": 0.05, "ang_vel": 0.02}, {"pos": 4.0}):
+        P = _clf(cmd, eta_scales=scales).P.double()
+        torch.testing.assert_close(P, P.T, rtol=0, atol=0)
+        assert torch.linalg.eigvalsh(P)[0] > 0.0, f"P not positive definite at {scales}"
+        torch.linalg.cholesky(P)   # raises if it is not
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.3])
+def test_eta_scales_reject_singular_and_negative(bad):
+    """The two values that quietly break the CLF rather than loudly failing.
+
+    ``0`` makes S singular, so P goes positive SEMI-definite and a nonzero eta can score
+    V = 0.  A negative factor keeps P definite but flips the P12 cross term, rewarding pose
+    error and velocity being aligned instead of opposed.
+    """
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    with pytest.raises(ValueError, match="must be > 0"):
+        _clf(cmd, eta_scales={"ang_vel": bad})
+
+
+def test_eta_scales_reject_unknown_class():
+    """A typo'd class name must fail loudly, not silently grade nothing."""
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    with pytest.raises(ValueError, match="unknown eta_scales class"):
+        _clf(cmd, eta_scales={"ang_velocity": 0.2})

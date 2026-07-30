@@ -136,6 +136,12 @@ class G1TeacherCommandsCfg:
         debug_vis=False,  # training: off (enabled in the -play variant)
         Q_weights=WALKING_Q_weights,
         R_weights=WALKING_R_weights,
+        # Put every class in the same currency as metres -- see CLF.eta_scales. Unscaled,
+        # link angular velocity took 68% of V and link POSITION 5%, at comparable RELATIVE
+        # accuracy, so "body-link tracking" graded rates. ori is a characteristic length
+        # (m/rad), the velocities a characteristic time (s). Shared with the tracker so
+        # both grade tracking the same way. Re-derive with scripts/rsl_rl/clf_balance_check.
+        eta_scales={"pos": 1.0, "ori": 0.45, "lin_vel": 0.7, "ang_vel": 0.2},
         # LOCAL reference frame (BeyondMimic / SONIC style). Every env, every step, the
         # clip is re-datumed onto the robot's root in whatever root DOFs its anchor mask
         # frees -- planar + yaw on flat, leaving z/roll/pitch at the clip's own value.
@@ -398,10 +404,19 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         # Stronger undesired-contact penalty + tighter CLF normalization.
         self.rewards.undesired_contacts.weight = -0.5
         # CLF reward normaliser: reward = 10 * exp(-V / (lambda_max * max_eta_err^2)).
-        # 3.5 puts the half-reward point at V ~= 38, sized against the V ~= 41 a live
-        # policy actually sits at (200 iters, body mode) rather than the V ~= 30 of a
-        # collapsing one. At 5.0 half-reward sat at V ~= 77, which the policy only reached
-        # as it was dying -- the whole operating range was squeezed into the saturated top.
+        # Must be re-derived whenever ANY of Q, R or ang_vel_scale move, since they change
+        # V's scale underneath it. The sizing rule, applied by clf_balance_check.py: put
+        # half-reward at ~3x the V a live policy actually averages, which lands the
+        # instantaneous reward near 8/10 in steady tracking and ~5/10 as an episode dies.
+        #
+        # 1.6 goes with the eta_scales above, which cut mean V 16.89 -> 2.20 (and lambda_max
+        # 4.46 -> 3.96) by putting the four channel classes in one currency. History: 2.25
+        # for ang_vel-only scaling at 0.3; 4.1 unscaled with _ROOT_Q_DEFAULT = [10.0, 0.1];
+        # 3.5 for the old [1.0, 0.1] at a measured V ~= 41; 5.0 before that, where
+        # half-reward sat at V ~= 77 and the policy only got there as it was dying.
+        #
+        # ``clf_decreasing_condition`` needs NO matching change: eta_scales is folded into P,
+        # not into eta, so eta_max / eta_dot_max keep their physical units.
         #
         # Two traps when re-tuning this from the dashboard:
         #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by
@@ -409,7 +424,7 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         #     episodes are ~1.3 s of a 20 s window. It tracks SURVIVAL as much as quality.
         #   * ``Metrics/traj_ref/v`` is logged at reset, so it is V at the instant of
         #     FAILURE, not the episode average. Back the average out of the reward instead.
-        self.rewards.clf_reward.params["max_eta_err"] = 3.5
+        self.rewards.clf_reward.params["max_eta_err"] = 1.6
         self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
         self._apply_tracking_mode()

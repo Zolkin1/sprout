@@ -225,6 +225,7 @@ class BaseTrajectoryCommand(CommandTerm):
             Q_weights=self.cfg.Q_weights,
             R_weights=self.cfg.R_weights,
             tracked_vel_names=self.tracked_vel_names,
+            eta_scales=self.cfg.eta_scales,
             device=self.device,
         )
 

@@ -20,6 +20,14 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     hf_repo: str = None
     Q_weights: list[float] = None
     R_weights: list[float] = None
+
+    eta_scales: dict[str, float] | None = None
+    """Per-class unit conversion applied to the CLF's channels (see :class:`CLF`).
+
+    V adds up metres, radians, m/s and rad/s as if they were one quantity; these are the
+    factors that make them commensurable, keyed by ``CLF.ETA_SCALE_CLASSES``.  Each class's
+    share of V moves as the SQUARE of its factor.  ``None`` is the historical all-1.0.
+    """
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
 
     library_fingerprint: str | None = None
