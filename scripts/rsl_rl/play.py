@@ -50,6 +50,7 @@ if _FM_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _FM_SCRIPT_DIR)
 from export_tracker_onnx import export_tracker_onnx  # isort: skip
 from export_fm_onnx import export_fm_onnx  # isort: skip
+from motion_gen.clips.subset import resolve_play_clip  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
@@ -179,7 +180,15 @@ parser.add_argument(
     help="Path to the clip / trajectory library (.h5) to track, overriding the "
          "cfg default. Applied to any command term exposing a `path` field "
          "(traj_ref). Equivalent to the hydra override "
-         "env.commands.traj_ref.path=<h5>, but without the hydra syntax.",
+         "env.commands.traj_ref.path=<h5>, but without the hydra syntax. NOTE play "
+         "loads the '<name>_small.h5' sibling when one exists -- see --full_clip.",
+)
+parser.add_argument(
+    "--full_clip", action="store_true", default=False,
+    help="Load the FULL library given to --clip instead of its '_small' sibling. Play "
+         "defaults to the small subset because a full training library is multi-GB and slow "
+         "to load; use this when you specifically need every clip / every terrain tile. Make "
+         "a missing sibling with scripts/rsl_rl/make_clip_subset.py.",
 )
 parser.add_argument(
     "--clip_device", type=str, default=None,
@@ -303,11 +312,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Optionally override the clip/trajectory library path (the file each
         # command term tracks).  Applied to any command term exposing a `path`
         # field; equivalent to env.commands.traj_ref.path=<h5> but without hydra.
-        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+        # PLAY DEFAULT: swap in the '<name>_small.h5' sibling when there is a current one, so a
+        # play run does not pay for a multi-GB training library. Resolved ONCE here, before both
+        # consumers below, so the command term and the terrain importer cannot disagree.
+        clip_path = args_cli.clip
+        if clip_path is not None:
+            clip_path, _clip_msgs = resolve_play_clip(clip_path, prefer_small=not args_cli.full_clip)
+            for _m in _clip_msgs:
+                print(_m)
+        if clip_path is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
             for name, term in vars(env_cfg.commands).items():
                 if hasattr(term, "path"):
-                    term.path = args_cli.clip
-                    print(f"[INFO] clip path='{args_cli.clip}' for commands.{name}.")
+                    term.path = clip_path
+                    print(f"[INFO] clip path='{clip_path}' for commands.{name}.")
             # The ClipTerrainImporter builds its terrain mesh + per-env terrain_id from
             # its OWN clip_library_path, which must stay identical to the command's clip
             # path -- tile terrain ids must line up with the clips' terrain ids. Re-point it
@@ -316,8 +333,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # on a terrain the clips do not belong to. Go through --clip.
             terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
             if terrain is not None and hasattr(terrain, "clip_library_path"):
-                terrain.clip_library_path = args_cli.clip
-                print(f"[INFO] clip path='{args_cli.clip}' for scene.terrain (ClipTerrainImporter).")
+                terrain.clip_library_path = clip_path
+                print(f"[INFO] clip path='{clip_path}' for scene.terrain (ClipTerrainImporter).")
 
         # Optionally hold a clip/trajectory library off-GPU (set in Python, not via
         # hydra: the cfg field default is None so hydra rejects a str override).

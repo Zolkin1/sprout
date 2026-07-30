@@ -34,6 +34,12 @@ import argparse
 import torch
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
+from motion_gen.clips.subset import (
+    DEFAULT_CLIPS_PER_TILE,
+    DEFAULT_FLAT_CLIPS,
+    DEFAULT_NUM_TILES,
+    write_small_library,
+)
 
 _PERSTEP = ["y_des", "dy_des", "contact", "target_vel", "anchor_mask_t"]
 
@@ -166,6 +172,17 @@ def main() -> int:
                         "clips are all terrain_id -1 is treated as a flat pool (its tiles -> flat-tile count).")
     p.add_argument("--out", required=True)
     p.add_argument("--num-steps", type=int, default=None, help="Common clip length (default = max over sources).")
+    # Play-subset knobs. The subset is written by default so play.py's '<name>_small.h5'
+    # default always has something current to load; see scripts/rsl_rl/make_clip_subset.py.
+    p.add_argument("--no-small", action="store_true",
+                   help="Skip writing the '<name>_small.h5' play subset (play.py then loads the "
+                        "FULL library and warns).")
+    p.add_argument("--small-tiles", type=int, default=DEFAULT_NUM_TILES,
+                   help=f"Terrain tiles in the play subset (default {DEFAULT_NUM_TILES}).")
+    p.add_argument("--small-clips-per-tile", type=int, default=DEFAULT_CLIPS_PER_TILE,
+                   help=f"Clips per tile in the play subset (default {DEFAULT_CLIPS_PER_TILE}).")
+    p.add_argument("--small-flat-clips", type=int, default=DEFAULT_FLAT_CLIPS,
+                   help=f"Flat clips in the play subset (default {DEFAULT_FLAT_CLIPS}).")
     p.add_argument("--flat-from", default=None,
                    help="Draw flat clips from this source's terrain_id==-1 clips (e.g. a stairs+flat library) "
                         "to size + fill the flat tiles. Flat tile SIZE = largest carried flat clip + buffer.")
@@ -257,6 +274,25 @@ def main() -> int:
     yy = torch.as_tensor(lib.y_des)
     print(f"\n[compose] wrote {args.out}: {lib.num_clips} clips x {lib.num_steps} steps, "
           f"{total_tiles} tiles, finite={bool(torch.isfinite(yy).all())}")
+
+    # Always cut the play-sized sibling. This is the ONE script that produces a library you
+    # train and play on (the family files from mb_assemble_library are intermediates), and
+    # play.py defaults to '<name>_small.h5' -- so emitting it here is what keeps that default
+    # working, and keeps the small in lock-step with the parent it was cut from. Failing to
+    # write it must NOT fail the compose: the full library is the deliverable.
+    if not args.no_small:
+        try:
+            info = write_small_library(
+                args.out, num_tiles=args.small_tiles,
+                clips_per_tile=args.small_clips_per_tile, flat_clips=args.small_flat_clips,
+            )
+            print(f"[compose] play subset -> {info['out']}: {info['num_clips']} clips over "
+                  f"{info['num_tiles']} tiles, {info['bytes'] / 1e6:.1f} MB "
+                  f"(play.py loads this by default; --full_clip for the full library)")
+        except (ValueError, OSError) as exc:
+            print(f"[compose][WARN] could not write the play subset: {exc}\n"
+                  f"[compose][WARN] make it later with: python scripts/rsl_rl/make_clip_subset.py "
+                  f"--lib {args.out}")
     return 0
 
 
