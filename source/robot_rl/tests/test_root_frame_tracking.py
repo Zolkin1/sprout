@@ -7,9 +7,13 @@ Three things are pinned here:
 * **The CLF channel subset.** ``y``/``dy`` always carry every channel; ``tracking_mode``
   selects what enters eta.  ``"joint"`` must reproduce the pre-existing behaviour EXACTLY
   (same P, same eta, same subgroups) or the A/B's control arm is not a control.
-* **The measured root-frame block.** ``compute_measured_output`` must produce the same
-  quantity the generator writes -- pose in the full pelvis frame, and a twist that is the
-  true derivative of that pose (the ``omega x p`` term is easy to omit and hard to notice).
+* **The comparison frame.** Both sides of the CLF are WORLD quantities: the measured block
+  is a plain world read, and the desired side is lifted out of its pelvis-relative storage
+  by ``_lift_root_frames_to_world``.  ``@root`` names how the CLIP STORES a channel (which
+  is what makes it immune to re-anchoring and slope rotation), not the frame it is graded
+  in.  The lift's ``omega x r`` cross term is easy to omit and hard to notice -- drop it and
+  the positions still look perfect while the velocities are quietly wrong -- so it is
+  pinned by a round-trip test.
 * **Frame-list stability.** ``resolve_ee_frames`` must keep returning only the WORLD
   end-effectors: it sizes ``ee_ref``, drives the per-step world lift, and gates FM checkpoint
   compatibility.
@@ -20,7 +24,7 @@ methods under test touch, following ``test_segment_placement.py``.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -136,15 +140,29 @@ def test_joint_mode_selects_world_and_joints():
 
 
 def test_body_mode_swaps_joints_for_root_frames():
-    """``body`` keeps the world skeleton, drops the joints, adds the root-frame links."""
+    """``body`` drops the joints, adds the body links, and DEDUPES the shared frames.
+
+    Ankles and wrists exist in both the world set and the ``@root`` set. Grading both would
+    double their weight and grade them against two different reference velocities (world =
+    finite differences, ``@root`` = FK Jacobian). Only the ``@root`` copy is kept.
+    """
     cmd = _fake_cmd(with_root=True, tracking_mode="body")
     tracked = cmd.tracked_vel_names
     assert not any(n.startswith("joint:") for n in tracked)
     assert sum(is_root_frame(n) for n in tracked) == 6 * len(G1_BODY_TRACK_FRAMES)
-    # The world end-effectors stay tracked, so global foot placement is still penalised.
+
+    shared = [f for f in WORLD_FRAMES if f in G1_BODY_TRACK_FRAMES]
+    assert shared, "fixture should exercise the dedupe"
+    for f in shared:
+        assert f"{f}:pos_x" not in tracked, f"{f} world copy must be deduped"
+        assert f"{root_frame_name(f)}:pos_x" in tracked
+    # Frames with no @root twin (the base) stay, so global placement is still penalised.
     for f in WORLD_FRAMES:
-        assert f"{f}:pos_x" in tracked
-    assert len(tracked) == 6 * len(WORLD_FRAMES) + 6 * len(G1_BODY_TRACK_FRAMES)
+        if f not in G1_BODY_TRACK_FRAMES:
+            assert f"{f}:pos_x" in tracked
+
+    kept_world = [f for f in WORLD_FRAMES if f not in G1_BODY_TRACK_FRAMES]
+    assert len(tracked) == 6 * (len(kept_world) + len(G1_BODY_TRACK_FRAMES))
 
 
 def test_body_mode_needs_a_widened_library():
@@ -214,7 +232,9 @@ def test_body_mode_clf_has_no_joint_energy_and_a_root_group():
     """Body-mode eta contains the root-frame links and no joint channel."""
     cmd = _fake_cmd(with_root=True, tracking_mode="body")
     clf = _clf(cmd)
-    assert clf.n_outputs == 2 * (6 * len(WORLD_FRAMES) + 6 * len(G1_BODY_TRACK_FRAMES))
+    # Deduped: the shared ankle/wrist frames are graded once, via their @root copy.
+    kept_world = [f for f in WORLD_FRAMES if f not in G1_BODY_TRACK_FRAMES]
+    assert clf.n_outputs == 2 * 6 * (len(kept_world) + len(G1_BODY_TRACK_FRAMES))
     assert clf.subgroup_indices["joint_pos"].numel() == 0
     assert clf.subgroup_indices["root_body_pos"].numel() == 3 * len(G1_BODY_TRACK_FRAMES)
     assert clf.subgroup_indices["root_body_ori"].numel() == 3 * len(G1_BODY_TRACK_FRAMES)
@@ -257,7 +277,8 @@ def test_batched_box_minus_matches_per_body():
         for tensor in (y_a, y_d):
             tensor[:, cols] = torch.nn.functional.normalize(tensor[:, cols], dim=-1)
     got = clf.compute_y_err(y_a, y_d)
-    assert len(clf.ori_body_indices_manifold) == len(WORLD_FRAMES) + len(G1_BODY_TRACK_FRAMES)
+    kept_world = [f for f in WORLD_FRAMES if f not in G1_BODY_TRACK_FRAMES]
+    assert len(clf.ori_body_indices_manifold) == len(kept_world) + len(G1_BODY_TRACK_FRAMES)
     for body, cols in clf.ori_body_indices_manifold.items():
         tan = clf.ori_body_indices_tangent[body]
         torch.testing.assert_close(got[:, tan], quat_box_minus(y_a[:, cols], y_d[:, cols]),
@@ -287,8 +308,14 @@ def _random_body_state(n: int, nb: int, seed: int = 0):
     return pos, quat, vel
 
 
-def test_measured_root_block_matches_hand_rolled_transform(plain_tensors):
-    """The measured block is the full-pelvis-frame pose and its TRUE derivative."""
+def test_measured_body_block_is_the_world_pose_and_twist(plain_tensors):
+    """The measured body block is a plain WORLD read, in the caller's reference frame.
+
+    The comparison frame moved: both sides of the CLF are now world quantities (the
+    desired side is lifted out of its pelvis-relative storage by
+    ``MotionSequenceCommand._lift_root_frames_to_world``).  ``@root`` names how the CLIP
+    STORES these channels, not the frame they are graded in.
+    """
     cmd = _fake_cmd(with_root=True, tracking_mode="body")
     n, nb_all = cmd.num_envs, len(BODY_NAMES)
     pos_w, quat_w, vel_w = _random_body_state(n, nb_all, seed=3)
@@ -305,41 +332,36 @@ def test_measured_root_block_matches_hand_rolled_transform(plain_tensors):
         cmd, torch.zeros(n, 3), torch.tensor([[0.0, 0.0, 0.0, 1.0]]).expand(n, 4)
     )
 
-    b = BODY_NAMES.index("pelvis_link")
-    base_p, base_q = pos_w[:, b], quat_w[:, b]
-    base_v, base_w = vel_w[:, b, :3], vel_w[:, b, 3:]
-    inv = quat_inv(base_q)
-    omega_b = quat_apply(inv, base_w)
-
-    names = cmd.ordered_pos_output_names
-    vnames = cmd.ordered_vel_output_names
+    names, vnames = cmd.ordered_pos_output_names, cmd.ordered_vel_output_names
     for body in G1_BODY_TRACK_FRAMES:
         i = BODY_NAMES.index(body)
         rf = root_frame_name(body)
-        p_r = quat_apply(inv, pos_w[:, i] - base_p)
-        q_r = quat_mul(inv, quat_w[:, i])
-        w_r = quat_apply(inv, vel_w[:, i, 3:] - base_w)
-        v_r = quat_apply(inv, vel_w[:, i, :3] - base_v) - torch.linalg.cross(omega_b, p_r)
-
         got_p = cmd.y_act[:, [names.index(f"{rf}:pos_{a}") for a in "xyz"]]
         got_q = cmd.y_act[:, [names.index(f"{rf}:ori_{a}") for a in ("x", "y", "z", "w")]]
         got_v = cmd.dy_act[:, [vnames.index(f"{rf}:pos_{a}") for a in "xyz"]]
         got_w = cmd.dy_act[:, [vnames.index(f"{rf}:ori_{a}") for a in "xyz"]]
-        torch.testing.assert_close(got_p, p_r, msg=f"{body} pos")
-        torch.testing.assert_close(got_q, q_r, msg=f"{body} ori")
-        torch.testing.assert_close(got_v, v_r, msg=f"{body} lin vel")
-        torch.testing.assert_close(got_w, w_r, msg=f"{body} ang vel")
+        torch.testing.assert_close(got_p, pos_w[:, i], msg=f"{body} pos")
+        torch.testing.assert_close(got_q, quat_w[:, i], msg=f"{body} ori")
+        torch.testing.assert_close(got_v, vel_w[:, i, :3], msg=f"{body} lin vel")
+        torch.testing.assert_close(got_w, vel_w[:, i, 3:], msg=f"{body} ang vel")
 
 
-def test_measured_root_block_is_pose_invariant(plain_tensors):
-    """Rigidly moving the whole robot in the world leaves the root-frame block unchanged."""
+def test_measured_body_block_moves_with_the_robot(plain_tensors):
+    """World quantities are pose-EQUIvariant, not pose-invariant.
+
+    The old pelvis-frame block was invariant to rigidly moving the robot.  The world block
+    must not be: displacing the robot displaces the tracked links by the same amount, which
+    is exactly what lets the anchored reference cancel the free root DOFs and leave the
+    z/roll/pitch discrepancy standing.
+    """
     cmd = _fake_cmd(with_root=True, tracking_mode="body")
     n, nb_all = cmd.num_envs, len(BODY_NAMES)
     pos_w, quat_w, vel_w = _random_body_state(n, nb_all, seed=4)
+    shift = torch.tensor([2.0, -1.0, 0.5])
 
-    def measured(p, q, v):
+    def measured(p):
         cmd.robot.data = SimpleNamespace(
-            body_pos_w=p, body_quat_w=q, body_link_vel_w=v,
+            body_pos_w=p, body_quat_w=quat_w, body_link_vel_w=vel_w,
             joint_pos=torch.zeros(n, len(JOINTS)), joint_vel=torch.zeros(n, len(JOINTS)),
         )
         cmd.y_act = torch.zeros(n, len(cmd.ordered_pos_output_names))
@@ -348,12 +370,67 @@ def test_measured_root_block_is_pose_invariant(plain_tensors):
         BaseTrajectoryCommand.compute_measured_output(
             cmd, torch.zeros(n, 3), torch.tensor([[0.0, 0.0, 0.0, 1.0]]).expand(n, 4)
         )
-        rp = [i for i, nm in enumerate(cmd.ordered_pos_output_names) if is_root_frame(nm)]
+        rp = [i for i, nm in enumerate(cmd.ordered_pos_output_names)
+              if is_root_frame(nm) and ":pos_" in nm]
         return cmd.y_act[:, rp].clone()
 
-    base = measured(pos_w, quat_w, vel_w)
-    shifted = measured(pos_w + torch.tensor([2.0, -1.0, 0.5]), quat_w, vel_w)
-    torch.testing.assert_close(base, shifted)
+    base = measured(pos_w)
+    shifted = measured(pos_w + shift)
+    nb = len(G1_BODY_TRACK_FRAMES)
+    torch.testing.assert_close(shifted, base + shift.repeat(nb)[None, :].expand(n, 3 * nb))
+
+
+def test_lift_inverts_the_pelvis_relative_storage(plain_tensors):
+    """Lifting ``@root`` into world and undoing it recovers the stored pose AND twist.
+
+    Guards the cross terms in ``_lift_root_frames_to_world``: drop the ``w0 x (R p_r)``
+    and the positions still look perfect while the velocities are quietly wrong, which is
+    exactly the bug that would show up only as a mysteriously unlearnable reward.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
+        MotionSequenceCommand,
+    )
+
+    cmd = _fake_cmd(with_root=True, tracking_mode="body")
+    n = cmd.num_envs
+    b = len(cmd.root_body_frames)
+    torch.manual_seed(11)
+
+    # Stored (pelvis-relative) values, and an arbitrary non-trivial base pose+twist.
+    p_r = torch.randn(n, b, 3)
+    q_r = torch.randn(n, b, 4)
+    q_r = q_r / torch.linalg.vector_norm(q_r, dim=-1, keepdim=True)
+    v_r, w_r = torch.randn(n, b, 3), torch.randn(n, b, 3)
+    base = torch.randn(n, 13)
+    base[:, 3:7] /= torch.linalg.vector_norm(base[:, 3:7], dim=-1, keepdim=True)
+
+    cmd.y_des = torch.zeros(n, len(cmd.ordered_pos_output_names))
+    cmd.dy_des = torch.zeros(n, len(cmd.ordered_vel_output_names))
+    cmd._rf_maps = "unset"
+    # The lift resolves its index maps through self._root_frame_maps().
+    cmd._root_frame_maps = MethodType(MotionSequenceCommand._root_frame_maps, cmd)
+    pos_i, ori_i, lin_i, ang_i = cmd._root_frame_maps()
+    cmd.y_des[:, pos_i] = p_r.reshape(n, -1)
+    cmd.y_des[:, ori_i] = q_r.reshape(n, -1)
+    cmd.dy_des[:, lin_i] = v_r.reshape(n, -1)
+    cmd.dy_des[:, ang_i] = w_r.reshape(n, -1)
+
+    MotionSequenceCommand._lift_root_frames_to_world(cmd, base)
+
+    p0, q0, v0, w0 = base[:, 0:3], base[:, 3:7], base[:, 7:10], base[:, 10:13]
+    inv = quat_inv(q0)[:, None, :].expand(n, b, 4).reshape(n * b, 4)
+    p_w = cmd.y_des[:, pos_i].view(n, b, 3)
+    off = p_w - p0[:, None, :]
+
+    # Undo the lift and compare with what went in.
+    torch.testing.assert_close(quat_apply(inv, off.reshape(n * b, 3)).view(n, b, 3), p_r)
+    torch.testing.assert_close(
+        quat_mul(inv, cmd.y_des[:, ori_i].view(n * b, 4)).view(n, b, 4), q_r)
+    v_w = cmd.dy_des[:, lin_i].view(n, b, 3)
+    lin_back = v_w - v0[:, None, :] - torch.linalg.cross(w0[:, None, :].expand_as(off), off)
+    torch.testing.assert_close(quat_apply(inv, lin_back.reshape(n * b, 3)).view(n, b, 3), v_r)
+    w_back = cmd.dy_des[:, ang_i].view(n, b, 3) - w0[:, None, :]
+    torch.testing.assert_close(quat_apply(inv, w_back.reshape(n * b, 3)).view(n, b, 3), w_r)
 
 
 # ----------------------------------------------------------------------------------

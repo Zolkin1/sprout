@@ -167,14 +167,6 @@ class BaseTrajectoryCommand(CommandTerm):
          self.ordered_pos_output_names, self.ordered_vel_output_names,
          self.body_type, self.root_body_idx, self.root_body_frames) = result
 
-        # Articulation index of the frame the root-frame channels are expressed in.  Read from
-        # ``body_pos_w`` / ``body_link_vel_w`` rather than ``root_pos_w`` / ``root_lin_vel_w`` so
-        # the base and the tracked bodies come from the SAME arrays -- ``root_*_vel_w`` is a
-        # centre-of-mass quantity in Isaac Lab, which would put a lever-arm error into the
-        # relative velocity.
-        self._root_base_body_idx = self.robot.body_names.index(
-            getattr(self.cfg, "base_frame_name", "pelvis_link")
-        )
 
         # --- State tensors ------------------------------------------------
         self.y_act = torch.zeros((self.num_envs, len(self.ordered_pos_output_names)), device=self.device)
@@ -360,47 +352,42 @@ class BaseTrajectoryCommand(CommandTerm):
             pos_output_idx += (4 * num_ori_bodies.item())
             vel_output_idx += (3 * num_ori_bodies.item())
 
-        # --- Root-frame bodies ---
-        # The DeepMimic / Sonic parameterization: each link's pose and twist relative to the
-        # robot's own root, expressed in the root frame.  Note this uses the FULL inverse root
-        # rotation, not the yaw-only ``_align_yaw_batched`` the world block above uses -- so the
-        # result is exactly FK(q) and pelvis roll/pitch error is charged only to the pelvis
-        # channels instead of being smeared across every body.
+        # --- Tracked body links ---
+        # Measured in the SAME frame as the world block above -- these are plain world
+        # pose+twist reads, aligned to the caller's reference frame.
+        #
+        # ``@root`` names the frame the CLIP STORES these in (pelvis-relative, so no rigid
+        # transform of the clip can corrupt them), NOT the frame they are compared in.  The
+        # desired side is lifted out of that storage into the anchored world frame by
+        # ``MotionSequenceCommand._lift_root_frames_to_world`` before the CLF sees it, so
+        # both sides of the error are world quantities.
+        #
+        # Comparing in the anchored world -- rather than each side in its own pelvis frame --
+        # is deliberate: with the clip root re-datumed onto the robot every step, the free
+        # root DOFs cancel exactly, so what is left is the local shape error PLUS the
+        # z/roll/pitch base discrepancy propagated down the limb.  A pitched robot really
+        # does have a displaced foot, and that should be charged.
         if self.root_body_idx is not None:
             body_pos_w = wp.to_torch(self.robot.data.body_pos_w)
             body_quat_w = wp.to_torch(self.robot.data.body_quat_w)
             body_vel_w = wp.to_torch(self.robot.data.body_link_vel_w)
 
-            b = self._root_base_body_idx
-            base_pos_w = body_pos_w[:, b, :]                      # [N, 3]
-            base_quat_w = body_quat_w[:, b, :]                    # [N, 4] xyzw
-            base_lin_w = body_vel_w[:, b, :3]                     # [N, 3]
-            base_ang_w = body_vel_w[:, b, 3:]                     # [N, 3]
-            inv_base = quat_inv(base_quat_w)
-
-            p_w = body_pos_w[:, self.root_body_idx, :]            # [N, B, 3]
-            q_w = body_quat_w[:, self.root_body_idx, :]           # [N, B, 4]
-            v_w = body_vel_w[:, self.root_body_idx, :3]
-            w_w = body_vel_w[:, self.root_body_idx, 3:]
-
-            p_r = _rotate_by_inv_batched(p_w - base_pos_w.unsqueeze(1), base_quat_w)
-            q_r = _quat_mul_inv_batched(q_w, base_quat_w)
-            w_r = _rotate_by_inv_batched(w_w - base_ang_w.unsqueeze(1), base_quat_w)
-            # d/dt (R^T (p - p0)) = R^T (v - v0) - omega_base x p_r, with omega_base expressed in
-            # the base frame.  The cross term is what makes this the true derivative of ``p_r``
-            # (and what makes it match the generator's ``jv @ qdot``).
-            base_ang_b = quat_apply(inv_base, base_ang_w)         # [N, 3]
-            v_r = (_rotate_by_inv_batched(v_w - base_lin_w.unsqueeze(1), base_quat_w)
-                   - torch.linalg.cross(base_ang_b.unsqueeze(1).expand_as(p_r), p_r))
+            p_w, q_w, v_w, w_w = _get_pos_ori_vel_relative(
+                ref_frame_pos_w, ref_frame_quat,
+                body_pos_w[:, self.root_body_idx, :],
+                body_quat_w[:, self.root_body_idx, :],
+                body_vel_w[:, self.root_body_idx, :3],
+                body_vel_w[:, self.root_body_idx, 3:],
+            )
 
             nb = len(self.root_body_idx)
-            self.y_act[:, pos_output_idx:pos_output_idx + 3 * nb] = p_r.flatten(1)
-            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = v_r.flatten(1)
+            self.y_act[:, pos_output_idx:pos_output_idx + 3 * nb] = p_w.flatten(1)
+            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = v_w.flatten(1)
             pos_output_idx += 3 * nb
             vel_output_idx += 3 * nb
 
-            self.y_act[:, pos_output_idx:pos_output_idx + 4 * nb] = q_r.flatten(1)
-            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = w_r.flatten(1)
+            self.y_act[:, pos_output_idx:pos_output_idx + 4 * nb] = q_w.flatten(1)
+            self.dy_act[:, vel_output_idx:vel_output_idx + 3 * nb] = w_w.flatten(1)
             pos_output_idx += 4 * nb
             vel_output_idx += 3 * nb
 
@@ -811,8 +798,16 @@ class BaseTrajectoryCommand(CommandTerm):
         ``y``/``dy`` always carry every channel; this picks the graded subset.  ``"joint"``
         keeps the world frames and the joints (the original behaviour, so the returned list is
         the full one minus nothing when the library carries no root-frame channels).
-        ``"body"`` swaps the joints for the root-frame body links, keeping the world-frame
-        skeleton so global placement stays penalised.
+        ``"body"`` swaps the joints for the tracked body links.
+
+        **Body mode DEDUPES the shared frames.**  The ankles and wrists are carried twice --
+        once as world clip channels and once as ``@root`` -- so grading both would give the
+        feet and hands double weight relative to every other link, and would grade them
+        against two slightly different reference velocities (the world channels are finite
+        differences of the clip; the ``@root`` ones come from the FK Jacobian, so
+        ``dy = d/dt y`` is exact, which is what the CLF's double-integrator model assumes).
+        Measured, the two disagree by up to ~0.08 m/s on a swinging foot.  The ``@root``
+        copy wins.  The tracked set is therefore the base frame + the 13 body links.
 
         Returns:
             Channel names, a subset of ``self.ordered_vel_output_names``.
@@ -833,7 +828,12 @@ class BaseTrajectoryCommand(CommandTerm):
                 f"({ROOT_FRAME_MARKER}), but this library has none. Widen it with "
                 "scripts/rsl_rl/backfill_root_frames.py, or use tracking_mode='joint'."
             )
-        return [n for n in names if not n.startswith("joint:")]
+        # World frames superseded by a @root copy of the same physical link.
+        duplicated = {strip_root_marker(f) for f in self.root_body_frames}
+        return [
+            n for n in names
+            if not n.startswith("joint:") and (is_root_frame(n) or n.split(":", 1)[0] not in duplicated)
+        ]
 
     def _parse_ref_frames(self, reference_frames: list[str]) -> tuple[list[int], list[str]]:
         """Parse reference frame names to body indices, adding left/right pairs.
@@ -916,36 +916,6 @@ def _align_quat_to_yaw(quat: torch.Tensor, root_quat: torch.Tensor) -> torch.Ten
     return quat_mul(yaw_quat(quat_inv(root_quat)), quat)
 
 
-def _rotate_by_inv_batched(vecs: torch.Tensor, frame_quat: torch.Tensor) -> torch.Tensor:
-    """Rotate batched vectors ``[N, B, 3]`` into ``frame_quat``'s frame (FULL rotation).
-
-    The root-frame counterpart of :func:`_align_yaw_batched`, which drops roll/pitch.
-
-    Args:
-        vecs: ``[N, B, 3]`` world-frame vectors.
-        frame_quat: ``[N, 4]`` frame orientations (xyzw).
-
-    Returns:
-        ``[N, B, 3]`` vectors in the frame.
-    """
-    n, b, _ = vecs.shape
-    inv = quat_inv(frame_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
-    return quat_apply(inv, vecs.reshape(n * b, 3)).reshape(n, b, 3)
-
-
-def _quat_mul_inv_batched(quats: torch.Tensor, frame_quat: torch.Tensor) -> torch.Tensor:
-    """Express batched orientations ``[N, B, 4]`` relative to ``frame_quat`` (FULL rotation).
-
-    Args:
-        quats: ``[N, B, 4]`` world-frame orientations (xyzw).
-        frame_quat: ``[N, 4]`` frame orientations (xyzw).
-
-    Returns:
-        ``[N, B, 4]`` orientations relative to the frame.
-    """
-    n, b, _ = quats.shape
-    inv = quat_inv(frame_quat).unsqueeze(1).expand(n, b, 4).reshape(n * b, 4)
-    return quat_mul(inv, quats.reshape(n * b, 4)).reshape(n, b, 4)
 
 
 def _align_quat_to_yaw_batched(quats: torch.Tensor, root_quat: torch.Tensor) -> torch.Tensor:

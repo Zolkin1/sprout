@@ -26,7 +26,7 @@ import os
 
 import torch
 import warp as wp
-from isaaclab.utils.math import quat_from_angle_axis
+from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from motion_gen.joint_names import is_root_frame
@@ -542,6 +542,83 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.dy_des[:, self._wf_lin_flat] = frames[:, :, 7:10].reshape(n, -1)
         self.dy_des[:, self._wf_ang_flat] = frames[:, :, 10:13].reshape(n, -1)
         self._wf_world_frames = frames
+        self._lift_root_frames_to_world(frames[:, 0, :])
+
+    def _root_frame_maps(self) -> tuple[torch.Tensor, ...] | None:
+        """Flat ``y_des`` / ``dy_des`` index maps for the ``@root`` body block (cached).
+
+        Returns ``(pos, ori, lin, ang)`` index tensors, or ``None`` when the clip library
+        carries no root-frame bodies.
+        """
+        maps = getattr(self, "_rf_maps", "unset")
+        if maps != "unset":
+            return maps
+        frames = list(self.root_body_frames or ())
+        if not frames:
+            self._rf_maps = None
+            return None
+        pos_names, vel_names = self.ordered_pos_output_names, self.ordered_vel_output_names
+        dev = self.device
+
+        def _idx(names, frames_, axes, kind):
+            return torch.tensor([names.index(f"{f}:{kind}_{a}") for f in frames_ for a in axes],
+                                dtype=torch.long, device=dev)
+
+        self._rf_maps = (
+            _idx(pos_names, frames, "xyz", "pos"),
+            _idx(pos_names, frames, ("x", "y", "z", "w"), "ori"),
+            _idx(vel_names, frames, "xyz", "pos"),
+            _idx(vel_names, frames, "xyz", "ori"),
+        )
+        return self._rf_maps
+
+    def _lift_root_frames_to_world(self, base13: torch.Tensor) -> None:
+        """Lift the stored pelvis-relative ``@root`` desired channels into the world frame.
+
+        The clip stores each tracked link's pose+twist relative to the CLIP's pelvis (raw
+        FK, Jacobian-exact velocities), which is what makes those channels immune to slope
+        rotation, world baking and re-anchoring.  The CLF compares in world, so they are
+        lifted here through the clip's own -- already anchored -- base pose:
+
+            p_w = p0 + R p_r
+            q_w = q0 * q_r
+            v_w = v0 + w0 x (R p_r) + R v_r
+            w_w = w0 + R w_r
+
+        Because ``base13`` is the anchored placement's base, this yields "the clip's FK in
+        world with its root placed on the robot in the mask's free DOFs" -- the
+        subtract-the-planar-root-error-and-rotate-by-yaw comparison, with no explicit
+        subtraction step.
+
+        Args:
+            base13: ``[N, 13]`` world base row ``[pos(3), quat(4, xyzw), lin(3), ang(3)]``.
+        """
+        maps = self._root_frame_maps()
+        if maps is None:
+            return
+        pos_i, ori_i, lin_i, ang_i = maps
+        n = self.num_envs
+        b = len(self.root_body_frames)
+
+        p0, q0, v0, w0 = base13[:, 0:3], base13[:, 3:7], base13[:, 7:10], base13[:, 10:13]
+        qf = q0[:, None, :].expand(n, b, 4).reshape(n * b, 4)
+
+        p_r = self.y_des[:, pos_i].view(n, b, 3)
+        q_r = self.y_des[:, ori_i].view(n, b, 4)
+        v_r = self.dy_des[:, lin_i].view(n, b, 3)
+        w_r = self.dy_des[:, ang_i].view(n, b, 3)
+
+        off = quat_apply(qf, p_r.reshape(n * b, 3)).view(n, b, 3)      # R p_r
+        self.y_des[:, pos_i] = (p0[:, None, :] + off).reshape(n, -1)
+        self.y_des[:, ori_i] = quat_mul(qf, q_r.reshape(n * b, 4)).view(n, -1)
+        self.dy_des[:, lin_i] = (
+            v0[:, None, :]
+            + torch.linalg.cross(w0[:, None, :].expand_as(off), off)
+            + quat_apply(qf, v_r.reshape(n * b, 3)).view(n, b, 3)
+        ).reshape(n, -1)
+        self.dy_des[:, ang_i] = (
+            w0[:, None, :] + quat_apply(qf, w_r.reshape(n * b, 3)).view(n, b, 3)
+        ).reshape(n, -1)
 
     def get_desired_outputs(self, phase: torch.Tensor = None, env_ids: torch.Tensor = None) -> None:
         """Gather the (clip-world) reference outputs for the current step."""
