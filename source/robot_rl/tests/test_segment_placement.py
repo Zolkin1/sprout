@@ -85,6 +85,7 @@ def _fake_cmd(mask_t: torch.Tensor, base_traj: torch.Tensor):
         _snap_mask=torch.ones(n, dtype=torch.bool),
         _reanchor_active=torch.zeros(n, dtype=torch.bool),
         _last_reanchor_step=-1,          # once-per-step guard state (see _post_init)
+        _resampling=False,               # not inside _resample_command (see that method)
         clip_world_pos=CELL.clone(),
         clip_world_quat=torch.tensor([[0.0, 0.0, 0.0, 1.0]]),
         _reset_world_pos=CELL.clone(),

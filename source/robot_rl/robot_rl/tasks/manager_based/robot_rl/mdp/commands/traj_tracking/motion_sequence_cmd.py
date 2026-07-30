@@ -292,6 +292,36 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(1, 3)
         # Once-per-step guard for the re-anchor snapshot; -1 so the first step always runs.
         self._last_reanchor_step = -1
+        # True only while _resample_command is running -- see _reanchor_ego_envs.
+        self._resampling = False
+
+    def _resample_command(self, env_ids) -> None:
+        """Reset-time refresh, flagged so the re-anchor sits it out.
+
+        The base class implements resampling by running a whole ``_update_command()``, and
+        Isaac Lab calls this from ``_reset_idx`` -- BEFORE it zeroes ``episode_length_buf``.
+        So during this call ``_advance_step`` computes ``_step`` from the DYING episode's
+        length against the NEW ``start_step``, and everything derived from ``_step`` is
+        nonsense for exactly this one call.  Most of it is harmless: the following
+        ``command_manager.compute()`` re-runs the same chain with the counter zeroed and
+        overwrites it.
+
+        The re-anchor SNAPSHOT is the exception, because it is guarded to once per
+        ``common_step_counter``: taken here, it both captures the clip base at a step far
+        past ``start_step`` AND stamps the guard, so the good seed
+        :meth:`seed_reanchor_snapshot` just wrote is destroyed and the corrected retake never
+        happens.  The placement is then off by the clip's travel over that bogus span --
+        planar only, since the mask pins z -- which is what tripped ``ee_pose_error`` on ~38%
+        of resets while never firing once mid-episode.
+
+        Args:
+            env_ids: Env indices being reset (unused; the base refreshes every env).
+        """
+        self._resampling = True
+        try:
+            super()._resample_command(env_ids)
+        finally:
+            self._resampling = False
 
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
@@ -395,6 +425,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         taken at most once per ``common_step_counter``, matching the guard
         :meth:`FmTrackingCommand._snapshot_and_infer` already uses.
         """
+        # Sit out the reset-time call and DO NOT stamp the guard, so the real re-anchor still
+        # happens later this step with a correct ``_step``. Stamping here would keep the
+        # clip base sampled from the dying episode's step count -- see _resample_command.
+        if self._resampling:
+            return
         step_counter = int(self.env.common_step_counter)
         if step_counter == self._last_reanchor_step:
             return

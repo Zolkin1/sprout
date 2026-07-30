@@ -143,6 +143,7 @@ def test_snap_decoupled_from_reanchor():
         _ego_mask=torch.tensor([1, 1, 0, 0, 0, 0], dtype=torch.bool),
         _reanchor_active=torch.zeros(n, dtype=torch.bool),
         _last_reanchor_step=-1,
+        _resampling=False,
         _reanchor_clip_ids=_stub_reanchor_clip_ids,
     )
     MotionSequenceCommand._reanchor_ego_envs(fake)
@@ -170,6 +171,7 @@ def _snap_fixture(ego_every: int, snap_every: int, step: int, counter: int = 0):
         _ego_mask=torch.ones(n, dtype=torch.bool),
         _reanchor_active=torch.zeros(n, dtype=torch.bool),
         _last_reanchor_step=-1,
+        _resampling=False,
         _reanchor_clip_ids=lambda ids: placed.setdefault("ids", ids.tolist()),
     )
     return fake, placed
@@ -226,3 +228,47 @@ def test_flat_bbox_centering_invariant():
     world_xy = cell_center - bbox_center                            # reset's flat placement
     world_bbox_center = world_xy + bbox_center                      # bbox center lifted to world
     assert torch.allclose(world_bbox_center, cell_center)
+
+
+def test_reanchor_sits_out_the_resample_call_without_stamping_the_guard():
+    """The reset-time ``_update_command`` must not take the re-anchor snapshot.
+
+    Isaac Lab's ``_reset_idx`` calls ``command_manager.reset()`` -- which the base command
+    implements as a full ``_update_command()`` -- BEFORE it zeroes ``episode_length_buf``.
+    During that call ``_step`` is the NEW ``start_step`` plus the DYING episode's length, so
+    a snapshot taken there samples the clip base far past the spawn.  Because the snapshot
+    is guarded to once per ``common_step_counter``, taking it there also stamps the guard
+    and suppresses the correct retake from the following ``command_manager.compute()``.
+
+    The placement was then wrong by the clip's travel over that bogus span -- planar only,
+    since the anchor mask pins z -- which put every tracked body ~0.57 m off its reference
+    on the first step of an episode and tripped ``ee_pose_error`` on ~38% of resets while
+    never once firing mid-episode.
+
+    So: skip while resampling, and critically LEAVE THE GUARD UNSET.
+    """
+    fake, placed = _snap_fixture(ego_every=1, snap_every=1, step=7)
+    fake._resampling = True
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert "ids" not in placed, "no snapshot may be taken during the resample call"
+    assert fake._last_reanchor_step == -1, (
+        "the guard must stay unset, or the corrected retake this same step is suppressed"
+    )
+
+    # The real re-anchor still happens later in the SAME step.
+    fake._resampling = False
+    MotionSequenceCommand._reanchor_ego_envs(fake)
+    assert placed["ids"] == [0, 1]
+    assert fake._last_reanchor_step == fake.env.common_step_counter
+
+
+def test_reanchor_still_guarded_once_per_step_after_a_resample():
+    """Sitting out the resample must not weaken the twice-per-step idempotency guard."""
+    fake, placed = _snap_fixture(ego_every=1, snap_every=1, step=4)
+    fake._resampling = True
+    MotionSequenceCommand._reanchor_ego_envs(fake)          # skipped
+    fake._resampling = False
+    MotionSequenceCommand._reanchor_ego_envs(fake)          # the real one
+    placed["ids"] = None                                     # detect any further take
+    MotionSequenceCommand._reanchor_ego_envs(fake)          # must be a no-op
+    assert placed["ids"] is None
