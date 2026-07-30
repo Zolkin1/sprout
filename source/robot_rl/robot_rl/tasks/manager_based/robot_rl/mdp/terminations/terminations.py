@@ -26,9 +26,10 @@ def base_pose_error_termination(
     (replaces the pelvis-upright / base-height / frame-drift terminations).
     Compares the robot's world base pose against the reference base pose served
     by :meth:`MotionSequenceCommand.termination_reference_world_state` -- the
-    tracked reference for clip- and open-loop-FM envs, but the **clip** reference
-    for closed-loop-FM envs (so a robot that stalls while the clip marches on
-    terminates instead of riding a stationary FM prediction):
+    **globally-placed** clip, deliberately NOT the per-step re-anchored reference
+    the reward grades against.  The reward forgives planar drift (the clip's free
+    root DOFs are re-datumed onto the robot every step); this does not, so a robot
+    that stalls while the clip marches on still terminates:
 
       * position: terminate if ``||ref_pos - root_pos|| > max_pos_dist`` (m).
       * orientation: terminate if the geodesic angle between the reference
@@ -48,9 +49,9 @@ def base_pose_error_termination(
     cmd = env.command_manager.get_term(command_name)
     state = cmd.termination_reference_world_state()
     ref_pos_w = state[:, 0:3]
-    ref_quat_w = state[:, 3:7]                      # wxyz
+    ref_quat_w = state[:, 3:7]                      # xyzw (Isaac Lab 3.0 convention)
     root_pos_w = wp.to_torch(asset.data.root_pos_w)
-    root_quat_w = wp.to_torch(asset.data.root_quat_w)  # wxyz
+    root_quat_w = wp.to_torch(asset.data.root_quat_w)  # xyzw
 
     pos_err = torch.norm(ref_pos_w - root_pos_w, dim=-1)
     # ||quat_box_minus|| is the geodesic rotation angle (rad).

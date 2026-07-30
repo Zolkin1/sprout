@@ -274,6 +274,9 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._zeros3 = torch.zeros(n, 3, device=dev)
         self._ident_quat = torch.zeros(n, 4, device=dev)
         self._ident_quat[:, 3] = 1.0  # xyzw identity
+        # World +z, for rebuilding the global (pure-yaw) placement quaternion in
+        # :meth:`termination_reference_world_state`.
+        self._world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(1, 3)
 
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
@@ -693,7 +696,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def reference_world_state(self) -> torch.Tensor:
         """World-frame reference state ``[N, 3+4+3+3+2*nj]`` at the current step.
 
-        ``[base_pos_w, base_quat_w(wxyz), base_lin_w, base_ang_w, joint_pos,
+        ``[base_pos_w, base_quat_w(xyzw), base_lin_w, base_ang_w, joint_pos,
         joint_vel]`` -- served from the per-step world cache populated by
         :meth:`_write_world_des` (base row) plus the frame-invariant joint
         channels.  Used by the reset event, observations, and terminations.
@@ -705,11 +708,33 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def termination_reference_world_state(self) -> torch.Tensor:
         """World-frame reference state used by the pose-drift termination.
 
-        Defaults to the tracked reference (:meth:`reference_world_state`).
-        :class:`FmTrackingCommand` overrides this so closed-loop FM envs
-        are graded against the clip reference rather than the FM prediction.
+        The **globally-placed** clip -- the reset-time terrain-cell anchor -- NOT the
+        per-step re-anchored reference that drives the reward.  The two must differ, and
+        the split is the whole point of anchoring:
+
+        * the REWARD grades local error, with the clip's free root DOFs re-datumed onto the
+          robot every step, so tracking the motion's shape is not punished for planar drift;
+        * TERMINATION grades that drift, against a clip that never moves.
+
+        Without this the termination silently dies under every-step anchoring: the free
+        DOFs coincide with the robot by construction, so the position error collapses to
+        ``|dz|`` -- and to identically zero on a pre-mask library, whose legacy mask frees
+        height too.  A robot could then stand still while the clip marched away and never
+        terminate.
+
+        ``_reset_world_pos`` / ``_reset_world_yaw`` are written once per episode by
+        ``_commit_clip_reset`` and are never touched by re-anchoring, so the global
+        placement is exactly recoverable at any step.
+
+        Returns:
+            ``[N, 3+4+3+3+2*nj]`` world reference state, same layout as
+            :meth:`reference_world_state`.
         """
-        return self.reference_world_state()
+        yaw = self._reset_world_yaw
+        world_quat = quat_from_angle_axis(yaw, self._world_z.expand(yaw.shape[0], 3))
+        return self.reference_world_state_at(
+            self.clip_id, self._step, self._reset_world_pos, world_quat
+        )
 
     def _frame_output_indices(self, frame_name: str) -> dict[str, torch.Tensor]:
         """Resolve (and cache) the y_des/dy_des indices for one output frame.
