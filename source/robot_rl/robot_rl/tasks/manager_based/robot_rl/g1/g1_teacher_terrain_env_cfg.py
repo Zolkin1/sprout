@@ -123,7 +123,9 @@ class G1TeacherTerrainEnvCfgPlay(G1TeacherTerrainEnvCfg):
         # if loaded onto the GPU, so keep the clip library on CPU (device-safe gather).
         # Override with --clip_device on the command line if you have GPU headroom.
         self.commands.traj_ref.clip_device = "cpu"
+        # Both actor-side groups: the reference window is corrupted during training too.
         self.observations.policy.enable_corruption = False
+        self.observations.reference.enable_corruption = False
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
         # Draw the reference-trajectory markers + the height-scan ray hits.

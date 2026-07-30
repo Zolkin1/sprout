@@ -541,6 +541,56 @@ def build_train_val(
     return train_ds, val_ds
 
 
+def _distractor_keep_mask(
+    data: dict[str, np.ndarray], cfg: FlowMatchingConfig, num_windows: int
+) -> np.ndarray | None:
+    """Boolean keep-mask dropping DISTRACTOR-family windows, or ``None`` to keep everything.
+
+    Distractor clips are flat walking routed around obstacle boxes. They are ego-anchored like
+    flat clips (so they DO produce honest snap windows), but whether they help the generator is
+    an open question -- hence the opt-out. ``record_data.py`` tags every window with
+    ``is_distractor``, so this is a train-time switch needing no re-record.
+
+    Args:
+        data: The loaded recording arrays.
+        cfg: Config; ``skip_distractors`` enables the filter.
+        num_windows: ``W``, for validating the tag's length.
+
+    Returns:
+        ``(W,)`` bool array (True = keep), or ``None`` when the filter is off / a no-op.
+
+    Raises:
+        ValueError: If the filter is requested but the recording carries no tag, or the tag
+            would drop every window.
+    """
+    if not getattr(cfg, "skip_distractors", False):
+        return None
+    tag = data.get("is_distractor")
+    if tag is None:
+        raise ValueError(
+            "--skip_distractors requested but this recording has no 'is_distractor' tag (it "
+            "predates the field). Either re-record with the current record_data.py, or drop the "
+            "flag -- silently training on the distractors would misreport what was excluded."
+        )
+    tag = np.asarray(tag).reshape(-1).astype(bool)
+    if tag.shape[0] != num_windows:
+        raise ValueError(
+            f"'is_distractor' has {tag.shape[0]} entries but there are {num_windows} windows."
+        )
+    n_drop = int(tag.sum())
+    if n_drop == 0:
+        print("[fm-data] --skip_distractors: no distractor windows in this recording (no-op).")
+        return None
+    if n_drop == num_windows:
+        raise ValueError(
+            f"--skip_distractors would drop ALL {num_windows} windows (the whole recording is "
+            f"distractors); nothing left to train on."
+        )
+    print(f"[fm-data] --skip_distractors: dropping {n_drop}/{num_windows} distractor windows "
+          f"({100.0 * n_drop / num_windows:.1f}%).")
+    return ~tag
+
+
 def _build_train_val_windowed(
     data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig
 ) -> tuple[FutureStateDataset, FutureStateDataset | None]:
@@ -554,6 +604,12 @@ def _build_train_val_windowed(
     """
     W = int(data["history_state"].shape[0])
     ep = np.asarray(data["episode_id"]).reshape(-1)  # (W,) snap-row episode id per window
+    keep = _distractor_keep_mask(data, cfg, W)
+    if keep is not None:
+        ep = ep[keep]
+        data = {**data, **{k: v[keep] for k, v in data.items()
+                           if isinstance(v, np.ndarray) and v.shape[:1] == (W,)}}
+        W = int(ep.shape[0])
     unique_eps = np.unique(ep)
     rng = np.random.default_rng(cfg.seed)
     n_val = int(round(cfg.val_fraction * len(unique_eps)))

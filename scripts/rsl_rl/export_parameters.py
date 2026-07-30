@@ -28,7 +28,35 @@ def convert_to_serializable(obj):
         return obj
 
 
-def export_policy_parameters(env, obs, actions, save_dir):
+def resolve_actor_obs_groups(obs, actor_obs_groups=None):
+    """Ordered observation groups the exported policy consumes.
+
+    Args:
+        obs: Observation dict / TensorDict from the environment.
+        actor_obs_groups: Explicit ordered group list, normally
+            ``agent_cfg.obs_groups["actor"]``. When None, falls back to the
+            single-group default: the distillation ``student`` group if present,
+            else ``policy``.
+
+    Returns:
+        List of group names, in the order the actor concatenates them.
+
+    Raises:
+        ValueError: If a named group is absent from the observations.
+    """
+    if actor_obs_groups is None:
+        return ["student" if "student" in obs else "policy"]
+    groups = list(actor_obs_groups)
+    missing = [g for g in groups if g not in obs]
+    if missing:
+        raise ValueError(
+            f"Actor observation groups {missing} are not produced by the environment "
+            f"(available: {sorted(obs.keys())})."
+        )
+    return groups
+
+
+def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None):
     """
     Export policy parameters and environment configuration to a YAML file.
 
@@ -37,6 +65,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
         obs: Current observations tensor
         actions: Current actions tensor
         save_dir: Base directory (will create 'exported' subfolder)
+        actor_obs_groups: Ordered observation groups the actor consumes
+            (``agent_cfg.obs_groups["actor"]``). A multi-group actor concatenates
+            them in this order, and the deploy rebuilds the flat observation vector
+            from the exported term table -- so the table must list every group's
+            terms in the same order. None keeps the legacy single-group behaviour.
     """
     # Create exported subfolder
     export_dir = os.path.join(save_dir, "exported")
@@ -45,11 +78,11 @@ def export_policy_parameters(env, obs, actions, save_dir):
     unwrapped_env = env.unwrapped
     robot = unwrapped_env.scene.articulations["robot"]
 
-    # Prefer student observations (distillation) over policy observations
-    obs_key = "student" if "student" in obs else "policy"
+    obs_group_names = resolve_actor_obs_groups(obs, actor_obs_groups)
 
     params = {
-        "num_obs": obs[obs_key].shape[1],
+        # Total width the exported network expects on its single flat `obs` input.
+        "num_obs": int(sum(obs[g].shape[1] for g in obs_group_names)),
         "num_actions": actions.shape[1],
         "dt": unwrapped_env.step_dt,
     }
@@ -227,22 +260,28 @@ def export_policy_parameters(env, obs, actions, save_dir):
 
     yaml.add_representer(FlowStyleList, represent_flow_list)
 
-    # Add observation information (prefer student group for distillation, else policy)
+    # Observation term table for every group the actor consumes, flattened into a single
+    # ordered mapping under "policy" -- the deploy concatenates the terms in exactly this
+    # order to rebuild the network's flat input vector, so the group order here must match
+    # obs_groups["actor"].
     obs_manager = unwrapped_env.observation_manager
-    obs_info = {}
-    obs_group_name = "student" if "student" in obs_manager.active_terms else "policy"
+    obs_info = {"policy": {}}
 
-    for group_name, group_terms in obs_manager.active_terms.items():
-        # Only include the target observation group
-        if group_name != obs_group_name:
-            continue
-
-        obs_info["policy"] = {}
+    for group_name in obs_group_names:
+        group_terms = obs_manager.active_terms[group_name]
         # Get the dimensions and configs for this group
         group_dims = obs_manager._group_obs_term_dim[group_name]
         group_cfgs = obs_manager._group_obs_term_cfgs[group_name]
 
         for term_name, term_dim, term_cfg in zip(group_terms, group_dims, group_cfgs):
+            if term_name in obs_info["policy"]:
+                # The table is keyed by term name, so a collision across groups would
+                # silently drop one term and shift every offset after it.
+                raise ValueError(
+                    f"Observation term '{term_name}' appears in more than one actor group "
+                    f"{obs_group_names}; rename it so the exported term table stays "
+                    "unambiguous."
+                )
             # Convert shape to scalar if single dimension, otherwise keep as list
             if len(term_dim) == 1:
                 shape_value = term_dim[0]
@@ -281,9 +320,13 @@ def export_policy_parameters(env, obs, actions, save_dir):
     hs_spec = None
     scene = unwrapped_env.scene
     scanner = scene.sensors.get("height_scanner") if hasattr(scene, "sensors") else None
-    term_cfgs = obs_manager._group_obs_term_cfgs.get(obs_group_name, [])
-    term_names = obs_manager.active_terms.get(obs_group_name, [])
-    hs_cfg = next((c for n, c in zip(term_names, term_cfgs) if n == "height_scan"), None)
+    hs_cfg = None
+    for group_name in obs_group_names:
+        term_cfgs = obs_manager._group_obs_term_cfgs.get(group_name, [])
+        term_names = obs_manager.active_terms.get(group_name, [])
+        hs_cfg = next((c for n, c in zip(term_names, term_cfgs) if n == "height_scan"), None)
+        if hs_cfg is not None:
+            break
     # Only when the EXPORTED group actually observes the scan. A depth task keeps the
     # scanner in the scene for its (privileged, never-deployed) critic, and emitting a
     # spec for that would both invent default values here and make the deploy raycast a
@@ -311,7 +354,7 @@ def export_policy_parameters(env, obs, actions, save_dir):
     # reason height_scan_spec is: describing a camera whose obs term the deployed policy
     # never reads would have the deploy cast it every step and silently discard the result
     # (which is exactly what the `-depth-image` variant's separate obs groups would do).
-    params["depth_camera_spec"] = mdp.depth_camera_specs(unwrapped_env, [obs_group_name]) or None
+    params["depth_camera_spec"] = mdp.depth_camera_specs(unwrapped_env, obs_group_names) or None
 
     # Convert to serializable format
     params = convert_to_serializable(params)

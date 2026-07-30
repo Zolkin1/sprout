@@ -2,7 +2,7 @@
 
 """Numpy rolling history buffer for the deployment generator inference.
 
-Numpy port of ``transfer/fm/online.BatchedHistory`` (reset-aware, fixed length).
+Numpy port of ``robot_rl.flow_matching.online.BatchedHistory`` (reset-aware, fixed length).
 A window becomes valid once an env has ``maxlen`` uninterrupted steps since its
 last reset; ``fill`` warm-starts every slot for deployment (no clip warmup).
 """

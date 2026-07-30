@@ -379,6 +379,10 @@ _WINDOW_DTYPES: dict[str, str] = {
     "depth": "float32",
     "cmd_future": "float32",
     "episode_id": "int64",
+    # Per-window: 1 if the window's clip belongs to the DISTRACTOR family (a box the robot walks
+    # around rather than onto). Recorded unconditionally so training can drop those windows with
+    # ``train.py --skip_distractors`` without a re-record. Absent in older recordings.
+    "is_distractor": "uint8",
 }
 
 
@@ -430,6 +434,7 @@ class RecordedWindowWriter:
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
+        tag_distractors: bool = False,
     ) -> None:
         import h5py
 
@@ -440,6 +445,11 @@ class RecordedWindowWriter:
             "ref_future": (num_windows, future_len, node_dim),
             "episode_id": (num_windows,),
         }
+        # Opt-in per-window distractor tag: declared only when the caller will supply it every
+        # batch (``write_batch`` requires every declared key), so older writers and the window
+        # tests stay valid. ``load_recorded_windows`` treats it as optional on read.
+        if tag_distractors:
+            shapes["is_distractor"] = (num_windows,)
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
         if depth_shape is not None:

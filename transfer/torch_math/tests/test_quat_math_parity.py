@@ -1,9 +1,9 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Parity test: vendored ``transfer/fm/quat_math.py`` vs ``isaaclab.utils.math``.
+"""Parity test: ``transfer/torch_math/quat_math.py`` vs ``isaaclab.utils.math``.
 
 Dev-only (imports isaaclab); the deployed sim2sim code never imports isaaclab.
-Run directly (``python transfer/fm/tests/test_quat_math_parity.py``) or via pytest.
+Run directly (``python transfer/torch_math/tests/test_quat_math_parity.py``) or via pytest.
 Guarantees the vendored xyzw math reproduces the repo's isaaclab math bit-for-bit
 (up to fp tolerance and the ``q`` vs ``-q`` sign ambiguity for matrix->quat).
 """

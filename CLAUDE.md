@@ -38,7 +38,8 @@ generation stages, `compare_sim2sim.py`) plus diagnostics. `scripts/flow_matchin
 and exports the FM. Runs are logged to `logs/`.
 
 `transfer/` — deployment: `transfer/sim` (MuJoCo sim2sim), `transfer/deploy` (the shared
-torch-free ONNX runtime), `transfer/fm` (isaaclab-free FM), `transfer/obelisk` (ROS2 hardware).
+torch-free ONNX runtime), `transfer/torch_math` (isaaclab-free torch quaternion math, the
+test-only oracle for the numpy ports), `transfer/obelisk` (ROS2 hardware).
 
 # Depth Cameras (this branch)
 Two self-scanning depth cameras on the terrain teacher, as an alternative exteroception to the height scan.
@@ -79,8 +80,12 @@ term the way training did instead of consulting a hardcoded table (kept only as 
 - KNOWN DELTA: MuJoCo group 1 includes the HAND meshes, which `SELF_SCAN_LINKS` excludes (~60/780
   near-camera px). Kept deliberately until the hardware camera's occlusion geometry is known; TODOs
   in `g1_self_scan.py` and `transfer/sim/depth_camera.py`.
-- sim2sim is ONNX-ONLY (the torch `gen_tracker_policy.py` is gone). `transfer/fm/` remains as the
-  torch oracle for the numpy ports + `fm_test_bench.py`, and is height-scan-only.
+- sim2sim is ONNX-ONLY (the torch `gen_tracker_policy.py` is gone). The vendored torch FM copy
+  (`transfer/fm`) is gone too — once deployment moved to ONNX and `fm_test_bench.py` was deleted,
+  nothing loaded a model through it. What survives is `transfer/torch_math/quat_math.py`, the
+  isaaclab-free torch quaternion math that `deploy/quat_math_np.py` is parity-tested against;
+  `transforms_np.py` is now tested against the real `robot_rl.flow_matching.transforms`
+  (`importorskip`-guarded, so that half skips without IsaacSim).
 
 # General Guidelines
 - Don't care for backwards compatibility.

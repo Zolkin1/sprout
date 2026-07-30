@@ -9,6 +9,7 @@ checkpoints have to keep loading), while depth becomes selectable via
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import numpy as np
@@ -165,9 +166,22 @@ def test_old_checkpoint_config_still_loads():
     assert cfg.extero_source == "height_scan" and cfg.extero_tokens == 1
 
 
-def test_penetration_loss_is_disabled_by_default():
-    """The flat-floor terrain loss is off: it is wrong on stairs (see flow.py's TODO)."""
-    assert FlowMatchingConfig().terrain_penetration_weight == 0.0
+def test_terrain_penetration_loss_is_gone():
+    """The flat-floor terrain losses were deleted (wrong on the stairs/boxes we train on).
+
+    Re-adding a penetration penalty is fine, but it must use a LOCAL floor (SDF or
+    height-scan-derived), so a resurrected flat-``ground_z`` knob should fail here.
+    """
+    names = {f.name for f in dataclasses.fields(FlowMatchingConfig)}
+    assert not [n for n in names if n.startswith("terrain_")]
+
+
+def test_stale_checkpoint_config_with_terrain_keys_loads():
+    """Checkpoints trained before the removal carry ``terrain_*`` keys; ignore them."""
+    d = FlowMatchingConfig().to_dict()
+    d["terrain_penetration_weight"] = 200.0
+    d["terrain_penetration_mode"] = "ankle"
+    assert FlowMatchingConfig.from_dict(d).extero_source == "height_scan"
 
 
 ##

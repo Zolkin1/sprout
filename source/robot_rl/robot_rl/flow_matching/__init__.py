@@ -24,11 +24,9 @@ from .flow import (
     sample_flow_batch,
     sample_trajectory,
     sample_trajectory_grad,
-    terrain_penetration_term,
 )
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
-from .terrain import FlatTerrain, box_sole_points
 from .transforms import (
     FRAME_BLOCK_DIM,
     frame_block_start,
@@ -56,13 +54,10 @@ __all__ = [
     "build_train_val",
     "resolve_term_slice",
     "FKChain",
-    "FlatTerrain",
-    "box_sole_points",
     "flow_matching_loss",
     "frame_consistency_terms",
     "joint_vel_consistency_term",
     "fk_consistency_terms",
-    "terrain_penetration_term",
     "sample_flow_batch",
     "sample_trajectory",
     "sample_trajectory_grad",

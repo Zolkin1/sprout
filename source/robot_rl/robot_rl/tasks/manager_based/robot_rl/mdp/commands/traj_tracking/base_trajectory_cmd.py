@@ -3,9 +3,13 @@
 """Abstract base class for trajectory command terms.
 
 Holds the manager-agnostic, phase-free shared logic.  Concrete commands
-extend either this class directly (multi-skill, no phase state) or the
-:class:`PhasedTrajectoryCommand` subclass (single-skill, phase variable
-exposed as observation with hold-phi logic).
+(:class:`MotionSequenceCommand`, :class:`FmTrackingCommand`) extend it directly.
+
+There is NO phase-as-observation subclass: the single-skill
+``PhasedTrajectoryCommand`` (phase obs + hold-phi logic) and its
+``_phased_cmd`` / ``ref_sin_phase`` / ``ref_cos_phase`` observation terms were
+deleted with the single-skill stack.  Clip phase is now carried as
+``manager.phase`` (see :meth:`_update_command`), advanced from the clip step.
 """
 
 from __future__ import annotations
@@ -38,9 +42,10 @@ class BaseTrajectoryCommand(CommandTerm):
 
     Handles measured/desired output computation, CLF tracking, ref-frame
     bookkeeping, and metrics logging.  Trajectory advancement is time-based
-    only; no phasing variable is stored on this class.  Subclasses that
-    want phase-as-observation or hold-phi logic should extend
-    :class:`PhasedTrajectoryCommand` instead.
+    only; no phasing variable is stored on this class -- subclasses publish
+    progress as ``manager.phase`` instead (``MotionSequenceCommand`` sets it
+    from the clip step).  The old phase-as-observation / hold-phi subclass is
+    gone; see the module docstring.
 
     Subclasses must implement ``_create_manager`` and
     ``_verify_contact_frames``.
@@ -149,26 +154,12 @@ class BaseTrajectoryCommand(CommandTerm):
 
         self._verify_contact_frames()
 
-        # --- Domain tracking ----------------------------------------------
-        # ``current_domain`` is the domain index from the previous step
-        # (relative to the previous trajectory).  ``prev_ref_frame_idx``
-        # is the index (into ``self.ref_frames``) of the body we last
-        # anchored ``ref_poses`` to.  Together they drive the
-        # "needs a ref_poses refresh" gate in get_measured_outputs:
-        #
-        #  * domain-level change (gate fire, snap) → anchor swap
-        #  * ref-frame-identity change across trajectories at the same
-        #    domain (e.g. cross-skill swap whose new domain 0 puts the
-        #    opposite foot in stance) → anchor swap
-        #
-        # Using ref-frame identity instead of trajectory index avoids
-        # spurious refreshes on intra-skill bucket swaps that keep the
-        # stance foot the same — those would otherwise re-anchor the
-        # marker to the foot's *current* world pose mid-stance, which
-        # lands above ground if the foot has already started pushoff.
-        # Initialised to -1 so the first step always triggers an update.
-        self.current_domain = -1 * torch.ones(self.num_envs, dtype=torch.long, device=self.device)
-        self.prev_ref_frame_idx = -1 * torch.ones(self.num_envs, dtype=torch.long, device=self.device)
+        # NOTE: ``current_domain`` / ``prev_ref_frame_idx`` / ``cur_ref_frame_idx`` used to live
+        # here. They drove the "needs a ref_poses refresh" gate in the deleted
+        # ``get_measured_outputs`` (a domain change or a stance-foot identity change forced an
+        # anchor swap). The foot-stance paradigm is gone, so nothing wrote them and they held their
+        # init value for entire runs -- while still being logged and plotted, which rendered a
+        # plausible constant rather than an obviously missing panel. All three are deleted.
 
         # --- Output parsing -----------------------------------------------
         result = self._parse_outputs(self.manager.get_pos_output_names)
@@ -216,11 +207,13 @@ class BaseTrajectoryCommand(CommandTerm):
         # anchor mask, and declare a NON-contact reference frame (e.g. pelvis_link).  What is
         # left here is just the name -> output-index resolution the reference frames need.
         #
-        # (This completes the "foot-ref-frame removal / scope 2" TODO: ``get_measured_outputs``,
-        # ``terrain_aware_ref.py`` and the ``uses_stance_ref`` / ``ref_to_contact_idx``
-        # bookkeeping are all deleted.  The manager ``ref_frame`` and the clip-io ``ref_frame``
-        # metadata do survive -- they still name the frame a clip's poses are expressed
-        # relative to, which is independent of how the clip is anchored.)
+        # The stance machinery is deleted: ``get_measured_outputs``, ``terrain_aware_ref.py`` and
+        # the ``uses_stance_ref`` / ``ref_to_contact_idx`` bookkeeping are all gone.
+        #
+        # The manager ``ref_frame`` and the clip-io ``ref_frame`` metadata deliberately SURVIVE:
+        # they name the frame a clip's poses are expressed RELATIVE TO, which is independent of
+        # how the clip is ANCHORED (the per-DOF anchor mask).  Conflating the two is what the
+        # stance paradigm did -- do not "finish the job" by deleting ``ref_frame`` as well.
         self.ref_frame_indices, self.ref_frames = self._parse_ref_frames(
             self.manager.get_reference_frames()
         )
@@ -229,11 +222,6 @@ class BaseTrajectoryCommand(CommandTerm):
         # (see motion_sequence_cmd._clip_world_frames), independent of the stance path.
         self.ref_poses = torch.zeros((self.num_envs, 7), device=self.device)
         self.ref_poses[:, 6] = 1.0  # identity quaternion
-
-        # Index (into self.ref_frames) of the ref frame currently in contact
-        # per env.  Updated each step inside get_measured_outputs (stance path only).  Exposed
-        # for logging / debug visualisation.
-        self.cur_ref_frame_idx = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
         # --- CLF ----------------------------------------------------------
         self.tracked_vel_names = self._resolve_tracked_vel_names()

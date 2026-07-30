@@ -18,21 +18,51 @@ import torch
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
     base_pose_error,
     ee_ref_relative_to_base,
-    future_base_pose,
-    future_base_velocity,
     joint_pos_ref,
     joint_vel_ref,
     ref_base_velocity_local,
+    reference_window,
+    reference_window_layout,
 )
 
 # Trajectory command term names to search for (in priority order)
 _TRAJ_TERM_NAMES = ("traj_ref", "hlip_ref")
 
-# Attributes to pull from the trajectory command term each step
+
+def _split_reference_window(
+    window: torch.Tensor, layout: list[tuple[str, int]], num_steps: int
+) -> dict[str, torch.Tensor]:
+    """Split a flat ``reference_window`` into one ``future_<block>`` tensor per block.
+
+    The observation packs the window as ``[step0(D), step1(D), ...]``; the plots want
+    one signal per physical quantity with the look-ahead index as the inner axis. Each
+    returned tensor is ``[N, num_steps * width]``, laid out ``[step0, step1, ...]``.
+
+    Args:
+        window: ``[N, num_steps * D]`` reference window observation.
+        layout: ``[(block_name, width), ...]`` from ``reference_window_layout``.
+        num_steps: Number of samples in the window.
+
+    Returns:
+        Mapping of ``"future_<block_name>"`` to its ``[N, num_steps * width]`` slice.
+    """
+    n = window.shape[0]
+    per_step = sum(width for _, width in layout)
+    stacked = window.view(n, num_steps, per_step)
+    out: dict[str, torch.Tensor] = {}
+    offset = 0
+    for block_name, width in layout:
+        out[f"future_{block_name}"] = stacked[:, :, offset:offset + width].reshape(n, -1).clone()
+        offset += width
+    return out
+
+# Attributes to pull from the trajectory command term each step.
+# ``current_domain`` / ``cur_ref_frame_idx`` used to be logged here; the foot-stance path that
+# updated them is gone, so they were constants and are no longer allocated at all.
 _TRAJ_ATTRS = (
     "y_des", "y_act", "dy_des", "dy_act",
-    "v", "vdot", "current_domain", "phasing_var",
-    "ref_poses", "cur_ref_frame_idx",
+    "v", "vdot", "phasing_var",
+    "ref_poses",
 )
 
 
@@ -65,10 +95,10 @@ class DataLogger:
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
         self._log_fm_window = log_fm_window
-        # Look-ahead params for the future_base_* reference obs; overridden from the
-        # policy obs cfg in _collect_metadata so the logged obs match what the policy sees.
-        self._future_horizon_s: float = 0.5
-        self._future_stride: int = 5
+        # Reference-window shape; overridden from the obs cfg in _collect_metadata so the
+        # logged obs match exactly what the policy is fed.
+        self._ref_num_steps: int = 11
+        self._ref_stride: int = 5
         self.metadata: dict[str, Any] = {}
         # Per-step termination signals, stacked in finalize() into a
         # "successful tracking" mask (steps in episodes that ended via
@@ -220,17 +250,23 @@ class DataLogger:
         # expose the reference (the helpers raise).
         if self._traj_term_name is not None:
             name = self._traj_term_name
-            hs, st = self._future_horizon_s, self._future_stride
+            ns, st = self._ref_num_steps, self._ref_stride
             def _traj_obs() -> dict[str, torch.Tensor]:
-                return {
+                out = {
                     "base_pose_error": base_pose_error(unwrapped, name).clone(),
                     "base_vel_ref": ref_base_velocity_local(unwrapped, name).clone(),
                     "joint_pos_ref": joint_pos_ref(unwrapped, name).clone(),
                     "joint_vel_ref": joint_vel_ref(unwrapped, name).clone(),
                     "ee_ref": ee_ref_relative_to_base(unwrapped, name).clone(),
-                    "future_base_pose": future_base_pose(unwrapped, name, hs, st).clone(),
-                    "future_base_velocity": future_base_velocity(unwrapped, name, hs, st).clone(),
                 }
+                # The policy's merged look-ahead, split back into named per-block
+                # signals so each keeps its own plot. Index 0 of every block is the
+                # CURRENT step (the window starts at offset 0), so block 0 should
+                # track the matching current-step term above.
+                cmd = unwrapped.command_manager.get_term(name)
+                win = reference_window(unwrapped, name, num_steps=ns, stride=st)
+                out.update(_split_reference_window(win, reference_window_layout(cmd), ns))
+                return out
             try:
                 for k, v in _traj_obs().items():
                     step[f"obs_{k}"] = v
@@ -510,19 +546,23 @@ class DataLogger:
             print(f"[WARN DataLogger] No trajectory command term found among {active}. "
                   f"Trajectory-related data will not be logged.")
 
-        # Look-ahead params for the future_base_* reference obs: read from the policy
-        # obs cfg so the logged obs match exactly what the policy is fed.
+        # Reference-window shape: read from whichever obs group carries the term (the
+        # actor's reference group, or the critic if the reference group was dropped) so
+        # the logged obs match exactly what the policy is fed.
         try:
             obs_mgr = unwrapped.observation_manager
-            policy_terms = list(obs_mgr.active_terms.get("policy", []))
-            if "future_base_pose" in policy_terms:
-                cfg = obs_mgr._group_obs_term_cfgs["policy"][policy_terms.index("future_base_pose")]
-                self._future_horizon_s = float(cfg.params.get("horizon_s", self._future_horizon_s))
-                self._future_stride = int(cfg.params.get("stride", self._future_stride))
-            self.metadata["future_horizon_s"] = self._future_horizon_s
-            self.metadata["future_stride"] = self._future_stride
+            for group_name, group_terms in obs_mgr.active_terms.items():
+                if "reference_window" in group_terms:
+                    cfg = obs_mgr._group_obs_term_cfgs[group_name][
+                        list(group_terms).index("reference_window")
+                    ]
+                    self._ref_num_steps = int(cfg.params.get("num_steps", self._ref_num_steps))
+                    self._ref_stride = int(cfg.params.get("stride", self._ref_stride))
+                    break
+            self.metadata["reference_num_steps"] = self._ref_num_steps
+            self.metadata["future_stride"] = self._ref_stride
         except Exception as exc:
-            print(f"[WARN DataLogger] Could not read future-obs lookahead params: {exc}")
+            print(f"[WARN DataLogger] Could not read reference-window params: {exc}")
 
         # Joint names
         try:

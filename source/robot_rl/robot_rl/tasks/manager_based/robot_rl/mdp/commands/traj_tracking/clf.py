@@ -338,7 +338,22 @@ class CLF:
         dy_nom: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute V_dot = (V_curr - V_prev) / sim_dt, returns (vdot, V_curr).
+        Compute the per-step Lyapunov DECREASE, returns (delta_v, V_curr).
+
+        NOTE the units: this is the raw difference ``V_k - V_{k-1}`` over ONE CONTROL step,
+        NOT a time derivative -- there is deliberately no division by dt (which is why
+        ``self.sim_dt`` goes unused). Consumers are written to match: the ``max_violation``
+        normalizer in ``mdp.rewards.clf_decreasing_condition`` carries its own ``dt``
+        factor, and its ``alpha * v`` term is likewise un-scaled, so the effective
+        continuous-time decay rate there is ``alpha / dt``, not ``alpha``. Anything that
+        starts dividing by dt here has to move those two with it, and any tuned Q/R
+        weights need re-checking.
+
+        ``self.sim_dt`` is the SIM step (0.005 s), while this is called once per CONTROL
+        step (``sim.dt * decimation``, 0.02 s) -- so it is not the right dt to divide by
+        either. See the discrete-ARE TODO in ``_compute_PK_np``: ``P`` solves the
+        CONTINUOUS ARE while this difference is discrete, which is the same
+        continuous-vs-discrete seam.
         """
         v_curr = self.compute_v(y_act, y_nom, dy_act, dy_nom,)# yaw_idx)
        
@@ -357,99 +372,6 @@ class CLF:
 
         return vdot_raw, v_curr
 
-
-    def compute_vdot_analytic(
-        self,
-        y_act: torch.Tensor,
-        y_nom: torch.Tensor,
-        dy_act: torch.Tensor,
-        dy_nom: torch.Tensor,
-        ddy_act: torch.Tensor,
-        ddy_nom: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute V_dot analytically using acceleration information.
-
-        Uses the formula: Vdot = 2 * eta^T * P * eta_dot
-
-        where:
-            eta = [y_err_0, dy_err_0, y_err_1, dy_err_1, ...] (interleaved pos/vel errors)
-            eta_dot = [dy_err_0, ddy_err_0, dy_err_1, ddy_err_1, ...] (interleaved vel/acc errors)
-
-        Args:
-            y_act: [B, n_outputs] actual positions.
-            y_nom: [B, n_outputs] nominal/desired positions.
-            dy_act: [B, n_outputs] actual velocities.
-            dy_nom: [B, n_outputs] nominal/desired velocities.
-            ddy_act: [B, n_outputs] actual accelerations (from simulation).
-            ddy_nom: [B, n_outputs] nominal/desired accelerations (from trajectory).
-            yaw_idx: list of indices for yaw outputs that need angle wrapping.
-            domain_idx: domain index for multi-domain P matrices.
-
-        Returns:
-            (vdot, v_curr): tuple of Vdot and V values, each shape [B].
-        """
-        # Restrict to the tracked channel subset, exactly as compute_v does.  Accelerations
-        # follow the velocity layout.
-        y_act, y_nom, dy_act, dy_nom = self._select(y_act, y_nom, dy_act, dy_nom)
-        if self._subset:
-            ddy_act, ddy_nom = ddy_act[:, self.vel_gather], ddy_nom[:, self.vel_gather]
-
-        # Compute errors
-        y_err = y_act - y_nom
-        dy_err = dy_act - dy_nom
-        ddy_err = ddy_act - ddy_nom
-
-        batch_size = y_act.shape[0]
-
-        # Build eta: [y_err_0, dy_err_0, y_err_1, dy_err_1, ...]
-        eta = torch.zeros(batch_size, self.n_outputs, device=y_act.device)
-        eta[:, 0::2] = y_err      # even indices: position errors
-        eta[:, 1::2] = dy_err     # odd indices: velocity errors
-
-        # # Wrap yaw errors to [-pi, pi]
-        # yaw_err = y_err[:, yaw_idx]
-        # two_pi = 2.0 * torch.pi
-        # wrapped_yaw_err = (yaw_err + torch.pi) % two_pi - torch.pi
-        # # Update the position error slots for yaw indices in eta
-        # yaw_eta_indices = [2 * i for i in yaw_idx]
-        # eta[:, yaw_eta_indices] = wrapped_yaw_err
-
-        # Build eta_dot: [dy_err_0, ddy_err_0, dy_err_1, ddy_err_1, ...]
-        eta_dot = torch.zeros(batch_size, self.n_outputs, device=y_act.device)
-        eta_dot[:, 0::2] = dy_err     # even indices: velocity errors (d/dt of position error)
-        eta_dot[:, 1::2] = ddy_err    # odd indices: acceleration errors (d/dt of velocity error)
-
-        # Select P matrix based on domain
-        # if self.num_domain > 1:
-        #     P = self.P[domain_idx]
-        # else:
-        P = self.P
-
-        # Compute V = eta^T P eta
-        V = torch.einsum('bi,ij,bj->b', eta, P, eta)
-
-        # Compute per-subgroup V contributions (for logging/debugging)
-        self.v_subgroups = {}
-        for name, idx in self.subgroup_indices.items():
-            if idx.numel() > 0:
-                eta_sub = eta[:, idx].contiguous()
-                P_sub = P[idx][:, idx].contiguous()
-                self.v_subgroups[name] = (torch.matmul(eta_sub, P_sub) * eta_sub).sum(dim=-1)
-
-        # Compute Vdot = 2 * eta^T * P * eta_dot
-        # First compute P @ eta_dot: [B, 2n]
-        P_eta_dot = torch.matmul(eta_dot, P.T)  # [B, 2n]
-        # Then compute eta^T @ (P @ eta_dot): scalar per batch
-        vdot = 2.0 * torch.einsum('bi,bi->b', eta, P_eta_dot)   # TODO: Check this
-
-        # Update V buffer for consistency with finite differencing method
-        self.v_buffer[:, 2] = self.v_buffer[:, 1]
-        self.v_buffer[:, 1] = self.v_buffer[:, 0]
-        self.v_buffer[:, 0] = V.detach()
-        self.step_count += 1
-
-        return vdot, V
 
     def compute_y_err(self, y_act, y_des):
         """

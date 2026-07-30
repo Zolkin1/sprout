@@ -128,9 +128,10 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     # FLAT exteroception width: one token per sensor (176-ray scan) or one per camera
     # (2 x 780 depth). The model reshapes to (B, T, height_dim) internally.
     edim = int(ctx.model.extero_tokens) * int(ctx.model.height_dim)
-    dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd), torch.randn(v, f, d))
-    hdim = int(ctx.model.height_dim)  # height-scan width (176), not 1
-    dummy = (torch.randn(v, n, d), torch.randn(v, hdim), torch.randn(v, n_cmd, cmd),
+    # One dummy per _FmSamplerOnnx.forward arg, in order:
+    # (history, extero, cmd_tokens, noise, history_null). ``extero`` is the FLAT width, so a
+    # depth FM traces at 2*780 rather than the scan's 176 -- do NOT use height_dim alone here.
+    dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd),
              torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
@@ -139,7 +140,8 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
     torch.onnx.export(
         wrapper, dummy, out_path,
         export_params=True, opset_version=opset, dynamo=False,
-        input_names=["history", "extero", "cmd_tokens", "noise", "history_null"], output_names=["trajectory"],
+        input_names=["history", "extero", "cmd_tokens", "noise", "history_null"],
+        output_names=["trajectory"],
         dynamic_axes={k: {0: "V"} for k in ("history", "extero", "cmd_tokens", "noise", "trajectory", "history_null")},
     )
 

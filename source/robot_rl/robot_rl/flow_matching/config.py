@@ -37,10 +37,16 @@ class FlowMatchingConfig:
     # Future window length F: the full denoised state sequence (node 0 = the current /
     # anchor step, ego-anchored onto the robot so its base offset ≈ 0; nodes 1..F-1 are
     # the future). The relative-frame anchor is the robot base at the most recent history
-    # step. F=40 = 0.8 s at dt=0.02 -- covers the deploy-time policy lookahead
-    # (future_base_pose/velocity reach 0.5 s = 25 steps) plus the re-plan block. Also a
-    # multiple of cmd_stride (=5) -> 8 evenly-spaced command tokens. Raising F grows
-    # per-window memory; bump --stride / --num_workers if training OOMs.
+    # step. F=40 = 0.8 s at dt=0.02, a multiple of cmd_stride (=5) -> 8 evenly-spaced
+    # command tokens. Raising F grows per-window memory; bump --stride / --num_workers if
+    # training OOMs.
+    #
+    # TOO SHORT for the current teacher. The policy's reference window now reaches
+    # REFERENCE_NUM_STEPS=11 samples at stride 5 = step +50 = 1.0 s
+    # (g1_teacher_env_cfg.py), so a generator serving it needs F >= 51 plus the re-plan
+    # block. Bumping F requires RE-RECORDING (record_data.py cuts windows at this length)
+    # and retraining. Until then the FM tracker task cannot serve the teacher's
+    # observation at all -- see the two blocked accessors in fm_tracking_cmd.py.
     future_len: int = 40
     # N real-robot-state history (phase) conditioning tokens. Default 2: enough to read
     # gait phase (the FM predicts nominal phase-dependent motion, not recovery).
@@ -64,6 +70,13 @@ class FlowMatchingConfig:
     # (perturbed steps in history and prediction alike). Recordings without a
     # ``perturb_active`` array fall back to "all" regardless.
     recovery_mode: str = "clean_prediction"
+
+    # Drop the DISTRACTOR-family windows (boxes the robot walks AROUND, not onto). Those clips
+    # are ego-anchored like flat walking, so they do produce honest snap windows -- but whether
+    # they help the generator or just add obstacle-shaped noise is unresolved. Recordings carry a
+    # per-window ``is_distractor`` tag, so this is a train-time switch: no re-recording needed to
+    # A/B it. Errors (rather than silently training on them) if the recording has no tag.
+    skip_distractors: bool = False
 
     # Dedicated recorded command array (e.g. "target_vel") giving the per-step
     # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
@@ -91,10 +104,12 @@ class FlowMatchingConfig:
     # recorded array at dataset build time (176x1 for the scan, 780x2 for the cameras).
     height_dim: int = 176
     extero_tokens: int = 1
-    # World floor height for the TERRAIN-PENETRATION LOSS only (flat ground -> 0.0). It no
-    # longer feeds any FM conditioning token (the height scan replaced the root-z scalar).
-    # TODO: the terrain loss's flat-``ground_z`` floor is wrong on non-flat terrain; move it
-    # to an SDF (or a height-scan-derived local floor) before training on complex terrain.
+    # World floor height (flat ground -> 0.0). VESTIGIAL: it fed no conditioning token once
+    # the height scan replaced the root-z scalar, and its last real consumer (the
+    # terrain-penetration loss) is now deleted. It is still copied into ``FMContext`` and the
+    # exported ONNX ``fm_meta``, where nothing reads it back.
+    # TODO: drop the field together with the ``ground_z`` key in ``export_fm_onnx.py`` /
+    # ``transfer/deploy/fm_session.py`` and the unused ``transforms.height_above_ground``.
     ground_z: float = 0.0
     # Std floor for the height-scan normalizer. On flat ground the per-ray scan is nearly
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
@@ -165,45 +180,13 @@ class FlowMatchingConfig:
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
 
-    # -- terrain penetration (penalize predicted feet going below the ground) --
-    # ``terrain_penetration_mode``: "ankle" (penalize the ankle-frame origin) or
-    # "contact" (sample a grid on the foot box sole and penalize each point, using the
-    # predicted foot orientation). ``terrain_ground_z``: world ground height; ``None``
-    # auto-calibrates the floor from the recording at train time (a low percentile of
-    # the lifted recorded foot z, so clean data has ~0 penetration). ``terrain_contact_grid``
-    # is the (nx, ny) sole-grid for contact mode.
-    # ``terrain_tau_gated`` (default False) keeps the penalty on ALL flow-times. Unlike the
-    # accel/FK terms, the low-τ predicted endpoint penetrates ~as much as the deployed
-    # multi-step sample (measured), while the high-τ endpoint ≈ clean data and barely
-    # crosses the floor -- so gating to ``tau >= consistency_tau_min`` suppresses nearly
-    # all the signal. Set True only to restrict it to the high-τ regime.
-    # DISABLED (was 200.0). ``terrain`` here is a single flat ``ground_z`` floor, which is
-    # simply wrong on stairs/boxes -- see the TODO on ``flow.terrain_penetration_term``.
-    # On a staircase the auto-calibrated floor lands near the LOWEST step, so the term is
-    # mostly inert and occasionally penalises correct predictions. ``do_terrain`` in
-    # ``flow.py`` is gated on ``> 0.0``, so 0.0 skips the term entirely (no compute, no
-    # ``ground_z`` dependency). Re-enable only with a real SDF / local-floor terrain, and
-    # watch for predicted feet crossing the floor on flat ground if you leave it off.
-    terrain_penetration_weight: float = 0.0  # was 200.0 (flat-floor loss, wrong on terrain)
-    terrain_penetration_mode: str = "ankle"
-    terrain_ground_z: float | None = None
-    terrain_contact_grid: tuple[int, int] = (3, 2)
-    terrain_floor_percentile: float = 1.0
-    terrain_tau_gated: bool = False
-
-    # -- sampled-rollout terrain penalty (penalize the actual multi-step sample) --
-    # The ``terrain_penetration_weight`` term acts on the teacher-forced endpoint
-    # ``x1_hat``; measured, that suppresses ``x1_hat`` penetration ~40x while the deployed
-    # multi-step sample barely improves (the penalty never sees the sampler's real path).
-    # This term penalizes ``sample_trajectory`` directly. ``terrain_sample_weight`` (>0
-    # enables it; same m² units as the x1_hat term so a similar ~1e2 scale is expected).
-    # To bound cost it samples a ``terrain_sample_size`` sub-batch with
-    # ``terrain_sample_steps`` Euler steps and truncated backprop through only the last
-    # ``terrain_sample_grad_steps`` steps (the rest run under no_grad).
-    terrain_sample_weight: float = 0.0
-    terrain_sample_size: int = 64
-    terrain_sample_steps: int = 8
-    terrain_sample_grad_steps: int = 1
+    # NOTE: the terrain-penetration losses (both the teacher-forced ``x1_hat`` term and the
+    # sampled-rollout term) were DELETED. Both assumed a single flat ``ground_z`` floor,
+    # which is wrong on the stairs/boxes the clip library actually trains on: the floor
+    # auto-calibrated near the LOWEST step, leaving the term mostly inert and occasionally
+    # penalising correct predictions. Nothing now penalises predicted feet crossing the
+    # ground -- re-introduce this only with a real SDF or a height-scan-derived LOCAL floor
+    # (the height scan is already in the conditioning), not a scalar.
 
     # -- training --
     batch_size: int = 256

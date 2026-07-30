@@ -121,7 +121,9 @@ class G1FmTrackerTerrainPlayEnvCfg(G1FmTrackerTerrainEnvCfg):
         self.scene.num_envs = 24
         # Terrain clip library is multi-GB; keep it off a small GPU (device-safe gather).
         self.commands.traj_ref.clip_device = "cpu"
+        # Both actor-side groups: the reference window is corrupted during training too.
         self.observations.policy.enable_corruption = False
+        self.observations.reference.enable_corruption = False
         self.events.push_robot = None
         self.events.randomize_ground_contact_friction = None
         # Draw the FM reference markers + the height-scan ray hits on the treads.

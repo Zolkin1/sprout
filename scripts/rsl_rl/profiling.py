@@ -387,6 +387,13 @@ def instrument_env_managers(
     undos: list[Callable[[], None]] = []
 
     def _w(obj: Any, attr: str, label: str) -> None:
+        # Warn on a MISSING attribute (a renamed/deleted method leaves a silently absent row --
+        # this is how ``traj.measured`` went missing when ``get_measured_outputs`` was deleted).
+        # ``obj is None`` is a legitimate "feature not present" case, and ``wrap_method`` also
+        # returns None when already wrapped, so neither of those warns.
+        if obj is not None and not hasattr(obj, attr):
+            print(f"[WARN profiling] '{label}' not timed: {type(obj).__name__} has no '{attr}' "
+                  f"(renamed or deleted?)")
         undo = wrap_method(obj, attr, timer, label)
         if undo is not None:
             undos.append(undo)
@@ -413,15 +420,17 @@ def instrument_env_managers(
         if include_debug_vis:
             _w(term, "_debug_vis_callback", "traj.debug_vis")
         if include_command_detail:
-            # Sub-steps of BaseTrajectoryCommand._update_command.
-            _w(term, "get_measured_outputs", "traj.measured")
+            # Sub-steps of BaseTrajectoryCommand._update_command. (There used to be a
+            # ``traj.measured`` row wrapping ``get_measured_outputs``; that method died with the
+            # foot-stance paradigm and its replacement is ``traj.compute_measured`` below. Only
+            # wrap a given method ONCE -- ``wrap_method`` skips an already-wrapped attribute, so a
+            # second label on the same method silently steals/drops a row.)
             _w(term, "get_desired_outputs", "traj.desired")
             _w(term, "_transform_desired_outputs", "traj.transform")
             _w(getattr(term, "manager", None), "get_output", "traj.get_output")
             _w(getattr(term, "clf", None), "compute_vdot", "traj.clf")
-            # One level inside get_measured_outputs — to see whether its cost is
-            # the contact-sensor read, the alignment math, or the (unavoidable)
-            # physics body-state fetch (the remainder of traj.measured).
+            # Contact-sensor read, timed separately so it can be told apart from the alignment
+            # math and the (unavoidable) physics body-state fetch.
             _w(term, "get_contact_state", "traj.contact_state")
             _w(term, "compute_measured_output", "traj.compute_measured")
 

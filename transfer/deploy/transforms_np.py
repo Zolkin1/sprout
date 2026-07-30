@@ -2,7 +2,9 @@
 
 """Pure-numpy flow-matching state transforms (no torch, no isaaclab).
 
-Numpy port of ``transfer/fm/transforms.py`` for the torch-free deployment runtime.
+Numpy port of ``robot_rl.flow_matching.transforms`` for the torch-free deployment
+runtime, parity-tested against it directly in
+``transfer/deploy/tests/test_deploy_parity.py``.
 Single source of truth for the relative-frame state layout (per timestep)::
 
     [joint_pos(nj), joint_vel(nj),

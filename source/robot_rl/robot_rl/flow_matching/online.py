@@ -13,7 +13,8 @@ exactly: ``N`` real-robot-state history tokens anchored at the most recent step
 (index N-1, the xyz+yaw ground frame), a single height-scan token, the strided
 command tokens, and the ``F`` predicted FUTURE states (node 0 = current step,
 offset ≈ 0). There is no inpainting / known-mask: conditioning is separate tokens.
-This file is kept in lock-step with the deployment-side ``transfer/fm/online.py``.
+The torch-free deployment counterpart is ``transfer/deploy/fm_session.py`` (numpy +
+onnxruntime); it ports this layout rather than duplicating this module.
 """
 
 from __future__ import annotations
@@ -74,7 +75,7 @@ class BatchedHistory:
 
         Used at deployment where there is no clip-tracking warmup -- pre-loading a
         standing snapshot makes the generator usable from the first control step.
-        Kept in lock-step with the vendored ``transfer/fm/online.py``.
+        Ported to numpy in ``transfer/deploy/history.BatchedHistory``.
         """
         self._steps.clear()
         for _ in range(self.maxlen):
@@ -203,7 +204,7 @@ def load_fm_context(
 
     Reads the predicted extra-frame order from the checkpoint ``meta``
     (``target_frame_names``, with the legacy ``state_frame_names`` as a fallback).
-    Kept in lock-step with the deployment-side ``transfer/fm/online.py``.
+    The deploy side reads the same order from the exported ONNX ``fm_meta``.
 
     Args:
         checkpoint: Path to a ``.pt`` checkpoint or an already-loaded checkpoint dict.

@@ -2,13 +2,13 @@
 
 """Pure-numpy quaternion / frame-transform math (no torch, no isaaclab).
 
-Numpy port of ``transfer/fm/quat_math.py`` for the torch-free deployment runtime
+Numpy port of ``transfer/torch_math/quat_math.py`` for the torch-free deployment runtime
 (numpy + onnxruntime). Convention: every quaternion is ``(x, y, z, w)``
 (scalar-last), matching the repo's ``isaaclab.utils.math`` and ``robot.data``.
 Last-axis component layout; leading dims broadcast.
 
 ``transfer/deploy/tests/test_deploy_parity.py`` asserts these match the torch
-``transfer/fm/quat_math`` numerically; keep them in lock-step.
+``transfer/torch_math/quat_math`` numerically; keep them in lock-step.
 """
 
 from __future__ import annotations

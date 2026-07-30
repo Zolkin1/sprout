@@ -728,7 +728,9 @@ def _size_stair_tile_to_motion(tile_recs, builder, m, is_pure):
     union of every clip and written identically to each.  The clips + overlays are re-shifted in y so the
     union sits at ``m`` (tile-local y in ``[m, m+span]``), keeping the walkable box aligned to [0, size_y].
     """
-    py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
+    # WORLD pos_y channels only -- root-frame channels are pelvis-relative, so they would
+    # both poison the bbox below and be CORRUPTED by the rigid shift further down.
+    py = world_position_channels(builder.pos_names, "y")
     ylo = min(float(np.asarray(r["y"])[:, py].min()) for r in tile_recs)
     yhi = max(float(np.asarray(r["y"])[:, py].max()) for r in tile_recs)
     # Also cover the fixed boxes so a widened surface never leaves an authored tread/platform uncovered.

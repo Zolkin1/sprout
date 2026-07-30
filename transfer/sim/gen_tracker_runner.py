@@ -315,12 +315,10 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
         hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
-        cmd_max_acc: float, fm_traj_points: int,
-        clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
-        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
         clip_spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
-        clip: ClipReference | None = None, clip_handoff_time: float = -1.0) -> bool:
+        clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
+        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
@@ -335,8 +333,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         total_time: Stop after this many seconds (``<= 0`` runs until the viewer closes).
         headless: Run without the viewer.
         log_path: CSV path for per-step metrics, or ``None`` to skip logging.
-        warmup_time: Seconds to PD-hold the stand before live control (``<= 0`` skips
-            the hold and falls back to a static warm-start fill).
+        warmup_time: Seconds to PD-hold the stand before live control. DEFAULTS TO 0 (skip the
+            hold; fall back to a static warm-start fill), because ``null_history_warmup``
+            makes the FM valid at step 0 without needing real snapshots in the window, so the
+            hold only delays the thing you launched the runner to see. A positive value also
+            arms the joystick start-button gate in viewer runs.
         rt_factor: Real-time speed multiple for viewer playback (``1.0`` = real time,
             ``0.5`` = half speed; ``<= 0`` disables pacing).
         standing_config: Path to a standing ``config_solution.yaml`` to spawn + hold; if
@@ -364,6 +365,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         fm_traj_points: Number of evenly-spaced spheres drawn along the FM predicted root
             (and feet) trajectory in the viewer; ``<= 0`` draws every predicted node (a
             dense ribbon, matching the IsaacLab debug viz).
+        spawn_on_box: Name or index of a scene box to spawn standing on TOP of, instead of
+            the floor (``None`` -> floor). Only the support height changes; the standing
+            joint pose is kept. Warns and falls back to the floor if the box is not found.
         clip: Optional baked-clip reference source. When given, the robot spawns on the
             clip's step-0 pose and the tracker is driven by the clip reference (no FM)
             instead of the standing warmup + FM path.
@@ -830,11 +834,17 @@ def main() -> None:
                              "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
                              "standing joint pose is kept; only the support height changes. "
                              "Pair with --warmup_time 0 to hand straight to the FM on the box.")
-    parser.add_argument("--warmup_time", type=float, default=1.0,
-                        help="Seconds to PD-hold a stand before live control. Pass 0 to spawn "
+    parser.add_argument("--warmup_time", type=float, default=0.0,
+                        help="Seconds to PD-hold a stand before live control. DEFAULT 0 = spawn "
                              "DIRECTLY into FM+tracker control: the FM history is warm-started "
                              "from the spawn state, the leg hold-gain stiffening is skipped, and "
-                             "the joystick start-button gate is disabled.")
+                             "the joystick start-button gate is disabled. The FM is valid at step "
+                             "0 regardless, because --null_history_warmup (also default on) "
+                             "samples it through the learned null-history embedding. Pass a "
+                             "POSITIVE value (e.g. 1.0, the old default) to get the stand hold "
+                             "back -- and, in a joystick viewer run, the start-button gate that "
+                             "holds until you press start. Ignored in --clip mode, which always "
+                             "spawns on the clip pose with RL gains.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
     parser.add_argument("--headless", action="store_true", default=False)
@@ -1044,8 +1054,6 @@ def main() -> None:
                   args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
                   args.cmd_max_acc, args.fm_traj_points,
                   spawn_on_box=args.spawn_on_box,
-                  clip=clip, clip_handoff_time=clip_handoff_time)
-                  args.hold_kv_scale, args.spawn_z_offset, args.cmd_max_acc, args.fm_traj_points,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)
     print(f"[INFO] Run finished. Survived: {success}")

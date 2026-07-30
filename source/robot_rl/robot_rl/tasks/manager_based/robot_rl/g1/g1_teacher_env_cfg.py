@@ -27,6 +27,8 @@ from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
 
+from motion_gen.joint_names import G1_JOINT_NAMES
+
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
@@ -37,6 +39,58 @@ from .g1_clf_tracking_base import (
     G1ClfTrackingSceneCfg,
 )
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
+
+
+##
+# Observation window sizes -- one knob each, shared by the policy and the critic.
+##
+
+#: Proprioception window length in CONTROL steps, current step included.  10 = the
+#: current step plus the 9 before it, i.e. 0.18 s of history at the 0.02 s control dt.
+#: These are *consecutive* steps (Isaac Lab's per-term ``history_length`` buffers every
+#: step); only the reference look-ahead below is decimated.  Set to 1 for no history.
+PROPRIO_HISTORY_LENGTH = 10
+
+#: Reference window length in samples, current step included.  11 = the current step
+#: plus 10 future ones.  Set to 1 to observe only the current reference.
+REFERENCE_NUM_STEPS = 11
+
+#: Control steps between reference samples.  5 * 0.02 s = 0.1 s, so 11 samples span
+#: 0.0 .. 1.0 s of look-ahead.
+REFERENCE_STRIDE = 5
+
+#: End-effector frames the reference window carries (clip output frames minus the base:
+#: both ankles + both wrists).  Only needed to size the per-channel noise vector below;
+#: the observation itself takes the list from the command's ``resolve_ee_frames``.  A
+#: mismatch fails loudly when the noise is broadcast against the observation.
+REFERENCE_NUM_EE_FRAMES = 4
+
+_REF_PARAMS = {
+    "command_name": "traj_ref",
+    "num_steps": REFERENCE_NUM_STEPS,
+    "stride": REFERENCE_STRIDE,
+}
+
+#: Per-channel noise for the merged reference window.  A single scalar cannot serve it:
+#: the window mixes metres, radians and rad/s, so the level that is right for a joint
+#: angle is negligible for a joint velocity.  Magnitudes live in
+#: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over the full 11 x 82 layout.
+_REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
+    num_steps=REFERENCE_NUM_STEPS,
+    num_joints=len(G1_JOINT_NAMES),
+    num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+)
+
+#: Per-channel multiplier for the reference window, applied AFTER noise and clipping.
+#: Only the joint-velocity block moves (x0.05, matching the proprioceptive ``joint_vel``
+#: term) so the encoder's inputs sit in a comparable range; see
+#: ``mdp.REFERENCE_WINDOW_SCALE``.  Because the scale comes last, the noise half-widths
+#: and the +-20 clip above stay in raw units, exactly as the old joint_vel_ref term had.
+_REF_SCALE = mdp.reference_window_scale(
+    num_steps=REFERENCE_NUM_STEPS,
+    num_joints=len(G1_JOINT_NAMES),
+    num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+)
 
 
 ##
@@ -96,74 +150,80 @@ class G1TeacherCommandsCfg:
 ##
 @configclass
 class G1TeacherObservationsCfg:
-    """World-frame-aware observations: deployable policy, privileged critic.
+    """Three groups: proprioception, reference, privileged critic.
 
-    The CLF tracking vectors are world-frame (absolute position / heading), so
-    the raw ``ref_traj``/``act_traj``/``*_vel`` observations live in the
-    critic-only group; the policy's reference terms (base-pose error, joint
-    refs, ee refs, future windows) are all relative / heading-invariant, so the
-    policy never sees a world coordinate.  Shared with
-    :class:`G1TrackerEnvCfg` (one frame across both tasks)."""
+    The actor consumes ``policy`` and ``reference`` as SEPARATE branches (see
+    ``agents/rsl_rl_ppo_cfg.py``): ``policy`` feeds the trunk directly while
+    ``reference`` goes through its own MLP encoder.  Keeping them apart at the
+    observation-manager level is what makes that routing declarative -- rsl-rl's
+    ``obs_groups`` maps group names onto model inputs.
+
+    * ``policy`` -- deployable proprioception, each term carrying
+      :data:`PROPRIO_HISTORY_LENGTH` consecutive control steps, plus the height
+      scan (exteroception, no history).
+    * ``reference`` -- the whole reference trajectory over
+      :data:`REFERENCE_NUM_STEPS` samples, all relative / heading-invariant so no
+      world coordinate reaches the policy.
+    * ``critic`` -- the same history and reference, uncorrupted, plus privileged
+      state and the world-frame CLF tracking vectors.
+
+    Shared with :class:`G1TrackerEnvCfg` (one frame across both tasks).
+    """
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Deployable proprioception + base-relative reference (no world coords)."""
+        """Deployable proprioception (history-stacked) + the height scan.
 
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
-        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05)
-        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
+        Every term here is history-stacked EXCEPT the height scan: the history is
+        proprioception (what the robot felt), and Isaac Lab stacks oldest-first with
+        noise/clip/scale baked into each slot independently -- which is the physical
+        thing, each past step carries its own sensor noise.
+        """
 
-        # Reference (current step only), base-relative. The reference *motion* terms
-        # carry observation noise so the teacher learns to track a noisy reference --
-        # the generator (FM) predicts these at deploy and its output is not perfectly
-        # clean. The command terms (command_vel / future_command_vel) stay clean: at
-        # deploy they come from the joystick / scripted profile, not the FM.
-        base_pose_error = ObsTerm(func=mdp.base_pose_error, params={"command_name": "traj_ref"},
-                                  noise=Unoise(n_min=-0.03, n_max=0.03))
-        joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"},
-                                noise=Unoise(n_min=-0.02, n_max=0.02))
-        joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"},
-                                noise=Unoise(n_min=-0.5, n_max=0.5), clip=(-20.0, 20.0))
-        ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"},
-                         noise=Unoise(n_min=-0.02, n_max=0.02))
-        # Reference base velocity (current step), rotated into the base frame
-        # (heading-invariant, deployable). The FM predicts this (the achieved-reference
-        # velocity, not the command); noised like the other reference-motion terms.
-        base_vel_ref = ObsTerm(func=mdp.ref_base_velocity_local, params={"command_name": "traj_ref"},
-                               noise=Unoise(n_min=-0.1, n_max=0.1))
-        # Joystick-level velocity command that generated the clip (target_vel =
-        # (vx, vy, wz)); pairs with the xy_vel / yaw_vel tracking rewards. No noise:
-        # this is the upstream command, not the FM-predicted reference.
-        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2),
+                               history_length=PROPRIO_HISTORY_LENGTH)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05),
+                                    history_length=PROPRIO_HISTORY_LENGTH)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01),
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.5, n_max=0.5), scale=0.05,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0),
+                          history_length=PROPRIO_HISTORY_LENGTH)
 
-        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps): future
-        # joystick command + future base pose/velocity, so the teacher can
-        # anticipate upcoming slowdowns / turns. Base pose/vel are relative to the
-        # current actual base (a "future base_pose_error"); noised like the
-        # current-step reference (the FM predicts these too).
-        future_command_vel = ObsTerm(
-            func=mdp.future_command_velocity,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-        )
-        future_base_pose = ObsTerm(
-            func=mdp.future_base_pose,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-            noise=Unoise(n_min=-0.03, n_max=0.03),
-        )
-        future_base_vel = ObsTerm(
-            func=mdp.future_base_velocity,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-            noise=Unoise(n_min=-0.1, n_max=0.1),
-        )
         # Terrain awareness: per-ray ground clearance from the pelvis height scanner
         # (the same scan the FM conditions on). Flat ground -> ~constant; carries terrain
-        # shape on rough ground. Noised like the other deployable sensor terms.
+        # shape on rough ground. Noised like the other deployable sensor terms. NOT
+        # history-stacked -- exteroception, and 176 rays x 10 steps buys little.
         height_scan = ObsTerm(
             func=mdp.height_scan, params={"sensor_cfg": SceneEntityCfg("height_scanner")},
-            noise=Unoise(n_min=-0.1, n_max=0.1), clip=(-1.0, 1.0),
+            noise=Unoise(n_min=-0.04, n_max=0.04), clip=(-1.0, 1.0),
         )
+
+        def __post_init__(self):
+            self.enable_corruption = True
+            self.concatenate_terms = True
+            # NB: history is declared PER TERM above, never via
+            # ObservationGroupCfg.history_length -- that field blanket-overrides every
+            # term in the group, which would stack the height scan too.
+
+    @configclass
+    class ReferenceCfg(ObsGroup):
+        """The reference trajectory: current step + look-ahead, base-relative.
+
+        Fed to the actor's dedicated encoder rather than the trunk.  The reference
+        *motion* carries observation noise so the teacher learns to track a noisy
+        reference -- the generator (FM) predicts it at deploy and its output is not
+        perfectly clean.  The joystick command stays clean: at deploy it comes from
+        the joystick / scripted profile, not the FM.
+        """
+
+        # Per-CHANNEL noise (see _REF_NOISE): position blocks ~cm, velocity blocks
+        # 0.25-0.5 in their own units. The clip saturates the velocity channels the way
+        # the old joint_vel_ref term did; it is a no-op for the position channels.
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+                                   noise=_REF_NOISE, clip=(-20.0, 20.0), scale=_REF_SCALE)
+        command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
         def __post_init__(self):
             self.enable_corruption = True
@@ -171,39 +231,37 @@ class G1TeacherObservationsCfg:
 
     @configclass
     class CriticCfg(ObsGroup):
-        """Privileged critic: clean state + world-frame CLF tracking vectors."""
+        """Privileged critic: clean state (history-stacked) + world-frame CLF vectors."""
 
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0)
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0)
-        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
-        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=1.0,
+                               history_length=PROPRIO_HISTORY_LENGTH)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=1.0,
+                               history_length=PROPRIO_HISTORY_LENGTH)
+        root_quat = ObsTerm(func=mdp.root_quat_w, scale=1.0,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity,
+                                    history_length=PROPRIO_HISTORY_LENGTH)
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        actions = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0),
+                          history_length=PROPRIO_HISTORY_LENGTH)
 
-        base_pose_error = ObsTerm(func=mdp.base_pose_error, params={"command_name": "traj_ref"})
-        joint_pos_ref = ObsTerm(func=mdp.joint_pos_ref, params={"command_name": "traj_ref"})
-        joint_vel_ref = ObsTerm(func=mdp.joint_vel_ref, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
-        ee_ref = ObsTerm(func=mdp.ee_ref_relative_to_base, params={"command_name": "traj_ref"})
-        # Joystick-level velocity command that generated the clip (target_vel).
-        command_vel = ObsTerm(func=mdp.command_velocity, params={"command_name": "traj_ref"})
+        # Same reference window the actor's encoder sees, uncorrupted.
+        # Same window the actor's encoder sees, uncorrupted -- but identically clipped and
+        # scaled, so the two networks read the reference in the same units.
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+                                   clip=(-20.0, 20.0), scale=_REF_SCALE)
+        command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
-        # Look-ahead into the clip (next 0.5 s, subsampled every 5 steps), same as
-        # the policy group (future command + base pose/vel rel. to current base).
-        future_command_vel = ObsTerm(
-            func=mdp.future_command_velocity,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-        )
-        future_base_pose = ObsTerm(
-            func=mdp.future_base_pose,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-        )
-        future_base_vel = ObsTerm(
-            func=mdp.future_base_velocity,
-            params={"command_name": "traj_ref", "horizon_s": 0.5, "stride": 5},
-        )
-
-        # Full world-frame tracking vector (privileged -- absolute coords).
+        # Full world-frame tracking vector (privileged -- absolute coords). NOT
+        # redundant with reference_window: act_traj/act_traj_vel are the only MEASURED
+        # Cartesian ee state anywhere in the observations, ref_traj carries ee
+        # reference ORIENTATION and velocity (the window keeps ee positions only), and
+        # the four together are exactly the CLF's arguments
+        # (clf.compute_vdot(y_act, y_des, dy_act, dy_des)) -- i.e. the arguments of the
+        # reward this critic has to predict.
         ref_traj = ObsTerm(func=mdp.ref_traj, params={"command_name": "traj_ref"})
         act_traj = ObsTerm(func=mdp.act_traj, params={"command_name": "traj_ref"})
         ref_traj_vel = ObsTerm(func=mdp.ref_traj_vel, params={"command_name": "traj_ref"}, clip=(-20.0, 20.0))
@@ -220,6 +278,7 @@ class G1TeacherObservationsCfg:
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
+    reference: ReferenceCfg = ReferenceCfg()
     critic: CriticCfg = CriticCfg()
 
 
@@ -313,36 +372,17 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         self._apply_tracking_mode()
 
     def _apply_tracking_mode(self) -> None:
-        """Swap the reference observation terms to match ``commands.traj_ref.tracking_mode``.
+        """Validate ``commands.traj_ref.tracking_mode``.
 
-        The reward side needs nothing here -- the command reads ``tracking_mode`` itself and
-        builds the CLF over the matching channel subset.  This is only the observation half:
-        under ``"body"`` the policy and critic see the root-frame body targets instead of the
-        reference joint angles, so the two arms of the A/B differ in *both* what is graded and
-        what is observed, which is the comparison being made.
+        The OBSERVATION is deliberately identical in both modes: the reference window keeps
+        its joint + ee content, so the A/B isolates the thing under test -- what the reward
+        grades -- rather than confounding it with a change in what the policy can see.  The
+        reward side needs nothing here either; the command reads ``tracking_mode`` itself and
+        builds the CLF over the matching channel subset.
 
-        ``ee_ref`` stays in both modes: the world end-effector frames are tracked either way.
-        Proprioception (``joint_pos`` / ``joint_vel`` / ``actions``) also stays -- the action
-        space is joint PD targets and joint encoders are what the hardware measures.
+        So this is only a fail-fast on a typo'd mode, which would otherwise surface much
+        later as a confusing channel-subset error inside the CLF.
         """
         mode = self.commands.traj_ref.tracking_mode
-        if mode == "joint":
-            return
-        if mode != "body":
+        if mode not in ("joint", "body"):
             raise ValueError(f"tracking_mode must be 'joint' or 'body'; got {mode!r}.")
-
-        for group, pos_noise, vel_noise in (
-            (self.observations.policy, Unoise(n_min=-0.02, n_max=0.02),
-             Unoise(n_min=-0.5, n_max=0.5)),
-            (self.observations.critic, None, None),
-        ):
-            group.joint_pos_ref = None
-            group.joint_vel_ref = None
-            group.body_pos_ref = ObsTerm(
-                func=mdp.body_pos_ref_root, params={"command_name": "traj_ref"},
-                noise=pos_noise,
-            )
-            group.body_vel_ref = ObsTerm(
-                func=mdp.body_vel_ref_root, params={"command_name": "traj_ref"},
-                noise=vel_noise, clip=(-20.0, 20.0),
-            )

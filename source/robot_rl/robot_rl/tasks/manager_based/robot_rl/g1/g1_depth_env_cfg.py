@@ -314,10 +314,17 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
     ``scene.height_scanner`` to None -- and drop the inherited
     ``scene.height_scanner.debug_vis = True`` in the play variant, which would otherwise
     raise on None.
+
+    Only the ``policy`` group is overridden here.  The proprioceptive history on the
+    inherited terms, the ``reference`` encoder group and the privileged ``critic`` all
+    come straight from :class:`G1TeacherObservationsCfg`.
     """
 
     @configclass
     class PolicyCfg(G1TeacherObservationsCfg.PolicyCfg):
+        # Depth is exteroception, so it is NOT history-stacked -- same call as the
+        # height scan it replaces (the inherited proprioception terms keep their
+        # PROPRIO_HISTORY_LENGTH stacking).
         # Noise is applied inside mdp.depth_image (driven by the resample_depth_noise
         # event), NOT via the term's `noise` field -- see mdp/sensors/noise.py.
         depth_near = ObsTerm(

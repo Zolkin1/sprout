@@ -25,13 +25,24 @@ box (tile) is shared by several motions placed relative to it (few tiles, many c
 motion + its REAL target_vel are kept (negatives: honest velocity -- stop ramps to 0, straight/turn
 hold), so the RL learns "box in view != jump".
 
-ANCHOR: these are WORLD-PINNED (anchor = nothing free), NOT ego. If they ego-re-anchored mid-episode
-the motion would float off the fixed box and the baked relationship (stop 0.3 m before the box)
-would drift away -- the teacher would then see a stop unrelated to the box. Deploy still re-aligns
-from perception via the FM.
-    TODO(revisit ego): world-pin is the safe default, but ego-anchoring these may well be fine in
-    practice -- ego fires on only a FRACTION of envs per episode (ego_anchor_fraction) and only on a
-    cadence, so the incoherent fraction is small and may wash out. Worth A/B-ing once training runs.
+ANCHOR: these carry the FLAT mask (``_ANCHOR_MASK_FLAT`` -- downrange/lateral/yaw FREE, height
+clip-fixed), i.e. ego-anchored exactly like flat walking. See :data:`_DISTRACTOR_MASK`.
+
+This is a deliberate TRADE, not a free win. World-pinning (nothing free) preserves the baked
+relationship the clip was generated to teach -- stop 0.3 m before the box -- and an ego re-anchor
+mid-episode can slide the motion relative to the fixed box, so the teacher may see a stop that no
+longer lines up with the obstacle. But a world-pinned clip is never re-anchored, and the FM's
+training windows are recorded exactly at re-anchor events: pinned distractors either yield nothing
+usable or (when ego still fires for the env) yield windows whose target is accumulated
+robot-vs-clip TRACKING DRIFT rather than a placement decision. Since the boxes here are obstacles
+to ROUTE AROUND rather than surfaces to land on, the spatial precision is worth less than getting
+these clips into the FM at all -- so they are ego.
+
+The ideal (keep the box relationship AND be re-anchorable) needs a mask that frees the root only
+while the motion is far from the box, i.e. a per-STEP schedule like the box family's, computed from
+the distance to the obstacle. Not implemented; that is the real fix if the trade turns out badly.
+If the distractors misbehave in the FM, turn them OFF rather than re-pinning them:
+``scripts/flow_matching/train.py --skip_distractors`` (no re-recording needed).
 
 Runs with NO IsaacLab.
 
@@ -62,15 +73,19 @@ from motion_gen.motion_matching.locomotion_db import (
 )
 from motion_gen.motionbricks.distractor_plan import profile_cmd
 from motion_gen.library_metadata import read_library_metadata
-from motion_gen.world_lift import anchor_mask_from_free
+from motion_gen.world_lift import _ANCHOR_MASK_FLAT
 
 _CONTACT = ["left_ankle_roll_link", "right_ankle_roll_link"]
 _FEET = ["left_ankle_roll_link", "right_ankle_roll_link"]
-_PINNED = anchor_mask_from_free(set())               # world-pinned: no root DOF re-anchors to the robot
-# TODO(distractor-ego-mask): should be the FLAT mask ({"x", "y", "yaw"} FREE, z clip-fixed) --
-# distractors are flat walking around obstacles, not motion that must land on geometry, so
-# world-pinning them means they are never a re-anchor event and contribute no usable FM
-# windows. See the longer note in mb_distractor_clips.py; fix both and regenerate.
+# Distractors are ego-anchored like flat walking -- see the ANCHOR section of the module docstring
+# for why (and for what the ideal per-step mask would be).
+#
+# DO NOT change this to a pinned/custom mask without also updating
+# ``mb_distractor_clips._DISTRACTOR_MASK`` and ``test_distractor_anchor_mask.py``, which pins BOTH
+# generators to this value. A pinned distractor silently poisons FM recording: the snap fires
+# (``ego_anchor_fraction=1.0`` when recording) but the placement cannot move, so the window's target
+# is tracking drift. ``record_data.py`` warns loudly if it ever sees a no-free-DOF clip.
+_DISTRACTOR_MASK = int(_ANCHOR_MASK_FLAT)
 
 
 # ---- velocity profiles ------------------------------------------------------------------------------
@@ -360,7 +375,7 @@ def main() -> int:
             "target_vel": r["target_vel"].unsqueeze(0),
             "terrain_id": torch.tensor([r["terrain_id"]], dtype=torch.int32, device=dev),
             "terrain_type": "box",
-            "anchor_mask": torch.tensor([_PINNED], dtype=torch.uint8, device=dev),
+            "anchor_mask": torch.tensor([_DISTRACTOR_MASK], dtype=torch.uint8, device=dev),
         })
     writer.close()
 
