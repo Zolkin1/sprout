@@ -29,7 +29,7 @@ import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
-from motion_gen.joint_names import is_root_frame
+from motion_gen.joint_names import is_root_frame, root_frame_name
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
@@ -1106,6 +1106,56 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not create body markers: {exc}")
             return None
+
+    def tracked_frame_pose(self, frame_names: list[str]):
+        """Measured and reference pose of named frames, in the frame the REWARD uses.
+
+        Reads ``y_act`` / ``y_des`` directly, so the pair is exactly what the CLF
+        differences: world positions with the clip already re-datumed onto the robot in the
+        anchor mask's free DOFs.  A consumer therefore measures LOCAL tracking error --
+        planar drift has already been removed, and is the base termination's job instead.
+
+        Prefers a frame's ``@root`` channels when the library carries them (that is the copy
+        body mode grades, and its velocities are Jacobian-exact), falling back to the world
+        channels otherwise, so this works in both tracking modes.
+
+        Args:
+            frame_names: Bare body names, e.g. ``["left_ankle_roll_link"]``.
+
+        Returns:
+            ``(act_pos, act_quat, des_pos, des_quat)``, shapes ``[N, F, 3]`` / ``[N, F, 4]``
+            (quaternions xyzw).
+
+        Raises:
+            KeyError: If a requested frame has no channels at all.
+        """
+        cache = getattr(self, "_tf_pose_idx", None)
+        if cache is None:
+            cache = self._tf_pose_idx = {}
+        key = tuple(frame_names)
+        if key not in cache:
+            names = self.ordered_pos_output_names
+            pos_i, ori_i = [], []
+            for f in frame_names:
+                stem = root_frame_name(f) if f"{root_frame_name(f)}:pos_x" in names else f
+                if f"{stem}:pos_x" not in names:
+                    raise KeyError(
+                        f"Frame '{f}' has no tracked channels (looked for '{f}' and "
+                        f"'{root_frame_name(f)}'). Available frames: "
+                        f"{sorted({n.split(':', 1)[0] for n in names if ':pos_' in n})}"
+                    )
+                pos_i += [names.index(f"{stem}:pos_{a}") for a in "xyz"]
+                ori_i += [names.index(f"{stem}:ori_{a}") for a in ("x", "y", "z", "w")]
+            cache[key] = (
+                torch.tensor(pos_i, dtype=torch.long, device=self.device),
+                torch.tensor(ori_i, dtype=torch.long, device=self.device),
+            )
+        pos_i, ori_i = cache[key]
+        f = len(frame_names)
+        return (
+            self.y_act[:, pos_i].view(-1, f, 3), self.y_act[:, ori_i].view(-1, f, 4),
+            self.y_des[:, pos_i].view(-1, f, 3), self.y_des[:, ori_i].view(-1, f, 4),
+        )
 
     def _tracked_body_pos_idx(self) -> torch.Tensor | None:
         """``[B, 3]`` ``y_des``/``y_act`` column indices of every TRACKED frame's position.

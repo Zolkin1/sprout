@@ -338,7 +338,14 @@ class G1TeacherRewardCfg(G1ClfTrackingRewardCfg):
 ##
 @configclass
 class G1TeacherTerminationCfg:
-    """One failure termination (base drift) + clip-end / time-out truncations."""
+    """Two failure terminations (global base drift, local ee drift) + truncations.
+
+    The pair is deliberate and mirrors the reward/termination frame split: the base term
+    watches the GLOBAL clip (drift the reward forgives), the ee term watches each limb
+    against the LOCAL, anchored reference (error the reward grades but only softly).  A
+    robot can fail either way independently -- hold its base pose while dragging a foot
+    through the wrong place, or track every limb while walking off the clip.
+    """
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     clip_end = DoneTerm(
@@ -346,7 +353,17 @@ class G1TeacherTerminationCfg:
     )
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.75, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.25, "max_ori_rad": 0.8},
+    )
+    ee_pose_error = DoneTerm(
+        func=mdp.tracked_frame_error_termination,
+        params={
+            "command_name": "traj_ref",
+            "frame_names": ("left_ankle_roll_link", "right_ankle_roll_link",
+                            "left_wrist_yaw_link", "right_wrist_yaw_link"),
+            "max_pos_dist": 0.25,
+            "max_ori_rad": 0.8,
+        },
     )
 
 
@@ -380,7 +397,19 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         self.events.push_robot = None
         # Stronger undesired-contact penalty + tighter CLF normalization.
         self.rewards.undesired_contacts.weight = -0.5
-        self.rewards.clf_reward.params["max_eta_err"] = 5.0
+        # CLF reward normaliser: reward = 10 * exp(-V / (lambda_max * max_eta_err^2)).
+        # 3.5 puts the half-reward point at V ~= 38, sized against the V ~= 41 a live
+        # policy actually sits at (200 iters, body mode) rather than the V ~= 30 of a
+        # collapsing one. At 5.0 half-reward sat at V ~= 77, which the policy only reached
+        # as it was dying -- the whole operating range was squeezed into the saturated top.
+        #
+        # Two traps when re-tuning this from the dashboard:
+        #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by
+        #     max_episode_length_s, so it reads ~7% of the instantaneous value while
+        #     episodes are ~1.3 s of a 20 s window. It tracks SURVIVAL as much as quality.
+        #   * ``Metrics/traj_ref/v`` is logged at reset, so it is V at the instant of
+        #     FAILURE, not the episode average. Back the average out of the reward instead.
+        self.rewards.clf_reward.params["max_eta_err"] = 3.5
         self.rewards.clf_decreasing_condition.params["eta_max"] = 5.0
         self.rewards.clf_decreasing_condition.params["eta_dot_max"] = 10.0
         self._apply_tracking_mode()

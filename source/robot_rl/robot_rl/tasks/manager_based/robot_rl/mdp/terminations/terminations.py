@@ -59,6 +59,46 @@ def base_pose_error_termination(
     return (pos_err > max_pos_dist) | (ori_err > max_ori_rad)
 
 
+def tracked_frame_error_termination(
+    env,
+    command_name: str = "traj_ref",
+    frame_names: tuple[str, ...] = (
+        "left_ankle_roll_link", "right_ankle_roll_link",
+        "left_wrist_yaw_link", "right_wrist_yaw_link",
+    ),
+    max_pos_dist: float = 0.25,
+    max_ori_rad: float = 0.8,
+) -> torch.Tensor:
+    """Terminate when a tracked end-effector drifts too far from ITS reference.
+
+    Complements :func:`base_pose_error_termination`, which watches the base against the
+    globally-placed clip. This one is LOCAL: it reads ``y_act`` / ``y_des``, so the clip
+    root has already been re-datumed onto the robot and what remains is limb error. The two
+    catch different failures -- a robot can hold its base pose perfectly while dragging a
+    foot through the wrong place, and it can track every limb while walking off the clip.
+
+    Terminates if ANY named frame exceeds either bound.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+        frame_names: Frames to watch. Defaults to the four end effectors.
+        max_pos_dist: Max per-frame position error before terminating (m).
+        max_ori_rad: Max per-frame geodesic orientation error before terminating (rad).
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    act_pos, act_quat, des_pos, des_quat = cmd.tracked_frame_pose(list(frame_names))
+    n, f = act_pos.shape[0], act_pos.shape[1]
+    pos_err = torch.norm(act_pos - des_pos, dim=-1)                                  # [N, F]
+    ori_err = torch.norm(
+        quat_box_minus(act_quat.reshape(n * f, 4), des_quat.reshape(n * f, 4)), dim=-1
+    ).view(n, f)
+    return ((pos_err > max_pos_dist) | (ori_err > max_ori_rad)).any(dim=-1)
+
+
 def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
     """Truncate (good termination) when the clip's last step is reached.
 
