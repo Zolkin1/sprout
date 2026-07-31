@@ -74,7 +74,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--val_every", type=int, default=5, help="Validate every N epochs.")
     parser.add_argument("--ckpt_every", type=int, default=20, help="Checkpoint every N epochs.")
     parser.add_argument("--cosine", action="store_true", help="Use cosine LR annealing.")
-    parser.add_argument("--wandb", action="store_true", help="Also log to Weights & Biases.")
+    # Opt-OUT, matching the RL side (its agent cfgs ship `logger: wandb`). Every FM run is
+    # worth comparing against the others, and a run you have to remember to instrument is
+    # a run whose curve you do not have when you want it. TensorBoard is written either way.
+    parser.add_argument("--wandb", action="store_true", default=True,
+                        help="Log to Weights & Biases (default; use --no_wandb to disable).")
+    parser.add_argument("--no_wandb", dest="wandb", action="store_false",
+                        help="Disable Weights & Biases; TensorBoard logging is unaffected.")
     parser.add_argument("--wandb_project", type=str, default="robot_rl_flow_matching")
     # config fields
     parser.add_argument("--future_len", type=int, default=FlowMatchingConfig().future_len,
@@ -476,8 +482,18 @@ def main() -> None:
     writer = SummaryWriter(log_dir=out_dir)
     wandb_run = None
     if args.wandb:
-        import wandb  # noqa: PLC0415
-        wandb_run = wandb.init(project=args.wandb_project, name=run_name, config=cfg.to_dict())
+        # Never let telemetry take down a training run. Now that this is on by default, an
+        # uninstalled wandb, a missing login or a network blip would otherwise kill a
+        # multi-hour job before its first epoch. Degrade to TensorBoard (which is always
+        # written) and say so loudly enough to notice at the top of the log.
+        try:
+            import wandb  # noqa: PLC0415
+            wandb_run = wandb.init(project=args.wandb_project, name=run_name,
+                                   config=cfg.to_dict())
+        except Exception as exc:                                          # noqa: BLE001
+            print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}\n"
+                  f"       Training continues; scalars still go to TensorBoard in {out_dir}.\n"
+                  "       Pass --no_wandb to silence this, or fix the login (wandb login).")
 
     best_val = math.inf
     global_step = 0
