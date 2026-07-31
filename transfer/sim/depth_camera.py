@@ -20,13 +20,14 @@ camera numbers of its own.  What it does hold is the MuJoCo-side convention:
 * ``terrain_group`` (2) -- the floor and stair geoms, matching
   :meth:`Robot.compute_height_scan` and ``generate_stairs_scene.py``.
 
-TODO(depth-parity): MuJoCo group 1 also holds the hand/palm/finger visual meshes, which
-IsaacLab's ``SELF_SCAN_LINKS`` (see ``g1/g1_self_scan.py``) leaves out -- measured at
-~60/780 near-camera pixels in a nominal stance, and ~34/780 on the far camera with the
-arms forward.  The mismatch is knowingly kept until the hardware camera's own occlusion
-geometry is known, since all three (both sims and the robot) should ultimately agree.
-Closing it on this side means filtering by body name: export the self-scan link list
-alongside the camera contract and keep only geoms whose body is in it.
+Group 1 also holds the hand/palm/finger visual meshes.  IsaacLab casts those too, so the
+two agree: ``compare_depth_sim2sim.py`` reports the hand pixels within 0.005 m.  This used
+to be a standing ~60/780-pixel delta, because IsaacLab's ``SELF_SCAN_LINKS`` could not see
+them -- the stock URDF hung the hand meshes off the wrist as bare ``<visual>`` elements,
+which the importer turned into Xforms with a non-identity mesh->body offset that
+``MultiMeshRayCaster`` silently fails to intersect.  The fix was to make them real
+fixed-joint links (``robot_assets/g1/g1_21j/make_hand_links_urdf.py``), so nothing has to
+be filtered out here.
 """
 
 from __future__ import annotations

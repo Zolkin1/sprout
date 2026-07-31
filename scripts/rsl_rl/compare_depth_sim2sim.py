@@ -13,9 +13,12 @@ randomisation and noise off, and the two 30x26 images are differenced. Also chec
 * **Mount frame** -- the world offset of ``torso_link`` from the pelvis in each simulator.
   The contract's camera offsets are expressed in that body's frame, so a USD/MJCF skew here
   moves both cameras and is the one failure mode the contract itself cannot catch.
-* **Known delta** -- MuJoCo casts every visual mesh in its self-scan geom group, which
-  includes the HAND meshes; IsaacLab's ``SELF_SCAN_LINKS`` excludes them (see the TODO in
-  ``g1_self_scan.py``). Hand pixels are reported separately so the residual is readable.
+* **Hand pixels** -- reported separately, because they were once a standing ~1 m delta:
+  IsaacLab could not cast the hands at all until they became real fixed-joint links (see
+  ``g1_self_scan.HAND_LINKS``).  They now agree to a few millimetres, and the split is kept
+  as the regression signal for that class of bug.  Note the mask is one-sided -- a pixel
+  counts as "hand" by what MUJOCO hit -- so a hand that only IsaacLab sees still shows up
+  in the main figures.
 
 Run under the full Isaac env (``env_isaaclab``), from the repo root. ``python -u`` matters:
 Kit can hard-exit and swallow buffered stdout.
