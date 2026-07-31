@@ -53,22 +53,10 @@ def reset_on_motion_sequence(
     k = env_ids.shape[0]
     device = env.device
     num_clips = cmd.manager.num_clips
-    num_steps = cmd.manager.num_steps
 
     # 1. Sample a clip and a start step per env.
     clip_id = torch.randint(0, num_clips, (k,), device=device)
-    if cmd.cfg.random_start_phase:
-        # Leave at least random_start_min_remaining_s of clip after the start.
-        margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
-        # so a short clip's random start doesn't land in (or past) its padding tail.  clip_len lives on
-        # the clip-library device (may be CPU via --clip_device), so index it with clip_id on THAT
-        # device, then move the result to the env device (device-safe gather; cf. flat_ids below).
-        clip_len = cmd.manager.clip_len
-        hi = (clip_len[clip_id.to(clip_len.device)].to(device) - margin).clamp(min=1)
-        start_step = (torch.rand(k, device=device) * hi.float()).long()
-    else:
-        start_step = torch.zeros(k, dtype=torch.long, device=device)
+    start_step = sample_start_step(cmd, clip_id, device, cap_at_terrain_end=False)
 
     # 2. World placement of the clip frame (optional random yaw): re-zero only the
     #    downrange (x, y) placement so a mid-clip start spawns the base at the env
@@ -177,6 +165,49 @@ def _commit_clip_reset(
     asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
 
+def sample_start_step(
+    cmd,
+    clip_id: torch.Tensor,
+    device: torch.device,
+    cap_at_terrain_end: bool,
+) -> torch.Tensor:
+    """Draw each env's start step within its clip.
+
+    Shared by both reset events so the sampling rule lives in one place.  Uniform over
+    ``[0, hi)`` where ``hi`` is:
+
+    * ``clip_len - random_start_min_remaining_s``, per clip, using each clip's OWN real
+      length rather than the padded ``num_steps`` -- otherwise a short clip's random start
+      lands in (or past) its repeat-last padding tail;
+    * additionally capped at ``terrain_end_step + 1`` when ``cap_at_terrain_end`` and
+      ``cfg.random_start_before_terrain_end``, so a start can land anywhere up to and
+      including the last frame of the clip's terrain-pinned run, but never after it.
+
+    ``clip_len`` / ``terrain_end_step`` live on the clip-library device (may be CPU via
+    ``--clip_device``), so both are gathered there and moved to the env device.
+
+    Args:
+        cmd: The :class:`MotionSequenceCommand` term (read for ``cfg`` and ``manager``).
+        clip_id: ``[k]`` long, each resetting env's clip.
+        device: Env device the result must land on.
+        cap_at_terrain_end: Whether the terrain cap applies (terrain reset only; a flat
+            teacher has no terrain to miss).
+
+    Returns:
+        ``[k]`` long start step per env, zeros when ``random_start_phase`` is False.
+    """
+    k = clip_id.shape[0]
+    if not cmd.cfg.random_start_phase:
+        return torch.zeros(k, dtype=torch.long, device=device)
+    margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
+    clip_len = cmd.manager.clip_len
+    hi = (clip_len[clip_id.to(clip_len.device)].to(device) - margin).clamp(min=1)
+    if cap_at_terrain_end and getattr(cmd.cfg, "random_start_before_terrain_end", False):
+        terrain_end = cmd.manager.gather_terrain_end_step(clip_id).to(device)
+        hi = torch.minimum(hi, terrain_end + 1).clamp(min=1)
+    return (torch.rand(k, device=device) * hi.float()).long()
+
+
 def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor]) -> torch.Tensor:
     """Sample, per env, a random clip whose ``terrain_id`` matches the env's tile.
 
@@ -267,7 +298,6 @@ def reset_on_terrain_motion_sequence(
             "ClipTerrainImporter (exposing env_terrain_id / env_cell_*). Use "
             "reset_on_motion_sequence for the flat-ground teacher."
         )
-    num_steps = cmd.manager.num_steps
 
     # Cache the terrain -> clip-indices grouping on the command (built once, on device).
     groups = getattr(cmd, "_terrain_groups", None)
@@ -289,17 +319,10 @@ def reset_on_terrain_motion_sequence(
     # 1. Per-env terrain id -> sample a matching clip + a start step.
     env_tid = importer.env_terrain_id[env_ids].to(torch.long)
     clip_id = sample_terrain_clips(env_tid, groups)
-    if cmd.cfg.random_start_phase:
-        margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
-        # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,
-        # so a short clip's random start doesn't land in (or past) its padding tail.  clip_len lives on
-        # the clip-library device (may be CPU via --clip_device), so index it with clip_id on THAT
-        # device, then move the result to the env device (device-safe gather; cf. flat_ids below).
-        clip_len = cmd.manager.clip_len
-        hi = (clip_len[clip_id.to(clip_len.device)].to(device) - margin).clamp(min=1)
-        start_step = (torch.rand(k, device=device) * hi.float()).long()
-    else:
-        start_step = torch.zeros(k, dtype=torch.long, device=device)
+    # Capped at the end of the clip's terrain-pinned run: a start past it would spawn the
+    # robot AFTER the stair climb / box mount, on the flat top or walking away, so the
+    # episode never sees the terrain the tile exists for.
+    start_step = sample_start_step(cmd, clip_id, device, cap_at_terrain_end=True)
 
     # 2. Place each clip on its tile (identity heading -- clips are baked axis-aligned
     #    with the staircase, so alignment is a pure translation). Terrain / transition
