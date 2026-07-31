@@ -509,7 +509,7 @@ def test_dataset_snap_windows_build():
     torch.manual_seed(0)
     data, meta, nj, K, F, state_dim = _synthetic_recording()
     cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
-                             target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
+                             extero_source="height_scan", target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
     train, val = build_train_val(data, meta, cfg)
     it = train[0]
     ksc = data["height_scan"].shape[1]
@@ -535,7 +535,7 @@ def test_online_roundtrip():
     data, meta, nj, K, F, state_dim = _synthetic_recording()
     N = 2
     cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
-                             target_source="ego_anchored_clip_future", val_fraction=0.2, seed=0,
+                             extero_source="height_scan", target_source="ego_anchored_clip_future", val_fraction=0.2, seed=0,
                              d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
     train, _ = build_train_val(data, meta, cfg)
     # Model must match the ctor load_fm_context will rebuild from cfg.
@@ -593,7 +593,7 @@ def _recording_with_ref_history(**kw):
 def _built_history(history_source: str, data, meta, F):
     """Build a dataset with the given history source and return its RAW history tensor."""
     cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel",
-                             cmd_stride=4, target_source="ego_anchored_clip_future",
+                             cmd_stride=4, extero_source="height_scan", target_source="ego_anchored_clip_future",
                              val_fraction=0.34, seed=0, obs_noise=False,
                              history_source=history_source)
     train, _ = build_train_val(data, meta, cfg)
@@ -647,7 +647,7 @@ def test_history_source_travels_on_the_context():
     data, meta, nj, K, F, state_dim = _recording_with_ref_history()
     N = 2
     cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
-                             cmd_stride=4, target_source="ego_anchored_clip_future",
+                             cmd_stride=4, extero_source="height_scan", target_source="ego_anchored_clip_future",
                              val_fraction=0.2, seed=0, d_model=32, nhead=4, num_layers=2,
                              dim_feedforward=64, history_source="reference_partial")
     train, _ = build_train_val(data, meta, cfg)

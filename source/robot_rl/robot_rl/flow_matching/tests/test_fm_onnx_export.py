@@ -36,7 +36,11 @@ _REPO_ROOT = os.path.abspath(os.path.join(_HERE, *[".."] * 5))
 # not as a package), so reach it through the directory rather than a relative import.
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts", "flow_matching"))
-from test_flow_matching import _synthetic_recording  # noqa: E402
+# The DEPTH fixture, deliberately: depth is the deployable exteroception (and the config
+# default), so the export path that ships is the one under test here. It also gives the
+# multi-token case -- T=2 cameras rather than the scan's single token -- and a
+# depth_camera_spec, so `extero_spec` in fm_meta is exercised rather than left None.
+from test_extero_tokens import _synthetic_recording  # noqa: E402
 
 onnx = pytest.importorskip("onnx", exc_type=ImportError)
 from export_fm_onnx import export_fm_onnx  # noqa: E402
@@ -49,25 +53,31 @@ def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
         ``(checkpoint_path, num_history_states, future_len, num_joints, num_extra_frames)``.
     """
     torch.manual_seed(0)
-    data, meta, nj, k, f, state_dim = _synthetic_recording()
+    # Two cameras of 15 px: the shape of the deployable pairing, in miniature.
+    data, meta, nj, k, f, _ = _synthetic_recording(depth=(2, 15))
+    state_dim = target_state_dim(nj, k)
     n = 2
     cfg = FlowMatchingConfig(
         num_history_states=n, future_len=f, cmd_array="target_vel", cmd_stride=4,
-        target_source="ego_anchored_clip_future", val_fraction=0.2, seed=0,
+        target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
     )
     train, _ = build_train_val(data, meta, cfg)
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=f, num_history_states=n, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
+        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens,
+        cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
         dim_feedforward=cfg.dim_feedforward,
     ).eval()
     path = str(tmp_path / "ckpt.pt")
     torch.save({
         "config": cfg.to_dict(),
+        # Mirrors train.py::_save_ckpt, including the camera contract it injects -- that is
+        # what fm_meta's extero_spec carries to the deploy for the agreement check.
         "meta": {"state_joint_names": meta.state_joint_names,
                  "target_frame_names": meta.state_frame_names,
+                 "extero_spec": train.extero_spec,
                  "fm_snap_every": 12},
         "num_joints": nj,
         "state_normalizer": train.state_normalizer.state_dict(),

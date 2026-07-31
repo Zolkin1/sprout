@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
+    EXTERO_SOURCES,
     HISTORY_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
@@ -89,6 +90,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "AUTOREGRESSIVE: measured root pose/twist, but joints and ee "
                              "positions from the reference applied at those steps. A train-time "
                              "A/B over the same recording.")
+    parser.add_argument("--extero_source", type=str, default=FlowMatchingConfig().extero_source,
+                        choices=list(EXTERO_SOURCES),
+                        help="Which recorded exteroception feeds the conditioning tokens. "
+                             "record_data.py stores BOTH the height scan and the depth images "
+                             "whenever the task has depth obs terms, so this is a train-time "
+                             "A/B over one recording. 'depth' is the deployable choice on a "
+                             "robot with cameras and no heightmap; the tracker it is paired "
+                             "with must agree (checked at load in deploy/gen_tracker.py).")
     parser.add_argument("--null_cond_prob", type=float, default=FlowMatchingConfig().null_cond_prob,
                         help="Probability a training sample's history (phase) tokens are replaced by "
                              "the model's learned null embedding (classifier-free guidance / phase-agnostic).")
@@ -182,7 +191,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         future_len=args.future_len, num_history_states=args.num_history_states,
-        history_source=args.history_source,
+        history_source=args.history_source, extero_source=args.extero_source,
         null_cond_prob=args.null_cond_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
         recovery_mode=args.recovery_mode,

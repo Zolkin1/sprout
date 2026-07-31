@@ -994,7 +994,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        # Recording never evaluates the value function -- it only needs the actor to
+        # produce actions -- so honour a runner cfg that opts out of restoring the critic
+        # (``load_critic = False``), exactly as play.py does. Without this, recording from
+        # the FM-tracker task (whose runner cfg sets it, because that env has no
+        # privileged critic group) fails on a critic it was never going to use. Actor
+        # weights are still loaded strictly, so a real policy mismatch fails loudly.
+        if getattr(agent_cfg, "load_critic", True):
+            runner.load(resume_path)
+        else:
+            print("[INFO] Skipping the critic (load_critic=False): loading actor weights only.")
+            runner.load(resume_path, load_cfg={"actor": True, "critic": False,
+                                               "optimizer": False, "iteration": True, "rnd": True})
         runner.alg.eval_mode()
 
         policy = runner.get_inference_policy(device=env.unwrapped.device)

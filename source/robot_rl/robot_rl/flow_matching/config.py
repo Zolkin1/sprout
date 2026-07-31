@@ -132,14 +132,20 @@ class FlowMatchingConfig:
     # Per-step history-token width (= state_dim; resolved at build time).
     history_dim: int = 73
     # Which recorded signal feeds the exteroception conditioning tokens.
-    #   "height_scan" -- the pelvis ray-cast grid (176 rays) as ONE token. Default; the
-    #                    validated path.
     #   "depth"       -- the two torso depth cameras, ONE token each (T=2), from
-    #                    ``G1-teacher-clf-terrain-depth*`` recordings. This is the
-    #                    deployable signal: the hardware has cameras, not a heightmap.
+    #                    ``G1-teacher-clf-terrain-depth*`` recordings. DEFAULT, because it
+    #                    is the deployable signal: the hardware has cameras, not a
+    #                    heightmap, and there is nothing on the robot that produces the
+    #                    scan. Defaulting to the thing that cannot ship made it too easy
+    #                    to train an FM that was never going to leave the simulator.
+    #   "height_scan" -- the pelvis ray-cast grid (176 rays) as ONE token. Sim-only; still
+    #                    the right choice for a scan-conditioned ablation or a task
+    #                    without cameras (pass ``--extero_source height_scan``).
     # ``record_data.py`` stores BOTH arrays when the task has the cameras, so one
-    # recording session can train either FM and this is a train-time choice.
-    extero_source: str = "height_scan"
+    # recording session can train either FM and this is a train-time choice. A recording
+    # that lacks the selected array fails loudly at dataset build (see dataset.py), which
+    # is what a cameraless task now gets by default.
+    extero_source: str = "depth"
     # Width of ONE exteroception token, and how many there are. Both resolved from the
     # recorded array at dataset build time (176x1 for the scan, 780x2 for the cameras).
     height_dim: int = 176
@@ -285,6 +291,17 @@ class FlowMatchingConfig:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "FlowMatchingConfig":
-        """Build a config from a dict, ignoring unknown keys."""
+        """Build a config from a dict, ignoring unknown keys.
+
+        A checkpoint saved BEFORE :attr:`extero_source` existed was necessarily a
+        height-scan model -- the depth path did not exist yet -- so an absent key resolves
+        to ``"height_scan"`` rather than to the current default. Taking the default here
+        would silently reinterpret every pre-selector checkpoint as a depth model the
+        moment that default changed, which is exactly what happened when it flipped to
+        ``"depth"``. Checkpoints written since the field exists always carry it, so this
+        only ever affects genuinely old ones.
+        """
         names = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in names})
+        kwargs = {k: v for k, v in d.items() if k in names}
+        kwargs.setdefault("extero_source", "height_scan")
+        return cls(**kwargs)

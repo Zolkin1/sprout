@@ -114,9 +114,13 @@ def _norm_quats(arr: np.ndarray) -> np.ndarray:
 
 
 def _cfg():
+    # extero_source is explicit because these fixtures emit a height scan and no depth
+    # array; the config default is "depth" (the deployable signal). This file is about the
+    # windowed writer matching the per-step path, not about exteroception.
     return FlowMatchingConfig(
         future_len=4, num_history_states=2, cmd_array="target_vel", cmd_stride=2,
         stride=1, val_fraction=0.25, seed=0, obs_noise=False,
+        extero_source="height_scan",
     )
 
 

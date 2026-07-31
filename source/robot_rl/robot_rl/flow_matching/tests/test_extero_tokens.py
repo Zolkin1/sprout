@@ -138,17 +138,21 @@ def _cfg(**kw) -> FlowMatchingConfig:
 # Config
 ##
 
-def test_default_source_is_the_height_scan():
-    """The validated signal stays the default, so nothing changes without opting in."""
-    cfg = FlowMatchingConfig()
-    assert cfg.extero_source == "height_scan"
-    assert cfg.extero_tokens == 1
+def test_default_source_is_depth():
+    """The DEPLOYABLE signal is the default: the robot has cameras, not a heightmap.
+
+    Defaulting to the height scan made it too easy to train an FM that could never leave
+    the simulator, so the sim-only signal is now the one you opt into.
+    """
+    assert FlowMatchingConfig().extero_source == "depth"
 
 
 def test_noise_knob_follows_the_source():
     """Each source has its own amplitude -- metres vs normalised depth units."""
-    assert _cfg().noise_extero == pytest.approx(FlowMatchingConfig().noise_height_scan)
-    assert _cfg(extero_source="depth").noise_extero == pytest.approx(FlowMatchingConfig().noise_depth)
+    assert _cfg(extero_source="height_scan").noise_extero == pytest.approx(
+        FlowMatchingConfig().noise_height_scan)
+    assert _cfg(extero_source="depth").noise_extero == pytest.approx(
+        FlowMatchingConfig().noise_depth)
 
 
 def test_unknown_source_is_rejected():
@@ -178,10 +182,14 @@ def test_terrain_penetration_loss_is_gone():
 
 def test_stale_checkpoint_config_with_terrain_keys_loads():
     """Checkpoints trained before the removal carry ``terrain_*`` keys; ignore them."""
-    d = FlowMatchingConfig().to_dict()
+    d = FlowMatchingConfig(extero_source="height_scan").to_dict()
     d["terrain_penetration_weight"] = 200.0
     d["terrain_penetration_mode"] = "ankle"
-    assert FlowMatchingConfig.from_dict(d).extero_source == "height_scan"
+    cfg = FlowMatchingConfig.from_dict(d)
+    # The unknown keys are dropped, and every known one survives round-tripping -- the
+    # recorded source in particular, which must NOT be re-defaulted on load.
+    assert cfg.extero_source == "height_scan"
+    assert not hasattr(cfg, "terrain_penetration_weight")
 
 
 ##
@@ -283,7 +291,7 @@ def test_swapping_two_cameras_changes_the_prediction():
 def test_height_scan_dataset_resolves_one_token():
     """The scan path resolves T=1 and the full ray count as the token width."""
     data, meta, *_ = _synthetic_recording()
-    cfg = _cfg()
+    cfg = _cfg(extero_source="height_scan")      # explicit: the default is depth
     train, _ = build_train_val(data, meta, cfg)
     ksc = data["height_scan"].shape[1]
     assert cfg.extero_tokens == 1 and cfg.height_dim == ksc
@@ -302,7 +310,8 @@ def test_depth_dataset_resolves_one_token_per_camera():
 def test_source_selects_which_array_is_used():
     """Both arrays present -> the config decides, and the widths differ observably."""
     data, meta, *_ = _synthetic_recording(depth=(2, 15))
-    scan_cfg, depth_cfg = _cfg(), _cfg(extero_source="depth")
+    scan_cfg = _cfg(extero_source="height_scan")
+    depth_cfg = _cfg(extero_source="depth")
     scan_ds, _ = build_train_val(data, meta, scan_cfg)
     depth_ds, _ = build_train_val(data, meta, depth_cfg)
     assert scan_ds[0]["height"].shape != depth_ds[0]["height"].shape
