@@ -30,11 +30,25 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     """Path to the trained robot-state-conditioned flow-matching ``.pt`` checkpoint
     (``target_source=ego_anchored_clip_future``). Required."""
 
-    fm_update_every: int = 12
+    fm_update_every: int = 1
     """Re-run flow-matching inference every ``K`` control steps (the receding-horizon
-    re-plan cadence = a snap); the applied index advances through the F-step window in
-    between. Must match the recording's ``fm_snap_every`` -- checked against the value
-    carried on the checkpoint -- because the FM's horizon is sized from it. Must be ``>= 1``."""
+    re-plan cadence); the applied index advances through the F-step window in between.
+    ``1`` = re-plan every step, so the cursor never advances and the reference is always
+    node 0 of a fresh prediction. Must be ``>= 1``.
+
+    This need NOT match the recording's ``fm_snap_every``; the agreement check that used to
+    enforce it was removed. Note what that means in each direction:
+
+    * FASTER than the recording (``K < fm_snap_every``) is horizon-SAFE -- the required
+      horizon is ``max_offset + K``, so a smaller K needs less of it -- and the query
+      states are a superset of the snapped ones rather than different in kind, since the
+      teacher re-anchors every step regardless.
+    * SLOWER (``K > fm_snap_every``) is the direction that bites: the cursor runs further
+      into the window between re-plans, and ``_check_horizon`` is now the only thing
+      standing between that and a silently frozen reference tail.
+
+    Cost scales directly with this: the generator is ~99% of per-step inference, so K=1
+    makes every control tick pay the full FM cost instead of one tick in K."""
 
     fm_num_sampling_steps: int | None = None
     """Override the checkpoint's Euler sampling-step count at inference (``None`` = trained)."""

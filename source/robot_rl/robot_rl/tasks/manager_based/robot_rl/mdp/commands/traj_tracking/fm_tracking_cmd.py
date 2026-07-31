@@ -109,7 +109,9 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "body-mode teacher runs fine on the default joint-mode tracker, because the "
                 "actor's observation groups are identical in both modes."
             )
-        self._check_snap_cadence()
+        # NOTE: the re-plan cadence is deliberately NOT checked against the recording's
+        # fm_snap_every any more -- see FmTrackingCommandCfg.fm_update_every. What still
+        # guards the horizon is _check_horizon, which is lazy (first look-ahead call).
 
         # The FM's extra frames must be exactly the CLF's end-effector output frames.
         ee_frames = self.resolve_ee_frames()
@@ -204,29 +206,6 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Show EVERY predicted node in the FM ribbon (dense), independent of the
         # clip ribbon's debug_vis_stride subsampling.
         self._fm_debug_offsets = torch.arange(0, self.ctx.F, dtype=torch.long, device=dev)
-
-    def _check_snap_cadence(self) -> None:
-        """Fail if the tracker re-plans at a different rate than the recording snapped.
-
-        The FM's horizon is sized from the re-plan period (see
-        ``FlowMatchingConfig.future_len``), and the training targets were cut at the
-        recording's ``fm_snap_every``. A tracker running a different period is both off the
-        training distribution and possibly short of horizon, with nothing in the shapes to
-        reveal it.
-        """
-        recorded = getattr(self.ctx, "fm_snap_every", None)
-        if recorded is None:
-            print("[WARN FmTrackingCommand] the FM checkpoint predates the fm_snap_every "
-                  f"record; cannot verify it matches fm_update_every={self.cfg.fm_update_every}.")
-            return
-        if int(recorded) != int(self.cfg.fm_update_every):
-            raise ValueError(
-                f"fm_update_every={self.cfg.fm_update_every} but the FM was trained on data "
-                f"snapped every {recorded} steps. The generator's horizon is sized from the "
-                "re-plan period and its targets were cut at the snap cadence, so these must "
-                "agree. Set commands.traj_ref.fm_update_every to the recorded value, or "
-                "re-record + retrain at the cadence you want."
-            )
 
     def _build_strict_masks(self) -> None:
         """Index the output channels the FM does NOT write, for ``strict_fm_only``.

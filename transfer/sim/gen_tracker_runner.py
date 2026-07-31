@@ -811,9 +811,10 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
-    parser.add_argument("--fm_update_every", type=int, default=2,
-                        help="Generator re-inference cadence (control steps). Fallback only: "
-                             "overridden by 'fm_update_every' in the tracker metadata if present.")
+    parser.add_argument("--fm_update_every", type=int, default=1,
+                        help="Generator re-inference cadence (control steps); 1 = every step. "
+                             "Fallback only: overridden by 'fm_update_every' in the tracker "
+                             "metadata if present. Every tick pays the full FM cost at 1.")
     # FM sampler noise. Zero noise is the sim2sim DEFAULT because it visibly tracks better in
     # MuJoCo than drawing x0 ~ N(0, I); the deploy library default stays Gaussian, so hardware
     # keeps the training-matched stochastic sampling unless it opts in too.

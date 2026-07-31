@@ -35,7 +35,10 @@ control:
       # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
       # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by
       # `fm_update_every` in the tracker metadata when the export carries it.
-      fm_update_every: 2
+      # 1 = re-plan every control tick. The generator is ~99% of per-step inference, so
+      # this makes EVERY tick pay the full FM cost rather than one tick in N -- check the
+      # latency line against the 20 ms budget before trusting it on the robot.
+      fm_update_every: 1
       # onnxruntime execution provider. false = CPU (the onboard minipc has no GPU);
       # true requests CUDA and falls back to CPU if the installed runtime has no CUDA build.
       use_cuda: false

@@ -134,7 +134,7 @@ def load_gen_tracker_from_hf(
     hf_repo_id: str,
     hf_policy_folder: str,
     cache_root: str,
-    fm_update_every: int = 2,
+    fm_update_every: int = 1,
     num_threads: int = 0,
     refresh: bool = False,
     providers=None,

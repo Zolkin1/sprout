@@ -85,7 +85,7 @@ class GenTrackerPolicy:
         self,
         tracker_onnx: str,
         fm_onnx: str | None,
-        fm_update_every: int = 2,
+        fm_update_every: int = 1,
         base_frame_name: str = "pelvis_link",
         num_threads: int = 0,
         seed: int | None = 0,
@@ -138,21 +138,15 @@ class GenTrackerPolicy:
             self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
-        # Re-plan cadence, most authoritative source first:
-        #   1. the tracker metadata -- the value the tracker task trained with;
-        #   2. the FM's own fm_snap_every -- the period its targets were CUT at during
-        #      recording, which is the cadence it is in-distribution for. A teacher export
-        #      has no fm_update_every at all (the field lives on FmTrackingCommandCfg, not
-        #      on the clip command), and falling through to the constructor default there
-        #      would silently re-plan at a cadence the FM never saw;
-        #   3. the constructor/CLI default.
-        # _check_horizon then rejects any pair that still disagrees.
+        # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
+        # else the constructor/CLI default. The old middle tier -- falling back to the FM's
+        # fm_snap_every -- existed only to satisfy the agreement rule that has since been
+        # dropped; with the cadence now a free choice, a teacher export (which carries no
+        # fm_update_every, since the field lives on FmTrackingCommandCfg rather than on the
+        # clip command) should take the caller's value rather than the recording's.
         meta_every = self._trk.params.get("fm_update_every")
-        snap_every = getattr(self.ctx, "fm_snap_every", None) if self.fm_enabled else None
         if meta_every is not None:
             self.fm_update_every, src = max(int(meta_every), 1), "tracker metadata"
-        elif snap_every is not None:
-            self.fm_update_every, src = max(int(snap_every), 1), "fm.onnx fm_snap_every"
         else:
             src = "constructor default"
         print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every} (from {src})")
@@ -394,14 +388,16 @@ class GenTrackerPolicy:
                 "stale when the furthest sample is read). Re-record with "
                 f"--ref_future_len {required} and retrain the FM with --future_len {required}."
             )
+        # The cadence is deliberately NOT required to equal the recording's fm_snap_every
+        # (see FmTrackingCommandCfg.fm_update_every). Re-planning FASTER than the recording
+        # only shrinks the horizon requirement checked above; re-planning slower is what
+        # that check exists to catch. Report the pairing so a surprising one is visible.
         snap = getattr(self.ctx, "fm_snap_every", None)
         if snap is not None and int(snap) != self.fm_update_every:
-            raise ValueError(
-                f"fm.onnx was recorded at fm_snap_every={int(snap)} but the tracker runs the "
-                f"generator every {self.fm_update_every} steps. The FM's targets were cut at "
-                "the recording cadence, so re-planning at another one is off-distribution. "
-                "Re-record/retrain the FM, or re-export the tracker, so the two agree."
-            )
+            print(f"[INFO GenTrackerPolicy] re-planning every {self.fm_update_every} step(s) "
+                  f"against an FM recorded at fm_snap_every={int(snap)}"
+                  + ("" if self.fm_update_every < int(snap) else
+                     " -- SLOWER than recorded; the horizon check above is the only guard"))
 
     # ------------------------------------------------------------------
     # Snapshot + generator inference

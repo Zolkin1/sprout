@@ -174,7 +174,7 @@ class G1FmTrackerCommandsCfg:
         fm_checkpoint="",
         # 0.24 s. MUST equal the recording's fm_snap_every -- checked against the value
         # carried on the checkpoint, because the FM's horizon is sized from this period.
-        fm_update_every=12,
+        fm_update_every=1,
         # No clip re-anchoring: nothing here reads the clip reference, so there is no
         # placement to keep on the robot. (The reset spawn pose still uses the library.)
         ego_anchor_fraction=0.0,
