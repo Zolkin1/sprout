@@ -465,13 +465,18 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         # ``clf_decreasing_condition`` needs NO matching change: eta_scales is folded into P,
         # not into eta, so eta_max / eta_dot_max keep their physical units.
         #
-        # TODO(clf-scale): 1.15 was derived against body_v2's model_5800 -- a policy trained
-        # under BOTH the old local-base reward and the reset-step placement bug, i.e. two
-        # reward generations stale. It is deliberately NOT re-derived here: depth_v1/v2/v3
-        # all trained on this value, and changing it would make them incomparable to whatever
-        # comes next. Re-derive off a current checkpoint with
-        # ``scripts/rsl_rl/clf_balance_check.py --load_run <run>`` at the point where a fresh
-        # baseline is being established anyway, and move it then -- not before.
+        # RE-DERIVED and left at 1.15. The worry was that this value came from body_v2's
+        # model_5800, trained under both the old local-base reward and the reset-step
+        # placement bug -- two reward generations stale. Measured against depth_v3's
+        # model_4200 in its own env (clf_balance_check.py, 64 envs x 200 steps): mean V 1.10
+        # versus the 1.12 that 1.15 was sized against, i.e. V did not move. The 3x rule wants
+        # 1.09 and the instantaneous reward is already 8.098/10, so the correction is inside
+        # the noise and not worth breaking comparability with depth_v1/v2/v3 for.
+        #
+        # For reference, the same policy measures mean V 1.42 (-> 1.25) in the CURRENT env,
+        # but that is a policy on out-of-distribution depth after the near-camera move plus
+        # harder spawns from the reset cap -- an upper bound that training should recover,
+        # not a reason to move the scale.
         #
         # Two traps when re-tuning this from the dashboard:
         #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by
