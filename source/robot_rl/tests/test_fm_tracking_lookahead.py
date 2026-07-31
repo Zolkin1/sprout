@@ -7,7 +7,7 @@ served correctly from the generator, and they are pure indexing -- no simulator 
 tests drive the real methods on a bare instance (``object.__new__``) carrying only the
 buffers each one reads, so the arithmetic under test is the shipped arithmetic.
 
-Three properties matter here:
+Four properties matter here:
 
 * **Joint order.** ``get_future_joint_state``'s contract is the ROBOT's joint order (the
   clip implementation builds its index by iterating ``robot.joint_names``), while the
@@ -15,7 +15,14 @@ Three properties matter here:
   the clip-output one instead scrambles the reference with no shape change to reveal it.
 * **No clamping.** A short horizon must raise, not saturate: a clamp would silently freeze
   the tail of the window the policy sees.
-* **The barrier.** The tracker env must carry no rewards and no clip-graded termination.
+* **The measured side runs.** ``_update_command`` must produce ``y_act`` and the CLF on
+  EVERY step, whatever the checkpoint's ``history_source``. It once did not: the
+  ``compute_measured_output`` + ``compute_vdot`` block was left below the early ``return``
+  in ``_stash_applied_reference``, so on the default ``history_source="measured"`` it never
+  ran -- ``y_act`` stayed at its initialised zeros and ``V`` at 0.0. Nothing crashed and the
+  policy still acted (the actor reads the reference window, not ``y_act``), so every
+  tracking number the task reported was silently wrong.
+* **The barrier.** Both tracker envs must carry no rewards and no clip-graded termination.
 """
 
 from __future__ import annotations
@@ -205,15 +212,116 @@ def test_teacher_window_fits_the_shipped_horizon():
 
 
 # ---------------------------------------------------------------------------
-# The generator/clip barrier, at the config level.
+# The measured side + the CLF must run on every step, for every history_source.
 # ---------------------------------------------------------------------------
-def test_tracker_env_has_no_rewards_and_no_clip_graded_termination():
-    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
-    from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
-        G1FmTrackerTerrainEnvCfg,
+POS_W, VEL_W = 20, 18
+
+
+def _update_stub(history_source: str) -> FmTrackingCommand:
+    """A bare command with everything ``_update_command`` touches, stubbed and recorded.
+
+    Args:
+        history_source: The checkpoint's history source to simulate.
+
+    Returns:
+        The instance; ``cmd.calls`` records which stubbed collaborators fired.
+    """
+    cmd = object.__new__(_BareFmCommand)
+    cmd.calls: list[str] = []
+    cmd.cfg = SimpleNamespace(fm_update_every=4, strict_fm_only=True)
+    cmd.ctx = SimpleNamespace(F=F, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES),
+                              history_source=history_source)
+    cmd._resampling = False
+    cmd.y_des = torch.zeros(N_ENVS, POS_W)
+    cmd.dy_des = torch.zeros(N_ENVS, VEL_W)
+    cmd.y_act = torch.zeros(N_ENVS, POS_W)
+    cmd.dy_act = torch.zeros(N_ENVS, VEL_W)
+    cmd._joint_slots_pos = torch.arange(NJ)
+    cmd._joint_slots_vel = torch.arange(NJ)
+    cmd._fm_jperm = torch.arange(NJ)
+    # One channel the FM does not write, so the strict_fm_only fill is exercised too.
+    cmd._unwritten_pos = torch.tensor([POS_W - 1])
+    cmd._unwritten_vel = torch.tensor([VEL_W - 1])
+    cmd._zeros3 = torch.zeros(N_ENVS, 3)
+    cmd._ident_quat = torch.zeros(N_ENVS, 4)
+    # As _post_init leaves them: no reference applied yet.
+    cmd._applied_jp = cmd._applied_jv = cmd._applied_frames = None
+
+    cmd._advance_step = lambda: cmd.calls.append("advance")
+    cmd._snapshot_and_infer = lambda: cmd.calls.append("infer")
+    cmd._write_world_des = lambda frames: cmd.calls.append("write_des")
+    cmd._fm_current_outputs = lambda: (
+        torch.zeros(N_ENVS, 13), torch.zeros(N_ENVS, K, 13),
+        torch.zeros(N_ENVS, NJ), torch.zeros(N_ENVS, NJ),
     )
 
-    cfg = G1FmTrackerTerrainEnvCfg()
+    def _measured(pos, quat):
+        cmd.calls.append("measured")
+        cmd.y_act = torch.full((N_ENVS, POS_W), 2.0)      # a stand-in for the real read
+        cmd.dy_act = torch.full((N_ENVS, VEL_W), 3.0)
+
+    cmd.compute_measured_output = _measured
+    cmd.clf = SimpleNamespace(compute_vdot=lambda ya, yd, dya, dyd: (
+        cmd.calls.append("clf") or (torch.full((N_ENVS,), -1.0), torch.full((N_ENVS,), 7.0))
+    ))
+    return cmd
+
+
+@pytest.mark.parametrize("history_source", ["measured", "reference_partial"])
+def test_update_command_always_computes_measured_output_and_clf(history_source):
+    """The regression: this block used to be stranded inside ``_stash_applied_reference``.
+
+    Below that method's ``history_source != "reference_partial"`` early return, so on the
+    DEFAULT source it never ran and every tracking metric read zero.
+    """
+    cmd = _update_stub(history_source)
+    FmTrackingCommand._update_command(cmd)
+
+    assert "measured" in cmd.calls, f"compute_measured_output never ran ({history_source})"
+    assert "clf" in cmd.calls, f"the CLF never ran ({history_source})"
+    # Order matters: the CLF grades the measured output produced this step, not last step's.
+    assert cmd.calls.index("measured") < cmd.calls.index("clf")
+    assert torch.equal(cmd.v, torch.full((N_ENVS,), 7.0))
+    assert torch.equal(cmd.vdot, torch.full((N_ENVS,), -1.0))
+
+
+def test_applied_reference_is_stashed_only_for_a_partially_autoregressive_checkpoint():
+    """The stash itself stays conditional -- that part of the early return was correct."""
+    measured = _update_stub("measured")
+    FmTrackingCommand._update_command(measured)
+    assert measured._applied_jp is None
+
+    partial = _update_stub("reference_partial")
+    FmTrackingCommand._update_command(partial)
+    assert partial._applied_jp is not None
+    assert partial._applied_frames is not None
+
+
+def test_strict_fm_only_nans_run_before_the_clf():
+    """So a graded channel the FM does not write shows up as a NaN ``V``, not a plausible one."""
+    cmd = _update_stub("measured")
+    FmTrackingCommand._update_command(cmd)
+    assert torch.isnan(cmd.y_des[:, POS_W - 1]).all()
+    assert torch.isnan(cmd.dy_des[:, VEL_W - 1]).all()
+
+
+# ---------------------------------------------------------------------------
+# The generator/clip barrier, at the config level.
+# ---------------------------------------------------------------------------
+def _tracker_cfgs():
+    """Both tracker env cfgs, so the barrier is asserted on each exteroception variant."""
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
+        G1FmTrackerTerrainDepthEnvCfg, G1FmTrackerTerrainEnvCfg,
+    )
+
+    return [G1FmTrackerTerrainEnvCfg, G1FmTrackerTerrainDepthEnvCfg]
+
+
+@pytest.mark.parametrize("index", [0, 1], ids=["height_scan", "depth"])
+def test_tracker_env_has_no_rewards_and_no_clip_graded_termination(index):
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+
+    cfg = _tracker_cfgs()[index]()
     assert [k for k in vars(cfg.rewards) if not k.startswith("_")] == []
     terms = {k for k in vars(cfg.terminations) if not k.startswith("_")}
     assert terms == {"time_out", "base_fallen"}, terms
@@ -223,6 +331,37 @@ def test_tracker_env_has_no_rewards_and_no_clip_graded_termination():
     assert cfg.commands.traj_ref.strict_fm_only is True
     # Nothing re-anchors the clip: no env reads its reference.
     assert cfg.commands.traj_ref.ego_anchor_fraction == 0.0
+    # No default generator: a stale FM loads and predicts and is silently wrong.
+    assert cfg.commands.traj_ref.fm_checkpoint == ""
+    # FmTrackingCommand refuses body mode (it predicts no '@root' links), so both variants
+    # must land on joint -- the depth env derives from the BODY teacher, which sets body.
+    assert cfg.commands.traj_ref.tracking_mode == "joint"
+
+
+def test_depth_tracker_carries_the_cameras_its_generator_needs():
+    """The reason this variant exists: a depth FM reads cameras off the SCENE.
+
+    ``FmTrackingCommand._read_extero`` picks the sensor from the CHECKPOINT, so a
+    depth-trained generator in the height-scan task raises looking for terms that are not
+    there. Depth is ``FlowMatchingConfig``'s default, so without this env a default-trained
+    FM had no task to run in at all.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
+        G1FmTrackerTerrainDepthEnvCfg, G1FmTrackerTerrainEnvCfg,
+    )
+
+    depth = G1FmTrackerTerrainDepthEnvCfg()
+    assert depth.scene.depth_camera_near is not None
+    assert depth.scene.depth_camera_far is not None
+    assert depth.observations.policy.depth_near is not None
+    assert depth.observations.policy.depth_far is not None
+    # Depth REPLACES the scan in the policy branch, as on the depth teacher.
+    assert depth.observations.policy.height_scan is None
+
+    scan = G1FmTrackerTerrainEnvCfg()
+    assert not hasattr(scan.scene, "depth_camera_near")
+    assert scan.observations.policy.height_scan is not None
 
 
 def test_tracker_runner_does_not_load_a_critic():

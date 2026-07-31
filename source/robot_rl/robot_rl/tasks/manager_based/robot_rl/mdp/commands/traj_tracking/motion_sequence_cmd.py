@@ -1314,6 +1314,25 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """
         return None
 
+    def _scene_alive(self) -> bool:
+        """Whether the env still has a scene, i.e. whether it is safe to draw.
+
+        The debug-vis callback is an Omniverse event subscription, and it fires once more
+        while the app shuts down -- AFTER ``env.close()`` has dropped ``env.scene``. Anything
+        in the draw path that reaches back through the env then raises, and because the
+        exception surfaces inside a ``weakref.proxy`` lambda the manager only prints it. The
+        run still exits 0, so it is pure noise -- but a full traceback on every play run is
+        exactly what hides a real one later.
+
+        ``ManagerBase`` exposes ``num_envs`` and ``device`` as properties that dereference
+        ``self._env``, so this cannot be replaced by caching one value; the guard has to sit
+        in front of the draw.
+
+        Returns:
+            True while the scene exists, False once it has been torn down.
+        """
+        return getattr(self._env, "scene", None) is not None
+
     def _debug_vis_callback(self, event) -> None:
         """Draw the upcoming reference ribbon as cylinder segments per env.
 
@@ -1324,6 +1343,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         z-scaled to the segment length.  The prototype index selects the
         frame's colour.
         """
+        if not self._scene_alive():
+            return
         if self._debug_markers is None:
             if not self._debug_vis_pending:
                 return

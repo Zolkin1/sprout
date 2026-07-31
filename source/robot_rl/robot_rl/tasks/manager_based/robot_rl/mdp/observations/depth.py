@@ -297,8 +297,10 @@ def depth_obs_stack(env: "ManagerBasedRLEnv") -> torch.Tensor:
     terms = find_depth_obs_terms(env)
     if not terms:
         raise RuntimeError(
-            "no depth observation terms found; run a depth task (e.g. "
-            "G1-teacher-clf-terrain-depth) so mdp.depth_image terms exist to read."
+            "no depth observation terms found; run a depth task so mdp.depth_image terms "
+            "exist to read -- G1-teacher-clf-terrain-depth to train, or "
+            "G1-tracker-clf-fm-terrain-depth-play to deploy a depth-conditioned generator "
+            "(the height-scan tracker task has no cameras)."
         )
     return torch.stack(
         [depth_image(env, SceneEntityCfg(name), **params) for name, params in terms], dim=1

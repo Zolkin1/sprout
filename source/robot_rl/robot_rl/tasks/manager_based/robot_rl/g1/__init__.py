@@ -183,4 +183,20 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
         },
     )
+
+    # Same tracker, DEPTH exteroception on both sides -- the depth teacher's policy branch
+    # plus a depth-trained generator. Needed because FmTrackingCommand feeds the sensor the
+    # CHECKPOINT names, so a depth FM cannot run in the height-scan task above (no cameras in
+    # its scene), and depth is what FlowMatchingConfig trains by default.
+    gym.register(
+        id="G1-tracker-clf-fm-terrain-depth-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainDepthPlayEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
+        },
+    )
     _registered = True

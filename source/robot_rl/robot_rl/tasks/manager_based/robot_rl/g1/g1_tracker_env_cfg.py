@@ -15,7 +15,21 @@ info in the policy.
 There is no separate tracker *training* task: the policy is the teacher
 (:mod:`g1_teacher_env_cfg`, ``G1-teacher-clf-terrain``).
 :class:`G1FmTrackerTerrainPlayEnvCfg` is a play-only deploy entry point -- pass the teacher
-via ``--load_run``, the FM via ``--fm_checkpoint``, and the library via ``--clip``.
+via ``--load_run``, the FM via ``--fm_checkpoint``, and the library via ``--clip``. All three
+are REQUIRED; in particular there is no default FM checkpoint, for the same reason ``--clip``
+has none (a stale generator loads and predicts and is silently wrong).
+
+**Two variants, one per exteroception source.** ``FmTrackingCommand`` reads the sensor off
+the CHECKPOINT rather than the task, so the env has to physically carry the sensor its
+generator was trained on:
+
+* :class:`G1FmTrackerTerrainPlayEnvCfg` -- pelvis height scan, for a
+  ``--extero_source height_scan`` FM;
+* :class:`G1FmTrackerTerrainDepthPlayEnvCfg` -- the two torso cameras, for a depth FM
+  (``FlowMatchingConfig``'s default, since depth is what the hardware has).
+
+Pairing them the wrong way round raises at command construction rather than training on the
+wrong signal.
 
 **A hard barrier separates this task from the offline clips.** The clip library supplies
 only the reset spawn pose (and the terrain meshed from it) and the ``target_vel`` command;
@@ -51,13 +65,14 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
+from .g1_depth_env_cfg import (
+    G1TeacherTerrainDepthEnvCfg,
+    G1TeacherTerrainDepthObservationsCfg,
+    apply_depth_play_trims,
+)
 from .g1_teacher_env_cfg import G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import G1TeacherTerrainEnvCfg
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
-
-# Default robot-state-conditioned FM checkpoint (override per-run via --fm_checkpoint).
-# Trained on ego_anchored_clip_future data; carries a height_normalizer.
-DEFAULT_FM_ROBOT_CKPT = "logs/flow_matching/2026-06-30_17-16-27_fm_robot_hist_v1/best.pt"
 
 
 ##
@@ -150,7 +165,13 @@ class G1FmTrackerCommandsCfg:
         # (m/rad), the velocities a characteristic time (s). Shared with the tracker so
         # both grade tracking the same way. Re-derive with scripts/rsl_rl/clf_balance_check.
         eta_scales={"pos": 1.0, "ori": 0.45, "lin_vel": 0.7, "ang_vel": 0.2},
-        fm_checkpoint=DEFAULT_FM_ROBOT_CKPT,
+        # No default checkpoint -- ``--fm_checkpoint`` is REQUIRED, and ``FmTrackingCommand``
+        # raises on an empty one. There used to be a default here, and it rotted: it went on
+        # pointing at an F=40 / state_dim=133 model long after the reference window pushed F
+        # to 65 and the ee frames to position-only. A stale generator is exactly the failure
+        # this task cannot detect for you -- it loads, it predicts, and it is wrong -- so the
+        # only safe default is none. Same reasoning as ``--clip`` having no default.
+        fm_checkpoint="",
         # 0.24 s. MUST equal the recording's fm_snap_every -- checked against the value
         # carried on the checkpoint, because the FM's horizon is sized from this period.
         fm_update_every=12,
@@ -194,6 +215,31 @@ class G1FmTrackerTerrainEnvCfg(G1TeacherTerrainEnvCfg):
         self.rewards = G1TrackerRewardCfg()
 
 
+def _apply_tracker_play_trims(cfg) -> None:
+    """Shared play/deploy trims for the FM tracker envs, applied in place.
+
+    A function rather than inheritance because the depth tracker derives from the DEPTH
+    teacher, not from :class:`G1FmTrackerTerrainPlayEnvCfg` -- so the two play variants have
+    no common ancestor below the teacher to hang these on.
+
+    Args:
+        cfg: A tracker env cfg to trim, modified in place.
+    """
+    # One replica row + one env per tile -> every terrain is shown exactly once.
+    cfg.scene.terrain.num_rows = 1
+    cfg.scene.num_envs = 24
+    # Terrain clip library is multi-GB; keep it off a small GPU (device-safe gather).
+    cfg.commands.traj_ref.clip_device = "cpu"
+    # Both actor-side groups: the reference window is corrupted during training too.
+    cfg.observations.policy.enable_corruption = False
+    cfg.observations.reference.enable_corruption = False
+    cfg.events.push_robot = None
+    cfg.events.randomize_ground_contact_friction = None
+    # Draw the FM reference markers + the height-scan ray hits on the treads.
+    cfg.commands.traj_ref.debug_vis = True
+    cfg.scene.height_scanner.debug_vis = True
+
+
 @configclass
 class G1FmTrackerTerrainPlayEnvCfg(G1FmTrackerTerrainEnvCfg):
     """Play/deploy viewer for the terrain FM tracker: one env per terrain tile, noise-free,
@@ -202,16 +248,71 @@ class G1FmTrackerTerrainPlayEnvCfg(G1FmTrackerTerrainEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # One replica row + one env per tile -> every terrain is shown exactly once.
-        self.scene.terrain.num_rows = 1
-        self.scene.num_envs = 24
-        # Terrain clip library is multi-GB; keep it off a small GPU (device-safe gather).
-        self.commands.traj_ref.clip_device = "cpu"
-        # Both actor-side groups: the reference window is corrupted during training too.
-        self.observations.policy.enable_corruption = False
-        self.observations.reference.enable_corruption = False
-        self.events.push_robot = None
-        self.events.randomize_ground_contact_friction = None
-        # Draw the FM reference markers + the height-scan ray hits on the treads.
-        self.commands.traj_ref.debug_vis = True
-        self.scene.height_scanner.debug_vis = True
+        _apply_tracker_play_trims(self)
+
+
+##
+# Closed-loop deploy against a DEPTH-conditioned generator
+##
+@configclass
+class G1TrackerDepthObservationsCfg:
+    """The depth teacher's two ACTOR groups and nothing else.
+
+    Same barrier as :class:`G1TrackerObservationsCfg` -- no privileged critic group -- but the
+    policy branch is the depth teacher's, where the two cameras REPLACE the height scan.
+    """
+
+    policy: G1TeacherTerrainDepthObservationsCfg.PolicyCfg = (
+        G1TeacherTerrainDepthObservationsCfg.PolicyCfg()
+    )
+    reference: G1TeacherObservationsCfg.ReferenceCfg = G1TeacherObservationsCfg.ReferenceCfg()
+
+
+@configclass
+class G1FmTrackerTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
+    """Closed-loop FM tracking where BOTH the policy and the generator see depth.
+
+    The height-scan tracker above cannot serve a depth-trained generator: its scene has no
+    cameras, so ``FmTrackingCommand._read_extero`` -- which picks the sensor off the
+    CHECKPOINT, not the task -- raises looking for them. Since ``FlowMatchingConfig``
+    defaults ``extero_source`` to depth (it is the signal the hardware actually has), a
+    default-trained FM had no task to run in at all. This is it.
+
+    Derives from the depth TEACHER rather than from :class:`G1FmTrackerTerrainEnvCfg` so the
+    camera scene, the depth observation terms and the camera-randomisation events are all
+    defined once, in :mod:`g1_depth_env_cfg`. The clip-consumer strip is then re-applied
+    here: FM command, no rewards, reference-independent terminations, no critic group.
+    """
+
+    commands: G1FmTrackerCommandsCfg = G1FmTrackerCommandsCfg()
+    observations: G1TrackerDepthObservationsCfg = G1TrackerDepthObservationsCfg()
+    terminations: G1TrackerTerminationCfg = G1TrackerTerminationCfg()
+
+    def __post_init__(self):
+        """Run the depth teacher's setup, then re-impose the generator/clip barrier."""
+        super().__post_init__()
+        self.rewards = G1TrackerRewardCfg()
+        # The depth teacher is a BODY-tracking env, and FmTrackingCommand refuses body mode:
+        # the body CLF grades 13 '@root' links the generator does not predict, so under
+        # strict_fm_only they would all be NaN. Nothing is lost here -- this task's CLF is
+        # diagnostic (no reward reads it) and the actor's groups are mode-independent, so a
+        # body-mode depth teacher still loads and still behaves as trained.
+        #
+        # Safe AFTER super(): _apply_tracking_mode is a validation only, and the reference
+        # observation is deliberately identical in both modes (see g1_teacher_env_cfg).
+        self.commands.traj_ref.tracking_mode = "joint"
+
+
+@configclass
+class G1FmTrackerTerrainDepthPlayEnvCfg(G1FmTrackerTerrainDepthEnvCfg):
+    """Play/deploy viewer for the depth FM tracker: one env per tile, noise-free, no pushes.
+
+    Load the teacher via ``--load_run``, a DEPTH-trained FM via ``--fm_checkpoint``, and the
+    widened (``@root``) terrain library via ``--clip`` (``--clip_device cpu``).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        _apply_tracker_play_trims(self)
+        # Camera DR off + draw both cameras' rays, exactly as the depth teacher's play does.
+        apply_depth_play_trims(self)

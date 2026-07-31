@@ -1697,7 +1697,12 @@ def _emit_tracking_stats(
         e_pos = data["y_des"] - data["y_act"]
         e_vel = data["dy_des"] - data["dy_act"]
         e = np.concatenate([e_pos, e_vel], axis=2)
-        norm_sq = (e ** 2).sum(axis=2)
+        # nansum, not sum: on the FM tracker ``strict_fm_only`` NaNs every channel the
+        # generator does not write (the ``@root`` blocks), and a plain sum propagates that
+        # to every entry -- making the headline number nan rather than the error over the
+        # channels there IS a reference for. Identical to sum wherever nothing is NaN, so
+        # the teacher is unaffected. The per-dimension tables below already nan-reduce.
+        norm_sq = np.nansum(e ** 2, axis=2)
         per_env_mean = _time_mean_per_env(norm_sq, mask)
         _log("")
         _log("Norm Squared Error (dot(e,e)):")

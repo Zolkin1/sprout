@@ -75,8 +75,11 @@ class FmTrackingCommand(MotionSequenceCommand):
             )
         if not self.cfg.fm_checkpoint:
             raise ValueError(
-                "FmTrackingCommandCfg.fm_checkpoint must be set to a trained robot-state-"
-                "conditioned (ego_anchored_clip_future) flow-matching .pt checkpoint."
+                "No FM checkpoint: pass --fm_checkpoint <path/to/best.pt>. There is "
+                "deliberately no default -- it must be a trained robot-state-conditioned "
+                "(target_source='ego_anchored_clip_future') flow-matching .pt whose horizon "
+                "covers this task's reference window, and a stale one would load and predict "
+                "and be silently wrong. Same reasoning as --clip having no default."
             )
         if not os.path.isfile(self.cfg.fm_checkpoint):
             raise FileNotFoundError(f"FmTrackingCommandCfg.fm_checkpoint '{self.cfg.fm_checkpoint}' does not exist.")
@@ -281,6 +284,15 @@ class FmTrackingCommand(MotionSequenceCommand):
             self.y_des[:, self._unwritten_pos] = torch.nan
             self.dy_des[:, self._unwritten_vel] = torch.nan
 
+        # Measured outputs in the world frame (identity reference -> no alignment), then the
+        # CLF. Deliberately AFTER the strict_fm_only fill: the graded channel subset should
+        # contain only channels the FM writes, so if one of the NaNs reaches eta then ``v``
+        # goes NaN and says so -- which is the whole point of the barrier. (Joint mode grades
+        # the base, the world ee frames and the joints; the NaNs are the ``@root`` blocks.)
+        self.compute_measured_output(self._zeros3, self._ident_quat)
+        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
+        self.vdot, self.v = vdot, vcur
+
     def _write_global_base_des(self) -> None:
         """Disabled: there is no global clip base to grade against here.
 
@@ -317,11 +329,6 @@ class FmTrackingCommand(MotionSequenceCommand):
         # [N, K, 13] world frames -> the ee half only; the FM predicts position, and the
         # snapshot's frame layout is [pos(3), quat(4), lin(3), ang(3)].
         self._applied_frames = fm_ee.clone() if self.ctx.num_extra_frames > 0 else None
-
-        # Measured outputs in the world frame (identity reference -> no alignment).
-        self.compute_measured_output(self._zeros3, self._ident_quat)
-        vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
-        self.vdot, self.v = vdot, vcur
 
     # ------------------------------------------------------------------
     # Robot-state history snapshot + inference (once per control step)
@@ -589,7 +596,15 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._fm_markers.set_visibility(False)
 
     def _debug_vis_callback(self, event) -> None:
-        """Draw the inherited viz plus the FM prediction (spheres)."""
+        """Draw the inherited viz plus the FM prediction (spheres).
+
+        Guarded independently of the base's own check: this callback's second half runs
+        whether or not the base drew anything, and :meth:`_draw_fm_prediction_ribbon` reads
+        ``self.device`` -- another env-backed property. See
+        :meth:`MotionSequenceCommand._scene_alive`.
+        """
+        if not self._scene_alive():
+            return
         super()._debug_vis_callback(event)
         if self.cfg.debug_vis_show_fm_prediction:
             self._draw_fm_prediction_ribbon()

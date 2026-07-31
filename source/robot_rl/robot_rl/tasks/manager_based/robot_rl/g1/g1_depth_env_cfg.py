@@ -500,8 +500,13 @@ class G1TeacherTerrainDepthImageEnvCfg(G1TeacherTerrainDepthEnvCfg):
 # PLAY variants -- inherit the terrain teacher's play trims, then add depth ones.
 # ---------------------------------------------------------------------------
 
-def _apply_depth_play_trims(cfg) -> None:
+def apply_depth_play_trims(cfg) -> None:
     """Disable depth randomisation and draw both cameras' rays.
+
+    Public because the FM tracker's depth play variant
+    (``g1_tracker_env_cfg.G1FmTrackerTerrainDepthPlayEnvCfg``) needs the same trims: it
+    derives from the depth teacher rather than from the play class below, so it cannot
+    inherit them.
 
     Args:
         cfg: The play env cfg to trim, modified in place.
@@ -528,7 +533,7 @@ class G1TeacherTerrainDepthEnvCfgPlay(G1TeacherTerrainBodyEnvCfgPlay):
 
     def __post_init__(self):
         super().__post_init__()
-        _apply_depth_play_trims(self)
+        apply_depth_play_trims(self)
 
 
 @configclass
