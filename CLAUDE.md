@@ -54,6 +54,11 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   the POLICY obs (the hardware has cameras, not a heightmap); the CRITIC keeps the scan, since it is
   privileged and never deployed. The `-image` variant differs only in obs SHAPE (per-camera image
   groups for a CNN) — it is untested in training and `PPORunnerCfg` is an MLP.
+- These extend the BODY-tracking terrain teacher, so they default to `tracking_mode="body"` and pair
+  with a widened (`@root`) clip library — the depth-vs-height-scan A/B is against
+  `G1-teacher-clf-terrain-body` with exteroception as the only variable. Override per-run with
+  `env.commands.traj_ref.tracking_mode=joint`. Costs ~20% more per iteration than the scan (measured
+  at 512 envs).
 - The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 

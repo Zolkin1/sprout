@@ -1480,6 +1480,19 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         Both are read straight out of ``y_act`` / ``y_des``, i.e. the exact tensors the CLF
         differences -- so the visualisation cannot disagree with the reward, and it follows
         ``tracking_mode`` without restating a body list.
+
+        EXPECTED: the green spheres visibly TRAIL their links during fast motion, and the
+        faster the link the further they trail.  That is a render-cadence artifact, not a
+        frame error -- ``y_act`` is a straight ``body_pos_w`` read and matches a live one to
+        0.000000 m on the tick it is written.  The markers are written once per CONTROL step
+        while the viewport draws faster, and a link covers up to ~0.17 m per control step
+        (ankles, measured; ~0.11 m at the wrists) against a 0.03 m sphere radius -- roughly
+        six sphere diameters, so the offset is obvious.
+        What stays exact is the green-to-magenta SEPARATION, since both come from the same
+        tick; it is only the overlay onto the rendered mesh that lags.  So read the gap, not
+        a dot's absolute position on a moving link.  ``play.py --real-time`` largely hides
+        it.  Redrawing green from a live read at render rate would glue the dots to the links
+        but put the two colours on different ticks, corrupting the one quantity this is for.
         """
         if self._debug_body_markers is None or not self.cfg.debug_vis_body_spheres:
             return

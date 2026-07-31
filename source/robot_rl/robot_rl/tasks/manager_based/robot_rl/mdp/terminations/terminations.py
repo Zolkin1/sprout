@@ -4,19 +4,27 @@ from __future__ import annotations
 
 import torch
 import warp as wp
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import euler_xyz_from_quat, quat_box_minus, wrap_to_pi
 
+from motion_gen.world_lift import anchor_mask_from_free
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
+
+
+#: Anchor-mask bit for the terrain-frame traversal axis. Computed, not hand-typed, so it
+#: stays in lock-step with the bit order in ``motion_gen.world_lift``.
+_MASK_DOWNRANGE_FREE: int = anchor_mask_from_free({"downrange"})
 
 
 def base_pose_error_termination(
     env,
     command_name: str = "traj_ref",
     max_pos_dist: float = 0.25,
+    max_pos_dist_downrange_free: float | None = None,
     max_ori_rad: float = 0.8,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -35,10 +43,34 @@ def base_pose_error_termination(
       * orientation: terminate if the geodesic angle between the reference
         and actual base quaternions exceeds ``max_ori_rad`` (rad).
 
+    **The position bound is anchor-mask dependent**, because how much drift matters -- and
+    whether the policy can even perceive it -- is exactly what the mask encodes:
+
+    * ``downrange`` PINNED (stairs, boxes): the anchored reference coincides with the global
+      one along the traversal axis, so the CLF already grades that drift AND the reference
+      window shows it to the policy as a nonzero base error.  Observable and correctable, so
+      hold it tight -- position relative to the treads is the whole task there.
+    * ``downrange`` FREE (flat): the clip is re-datumed onto the robot every step, so the
+      base error the policy observes is ~0 by construction and global drift is INVISIBLE to
+      it.  Terminating tightly on something unobservable just truncates episodes without
+      teaching anything, and on flat ground absolute world position is arbitrary anyway --
+      the motion's shape and speed are what matter.  So give it slack.
+
+    Box clips carry a PER-FRAME mask (ego approach -> pinned mount), so the bound follows the
+    phase within a single episode rather than being fixed per tile.
+
+    Known imprecision: this switches a single scalar radius on one bit, while the error it
+    bounds is the full 3-D norm.  On a stair tile lateral IS free, so lateral drift still
+    counts against the tight bound.  Splitting the error into free / pinned components in the
+    terrain frame would fix that; it needs the ``mask_frame_yaw`` rotation and is deliberately
+    not done here.
+
     Args:
         env: IsaacLab environment.
         command_name: The :class:`MotionSequenceCommand` term name.
-        max_pos_dist: Max base position error before terminating (m).
+        max_pos_dist: Max base position error where downrange is PINNED (m).
+        max_pos_dist_downrange_free: Max base position error where downrange is FREE (m).
+            ``None`` uses ``max_pos_dist`` everywhere, i.e. the old mask-blind behaviour.
         max_ori_rad: Max base orientation error before terminating (rad).
         asset_cfg: Robot scene entity.
 
@@ -56,7 +88,18 @@ def base_pose_error_termination(
     pos_err = torch.norm(ref_pos_w - root_pos_w, dim=-1)
     # ||quat_box_minus|| is the geodesic rotation angle (rad).
     ori_err = torch.norm(quat_box_minus(root_quat_w, ref_quat_w), dim=-1)
-    return (pos_err > max_pos_dist) | (ori_err > max_ori_rad)
+
+    if max_pos_dist_downrange_free is None:
+        limit = max_pos_dist
+    else:
+        mask = cmd.manager.gather_anchor_mask_at_step(cmd.clip_id, cmd._step).to(pos_err.device)
+        limit = torch.where(
+            (mask & _MASK_DOWNRANGE_FREE) > 0,
+            torch.as_tensor(max_pos_dist_downrange_free, device=pos_err.device,
+                            dtype=pos_err.dtype),
+            torch.as_tensor(max_pos_dist, device=pos_err.device, dtype=pos_err.dtype),
+        )
+    return (pos_err > limit) | (ori_err > max_ori_rad)
 
 
 def tracked_frame_error_termination(
@@ -67,7 +110,7 @@ def tracked_frame_error_termination(
         "left_wrist_yaw_link", "right_wrist_yaw_link",
     ),
     max_pos_dist: float = 0.25,
-    max_ori_rad: float = 0.8,
+    max_ori_rad: float | Sequence[float | None] = 0.8,
 ) -> torch.Tensor:
     """Terminate when a tracked end-effector drifts too far from ITS reference.
 
@@ -85,9 +128,23 @@ def tracked_frame_error_termination(
         frame_names: Frames to watch. Defaults to the four end effectors.
         max_pos_dist: Max per-frame position error before terminating (m).
         max_ori_rad: Max per-frame geodesic orientation error before terminating (rad).
+            Either one value for every frame, or one PER frame in ``frame_names`` order,
+            where ``None`` disables the orientation bound for that frame (its POSITION bound
+            still applies).  Per-frame exists because the wrists and the ankles are not
+            comparable: profiled at 2.6k iterations, orientation drove 492 of 629 ee trips
+            and ``left_wrist_yaw`` alone was 305 of them, of which 286 were on TERRAIN and
+            only 4 on flat.  A wrist rides a longer kinematic chain than an ankle and its yaw
+            is not pinned by ground contact, so one shared bound made this mostly a
+            left-wrist-on-terrain detector.  Raising the bound does not fix that -- 0.8 ->
+            1.0 rad moved it 305 -> 290 trips, so the error is far past the bound rather than
+            marginally over it, and the honest options are to disable it or to fix whatever
+            the terrain clips are asking of that wrist.
 
     Returns:
         Boolean ``[num_envs]`` -- True for envs that should terminate.
+
+    Raises:
+        ValueError: If a per-frame ``max_ori_rad`` does not match ``frame_names``.
     """
     cmd = env.command_manager.get_term(command_name)
     act_pos, act_quat, des_pos, des_quat = cmd.tracked_frame_pose(list(frame_names))
@@ -96,7 +153,19 @@ def tracked_frame_error_termination(
     ori_err = torch.norm(
         quat_box_minus(act_quat.reshape(n * f, 4), des_quat.reshape(n * f, 4)), dim=-1
     ).view(n, f)
-    return ((pos_err > max_pos_dist) | (ori_err > max_ori_rad)).any(dim=-1)
+
+    if isinstance(max_ori_rad, (int, float)):
+        ori_lim = torch.full((f,), float(max_ori_rad), device=ori_err.device,
+                             dtype=ori_err.dtype)
+    else:
+        vals = [float("inf") if v is None else float(v) for v in max_ori_rad]
+        ori_lim = torch.as_tensor(vals, device=ori_err.device, dtype=ori_err.dtype)
+        if ori_lim.numel() != f:
+            raise ValueError(
+                f"max_ori_rad has {ori_lim.numel()} entries but frame_names has {f}: "
+                f"{list(frame_names)}"
+            )
+    return ((pos_err > max_pos_dist) | (ori_err > ori_lim)).any(dim=-1)
 
 
 def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: bool = True) -> torch.Tensor:

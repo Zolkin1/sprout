@@ -272,3 +272,99 @@ def test_reanchor_still_guarded_once_per_step_after_a_resample():
     placed["ids"] = None                                     # detect any further take
     MotionSequenceCommand._reanchor_ego_envs(fake)          # must be a no-op
     assert placed["ids"] is None
+
+
+def test_base_termination_radius_follows_the_anchor_mask():
+    """Drift is bounded tightly only where the policy can actually perceive it.
+
+    Where ``downrange`` is PINNED (stairs / boxes) the anchored reference coincides with the
+    global one along the traversal axis, so the drift is graded by the CLF and shows up in
+    the reference window as a nonzero base error -- observable, correctable, and the whole
+    point of the task there.  Where it is FREE (flat) the clip is re-datumed onto the robot
+    every step, so the base error the policy sees is ~0 by construction and global drift is
+    invisible to it; bounding that tightly truncates episodes without teaching anything.
+    """
+    from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
+    from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
+        base_pose_error_termination,
+    )
+
+    tight, loose = 0.3, 0.75
+    drift = 0.5                                   # between the two bounds
+    n = 4
+    # env 0,1 = flat (downrange free); env 2,3 = box (pinned). Envs 1 and 3 have drifted.
+    masks = torch.tensor([_ANCHOR_MASK_FLAT, _ANCHOR_MASK_FLAT,
+                          _ANCHOR_MASK_BOX, _ANCHOR_MASK_BOX], dtype=torch.uint8)
+    offset = torch.tensor([0.0, drift, 0.0, drift])
+    ref = torch.zeros(n, 3)
+    root = torch.zeros(n, 3)
+    root[:, 0] = offset
+    ident = torch.zeros(n, 4); ident[:, 3] = 1.0
+
+    state = torch.cat([ref, ident, torch.zeros(n, 6)], dim=-1)
+    cmd = SimpleNamespace(
+        termination_reference_world_state=lambda: state,
+        clip_id=torch.zeros(n, dtype=torch.long), _step=torch.zeros(n, dtype=torch.long),
+        manager=SimpleNamespace(gather_anchor_mask_at_step=lambda cid, st: masks),
+    )
+    env = SimpleNamespace(
+        scene={"robot": SimpleNamespace(data=SimpleNamespace(root_pos_w=root, root_quat_w=ident))},
+        command_manager=SimpleNamespace(get_term=lambda name: cmd),
+    )
+    # The command reads the robot through warp; hand it plain torch tensors.
+    import robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations as T
+    old_wp, T.wp = T.wp, SimpleNamespace(to_torch=lambda t: t)
+    try:
+        done = base_pose_error_termination(
+            env, max_pos_dist=tight, max_pos_dist_downrange_free=loose, max_ori_rad=0.8)
+        # 0.5 m is under the flat bound and over the terrain one.
+        assert done.tolist() == [False, False, False, True]
+
+        # None restores the mask-blind behaviour: the flat env terminates too.
+        done_blind = base_pose_error_termination(env, max_pos_dist=tight, max_ori_rad=0.8)
+        assert done_blind.tolist() == [False, True, False, True]
+    finally:
+        T.wp = old_wp
+
+
+def test_tracked_frame_ori_bound_is_per_frame_and_none_disables_it():
+    """``None`` drops a frame's ORIENTATION bound while keeping its POSITION bound.
+
+    The wrists carry orientation error the terrain clips ask for and the policy cannot
+    follow -- 286 of left_wrist_yaw's 290 orientation trips were on terrain, and raising the
+    bound 0.8 -> 1.0 rad barely moved it. Disabling per frame beats setting a number large
+    enough to be meaningless, but the position bound must survive.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
+        tracked_frame_error_termination,
+    )
+
+    frames = ("a", "b")
+    n = 4
+    # env 0 clean; 1 = 'b' over ori only; 2 = 'b' over pos only; 3 = 'a' over ori.
+    act_p = torch.zeros(n, 2, 3)
+    des_p = torch.zeros(n, 2, 3)
+    act_p[2, 1, 0] = 1.0                                     # 'b' position error
+    act_q = torch.zeros(n, 2, 4); act_q[..., 3] = 1.0
+    des_q = torch.zeros(n, 2, 4); des_q[..., 3] = 1.0
+    # ~pi/2 about z on the offending frames.
+    for env_i, frm in ((1, 1), (3, 0)):
+        des_q[env_i, frm] = torch.tensor([0.0, 0.0, 0.7071, 0.7071])
+
+    cmd = SimpleNamespace(tracked_frame_pose=lambda names: (act_p, act_q, des_p, des_q))
+    env = SimpleNamespace(command_manager=SimpleNamespace(get_term=lambda name: cmd))
+
+    # 'b' orientation disabled -> env 1 survives, but its POSITION bound still bites (env 2),
+    # and 'a' keeps its orientation bound (env 3).
+    done = tracked_frame_error_termination(
+        env, frame_names=frames, max_pos_dist=0.5, max_ori_rad=(0.8, None))
+    assert done.tolist() == [False, False, True, True]
+
+    # Both bounds active -> env 1 terminates too.
+    done_both = tracked_frame_error_termination(
+        env, frame_names=frames, max_pos_dist=0.5, max_ori_rad=(0.8, 0.8))
+    assert done_both.tolist() == [False, True, True, True]
+
+    with pytest.raises(ValueError, match="max_ori_rad has 3 entries"):
+        tracked_frame_error_termination(
+            env, frame_names=frames, max_pos_dist=0.5, max_ori_rad=(0.8, 0.8, 0.8))
