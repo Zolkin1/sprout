@@ -25,6 +25,8 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.terrains import TerrainGeneratorCfg
+from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg
 
 from motion_gen.joint_names import G1_JOINT_NAMES
 
@@ -38,6 +40,22 @@ from .g1_clf_tracking_base import (
     G1ClfTrackingSceneCfg,
 )
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
+
+
+# Flat TRIANGLE-MESH terrain at z=0.  A RayCaster cannot hit the infinite "plane"
+# primitive, so any tool that needs a ray-castable flat ground builds one from this.
+#
+# No TASK uses it -- the flat-mesh record env that owned it was pruned in 0f26c06.  It
+# lives on for the two depth diagnostics that import it from here
+# (``scripts/rsl_rl/verify_depth_self_scan.py`` and ``compare_depth_sim2sim.py``), both of
+# which want a minimal ray-castable scene rather than the terrain teacher's tiles.  It was
+# deleted with the record env and the scripts were left dangling on it; restored rather
+# than inlined twice.
+FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0), border_width=20.0, num_rows=10, num_cols=20,
+    horizontal_scale=0.1, vertical_scale=0.005, slope_threshold=0.75, use_cache=False,
+    sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
+)
 
 
 ##

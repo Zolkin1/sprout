@@ -46,6 +46,12 @@ parser.add_argument("--robot_name", default="g1_29j", help="MuJoCo robot model t
 parser.add_argument("--scene", default="basic_scene", help="MuJoCo (flat) scene name.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--save_dir", default=None, help="Write side-by-side difference PNGs here.")
+parser.add_argument("--upscale", type=int, default=16,
+                    help="Nearest-neighbour zoom for --save_dir panels (30x26 is unreadable "
+                         "at 1:1).")
+parser.add_argument("--dump", default=None,
+                    help="Write an .npz of both sims' poses, camera frames and depth for "
+                         "scripts/rsl_rl/view_depth_compare_viser.py.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 args.headless = True
@@ -281,29 +287,129 @@ def _hand_mask(model, cams, index: int) -> np.ndarray:
     return mask
 
 
+# Colour ramps, as anchor stops interpolated per pixel.  Hand-rolled rather than pulled
+# from matplotlib: this script already runs inside Kit, and adding a plotting import to it
+# is not worth the startup cost.
+#: Near-to-far depth: dark blue -> teal -> green -> yellow (a viridis approximation).
+_DEPTH_RAMP = np.array([(68, 1, 84), (59, 82, 139), (33, 145, 140),
+                        (94, 201, 98), (253, 231, 37)], dtype=np.float32)
+#: Agreement-to-disagreement: black -> red -> orange -> white.
+_DIFF_RAMP = np.array([(0, 0, 0), (110, 0, 0), (220, 40, 0),
+                       (255, 170, 0), (255, 255, 255)], dtype=np.float32)
+
+
+def _colorize(norm: np.ndarray, ramp: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Map values in [0, 1] through a colour ramp to an RGB image.
+
+    Args:
+        norm: Flat array of normalised values; clipped into range.
+        ramp: ``[K, 3]`` anchor colours, evenly spaced over [0, 1].
+        height: Image height.
+        width: Image width.
+
+    Returns:
+        ``[height, width, 3]`` uint8 image.
+    """
+    x = np.clip(norm, 0.0, 1.0) * (len(ramp) - 1)
+    lo = np.floor(x).astype(int)
+    hi = np.minimum(lo + 1, len(ramp) - 1)
+    t = (x - lo)[:, None]
+    rgb = ramp[lo] * (1.0 - t) + ramp[hi] * t
+    return rgb.astype(np.uint8).reshape(height, width, 3)
+
+
+def _mat_from_quat_xyzw(q: np.ndarray) -> np.ndarray:
+    """Rotation matrix from an ``(x, y, z, w)`` quaternion."""
+    x, y, z, w = (float(v) for v in q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _isaac_camera_pose(robot, cam: dict) -> tuple[np.ndarray, np.ndarray]:
+    """World OPTICAL pose of an IsaacLab depth camera, as ``(pos, rot3x3)``.
+
+    Built from the MOUNT BODY's pose composed with the contract's offset -- deliberately
+    NOT from ``RayCasterData.quat_w``.  That field holds neither the camera's optical
+    frame nor, in this configuration, anything that rotates with the torso: the sensor
+    bakes ``cfg.offset.rot`` into ``ray_directions`` once at init (``ray_caster.py:215``),
+    and reading ``quat_w`` back yields an optical axis of +x with no pitch, unchanged
+    across postures.  Composing it with the offset still disagrees with MuJoCo by up to
+    0.19 rad on tilted postures, while the two sims' IMAGES agree pixel-for-pixel -- so
+    ``quat_w`` is the wrong source, not the sim.
+
+    The mount body plus offset is what the contract actually means, and it is the same
+    construction the MuJoCo caster's ``_Camera.pose`` uses, which makes the two triads
+    directly comparable rather than comparable-by-coincidence.
+
+    Args:
+        robot: The IsaacLab articulation.
+        cam: That camera's contract entry (``mount_body``, ``offset_pos``,
+            ``offset_quat_xyzw``).
+
+    Returns:
+        ``((3,), (3, 3))`` position and rotation for env 0.
+    """
+    i = list(robot.data.body_names).index(cam["mount_body"])
+    body_pos = _as_torch(robot.data.body_pos_w)[0, i].cpu().numpy().astype(np.float64)
+    body_rot = _mat_from_quat_xyzw(
+        _as_torch(robot.data.body_quat_w)[0, i].cpu().numpy().astype(np.float64))
+    offset = np.asarray(cam["offset_pos"], dtype=np.float64)
+    return (body_pos + body_rot @ offset,
+            body_rot @ _mat_from_quat_xyzw(np.asarray(cam["offset_quat_xyzw"], dtype=np.float64)))
+
+
 def _save_comparison(out_dir: str, tag: str, cam: dict, isaac_row, mj_row, camera) -> None:
-    """Write an isaac | mujoco | difference strip for one camera."""
+    """Write a labelled isaac | mujoco | |difference| panel for one camera.
+
+    The two depth panels share one colour scale so they are directly comparable; the
+    difference panel gets its own heat scale, since its range is usually far smaller and
+    would otherwise be invisible.  Panels are nearest-neighbour upscaled, so one source
+    pixel stays a readable, hard-edged block rather than being smoothed away.
+    """
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw
     except ImportError:
         print(f"[WARN] Pillow not installed; skipping --save_dir {out_dir}.")
         return
     os.makedirs(out_dir, exist_ok=True)
     height, width = camera.height, camera.width
+    scale = max(int(args.upscale), 1)
     to_m = lambda row: denormalize_depth_np(row, cam["offset"], cam["scale"])
-    both = np.concatenate([to_m(isaac_row), to_m(mj_row)])
-    lo, hi = float(both.min()), float(both.max())
-    gray = lambda row: (255.0 * (1.0 - np.clip((to_m(row) - lo) / max(hi - lo, 1e-9), 0, 1))
-                        ).astype(np.uint8).reshape(height, width)
-    diff = np.abs(to_m(isaac_row) - to_m(mj_row))
-    diff_img = (255.0 * np.clip(diff / max(diff.max(), 1e-9), 0, 1)).astype(np.uint8).reshape(
-        height, width)
-    strip = np.concatenate([gray(isaac_row), np.full((height, 2), 128, np.uint8),
-                            gray(mj_row), np.full((height, 2), 128, np.uint8), diff_img], axis=1)
+    isaac_m, mj_m = to_m(isaac_row), to_m(mj_row)
+    lo, hi = float(min(isaac_m.min(), mj_m.min())), float(max(isaac_m.max(), mj_m.max()))
+    diff = np.abs(isaac_m - mj_m)
+    dmax = float(diff.max())
+
+    depth = lambda row: _colorize((row - lo) / max(hi - lo, 1e-9), _DEPTH_RAMP, height, width)
+    panels = [
+        ("IsaacLab", depth(isaac_m)),
+        ("MuJoCo", depth(mj_m)),
+        ("|difference|", _colorize(diff / max(dmax, 1e-9), _DIFF_RAMP, height, width)),
+    ]
+
+    pad, label_h = 6, 18
+    panel_w, panel_h = width * scale, height * scale
+    canvas = Image.new(
+        "RGB",
+        (len(panels) * panel_w + (len(panels) + 1) * pad, panel_h + label_h + 2 * pad),
+        (24, 24, 24),
+    )
+    draw = ImageDraw.Draw(canvas)
+    for i, (title, rgb) in enumerate(panels):
+        x = pad + i * (panel_w + pad)
+        img = Image.fromarray(rgb, mode="RGB").resize((panel_w, panel_h), Image.NEAREST)
+        canvas.paste(img, (x, label_h))
+        draw.text((x + 2, 4), title, fill=(235, 235, 235))
+    draw.text((pad + 2, label_h + panel_h + 4),
+              f"{tag} / {camera.sensor} -- depth {lo:.2f}..{hi:.2f} m (shared scale); "
+              f"|difference| 0..{dmax:.3f} m",
+              fill=(170, 170, 170))
     path = os.path.join(out_dir, f"{tag}_{camera.sensor}.png")
-    Image.fromarray(strip, mode="L").resize(
-        (strip.shape[1] * 8, height * 8), Image.NEAREST).save(path)
-    print(f"    wrote {path}  (isaac | mujoco | |difference|, max {diff.max():.3f} m)")
+    canvas.save(path)
+    print(f"    wrote {path}  (isaac | mujoco | |difference|, max {dmax:.3f} m)")
 
 
 def main() -> int:
@@ -343,6 +449,11 @@ def main() -> int:
     nominal = _as_torch(robot.data.joint_pos)[0].clone()
     root_pose = _as_torch(robot.data.root_pose_w)[0].clone()
     ok = True
+    dump: dict[str, list] = {k: [] for k in (
+        "tag", "joint_pos", "root_pos", "root_quat_xyzw",
+        "isaac_cam_pos", "isaac_cam_rot", "mj_cam_pos", "mj_cam_rot",
+        "isaac_depth_m", "mj_depth_m",
+    )}
 
     for pose_i in range(max(1, args.poses)):
         if pose_i == 0:
@@ -392,6 +503,39 @@ def main() -> int:
                       f"max {diff[hands].max():.4f} m")
             if args.save_dir:
                 _save_comparison(args.save_dir, tag, cam, isaac_rows[i], mj_rows[i], camera)
+
+        if args.dump:
+            dump["tag"].append(tag)
+            dump["joint_pos"].append(actual_joints)
+            dump["root_pos"].append(actual_root[:3])
+            dump["root_quat_xyzw"].append(actual_root[3:7])
+            isaac_poses = [_isaac_camera_pose(robot, c) for c in spec]
+            mj_poses = [c.pose(data) for c in cams.cameras]
+            dump["isaac_cam_pos"].append([p for p, _ in isaac_poses])
+            dump["isaac_cam_rot"].append([r for _, r in isaac_poses])
+            dump["mj_cam_pos"].append([np.asarray(p) for p, _ in mj_poses])
+            dump["mj_cam_rot"].append([np.asarray(r) for _, r in mj_poses])
+            to_m = lambda row, c: denormalize_depth_np(row, c["offset"], c["scale"])
+            dump["isaac_depth_m"].append([to_m(isaac_rows[i], c) for i, c in enumerate(spec)])
+            dump["mj_depth_m"].append([to_m(mj_rows[i], c) for i, c in enumerate(spec)])
+
+    if args.dump:
+        # dirs_cam / cos_theta are the SHARED ray pattern (unit-tested identical), so the
+        # viewer reconstructs both sims' hit points with one formula and any difference in
+        # the dots is purely a depth difference.
+        np.savez_compressed(
+            args.dump,
+            sensors=np.array([c.sensor for c in cams.cameras]),
+            joint_names=np.array(isaac_joint_names),
+            dirs_cam=np.stack([c.dirs_cam for c in cams.cameras]),
+            cos_theta=np.stack([c.cos_theta for c in cams.cameras]),
+            max_dist=np.array([c["max_dist"] for c in spec]),
+            width=np.array([c.width for c in cams.cameras]),
+            height=np.array([c.height for c in cams.cameras]),
+            **{k: np.asarray(v) for k, v in dump.items()},
+        )
+        print(f"\nwrote {args.dump}  "
+              f"({len(dump['tag'])} pose(s); view with scripts/rsl_rl/view_depth_compare_viser.py)")
 
     print("\n" + ("DEPTH MATCHES ACROSS SIMULATORS" if ok else "DEPTH MISMATCH -- see FAIL rows"))
     return 0 if ok else 1
