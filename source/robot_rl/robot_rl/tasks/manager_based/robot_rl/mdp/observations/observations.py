@@ -535,6 +535,17 @@ def reference_window(
     Note the window saturates on the clip's final padded frame near the end of a
     clip (``_future_step_indices`` clamps to the padded library length); the
     episode is truncated by ``clip_end_reached`` before that matters.
+
+    TODO(perf): the observation manager is the single largest phase of the env step --
+    50.8 ms/frame, ~39%, tied with physics (profiled with the trained depth_v3 at 1024
+    envs via ``play.py --profile``).  Roughly 19 ms of that is the two depth cameras
+    (measured by A/B against ``G1-teacher-clf-terrain-body``, which is otherwise
+    identical), leaving ~31 ms across this window, the critic's height scan and the
+    tracking-error terms.  This term is the prime suspect for the remainder: it gathers
+    ``num_steps`` future frames of base + joints + ee for every env every step, then does
+    several quaternion ops on an ``[N*K, .]`` flattening.  Nothing here is instrumented
+    individually, so the first move is a per-term breakdown rather than an optimisation --
+    the manager total is all we currently know.
     """
     cmd = env.command_manager.get_term(command_name)
     offs = _window_offsets(cmd, num_steps, stride)

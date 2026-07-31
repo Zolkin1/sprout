@@ -57,8 +57,14 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
 - These extend the BODY-tracking terrain teacher, so they default to `tracking_mode="body"` and pair
   with a widened (`@root`) clip library — the depth-vs-height-scan A/B is against
   `G1-teacher-clf-terrain-body` with exteroception as the only variable. Override per-run with
-  `env.commands.traj_ref.tracking_mode=joint`. Costs ~20% more per iteration than the scan (measured
-  at 512 envs).
+  `env.commands.traj_ref.tracking_mode=joint`. Costs ~19% more per iteration than the scan
+  (139 vs 116 ms/frame at 1024 envs), almost all of it in `obs`.
+- PROFILE (trained depth_v3, 1024 envs, `play.py --profile`; profile with a LOADED policy — an
+  untrained one dies every step and doubles the apparent reset cost): of a 129 ms env step,
+  `obs` 50.8 ms (39%) and physics/render ~47 ms (37%) dominate, then `command` 13.1, `events`
+  7.8, `reward` 7.6, `termination` 2.5. ~19 ms of `obs` is the two depth cameras. `TODO(perf)`
+  notes sit on `mdp.observations.reference_window` and `MotionSequenceCommand._update_command`;
+  neither is instrumented per-term yet, so a breakdown comes before any optimisation.
 - The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 

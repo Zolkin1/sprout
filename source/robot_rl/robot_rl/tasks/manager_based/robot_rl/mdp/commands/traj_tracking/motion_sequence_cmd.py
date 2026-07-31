@@ -369,7 +369,18 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._wf_world_frames = torch.zeros(self.num_envs, len(self._wf_frames), 13, device=self.device)
 
     def _update_command(self) -> None:
-        """Advance the step, build world-frame desired + measured, update CLF."""
+        """Advance the step, build world-frame desired + measured, update CLF.
+
+        TODO(perf): this term is 13.1 ms/frame, ~10% of the env step -- second only to the
+        observations and the physics themselves.  Profiled with the trained depth_v3 at
+        1024 envs (``play.py --profile``, see the phase table in ``profiling.py``'s report):
+        the instrumented children only account for 7.9 of it (``compute_measured`` 5.4,
+        ``clf`` 1.6, ``desired`` 0.9), so ~5 ms is spread across the uninstrumented steps
+        below -- the re-anchor, the placement refresh and the world lifts, all of which run
+        for EVERY env EVERY step.  Worth a look before touching anything behavioural: it is
+        pure bookkeeping, so any win here is free.  Start by timing the four unlabelled
+        calls individually rather than guessing which one it is.
+        """
         self._advance_step()
         self._reanchor_ego_envs()                  # ego-centric re-anchor snapshot (subset of envs)
         self._refresh_current_placement()          # placement for THIS step's segment mask
