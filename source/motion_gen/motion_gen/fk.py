@@ -2,8 +2,8 @@
 
 """Differentiable, batched forward kinematics for the FK consistency loss.
 
-A pure-torch FK chain parsed once from a MuJoCo MJCF (the same ``g1_21j.xml`` the
-test bench uses for plotting), so it needs **no** external kinematics dependency and
+A pure-torch FK chain parsed once from a MuJoCo MJCF (``g1_29j.xml``, see
+``features.DEFAULT_MJCF``), so it needs **no** external kinematics dependency and
 can be validated exactly against ``mujoco.mj_kinematics``. It runs on the model's
 device (GPU), is differentiable in the joint angles, and is batched over arbitrary
 leading dims — so it can be evaluated inside the training loss with gradients flowing

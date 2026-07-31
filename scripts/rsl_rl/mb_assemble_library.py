@@ -39,6 +39,7 @@ from mb_terrain_clips import clip_from_plan, make_builder                    # n
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library    # noqa: E402
 from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
+from motion_gen.joint_names import world_position_channels                   # noqa: E402
 from motion_gen.motionbricks import load_terrain_plan, overlays_for          # noqa: E402
 from motion_gen.world_lift import _ANCHOR_MASK_BOX                           # noqa: E402
 
@@ -214,9 +215,11 @@ def main() -> int:
     os.makedirs(args.out_dir, exist_ok=True)
 
     builder = make_builder(args, args.device)
+    # WORLD-frame position channels only: root-frame channels are pelvis-relative, so a tile
+    # re-datum must not shift them (see ``joint_names.world_position_channels``).
     _SHARED.update(args=args, work=work, builder=builder, dev=args.device, tiles=tiles,
-                   x_ch=[i for i, n in enumerate(builder.pos_names) if n.endswith(":pos_x")],
-                   y_ch=[i for i, n in enumerate(builder.pos_names) if n.endswith(":pos_y")])
+                   x_ch=world_position_channels(builder.pos_names, "x"),
+                   y_ch=world_position_channels(builder.pos_names, "y"))
     n_workers = default_workers(len(tiles), args.workers)
     print(f"[mb_asm] {len(jobs)} clips over {len(tiles)} tiles, workers={n_workers}")
     recs = unit_pool(_tile_worker, range(len(tiles)), n_workers)

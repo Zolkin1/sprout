@@ -6,13 +6,61 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 from isaaclab.utils.math import quat_box_minus
 
+from motion_gen.joint_names import is_root_frame
+
 class CLF:
     """
     Continuous-time Control Lyapunov Function (CLF) evaluator for relative-degree-2 outputs.
     Uses user-provided LIP dynamics (A_lip, B_lip) and augments with double-integrator channels
     for additional outputs. Solves the continuous-time ARE once via SciPy, caches P and LQR gain K
     on the specified torch device for efficient V, V_dot, and control-law evaluation.
+
+    The command's ``y``/``dy`` vectors may carry MORE channels than the CLF grades:
+    ``tracked_vel_names`` selects the subset that forms eta.  That is what makes the
+    joint-vs-body tracking A/B a config switch on one clip library -- the clip always stores
+    both the ``joint:*`` and the root-frame body channels, and only the selection changes.
     """
+    #: Channel classes ``eta_scales`` accepts.  These are the CLASS half of the
+    #: ``v_subgroups`` metric names (``root_body_pos`` -> ``pos``), so a factor here and the
+    #: dashboard block it moves are named the same thing.  ``joint_*`` is kept separate from
+    #: ``ori``/``ang_vel`` even though joints are also radians: it keeps the joint-vs-body
+    #: A/B's control arm untouched unless it is scaled deliberately.
+    ETA_SCALE_CLASSES = ("pos", "lin_vel", "ori", "ang_vel", "joint_pos", "joint_vel")
+
+    @classmethod
+    def _channel_classes(cls, name: str) -> tuple[str, str]:
+        """Map a velocity channel name to its ``(pose_class, twist_class)`` scale keys."""
+        if name.startswith("joint:"):
+            return "joint_pos", "joint_vel"
+        if ":ori_" in name:
+            return "ori", "ang_vel"
+        return "pos", "lin_vel"
+
+    @classmethod
+    def _resolve_eta_scales(cls, eta_scales: dict[str, float] | None) -> dict[str, float]:
+        """Fill in defaults and reject the values that quietly break the CLF.
+
+        Raises:
+            ValueError: On an unknown class name, or a non-positive factor (``0`` makes P
+                singular, a negative one inverts the pose/velocity cross term).
+        """
+        resolved = {k: 1.0 for k in cls.ETA_SCALE_CLASSES}
+        for key, value in (eta_scales or {}).items():
+            if key not in resolved:
+                raise ValueError(
+                    f"unknown eta_scales class {key!r}; expected one of "
+                    f"{list(cls.ETA_SCALE_CLASSES)}"
+                )
+            if not float(value) > 0.0:
+                raise ValueError(
+                    f"eta_scales[{key!r}] must be > 0, got {value}: 0 makes P singular (V is "
+                    "no longer a valid CLF) and a negative value inverts the pose/velocity "
+                    "cross term. To stop grading a class, remove its channels from "
+                    "tracked_vel_names."
+                )
+            resolved[key] = float(value)
+        return resolved
+
     def __init__(
         self,
         sim_dt: float,
@@ -22,11 +70,62 @@ class CLF:
         device: torch.device = None,
         Q_weights: Dict = None,
         R_weights: Dict = None,
+        tracked_vel_names: list[str] | None = None,
+        eta_scales: dict[str, float] | None = None,
         # domain_scalar: list[float]|None = None
     ):
+        """Build P over the tracked channel subset and cache the gathers into the full vectors.
+
+        Args:
+            sim_dt: Simulation timestep.
+            batch_size: Number of environments.
+            ordered_vel_output_names: FULL velocity channel names of the command's ``dy``.
+            ordered_pos_output_names: FULL position channel names of the command's ``y``.
+            device: Torch device.
+            Q_weights: Per-channel ``[q_pos, q_vel]``, keyed by velocity channel name.
+            R_weights: Per-channel ``[r]``, keyed by velocity channel name.
+            tracked_vel_names: Velocity channels that form eta; ``None`` tracks all of them.
+                Order is normalised to ``ordered_vel_output_names`` order regardless of how it
+                is passed, which is what keeps the pos/vel channel correspondence that
+                :meth:`compute_y_err` relies on.
+            eta_scales: Per-class unit conversion folded into P, keyed by the classes in
+                :attr:`ETA_SCALE_CLASSES`.  All-``1.0`` (the default) charges 1 rad, 1 m/s
+                and 1 rad/s each like 1 m, which is what lets the numerically largest class
+                dominate V.  Each class's share of V scales as the SQUARE of its factor.
+                Missing keys default to 1.0; every value must be > 0.  See the derivation at
+                the fold site below.
+        """
         # Initialize device and basic parameters
-        self.device = device 
+        self.device = device
         self.sim_dt = sim_dt
+
+        # --- Tracked-channel subset -------------------------------------------------
+        full_pos = list(ordered_pos_output_names)
+        full_vel = list(ordered_vel_output_names)
+        if tracked_vel_names is None:
+            tracked_pos, tracked_vel = full_pos, full_vel
+        else:
+            want = set(tracked_vel_names)
+            unknown = sorted(want - set(full_vel))
+            if unknown:
+                raise ValueError(f"tracked_vel_names not in the command's outputs: {unknown}")
+            # Filter the FULL lists to preserve their relative order.  A position list also
+            # keeps each tracked frame's ``ori_w`` (present in y, absent from dy).
+            tracked_vel = [n for n in full_vel if n in want]
+            tracked_pos = [
+                n for n in full_pos
+                if n in want or (n.endswith(":ori_w") and f"{n[:-1]}x" in want)
+            ]
+        self._subset = (tracked_pos != full_pos) or (tracked_vel != full_vel)
+        self.pos_gather = torch.tensor([full_pos.index(n) for n in tracked_pos],
+                                       dtype=torch.long, device=self.device)
+        self.vel_gather = torch.tensor([full_vel.index(n) for n in tracked_vel],
+                                       dtype=torch.long, device=self.device)
+
+        # From here on, "ordered_*_output_names" means the TRACKED set: P, the subgroup index
+        # maps and the quaternion maps are all built over it.
+        ordered_pos_output_names = tracked_pos
+        ordered_vel_output_names = tracked_vel
         self.n_outputs = 2*len(ordered_vel_output_names)
         self.ordered_pos_output_names = ordered_pos_output_names
         self.ordered_vel_output_names = ordered_vel_output_names
@@ -60,6 +159,59 @@ class CLF:
 
         # Solve for P and LQR gain K in NumPy
         P_np = self._compute_PK_np(Q_np,R_np)
+
+        # --- Per-class channel scaling (the unit conversion V is missing) -------------
+        # V sums raw squares over channels carried in metres, radians, m/s and rad/s as
+        # though they were one quantity.  They are not, and the numerically biggest wins by
+        # default: measured on a trained body-mode checkpoint, link angular velocity took 68%
+        # of V and link POSITION 5%, at comparable RELATIVE accuracy.  ``eta_scales`` is the
+        # missing conversion -- one factor per channel class, each block's contribution to V
+        # scaling as the SQUARE of its factor.
+        #
+        # Read them physically rather than as fudge factors:
+        #   * ``ori`` is a characteristic LENGTH (m/rad) -- how many metres of position error
+        #     one radian of orientation error is worth.  A limb half-segment, ~0.2-0.5.
+        #   * ``lin_vel`` / ``ang_vel`` are a characteristic TIME (s) -- how long a velocity
+        #     error has to persist to matter like the corresponding pose error.  ``ang_vel``
+        #     carries the length too, so it is naturally the smallest of the four.
+        # ``pos`` is the natural reference at 1.0: scale the others against metres.
+        #
+        # Folded into P as S^T P S rather than applied at eta assembly.  S is diagonal so the
+        # two are the same quadratic form, but doing it here means (a) ``lambda_max`` and
+        # ``norm_P`` below pick the change up automatically, and (b) eta stays in physical
+        # units, so ``clf_decreasing_condition``'s eta_max / eta_dot_max thresholds keep
+        # meaning what they say and ``v_subgroups`` stays comparable across runs.
+        #
+        # Still a genuine CARE solution, not an ad-hoc reweighting.  For the scalar double
+        # integrator with ``S = diag(a, b)`` on a channel's (pose, twist) pair,
+        #
+        #     S^T P S = CARE(a^3/b * q_p,  a*b * q_v,  b^3/a * r)
+        #
+        # (verified to 1e-14 over a range of a, b).  So V remains a valid CLF and the
+        # decrease condition keeps its guarantee.  The pose:twist ratio within a channel goes
+        # as ``(a/b)^2``, which is the knob q_v alone cannot reach: ``P22 = sqrt(r*(2*sqrt(
+        # r*q_p) + q_v))`` is floored by its q_p term (see ``clf_weights._ROOT_Q_DEFAULT``).
+        #
+        # P stays SYMMETRIC POSITIVE DEFINITE for any positive scales: S^T P S is a
+        # congruence transform, and by Sylvester's law of inertia congruence by a NONSINGULAR
+        # S preserves inertia.  Both halves of that matter, hence the guard:
+        #   * ``0.0`` is singular -- it drops V to positive SEMI-definite (smallest eigenvalue
+        #     ~1e-15), so a nonzero eta can score V = 0 and V stops being a Lyapunov function.
+        #     To ignore a class, drop its channels from ``tracked_vel_names`` instead; that
+        #     shrinks eta rather than making P singular.
+        #   * a NEGATIVE scale is nonsingular, so P stays positive definite, but it flips the
+        #     sign of the P12 cross term and so rewards pose error and velocity being ALIGNED
+        #     rather than opposed -- silently the wrong objective.
+        # The conditioning cost is mild and bounded: cond(P) grows as the square of the
+        # spread between the largest and smallest scale (31 -> 339 at 0.3), nothing in fp32.
+        self.eta_scales = self._resolve_eta_scales(eta_scales)
+        if any(v != 1.0 for v in self.eta_scales.values()):
+            s_vec = np.ones(n_states)
+            for i, name in enumerate(ordered_vel_output_names):
+                pose_key, twist_key = self._channel_classes(name)
+                s_vec[2 * i] = self.eta_scales[pose_key]
+                s_vec[2 * i + 1] = self.eta_scales[twist_key]
+            P_np = P_np * np.outer(s_vec, s_vec)
 
         # Cache as torch tensors
         self.P = torch.from_numpy(P_np).to(self.device).to(torch.float32)
@@ -100,6 +252,12 @@ class CLF:
             "other_body_lin_vel": [],
             "other_body_ori": [],
             "other_body_ang_vel": [],
+            # Root-frame body links (``<body>@root:*``) are their own group so the logged
+            # error split separates local limb tracking from the world-frame skeleton.
+            "root_body_pos": [],
+            "root_body_lin_vel": [],
+            "root_body_ori": [],
+            "root_body_ang_vel": [],
         }
         for i, name in enumerate(ordered_vel_output_names):
             if name.startswith("pelvis_link:pos_"):
@@ -111,6 +269,12 @@ class CLF:
             elif name.startswith("joint:"):
                 pos_key = "joint_pos"
                 vel_key = "joint_vel"
+            elif is_root_frame(name) and ":pos_" in name:
+                pos_key = "root_body_pos"
+                vel_key = "root_body_lin_vel"
+            elif is_root_frame(name) and ":ori_" in name:
+                pos_key = "root_body_ori"
+                vel_key = "root_body_ang_vel"
             elif ":pos_" in name:
                 pos_key = "other_body_pos"
                 vel_key = "other_body_lin_vel"
@@ -157,9 +321,41 @@ class CLF:
                     else:
                         self.ori_body_indices_tangent[body_name] = [i]
 
+        # Stack the per-body quaternion index blocks so compute_y_err runs ONE batched
+        # quat_box_minus instead of one kernel launch per tracked body.  Body order is shared
+        # between the two so the manifold rows and the tangent rows line up.
+        self._ori_bodies = list(self.ori_body_indices_manifold)
+        if self._ori_bodies:
+            self._ori_manifold_idx = torch.tensor(
+                [self.ori_body_indices_manifold[b] for b in self._ori_bodies],
+                dtype=torch.long, device=self.device)                       # [B, 4]
+            self._ori_tangent_idx = torch.tensor(
+                [self.ori_body_indices_tangent[b] for b in self._ori_bodies],
+                dtype=torch.long, device=self.device)                       # [B, 3]
+        else:
+            self._ori_manifold_idx = torch.zeros((0, 4), dtype=torch.long, device=self.device)
+            self._ori_tangent_idx = torch.zeros((0, 3), dtype=torch.long, device=self.device)
+
         self.v_buffer = torch.zeros((batch_size, 3), device=self.device)
         self.step_count = 0
-        
+
+    def _select(self, y_act, y_nom, dy_act, dy_nom):
+        """Gather the tracked channel subset out of the command's full ``y``/``dy`` vectors.
+
+        Args:
+            y_act, y_nom: ``[B, P_full]`` measured / desired positions.
+            dy_act, dy_nom: ``[B, V_full]`` measured / desired velocities.
+
+        Returns:
+            The same four tensors restricted to the tracked channels (unchanged when the CLF
+            tracks everything, so the common path stays copy-free).
+        """
+        if not self._subset:
+            return y_act, y_nom, dy_act, dy_nom
+        return (y_act[:, self.pos_gather], y_nom[:, self.pos_gather],
+                dy_act[:, self.vel_gather], dy_nom[:, self.vel_gather])
+
+
     def _compute_PK_np(self, Q_np, R_np) -> tuple[np.ndarray, np.ndarray]:
         """
         Construct a pure double integrator system for all outputs,
@@ -203,7 +399,11 @@ class CLF:
     ) -> torch.Tensor:
         """
         Evaluate V = (y_act - y_nom)^T P (y_act - y_nom).
+
+        Inputs are the command's FULL ``y``/``dy`` vectors; only the tracked channel subset
+        (see ``tracked_vel_names``) enters eta.
         """
+        y_act, y_nom, dy_act, dy_nom = self._select(y_act, y_nom, dy_act, dy_nom)
 
         y_err = self.compute_y_err(y_act, y_nom)
 
@@ -279,15 +479,28 @@ class CLF:
         Compute the error between the measured values and the desired values.
 
         Must respect the quaternion orientation by using the box minus operator.
+
+        Args:
+            y_act: ``[B, P]`` measured positions over the TRACKED channels.
+            y_des: ``[B, P]`` desired positions over the TRACKED channels.
+
+        Returns:
+            ``[B, V]`` error in the tangent (velocity) channel layout.
         """
-        y_err = torch.zeros((y_act.shape[0], len(self.ordered_vel_output_names)), device=self.device)
+        b = y_act.shape[0]
+        y_err = torch.zeros((b, len(self.ordered_vel_output_names)), device=self.device)
 
         # Subtract all the non-quaternions normally
         y_err[:, self.not_quat_mask_tangent] = y_act[:, self.not_quat_mask_manifold] - y_des[:, self.not_quat_mask_manifold]
 
-        # Subtract quats with box minus operator
-        for body_name, indices in self.ori_body_indices_manifold.items():
-            tangent_indices = self.ori_body_indices_tangent[body_name]
-            y_err[:, tangent_indices] = quat_box_minus(y_act[:, indices], y_des[:, indices])
+        # Subtract quats with the box-minus operator.  ONE batched call over every tracked
+        # orientation frame -- body tracking pushes this from 5 frames to 18, and a Python
+        # loop would be 18 kernel launches on the critical path of every step.
+        nb = self._ori_manifold_idx.shape[0]
+        if nb:
+            act_q = y_act[:, self._ori_manifold_idx.reshape(-1)].reshape(b * nb, 4)
+            des_q = y_des[:, self._ori_manifold_idx.reshape(-1)].reshape(b * nb, 4)
+            box = quat_box_minus(act_q, des_q).reshape(b, nb * 3)
+            y_err[:, self._ori_tangent_idx.reshape(-1)] = box
 
         return y_err

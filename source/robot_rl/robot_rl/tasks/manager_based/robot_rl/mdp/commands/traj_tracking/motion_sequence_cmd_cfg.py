@@ -25,6 +25,22 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     base_frame_name: str = "pelvis_link"
     """Trajectory output frame used as the robot root (must expose pos/ori)."""
 
+    tracking_mode: str = "joint"
+    """Which reference parameterization the CLF grades -- the joint-vs-body A/B switch.
+
+    ``y_des`` / ``y_act`` always carry every channel (the reset, the world-state
+    reconstruction and the FM path all read ``joint:*`` regardless); this only selects
+    what enters eta:
+
+    * ``"joint"`` -- ``pelvis_link:*`` + the world end-effector frames + all ``joint:*``.
+      The original parameterization.
+    * ``"body"`` -- ``pelvis_link:*`` + the world end-effector frames + the root-frame body
+      links (``<body>@root:*``), with ``joint:*`` dropped.  The DeepMimic / Sonic style
+      Cartesian error metric.  Requires a clip library carrying root-frame channels (see
+      ``scripts/rsl_rl/backfill_root_frames.py``); the world-frame skeleton is kept so
+      global foot placement is still penalised against the terrain.
+    """
+
     random_start_phase: bool = False
     """If True, episodes start at a random step within the clip (else step 0)."""
 
@@ -59,7 +75,24 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Re-anchor cadence in control steps for ego-anchored envs: the clip is
     re-placed on the robot's root every this many steps (a receding-horizon
     re-plan).  Smaller = more frequent, smaller per-step reference jumps.  Only
-    used when ``ego_anchor_fraction > 0``."""
+    used when ``ego_anchor_fraction > 0``.
+
+    ``1`` (what the teacher uses) makes the reference fully LOCAL: the free root
+    DOFs coincide with the robot every step, so tracking error is measured
+    locally and planar drift is not double-counted.  Drift is still graded --
+    by the termination, against the globally-fixed clip.  See
+    :meth:`MotionSequenceCommand.termination_reference_world_state`."""
+
+    fm_snap_every: int = 12
+    """Cadence in control steps for the FM SNAP flag (``_reanchor_active``), which the
+    recorder logs and the flow-matching dataset turns into one training window each.
+
+    Deliberately SEPARATE from :attr:`ego_anchor_every`.  They used to share one timer,
+    which was fine when re-placement was occasional but breaks at every-step anchoring:
+    the recorder would emit a window per env per step, and the FM target would degenerate
+    to nothing (node 0 always coincides with the robot, so the window would encode no
+    placement decision -- the very thing the FM predicts).  Keep this at the value the FM
+    checkpoint was recorded with; it must match ``fm_update_every`` on the tracker."""
 
     # --- Debug visualization (set ``debug_vis = True`` to enable) ---
     debug_vis_horizon_s: float = 3.0
@@ -73,6 +106,24 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     segments (thin = line-like, matching the online command's marker style)."""
 
     debug_vis_show_hands: bool = False
+
+    debug_vis_body_spheres: bool = True
+    """Draw a sphere pair per TRACKED body: measured (green) vs the reference the reward
+    grades against (magenta), i.e. the clip after the per-step re-datum onto the robot.
+
+    The gap between each pair IS the reward's per-body error, so this is the direct read on
+    whether body-link tracking is working.  Follows ``tracking_mode`` automatically -- it
+    reads the tracked channels out of ``y_act``/``y_des`` rather than restating a body list."""
+
+    debug_vis_body_sphere_radius: float = 0.03
+    """Radius (m) of the tracked-body spheres."""
+
+    debug_vis_obs_window: bool = True
+    """Draw a ribbon along the base of the reference window the POLICY observes.
+
+    Distinct from the clip ribbon, which is drawn at the clip's GLOBAL placement: this one
+    is anchored, so it rides the robot.  The separation between the two ribbons is exactly
+    the accumulated drift -- the thing the reward forgives and the termination fires on."""
     """Whether to draw the hand/wrist end-effector frames in the debug ribbon.
     Off by default (pelvis + feet are usually what matters); set True to also
     visualize the wrist trajectories."""

@@ -1017,7 +1017,8 @@ def main() -> None:
                              clip_id=args.clip_id,
                              start_time=args.clip_start_time,
                              ego_anchor=args.clip_ego_anchor,
-                             ego_anchor_every=args.clip_ego_anchor_every)
+                             ego_anchor_every=args.clip_ego_anchor_every,
+                             root_frame_bodies=policy._trk.get_root_frame_bodies())
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")

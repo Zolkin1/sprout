@@ -1251,21 +1251,33 @@ def _plot_future_obs(
     save_dir: str, env_ids: list[int], dt: float | None, t_off: float, stride: int,
     fm_active: np.ndarray | None, fm_pred_idx: np.ndarray | None = None,
 ) -> None:
-    """One figure for a strided future_* obs: 6 subplots (one per component), each with
-    one line per lookahead step colored by horizon. Overlays the clip (dashed) when
-    ``obs_clip_<key>`` is present, so FM vs clip is visible per horizon/component."""
+    """One figure for a windowed future_* obs: one subplot per component, each with one
+    line per look-ahead sample colored by horizon. Overlays the clip (dashed) when
+    ``obs_clip_<key>`` is present, so FM vs clip is visible per horizon/component.
+
+    The window starts at the CURRENT step, so sample ``j`` is ``+j*stride*dt`` seconds
+    ahead and sample 0 is the present.  The component count is taken from
+    ``comp_labels``, so this serves the 6-wide base blocks and the nj-wide joint blocks
+    alike."""
     clip_key = "obs_clip_" + key[len("obs_"):]
     has_clip = clip_key in data
     cmap = plt.cm.viridis
+    n_comp = len(comp_labels)
+    if n_comp == 0 or data[key].shape[2] % n_comp:
+        print(f"[WARN _plot_future_obs] {key}: width {data[key].shape[2]} is not a multiple "
+              f"of {n_comp} labels, skipping.")
+        return
+    n_cols = min(4, n_comp)
+    n_rows = int(np.ceil(n_comp / n_cols))
     for env_id in env_ids:
         a = data[key][:, env_id, :]
         T = a.shape[0]
-        k = a.shape[1] // 6
-        a = a.reshape(T, k, 6)
-        ac = data[clip_key][:, env_id, :].reshape(T, k, 6) if has_clip else None
+        k = a.shape[1] // n_comp
+        a = a.reshape(T, k, n_comp)
+        ac = data[clip_key][:, env_id, :].reshape(T, k, n_comp) if has_clip else None
         x = np.arange(T) * dt + t_off if dt is not None else np.arange(T)
         xlabel = "Time (s)" if dt is not None else "Time Steps"
-        fig, axs = plt.subplots(2, 3, figsize=(18, 8))
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 3.0 * n_rows), squeeze=False)
         sub = "  solid = FM/applied, dashed = clip;  color = lookahead horizon" if has_clip \
             else "  color = lookahead horizon"
         fig.suptitle(f"{title}  (Env {env_id}){sub}", fontsize=14)
@@ -1273,11 +1285,11 @@ def _plot_future_obs(
         fm = _fm_for_env({"fm_active": fm_active} if fm_active is not None else {}, env_id, dt, t_off)
         has_fm = fm is not None and (fm[0] or fm[1] or fm[2])
         replan = _replan_times(fm_pred_idx[:, env_id] if fm_pred_idx is not None else None, dt, t_off)
-        for c in range(min(6, len(comp_labels))):
+        for c in range(n_comp):
             ax = axs[c]
             for j in range(k):
                 col = cmap(j / max(1, k - 1))
-                hs = (j + 1) * stride * (dt or 1.0)
+                hs = j * stride * (dt or 1.0)
                 ax.plot(x, a[:, j, c], color=col, lw=1.4, label=f"+{hs:.2f}s")
                 if has_clip:
                     ax.plot(x, ac[:, j, c], color=col, lw=1.1, ls="--", alpha=0.8)
@@ -1290,6 +1302,8 @@ def _plot_future_obs(
             ax.grid(True, alpha=0.3)
             if c == 0:
                 ax.legend(fontsize=6, ncol=2, title="lookahead")
+        for ax in axs[n_comp:]:
+            ax.set_visible(False)
         plt.tight_layout(rect=[0, 0.02, 1, 0.95])
         plt.savefig(os.path.join(save_dir, f"trajectory_obs_{fname}_env{env_id}.png"),
                     dpi=200, bbox_inches="tight")
@@ -1308,11 +1322,41 @@ def _traj_obs_labels(data: dict[str, np.ndarray], metadata: dict[str, Any]):
         "obs_base_vel_ref": ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
         "obs_joint_pos_ref": jp, "obs_joint_vel_ref": jv, "obs_ee_ref": ee,
     }
+    # The merged reference window, split by the logger into one signal per block. Sample
+    # 0 of each is the CURRENT step, so these should track the matching flat term above.
+    # NB the window's joint block is in the ROBOT's joint order, not the clip-output order
+    # that labels joint_pos_ref -- hence joint_names here rather than jp/jv.
+    joint_names = metadata.get("joint_names", [])
     fut = {
         "obs_future_base_pose": ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
-        "obs_future_base_velocity": ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+        "obs_future_base_vel": ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
+        "obs_future_joint_pos": list(joint_names),
+        "obs_future_joint_vel": list(joint_names),
+        "obs_future_ee_pos": ee,
     }
     return flat, fut
+
+
+def _future_column_labels(comps: list[str], n_cols: int, stride: int, dt: float) -> list[str]:
+    """Column labels for a windowed ``future_*`` term, laid out ``[step0, step1, ...]``.
+
+    Sample ``j`` is ``+j*stride*dt`` seconds ahead -- the window includes the current
+    step at index 0, so the first block is labelled ``+0.00s``.
+
+    Args:
+        comps: Per-component labels for one sample.
+        n_cols: Total flat width of the term.
+        stride: Control steps between samples.
+        dt: Control timestep in seconds.
+
+    Returns:
+        ``n_cols`` labels, or generic ``dim{i}`` if the width is not a multiple of
+        ``len(comps)``.
+    """
+    if not comps or n_cols % len(comps):
+        return [f"dim{i}" for i in range(n_cols)]
+    k = n_cols // len(comps)
+    return [f"{c} +{j * stride * dt:.2f}s" for j in range(k) for c in comps]
 
 
 def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
@@ -1334,8 +1378,7 @@ def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
             clip_key = "obs_clip_" + key[len("obs_"):]
             clip = data[clip_key][:, e, :] if clip_key in data else None
             if key in fut:
-                comps, k = fut[key], fm.shape[1] // 6
-                labels = [f"{comps[c]} +{(j + 1) * stride * dt:.2f}s" for j in range(k) for c in range(6)]
+                labels = _future_column_labels(fut[key], fm.shape[1], stride, dt)
             else:
                 labels = flat[key]
                 if len(labels) != fm.shape[1]:
@@ -1373,9 +1416,10 @@ def plot_trajectory_obs(
     Emits one figure per obs term (zoomable, like the positions/velocities plots),
     plotting the clean (no-corruption) base-relative reference the policy consumes:
     ``base_pose_error``, ``base_vel_ref``, ``joint_pos_ref``, ``joint_vel_ref``,
-    ``ee_ref`` (one subplot per dimension), and ``future_base_pose`` /
-    ``future_base_velocity`` (one subplot per component, one line per strided lookahead
-    step colored by horizon). When the FM-in-loop command also logged the clip
+    ``ee_ref`` (one subplot per dimension), and the ``future_*`` blocks of the merged
+    reference window -- base pose/velocity, joint pos/vel and ee positions -- as one
+    subplot per component with one line per look-ahead sample colored by horizon (sample
+    0 is the current step). When the FM-in-loop command also logged the clip
     reference (``obs_clip_*``), the clip is overlaid (dashed) so the FM vs clip
     difference -- and obs-level artifacts like the lookahead truncation / re-plan jumps
     -- is visible directly. Otherwise only the applied reference is shown.
@@ -1419,16 +1463,29 @@ def plot_trajectory_obs(
             dt=dt, t_offset=t_off, fm_active=fm_active, fm_pred_idx=data.get("fm_pred_idx"),
         )
 
-    # Strided lookahead terms (per-component subplots, per-horizon lines).
+    # Reference-window blocks (per-component subplots, one line per look-ahead sample).
     fpi = data.get("fm_pred_idx")
-    _plot_future_obs(data, "obs_future_base_pose",
-                     ["pos x", "pos y", "pos z", "ori x", "ori y", "ori z"],
-                     "future_base_pose (rel base)", "future_base_pose",
-                     save_dir, env_ids, dt, t_off, stride, fm_active, fpi) if "obs_future_base_pose" in data else None
-    _plot_future_obs(data, "obs_future_base_velocity",
-                     ["lin x", "lin y", "lin z", "ang x", "ang y", "ang z"],
-                     "future_base_velocity (rel base)", "future_base_velocity",
-                     save_dir, env_ids, dt, t_off, stride, fm_active, fpi) if "obs_future_base_velocity" in data else None
+    _, fut_labels = _traj_obs_labels(data, metadata)
+    window_titles = {
+        "obs_future_base_pose": "future_base_pose (rel current base)",
+        "obs_future_base_vel": "future_base_vel (rel current base)",
+        "obs_future_joint_pos": "future_joint_pos",
+        "obs_future_joint_vel": "future_joint_vel",
+        "obs_future_ee_pos": "future_ee_pos (rel reference base)",
+    }
+    num_steps = int(metadata.get("reference_num_steps", 1)) or 1
+    for key, title in window_titles.items():
+        if key not in data:
+            continue
+        width = data[key].shape[2]
+        labels = list(fut_labels.get(key) or [])
+        # Fall back to generic component names when the metadata labels do not match the
+        # logged width (e.g. an older dump, or a joint count that moved).
+        if width % max(1, len(labels)):
+            n_comp = max(1, width // num_steps)
+            labels = [f"dim {i}" for i in range(n_comp)]
+        _plot_future_obs(data, key, labels, title, key[len("obs_"):],
+                         save_dir, env_ids, dt, t_off, stride, fm_active, fpi)
 
     _dump_trajectory_obs(data, metadata, save_dir, env_ids)
 
@@ -1436,8 +1493,9 @@ def plot_trajectory_obs(
 # Reference-obs terms compared between the clip and the FM (bare names; the logger
 # keys them obs_clip_<term> / obs_fm_<term>).
 _OBS_DIFF_TERMS = [
-    "base_pose_error", "base_vel_ref", "joint_pos_ref", "joint_vel_ref",
-    "ee_ref", "future_base_pose", "future_base_velocity",
+    "base_pose_error", "base_vel_ref", "joint_pos_ref", "joint_vel_ref", "ee_ref",
+    "future_base_pose", "future_base_vel", "future_joint_pos", "future_joint_vel",
+    "future_ee_pos",
 ]
 
 
@@ -1446,11 +1504,9 @@ def _obs_column_labels(term: str, n_cols: int, metadata: dict[str, Any]) -> list
     flat, fut = _traj_obs_labels({}, metadata)
     fkey = "obs_" + term
     if fkey in fut:
-        comps = fut[fkey]
         dt = metadata.get("dt") or 1.0
         stride = int(metadata.get("future_stride", 5))
-        k = max(1, n_cols // 6)
-        return [f"{comps[c]} +{(j + 1) * stride * dt:.2f}s" for j in range(k) for c in range(6)]
+        return _future_column_labels(fut[fkey], n_cols, stride, dt)
     labels = flat.get(fkey, [])
     return labels if len(labels) == n_cols else [f"dim{i}" for i in range(n_cols)]
 

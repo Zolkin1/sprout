@@ -588,6 +588,12 @@ class GenTrackerPolicy:
         }
         if base_vel_ref is not None:
             values["base_vel_ref"] = base_vel_ref
+        # Root-frame body-link targets (tracker trained with tracking_mode="body").  These
+        # are pelvis-relative already, so they pass through untransformed.  Only a clip
+        # reference supplies them today -- see the guard in _assemble for the FM case.
+        if "body_pos_root" in cur:
+            values["body_pos_ref"] = f64(cur["body_pos_root"])
+            values["body_vel_ref"] = f64(cur["body_vel_root"])
         # Height-scan obs term (only if the tracker was trained with it). The runner puts
         # the per-ray clearance in state["height_scan"]; _assemble clips it via _TERM_CLIP.
         if "height_scan" in state:
@@ -600,12 +606,44 @@ class GenTrackerPolicy:
         return self._assemble(values)
 
     def _assemble(self, values: dict[str, np.ndarray]) -> np.ndarray:
-        """Order, scale, and clip the terms per the embedded observation_terms.policy."""
+        """Order, scale, and clip the terms per the embedded observation_terms.policy.
+
+        TODO(deploy): this does NOT implement observation history, so a policy trained
+        with ``history_length`` on any term fails the dim check below on the first
+        control step (loudly, which is the intent -- the alternative is a silently
+        misaligned observation vector). The current teacher does exactly that, so this
+        path is broken until ported. What it owes, in order:
+
+        1. per-term ring buffers keyed on ``term["history_length"]`` (already parsed by
+           ``TrackerSession._resolve_obs_terms``), flattened OLDEST-FIRST and warm-started
+           by replicating the first sample into every slot -- Isaac Lab's
+           ``CircularBuffer`` semantics; ``transfer/sim/rl_policy.py:_update_history`` is
+           a correct reference port;
+        2. clip and scale applied PER TIMESTEP before stacking, not once over the stacked
+           slice -- Isaac Lab bakes them into each slot, and ``scale`` may be a vector, so
+           it needs tiling across the history (see ``rl_policy.py``'s ``np.tile``);
+        3. the new merged ``reference_window`` / ``command_window`` terms built in
+           ``_build_obs``, replacing the retired ``joint_pos_ref`` / ``ee_ref`` /
+           ``future_base_*`` terms;
+        4. ``GenTrackerPolicy.reset()`` clearing the new buffers.
+
+        See also the two blocked FM look-ahead accessors in ``fm_tracking_cmd.py``, which
+        must land before the generator can serve the window at all.
+        """
         out = np.zeros(self.get_num_obs(), dtype=np.float32)
         idx = 0
         for term in self._trk.get_obs_terms():
             name, shape, scale = term["name"], term["shape"], term["scale"]
             if name not in values:
+                if name in ("body_pos_ref", "body_vel_ref"):
+                    raise NotImplementedError(
+                        f"Obs term '{name}': this tracker was trained with "
+                        "tracking_mode='body', so its reference must carry root-frame body "
+                        "targets. Clip playback supplies them (ClipReference with "
+                        "root_frame_bodies set); the FM path does NOT yet -- the generator "
+                        "predicts joint angles, and turning those into root-frame link poses "
+                        "needs a torch-free FK, which is not implemented here."
+                    )
                 raise NotImplementedError(
                     f"Generator-tracker obs term '{name}' not implemented (a depth term "
                     "means the caller supplied no state['depth'] rows)."

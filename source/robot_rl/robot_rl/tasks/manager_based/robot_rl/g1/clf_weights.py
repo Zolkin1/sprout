@@ -1,5 +1,16 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
+"""Per-channel CLF weights.
+
+``CLF.__init__`` indexes these dicts by channel name, so a channel the command tracks but the
+dict does not name is a ``KeyError`` at env construction.  The world-frame + joint channels are
+written out explicitly below; the root-frame body channels are filled programmatically by
+:func:`add_root_frame_weights` (13 bodies x 6 channels would otherwise be 156 near-identical
+lines to hand-maintain).
+"""
+
+from motion_gen.joint_names import G1_BODY_TRACK_FRAMES, root_frame_name
+
 ##
 # Lyapunov Weights
 ##
@@ -148,6 +159,90 @@ WALKING_R_weights["left_wrist_yaw_link:pos_z"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_x"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_y"] = [0.05]
 WALKING_R_weights["left_wrist_yaw_link:ori_z"] = [0.05]
+
+
+##
+# Root-frame body-link weights (``tracking_mode="body"``)
+##
+
+# ``[q_pose, q_twist]`` per channel: for a ``pos_`` channel that is (position, linear
+# velocity); for an ``ori_`` channel it is (orientation, angular velocity).
+#
+# Deliberately uniform ACROSS LINKS -- the point of the joint-vs-body A/B is the
+# parameterization, so a hand-tuned per-link profile would confound it.  But pose and twist
+# are NOT treated alike: measured on a rollout with the twist weight at 1.0, the unweighted
+# error energy split was
+#
+#     root_body_ang_vel 150.97 | root_body_lin_vel 10.51 | root_body_ori 5.38 | root_body_pos 0.30
+#
+# i.e. link angular velocity outweighed link POSITION by ~500x, so "body-link tracking"
+# was in practice "match the links' angular velocities".
+#
+# The POSE weight is the lever, NOT the twist weight -- q_twist is very nearly a no-op.
+# Solving the scalar double-integrator CARE by hand gives, for Q = diag(qp, qv) and R = r,
+#
+#     P12 = sqrt(r*qp)     P22 = sqrt(r * (2*sqrt(r*qp) + qv))     P11 = sqrt(qp/r) * P22
+#
+# so the pose:twist ratio the reward actually applies is exactly ``sqrt(qp/r)``, and P22 is
+# floored by the ``2*sqrt(r*qp)`` term: at r = 0.05, qp = 10, dropping qv 0.1 -> 0 moves P22
+# only 0.2752 -> 0.2659.  The optimal cost-to-go has to penalise velocity in order to
+# control position, so you cannot buy pose dominance by shrinking the twist weight.
+#
+# Corroborated by the run itself: with [1.0, 0.1] the link POSITION error grew 70x over
+# training (0.12 -> 8.69) while angular-velocity error FELL (299 -> 172) -- the policy was
+# buying velocity accuracy with position error, exactly as the weighting asked.  Raising qp
+# 1 -> 10 lifts P11 16.6x against P22 5.3x, which is what this change is for.
+#
+# It does NOT equalise the two, and the honest reason is that the raw error ratio is far
+# wider than any weight applied to it.  Two measurements, both real, on the same
+# 1000-iteration checkpoint (clf_balance_check.py) -- they differ because they sample
+# different moments:
+#
+#     raw (identity-P) error       ang_vel    pose      -> share of V under [10.0, 0.1]
+#     episode average                40.92    0.229        68% ang_vel / 21% pose
+#     at the failure instant        172       8.69         47% ang_vel / 34% pose
+#
+# Link position error is what BLOWS UP as an episode dies; link angular velocity is what
+# dominates V the rest of the time (36 channels at ~1.1 rad/s RMS).  Pushing the steady
+# state further toward pose means raising ``sqrt(qp/r)``, not touching qv.
+#
+# NOTE this nearly doubles V, so ``clf_reward.max_eta_err`` moves with it (see
+# g1_teacher_env_cfg).  Re-derive both together with scripts/rsl_rl/clf_balance_check.py.
+_ROOT_Q_DEFAULT = [10.0, 0.1]
+_ROOT_R_DEFAULT = [0.05]
+
+
+def add_root_frame_weights(
+    q_weights: dict,
+    r_weights: dict,
+    bodies: list[str] | None = None,
+    q_overrides: dict | None = None,
+    r_overrides: dict | None = None,
+) -> None:
+    """Fill in Q/R entries for every root-frame body channel, in place.
+
+    Args:
+        q_weights: Q dict to extend (channel name -> ``[q_pos, q_vel]``).
+        r_weights: R dict to extend (channel name -> ``[r]``).
+        bodies: Body names to add channels for; defaults to
+            :data:`~motion_gen.joint_names.G1_BODY_TRACK_FRAMES`.
+        q_overrides: Per-BODY Q override, e.g. ``{"torso_link": [3.0, 1.0]}``.
+        r_overrides: Per-BODY R override.
+    """
+    bodies = list(G1_BODY_TRACK_FRAMES if bodies is None else bodies)
+    q_overrides = q_overrides or {}
+    r_overrides = r_overrides or {}
+    for body in bodies:
+        rf = root_frame_name(body)
+        q = list(q_overrides.get(body, _ROOT_Q_DEFAULT))
+        r = list(r_overrides.get(body, _ROOT_R_DEFAULT))
+        for kind in ("pos", "ori"):
+            for axis in ("x", "y", "z"):
+                q_weights[f"{rf}:{kind}_{axis}"] = list(q)
+                r_weights[f"{rf}:{kind}_{axis}"] = list(r)
+
+
+add_root_frame_weights(WALKING_Q_weights, WALKING_R_weights)
 
 
 # ##

@@ -36,9 +36,19 @@ import torch
 from .fk import FKChain
 from .math_utils import quat_apply, quat_inv, yaw_quat
 
-# The canonical joint order lives in its own module so the motionbricks ingest can read it
-# without importing this (torch + FK) module.
-from .joint_names import G1_JOINT_NAMES  # noqa: F401  (re-exported for callers)
+# The canonical joint order + the root-frame tracking names live in their own module so the
+# motionbricks ingest can read them without importing this (torch + FK) module.
+from .joint_names import (  # noqa: F401  (re-exported for callers)
+    G1_BODY_TRACK_FRAMES,
+    G1_JOINT_NAMES,
+    ROOT_FRAME_MARKER,
+    is_root_frame,
+    output_frame_names,
+    root_frame_name,
+    strip_root_marker,
+    world_frame_names,
+    world_position_channels,
+)
 
 FOOT_FRAMES: list[str] = ["left_ankle_roll_link", "right_ankle_roll_link"]
 HAND_FRAMES: list[str] = ["left_palm_link", "right_palm_link"]

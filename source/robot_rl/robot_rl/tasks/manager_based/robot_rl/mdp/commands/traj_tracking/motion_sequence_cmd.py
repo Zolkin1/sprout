@@ -26,9 +26,10 @@ import os
 
 import torch
 import warp as wp
-from isaaclab.utils.math import quat_from_angle_axis
+from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
+from motion_gen.joint_names import is_root_frame, root_frame_name
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
 from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, verify_clip_fingerprint
@@ -55,10 +56,22 @@ _DEBUG_FRAME_COLOR_MAP: dict[str, tuple[float, float, float]] = {
     "right_wrist_yaw_link": (0.80, 0.30, 0.90),
 }
 _DEBUG_FRAME_FALLBACK_COLOR: tuple[float, float, float] = (0.6, 0.6, 0.6)
+
+# Tracked-body spheres: what the robot IS vs what it is REWARDED AGAINST.  Two spheres per
+# tracked body per env, so the reward's own error is visible as the gap between them.  The
+# reference here is the clip AFTER the per-step re-datum onto the robot, which is the whole
+# point -- against the global clip the pair would separate as the robot drifts even while
+# tracking perfectly.
+_DEBUG_ACTUAL_COLOR: tuple[float, float, float] = (0.15, 0.95, 0.35)      # green  = measured
+_DEBUG_REWARDED_COLOR: tuple[float, float, float] = (1.00, 0.15, 0.85)    # magenta = reference
+# The obs look-ahead ribbon: the base of the reference window the POLICY sees, which rides
+# the robot (anchored) and so separates from the global clip ribbon exactly by the drift.
+_DEBUG_OBS_WINDOW_COLOR: tuple[float, float, float] = (1.00, 0.95, 0.20)  # yellow
 # Frame-name substrings treated as "hand" end-effectors (filtered out of the
 # debug ribbon unless cfg.debug_vis_show_hands is True).
 _DEBUG_HAND_FRAME_KEYS: tuple[str, ...] = ("wrist", "hand")
 _DEBUG_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_ref"
+_DEBUG_BODY_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_bodies"
 _DEBUG_VIZ_EPS: float = 1e-6  # guard against zero-length segments / degenerate axes
 
 
@@ -70,6 +83,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     # Lazily built once the simulator is up (CommandTerm may call
     # ``_set_debug_vis_impl`` before ``_post_init``).  See the debug-vis block.
     _debug_markers: object | None = None
+    _debug_body_markers: object | None = None
     _debug_vis_pending: bool = False
 
     # ------------------------------------------------------------------
@@ -236,8 +250,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._record_clip_fingerprint(self.cfg)
 
         # --- Debug-viz setup (per reference frame: pos indices + color) ---
+        # WORLD frames only -- the ribbon draws world-space polylines, and a root-frame
+        # channel would be drawn as if it were a world position (a blob at the origin).
         self._debug_frame_names = [
-            n[: -len(":pos_x")] for n in self.ordered_pos_output_names if n.endswith(":pos_x")
+            n[: -len(":pos_x")] for n in self.ordered_pos_output_names
+            if n.endswith(":pos_x") and not is_root_frame(n)
         ]
         # Optionally drop hand/wrist end-effector frames from the ribbon.
         if not self.cfg.debug_vis_show_hands:
@@ -270,6 +287,41 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._zeros3 = torch.zeros(n, 3, device=dev)
         self._ident_quat = torch.zeros(n, 4, device=dev)
         self._ident_quat[:, 3] = 1.0  # xyzw identity
+        # World +z, for rebuilding the global (pure-yaw) placement quaternion in
+        # :meth:`termination_reference_world_state`.
+        self._world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(1, 3)
+        # Once-per-step guard for the re-anchor snapshot; -1 so the first step always runs.
+        self._last_reanchor_step = -1
+        # True only while _resample_command is running -- see _reanchor_ego_envs.
+        self._resampling = False
+
+    def _resample_command(self, env_ids) -> None:
+        """Reset-time refresh, flagged so the re-anchor sits it out.
+
+        The base class implements resampling by running a whole ``_update_command()``, and
+        Isaac Lab calls this from ``_reset_idx`` -- BEFORE it zeroes ``episode_length_buf``.
+        So during this call ``_advance_step`` computes ``_step`` from the DYING episode's
+        length against the NEW ``start_step``, and everything derived from ``_step`` is
+        nonsense for exactly this one call.  Most of it is harmless: the following
+        ``command_manager.compute()`` re-runs the same chain with the counter zeroed and
+        overwrites it.
+
+        The re-anchor SNAPSHOT is the exception, because it is guarded to once per
+        ``common_step_counter``: taken here, it both captures the clip base at a step far
+        past ``start_step`` AND stamps the guard, so the good seed
+        :meth:`seed_reanchor_snapshot` just wrote is destroyed and the corrected retake never
+        happens.  The placement is then off by the clip's travel over that bogus span --
+        planar only, since the mask pins z -- which is what tripped ``ee_pose_error`` on ~38%
+        of resets while never firing once mid-episode.
+
+        Args:
+            env_ids: Env indices being reset (unused; the base refreshes every env).
+        """
+        self._resampling = True
+        try:
+            super()._resample_command(env_ids)
+        finally:
+            self._resampling = False
 
     def _record_clip_fingerprint(self, cfg: MotionSequenceCommandCfg) -> None:
         """Persist (and verify) the loaded clip library's fingerprint.
@@ -341,34 +393,52 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.manager.phase = self._step.float() / max(T - 1, 1)
 
     def _reanchor_ego_envs(self) -> None:
-        """Emit FM snap events on the cadence and re-place the clip for ego envs.
+        """Emit FM snap events and re-place the clip for ego envs, on SEPARATE cadences.
 
-        The re-anchor cadence timer (``cfg.ego_anchor_every``) fires for EVERY env; two
-        things are then keyed off it, and they are DECOUPLED:
+        Two things happen here and they run on **independent timers**, because the right
+        rate for each is different by an order of magnitude:
 
-        * **FM snap flag** (``_reanchor_active``): set for the ``_snap_mask`` envs on the
-          tick. The recorder logs it and the FM dataset builds one training window per
-          snap. ``_snap_mask == _ego_mask`` on flat AND terrain alike: a window is emitted
-          exactly when the clip is re-anchored, on whatever axes its per-step mask frees
-          (the dataset ego-anchors the recorded clip future to the robot base at each snap,
-          so the FM learns to place the non-free axes from the history + height scan).
-        * **Clip re-placement** (``_reanchor_clip_ids``): applied to ``_ego_mask`` envs on
-          the tick -- recompute the placement so the FREE root DOFs of the clip's
-          CURRENT-STEP anchor mask coincide with the robot's measured root, while FIXED
-          DOFs stay pinned to the reset-time terrain-cell anchor. Because the re-placement
-          is per-DOF MASKED, terrain envs can be ego too: a stair clip re-places only its
-          free y onto the robot, keeping x/z/yaw locked to the treads (it no longer
-          detaches), and a box clip's mask varies per step (y-free-pinned approach/jump,
-          then ego recovery). So all envs may be partial-ego; the mask governs which axes
-          float. Snapping matches the FM deploy anchor (:meth:`FmTrackingCommand._run_fm`).
+        * **Clip re-placement** (``_reanchor_clip_ids``, every ``cfg.ego_anchor_every``
+          steps for ``_ego_mask`` envs) -- recompute the placement so the FREE root DOFs of
+          the clip's CURRENT-STEP anchor mask coincide with the robot's measured root,
+          while FIXED DOFs stay pinned to the reset-time terrain-cell anchor. Because the
+          re-placement is per-DOF MASKED, terrain envs can be ego too: a stair clip
+          re-places only its free lateral onto the robot, keeping downrange/height/yaw
+          locked to the treads, and a box clip's mask varies per step. The teacher runs
+          this at **every step** so tracking error is measured locally and planar drift is
+          not double-counted (see ``termination_reference_world_state`` for the other half
+          of that split).
+        * **FM snap flag** (``_reanchor_active``, every ``cfg.fm_snap_every`` steps for
+          ``_snap_mask`` envs) -- the recorder logs it and the FM dataset builds one
+          training window per snap.
 
-        Naturally idempotent across Isaac Lab's twice-per-step compute (same tick, masks,
-        robot pose + clip step -> same flag + placement), so no once-per-step guard.
+        These USED to share ``ego_anchor_every``, which was fine while re-placement was
+        occasional. It is not fine at every step: the recorder would emit one window per
+        env per step (12x the dataset, consecutive windows overlapping in all but one
+        history row), and worse, the FM target would degenerate -- node 0 always coincides
+        with the robot, so the window would encode no placement decision at all, which is
+        the very thing the FM is being trained to predict.
+
+        Idempotency across Isaac Lab's twice-per-step compute used to be incidental (same
+        tick + same robot pose -> same result). At period 1 it is load-bearing on every
+        step rather than 1 step in 12, so it is now enforced explicitly: the snapshot is
+        taken at most once per ``common_step_counter``, matching the guard
+        :meth:`FmTrackingCommand._snapshot_and_infer` already uses.
         """
-        period = max(int(self.cfg.ego_anchor_every), 1)
-        tick = self.env.episode_length_buf % period == 0
-        self._reanchor_active = self._snap_mask & tick
-        ego_due = self._ego_mask & tick
+        # Sit out the reset-time call and DO NOT stamp the guard, so the real re-anchor still
+        # happens later this step with a correct ``_step``. Stamping here would keep the
+        # clip base sampled from the dying episode's step count -- see _resample_command.
+        if self._resampling:
+            return
+        step_counter = int(self.env.common_step_counter)
+        if step_counter == self._last_reanchor_step:
+            return
+        self._last_reanchor_step = step_counter
+
+        ego_period = max(int(self.cfg.ego_anchor_every), 1)
+        snap_period = max(int(getattr(self.cfg, "fm_snap_every", ego_period)), 1)
+        self._reanchor_active = self._snap_mask & (self.env.episode_length_buf % snap_period == 0)
+        ego_due = self._ego_mask & (self.env.episode_length_buf % ego_period == 0)
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
     def _reanchor_clip_ids(self, ids: torch.Tensor) -> None:
@@ -520,6 +590,140 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self.dy_des[:, self._wf_lin_flat] = frames[:, :, 7:10].reshape(n, -1)
         self.dy_des[:, self._wf_ang_flat] = frames[:, :, 10:13].reshape(n, -1)
         self._wf_world_frames = frames
+        # MUST precede the base rewrite below: the @root bodies are lifted through the
+        # ANCHORED base, which is what makes their error local.
+        self._lift_root_frames_to_world(frames[:, 0, :])
+        self._write_global_base_des()
+
+    def _write_global_base_des(self) -> None:
+        """Re-point the BASE channels of ``y_des`` / ``dy_des`` at the GLOBAL clip.
+
+        Splits the CLF's job in two, which is the whole point of tracking body links:
+
+        * the BASE says WHERE the robot should be -- graded against the globally-placed
+          clip, which never moves;
+        * the body links and end effectors say WHAT SHAPE it should be in -- graded against
+          the re-datumed clip, so limb tracking is not punished for planar drift.
+
+        Without this the base term does nothing at all.  Every-step anchoring re-datums the
+        clip onto the robot in the mask's FREE root DOFs, so the base error in those DOFs is
+        ~0 by construction -- measured at 0.3-1.9% of V.  Yet
+        :func:`base_pose_error_termination` ends the episode on exactly that drift, so the
+        policy was being killed for a quantity no reward mentioned.  Now the reward and the
+        termination read the same reference.
+
+        On stair / box tiles the mask already pins downrange / height / yaw to the terrain
+        cell, so there the global and anchored bases coincide and this is a no-op; on flat
+        it is the only thing grading global position and heading.
+
+        Deliberately does NOT touch ``_wf_world_frames``: that cache is the ANCHORED
+        placement, and the recorder / FM window / debug viz read it back through
+        :meth:`reference_world_state`.  ``y_des`` being mutated past the cache is the
+        pre-existing contract here (see :meth:`_write_world_des`), not a new one.
+
+        FRAME.  The twist goes global with the position, because both come from the one
+        :func:`lift_base_world_state` call -- so it is world axes rotated by the GLOBAL
+        placement quaternion, not the anchored one.  That is required, not incidental: the
+        CLF pairs each position channel with its velocity channel as a double integrator,
+        and the ``2 * P12 * e * edot`` cross term only means anything if ``edot = d/dt e`` in
+        the SAME frame.  Consequence on flat, where the mask frees yaw: a heading error now
+        rotates the desired velocity vector (measured 0.046 rad mean, 0.67 rad max), so
+        heading error feeds the velocity term instead of being absorbed by the frame -- which
+        is the same reason the position term is global.  Exactly zero on stair / box tiles,
+        where yaw is pinned and the two placements are the same rotation.
+
+        Everything here stays in WORLD AXES on purpose.  Expressing the tracked links'
+        twists base-RELATIVE instead would drop the ``omega x r`` transport term, which
+        leaks base angular-velocity error into every link's linear-velocity error scaled by
+        its lever arm -- genuinely unwanted.  But it would also stop grading WHERE the limbs
+        are in space, and with the tracked set deduped to pelvis + the 13 ``@root`` frames
+        that would leave foot placement against the stair treads graded only through the
+        base pose and the anchor mask.  Terrain needs that signal, so the transport coupling
+        is accepted deliberately.  (Note rotating the error into the base frame does NOT
+        remove it -- rotation changes axes, and the transport term rotates with them.)
+        """
+        bi = self._base_idx
+        state = self.termination_reference_world_state()      # independent of y_des
+        self.y_des[:, bi["pos"]] = state[:, 0:3]
+        self.y_des[:, bi["ori"]] = state[:, 3:7]
+        self.dy_des[:, bi["lin_vel"]] = state[:, 7:10]
+        self.dy_des[:, bi["ang_vel"]] = state[:, 10:13]
+
+    def _root_frame_maps(self) -> tuple[torch.Tensor, ...] | None:
+        """Flat ``y_des`` / ``dy_des`` index maps for the ``@root`` body block (cached).
+
+        Returns ``(pos, ori, lin, ang)`` index tensors, or ``None`` when the clip library
+        carries no root-frame bodies.
+        """
+        maps = getattr(self, "_rf_maps", "unset")
+        if maps != "unset":
+            return maps
+        frames = list(self.root_body_frames or ())
+        if not frames:
+            self._rf_maps = None
+            return None
+        pos_names, vel_names = self.ordered_pos_output_names, self.ordered_vel_output_names
+        dev = self.device
+
+        def _idx(names, frames_, axes, kind):
+            return torch.tensor([names.index(f"{f}:{kind}_{a}") for f in frames_ for a in axes],
+                                dtype=torch.long, device=dev)
+
+        self._rf_maps = (
+            _idx(pos_names, frames, "xyz", "pos"),
+            _idx(pos_names, frames, ("x", "y", "z", "w"), "ori"),
+            _idx(vel_names, frames, "xyz", "pos"),
+            _idx(vel_names, frames, "xyz", "ori"),
+        )
+        return self._rf_maps
+
+    def _lift_root_frames_to_world(self, base13: torch.Tensor) -> None:
+        """Lift the stored pelvis-relative ``@root`` desired channels into the world frame.
+
+        The clip stores each tracked link's pose+twist relative to the CLIP's pelvis (raw
+        FK, Jacobian-exact velocities), which is what makes those channels immune to slope
+        rotation, world baking and re-anchoring.  The CLF compares in world, so they are
+        lifted here through the clip's own -- already anchored -- base pose:
+
+            p_w = p0 + R p_r
+            q_w = q0 * q_r
+            v_w = v0 + w0 x (R p_r) + R v_r
+            w_w = w0 + R w_r
+
+        Because ``base13`` is the anchored placement's base, this yields "the clip's FK in
+        world with its root placed on the robot in the mask's free DOFs" -- the
+        subtract-the-planar-root-error-and-rotate-by-yaw comparison, with no explicit
+        subtraction step.
+
+        Args:
+            base13: ``[N, 13]`` world base row ``[pos(3), quat(4, xyzw), lin(3), ang(3)]``.
+        """
+        maps = self._root_frame_maps()
+        if maps is None:
+            return
+        pos_i, ori_i, lin_i, ang_i = maps
+        n = self.num_envs
+        b = len(self.root_body_frames)
+
+        p0, q0, v0, w0 = base13[:, 0:3], base13[:, 3:7], base13[:, 7:10], base13[:, 10:13]
+        qf = q0[:, None, :].expand(n, b, 4).reshape(n * b, 4)
+
+        p_r = self.y_des[:, pos_i].view(n, b, 3)
+        q_r = self.y_des[:, ori_i].view(n, b, 4)
+        v_r = self.dy_des[:, lin_i].view(n, b, 3)
+        w_r = self.dy_des[:, ang_i].view(n, b, 3)
+
+        off = quat_apply(qf, p_r.reshape(n * b, 3)).view(n, b, 3)      # R p_r
+        self.y_des[:, pos_i] = (p0[:, None, :] + off).reshape(n, -1)
+        self.y_des[:, ori_i] = quat_mul(qf, q_r.reshape(n * b, 4)).view(n, -1)
+        self.dy_des[:, lin_i] = (
+            v0[:, None, :]
+            + torch.linalg.cross(w0[:, None, :].expand_as(off), off)
+            + quat_apply(qf, v_r.reshape(n * b, 3)).view(n, b, 3)
+        ).reshape(n, -1)
+        self.dy_des[:, ang_i] = (
+            w0[:, None, :] + quat_apply(qf, w_r.reshape(n * b, 3)).view(n, b, 3)
+        ).reshape(n, -1)
 
     def get_desired_outputs(self, phase: torch.Tensor = None, env_ids: torch.Tensor = None) -> None:
         """Gather the (clip-world) reference outputs for the current step."""
@@ -689,7 +893,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def reference_world_state(self) -> torch.Tensor:
         """World-frame reference state ``[N, 3+4+3+3+2*nj]`` at the current step.
 
-        ``[base_pos_w, base_quat_w(wxyz), base_lin_w, base_ang_w, joint_pos,
+        ``[base_pos_w, base_quat_w(xyzw), base_lin_w, base_ang_w, joint_pos,
         joint_vel]`` -- served from the per-step world cache populated by
         :meth:`_write_world_des` (base row) plus the frame-invariant joint
         channels.  Used by the reset event, observations, and terminations.
@@ -701,11 +905,33 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     def termination_reference_world_state(self) -> torch.Tensor:
         """World-frame reference state used by the pose-drift termination.
 
-        Defaults to the tracked reference (:meth:`reference_world_state`).
-        :class:`FmTrackingCommand` overrides this so closed-loop FM envs
-        are graded against the clip reference rather than the FM prediction.
+        The **globally-placed** clip -- the reset-time terrain-cell anchor -- NOT the
+        per-step re-anchored reference that drives the reward.  The two must differ, and
+        the split is the whole point of anchoring:
+
+        * the REWARD grades local error, with the clip's free root DOFs re-datumed onto the
+          robot every step, so tracking the motion's shape is not punished for planar drift;
+        * TERMINATION grades that drift, against a clip that never moves.
+
+        Without this the termination silently dies under every-step anchoring: the free
+        DOFs coincide with the robot by construction, so the position error collapses to
+        ``|dz|`` -- and to identically zero on a pre-mask library, whose legacy mask frees
+        height too.  A robot could then stand still while the clip marched away and never
+        terminate.
+
+        ``_reset_world_pos`` / ``_reset_world_yaw`` are written once per episode by
+        ``_commit_clip_reset`` and are never touched by re-anchoring, so the global
+        placement is exactly recoverable at any step.
+
+        Returns:
+            ``[N, 3+4+3+3+2*nj]`` world reference state, same layout as
+            :meth:`reference_world_state`.
         """
-        return self.reference_world_state()
+        yaw = self._reset_world_yaw
+        world_quat = quat_from_angle_axis(yaw, self._world_z.expand(yaw.shape[0], 3))
+        return self.reference_world_state_at(
+            self.clip_id, self._step, self._reset_world_pos, world_quat
+        )
 
     def _frame_output_indices(self, frame_name: str) -> dict[str, torch.Tensor]:
         """Resolve (and cache) the y_des/dy_des indices for one output frame.
@@ -821,17 +1047,26 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         output frame that exposes a position, except the base frame, sorted
         alphabetically (matching the obs default).
 
+        Root-frame (``@root``) frames are excluded: this is the WORLD end-effector
+        set.  Keeping it stable as the clip layout widened is load-bearing -- it
+        sizes the ``ee_ref`` observation, drives ``_build_world_frame_maps`` (so a
+        root-frame body would otherwise be pointlessly lifted through the placement
+        every step), and is what :class:`FmTrackingCommand` checks an FM checkpoint's
+        ``frame_names`` against, so growing it would invalidate every existing
+        checkpoint.
+
         Args:
             frame_names: Explicit frame list, or ``None`` for the default.
 
         Returns:
-            Ordered end-effector frame names.
+            Ordered world end-effector frame names.
         """
         if frame_names is not None:
             return list(frame_names)
         base = self.cfg.base_frame_name
         return sorted(
-            {n.split(":", 1)[0] for n in self.ordered_pos_output_names if ":pos_" in n} - {base}
+            {n.split(":", 1)[0] for n in self.ordered_pos_output_names
+             if ":pos_" in n and not is_root_frame(n)} - {base}
         )
 
     def get_symmetric_ee(
@@ -870,24 +1105,39 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     # ------------------------------------------------------------------
 
     def _set_debug_vis_impl(self, debug_vis: bool) -> None:
-        """Toggle the reference-trajectory marker visualizer.
+        """Toggle the reference-trajectory marker visualizers.
 
-        Draws, per env, a forward window of each reference frame's world
-        position as colored cylinder segments -- a "ribbon" of where the clip
-        says each body should go (matching the online command's marker style).
-        Per-step update is in :meth:`_debug_vis_callback`.
+        Four things are drawn, and the point is the RELATIVE motion between them -- each
+        pair isolates one frame the system uses:
+
+        * **Clip ribbon** (per-frame colours) -- the clip at its GLOBAL placement, welded to
+          the terrain cell. Where the motion was authored.
+        * **Obs-window ribbon** (yellow) -- the base of the reference window the POLICY
+          sees, which is anchored and therefore rides the robot. Its separation from the
+          clip ribbon IS the accumulated drift: forgiven by the reward, fired on by the
+          termination.
+        * **Body spheres** -- measured (green) vs the reference the reward grades against
+          (magenta). The gap in each pair is the reward's per-body error.
+
+        So: green-vs-magenta = what the reward sees; yellow-vs-clip = what the termination
+        sees. Per-step update is in :meth:`_debug_vis_callback`.
         """
         if debug_vis:
             if self._debug_markers is None and hasattr(self, "_debug_frame_pos_idx"):
                 self._debug_markers = self._create_debug_markers()
+            if self._debug_body_markers is None and self.cfg.debug_vis_body_spheres:
+                self._debug_body_markers = self._create_debug_body_markers()
             if self._debug_markers is not None:
                 self._debug_markers.set_visibility(True)
             else:
                 self._debug_vis_pending = True
+            if self._debug_body_markers is not None:
+                self._debug_body_markers.set_visibility(True)
         else:
             self._debug_vis_pending = False
-            if self._debug_markers is not None:
-                self._debug_markers.set_visibility(False)
+            for m in (self._debug_markers, self._debug_body_markers):
+                if m is not None:
+                    m.set_visibility(False)
 
     def _create_debug_markers(self):
         """Build a :class:`VisualizationMarkers` with one cylinder prototype per frame.
@@ -913,12 +1163,139 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             )
             for name, color in zip(self._debug_frame_names, self._debug_frame_colors)
         }
+        # Extra prototype, always last, for the policy's observed reference-window base.
+        prototypes["obs_window_base"] = sim_utils.CylinderCfg(
+            radius=radius * 1.5,
+            height=1.0,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=_DEBUG_OBS_WINDOW_COLOR),
+        )
         cfg = VisualizationMarkersCfg(prim_path=_DEBUG_VIZ_PRIM_PATH, markers=prototypes)
         try:
             return VisualizationMarkers(cfg)
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not create VisualizationMarkers: {exc}")
             return None
+
+    def _create_debug_body_markers(self):
+        """Build the tracked-body sphere markers: prototype 0 = measured, 1 = reference."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN MotionSequenceCommand] could not import VisualizationMarkers: {exc}")
+            return None
+        r = float(self.cfg.debug_vis_body_sphere_radius)
+        prototypes = {
+            name: sim_utils.SphereCfg(
+                radius=r,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+            )
+            for name, color in (("actual", _DEBUG_ACTUAL_COLOR), ("rewarded", _DEBUG_REWARDED_COLOR))
+        }
+        cfg = VisualizationMarkersCfg(prim_path=_DEBUG_BODY_VIZ_PRIM_PATH, markers=prototypes)
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not create body markers: {exc}")
+            return None
+
+    def tracked_frame_pose(self, frame_names: list[str]):
+        """Measured and reference pose of named frames, in the frame the REWARD uses.
+
+        Reads ``y_act`` / ``y_des`` directly, so the pair is exactly what the CLF
+        differences: world positions with the clip already re-datumed onto the robot in the
+        anchor mask's free DOFs.  A consumer therefore measures LOCAL tracking error --
+        planar drift has already been removed, and is the base termination's job instead.
+
+        Prefers a frame's ``@root`` channels when the library carries them (that is the copy
+        body mode grades, and its velocities are Jacobian-exact), falling back to the world
+        channels otherwise, so this works in both tracking modes.
+
+        Args:
+            frame_names: Bare body names, e.g. ``["left_ankle_roll_link"]``.
+
+        Returns:
+            ``(act_pos, act_quat, des_pos, des_quat)``, shapes ``[N, F, 3]`` / ``[N, F, 4]``
+            (quaternions xyzw).
+
+        Raises:
+            KeyError: If a requested frame has no channels at all.
+        """
+        cache = getattr(self, "_tf_pose_idx", None)
+        if cache is None:
+            cache = self._tf_pose_idx = {}
+        key = tuple(frame_names)
+        if key not in cache:
+            names = self.ordered_pos_output_names
+            pos_i, ori_i = [], []
+            for f in frame_names:
+                stem = root_frame_name(f) if f"{root_frame_name(f)}:pos_x" in names else f
+                if f"{stem}:pos_x" not in names:
+                    raise KeyError(
+                        f"Frame '{f}' has no tracked channels (looked for '{f}' and "
+                        f"'{root_frame_name(f)}'). Available frames: "
+                        f"{sorted({n.split(':', 1)[0] for n in names if ':pos_' in n})}"
+                    )
+                pos_i += [names.index(f"{stem}:pos_{a}") for a in "xyz"]
+                ori_i += [names.index(f"{stem}:ori_{a}") for a in ("x", "y", "z", "w")]
+            cache[key] = (
+                torch.tensor(pos_i, dtype=torch.long, device=self.device),
+                torch.tensor(ori_i, dtype=torch.long, device=self.device),
+            )
+        pos_i, ori_i = cache[key]
+        f = len(frame_names)
+        return (
+            self.y_act[:, pos_i].view(-1, f, 3), self.y_act[:, ori_i].view(-1, f, 4),
+            self.y_des[:, pos_i].view(-1, f, 3), self.y_des[:, ori_i].view(-1, f, 4),
+        )
+
+    def _tracked_body_pos_idx(self) -> torch.Tensor | None:
+        """``[B, 3]`` ``y_des``/``y_act`` column indices of every TRACKED frame's position.
+
+        Derived from ``tracked_vel_names`` rather than a restated body list, so the spheres
+        follow ``tracking_mode`` automatically: joint mode shows the world skeleton, body
+        mode the 13 links.  Cached.
+        """
+        cached = getattr(self, "_tb_idx", "unset")
+        if cached != "unset":
+            return cached
+        frames: list[str] = []
+        for n in self.tracked_vel_names:
+            if ":pos_" not in n:
+                continue
+            f = n.split(":", 1)[0]
+            if f not in frames:
+                frames.append(f)
+        pos_names = self.ordered_pos_output_names
+        self._tb_idx = (
+            torch.tensor([[pos_names.index(f"{f}:pos_{a}") for a in "xyz"] for f in frames],
+                         dtype=torch.long, device=self.device)
+            if frames else None
+        )
+        return self._tb_idx
+
+    def _obs_window_offsets(self) -> torch.Tensor | None:
+        """Step offsets of the ``reference_window`` observation, read from the obs manager.
+
+        Read from the live term rather than restated in this cfg, so the drawn ribbon cannot
+        drift from the window the policy is actually fed.  ``None`` if no such term exists.
+        """
+        cached = getattr(self, "_obs_win_offsets", "unset")
+        if cached != "unset":
+            return cached
+        self._obs_win_offsets = None
+        try:
+            om = self.env.observation_manager
+            for group, terms in om.active_terms.items():
+                if "reference_window" in terms:
+                    p = om._group_obs_term_cfgs[group][list(terms).index("reference_window")].params
+                    ns = max(1, int(p.get("num_steps", 11)))
+                    st = max(1, int(p.get("stride", 5)))
+                    self._obs_win_offsets = torch.arange(ns, device=self.device, dtype=torch.long) * st
+                    break
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not read reference_window params: {exc}")
+        return self._obs_win_offsets
 
     def _clip_ribbon_env_mask(self) -> torch.Tensor | None:
         """Per-env bool mask of which envs draw the clip ribbon (``None`` => all).
@@ -978,7 +1355,17 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         # with the approach, which is what made the reference look detached from the stairs / box).
         frame_idx = torch.stack(self._debug_frame_pos_idx, dim=0)                        # [F, 3]
         rel = self.manager.gather(self.manager.lib.y_des, cid, steps)[:, :, frame_idx]    # [n, Ns, F, 3] clip-world
-        wpos, wquat = self._window_placement(cid, steps, env_ids=env_ids)                 # [n, Ns, .]
+        # GLOBAL placement (the reset-time terrain-cell anchor), NOT the anchored one. Under
+        # per-step anchoring the anchored ribbon sits on the robot by construction and shows
+        # nothing; the global ribbon is where the motion was authored, so the gap to the
+        # yellow obs-window ribbon below reads as the accumulated drift.
+        sl = slice(None) if env_ids is None else env_ids
+        gpos = self._reset_world_pos[sl][:, None, :].expand(n, ns, 3)
+        gyaw = self._reset_world_yaw[sl]
+        gquat = quat_from_angle_axis(
+            gyaw, self._world_z.expand(gyaw.shape[0], 3)
+        )[:, None, :].expand(n, ns, 4)
+        wpos, wquat = gpos, gquat
         # One placement per (frame), shared by that frame's F reference bodies.
         wpos_f = wpos.unsqueeze(2).expand(n, ns, F, 3).reshape(n, ns * F, 3)
         wquat_f = wquat.unsqueeze(2).expand(n, ns, F, 4).reshape(n, ns * F, 4)
@@ -1012,10 +1399,90 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             torch.arange(F, device=self.device, dtype=torch.long)
             .view(1, 1, F).expand(n, ns - 1, F).reshape(-1)
         )
+        centers, quats = centers.reshape(-1, 3), quats
+        scales, marker_indices = scales.reshape(-1, 3), marker_indices
+
+        # The policy's observed reference-window base, as a second ribbon. Anchored, so it
+        # rides the robot; its offset from the global clip ribbon is the drift.
+        obs_off = self._obs_window_offsets() if self.cfg.debug_vis_obs_window else None
+        if obs_off is not None and obs_off.numel() >= 2:
+            opos, _, _, _ = self.get_future_world_base(obs_off)                     # [N, K, 3]
+            if env_ids is not None:
+                opos = opos[env_ids]
+            oc, oq, os_, oi = self._ribbon_segments(opos, F)                        # prototype F
+            centers = torch.cat([centers, oc], dim=0)
+            quats = torch.cat([quats, oq], dim=0)
+            scales = torch.cat([scales, os_], dim=0)
+            marker_indices = torch.cat([marker_indices, oi], dim=0)
 
         self._debug_markers.visualize(
-            translations=centers.reshape(-1, 3),
+            translations=centers,
             orientations=quats,
-            scales=scales.reshape(-1, 3),
+            scales=scales,
             marker_indices=marker_indices,
         )
+        self._draw_body_spheres(env_ids)
+
+    def _ribbon_segments(self, pts: torch.Tensor, proto: int):
+        """Cylinder segments joining consecutive points of a ``[n, K, 3]`` polyline.
+
+        Args:
+            pts: ``[n, K, 3]`` world points, one polyline per env.
+            proto: Marker prototype index to tag every segment with.
+
+        Returns:
+            ``(centers, quats, scales, indices)`` flattened over ``n * (K - 1)``.
+        """
+        starts, ends = pts[:, :-1], pts[:, 1:]
+        centers = 0.5 * (starts + ends)
+        vecs = ends - starts
+        lens = torch.linalg.norm(vecs, dim=-1).clamp(min=_DEBUG_VIZ_EPS)
+        dirs = vecs / lens.unsqueeze(-1)
+        angle = torch.acos(dirs[..., 2].clamp(-1.0, 1.0))
+        axis = torch.stack([-dirs[..., 1], dirs[..., 0], torch.zeros_like(dirs[..., 0])], dim=-1)
+        norm = torch.linalg.norm(axis, dim=-1, keepdim=True)
+        axis = torch.where(norm > _DEBUG_VIZ_EPS,
+                           axis, torch.tensor([1.0, 0.0, 0.0], device=self.device).expand_as(axis))
+        quats = quat_from_angle_axis(angle.reshape(-1), axis.reshape(-1, 3))
+        scales = torch.ones_like(dirs)
+        scales[..., 2] = lens
+        idx = torch.full((centers.shape[0] * centers.shape[1],), proto,
+                         dtype=torch.long, device=self.device)
+        return centers.reshape(-1, 3), quats, scales.reshape(-1, 3), idx
+
+    def _draw_body_spheres(self, env_ids: torch.Tensor | None) -> None:
+        """Spheres at each tracked body: measured (green) vs the rewarded reference (magenta).
+
+        Both are read straight out of ``y_act`` / ``y_des``, i.e. the exact tensors the CLF
+        differences -- so the visualisation cannot disagree with the reward, and it follows
+        ``tracking_mode`` without restating a body list.
+
+        EXPECTED: the green spheres visibly TRAIL their links during fast motion, and the
+        faster the link the further they trail.  That is a render-cadence artifact, not a
+        frame error -- ``y_act`` is a straight ``body_pos_w`` read and matches a live one to
+        0.000000 m on the tick it is written.  The markers are written once per CONTROL step
+        while the viewport draws faster, and a link covers up to ~0.17 m per control step
+        (ankles, measured; ~0.11 m at the wrists) against a 0.03 m sphere radius -- roughly
+        six sphere diameters, so the offset is obvious.
+        What stays exact is the green-to-magenta SEPARATION, since both come from the same
+        tick; it is only the overlay onto the rendered mesh that lags.  So read the gap, not
+        a dot's absolute position on a moving link.  ``play.py --real-time`` largely hides
+        it.  Redrawing green from a live read at render rate would glue the dots to the links
+        but put the two colours on different ticks, corrupting the one quantity this is for.
+        """
+        if self._debug_body_markers is None or not self.cfg.debug_vis_body_spheres:
+            return
+        idx = self._tracked_body_pos_idx()
+        if idx is None:
+            return
+        flat = idx.reshape(-1)
+        sl = slice(None) if env_ids is None else env_ids
+        act = self.y_act[sl][:, flat].reshape(-1, idx.shape[0], 3)      # [n, B, 3]
+        des = self.y_des[sl][:, flat].reshape(-1, idx.shape[0], 3)
+        n, b = act.shape[0], act.shape[1]
+        pts = torch.cat([act.reshape(-1, 3), des.reshape(-1, 3)], dim=0)
+        proto = torch.cat([
+            torch.zeros(n * b, dtype=torch.long, device=self.device),
+            torch.ones(n * b, dtype=torch.long, device=self.device),
+        ])
+        self._debug_body_markers.visualize(translations=pts, marker_indices=proto)

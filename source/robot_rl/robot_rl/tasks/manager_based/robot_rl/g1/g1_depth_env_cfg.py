@@ -50,8 +50,8 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
 from .g1_self_scan import link_prim_path, self_scan_prim_paths
 from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import (
-    G1TeacherTerrainEnvCfg,
-    G1TeacherTerrainEnvCfgPlay,
+    G1TeacherTerrainBodyEnvCfg,
+    G1TeacherTerrainBodyEnvCfgPlay,
     G1TeacherTerrainSceneCfg,
 )
 
@@ -314,10 +314,17 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
     ``scene.height_scanner`` to None -- and drop the inherited
     ``scene.height_scanner.debug_vis = True`` in the play variant, which would otherwise
     raise on None.
+
+    Only the ``policy`` group is overridden here.  The proprioceptive history on the
+    inherited terms, the ``reference`` encoder group and the privileged ``critic`` all
+    come straight from :class:`G1TeacherObservationsCfg`.
     """
 
     @configclass
     class PolicyCfg(G1TeacherObservationsCfg.PolicyCfg):
+        # Depth is exteroception, so it is NOT history-stacked -- same call as the
+        # height scan it replaces (the inherited proprioception terms keep their
+        # PROPRIO_HISTORY_LENGTH stacking).
         # Noise is applied inside mdp.depth_image (driven by the resample_depth_noise
         # event), NOT via the term's `noise` field -- see mdp/sensors/noise.py.
         depth_near = ObsTerm(
@@ -408,8 +415,16 @@ class G1TeacherTerrainDepthEventsCfg(G1TeacherEventsCfg):
 # ---------------------------------------------------------------------------
 
 @configclass
-class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainEnvCfg):
-    """Terrain teacher + two self-scanning depth cameras, flattened into the policy."""
+class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
+    """Terrain teacher + two self-scanning depth cameras, flattened into the policy.
+
+    Extends the BODY-tracking terrain teacher, so depth defaults to body-link tracking and
+    the depth-vs-height-scan comparison runs against ``G1-teacher-clf-terrain-body`` with
+    the exteroception as the only variable.  Joint mode stays reachable per-run with
+    ``env.commands.traj_ref.tracking_mode=joint``; both modes read the SAME widened clip
+    library (joint mode simply ignores the ``@root`` channels), which is what keeps that
+    A/B controlled too.
+    """
 
     scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
         num_envs=4096, env_spacing=2.5
@@ -502,8 +517,8 @@ def _apply_depth_play_trims(cfg) -> None:
 
 
 @configclass
-class G1TeacherTerrainDepthEnvCfgPlay(G1TeacherTerrainEnvCfgPlay):
-    """Play variant of :class:`G1TeacherTerrainDepthEnvCfg`."""
+class G1TeacherTerrainDepthEnvCfgPlay(G1TeacherTerrainBodyEnvCfgPlay):
+    """Play variant of :class:`G1TeacherTerrainDepthEnvCfg` (body tracking, as above)."""
 
     scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
         num_envs=4096, env_spacing=2.5

@@ -20,6 +20,14 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     hf_repo: str = None
     Q_weights: list[float] = None
     R_weights: list[float] = None
+
+    eta_scales: dict[str, float] | None = None
+    """Per-class unit conversion applied to the CLF's channels (see :class:`CLF`).
+
+    V adds up metres, radians, m/s and rad/s as if they were one quantity; these are the
+    factors that make them commensurable, keyed by ``CLF.ETA_SCALE_CLASSES``.  Each class's
+    share of V moves as the SQUARE of its factor.  ``None`` is the historical all-1.0.
+    """
     resampling_time_range: tuple[float, float] = (5.0, 15.0)
 
     library_fingerprint: str | None = None
@@ -37,6 +45,14 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     """Per-skill trajectory counts of the loaded library (``{skill: count}``),
     recorded alongside :attr:`library_fingerprint` for human-readable provenance
     in ``params/env.yaml``."""
+
+    log_per_channel_metrics: bool = False
+    """If True, log a per-output-channel absolute tracking error every step.
+
+    Off by default: it is one tensor per channel per step (292 with root-frame body tracking
+    on), which is heavy logging traffic for something only useful when chasing one specific
+    channel.  The per-subgroup CLF energies (``v_pelvis_pos``, ``v_joint_pos``,
+    ``v_root_body_pos``, ...) are always logged and cover the usual need."""
 
     strict_fingerprint: bool = False
     """If True, a trajectory/clip library fingerprint mismatch at construction *raises*

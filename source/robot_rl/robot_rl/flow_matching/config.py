@@ -37,10 +37,16 @@ class FlowMatchingConfig:
     # Future window length F: the full denoised state sequence (node 0 = the current /
     # anchor step, ego-anchored onto the robot so its base offset ≈ 0; nodes 1..F-1 are
     # the future). The relative-frame anchor is the robot base at the most recent history
-    # step. F=40 = 0.8 s at dt=0.02 -- covers the deploy-time policy lookahead
-    # (future_base_pose/velocity reach 0.5 s = 25 steps) plus the re-plan block. Also a
-    # multiple of cmd_stride (=5) -> 8 evenly-spaced command tokens. Raising F grows
-    # per-window memory; bump --stride / --num_workers if training OOMs.
+    # step. F=40 = 0.8 s at dt=0.02, a multiple of cmd_stride (=5) -> 8 evenly-spaced
+    # command tokens. Raising F grows per-window memory; bump --stride / --num_workers if
+    # training OOMs.
+    #
+    # TOO SHORT for the current teacher. The policy's reference window now reaches
+    # REFERENCE_NUM_STEPS=11 samples at stride 5 = step +50 = 1.0 s
+    # (g1_teacher_env_cfg.py), so a generator serving it needs F >= 51 plus the re-plan
+    # block. Bumping F requires RE-RECORDING (record_data.py cuts windows at this length)
+    # and retraining. Until then the FM tracker task cannot serve the teacher's
+    # observation at all -- see the two blocked accessors in fm_tracking_cmd.py.
     future_len: int = 40
     # N real-robot-state history (phase) conditioning tokens. Default 2: enough to read
     # gait phase (the FM predicts nominal phase-dependent motion, not recovery).

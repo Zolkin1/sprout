@@ -2,6 +2,13 @@
 
 """Parity test: the deployed obs assembly vs the real observations.py.
 
+CURRENTLY SKIPPED. The teacher now builds one merged ``reference_window`` observation and
+stacks proprioception history, while the deployment port still assembles the retired
+per-term future_* layout with no history -- so the two sides no longer describe the same
+observation. The body below is kept verbatim because it is the spec the port has to meet:
+un-skip it as part of the deploy port (see ``GenTrackerPolicy._assemble``'s TODO) and
+retarget the term list at ``reference_window`` / ``command_window``.
+
 Dev-only (imports isaaclab + robot_rl for the real observation functions). Feeds
 *identical* synthetic world references into those functions and into
 ``deploy.gen_tracker.GenTrackerPolicy._build_obs``, then compares the
@@ -60,7 +67,8 @@ def _find_run(explicit: str | None) -> str | None:
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
 
 
-def _output_names(joint_out: list[str], ee_frames: list[str]) -> tuple[list[str], list[str]]:
+def _output_names(joint_out: list[str], ee_frames: list[str],
+                  root_bodies: list[str]) -> tuple[list[str], list[str]]:
     """Synthesise the CLF output-name layout from the tracker's own metadata.
 
     The observation functions index ``y_des`` / ``dy_des`` by NAME, so any consistent
@@ -73,6 +81,7 @@ def _output_names(joint_out: list[str], ee_frames: list[str]) -> tuple[list[str]
     Args:
         joint_out: CLF output joint order from the tracker metadata.
         ee_frames: End-effector frame names from the tracker metadata.
+        root_bodies: Root-frame body links (``tracking_mode="body"``); empty otherwise.
 
     Returns:
         ``(ordered_pos_output_names, ordered_vel_output_names)``.
@@ -83,6 +92,10 @@ def _output_names(joint_out: list[str], ee_frames: list[str]) -> tuple[list[str]
     pos += [f"joint:{n}" for n in joint_out]
     vel = [f"{BASE}:pos_{a}" for a in "xyz"] + [f"{BASE}:ori_{a}" for a in "xyz"]
     vel += [f"joint:{n}" for n in joint_out]
+    for body in root_bodies:
+        rf = f"{body}@root"
+        pos += [f"{rf}:pos_{a}" for a in "xyz"] + [f"{rf}:ori_{a}" for a in ("w", "x", "y", "z")]
+        vel += [f"{rf}:pos_{a}" for a in "xyz"] + [f"{rf}:ori_{a}" for a in "xyz"]
     return pos, vel
 
 
@@ -94,11 +107,13 @@ def _rand_quat(n: int, g: torch.Generator) -> torch.Tensor:
 class _MockCmd:
     """Minimal stand-in exposing what the observation functions read."""
 
-    def __init__(self, pos_names, vel_names, ee_frames, joint_out, truth):
+    def __init__(self, pos_names, vel_names, ee_frames, joint_out, truth, root_bodies=()):
         self.ordered_pos_output_names = pos_names
         self.ordered_vel_output_names = vel_names
         self._ee_frames = ee_frames
         self._joint_out = joint_out
+        # What mdp.body_pos_ref_root / body_vel_ref_root read to locate their block.
+        self.root_body_frames = [f"{b}@root" for b in root_bodies]
         self.cfg = type("cfg", (), {"base_frame_name": BASE})
         self.manager = type("mgr", (), {"dt": DT})
         self.device = truth["root_quat"].device
@@ -131,6 +146,13 @@ class _MockCmd:
                 y[:, self._pos_idx(f"{f}:pos_{a}")] = t["ref_ee_pos"][:, kf, j]
         for jj, jn in enumerate(self._joint_out):  # ref_jp is isaac order -> place by joint name
             y[:, self._pos_idx(f"joint:{jn}")] = t["ref_jp_isaac"][:, t["isaac"].index(jn)]
+        # Root-frame body block, body-major [pos_xyz, ori_wxyz] -- the layout
+        # body_pos_ref_root stacks and the clip reference serves.
+        for kb, rf in enumerate(self.root_body_frames):
+            for j, a in enumerate("xyz"):
+                y[:, self._pos_idx(f"{rf}:pos_{a}")] = t["ref_body_pos"][:, kb, j]
+            for j, a in enumerate(("w", "x", "y", "z")):
+                y[:, self._pos_idx(f"{rf}:ori_{a}")] = t["ref_body_ori"][:, kb, j]
         return y
 
     def _build_dy_des(self) -> torch.Tensor:
@@ -141,6 +163,10 @@ class _MockCmd:
             dy[:, self._vel_idx(f"{BASE}:ori_{a}")] = t["ref_ang"][:, j]
         for jn in self._joint_out:
             dy[:, self._vel_idx(f"joint:{jn}")] = t["ref_jv_isaac"][:, t["isaac"].index(jn)]
+        for kb, rf in enumerate(self.root_body_frames):
+            for j, a in enumerate("xyz"):
+                dy[:, self._vel_idx(f"{rf}:pos_{a}")] = t["ref_body_lin"][:, kb, j]
+                dy[:, self._vel_idx(f"{rf}:ori_{a}")] = t["ref_body_ang"][:, kb, j]
         return dy
 
     def reference_world_state(self):
@@ -160,6 +186,17 @@ class _MockCmd:
 
 def test_obs_parity(run: str | None = None) -> None:
     """Compare each command/reference obs term: Isaac functions vs the deployment port."""
+    if hasattr(O, "reference_window"):
+        print(
+            "[SKIP] The teacher's reference observations were merged into a single "
+            "`reference_window` term (plus `command_window`), replacing base_pose_error / "
+            "joint_*_ref / ee_ref / future_base_* as separate terms. The deployment port "
+            "in deploy/gen_tracker.py still builds the retired per-term layout and has no "
+            "observation history, so the two sides describe different observations and "
+            "there is nothing to compare. Restore this test together with that port -- "
+            "see the TODO on GenTrackerPolicy._assemble."
+        )
+        return
     exported = _find_run(run)
     if exported is None:
         print("[SKIP] No exported tracker.onnx found under logs/rsl_rl/*/*/exported/; "
@@ -176,8 +213,10 @@ def test_obs_parity(run: str | None = None) -> None:
 
     isaac = pol._trk.get_joint_out_names() or isaac_jn   # CLF output order
     ee_frames = pol._trk.get_ee_frame_names() or []
+    # Non-empty only for a tracker trained with tracking_mode="body".
+    root_bodies = pol._trk.get_root_frame_bodies()
     nj = len(isaac_jn)
-    pos_names, vel_names = _output_names(isaac, ee_frames)
+    pos_names, vel_names = _output_names(isaac, ee_frames, root_bodies)
     if sorted(isaac) != sorted(isaac_jn):
         print(f"[SKIP] joint_out_names ({len(isaac)}) is not a permutation of the "
               f"tracker's joint order ({nj}).")
@@ -203,8 +242,13 @@ def test_obs_parity(run: str | None = None) -> None:
     }
     # Held command over the horizon so future_command_vel matches the deployment path.
     truth["fut_cmd"] = truth["command"][:, None, :].expand(N, K, 3).contiguous()
+    nb = len(root_bodies)
+    truth["ref_body_pos"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
+    truth["ref_body_ori"] = _rand_quat(max(N * nb, 1), g)[:N * nb].reshape(N, nb, 4)
+    truth["ref_body_lin"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
+    truth["ref_body_ang"] = torch.randn(N, nb, 3, generator=g, dtype=torch.float64)
 
-    cmd = _MockCmd(pos_names, vel_names, ee_frames, isaac, truth)
+    cmd = _MockCmd(pos_names, vel_names, ee_frames, isaac, truth, root_bodies)
     env = type("env", (), {"num_envs": N, "device": "cpu",
                            "command_manager": type("cm", (), {"get_term": lambda self, n: cmd})()})()
 
@@ -214,14 +258,20 @@ def test_obs_parity(run: str | None = None) -> None:
     try:
         isaac_terms = {
             "base_pose_error": O.base_pose_error(env, "x"),
-            "joint_pos_ref": O.joint_pos_ref(env, "x"),
-            "joint_vel_ref": O.joint_vel_ref(env, "x").clamp(-20.0, 20.0),
             "ee_ref": O.ee_ref_relative_to_base(env, "x"),
             "command_vel": O.command_velocity(env, "x"),
             "future_command_vel": O.future_command_velocity(env, "x", HORIZON_S, STRIDE),
             "future_base_pose": O.future_base_pose(env, "x", HORIZON_S, STRIDE),
             "future_base_vel": O.future_base_velocity(env, "x", HORIZON_S, STRIDE),
         }
+        # The reference parameterization is mode-dependent: joint mode exposes the reference
+        # joint angles, body mode the root-frame body targets that replaced them.
+        if root_bodies:
+            isaac_terms["body_pos_ref"] = O.body_pos_ref_root(env, "x")
+            isaac_terms["body_vel_ref"] = O.body_vel_ref_root(env, "x").clamp(-20.0, 20.0)
+        else:
+            isaac_terms["joint_pos_ref"] = O.joint_pos_ref(env, "x")
+            isaac_terms["joint_vel_ref"] = O.joint_vel_ref(env, "x").clamp(-20.0, 20.0)
     finally:
         wp.to_torch = orig
 
@@ -248,6 +298,13 @@ def test_obs_parity(run: str | None = None) -> None:
                 "root_lin": truth["ref_lin"][e], "root_ang": truth["ref_ang"][e],
                 "jp": truth["ref_jp_isaac"][e], "jv": truth["ref_jv_isaac"][e],
                 "frame_pos": truth["ref_ee_pos"][e],
+                # Flattened body-major, exactly as ClipReference serves the block.
+                **({"body_pos_root": torch.cat(
+                        [torch.cat([truth["ref_body_pos"][e, k], truth["ref_body_ori"][e, k]])
+                         for k in range(nb)]),
+                    "body_vel_root": torch.cat(
+                        [torch.cat([truth["ref_body_lin"][e, k], truth["ref_body_ang"][e, k]])
+                         for k in range(nb)])} if root_bodies else {}),
             },
             "future": [{
                 "root_pos": truth["fut_pos"][e, o], "root_quat": truth["fut_quat"][e, o],

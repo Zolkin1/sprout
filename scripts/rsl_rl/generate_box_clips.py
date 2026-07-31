@@ -47,6 +47,7 @@ from motion_gen.terrain.box_clip import (
 from motion_gen.math_utils import quat_apply, quat_mul
 from motion_gen.clip_output import ClipOutputBuilder
 from motion_gen.gen_parallel import default_workers, unit_pool
+from motion_gen.joint_names import world_position_channels
 from motion_gen.motion_matching.locomotion_db import (
     APPROACH_FILTERS,
     build_locomotion_matcher,
@@ -727,7 +728,9 @@ def _size_stair_tile_to_motion(tile_recs, builder, m, is_pure):
     union of every clip and written identically to each.  The clips + overlays are re-shifted in y so the
     union sits at ``m`` (tile-local y in ``[m, m+span]``), keeping the walkable box aligned to [0, size_y].
     """
-    py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
+    # WORLD pos_y channels only -- root-frame channels are pelvis-relative, so they would
+    # both poison the bbox below and be CORRUPTED by the rigid shift further down.
+    py = world_position_channels(builder.pos_names, "y")
     ylo = min(float(np.asarray(r["y"])[:, py].min()) for r in tile_recs)
     yhi = max(float(np.asarray(r["y"])[:, py].max()) for r in tile_recs)
     # Also cover the fixed boxes so a widened surface never leaves an authored tread/platform uncovered.
@@ -1266,9 +1269,10 @@ def main() -> int:
                                      nav_width_range=(args.tile_width_min, args.tile_width_max),
                                      footprint_scale_range=tuple(args.box_footprint_scale))
         # Tile footprint = the UNION of all the tile's clips' body positions + the box, padded by
-        # ``box_tile_buffer`` m on each side (sized inside the worker).  pos_x / pos_y channels of y_des:
-        _px = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_x")]
-        _py = [i for i, nm in enumerate(builder.pos_names) if nm.endswith(":pos_y")]
+        # ``box_tile_buffer`` m on each side (sized inside the worker).  WORLD pos_x / pos_y channels
+        # of y_des -- root-frame channels are pelvis-relative and must not be shifted:
+        _px = world_position_channels(builder.pos_names, "x")
+        _py = world_position_channels(builder.pos_names, "y")
         buf = float(args.box_tile_buffer)
         # Fan the box tiles across the fork pool: one worker builds ALL clips for one box tile + sizes it;
         # per-tile velocity/duration RNG seeded by (tile_seed, terrain_id) inside the worker.
