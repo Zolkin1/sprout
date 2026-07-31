@@ -46,7 +46,7 @@ SCENE = os.path.join(_SIM, "robots", "g1", "g1_21j_basic_scene.xml")
 # The two trained cameras (g1_depth_env_cfg._NEAR / _FAR), as the exported contract.
 NEAR = {
     "obs_term": "depth_near", "sensor": "depth_camera_near", "mount_body": "torso_link",
-    "offset_pos": [0.10, 0.0, 0.05], "width": WIDTH, "height": HEIGHT,
+    "offset_pos": [0.1107625, 0.0, 0.0994260], "width": WIDTH, "height": HEIGHT,
     "max_distance": 8.0, "min_dist": 0.10, "max_dist": 7.9,
     "offset": 0.75, "scale": 0.5, "min_clip_val": 0.0, "max_clip_val": 0.0,
     "clip": [-2.0, 2.0], "update_period": 0.02,
@@ -75,7 +75,7 @@ def _intrinsics(fov_h_deg: float, fov_v_deg: float) -> dict:
 def _spec() -> list[dict]:
     """The full two-camera contract with the trained optics."""
     return [
-        {**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(75.0)},
+        {**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(65.0)},
         {**FAR, **_intrinsics(70.0, 42.0), "offset_quat_xyzw": _pitch_quat_xyzw(35.0)},
     ]
 
@@ -270,7 +270,7 @@ def test_mount_body_must_exist():
     if not os.path.exists(SCENE):
         pytest.skip("MuJoCo scene not found (run from transfer/sim)")
     model = mujoco.MjModel.from_xml_path(SCENE)
-    spec = [{**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(75.0),
+    spec = [{**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(65.0),
              "mount_body": "not_a_body"}]
     with pytest.raises(ValueError, match="not_a_body"):
         MujocoDepthCameras(model, spec)

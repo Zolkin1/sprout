@@ -41,7 +41,7 @@ def _cam(**overrides) -> dict:
     """A complete camera contract entry, with overrides applied."""
     cam = {
         "obs_term": "depth_near", "sensor": "depth_camera_near", "mount_body": "torso_link",
-        "offset_pos": [0.10, 0.0, 0.05], "offset_quat_xyzw": [0.0, 0.60876, 0.0, 0.79335],
+        "offset_pos": [0.1107625, 0.0, 0.0994260], "offset_quat_xyzw": [0.0, 0.53730, 0.0, 0.84339],
         "width": 30, "height": 26, "fx": 12.586494, "fy": 18.565924, "cx": 15.0, "cy": 13.0,
         "max_distance": 8.0, "update_period": 0.02, "clip": [-2.0, 2.0],
         "min_clip_val": 0.0, "max_clip_val": 0.0, **NEAR,
