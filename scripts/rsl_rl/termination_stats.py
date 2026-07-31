@@ -53,20 +53,10 @@ parser.add_argument("--no_events", action="store_true", default=None,
 parser.add_argument("--num_rows", type=int, default=None,
                     help="Terrain replica rows. The -play cfg uses 1, training uses the "
                          "task default -- this changes the TERRAIN MIX, not just the count.")
-parser.add_argument("--as_trained", action="store_true",
-                    help="Force the base termination back to a single mask-blind radius, "
-                         "i.e. what a run launched before the mask-dependent bound actually "
-                         "trained under. Use this so 'fired' is the real behaviour and the "
-                         "counterfactual column is the proposed change.")
 parser.add_argument("--ee_ori_rad", type=float, default=None,
                     help="Override the ee orientation bound to this value for EVERY frame, "
                          "re-enabling any the cfg disables. Use it to ask whether a policy "
                          "could hold a bound it was not trained against.")
-parser.add_argument("--base_pos_limit_free", type=float, default=0.75,
-                    help="Counterfactual base radius for downrange-FREE (flat) envs. The "
-                         "report shows what the base termination WOULD do at this bound "
-                         "alongside what it actually did, so the change can be judged "
-                         "before spending GPU on it.")
 parser.add_argument("--out", default="termination_stats.txt",
                     help="Report file. IsaacSim's startup often swallows stdout.")
 AppLauncher.add_app_launcher_args(parser)
@@ -89,7 +79,9 @@ import robot_rl  # noqa: F401,E402  (registers the gym envs)
 # applied at import time; the public shim does NOT apply it. train.py does the same.
 import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401,E402
 import warp as wp  # noqa: E402
-from isaaclab.utils.math import quat_box_minus  # noqa: E402
+from isaaclab.utils.math import (  # noqa: E402
+    euler_xyz_from_quat, quat_apply, quat_box_minus, wrap_to_pi,
+)
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 
@@ -109,8 +101,6 @@ def build_env():
         cfg.events.randomize_ground_contact_friction = None
     if args.num_rows is not None:
         cfg.scene.terrain.num_rows = args.num_rows
-    if args.as_trained:
-        cfg.terminations.base_pose_error.params["max_pos_dist_downrange_free"] = None
     if args.ee_ori_rad is not None:
         cfg.terminations.ee_pose_error.params["max_ori_rad"] = args.ee_ori_rad
     return gym.make(args.task, cfg=cfg).unwrapped, cfg
@@ -203,17 +193,21 @@ def main() -> None:
     # -- on flat the reference window's base error is ~0 by construction.
     from motion_gen.world_lift import anchor_mask_from_free
     DOWNRANGE = anchor_mask_from_free({"downrange"})
+    LATERAL = anchor_mask_from_free({"lateral"})
+    HEIGHT = anchor_mask_from_free({"height"})
+    ROLL_PITCH = anchor_mask_from_free({"roll", "pitch"})
+    YAW = anchor_mask_from_free({"yaw"})
     base_cfg = env.termination_manager.get_term_cfg("base_pose_error").params
     b_pos, b_ori = base_cfg["max_pos_dist"], base_cfg["max_ori_rad"]
-    b_free = base_cfg.get("max_pos_dist_downrange_free")
-    base = {k: {"steps": 0, "fired": 0, "pos": 0.0, "by_pos": 0, "by_ori": 0, "cf": 0}
-            for k in ("flat", "terrain")}
-    # WHERE in the episode do flat base terminations land, and does drift ACCUMULATE?
-    # If it grows with episode age the walk is open-loop and a looser bound only delays the
-    # hit; if it plateaus, the bound is just clipping a stationary distribution's tail.
+    base = {k: {"steps": 0, "fired": 0, "pos": 0.0} for k in ("flat", "terrain")}
+    # WHICH PINNED AXIS trips. The base term measures only the mask's pinned DOFs, so this
+    # says whether a failure is sinking (height), falling over (tilt), losing the treads
+    # (downrange) or turning off-heading (yaw) -- each of which is a different problem.
+    AXES = ("downrange", "lateral", "height", "tilt", "yaw")
+    axis_hits = {k: dict.fromkeys(AXES, 0) for k in ("flat", "terrain")}
     clip_len_t = cmd.manager.clip_len
-    frac_bins = [0] * 5                      # fifths of the clip, at the firing instant
-    age_bins = {b: [0, 0.0] for b in (25, 50, 100, 200, 400, 10**9)}   # age -> [n, sum drift]
+    frac_bins = [0] * 5
+    age_bins = {b: [0, 0.0] for b in (25, 50, 100, 200, 400, 10**9)}
     post = {"n": 0, "err": 0.0, "over": 0}
     stdy = {"n": 0, "err": 0.0, "over": 0}
     just_reset = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -222,11 +216,30 @@ def main() -> None:
         with torch.inference_mode():
             bstate = cmd.termination_reference_world_state()
             broot = wp.to_torch(env.scene["robot"].data.root_pos_w)
-            bpos = torch.norm(bstate[:, 0:3] - broot, dim=-1)
-            bori = torch.norm(quat_box_minus(
-                wp.to_torch(env.scene["robot"].data.root_quat_w), bstate[:, 3:7]), dim=-1)
-            mask_free = (cmd.manager.gather_anchor_mask_at_step(
-                cmd.clip_id, cmd._step).to(bpos.device) & DOWNRANGE) > 0
+            bq = wp.to_torch(env.scene["robot"].data.root_quat_w)
+            bmask = cmd.manager.gather_anchor_mask_at_step(cmd.clip_id, cmd._step).to(broot.device)
+            mask_free = (bmask & DOWNRANGE) > 0
+            # Mirror the termination's own decomposition so the attribution is the real one.
+            dd = bstate[:, 0:3] - broot
+            yf = cmd._mask_frame_yaw.to(dd.device)
+            cy, sy = torch.cos(yf), torch.sin(yf)
+            e_dr = cy * dd[:, 0] + sy * dd[:, 1]
+            e_lat = -sy * dd[:, 0] + cy * dd[:, 1]
+            pin = lambda bit: (bmask & bit) == 0                             # noqa: E731
+            b_dr = (e_dr.abs() > b_pos) & pin(DOWNRANGE)
+            b_lat = (e_lat.abs() > b_pos) & pin(LATERAL)
+            b_h = (dd[:, 2].abs() > b_pos) & pin(HEIGHT)
+            _, _, ry = euler_xyz_from_quat(bstate[:, 3:7], wrap_to_2pi=False)
+            _, _, ay = euler_xyz_from_quat(bq, wrap_to_2pi=False)
+            b_yaw = (wrap_to_pi(ry - ay).abs() > b_ori) & pin(YAW)
+            upv = torch.tensor([0.0, 0.0, 1.0], device=dd.device).expand(dd.shape[0], 3)
+            tilt = torch.acos(((quat_apply(bstate[:, 3:7], upv) * quat_apply(bq, upv))
+                               .sum(dim=-1)).clamp(-1.0, 1.0))
+            b_tilt = (tilt > b_ori) & pin(ROLL_PITCH)
+            # Norm over pinned translational axes only -- what the term actually bounds.
+            keepv = torch.stack([pin(DOWNRANGE), pin(LATERAL), pin(HEIGHT)], dim=-1)
+            bpos = torch.norm(torch.stack([e_dr, e_lat, dd[:, 2]], dim=-1)
+                              * keepv.to(dd.dtype), dim=-1)
             act_p, act_q, des_p, des_q = cmd.tracked_frame_pose(frames)
             n_e, n_f = act_p.shape[0], act_p.shape[1]
             pe = torch.norm(act_p - des_p, dim=-1)                                   # [N, F]
@@ -246,8 +259,8 @@ def main() -> None:
         n = int((terminated | truncated).sum())
         if not n:
             continue
-        # Base drift, attributed by mask. Read pre-step so it is the state the termination
-        # evaluated, same convention as the ee split above.
+        # Base drift, attributed by mask AND by which pinned axis tripped. Read pre-step so
+        # it is the state the termination evaluated, same convention as the ee split above.
         bfired = env.termination_manager.get_term("base_pose_error")
         for key, m in (("flat", mask_free), ("terrain", ~mask_free)):
             if not m.any():
@@ -270,14 +283,12 @@ def main() -> None:
                     cl = clip_len_t[cmd.clip_id[f].to(clip_len_t.device)].to(bpos.device)
                     step_now = (cmd.start_step[f] + env.episode_length_buf[f]).to(bpos.device)
                     fr = (step_now.float() / cl.float().clamp(min=1)).clamp(0, 0.999)
-                    for i in range(5):
-                        frac_bins[i] += int(((fr >= i * 0.2) & (fr < (i + 1) * 0.2)).sum())
+                    for i2 in range(5):
+                        frac_bins[i2] += int(((fr >= i2 * 0.2) & (fr < (i2 + 1) * 0.2)).sum())
                 d["fired"] += int(f.sum())
                 d["pos"] += float(bpos[f].sum())
-                d["by_pos"] += int((bpos[f] > b_pos).sum())
-                d["by_ori"] += int((bori[f] > b_ori).sum())
-                lim = (args.base_pos_limit_free if key == "flat" else b_pos)
-                d["cf"] += int(((bpos[f] > lim) | (bori[f] > b_ori)).sum())
+                for ax, over in zip(AXES, (b_dr, b_lat, b_h, b_tilt, b_yaw)):
+                    axis_hits[key][ax] += int((over & f).sum())
         fired = env.termination_manager.get_term("ee_pose_error")
         if fired.any():
             for j, f in enumerate(frames):
@@ -343,18 +354,18 @@ def main() -> None:
             f"  worst frame error             {fire['maxfrm']/k:8.3f} m",
             f"  frames over limit             {fire['nframes']/k:8.2f} of {len(frames)}",
         ]
-    lines += ["", f"base_pose_error by anchor mask  (bounds: {b_pos} m pinned / "
-              f"{b_free if b_free is not None else b_pos} m free, {b_ori} rad)"]
+    lines += ["", f"base_pose_error by anchor mask  (PINNED axes only; {b_pos} m, {b_ori} rad)"]
     tot_fired = sum(d["fired"] for d in base.values()) or 1
-    lines += [f"  {'mask':10} {'env-steps':>10} {'fired':>8} {'% of base':>10} "
-              f"{'mean pos':>10} {'by pos':>8} {'by ori':>8} {'@' + str(args.base_pos_limit_free) + '/' + str(b_pos):>10}"]
+    lines += [f"  {'mask':10} {'env-steps':>10} {'fired':>8} {'% of base':>10} {'mean pos':>10}"]
     for k, d in base.items():
-        if not d["steps"]:
-            continue
-        lines.append(
-            f"  {k:10} {d['steps']:10d} {d['fired']:8d} {100.0*d['fired']/tot_fired:9.1f}% "
-            f"{d['pos']/max(d['fired'],1):9.3f}m {d['by_pos']:8d} {d['by_ori']:8d} {d['cf']:10d}")
-    lines += ["  last column = terminations that would REMAIN at the counterfactual bounds"]
+        if d["steps"]:
+            lines.append(f"  {k:10} {d['steps']:10d} {d['fired']:8d} "
+                         f"{100.0*d['fired']/tot_fired:9.1f}% {d['pos']/max(d['fired'],1):9.3f}m")
+    lines += ["", "which PINNED axis tripped (a step can trip more than one; '-' = free here):",
+              f"  {'mask':10}" + "".join(f"{a:>11}" for a in AXES)]
+    for k in ("flat", "terrain"):
+        if base[k]["steps"]:
+            lines.append(f"  {k:10}" + "".join(f"{axis_hits[k][a]:11d}" for a in AXES))
     tf = sum(frac_bins) or 1
     lines += ["", "WHERE in the clip flat base terminations fire (fifths of clip length):",
               "  " + "  ".join(f"{i*20}-{(i+1)*20}%: {100.0*frac_bins[i]/tf:4.1f}%" for i in range(5))]

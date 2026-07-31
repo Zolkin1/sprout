@@ -357,28 +357,17 @@ class G1TeacherTerminationCfg:
     clip_end = DoneTerm(
         func=mdp.clip_end_reached, params={"command_name": "traj_ref"}, time_out=True
     )
-    # The positional radii are being swept; the 0.8 rad bounds are unchanged.
+    # The 0.8 rad bounds are unchanged.
     #
-    # The base radius is MASK-DEPENDENT. Where downrange is pinned (stairs, boxes) the drift
-    # is both graded by the CLF and visible in the reference window, so it is correctable and
-    # position relative to the treads is the task -- hold 0.3. Where downrange is free (flat)
-    # the clip is re-datumed onto the robot every step, so global drift is invisible to the
-    # policy and absolute world position is arbitrary anyway.
-    #
-    # 0.5 rather than something tighter, because unobserved drift DIFFUSES to whatever bound
-    # exists. Measured end to end: terminations cluster right at the bound (mean 0.307 m at
-    # a 0.3 m bound, 0.407 m at a 0.4 m bound), and drift grows with episode age -- at the
-    # 0.4 bound the >400-step mean went 0.164 -> 0.235 m purely because episodes lived
-    # longer. So a static counterfactual on a fixed rollout UNDER-predicts what a looser
-    # bound costs (it predicted base terminations 0.260 -> 0.014; the real answer was 0.194),
-    # and picking the tightest value that clears today's distribution just re-fills.
-    # 0.5 buys headroom against that instead. Still well under the baseline's 0.75, which was
-    # propped up by an observability this regime does not have.
-    # See base_pose_error_termination.
+    # The base term measures only the anchor mask's PINNED axes -- on flat that is height +
+    # tilt (exactly SONIC's condition), on stairs/boxes it adds downrange and yaw. A FREE
+    # axis is one the clip was slid along to sit on the robot, so error there is zero by
+    # construction and invisible to the policy; bounding it only truncated episodes, and was
+    # 90% of all base terminations at 2.6k iterations. Because the free axes are no longer
+    # measured, ONE tight 0.3 works everywhere -- no separate inflated bound for flat.
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.3,
-                "max_pos_dist_downrange_free": 0.5, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.3, "max_ori_rad": 0.8},
     )
     ee_pose_error = DoneTerm(
         func=mdp.tracked_frame_error_termination,
@@ -455,6 +444,14 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         #
         # ``clf_decreasing_condition`` needs NO matching change: eta_scales is folded into P,
         # not into eta, so eta_max / eta_dot_max keep their physical units.
+        #
+        # TODO(clf-scale): 1.15 was derived against body_v2's model_5800 -- a policy trained
+        # under BOTH the old local-base reward and the reset-step placement bug, i.e. two
+        # reward generations stale. It is deliberately NOT re-derived here: depth_v1/v2/v3
+        # all trained on this value, and changing it would make them incomparable to whatever
+        # comes next. Re-derive off a current checkpoint with
+        # ``scripts/rsl_rl/clf_balance_check.py --load_run <run>`` at the point where a fresh
+        # baseline is being established anyway, and move it then -- not before.
         #
         # Two traps when re-tuning this from the dashboard:
         #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by

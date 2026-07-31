@@ -7,7 +7,12 @@ import warp as wp
 from typing import TYPE_CHECKING, Sequence
 
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import euler_xyz_from_quat, quat_box_minus, wrap_to_pi
+from isaaclab.utils.math import (
+    euler_xyz_from_quat,
+    quat_apply,
+    quat_box_minus,
+    wrap_to_pi,
+)
 
 from motion_gen.world_lift import anchor_mask_from_free
 
@@ -15,63 +20,62 @@ if TYPE_CHECKING:
     from isaaclab.assets import Articulation
 
 
-#: Anchor-mask bit for the terrain-frame traversal axis. Computed, not hand-typed, so it
-#: stays in lock-step with the bit order in ``motion_gen.world_lift``.
-_MASK_DOWNRANGE_FREE: int = anchor_mask_from_free({"downrange"})
+#: Anchor-mask bits, computed rather than hand-typed so they stay in lock-step with the bit
+#: order in ``motion_gen.world_lift``.  Bit SET = that DOF is FREE.
+_MASK_DOWNRANGE = anchor_mask_from_free({"downrange"})
+_MASK_LATERAL = anchor_mask_from_free({"lateral"})
+_MASK_HEIGHT = anchor_mask_from_free({"height"})
+_MASK_ROLL_PITCH = anchor_mask_from_free({"roll", "pitch"})
+_MASK_YAW = anchor_mask_from_free({"yaw"})
 
 
 def base_pose_error_termination(
     env,
     command_name: str = "traj_ref",
     max_pos_dist: float = 0.25,
-    max_pos_dist_downrange_free: float | None = None,
     max_ori_rad: float = 0.8,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Terminate when the base pose drifts too far from the tracking reference.
+    """Terminate when the base drifts too far from the reference, on the PINNED axes only.
 
-    The single failure termination for open-loop motion-sequence tracking
-    (replaces the pelvis-upright / base-height / frame-drift terminations).
-    Compares the robot's world base pose against the reference base pose served
-    by :meth:`MotionSequenceCommand.termination_reference_world_state` -- the
-    **globally-placed** clip, deliberately NOT the per-step re-anchored reference
-    the reward grades against.  The reward forgives planar drift (the clip's free
-    root DOFs are re-datumed onto the robot every step); this does not, so a robot
-    that stalls while the clip marches on still terminates:
+    Compares the robot's world base pose against
+    :meth:`MotionSequenceCommand.termination_reference_world_state` -- the **globally-placed**
+    clip, deliberately NOT the per-step re-anchored reference the reward grades against.
 
-      * position: terminate if ``||ref_pos - root_pos|| > max_pos_dist`` (m).
-      * orientation: terminate if the geodesic angle between the reference
-        and actual base quaternions exceeds ``max_ori_rad`` (rad).
+    Only the anchor mask's PINNED DOFs are measured.  A FREE DOF is one the clip was slid
+    along to sit on the robot, so error there is zero by construction and invisible to the
+    policy: the reference window shows it a base error of ~0 in exactly those directions.
+    Bounding something unobservable only truncates episodes.  What remains is the part of the
+    pose the clip genuinely pins down, which is both graded by the CLF and visible:
 
-    **The position bound is anchor-mask dependent**, because how much drift matters -- and
-    whether the policy can even perceive it -- is exactly what the mask encodes:
+    ==========================  ====================================================
+    mask                        measured
+    ==========================  ====================================================
+    flat (downrange/lat/yaw     height, roll, pitch  -- i.e. "don't sink, stay upright"
+    free)
+    stairs / boxes (lateral     downrange, height, roll, pitch, yaw
+    free)
+    ==========================  ====================================================
 
-    * ``downrange`` PINNED (stairs, boxes): the anchored reference coincides with the global
-      one along the traversal axis, so the CLF already grades that drift AND the reference
-      window shows it to the policy as a nonzero base error.  Observable and correctable, so
-      hold it tight -- position relative to the treads is the whole task there.
-    * ``downrange`` FREE (flat): the clip is re-datumed onto the robot every step, so the
-      base error the policy observes is ~0 by construction and global drift is INVISIBLE to
-      it.  Terminating tightly on something unobservable just truncates episodes without
-      teaching anything, and on flat ground absolute world position is arbitrary anyway --
-      the motion's shape and speed are what matter.  So give it slack.
+    On flat that is exactly a height + orientation check, which is all SONIC terminates on.
+    On terrain it additionally holds position along the treads and heading.  Because the free
+    axes are no longer measured, ONE tight ``max_pos_dist`` works everywhere -- there is no
+    longer a reason to inflate the bound on flat to stop it firing on drift nobody grades.
 
-    Box clips carry a PER-FRAME mask (ego approach -> pinned mount), so the bound follows the
-    phase within a single episode rather than being fixed per tile.
+    Frames: the translational bits are named in the TERRAIN's frame, so the horizontal error
+    is rotated by ``-mask_frame_yaw`` before being split into downrange / lateral.  Height is
+    gravity-aligned and needs no rotation.  Orientation splits into TILT (roll+pitch together,
+    as the angle between the two up-axes -- frame-free) and YAW (the heading difference).
+    Roll and pitch share one test because every mask in use pins both.
 
-    Known imprecision: this switches a single scalar radius on one bit, while the error it
-    bounds is the full 3-D norm.  On a stair tile lateral IS free, so lateral drift still
-    counts against the tight bound.  Splitting the error into free / pinned components in the
-    terrain frame would fix that; it needs the ``mask_frame_yaw`` rotation and is deliberately
-    not done here.
+    Box clips carry a PER-FRAME mask (ego approach -> pinned mount), so which axes are
+    measured follows the phase within a single episode.
 
     Args:
         env: IsaacLab environment.
         command_name: The :class:`MotionSequenceCommand` term name.
-        max_pos_dist: Max base position error where downrange is PINNED (m).
-        max_pos_dist_downrange_free: Max base position error where downrange is FREE (m).
-            ``None`` uses ``max_pos_dist`` everywhere, i.e. the old mask-blind behaviour.
-        max_ori_rad: Max base orientation error before terminating (rad).
+        max_pos_dist: Max position error over the PINNED translational axes (m).
+        max_ori_rad: Max tilt, and max yaw error where yaw is pinned (rad).
         asset_cfg: Robot scene entity.
 
     Returns:
@@ -80,26 +84,37 @@ def base_pose_error_termination(
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
     state = cmd.termination_reference_world_state()
-    ref_pos_w = state[:, 0:3]
-    ref_quat_w = state[:, 3:7]                      # xyzw (Isaac Lab 3.0 convention)
+    ref_pos_w, ref_quat_w = state[:, 0:3], state[:, 3:7]   # xyzw (Isaac Lab 3.0)
     root_pos_w = wp.to_torch(asset.data.root_pos_w)
-    root_quat_w = wp.to_torch(asset.data.root_quat_w)  # xyzw
+    root_quat_w = wp.to_torch(asset.data.root_quat_w)      # xyzw
 
-    pos_err = torch.norm(ref_pos_w - root_pos_w, dim=-1)
-    # ||quat_box_minus|| is the geodesic rotation angle (rad).
-    ori_err = torch.norm(quat_box_minus(root_quat_w, ref_quat_w), dim=-1)
+    mask = cmd.manager.gather_anchor_mask_at_step(cmd.clip_id, cmd._step).to(root_pos_w.device)
+    pinned = lambda bit: (mask & bit) == 0                                       # noqa: E731
 
-    if max_pos_dist_downrange_free is None:
-        limit = max_pos_dist
-    else:
-        mask = cmd.manager.gather_anchor_mask_at_step(cmd.clip_id, cmd._step).to(pos_err.device)
-        limit = torch.where(
-            (mask & _MASK_DOWNRANGE_FREE) > 0,
-            torch.as_tensor(max_pos_dist_downrange_free, device=pos_err.device,
-                            dtype=pos_err.dtype),
-            torch.as_tensor(max_pos_dist, device=pos_err.device, dtype=pos_err.dtype),
-        )
-    return (pos_err > limit) | (ori_err > max_ori_rad)
+    # --- position, in the TERRAIN frame -------------------------------------------------
+    d = ref_pos_w - root_pos_w
+    yaw_f = cmd._mask_frame_yaw.to(d.device)
+    cos_y, sin_y = torch.cos(yaw_f), torch.sin(yaw_f)
+    downrange = cos_y * d[:, 0] + sin_y * d[:, 1]
+    lateral = -sin_y * d[:, 0] + cos_y * d[:, 1]
+    comps = torch.stack([downrange, lateral, d[:, 2]], dim=-1)
+    keep = torch.stack([pinned(_MASK_DOWNRANGE), pinned(_MASK_LATERAL),
+                        pinned(_MASK_HEIGHT)], dim=-1)
+    pos_err = torch.norm(comps * keep.to(comps.dtype), dim=-1)
+
+    # --- orientation: tilt (roll+pitch) and yaw, tested separately ----------------------
+    _, _, ref_yaw = euler_xyz_from_quat(ref_quat_w, wrap_to_2pi=False)
+    _, _, act_yaw = euler_xyz_from_quat(root_quat_w, wrap_to_2pi=False)
+    yaw_err = wrap_to_pi(ref_yaw - act_yaw).abs()
+    # Tilt = angle between the two body-z axes. Independent of yaw, so the two tests do not
+    # double-count, and gravity-aligned so no terrain-frame rotation is needed.
+    up = torch.tensor([0.0, 0.0, 1.0], device=d.device).expand(d.shape[0], 3)
+    cos_tilt = (quat_apply(ref_quat_w, up) * quat_apply(root_quat_w, up)).sum(dim=-1)
+    tilt_err = torch.acos(cos_tilt.clamp(-1.0, 1.0))
+
+    over_tilt = (tilt_err > max_ori_rad) & pinned(_MASK_ROLL_PITCH)
+    over_yaw = (yaw_err > max_ori_rad) & pinned(_MASK_YAW)
+    return (pos_err > max_pos_dist) | over_tilt | over_yaw
 
 
 def tracked_frame_error_termination(
