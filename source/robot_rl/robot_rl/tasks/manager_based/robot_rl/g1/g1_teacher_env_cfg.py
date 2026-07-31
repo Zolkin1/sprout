@@ -21,7 +21,6 @@ from isaaclab.utils import configclass
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.managers import SceneEntityCfg
@@ -321,22 +320,25 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
 ##
 @configclass
 class G1TeacherRewardCfg(G1ClfTrackingRewardCfg):
-    """CLF tracking + penalties, plus dense commanded-velocity tracking."""
+    """CLF tracking + penalties.
 
-    # Track the clip's joystick-level velocity command (target_vel = (vx, vy, wz)) -- the
-    # same signal a velocity joystick would supply -- rather than the achieved reference
-    # base velocity.  Split into planar (xy) + yaw exactly like the stock
-    # track_lin_vel_xy_exp / track_ang_vel_z_exp, but sourced from traj_ref.
-    xy_vel = RewTerm(
-        func=mdp.command_lin_vel_xy_tracking_exp,
-        weight=1.0,
-        params={"command_name": "traj_ref", "std": 0.5},
-    )
-    yaw_vel = RewTerm(
-        func=mdp.command_ang_vel_z_tracking_exp,
-        weight=1.0,
-        params={"command_name": "traj_ref", "std": 0.5},
-    )
+    The two dense commanded-velocity terms that used to live here (``xy_vel`` /
+    ``yaw_vel``, weight 1.0 each against ``clf_reward``'s 10, grading the clip's
+    joystick-level ``target_vel`` against the measured base twist) are GONE: the CLF
+    already grades the base twist against the reference, so they were re-scoring the same
+    quantity through a second, softer lens.
+
+    Removing them does change what is graded, and the change is the point.  The CLF grades
+    reference SHAPE in the locally-anchored frame and deliberately does not double-count
+    planar drift (see the ``ego_anchor_fraction`` note on the command above), so the only
+    remaining pressure to actually travel at the commanded velocity is
+    ``base_pose_error_termination`` against the GLOBAL clip.  If the policy starts
+    under-tracking the command, that is the term to look at first.
+
+    Evaluation is unaffected: ``play_plots.py`` still reports
+    ``vel_track_{forward_vx,lateral_vy,yaw_wz}_mse_*`` from the recorded ``target_vel``.
+    The reward functions themselves are kept in ``mdp.rewards`` for the tracker task.
+    """
 
 
 ##

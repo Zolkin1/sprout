@@ -202,10 +202,13 @@ def command_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> 
     "joystick" would supply -- rather than the achieved reference base velocity
     (:func:`ref_base_velocity`, ``dy_des``).  Heading-invariant (planar linear
     velocity + yaw rate in the base/heading frame) and available at deployment.
-    Pairs with the ``command_lin_vel_xy_tracking_exp`` /
-    ``command_ang_vel_z_tracking_exp`` rewards so the command they grade against
-    is observable to the policy.  Returns ``[N, 3]``.  Requires a clip library
-    carrying ``target_vel``.
+    Returns ``[N, 3]``.  Requires a clip library carrying ``target_vel``.
+
+    NOTE this used to pair with the ``command_lin_vel_xy_tracking_exp`` /
+    ``command_ang_vel_z_tracking_exp`` rewards, which no task registers any more -- the
+    teacher's CLF already grades the base twist.  The command is still worth OBSERVING
+    (it is what the reference was generated from, and the deployment joystick supplies
+    it); it is simply no longer separately rewarded.
     """
     cmd = env.command_manager.get_term(command_name)
     return cmd.get_command_velocity().clone()
