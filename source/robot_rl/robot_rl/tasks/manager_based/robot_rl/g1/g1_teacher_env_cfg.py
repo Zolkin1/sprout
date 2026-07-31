@@ -445,6 +445,14 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         # ``clf_decreasing_condition`` needs NO matching change: eta_scales is folded into P,
         # not into eta, so eta_max / eta_dot_max keep their physical units.
         #
+        # TODO(clf-scale): 1.15 was derived against body_v2's model_5800 -- a policy trained
+        # under BOTH the old local-base reward and the reset-step placement bug, i.e. two
+        # reward generations stale. It is deliberately NOT re-derived here: depth_v1/v2/v3
+        # all trained on this value, and changing it would make them incomparable to whatever
+        # comes next. Re-derive off a current checkpoint with
+        # ``scripts/rsl_rl/clf_balance_check.py --load_run <run>`` at the point where a fresh
+        # baseline is being established anyway, and move it then -- not before.
+        #
         # Two traps when re-tuning this from the dashboard:
         #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by
         #     max_episode_length_s, so it reads ~7% of the instantaneous value while
