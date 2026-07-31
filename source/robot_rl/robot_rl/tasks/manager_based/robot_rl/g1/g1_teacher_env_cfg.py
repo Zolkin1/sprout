@@ -358,9 +358,27 @@ class G1TeacherTerminationCfg:
         func=mdp.clip_end_reached, params={"command_name": "traj_ref"}, time_out=True
     )
     # The positional radii are being swept; the 0.8 rad bounds are unchanged.
+    #
+    # The base radius is MASK-DEPENDENT. Where downrange is pinned (stairs, boxes) the drift
+    # is both graded by the CLF and visible in the reference window, so it is correctable and
+    # position relative to the treads is the task -- hold 0.3. Where downrange is free (flat)
+    # the clip is re-datumed onto the robot every step, so global drift is invisible to the
+    # policy and absolute world position is arbitrary anyway.
+    #
+    # 0.5 rather than something tighter, because unobserved drift DIFFUSES to whatever bound
+    # exists. Measured end to end: terminations cluster right at the bound (mean 0.307 m at
+    # a 0.3 m bound, 0.407 m at a 0.4 m bound), and drift grows with episode age -- at the
+    # 0.4 bound the >400-step mean went 0.164 -> 0.235 m purely because episodes lived
+    # longer. So a static counterfactual on a fixed rollout UNDER-predicts what a looser
+    # bound costs (it predicted base terminations 0.260 -> 0.014; the real answer was 0.194),
+    # and picking the tightest value that clears today's distribution just re-fills.
+    # 0.5 buys headroom against that instead. Still well under the baseline's 0.75, which was
+    # propped up by an observability this regime does not have.
+    # See base_pose_error_termination.
     base_pose_error = DoneTerm(
         func=mdp.base_pose_error_termination,
-        params={"command_name": "traj_ref", "max_pos_dist": 0.3, "max_ori_rad": 0.8},
+        params={"command_name": "traj_ref", "max_pos_dist": 0.3,
+                "max_pos_dist_downrange_free": 0.5, "max_ori_rad": 0.8},
     )
     ee_pose_error = DoneTerm(
         func=mdp.tracked_frame_error_termination,
@@ -369,7 +387,24 @@ class G1TeacherTerminationCfg:
             "frame_names": ("left_ankle_roll_link", "right_ankle_roll_link",
                             "left_wrist_yaw_link", "right_wrist_yaw_link"),
             "max_pos_dist": 0.3,
-            "max_ori_rad": 0.8,
+            # Per frame, in frame_names order: ankles 0.8 rad, wrists 1.0.
+            #
+            # The wrists get slack but KEEP a bound, because the constraint is demonstrably
+            # satisfiable: body_v2's left_wrist_yaw orientation trips at a 0.8 bound went
+            # 25 -> 12 -> 5 over iterations 2.6k -> 5k -> 8.2k. It is learnable, so removing
+            # it entirely would discard a real signal.
+            #
+            # Slack because body_v3 is far worse on this one axis than body_v2 was at the
+            # SAME iteration -- 305 trips vs 25, while being 120x better on v_root_body_pos.
+            # Part of that is exposure: v3's episodes run 196 steps vs 132, so it reaches
+            # more of each clip's dynamic arm motion. 1.0 is a mild easing (it only moved v3
+            # 305 -> 290 on its own) that keeps the signal while the rest converges.
+            #
+            # Watch it: if v3 does not follow v2's downward curve, the terrain clips may be
+            # asking for wrist motion that is not trackable, which is a clip-generation
+            # question rather than a threshold one. 286 of those 305 trips were on TERRAIN
+            # and only 4 on flat.
+            "max_ori_rad": (0.8, 0.8, 1.0, 1.0),
         },
     )
 

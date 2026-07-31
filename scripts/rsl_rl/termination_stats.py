@@ -53,6 +53,20 @@ parser.add_argument("--no_events", action="store_true", default=None,
 parser.add_argument("--num_rows", type=int, default=None,
                     help="Terrain replica rows. The -play cfg uses 1, training uses the "
                          "task default -- this changes the TERRAIN MIX, not just the count.")
+parser.add_argument("--as_trained", action="store_true",
+                    help="Force the base termination back to a single mask-blind radius, "
+                         "i.e. what a run launched before the mask-dependent bound actually "
+                         "trained under. Use this so 'fired' is the real behaviour and the "
+                         "counterfactual column is the proposed change.")
+parser.add_argument("--ee_ori_rad", type=float, default=None,
+                    help="Override the ee orientation bound to this value for EVERY frame, "
+                         "re-enabling any the cfg disables. Use it to ask whether a policy "
+                         "could hold a bound it was not trained against.")
+parser.add_argument("--base_pos_limit_free", type=float, default=0.75,
+                    help="Counterfactual base radius for downrange-FREE (flat) envs. The "
+                         "report shows what the base termination WOULD do at this bound "
+                         "alongside what it actually did, so the change can be judged "
+                         "before spending GPU on it.")
 parser.add_argument("--out", default="termination_stats.txt",
                     help="Report file. IsaacSim's startup often swallows stdout.")
 AppLauncher.add_app_launcher_args(parser)
@@ -74,6 +88,8 @@ import robot_rl  # noqa: F401,E402  (registers the gym envs)
 # The recursive activate_contact_sensors patch lives in the PRIVATE impl module and is
 # applied at import time; the public shim does NOT apply it. train.py does the same.
 import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401,E402
+import warp as wp  # noqa: E402
+from isaaclab.utils.math import quat_box_minus  # noqa: E402
 from isaaclab_tasks.utils import load_cfg_from_registry, parse_env_cfg  # noqa: E402
 
 
@@ -93,6 +109,10 @@ def build_env():
         cfg.events.randomize_ground_contact_friction = None
     if args.num_rows is not None:
         cfg.scene.terrain.num_rows = args.num_rows
+    if args.as_trained:
+        cfg.terminations.base_pose_error.params["max_pos_dist_downrange_free"] = None
+    if args.ee_ori_rad is not None:
+        cfg.terminations.ee_pose_error.params["max_ori_rad"] = args.ee_ori_rad
     return gym.make(args.task, cfg=cfg).unwrapped, cfg
 
 
@@ -156,9 +176,16 @@ def main() -> None:
     cmd = env.command_manager.get_term("traj_ref")
     ee_cfg = env.termination_manager.get_term_cfg("ee_pose_error").params
     frames = list(ee_cfg["frame_names"])
-    pos_lim, ori_lim = ee_cfg["max_pos_dist"], ee_cfg["max_ori_rad"]
+    pos_lim = ee_cfg["max_pos_dist"]
+    # max_ori_rad may be a scalar, or per frame with None meaning "no orientation bound".
+    _raw = ee_cfg["max_ori_rad"]
+    ori_lim = ([float("inf") if v is None else float(v) for v in _raw]
+               if hasattr(_raw, "__len__") else [float(_raw)] * len(frames))
     from isaaclab.utils.math import quat_box_minus
-    trips = {f: [0, 0] for f in frames}          # frame -> [position trips, orientation trips]
+    # frame -> [pos trips, ori trips, ori trips on FLAT, ori trips on TERRAIN]. The terrain
+    # split is here to test whether a lopsided frame (left wrist ran 7.6x the right at 2.6k
+    # iterations) is a terrain-geometry effect or something about the frame itself.
+    trips = {f: [0, 0, 0, 0] for f in frames}
     err_sum = {f: 0.0 for f in frames}
     err_n = 0
     # State AT the firing instant. All four frames are lifted through the anchored base, so
@@ -171,12 +198,35 @@ def main() -> None:
     # is read at the top of the loop, so it is one consistent instant, and "just reset"
     # means the robot has been teleported onto its new clip start -- where the tracking
     # error must be ~0.  If it is not, the reference is stale on the reset step.
+    # Base-drift profile, split by whether the anchor mask frees the traversal axis. That
+    # bit is both "does world position matter here" and "can the policy even see the drift"
+    # -- on flat the reference window's base error is ~0 by construction.
+    from motion_gen.world_lift import anchor_mask_from_free
+    DOWNRANGE = anchor_mask_from_free({"downrange"})
+    base_cfg = env.termination_manager.get_term_cfg("base_pose_error").params
+    b_pos, b_ori = base_cfg["max_pos_dist"], base_cfg["max_ori_rad"]
+    b_free = base_cfg.get("max_pos_dist_downrange_free")
+    base = {k: {"steps": 0, "fired": 0, "pos": 0.0, "by_pos": 0, "by_ori": 0, "cf": 0}
+            for k in ("flat", "terrain")}
+    # WHERE in the episode do flat base terminations land, and does drift ACCUMULATE?
+    # If it grows with episode age the walk is open-loop and a looser bound only delays the
+    # hit; if it plateaus, the bound is just clipping a stationary distribution's tail.
+    clip_len_t = cmd.manager.clip_len
+    frac_bins = [0] * 5                      # fifths of the clip, at the firing instant
+    age_bins = {b: [0, 0.0] for b in (25, 50, 100, 200, 400, 10**9)}   # age -> [n, sum drift]
     post = {"n": 0, "err": 0.0, "over": 0}
     stdy = {"n": 0, "err": 0.0, "over": 0}
     just_reset = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
     for _ in range(args.steps):
         with torch.inference_mode():
+            bstate = cmd.termination_reference_world_state()
+            broot = wp.to_torch(env.scene["robot"].data.root_pos_w)
+            bpos = torch.norm(bstate[:, 0:3] - broot, dim=-1)
+            bori = torch.norm(quat_box_minus(
+                wp.to_torch(env.scene["robot"].data.root_quat_w), bstate[:, 3:7]), dim=-1)
+            mask_free = (cmd.manager.gather_anchor_mask_at_step(
+                cmd.clip_id, cmd._step).to(bpos.device) & DOWNRANGE) > 0
             act_p, act_q, des_p, des_q = cmd.tracked_frame_pose(frames)
             n_e, n_f = act_p.shape[0], act_p.shape[1]
             pe = torch.norm(act_p - des_p, dim=-1)                                   # [N, F]
@@ -196,11 +246,47 @@ def main() -> None:
         n = int((terminated | truncated).sum())
         if not n:
             continue
+        # Base drift, attributed by mask. Read pre-step so it is the state the termination
+        # evaluated, same convention as the ee split above.
+        bfired = env.termination_manager.get_term("base_pose_error")
+        for key, m in (("flat", mask_free), ("terrain", ~mask_free)):
+            if not m.any():
+                continue
+            d = base[key]
+            d["steps"] += int(m.sum())
+            if key == "flat":
+                age = env.episode_length_buf[m]
+                drift = bpos[m]
+                lo = 0
+                for b in sorted(age_bins):
+                    sel = (age > lo) & (age <= b)
+                    if sel.any():
+                        age_bins[b][0] += int(sel.sum())
+                        age_bins[b][1] += float(drift[sel].sum())
+                    lo = b
+            f = bfired & m
+            if f.any():
+                if key == "flat":
+                    cl = clip_len_t[cmd.clip_id[f].to(clip_len_t.device)].to(bpos.device)
+                    step_now = (cmd.start_step[f] + env.episode_length_buf[f]).to(bpos.device)
+                    fr = (step_now.float() / cl.float().clamp(min=1)).clamp(0, 0.999)
+                    for i in range(5):
+                        frac_bins[i] += int(((fr >= i * 0.2) & (fr < (i + 1) * 0.2)).sum())
+                d["fired"] += int(f.sum())
+                d["pos"] += float(bpos[f].sum())
+                d["by_pos"] += int((bpos[f] > b_pos).sum())
+                d["by_ori"] += int((bori[f] > b_ori).sum())
+                lim = (args.base_pos_limit_free if key == "flat" else b_pos)
+                d["cf"] += int(((bpos[f] > lim) | (bori[f] > b_ori)).sum())
         fired = env.termination_manager.get_term("ee_pose_error")
         if fired.any():
             for j, f in enumerate(frames):
+                lim_j = ori_lim[j]
+                over_o = (oe[:, j] > lim_j) & fired
                 trips[f][0] += int(((pe[:, j] > pos_lim) & fired).sum())
-                trips[f][1] += int(((oe[:, j] > ori_lim) & fired).sum())
+                trips[f][1] += int(over_o.sum())
+                trips[f][2] += int((over_o & mask_free).sum())
+                trips[f][3] += int((over_o & ~mask_free).sum())
             k = int(fired.sum()); fire["n"] += k
             root = wp.to_torch(env.scene["robot"].data.root_pos_w)[fired]
             fire["base_glob"] += float(torch.norm(
@@ -239,11 +325,12 @@ def main() -> None:
     lines += [
         "",
         f"ee_pose_error attribution  (limits: {pos_lim} m / {ori_lim} rad)",
-        f"  {'frame':28} {'pos trips':>10} {'ori trips':>10} {'mean err':>10}",
+        f"  {'frame':28} {'pos':>7} {'ori':>7} {'ori flat':>9} {'ori terr':>9} {'mean err':>10}",
     ]
     lines += [
-        f"  {f:28} {trips[f][0]:10d} {trips[f][1]:10d} {err_sum[f] / max(err_n,1):9.3f} m"
-        for f in sorted(frames, key=lambda f: -trips[f][0])
+        f"  {f:28} {trips[f][0]:7d} {trips[f][1]:7d} {trips[f][2]:9d} {trips[f][3]:9d} "
+        f"{err_sum[f] / max(err_n,1):9.3f} m"
+        for f in sorted(frames, key=lambda f: -(trips[f][0] + trips[f][1]))
     ]
     if fire["n"]:
         k = fire["n"]
@@ -256,6 +343,29 @@ def main() -> None:
             f"  worst frame error             {fire['maxfrm']/k:8.3f} m",
             f"  frames over limit             {fire['nframes']/k:8.2f} of {len(frames)}",
         ]
+    lines += ["", f"base_pose_error by anchor mask  (bounds: {b_pos} m pinned / "
+              f"{b_free if b_free is not None else b_pos} m free, {b_ori} rad)"]
+    tot_fired = sum(d["fired"] for d in base.values()) or 1
+    lines += [f"  {'mask':10} {'env-steps':>10} {'fired':>8} {'% of base':>10} "
+              f"{'mean pos':>10} {'by pos':>8} {'by ori':>8} {'@' + str(args.base_pos_limit_free) + '/' + str(b_pos):>10}"]
+    for k, d in base.items():
+        if not d["steps"]:
+            continue
+        lines.append(
+            f"  {k:10} {d['steps']:10d} {d['fired']:8d} {100.0*d['fired']/tot_fired:9.1f}% "
+            f"{d['pos']/max(d['fired'],1):9.3f}m {d['by_pos']:8d} {d['by_ori']:8d} {d['cf']:10d}")
+    lines += ["  last column = terminations that would REMAIN at the counterfactual bounds"]
+    tf = sum(frac_bins) or 1
+    lines += ["", "WHERE in the clip flat base terminations fire (fifths of clip length):",
+              "  " + "  ".join(f"{i*20}-{(i+1)*20}%: {100.0*frac_bins[i]/tf:4.1f}%" for i in range(5))]
+    lines += ["", "flat base DRIFT vs episode age (all flat env-steps, not just failures):"]
+    prev = 0
+    for b in sorted(age_bins):
+        n, tot = age_bins[b]
+        if n:
+            name = f"{prev+1}-{b}" if b < 10**8 else f">{prev}"
+            lines.append(f"  age {name:>10} steps : mean drift {tot/n:6.3f} m   [n={n}]")
+        prev = b
     lines += ["", "worst-frame position error, split by whether the env JUST RESET:"]
     for nm, d in (("first step after reset", post), ("steady (mid-episode)", stdy)):
         if d["n"]:
