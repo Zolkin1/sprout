@@ -274,55 +274,82 @@ def test_reanchor_still_guarded_once_per_step_after_a_resample():
     assert placed["ids"] is None
 
 
-def test_base_termination_radius_follows_the_anchor_mask():
-    """Drift is bounded tightly only where the policy can actually perceive it.
+def test_base_termination_measures_only_the_pinned_axes():
+    """A FREE anchor DOF is not measured; a PINNED one is, at one tight bound.
 
-    Where ``downrange`` is PINNED (stairs / boxes) the anchored reference coincides with the
-    global one along the traversal axis, so the drift is graded by the CLF and shows up in
-    the reference window as a nonzero base error -- observable, correctable, and the whole
-    point of the task there.  Where it is FREE (flat) the clip is re-datumed onto the robot
-    every step, so the base error the policy sees is ~0 by construction and global drift is
-    invisible to it; bounding that tightly truncates episodes without teaching anything.
+    A free DOF is one the clip was slid along to sit on the robot, so error there is zero by
+    construction and invisible to the policy -- bounding it only truncates episodes, and it
+    was 90% of base terminations at 2.6k iterations. On flat that leaves height + tilt, which
+    is exactly what SONIC terminates on; stairs/boxes additionally pin downrange and yaw.
     """
     from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
     from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
         base_pose_error_termination,
     )
 
-    tight, loose = 0.3, 0.75
-    drift = 0.5                                   # between the two bounds
+    lim, big = 0.3, 0.5          # big is over the bound
     n = 4
-    # env 0,1 = flat (downrange free); env 2,3 = box (pinned). Envs 1 and 3 have drifted.
+    # 0,1 = flat (downrange free); 2,3 = box (downrange pinned).
+    # Envs 0,2 are displaced DOWNRANGE; envs 1,3 are displaced in HEIGHT.
     masks = torch.tensor([_ANCHOR_MASK_FLAT, _ANCHOR_MASK_FLAT,
                           _ANCHOR_MASK_BOX, _ANCHOR_MASK_BOX], dtype=torch.uint8)
-    offset = torch.tensor([0.0, drift, 0.0, drift])
-    ref = torch.zeros(n, 3)
     root = torch.zeros(n, 3)
-    root[:, 0] = offset
+    root[0, 0] = big; root[2, 0] = big        # downrange offset
+    root[1, 2] = big; root[3, 2] = big        # height offset
     ident = torch.zeros(n, 4); ident[:, 3] = 1.0
+    state = torch.cat([torch.zeros(n, 3), ident, torch.zeros(n, 6)], dim=-1)
 
-    state = torch.cat([ref, ident, torch.zeros(n, 6)], dim=-1)
     cmd = SimpleNamespace(
         termination_reference_world_state=lambda: state,
         clip_id=torch.zeros(n, dtype=torch.long), _step=torch.zeros(n, dtype=torch.long),
+        _mask_frame_yaw=torch.zeros(n),
         manager=SimpleNamespace(gather_anchor_mask_at_step=lambda cid, st: masks),
     )
     env = SimpleNamespace(
         scene={"robot": SimpleNamespace(data=SimpleNamespace(root_pos_w=root, root_quat_w=ident))},
         command_manager=SimpleNamespace(get_term=lambda name: cmd),
     )
-    # The command reads the robot through warp; hand it plain torch tensors.
     import robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations as T
     old_wp, T.wp = T.wp, SimpleNamespace(to_torch=lambda t: t)
     try:
-        done = base_pose_error_termination(
-            env, max_pos_dist=tight, max_pos_dist_downrange_free=loose, max_ori_rad=0.8)
-        # 0.5 m is under the flat bound and over the terrain one.
-        assert done.tolist() == [False, False, False, True]
+        done = base_pose_error_termination(env, max_pos_dist=lim, max_ori_rad=0.8)
+        # flat + downrange  -> IGNORED (free);   flat + height     -> caught (pinned)
+        # box  + downrange  -> caught (pinned);  box  + height     -> caught (pinned)
+        assert done.tolist() == [False, True, True, True]
+    finally:
+        T.wp = old_wp
 
-        # None restores the mask-blind behaviour: the flat env terminates too.
-        done_blind = base_pose_error_termination(env, max_pos_dist=tight, max_ori_rad=0.8)
-        assert done_blind.tolist() == [False, True, False, True]
+
+def test_base_termination_yaw_only_counts_where_yaw_is_pinned():
+    """Yaw is free on flat and pinned on terrain; tilt is pinned in both."""
+    from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
+    from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
+        base_pose_error_termination,
+    )
+
+    n = 2
+    masks = torch.tensor([_ANCHOR_MASK_FLAT, _ANCHOR_MASK_BOX], dtype=torch.uint8)
+    ident = torch.zeros(n, 4); ident[:, 3] = 1.0
+    # Reference yawed ~90 deg from the robot; positions identical.
+    ref_q = torch.zeros(n, 4); ref_q[:, 2] = 0.7071; ref_q[:, 3] = 0.7071
+    state = torch.cat([torch.zeros(n, 3), ref_q, torch.zeros(n, 6)], dim=-1)
+    cmd = SimpleNamespace(
+        termination_reference_world_state=lambda: state,
+        clip_id=torch.zeros(n, dtype=torch.long), _step=torch.zeros(n, dtype=torch.long),
+        _mask_frame_yaw=torch.zeros(n),
+        manager=SimpleNamespace(gather_anchor_mask_at_step=lambda cid, st: masks),
+    )
+    env = SimpleNamespace(
+        scene={"robot": SimpleNamespace(data=SimpleNamespace(
+            root_pos_w=torch.zeros(n, 3), root_quat_w=ident))},
+        command_manager=SimpleNamespace(get_term=lambda name: cmd),
+    )
+    import robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations as T
+    old_wp, T.wp = T.wp, SimpleNamespace(to_torch=lambda t: t)
+    try:
+        done = base_pose_error_termination(env, max_pos_dist=0.3, max_ori_rad=0.8)
+        # A pure yaw error is ignored on flat (yaw free) and caught on the box (yaw pinned).
+        assert done.tolist() == [False, True]
     finally:
         T.wp = old_wp
 
