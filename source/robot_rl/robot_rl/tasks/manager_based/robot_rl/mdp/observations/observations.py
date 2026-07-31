@@ -285,8 +285,8 @@ REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
 #: since the noise is applied before the scale and so the signal-to-noise ratio is
 #: untouched.
 #:
-#: TODO(scaling): this is a first pass, tuned only to put the blocks in the same ballpark.
-#: Two things to revisit once there is a trained baseline to compare against:
+#: DEFERRED (no compute to spend on it now, not a dead end): this is a first pass, tuned
+#: only to put the blocks in the same ballpark.  Two things to revisit:
 #:
 #: 1. These numbers are NOT normalization -- they are hand-picked, and the remaining
 #:    spread is still ~5x (measured p99 after scaling: base_pose 0.68, base_vel 1.14,
@@ -302,6 +302,13 @@ REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
 #:    ``RefEncoderMLPModel.reconstruction_loss`` rather than by distorting this scale
 #:    further -- this one also feeds the actor's forward pass, so the two cannot be tuned
 #:    independently through it.
+#:
+#: When it IS worth spending a run on: (1) is a one-flag A/B
+#: (``agent.actor.obs_normalization=true``, and the critic's) and (2) is dormant while the
+#: reconstruction loss is off (``reconstruction=False``, ``coeff=0.0``), so the two can be
+#: taken one at a time.  The cheap moment for (1) is a round that already breaks baseline
+#: comparability for other reasons -- it needs its own run either way, or it cannot be told
+#: apart from whatever else moved.
 REFERENCE_WINDOW_SCALE: dict[str, float | list[float]] = {
     "base_pos": 1.0,
     "base_ori": 1.0,
