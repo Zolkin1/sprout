@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import warp as wp
+from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
@@ -238,23 +239,77 @@ def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
     return torch.arange(n, device=cmd.device, dtype=torch.long) * s
 
 
-def reference_window_layout(cmd) -> list[tuple[str, int]]:
+#: Blocks :func:`reference_window` packs, in order, when none are selected explicitly.
+#:
+#: A block can be dropped to ask what the policy actually needs from the reference.  The
+#: name is passed through ``blocks=`` on the observation term AND on the noise / scale
+#: builders -- all four read this same list, so a subset cannot land in one and not the
+#: others.  Dropping a block also skips computing it, which is not free: the observation
+#: manager is the largest phase of the env step.
+REFERENCE_WINDOW_BLOCKS: tuple[str, ...] = (
+    "base_pose", "base_vel", "joint_pos", "joint_vel", "ee_pos",
+)
+
+#: Layout block -> the per-block keys in :data:`REFERENCE_WINDOW_NOISE` /
+#: :data:`REFERENCE_WINDOW_SCALE` that expand into it.  ``base_pose`` and ``base_vel`` are
+#: each two 3-axis halves, which is why the two tables key more finely than the layout.
+_REFERENCE_BLOCK_KEYS: dict[str, tuple[str, ...]] = {
+    "base_pose": ("base_pos", "base_ori"),
+    "base_vel": ("base_lin_vel", "base_ang_vel"),
+    "joint_pos": ("joint_pos",),
+    "joint_vel": ("joint_vel",),
+    "ee_pos": ("ee_pos",),
+}
+
+
+def resolve_reference_blocks(blocks: Sequence[str] | None) -> tuple[str, ...]:
+    """Validate a block selection and put it in canonical packing order.
+
+    Args:
+        blocks: Requested block names, or None for :data:`REFERENCE_WINDOW_BLOCKS`.
+
+    Returns:
+        The selection, ordered as :func:`reference_window` packs it.
+
+    Raises:
+        ValueError: On an unknown name or an empty selection.
+    """
+    if blocks is None:
+        return REFERENCE_WINDOW_BLOCKS
+    wanted = set(blocks)
+    unknown = wanted - set(REFERENCE_WINDOW_BLOCKS)
+    if unknown:
+        raise ValueError(
+            f"unknown reference-window block(s) {sorted(unknown)}; "
+            f"expected a subset of {list(REFERENCE_WINDOW_BLOCKS)}"
+        )
+    if not wanted:
+        raise ValueError("reference_window needs at least one block")
+    return tuple(b for b in REFERENCE_WINDOW_BLOCKS if b in wanted)
+
+
+def reference_window_layout(cmd, blocks: Sequence[str] | None = None) -> list[tuple[str, int]]:
     """Per-step block layout of :func:`reference_window` as ``[(name, width), ...]``.
 
     The single source of truth for how one step of the window is packed, so the
     diagnostics (``scripts/rsl_rl/data_logger.py``) can slice the flat term back
     into named blocks without restating the layout.  Widths depend on the robot
     (joint count) and the clip library (ee frame count).
+
+    Args:
+        cmd: The trajectory command term.
+        blocks: Subset to include; defaults to :data:`REFERENCE_WINDOW_BLOCKS`.
     """
     nj = len(cmd.robot.joint_names)
     n_ee = len(cmd.resolve_ee_frames(None))
-    return [
-        ("base_pose", 6),
-        ("base_vel", 6),
-        ("joint_pos", nj),
-        ("joint_vel", nj),
-        ("ee_pos", 3 * n_ee),
-    ]
+    widths = {
+        "base_pose": 6,
+        "base_vel": 6,
+        "joint_pos": nj,
+        "joint_vel": nj,
+        "ee_pos": 3 * n_ee,
+    }
+    return [(b, widths[b]) for b in resolve_reference_blocks(blocks)]
 
 
 #: Default per-block uniform-noise HALF-WIDTHS for :func:`reference_window`.
@@ -325,6 +380,7 @@ def _expand_reference_blocks(
     num_joints: int,
     num_ee_frames: int,
     per_block: dict[str, float | list[float]],
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block values to one value per :func:`reference_window` channel.
 
@@ -349,19 +405,26 @@ def _expand_reference_blocks(
         value = per_block[key]
         return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * 3
 
-    per_step = (
-        axes("base_pos") + axes("base_ori")                        # base_pose  (6)
-        + axes("base_lin_vel") + axes("base_ang_vel")              # base_vel   (6)
-        + [float(per_block["joint_pos"])] * num_joints             # joint_pos  (nj)
-        + [float(per_block["joint_vel"])] * num_joints             # joint_vel  (nj)
-        + axes("ee_pos") * num_ee_frames                           # ee_pos     (3F)
-    )
-    expected = 6 + 6 + 2 * num_joints + 3 * num_ee_frames
+    widths = {"base_pose": 6, "base_vel": 6, "joint_pos": num_joints,
+              "joint_vel": num_joints, "ee_pos": 3 * num_ee_frames}
+    builders = {
+        "base_pose": lambda: axes("base_pos") + axes("base_ori"),
+        "base_vel": lambda: axes("base_lin_vel") + axes("base_ang_vel"),
+        "joint_pos": lambda: [float(per_block["joint_pos"])] * num_joints,
+        "joint_vel": lambda: [float(per_block["joint_vel"])] * num_joints,
+        "ee_pos": lambda: axes("ee_pos") * num_ee_frames,
+    }
+
+    selected = resolve_reference_blocks(blocks)
+    per_step: list[float] = []
+    for name in selected:
+        per_step += builders[name]()
+    expected = sum(widths[b] for b in selected)
     if len(per_step) != expected:
         raise ValueError(
             f"Built {len(per_step)} per-step channels, expected {expected} "
-            f"(nj={num_joints}, ee={num_ee_frames}). The per-block expansion has drifted "
-            "from reference_window_layout."
+            f"(blocks={list(selected)}, nj={num_joints}, ee={num_ee_frames}). The per-block "
+            "expansion has drifted from reference_window_layout."
         )
     return per_step * int(num_steps)
 
@@ -371,6 +434,7 @@ def reference_window_noise_vector(
     num_joints: int,
     num_ee_frames: int,
     magnitudes: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block noise magnitudes to one half-width per :func:`reference_window` channel.
 
@@ -391,7 +455,7 @@ def reference_window_noise_vector(
         ``num_steps * D`` half-widths, in the channel order the window packs.
     """
     mags = REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes
-    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags)
+    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags, blocks)
 
 
 def reference_window_scale(
@@ -399,6 +463,7 @@ def reference_window_scale(
     num_joints: int,
     num_ee_frames: int,
     factors: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> tuple[float, ...]:
     """Per-channel multiplier for a :func:`reference_window` observation term.
 
@@ -415,7 +480,7 @@ def reference_window_scale(
         ``num_steps * D`` multipliers, in the channel order the window packs.
     """
     facs = REFERENCE_WINDOW_SCALE if factors is None else factors
-    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs))
+    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs, blocks))
 
 
 def per_channel_uniform_noise(data: torch.Tensor, cfg) -> torch.Tensor:
@@ -485,6 +550,7 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         num_joints: int,
         num_ee_frames: int,
         magnitudes: dict[str, float | list[float]] | None = None,
+        blocks: Sequence[str] | None = None,
     ) -> "ReferenceWindowNoiseCfg":
         """Build the config by expanding per-block magnitudes over the window layout.
 
@@ -499,13 +565,14 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         """
         mags = dict(REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes)
         return cls(
-            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags),
+            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags, blocks),
             magnitudes=mags,
         )
 
 
 def reference_window(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
+    blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """The full reference trajectory over a look-ahead window (``[N, num_steps * D]``).
 
@@ -559,30 +626,38 @@ def reference_window(
     inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
     root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
 
-    pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
-    ori_err_w = quat_box_minus(root_q, quat_w.reshape(n * k, 4))   # actual ⊟ reference (world)
-    ori_err_b = quat_apply(inv_root, ori_err_w)                    # -> current base frame
-    base_pose = torch.cat([pos_err_b, ori_err_b], dim=-1).reshape(n, k, 6)
+    selected = resolve_reference_blocks(blocks)
+    parts: dict[str, torch.Tensor] = {}
 
-    lin_b = quat_apply(inv_root, lin_w.reshape(n * k, 3)).reshape(n, k, 3)
-    ang_b = quat_apply(inv_root, ang_w.reshape(n * k, 3)).reshape(n, k, 3)
-    base_vel = torch.cat([lin_b, ang_b], dim=-1)                   # [N, K, 6]
+    if "base_pose" in selected:
+        pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
+        ori_err_w = quat_box_minus(root_q, quat_w.reshape(n * k, 4))  # actual ⊟ ref (world)
+        ori_err_b = quat_apply(inv_root, ori_err_w)                   # -> current base frame
+        parts["base_pose"] = torch.cat([pos_err_b, ori_err_b], dim=-1).reshape(n, k, 6)
 
-    joint_pos, joint_vel = cmd.get_future_joint_state(offs)        # [N, K, nj] each
+    if "base_vel" in selected:
+        lin_b = quat_apply(inv_root, lin_w.reshape(n * k, 3)).reshape(n, k, 3)
+        ang_b = quat_apply(inv_root, ang_w.reshape(n * k, 3)).reshape(n, k, 3)
+        parts["base_vel"] = torch.cat([lin_b, ang_b], dim=-1)         # [N, K, 6]
 
-    # ee positions relative to the reference base AT THE SAME STEP: the world lift is
-    # rigid, so differencing and unrotating recovers exactly the clip-frame posture
-    # that ee_ref_relative_to_base reports at offset 0.
-    frames = cmd.resolve_ee_frames(None)
-    ee_w = cmd.get_future_world_frames(frames, offs)               # [N, K, F, 13]
-    inv_ref_q = quat_inv(quat_w.reshape(n * k, 4))
-    ee_rel = [
-        quat_apply(inv_ref_q, (ee_w[:, :, i, 0:3] - pos_w).reshape(n * k, 3)).reshape(n, k, 3)
-        for i in range(len(frames))
-    ]
-    ee_pos = torch.cat(ee_rel, dim=-1)                             # [N, K, 3F]
+    if "joint_pos" in selected or "joint_vel" in selected:
+        joint_pos, joint_vel = cmd.get_future_joint_state(offs)       # [N, K, nj] each
+        parts["joint_pos"], parts["joint_vel"] = joint_pos, joint_vel
 
-    out = torch.cat([base_pose, base_vel, joint_pos, joint_vel, ee_pos], dim=-1)
+    if "ee_pos" in selected:
+        # ee positions relative to the reference base AT THE SAME STEP: the world lift is
+        # rigid, so differencing and unrotating recovers exactly the clip-frame posture
+        # that ee_ref_relative_to_base reports at offset 0.
+        frames = cmd.resolve_ee_frames(None)
+        ee_w = cmd.get_future_world_frames(frames, offs)              # [N, K, F, 13]
+        inv_ref_q = quat_inv(quat_w.reshape(n * k, 4))
+        ee_rel = [
+            quat_apply(inv_ref_q, (ee_w[:, :, i, 0:3] - pos_w).reshape(n * k, 3)).reshape(n, k, 3)
+            for i in range(len(frames))
+        ]
+        parts["ee_pos"] = torch.cat(ee_rel, dim=-1)                   # [N, K, 3F]
+
+    out = torch.cat([parts[b] for b in selected], dim=-1)
     return out.reshape(n, -1)
 
 

@@ -99,6 +99,9 @@ class DataLogger:
         # logged obs match exactly what the policy is fed.
         self._ref_num_steps: int = 11
         self._ref_stride: int = 5
+        # Which reference blocks the term actually packs; None = the full default set.
+        # Read from the obs cfg below, so a task that drops blocks is sliced correctly.
+        self._ref_blocks: tuple[str, ...] | None = None
         self.metadata: dict[str, Any] = {}
         # Per-step termination signals, stacked in finalize() into a
         # "successful tracking" mask (steps in episodes that ended via
@@ -250,7 +253,7 @@ class DataLogger:
         # expose the reference (the helpers raise).
         if self._traj_term_name is not None:
             name = self._traj_term_name
-            ns, st = self._ref_num_steps, self._ref_stride
+            ns, st, blocks = self._ref_num_steps, self._ref_stride, self._ref_blocks
             def _traj_obs() -> dict[str, torch.Tensor]:
                 out = {
                     "base_pose_error": base_pose_error(unwrapped, name).clone(),
@@ -264,8 +267,9 @@ class DataLogger:
                 # CURRENT step (the window starts at offset 0), so block 0 should
                 # track the matching current-step term above.
                 cmd = unwrapped.command_manager.get_term(name)
-                win = reference_window(unwrapped, name, num_steps=ns, stride=st)
-                out.update(_split_reference_window(win, reference_window_layout(cmd), ns))
+                win = reference_window(unwrapped, name, num_steps=ns, stride=st, blocks=blocks)
+                out.update(_split_reference_window(
+                    win, reference_window_layout(cmd, blocks), ns))
                 return out
             try:
                 for k, v in _traj_obs().items():
@@ -558,9 +562,13 @@ class DataLogger:
                     ]
                     self._ref_num_steps = int(cfg.params.get("num_steps", self._ref_num_steps))
                     self._ref_stride = int(cfg.params.get("stride", self._ref_stride))
+                    blocks = cfg.params.get("blocks")
+                    self._ref_blocks = tuple(blocks) if blocks else None
                     break
             self.metadata["reference_num_steps"] = self._ref_num_steps
             self.metadata["future_stride"] = self._ref_stride
+            self.metadata["reference_blocks"] = list(
+                self._ref_blocks) if self._ref_blocks else "all"
         except Exception as exc:
             print(f"[WARN DataLogger] Could not read reference-window params: {exc}")
 

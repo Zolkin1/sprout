@@ -82,20 +82,40 @@ REFERENCE_STRIDE = 5
 #: mismatch fails loudly when the noise is broadcast against the observation.
 REFERENCE_NUM_EE_FRAMES = 4
 
+#: Which reference blocks the window carries.  The full set is
+#: ``mdp.REFERENCE_WINDOW_BLOCKS`` = base_pose, base_vel, joint_pos, joint_vel, ee_pos.
+#:
+#: Currently REDUCED to pose + velocity + joint angles: the reference joint VELOCITIES and
+#: the ee positions are dropped, to test whether the policy needs them at all.  The ee block
+#: is largely redundant with joint_pos (forward kinematics of the same posture) and the
+#: velocity block is the noisiest thing the FM has to predict at deploy, so if tracking
+#: holds without them the reference gets cheaper to produce and cheaper to observe.
+#:
+#: One knob: the noise vector, the scale vector and the observation itself are all built
+#: from this, so they cannot disagree.  Restore by setting it to ``None``.
+REFERENCE_WINDOW_BLOCKS = ("base_pose", "base_vel", "joint_pos")
+
+#: Shared by BOTH window terms.  ``command_window`` takes no ``blocks`` -- it is a single
+#: 3-channel command, not a packed layout -- so the selection is added only for
+#: ``reference_window`` below.
 _REF_PARAMS = {
     "command_name": "traj_ref",
     "num_steps": REFERENCE_NUM_STEPS,
     "stride": REFERENCE_STRIDE,
 }
 
+_REF_WINDOW_PARAMS = {**_REF_PARAMS, "blocks": REFERENCE_WINDOW_BLOCKS}
+
 #: Per-channel noise for the merged reference window.  A single scalar cannot serve it:
 #: the window mixes metres, radians and rad/s, so the level that is right for a joint
 #: angle is negligible for a joint velocity.  Magnitudes live in
-#: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over the full 11 x 82 layout.
+#: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over whatever
+#: ``REFERENCE_WINDOW_BLOCKS`` selects.
 _REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
     num_steps=REFERENCE_NUM_STEPS,
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+    blocks=REFERENCE_WINDOW_BLOCKS,
 )
 
 #: Per-channel multiplier for the reference window, applied AFTER noise and clipping.
@@ -107,6 +127,7 @@ _REF_SCALE = mdp.reference_window_scale(
     num_steps=REFERENCE_NUM_STEPS,
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+    blocks=REFERENCE_WINDOW_BLOCKS,
 )
 
 
@@ -253,7 +274,7 @@ class G1TeacherObservationsCfg:
         # Per-CHANNEL noise (see _REF_NOISE): position blocks ~cm, velocity blocks
         # 0.25-0.5 in their own units. The clip saturates the velocity channels the way
         # the old joint_vel_ref term did; it is a no-op for the position channels.
-        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_WINDOW_PARAMS,
                                    noise=_REF_NOISE, clip=(-20.0, 20.0), scale=_REF_SCALE)
         command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
@@ -283,7 +304,7 @@ class G1TeacherObservationsCfg:
         # Same reference window the actor's encoder sees, uncorrupted.
         # Same window the actor's encoder sees, uncorrupted -- but identically clipped and
         # scaled, so the two networks read the reference in the same units.
-        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_WINDOW_PARAMS,
                                    clip=(-20.0, 20.0), scale=_REF_SCALE)
         command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
