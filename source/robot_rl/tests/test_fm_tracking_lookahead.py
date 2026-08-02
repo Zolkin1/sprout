@@ -46,14 +46,15 @@ ROBOT_TO_FM = [3, 0, 5, 1, 4, 2]
 
 
 class _BareFmCommand(FmTrackingCommand):
-    """``FmTrackingCommand`` with ``device`` overridden to a plain attribute.
+    """``FmTrackingCommand`` with ``device`` / ``num_envs`` overridden to plain attributes.
 
-    The base class exposes ``device`` as a read-only property off the env; the class
-    attribute here shadows it so a bare instance can be built without one. Everything else
-    is the real class -- the methods under test are inherited unchanged.
+    The base class exposes both as read-only properties off the env; the class attributes
+    here shadow them so a bare instance can be built without one. Everything else is the
+    real class -- the methods under test are inherited unchanged.
     """
 
     device = torch.device("cpu")
+    num_envs = N_ENVS
     # ``CommandTerm.__del__`` touches this; a bare instance never ran the ctor that sets it.
     _debug_vis_handle = None
 
@@ -61,8 +62,11 @@ class _BareFmCommand(FmTrackingCommand):
 def _stub(pred_idx: list[int], fm_update_every: int = 4) -> FmTrackingCommand:
     """A bare command carrying only what the look-ahead accessors read."""
     cmd = object.__new__(_BareFmCommand)
-    cmd.cfg = SimpleNamespace(fm_update_every=fm_update_every)
+    cmd.cfg = SimpleNamespace(fm_update_every=fm_update_every, reference_source="fm")
     cmd.ctx = SimpleNamespace(F=F, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
+    # No diagnostic override in force: the accessors answer for cfg.reference_source.
+    cmd._serve_override = None
+    cmd.fm_enabled = True
     cmd._arange_n = torch.arange(N_ENVS)
     cmd._pred_idx = torch.tensor(pred_idx, dtype=torch.long)
     cmd._checked_max_offset = -1
@@ -214,28 +218,45 @@ def test_teacher_window_fits_the_shipped_horizon():
 # ---------------------------------------------------------------------------
 # The measured side + the CLF must run on every step, for every history_source.
 # ---------------------------------------------------------------------------
-POS_W, VEL_W = 20, 18
+# Wide enough for the real channel layout the window test scatters into: base + K ee
+# frames (pos 3 + ori 4 each), the NJ joints, and one channel the generator never writes.
+POS_W, VEL_W = 30, 26
 
 
-def _update_stub(history_source: str) -> FmTrackingCommand:
+#: What the stubbed CLIP half writes into ``y_des`` -- a value the generator half can never
+#: produce, so "which source is applied" is decidable by inspection.
+CLIP_FILL = 9.0
+
+
+def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackingCommand:
     """A bare command with everything ``_update_command`` touches, stubbed and recorded.
+
+    The CLIP half is stubbed to a constant fill (the real one is the inherited clip path,
+    covered by ``test_segment_placement.py``); the GENERATOR half and the source selection
+    run for real.
 
     Args:
         history_source: The checkpoint's history source to simulate.
+        reference_source: Which reference the command should apply.
 
     Returns:
         The instance; ``cmd.calls`` records which stubbed collaborators fired.
     """
     cmd = object.__new__(_BareFmCommand)
     cmd.calls: list[str] = []
-    cmd.cfg = SimpleNamespace(fm_update_every=4, strict_fm_only=True)
+    cmd.cfg = SimpleNamespace(fm_update_every=4, strict_fm_only=True,
+                              reference_source=reference_source)
     cmd.ctx = SimpleNamespace(F=F, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES),
                               history_source=history_source)
     cmd._resampling = False
+    cmd._building = None
+    cmd._serve_override = None
+    cmd.fm_enabled = True
     cmd.y_des = torch.zeros(N_ENVS, POS_W)
     cmd.dy_des = torch.zeros(N_ENVS, VEL_W)
     cmd.y_act = torch.zeros(N_ENVS, POS_W)
     cmd.dy_act = torch.zeros(N_ENVS, VEL_W)
+    cmd._wf_world_frames = torch.zeros(N_ENVS, 1 + K, 13)
     cmd._joint_slots_pos = torch.arange(NJ)
     cmd._joint_slots_vel = torch.arange(NJ)
     cmd._fm_jperm = torch.arange(NJ)
@@ -247,6 +268,15 @@ def _update_stub(history_source: str) -> FmTrackingCommand:
     # As _post_init leaves them: no reference applied yet.
     cmd._applied_jp = cmd._applied_jv = cmd._applied_frames = None
 
+    def _clip_half():
+        cmd.calls.append("clip")
+        cmd.y_des.fill_(CLIP_FILL)
+        cmd.dy_des.fill_(CLIP_FILL)
+        cmd._y_des_clip = cmd.y_des.clone()
+        cmd._dy_des_clip = cmd.dy_des.clone()
+        cmd._clip_wf_frames = cmd._wf_world_frames
+
+    cmd._build_clip_reference = _clip_half
     cmd._advance_step = lambda: cmd.calls.append("advance")
     cmd._snapshot_and_infer = lambda: cmd.calls.append("infer")
     cmd._write_world_des = lambda frames: cmd.calls.append("write_des")
@@ -303,6 +333,154 @@ def test_strict_fm_only_nans_run_before_the_clf():
     FmTrackingCommand._update_command(cmd)
     assert torch.isnan(cmd.y_des[:, POS_W - 1]).all()
     assert torch.isnan(cmd.dy_des[:, VEL_W - 1]).all()
+
+
+# ---------------------------------------------------------------------------
+# Dual reference source: both are computed, exactly one is applied.
+# ---------------------------------------------------------------------------
+def test_both_references_are_computed_every_step():
+    """Whichever source is applied, both halves run and both caches are filled.
+
+    That is what makes the FM-vs-clip diagnostic possible without a second rollout: the two
+    references are produced from the SAME robot state on the same tick.
+    """
+    for source in ("fm", "clip"):
+        cmd = _update_stub("measured", reference_source=source)
+        FmTrackingCommand._update_command(cmd)
+        assert "clip" in cmd.calls and "infer" in cmd.calls, (source, cmd.calls)
+        # The clip half runs first: the generator must be able to overwrite it.
+        assert cmd.calls.index("clip") < cmd.calls.index("infer")
+        assert torch.equal(cmd._y_des_clip[:, :NJ], torch.full((N_ENVS, NJ), CLIP_FILL))
+        assert torch.equal(cmd._y_des_fm[:, :NJ], torch.zeros(N_ENVS, NJ))
+
+
+def test_reference_source_selects_what_is_applied():
+    """``y_des`` is the named source's cache -- the joint slots tell the two apart."""
+    fm = _update_stub("measured", reference_source="fm")
+    FmTrackingCommand._update_command(fm)
+    assert torch.equal(fm.y_des[:, :NJ], torch.zeros(N_ENVS, NJ))
+
+    clip = _update_stub("measured", reference_source="clip")
+    FmTrackingCommand._update_command(clip)
+    assert torch.equal(clip.y_des[:, :NJ], torch.full((N_ENVS, NJ), CLIP_FILL))
+    # The clip reference is not NaN-poisoned: strict_fm_only guards the GENERATOR cache,
+    # and NaNing the applied clip would take the CLF down with it.
+    assert torch.isfinite(clip.y_des).all()
+    assert torch.isnan(clip._y_des_fm[:, POS_W - 1]).all()
+
+
+@pytest.mark.parametrize("source", ["fm", "clip"])
+def test_as_other_reference_swaps_and_restores(source):
+    """The context managers serve the other source, then put the configured one back."""
+    other = "clip" if source == "fm" else "fm"
+    cmd = _update_stub("measured", reference_source=source)
+    FmTrackingCommand._update_command(cmd)
+    applied = cmd.y_des.clone()
+
+    manager = cmd.as_clip_reference() if other == "clip" else cmd.as_fm_reference()
+    with manager:
+        assert cmd._serving() == other
+        expected = cmd._y_des_clip if other == "clip" else cmd._y_des_fm
+        torch.testing.assert_close(cmd.y_des, expected, equal_nan=True)
+    assert cmd._serving() == source
+    torch.testing.assert_close(cmd.y_des, applied, equal_nan=True)
+
+
+def test_apply_source_keeps_one_stable_y_des_tensor():
+    """``get_desired_outputs`` assigns into ``y_des`` by index, so it cannot be rebound.
+
+    A rebinding ``_apply_source`` would alias the live vector onto a cache and the next
+    step's clip gather would write straight into last step's snapshot.
+    """
+    cmd = _update_stub("measured")
+    before = cmd.y_des
+    FmTrackingCommand._update_command(cmd)
+    assert cmd.y_des is before
+    assert cmd.y_des is not cmd._y_des_fm and cmd.y_des is not cmd._y_des_clip
+
+
+def test_serve_rejects_the_generator_when_none_was_loaded():
+    """The pure-clip control has no generator to report on, and says so."""
+    cmd = _update_stub("measured", reference_source="clip")
+    cmd.fm_enabled = False
+    with pytest.raises(RuntimeError, match="no fm_checkpoint"):
+        with cmd.as_fm_reference():
+            pass
+
+
+@pytest.mark.parametrize(
+    "accessor,args",
+    [("get_future_world_base", ()), ("get_future_joint_state", ()),
+     ("get_future_world_frames", (list(FM_FRAMES),))],
+)
+def test_serving_dispatches_the_lookahead_to_the_clip(monkeypatch, accessor, args):
+    """Under a ``clip`` override every window accessor defers to the inherited clip path.
+
+    ``mdp.reference_window`` is built entirely out of these three, so if one of them kept
+    reading the prediction buffers the "clip" observation would be a silent hybrid: the
+    clip's base with the generator's joints, or similar.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
+        MotionSequenceCommand,
+    )
+
+    cmd = _stub(pred_idx=[0, 0, 0, 0])
+    seen: list[str] = []
+    monkeypatch.setattr(MotionSequenceCommand, accessor,
+                        lambda self, *a: seen.append("clip") or torch.zeros(1))
+
+    offsets = torch.tensor([0, 4])
+    getattr(FmTrackingCommand, accessor)(cmd, *args, offsets)
+    assert seen == [], "the FM source must NOT go through the clip implementation"
+
+    cmd._serve_override = "clip"
+    getattr(FmTrackingCommand, accessor)(cmd, *args, offsets)
+    assert seen == ["clip"]
+
+
+def test_predicted_outputs_window_lands_in_the_y_des_layout():
+    """The whole horizon, scattered into the same channels the applied reference uses.
+
+    ``plot_fm_predictions`` fans these off the tracked line and can only do that if node
+    ``_pred_idx`` of the window equals what ``_fm_current_outputs`` applies -- same channel
+    slots, same joint permutation, same NaN mask.
+    """
+    cmd = _stub(pred_idx=[0, 1, 2, 3])
+    cmd.cfg.strict_fm_only = True
+    cmd.y_des = torch.zeros(N_ENVS, POS_W)
+    cmd.dy_des = torch.zeros(N_ENVS, VEL_W)
+    # base + K ee frames, laid out [base_xyz, ee0_xyz, ...] / [base_quat, ee0_quat, ...].
+    cmd._wf_pos_flat = torch.arange(3 * (1 + K))
+    cmd._wf_ori_flat = torch.arange(3 * (1 + K), 3 * (1 + K) + 4 * (1 + K))
+    cmd._wf_lin_flat = torch.arange(3 * (1 + K))
+    cmd._wf_ang_flat = torch.arange(3 * (1 + K), 6 * (1 + K))
+    cmd._joint_slots_pos = torch.arange(POS_W - NJ - 1, POS_W - 1)
+    cmd._joint_slots_vel = torch.arange(VEL_W - NJ - 1, VEL_W - 1)
+    cmd._fm_jperm = torch.tensor(ROBOT_TO_FM, dtype=torch.long)
+    cmd._unwritten_pos = torch.tensor([POS_W - 1])
+    cmd._unwritten_vel = torch.tensor([VEL_W - 1])
+    cmd._ee_zero_quat = torch.zeros(N_ENVS, K, 4)
+    cmd._ee_zero_quat[..., 3] = 1.0
+    cmd._ee_zero_vec = torch.zeros(N_ENVS, K, 3)
+
+    y, dy = FmTrackingCommand.predicted_outputs_window(cmd)
+    assert y.shape == (N_ENVS, F, POS_W) and dy.shape == (N_ENVS, F, VEL_W)
+    # The base position of every node is the prediction buffer, unpermuted.
+    torch.testing.assert_close(y[:, :, 0:3], cmd._pred_root_pos)
+    torch.testing.assert_close(y[:, :, 3:6], cmd._pred_frame_pos[:, :, 0])
+    # Joints go through the clip-OUTPUT permutation, as the applied write does.
+    torch.testing.assert_close(y[:, :, cmd._joint_slots_pos], cmd._pred_jp[..., cmd._fm_jperm])
+    torch.testing.assert_close(dy[:, :, cmd._joint_slots_vel], cmd._pred_jv[..., cmd._fm_jperm])
+    assert torch.isnan(y[:, :, POS_W - 1]).all() and torch.isnan(dy[:, :, VEL_W - 1]).all()
+
+    # Node _pred_idx of the window == what _fm_current_outputs applies this step.
+    base, ee, jp, jv = FmTrackingCommand._fm_current_outputs(cmd)
+    for e in range(N_ENVS):
+        node = int(cmd._pred_idx[e])
+        torch.testing.assert_close(y[e, node, 0:3], base[e, 0:3])
+        torch.testing.assert_close(y[e, node, 3:6], ee[e, 0, 0:3])
+        torch.testing.assert_close(y[e, node, cmd._joint_slots_pos], jp[e][cmd._fm_jperm])
+        torch.testing.assert_close(dy[e, node, cmd._joint_slots_vel], jv[e][cmd._fm_jperm])
 
 
 # ---------------------------------------------------------------------------

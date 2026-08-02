@@ -28,7 +28,32 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     fm_checkpoint: str = ""
     """Path to the trained robot-state-conditioned flow-matching ``.pt`` checkpoint
-    (``target_source=ego_anchored_clip_future``). Required."""
+    (``target_source=ego_anchored_clip_future``). Required, except with
+    :attr:`reference_source` ``= "clip"``, where an empty value means "no generator at all"."""
+
+    reference_source: str = "fm"
+    """Which reference the policy actually TRACKS: ``"fm"`` or ``"clip"``.
+
+    Both are computed every step regardless -- the command caches the generator's
+    ``y_des``/``dy_des`` and the clip's side by side, and
+    :meth:`~.fm_tracking_cmd.FmTrackingCommand.as_clip_reference` /
+    :meth:`~.fm_tracking_cmd.FmTrackingCommand.as_fm_reference` serve the other one to a
+    caller that asks. This field only decides which of the two is applied.
+
+    ``"clip"`` exists for ONE purpose: the FM-vs-clip diagnostic
+    (``scripts/rsl_rl/fm_debug.py``). Driving from the clip and running the generator
+    PASSIVELY means the two references are evaluated at *exactly the same robot states*, so
+    a difference between them is the generator's, not a consequence of the robot having
+    already diverged. The FM-driven run answers "how does it behave"; this one answers
+    "what would it have said here".
+
+    Pair ``"clip"`` with the TEACHER's anchoring (``ego_anchor_fraction=1.0``,
+    ``ego_anchor_every=1``) -- otherwise the clip reference is not the one the policy was
+    trained against and the baseline is not a baseline. ``fm_debug.py`` does this; the task
+    default stays at the deploy value.
+
+    With ``"clip"`` and an empty :attr:`fm_checkpoint` the generator is not loaded at all --
+    the pure clip control, useful to rule out any FM-induced cost or nondeterminism."""
 
     fm_update_every: int = 1
     """Re-run flow-matching inference every ``K`` control steps (the receding-horizon

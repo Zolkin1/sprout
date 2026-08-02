@@ -28,11 +28,23 @@ quietly tracking the wrong thing.
 The desired/measured outputs are in the world frame, so the inherited CLF and observations
 work uniformly. All base/ee velocities are the **link** (actor-frame) twist (the FM is
 conditioned on ``root_link_{lin,ang}_vel_w``; ``y_act`` comes from ``body_link_vel_w``).
+
+**Both references are computed every step.** The command builds the clip reference and the
+generator reference into separate caches and then APPLIES the one
+:attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.reference_source` names; the other stays
+available through :meth:`FmTrackingCommand.as_clip_reference` /
+:meth:`FmTrackingCommand.as_fm_reference`. That is what lets a diagnostic ask "what would the
+OTHER source have said at this exact robot state" -- for the reference observations, the
+world-frame outputs, and the whole look-ahead window -- without a second rollout. The barrier
+is unchanged: with ``reference_source="fm"`` the applied ``y_des`` is bit-for-bit what it was
+when only the generator was computed (the clip half writes into ``y_des`` first, but every
+channel is then either overwritten by the generator or NaN-filled by ``strict_fm_only``).
 """
 
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import torch
 import warp as wp
@@ -68,11 +80,40 @@ class FmTrackingCommand(MotionSequenceCommand):
         super()._post_init()
         n, dev = self.num_envs, self.device
 
+        if self.cfg.reference_source not in ("fm", "clip"):
+            raise ValueError(
+                f"FmTrackingCommandCfg.reference_source must be 'fm' or 'clip', got "
+                f"{self.cfg.reference_source!r}."
+            )
+        # Reference caches + the "which half is being built / served" flags. Set before any
+        # early return so the accessors below are always safe to call.
+        self._building: str | None = None
+        self._serve_override: str | None = None
+        self._y_des_clip = self.y_des.clone()
+        self._dy_des_clip = self.dy_des.clone()
+        self._clip_wf_frames = self._wf_world_frames.clone()
+        self._y_des_fm = self.y_des.clone()
+        self._dy_des_fm = self.dy_des.clone()
+        self._fm_wf_frames = self._wf_world_frames.clone()
+        # Allocated up front so :meth:`reset` and :attr:`fm_pred_idx` are safe on the
+        # no-generator path too.
+        self._pending_reset = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._pred_idx = torch.zeros(n, dtype=torch.long, device=dev)
+
         if not self.command_velocity_available:
             raise RuntimeError(
                 "FmTrackingCommand requires a clip library with target_vel (the FM velocity "
                 "command). Regenerate clips with a generator that writes it."
             )
+        # The generator is optional in exactly one configuration: the clip-driven control
+        # run, where there is nothing for it to do. Everywhere else a missing checkpoint is
+        # a hard error -- see the message below.
+        self.fm_enabled = bool(self.cfg.fm_checkpoint) or self.cfg.reference_source == "fm"
+        if not self.fm_enabled:
+            print("[INFO FmTrackingCommand] reference_source='clip' with no fm_checkpoint: "
+                  "the generator is not loaded. This is the pure-clip control; nothing here "
+                  "can report on the FM.")
+            return
         if not self.cfg.fm_checkpoint:
             raise ValueError(
                 "No FM checkpoint: pass --fm_checkpoint <path/to/best.pt>. There is "
@@ -97,7 +138,7 @@ class FmTrackingCommand(MotionSequenceCommand):
                   "off the training distribution).")
         if self.ctx.cmd_dim <= 0:
             raise ValueError("FmTrackingCommand expects a command-conditioned FM checkpoint (cmd_dim>0).")
-        if self.cfg.tracking_mode == "body":
+        if self.cfg.tracking_mode == "body" and self.cfg.reference_source == "fm":
             raise ValueError(
                 "FmTrackingCommand does not support tracking_mode='body'. The body CLF grades "
                 "13 '@root' body links, but the generator predicts only the base, the joints "
@@ -107,7 +148,10 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "Note this is about THIS task's CLF, which here is diagnostic only (no "
                 "reward reads it). It says nothing about the teacher you are loading: a "
                 "body-mode teacher runs fine on the default joint-mode tracker, because the "
-                "actor's observation groups are identical in both modes."
+                "actor's observation groups are identical in both modes.\n"
+                "With reference_source='clip' this is allowed: the APPLIED reference is the "
+                "clip, which does carry those links -- only the passive FM cache is short of "
+                "them, and nothing grades it."
             )
         # NOTE: the re-plan cadence is deliberately NOT checked against the recording's
         # fm_snap_every any more -- see FmTrackingCommandCfg.fm_update_every. What still
@@ -157,17 +201,22 @@ class FmTrackingCommand(MotionSequenceCommand):
             if self.ctx.num_extra_frames > 0 else None
         )
 
-        # Prediction buffers + cadence state (every env runs the FM).
-        self._pending_reset = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Prediction buffers + cadence state (every env runs the FM). ``_pending_reset`` and
+        # ``_pred_idx`` are already allocated above, on the path shared with the
+        # no-generator control.
         f, nj, k = self.ctx.F, self.ctx.nj, self.ctx.num_extra_frames
         self._pred_root_pos = torch.zeros(n, f, 3, device=dev)
+        # Identity, not zeros: the buffers are read once before the first inference (the
+        # reset-time resample runs the whole update with no prediction yet), and a
+        # zero quaternion makes the world lift produce NaNs rather than a harmless
+        # placeholder pose. The values are overwritten on the next compute either way.
         self._pred_root_quat = torch.zeros(n, f, 4, device=dev)
+        self._pred_root_quat[..., 3] = 1.0
         self._pred_root_lin = torch.zeros(n, f, 3, device=dev)
         self._pred_root_ang = torch.zeros(n, f, 3, device=dev)
         self._pred_jp = torch.zeros(n, f, nj, device=dev)
         self._pred_jv = torch.zeros(n, f, nj, device=dev)
         self._pred_frame_pos = torch.zeros(n, f, k, 3, device=dev)
-        self._pred_idx = torch.zeros(n, dtype=torch.long, device=dev)
         self._pred_valid = torch.zeros(n, dtype=torch.bool, device=dev)
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         self._last_step_seen = -1
@@ -242,26 +291,19 @@ class FmTrackingCommand(MotionSequenceCommand):
     # Per-step update
     # ------------------------------------------------------------------
     def _update_command(self) -> None:
-        """World-frame desired outputs from the FM alone, then measured outputs + CLF."""
-        self._advance_step()          # clip step counter -- drives the target_vel look-ahead only
-        # Sit out the reset-time resample, for the same reason the re-anchor snapshot does
-        # (see ``MotionSequenceCommand._resample_command``): that call runs with a bogus
-        # ``_step``, and ``_snapshot_and_infer`` is likewise guarded to once per
-        # ``common_step_counter`` -- so a history row appended here would both be taken
-        # around the reset AND stamp the guard, suppressing the real snapshot in the
-        # ``compute()`` that follows. Everything below is harmless to run: it is overwritten
-        # by that same following call.
-        if not self._resampling:
-            self._snapshot_and_infer()
+        """Build BOTH references, apply the configured one, then measured outputs + CLF.
 
-        fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
-        self._write_world_des(torch.cat([fm_base[:, None, :], fm_ee], dim=1))   # [N, nf, 13]
-        self.y_des[:, self._joint_slots_pos] = fm_jp[:, self._fm_jperm]
-        self.dy_des[:, self._joint_slots_vel] = fm_jv[:, self._fm_jperm]
-        self._stash_applied_reference(fm_jp, fm_jv, fm_ee)
-        if self.cfg.strict_fm_only:
-            self.y_des[:, self._unwritten_pos] = torch.nan
-            self.dy_des[:, self._unwritten_vel] = torch.nan
+        The clip half runs first and the generator half second, each caching its own
+        ``y_des``/``dy_des``/world-frame set; :meth:`_apply_source` then installs one of them.
+        Order matters only in that the generator must overwrite the clip in ``y_des`` for
+        ``reference_source="fm"`` to be byte-identical to the FM-only implementation -- which
+        it is, because every channel the generator does not write is NaN-filled by
+        ``strict_fm_only``.
+        """
+        self._build_clip_reference()
+        if self.fm_enabled:
+            self._build_fm_reference()
+        self._apply_source(self.cfg.reference_source)
 
         # Measured outputs in the world frame (identity reference -> no alignment), then the
         # CLF. Deliberately AFTER the strict_fm_only fill: the graded channel subset should
@@ -272,20 +314,186 @@ class FmTrackingCommand(MotionSequenceCommand):
         vdot, vcur = self.clf.compute_vdot(self.y_act, self.y_des, self.dy_act, self.dy_des)
         self.vdot, self.v = vdot, vcur
 
-    def _write_global_base_des(self) -> None:
-        """Disabled: there is no global clip base to grade against here.
+    def _build_clip_reference(self) -> None:
+        """Run the inherited clip path and cache its world-frame outputs.
 
-        On the teacher this re-points ``y_des``'s base channels at the GLOBALLY-placed clip,
-        so the base says WHERE to be while the links say WHAT SHAPE -- and the reward then
-        reads the same reference the drift termination fires on.
-
-        Neither half of that reasoning survives on the generator. The FM's prediction IS the
-        reference, and it is anchored on the robot by construction; there is no
-        globally-placed clip the robot is supposed to be at, and the drift termination that
-        motivated the split is not in this task's termination set. Letting the base run would
-        put clip data straight into the channel the CLF grades hardest -- exactly what
-        ``strict_fm_only`` exists to catch.
+        Exactly ``MotionSequenceCommand._update_command`` minus the CLF (which grades the
+        APPLIED reference and so runs once, in :meth:`_update_command`). ``_advance_step``
+        lives here and is what drives the ``target_vel`` look-ahead the generator conditions
+        on, so it runs whichever source is applied.
         """
+        self._building = "clip"
+        try:
+            self._advance_step()
+            self._reanchor_ego_envs()
+            self._refresh_current_placement()
+            self.get_desired_outputs()             # clip-world y_des/dy_des
+            self._write_world_des(self._clip_world_frames())
+        finally:
+            self._building = None
+        self._y_des_clip = self.y_des.clone()
+        self._dy_des_clip = self.dy_des.clone()
+        self._clip_wf_frames = self._wf_world_frames
+
+    def _build_fm_reference(self) -> None:
+        """Run generator inference and cache its world-frame outputs."""
+        # Sit out the reset-time resample, for the same reason the re-anchor snapshot does
+        # (see ``MotionSequenceCommand._resample_command``): that call runs with a bogus
+        # ``_step``, and ``_snapshot_and_infer`` is likewise guarded to once per
+        # ``common_step_counter`` -- so a history row appended here would both be taken
+        # around the reset AND stamp the guard, suppressing the real snapshot in the
+        # ``compute()`` that follows. Everything below is harmless to run: it is overwritten
+        # by that same following call.
+        if not self._resampling:
+            self._snapshot_and_infer()
+
+        self._building = "fm"
+        try:
+            fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
+            self._write_world_des(torch.cat([fm_base[:, None, :], fm_ee], dim=1))   # [N, nf, 13]
+            self.y_des[:, self._joint_slots_pos] = fm_jp[:, self._fm_jperm]
+            self.dy_des[:, self._joint_slots_vel] = fm_jv[:, self._fm_jperm]
+            self._stash_applied_reference(fm_jp, fm_jv, fm_ee)
+            if self.cfg.strict_fm_only:
+                self.y_des[:, self._unwritten_pos] = torch.nan
+                self.dy_des[:, self._unwritten_vel] = torch.nan
+        finally:
+            self._building = None
+        self._y_des_fm = self.y_des.clone()
+        self._dy_des_fm = self.dy_des.clone()
+        self._fm_wf_frames = self._wf_world_frames
+
+    def _apply_source(self, source: str) -> None:
+        """Install one cached reference as the live ``y_des``/``dy_des`` + world-frame cache.
+
+        Copies IN PLACE rather than rebinding, because ``get_desired_outputs`` writes into
+        ``self.y_des`` with an indexed assignment -- it needs one stable tensor for the whole
+        run, and rebinding would silently alias the live vector onto a cache.
+
+        ``_wf_world_frames`` moves with them: it is what
+        :meth:`~.motion_sequence_cmd.MotionSequenceCommand.reference_world_state` and the
+        recorder read back, so leaving it on the other source would make the world-frame API
+        disagree with ``y_des``.
+
+        Args:
+            source: ``"clip"`` or ``"fm"``.
+        """
+        y, dy, frames = ((self._y_des_fm, self._dy_des_fm, self._fm_wf_frames) if source == "fm"
+                         else (self._y_des_clip, self._dy_des_clip, self._clip_wf_frames))
+        self.y_des.copy_(y)
+        self.dy_des.copy_(dy)
+        self._wf_world_frames = frames
+
+    # ------------------------------------------------------------------
+    # Serving the OTHER source (diagnostics)
+    # ------------------------------------------------------------------
+    def _serving(self) -> str:
+        """Which source the look-ahead accessors currently answer for."""
+        return self._serve_override or self.cfg.reference_source
+
+    @contextmanager
+    def _serve(self, source: str):
+        """Temporarily apply and serve ``source``, restoring the configured one after.
+
+        Swaps BOTH halves of the reference surface, because consumers use both and would
+        otherwise see a mix: ``y_des``/``dy_des`` (read by ``base_pose_error``,
+        ``joint_pos_ref``, ``ee_ref_relative_to_base``, the CLF) and the three look-ahead
+        accessors (read by ``mdp.reference_window``). Swapping only ``y_des`` -- the obvious
+        version -- would silently pair one source's current step with the other's future.
+        """
+        if source not in ("clip", "fm"):
+            raise ValueError(f"reference source must be 'clip' or 'fm', got {source!r}.")
+        if source == "fm" and not self.fm_enabled:
+            raise RuntimeError(
+                "as_fm_reference() needs a generator, but this command was built with "
+                "reference_source='clip' and no fm_checkpoint (the pure-clip control)."
+            )
+        prev_override, prev_source = self._serve_override, self._serving()
+        self._serve_override = source
+        self._apply_source(source)
+        try:
+            yield self
+        finally:
+            self._serve_override = prev_override
+            self._apply_source(prev_source)
+
+    def as_clip_reference(self):
+        """Context manager serving the CLIP reference (outputs + look-ahead) throughout."""
+        return self._serve("clip")
+
+    def as_fm_reference(self):
+        """Context manager serving the GENERATOR reference (outputs + look-ahead) throughout."""
+        return self._serve("fm")
+
+    @property
+    def fm_active(self) -> torch.Tensor:
+        """``[N]`` bool: whether the APPLIED reference is the generator (uniform per run).
+
+        Per-env rather than a scalar because the diagnostics (``data_logger`` and the
+        clip-to-FM transition markers in ``play_plots``) index it per env -- a hangover from
+        when the two sources could be mixed within one rollout. They cannot be today: the
+        source is a config field.
+        """
+        return torch.full((self.num_envs,), self.cfg.reference_source == "fm",
+                          dtype=torch.bool, device=self.device)
+
+    @property
+    def fm_pred_idx(self) -> torch.Tensor:
+        """``[N]`` node currently applied within the predicted window (0 on a re-plan)."""
+        return self._pred_idx
+
+    def predicted_outputs_window(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The whole predicted horizon in the ``y_des`` / ``dy_des`` channel layout.
+
+        ``([N, F, P], [N, F, V])``, so a plot can fan every node of one prediction off the
+        applied line using the same channel names as the tracked reference. Channels the
+        generator does not write are NaN under ``strict_fm_only``, matching the applied
+        vector rather than quietly reading zero.
+
+        Raises:
+            RuntimeError: If this command was built without a generator.
+        """
+        if not self.fm_enabled:
+            raise RuntimeError("predicted_outputs_window() needs a generator; none was loaded.")
+        n, f, k = self.num_envs, self.ctx.F, self.ctx.num_extra_frames
+        y = torch.zeros(n, f, self.y_des.shape[1], device=self.device)
+        dy = torch.zeros(n, f, self.dy_des.shape[1], device=self.device)
+        # [base] + ee, in _wf_frames order -- the same order _write_world_des scatters.
+        pos = torch.cat([self._pred_root_pos[:, :, None, :], self._pred_frame_pos[:, :, :k]], dim=2)
+        y[:, :, self._wf_pos_flat] = pos.reshape(n, f, -1)
+        quat = torch.cat([self._pred_root_quat[:, :, None, :],
+                          self._ee_zero_quat[:, None, :k].expand(n, f, k, 4)], dim=2)
+        y[:, :, self._wf_ori_flat] = quat.reshape(n, f, -1)
+        zeros_ee = self._ee_zero_vec[:, None, :k].expand(n, f, k, 3)
+        dy[:, :, self._wf_lin_flat] = torch.cat(
+            [self._pred_root_lin[:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+        dy[:, :, self._wf_ang_flat] = torch.cat(
+            [self._pred_root_ang[:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+        y[:, :, self._joint_slots_pos] = self._pred_jp[..., self._fm_jperm]
+        dy[:, :, self._joint_slots_vel] = self._pred_jv[..., self._fm_jperm]
+        if self.cfg.strict_fm_only:
+            y[:, :, self._unwritten_pos] = torch.nan
+            dy[:, :, self._unwritten_vel] = torch.nan
+        return y, dy
+
+    def _write_global_base_des(self) -> None:
+        """Re-point the base channels at the GLOBAL clip -- for the CLIP half only.
+
+        On the teacher this makes the base say WHERE to be while the links say WHAT SHAPE, so
+        the reward reads the same reference the drift termination fires on. That reasoning
+        holds for the clip reference here too, and the clip half must reproduce the teacher
+        exactly or it is not a baseline.
+
+        Neither half of it survives on the generator. The FM's prediction IS the reference,
+        and it is anchored on the robot by construction; there is no globally-placed clip the
+        robot is supposed to be at, and the drift termination that motivated the split is not
+        in this task's termination set. Letting the base run there would put clip data
+        straight into the channel the CLF grades hardest -- exactly what ``strict_fm_only``
+        exists to catch.
+        """
+        if self._building == "fm":
+            return
+        super()._write_global_base_des()
 
     def _stash_applied_reference(
         self, fm_jp: torch.Tensor, fm_jv: torch.Tensor, fm_ee: torch.Tensor
@@ -512,11 +720,14 @@ class FmTrackingCommand(MotionSequenceCommand):
     def get_future_world_base(
         self, offsets: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """World-frame future reference base pose+velocity from the FM prediction.
+        """World-frame future reference base pose+velocity for the SERVED source.
 
-        Overrides the clip look-ahead entirely: in this command the reference IS the
-        generator, so there is no per-env source to select.
+        Defaults to ``cfg.reference_source``; inside :meth:`as_clip_reference` /
+        :meth:`as_fm_reference` it answers for that one instead. The clip branch is the
+        inherited implementation verbatim.
         """
+        if self._serving() == "clip":
+            return super().get_future_world_base(offsets)
         ar, idx = self._future_indices(offsets)
         return (
             self._pred_root_pos[ar, idx], self._pred_root_quat[ar, idx],
@@ -524,7 +735,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         )
 
     def get_future_joint_state(self, offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """FM joint pos/vel ``([N, K, nj], [N, K, nj])`` at the future ``offsets``.
+        """Future joint pos/vel ``([N, K, nj], [N, K, nj])`` for the SERVED source.
 
         Returned in the **robot's** joint order, matching the base-class contract (the clip
         implementation gathers ``_base_idx["joint_pos"]``, which is built by iterating
@@ -532,22 +743,27 @@ class FmTrackingCommand(MotionSequenceCommand):
         is mandatory -- and it is ``_fm_to_robot_jperm``, NOT the clip-output ``_fm_jperm``
         used when writing ``y_des``.
         """
+        if self._serving() == "clip":
+            return super().get_future_joint_state(offsets)
         ar, idx = self._future_indices(offsets)
         perm = self._fm_to_robot_jperm
         return self._pred_jp[ar, idx][..., perm], self._pred_jv[ar, idx][..., perm]
 
     def get_future_world_frames(self, frame_names: list[str], offsets: torch.Tensor) -> torch.Tensor:
-        """FM end-effector futures ``[N, K, F, 13]`` at the future ``offsets``.
+        """Future end-effector state ``[N, K, F, 13]`` for the SERVED source.
 
         Layout matches the clip implementation -- ``[pos_w(3), quat_w(4 xyzw), lin_w(3),
-        ang_w(3)]`` -- but the FM predicts POSITION only, so the trailing 10 channels are
-        an identity quaternion and zeros. The one consumer, ``mdp.reference_window``, reads
-        the position; anything reaching for the rest is reading a placeholder, which is why
-        they are constants rather than a stale lift of clip data.
+        ang_w(3)]`` -- but the FM predicts POSITION only, so on that branch the trailing 10
+        channels are an identity quaternion and zeros. The one consumer,
+        ``mdp.reference_window``, reads the position; anything reaching for the rest is
+        reading a placeholder, which is why they are constants rather than a stale lift of
+        clip data.
 
         Raises:
             ValueError: If a requested frame is not one the checkpoint predicts.
         """
+        if self._serving() == "clip":
+            return super().get_future_world_frames(frame_names, offsets)
         missing = [f for f in frame_names if f not in self.ctx.frame_names]
         if missing:
             raise ValueError(
@@ -585,11 +801,19 @@ class FmTrackingCommand(MotionSequenceCommand):
         if not self._scene_alive():
             return
         super()._debug_vis_callback(event)
-        if self.cfg.debug_vis_show_fm_prediction:
+        if self.fm_enabled and self.cfg.debug_vis_show_fm_prediction:
             self._draw_fm_prediction_ribbon()
 
-    def _clip_ribbon_env_mask(self) -> torch.Tensor:
-        """Never draw the inherited CLIP ribbon: no env here tracks the clip."""
+    def _clip_ribbon_env_mask(self) -> torch.Tensor | None:
+        """Draw the inherited CLIP ribbon only when the clip is what the robot tracks.
+
+        With ``reference_source="fm"`` no env tracks the clip, so the ribbon would be a
+        distraction pointing at a reference nothing follows. With ``"clip"`` it is the
+        applied reference and the FM ribbon becomes the overlay -- which is exactly the
+        picture the diagnostic wants.
+        """
+        if self.cfg.reference_source == "clip":
+            return None
         return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def _draw_fm_prediction_ribbon(self) -> None:

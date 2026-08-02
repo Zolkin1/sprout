@@ -33,7 +33,7 @@ try:
 except Exception as exc:  # pragma: no cover - environment without a usable warp runtime
     pytest.skip(f"warp runtime unavailable: {exc}", allow_module_level=True)
 
-from isaaclab.utils.math import quat_apply, quat_mul  # noqa: E402
+from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul  # noqa: E402
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (  # noqa: E402
     REFERENCE_WINDOW_NOISE,
@@ -47,8 +47,10 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
     ref_base_velocity_local,
     reference_window,
     reference_window_layout,
+    reference_window_layout_from_dims,
     reference_window_noise_vector,
     reference_window_scale,
+    reference_window_to_world,
 )
 
 N_ENVS, N_JOINTS, T = 3, 4, 60
@@ -246,6 +248,71 @@ def test_sample_zero_matches_the_current_step_terms(env_cmd):
     torch.testing.assert_close(first[:, 0:6], base_pose_error(env, "traj_ref"))
     torch.testing.assert_close(first[:, 6:12], ref_base_velocity_local(env, "traj_ref"))
     torch.testing.assert_close(first[:, -3 * len(EE_FRAMES):], ee_ref_relative_to_base(env, "traj_ref"))
+
+
+def test_layout_from_dims_matches_the_command_layout(env_cmd):
+    """The dimension-only layout is the same table the command-based one builds."""
+    _, cmd = env_cmd
+    assert reference_window_layout_from_dims(N_JOINTS, len(EE_FRAMES)) == reference_window_layout(cmd)
+
+
+def _to_world(env, cmd, num_steps: int = 11, stride: int = 5) -> dict:
+    """Round-trip the window back to world through :func:`reference_window_to_world`."""
+    window = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride)
+    return reference_window_to_world(
+        window,
+        wp.to_torch(cmd.robot.data.root_pos_w),
+        wp.to_torch(cmd.robot.data.root_quat_w),
+        num_steps=num_steps, num_joints=N_JOINTS, num_ee_frames=len(EE_FRAMES),
+    )
+
+
+def test_window_to_world_recovers_the_reference(env_cmd):
+    """The inverse reproduces exactly the world-frame reference the command served.
+
+    This is the load-bearing check behind the viser overlay: the debugger draws the
+    reference the POLICY saw by inverting the observation, so if the inverse and the
+    forward transform ever disagree the overlay would show a phantom frame error.
+    """
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, 11, 5)
+    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offs)
+    out = _to_world(env, cmd)
+
+    torch.testing.assert_close(out["base_pos_w"], pos_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["base_lin_vel_w"], lin_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["base_ang_vel_w"], ang_w, atol=1e-5, rtol=1e-5)
+    # quat_box_plus normalises the sign, so compare the ROTATION: q_out * q_in^-1 is
+    # identity up to sign, i.e. |w| == 1 and the vector part is zero.
+    n, k = quat_w.shape[:2]
+    diff = quat_mul(out["base_quat_w"].reshape(n * k, 4),
+                    quat_conjugate(quat_w.reshape(n * k, 4)))
+    torch.testing.assert_close(diff[:, :3], torch.zeros(n * k, 3), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(diff[:, 3].abs(), torch.ones(n * k), atol=1e-5, rtol=1e-5)
+
+
+def test_window_to_world_recovers_the_ee_frames_and_joints(env_cmd):
+    """ee positions come back in world; the joint blocks pass through untouched."""
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, 11, 5)
+    ee_w = cmd.get_future_world_frames(EE_FRAMES, offs)[..., 0:3]   # [N, K, F, 3]
+    joint_pos, joint_vel = cmd.get_future_joint_state(offs)
+    out = _to_world(env, cmd)
+
+    torch.testing.assert_close(out["ee_pos_w"], ee_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["joint_pos"], joint_pos, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["joint_vel"], joint_vel, atol=1e-5, rtol=1e-5)
+
+
+def test_window_to_world_rejects_a_width_mismatch(env_cmd):
+    """A window built for a different layout fails loudly instead of reshaping silently."""
+    env, cmd = env_cmd
+    window = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    with pytest.raises(ValueError, match="implies"):
+        reference_window_to_world(
+            window, wp.to_torch(cmd.robot.data.root_pos_w), wp.to_torch(cmd.robot.data.root_quat_w),
+            num_steps=11, num_joints=N_JOINTS + 1, num_ee_frames=len(EE_FRAMES),
+        )
 
 
 def test_joint_block_is_in_robot_order(env_cmd):

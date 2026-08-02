@@ -198,6 +198,45 @@ python scripts/rsl_rl/debug_episodes.py --task G1-teacher-clf-terrain-play ... -
 python scripts/rsl_rl/view_debug_episodes.py bundle.npz     # viser replay + plots, no Isaac
 ```
 
+#### Debugging the generator: `fm_debug.py`
+
+When the tracker follows the clips well but degrades on the FM, this is the tool. It freezes
+**three** clips (a stair transition, a flat walk, a box jump-up) into a small library, rolls
+the tracker over them twice, plots both, and replays both in viser:
+
+```bash
+python scripts/rsl_rl/fm_debug.py --lib clips/g1_mb_v5_body.h5 \
+    --checkpoint logs/rsl_rl/g1/<teacher>/model_XXXX.pt \
+    --fm_checkpoint logs/flow_matching/<fm_run>/best.pt
+# then iterate without touching the GPU:
+python scripts/rsl_rl/fm_debug.py --stage plot --out logs/fm_debug/<run>
+python scripts/rsl_rl/fm_debug.py --stage view --out logs/fm_debug/<run>
+```
+
+The two rollouts differ in exactly one field, `commands.traj_ref.reference_source`:
+
+* **`clip`** — the policy tracks the pre-made clip (the known-good baseline) while the
+  generator runs **passively** every step and its output is recorded. So both references are
+  evaluated at *identical* robot states, and a difference between them is the generator's
+  rather than a consequence of the robot having already diverged.
+* **`fm`** — the policy tracks the generator, from the same spawn pose and the same
+  `target_vel` profile.
+
+Everything is persisted in `<out>/fm_debug.json`, so no argument is retyped across stages
+(and no two stages can disagree). Read the output in this order: `contract_<mode>.txt`
+(the pre-rollout agreement report — checkpoint vs live obs layout, horizon vs window,
+generator frames vs command frames, the depth-camera contract),
+`plots/<mode>/obs_clip_fm_diff_env*.csv` (the reference-observation columns where the two
+sources diverge most, ranked), `plots/compare/` (where the rollouts part), then the viewer.
+
+In viser, the load-bearing comparison is the **FM horizon** layer against the **reference
+window** layer: the window is the generator's prediction after the whole conversion chain
+(world lift → base-relative differencing → observation packing) and back, so they must
+coincide. A constant offset or a yaw twist between them is a frame bug in
+`mdp.reference_window`; agreement moves the search to the generator itself. `--corrupt_obs`
+re-enables training-time observation noise, which the play trims switch off, so the
+"observed" window variant shows how much of the reference the noise eats.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

@@ -41,9 +41,7 @@ import numpy as np
 from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
 from view_clip_viser import (
     _DEFAULT_URDF,
-    _box,
-    _box_terrain_mesh,
-    _stair_terrain_mesh,
+    _terrain_mesh,
     _tube_mesh,
 )
 
@@ -195,48 +193,8 @@ def _scan_points(hits: np.ndarray, vals: np.ndarray, vmin: float, vmax: float):
 
 # --------------------------------------------------------------------------- 3D scene
 
-def _overlay_mesh(m: dict):
-    """Build a tile mesh from the OVERLAY schema (the one MB/current libraries write).
-
-    Each overlay is an axis-aligned box: ``pos_xy`` is its CENTRE in tile-local coords,
-    ``size_xyz`` its full extent, ``base_z`` the bottom face (so the top surface sits at
-    ``base_z + size_xyz[2]`` -- that identity is what matched the raycaster's mesh z-max
-    exactly, which is how the schema was confirmed).
-
-    ``view_clip_viser._stair_terrain_mesh`` handles the LEGACY ``dims`` schema and raises
-    ``KeyError('dims')`` on these, so this is the fallback path.
-    """
-    verts, faces, n = [], [], 0
-    for ov in m.get("overlays", []):
-        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
-        bz = float(ov.get("base_z", 0.0))
-        v, f = _box(px - sx / 2.0, px + sx / 2.0, py - sy / 2.0, py + sy / 2.0, bz, bz + sz)
-        verts.append(np.asarray(v))
-        faces.append(np.asarray(f) + n)
-        n += len(v)
-    if not verts:
-        return None
-    return np.concatenate(verts, 0), np.concatenate(faces, 0)
-
-
-def _terrain_mesh(manifest: list[dict], tid: int):
-    """Rebuild ONE tile's mesh (the tile the robot is on) from the library manifest."""
-    for m in manifest:
-        if int(m.get("terrain_id", -1)) != int(tid):
-            continue
-        if m.get("overlays"):
-            try:
-                return _overlay_mesh(m)
-            except Exception as e:                                   # noqa: BLE001
-                print(f"[WARN] overlay mesh for tid={tid}: {e}")
-        try:                                                          # legacy 'dims' schema
-            if m.get("type") in ("terrain", "transition"):
-                return _stair_terrain_mesh(m)
-            return _box_terrain_mesh(m)
-        except Exception as e:                                       # noqa: BLE001
-            print(f"[WARN] terrain mesh for tid={tid}: {e}")
-            return None
-    return None
+# The tile-mesh builders now live in ``view_clip_viser`` next to the box / stair geometry
+# they call, so this viewer and ``fm_debug_scene`` share one implementation.
 
 
 # ------------------------------------------------------- live height-scan "depth image"

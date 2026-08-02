@@ -37,6 +37,19 @@ silently trains on the wrong terrain). See `README.md` for the stage-by-stage ru
 generation stages, `compare_sim2sim.py`) plus diagnostics. `scripts/flow_matching/` trains
 and exports the FM. Runs are logged to `logs/`.
 
+`scripts/rsl_rl/fm_debug.py` — the FM-vs-clip debugger, and the tool to reach for when the
+tracker follows clips but not the generator. Freezes three clips (stair transition / flat /
+box jump-up) into a small library and rolls the tracker over them twice, differing in ONE
+field, `commands.traj_ref.reference_source`: `"clip"` tracks the pre-made clip while the
+generator runs PASSIVELY (both references evaluated at identical robot states), `"fm"`
+tracks the generator. `FmTrackingCommand` computes both every step and applies one;
+`as_clip_reference()` / `as_fm_reference()` serve the other to a diagnostic — they swap
+`y_des` AND the three look-ahead accessors, since `mdp.reference_window` reads the latter.
+Stages `prep`/`run`/`plot`/`view` share `<out>/fm_debug.json`; `plot` and `view` are
+IsaacLab-free. `mdp.reference_window_to_world` is the exact inverse of the window
+observation, so the viewer can draw what the policy SAW and check it against what the
+generator predicted.
+
 `transfer/` — deployment: `transfer/sim` (MuJoCo sim2sim), `transfer/deploy` (the shared
 torch-free ONNX runtime), `transfer/torch_math` (isaaclab-free torch quaternion math, the
 test-only oracle for the numpy ports), `transfer/obelisk` (ROS2 hardware).

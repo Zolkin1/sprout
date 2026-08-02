@@ -326,6 +326,63 @@ def _box_terrain_mesh(m: dict) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(verts), np.concatenate(faces)
 
 
+def _overlay_mesh(m: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    """Build a tile mesh from the OVERLAY schema (the one MB / current libraries write).
+
+    Each overlay is an axis-aligned box: ``pos_xy`` is its CENTRE in tile-local coords,
+    ``size_xyz`` its full extent, ``base_z`` the bottom face (so the top surface sits at
+    ``base_z + size_xyz[2]`` -- that identity is what matched the raycaster's mesh z-max
+    exactly, which is how the schema was confirmed).
+
+    :func:`_stair_terrain_mesh` handles the LEGACY ``dims`` schema and raises
+    ``KeyError('dims')`` on these, so this is the fallback path.
+    """
+    verts, faces, n = [], [], 0
+    for ov in m.get("overlays", []):
+        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
+        bz = float(ov.get("base_z", 0.0))
+        v, f = _box(px - sx / 2.0, px + sx / 2.0, py - sy / 2.0, py + sy / 2.0, bz, bz + sz)
+        verts.append(np.asarray(v))
+        faces.append(np.asarray(f) + n)
+        n += len(v)
+    if not verts:
+        return None
+    return np.concatenate(verts, 0), np.concatenate(faces, 0)
+
+
+def _terrain_mesh(manifest: list[dict], tid: int) -> tuple[np.ndarray, np.ndarray] | None:
+    """Rebuild ONE tile's mesh from a clip library's terrain manifest.
+
+    The entry point every offline viewer uses to put a recorded rollout on its terrain:
+    tries the overlay schema first, then the legacy ``dims`` one. Returns ``None`` (with a
+    warning) rather than raising, so a viewer still shows the motion when a tile's geometry
+    cannot be rebuilt.
+
+    Args:
+        manifest: The library's ``terrain_manifest`` attribute, already parsed.
+        tid: The tile's ``terrain_id``; ``-1`` (flat) has no entry and yields ``None``.
+
+    Returns:
+        ``(vertices, faces)`` in TILE-LOCAL coordinates -- add the tile corner -- or ``None``.
+    """
+    for m in manifest:
+        if int(m.get("terrain_id", -2)) != int(tid):
+            continue
+        if m.get("overlays"):
+            try:
+                return _overlay_mesh(m)
+            except Exception as e:                                   # noqa: BLE001
+                print(f"[WARN] overlay mesh for tid={tid}: {e}")
+        try:                                                          # legacy 'dims' schema
+            if m.get("type") in ("terrain", "transition"):
+                return _stair_terrain_mesh(m)
+            return _box_terrain_mesh(m)
+        except Exception as e:                                       # noqa: BLE001
+            print(f"[WARN] terrain mesh for tid={tid}: {e}")
+            return None
+    return None
+
+
 def _central_diff(a: np.ndarray, dt: float) -> np.ndarray:
     d = np.zeros_like(a)
     if a.shape[0] > 2:

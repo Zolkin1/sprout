@@ -8,7 +8,7 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_box_minus, quat_inv
+from isaaclab.utils.math import quat_apply, quat_box_minus, quat_box_plus, quat_inv
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
 
 if TYPE_CHECKING:
@@ -235,23 +235,41 @@ def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
     return torch.arange(n, device=cmd.device, dtype=torch.long) * s
 
 
-def reference_window_layout(cmd) -> list[tuple[str, int]]:
-    """Per-step block layout of :func:`reference_window` as ``[(name, width), ...]``.
+def reference_window_layout_from_dims(num_joints: int, num_ee_frames: int) -> list[tuple[str, int]]:
+    """Per-step block layout of :func:`reference_window` from raw dimensions.
 
-    The single source of truth for how one step of the window is packed, so the
-    diagnostics (``scripts/rsl_rl/data_logger.py``) can slice the flat term back
-    into named blocks without restating the layout.  Widths depend on the robot
-    (joint count) and the clip library (ee frame count).
+    The single source of truth for how one step of the window is packed.  Split from
+    :func:`reference_window_layout` so consumers that have only the numbers -- the offline
+    inverse (:func:`reference_window_to_world`) and its tests -- share the same definition
+    rather than restating it.
+
+    Args:
+        num_joints: Robot joint count.
+        num_ee_frames: End-effector frames the clip library exposes.
+
+    Returns:
+        ``[(block_name, width), ...]`` in packing order.
     """
-    nj = len(cmd.robot.joint_names)
-    n_ee = len(cmd.resolve_ee_frames(None))
     return [
         ("base_pose", 6),
         ("base_vel", 6),
-        ("joint_pos", nj),
-        ("joint_vel", nj),
-        ("ee_pos", 3 * n_ee),
+        ("joint_pos", num_joints),
+        ("joint_vel", num_joints),
+        ("ee_pos", 3 * num_ee_frames),
     ]
+
+
+def reference_window_layout(cmd) -> list[tuple[str, int]]:
+    """Per-step block layout of :func:`reference_window` as ``[(name, width), ...]``.
+
+    Resolves the robot's joint count and the clip library's ee-frame count off the command
+    term, then defers to :func:`reference_window_layout_from_dims`.  Used by the diagnostics
+    (``scripts/rsl_rl/data_logger.py``) to slice the flat term back into named blocks
+    without restating the layout.
+    """
+    return reference_window_layout_from_dims(
+        len(cmd.robot.joint_names), len(cmd.resolve_ee_frames(None))
+    )
 
 
 #: Default per-block uniform-noise HALF-WIDTHS for :func:`reference_window`.
@@ -563,6 +581,102 @@ def reference_window(
 
     out = torch.cat([base_pose, base_vel, joint_pos, joint_vel, ee_pos], dim=-1)
     return out.reshape(n, -1)
+
+
+def reference_window_to_world(
+    window: torch.Tensor,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    num_steps: int,
+    num_joints: int,
+    num_ee_frames: int,
+) -> dict[str, torch.Tensor]:
+    """Exact inverse of :func:`reference_window`: put the observation back in the world.
+
+    The window is entirely base-relative by design -- that is what keeps world coordinates
+    away from the policy -- which also makes it impossible to eyeball.  Given the robot's
+    measured base pose at the same step (the frame the forward direction divided out), this
+    reconstructs the world-frame reference the window encodes, so a viewer can draw *what
+    the policy actually saw* next to what the generator predicted.  A frame bug in
+    :func:`reference_window` then shows up as a visible offset or twist between the two,
+    rather than as a plausible-looking vector of numbers.
+
+    Feed the CLEAN window (as ``data_logger`` computes it), not the corrupted observation:
+    noise, ``clip`` and ``scale`` are applied by the observation manager AFTER this layout
+    and are not inverted here.
+
+    Args:
+        window: ``[N, num_steps * D]`` reference window, packed as
+            :func:`reference_window` emits it.
+        root_pos_w: ``[N, 3]`` measured base position at the same step.
+        root_quat_w: ``[N, 4]`` measured base orientation (xyzw) at the same step.
+        num_steps: Samples in the window.
+        num_joints: Robot joint count.
+        num_ee_frames: End-effector frames the window carries.
+
+    Returns:
+        Mapping with ``base_pos_w`` ``[N, K, 3]``, ``base_quat_w`` ``[N, K, 4]`` (xyzw),
+        ``base_lin_vel_w`` / ``base_ang_vel_w`` ``[N, K, 3]``, ``joint_pos`` / ``joint_vel``
+        ``[N, K, nj]`` (robot joint order, frame-invariant so passed through), and
+        ``ee_pos_w`` ``[N, K, E, 3]``.
+
+    Raises:
+        ValueError: If ``window``'s width disagrees with the layout implied by the
+            dimensions.
+
+    Note:
+        ``base_quat_w`` comes back through ``quat_box_plus``, which normalises the sign
+        (``quat_unique``), so it may be the negation of the quaternion that went in.  That
+        is the same rotation; compare rotations, not raw components.
+    """
+    layout = reference_window_layout_from_dims(num_joints, num_ee_frames)
+    per_step = sum(width for _, width in layout)
+    k = max(1, int(num_steps))
+    if window.shape[-1] != k * per_step:
+        raise ValueError(
+            f"reference_window_to_world got a {window.shape[-1]}-wide window but the layout "
+            f"implies {k} x {per_step} = {k * per_step} (num_steps={num_steps}, "
+            f"nj={num_joints}, ee={num_ee_frames})."
+        )
+    n = window.shape[0]
+    stacked = window.reshape(n, k, per_step)
+    blocks: dict[str, torch.Tensor] = {}
+    offset = 0
+    for name, width in layout:
+        blocks[name] = stacked[..., offset:offset + width]
+        offset += width
+
+    root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
+    root_p = root_pos_w[:, None, :].expand(n, k, 3).reshape(n * k, 3)
+
+    # base_pose = [pos_err_b(3), ori_err_b(3)], both expressed in the CURRENT base frame.
+    pos_err_b = blocks["base_pose"][..., 0:3].reshape(n * k, 3)
+    ori_err_b = blocks["base_pose"][..., 3:6].reshape(n * k, 3)
+    pos_w = root_p + quat_apply(root_q, pos_err_b)
+    # Forward: ori_err_w = quat_box_minus(root_q, quat_w), i.e. exp(ori_err_w) * quat_w =
+    # root_q.  So quat_w = exp(-ori_err_w) * root_q = quat_box_plus(root_q, -ori_err_w).
+    ori_err_w = quat_apply(root_q, ori_err_b)
+    quat_w = quat_box_plus(root_q, -ori_err_w)
+
+    lin_w = quat_apply(root_q, blocks["base_vel"][..., 0:3].reshape(n * k, 3))
+    ang_w = quat_apply(root_q, blocks["base_vel"][..., 3:6].reshape(n * k, 3))
+
+    # ee positions are relative to THAT step's reference base, so they lift through
+    # (pos_w, quat_w) -- not through the robot's own pose.
+    ee_pos_w = torch.zeros(n, k, num_ee_frames, 3, device=window.device, dtype=window.dtype)
+    for i in range(num_ee_frames):
+        rel = blocks["ee_pos"][..., 3 * i:3 * i + 3].reshape(n * k, 3)
+        ee_pos_w[:, :, i, :] = (pos_w + quat_apply(quat_w, rel)).reshape(n, k, 3)
+
+    return {
+        "base_pos_w": pos_w.reshape(n, k, 3),
+        "base_quat_w": quat_w.reshape(n, k, 4),
+        "base_lin_vel_w": lin_w.reshape(n, k, 3),
+        "base_ang_vel_w": ang_w.reshape(n, k, 3),
+        "joint_pos": blocks["joint_pos"].clone(),
+        "joint_vel": blocks["joint_vel"].clone(),
+        "ee_pos_w": ee_pos_w,
+    }
 
 
 def command_window(

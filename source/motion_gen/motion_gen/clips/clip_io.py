@@ -18,6 +18,7 @@ never holds more than one batch in memory at once.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import h5py
@@ -29,6 +30,11 @@ from motion_gen.world_lift import _ANCHOR_MASK_LEGACY
 # Sentinel in the per-step ``anchor_mask_t`` dataset meaning "no per-step value here -> use the
 # clip's per-clip ``anchor_mask``".  Valid masks are 6-bit (0..63), so 255 is unambiguous.
 _ANCHOR_MASK_T_UNSET = 255
+
+# ``terrain_id`` of a clip with no terrain tile (flat ground).  Mirrors
+# ``robot_rl...terrains.clip_terrain_loader._FLAT_TERRAIN_ID``, which cannot be imported here
+# (motion_gen stays IsaacLab-free); the value is baked into every library on disk.
+_FLAT_TERRAIN_ID = -1
 
 # Per-step dense datasets, with their on-disk dtype.
 _DENSE_DTYPES: dict[str, str] = {
@@ -326,6 +332,72 @@ def load_clip_library(
                 decoded = v.item() if isinstance(v, np.generic) else v
             (meta if k in meta_keys else attrs)[k] = decoded
     return ClipLibraryData(meta=meta, attrs=attrs, **tensors)
+
+
+def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int]) -> list[dict]:
+    """Copy a clip library keeping only ``clip_indices`` (and only their manifest tiles).
+
+    The point of a subset library is REPRODUCIBILITY: with a handful of clips in the file
+    the terrain importer builds exactly their tiles, the terrain reset has nothing else to
+    sample, and one env per tile therefore replays one known clip every run. That is what
+    ``scripts/rsl_rl/compare_sim2sim.py`` needs (one clip) and what
+    ``scripts/rsl_rl/fm_debug.py`` needs (one per terrain family).
+
+    Every dataset is sliced by the same index list, so per-clip order in the output follows
+    ``clip_indices``. Root attributes are copied verbatim except three that would otherwise
+    describe the SOURCE library:
+
+    * ``num_clips`` / ``num_clips_written`` -- rewritten to the kept count;
+    * ``terrain_manifest`` -- filtered to the tiles the kept clips actually stand on;
+    * ``generator_config.counts.flat`` -- rewritten to the number of kept FLAT clips. The
+      importer sizes its flat-tile count from that field in preference to the clip count
+      (``clip_terrain_loader.default_num_flat_tiles``), so a copied ``flat: 60`` would build
+      60 flat tiles for a 3-clip library and the terrain reset then aborts with "terrain
+      id(s) [-1] have an env tile but NO clips".
+
+    Args:
+        src: Source library ``.h5``.
+        dst: Output ``.h5`` (overwritten).
+        clip_indices: Clip indices to keep, in output order. Must be non-empty and unique.
+
+    Returns:
+        The filtered terrain manifest (one entry per kept non-flat tile).
+
+    Raises:
+        ValueError: If ``clip_indices`` is empty or contains duplicates.
+    """
+    idx = [int(i) for i in clip_indices]
+    if not idx:
+        raise ValueError("write_clip_subset needs at least one clip index.")
+    if len(set(idx)) != len(idx):
+        raise ValueError(f"write_clip_subset got duplicate clip indices: {idx}")
+
+    with h5py.File(str(src), "r") as fi, h5py.File(str(dst), "w") as fo:
+        tid = np.asarray(fi["terrain_id"][:])[idx]
+        for key in fi.keys():
+            d = fi[key]
+            # h5py fancy indexing needs the selection sorted+unique, so gather per clip and
+            # restack in the requested order. The libraries here are per-clip-chunked, so
+            # this is a handful of reads, not a full-file scan.
+            fo.create_dataset(key, data=np.stack([np.asarray(d[i]) for i in idx]), dtype=d.dtype)
+        for key, value in fi.attrs.items():
+            fo.attrs[key] = value
+        keep_tiles = {int(t) for t in tid if int(t) != _FLAT_TERRAIN_ID}
+        manifest = [m for m in json.loads(fi.attrs["terrain_manifest"])
+                    if int(m.get("terrain_id", -2)) in keep_tiles]
+        fo.attrs["terrain_manifest"] = json.dumps(manifest)
+        fo.attrs["num_clips"] = len(idx)
+        fo.attrs["num_clips_written"] = len(idx)
+
+        raw = fi.attrs.get("generator_config")
+        gcfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not isinstance(gcfg, dict):
+            gcfg = {}
+        gcfg.setdefault("counts", {})
+        gcfg["counts"]["flat"] = int(sum(1 for t in tid if int(t) == _FLAT_TERRAIN_ID))
+        gcfg["subset_of"] = {"path": str(src), "clip_indices": idx}
+        fo.attrs["generator_config"] = json.dumps(gcfg)
+    return manifest
 
 
 def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
