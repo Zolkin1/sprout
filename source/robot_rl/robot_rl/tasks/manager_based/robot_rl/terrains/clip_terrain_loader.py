@@ -306,11 +306,26 @@ def assemble_clip_terrain(
         :class:`ClipTerrainLayout`.
 
     Raises:
-        ValueError: If the library has no ``terrain_manifest``.
+        ValueError: If the library has no ``terrain_manifest`` attribute at all, or has an
+            empty one AND no flat tiles to fall back on.
     """
     manifest = lib.attrs.get("terrain_manifest")
-    if not manifest:
+    if manifest is None:
         raise ValueError("clip library has no 'terrain_manifest'; not a terrain-aware library.")
+    if not manifest:
+        # An EMPTY manifest is legitimate: a flat-only library (see
+        # scripts/rsl_rl/make_flat_clip_lib.py) has no stairs or boxes to describe, so every
+        # tile is flat and the manifest is correctly []. Distinguish that from a library
+        # that predates terrain awareness -- which has no attribute at all, caught above.
+        # Only a library with neither manifest entries NOR flat tiles is unusable.
+        n_flat_check = (default_num_flat_tiles(lib) if num_flat_tiles is None
+                        else int(num_flat_tiles))
+        if n_flat_check <= 0:
+            raise ValueError(
+                "clip library has an empty 'terrain_manifest' and no flat tiles, so there "
+                "is no terrain to build. A flat-only subset needs "
+                "generator_config.counts.flat > 0."
+            )
     manifest = sorted(manifest, key=lambda m: int(m["terrain_id"]))
     terr = [m for m in manifest if m["type"] == "terrain"]
     trans = [m for m in manifest if m["type"] == "transition"]
