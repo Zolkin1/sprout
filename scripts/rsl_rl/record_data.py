@@ -426,6 +426,27 @@ def _assemble_state(robot, state_frames, frame_body_idx, n_envs) -> torch.Tensor
     return torch.cat(parts, dim=-1)
 
 
+# TODO(latent-fm): also record the reference ENCODER LATENT per window, so a latent-space
+# FM can be trained without re-deriving it. The teacher is a RefEncoderMLPModel: the
+# `reference` group (reference_window 902 + command_window 33 = 935) goes through
+# [1024, 512, 512] and the trunk only ever sees the resulting 512-d latent. That latent is
+# ~half the width of the window it replaces, so recording it is cheap (~2 KB/window).
+#
+# It IS derivable offline from ref_future + history_state + cmd_future, but only by
+# replicating the observation manager's noise -> clip -> scale ordering exactly and pinning
+# the teacher checkpoint -- the kind of re-derivation that drifts silently, which is why
+# recording it is worth the plumbing.
+#
+# Record the CLEAN latent (an FM target should not be noise-corrupted) and ideally the
+# corrupted one too; the pair measures how much the encoder actually cares about the noise.
+#
+# Two consequences to accept before using it, not after:
+#   * it welds the FM to ONE teacher checkpoint -- today's FM predicts a semantically
+#     defined vector, so any reference_window-consuming teacher can use it;
+#   * a latent is opaque, so it cannot be re-anchored onto the current robot pose or
+#     indexed by a cursor -> fm_update_every is pinned to 1 forever.
+
+
 def _assemble_ref_state(ref_cmd, ref_base_frame: str, state_frames, n_envs) -> torch.Tensor:
     """The APPLIED reference in the ``_assemble_state`` layout ``[N, node]``.
 

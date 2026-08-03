@@ -2,15 +2,31 @@
 
 # Flow-Matching Workflow
 
-A conditional flow-matching transformer that predicts a robot's **future references** —
-base pose + twist, joint pos/vel, and end-effector **positions**, all in the robot's current
-xyz+yaw ground frame — from **state history + exteroception + a velocity command**. Built on
-the open-loop motion-sequence task.
+A conditional flow-matching transformer that predicts the teacher's **`reference_window`
+observation vector directly** — `[base_pose(6), base_vel(6), joint_pos(nj), joint_vel(nj),
+ee_pos(3K)]` per node, `D = 82` for the G1 — from **its own recent output + exteroception +
+a velocity command**.
 
-What it predicts is exactly what the teacher's `reference_window` observation consumes, no
-more: the end-effector frames are position-only, because that observation's `ee_pos` block
-is a position and the tracker's CLF no longer grades ee frames. See
-`robot_rl/flow_matching/transforms.py` for the state layout.
+Two things follow from that, and they are the point of the design:
+
+- **The generator's output IS the policy's observation.** There is no world-frame lift on
+  the path from the network to the tracker, in simulation or at deploy. The state layout is
+  `robot_rl/flow_matching/window.py`, shared by the observation, the dataset and the
+  torch-free deploy port so it cannot drift between them.
+- **It is autoregressive over itself.** The `N` context tokens are the nodes it emitted at
+  the `N` previous control steps, each already relative to the robot as it was at that step,
+  so deploy pushes back what it just served — no base-pose estimate anywhere on the FM path.
+
+`fm_update_every` is pinned to **1**: the window is anchored on the robot at the re-plan, so
+serving it a step later would need the egomotion since then, which is exactly the
+dependency this representation removes. `F = 51` follows
+(`(REFERENCE_NUM_STEPS-1)*REFERENCE_STRIDE + 1`).
+
+The caveat to keep in mind when reading results: at training time the history is the CLIP
+TEACHER's applied reference, never the model's own, so this carries textbook **exposure
+bias**. The defences are `null_cond_prob` and the history-token noise — which is the *same*
+`REFERENCE_WINDOW_NOISE` table the policy's reference observation is corrupted with, because
+both stand in for the same thing (this model's prediction error).
 
 Pipeline: **record data → train → deploy**. Recording needs Isaac Sim; training is pure
 PyTorch (no Isaac). You **record once and train many** FM variants on the same recording —
@@ -24,15 +40,23 @@ The scripts **auto-configure from the data**: they infer `target_source`, `cmd_a
 `clip_device` from the recording's contents, so you rarely pass those flags.
 
 ```bash
-# 1. record teacher rollouts (needs Isaac)
-python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-play \
-    --load_run <teacher-run> --clip <lib.h5> --num_windows 200000 --num_envs 256
+# 1. record teacher rollouts (needs Isaac). Record on the TRAIN task, not -play:
+#    -play trims to 24 envs / 1 terrain row AND disables every domain randomisation,
+#    including the depth-camera noise/intrinsics/extrinsics jitter. Depth is the FM's only
+#    exteroceptive input, so recording on -play trains a generator that has only ever seen
+#    a perfect camera. Observation corruption does NOT corrupt the recorded targets -- the
+#    recorder reads the command term's world state, not the observation tensor.
+python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
+    --load_run <teacher-run> --clip <lib.h5> --clip_device cpu \
+    --num_windows 200000 --history_len 8 --ref_future_len 51 --num_envs 256 --headless
 
-# 2. train the FM (no Isaac)
-python scripts/flow_matching/train.py --data <windows.h5> --wandb
+# 2. train the FM (no Isaac).  --skip_distractors while the distractor family still has
+#    anchor_mask == 0 clips (the recorder warns when it does).
+python scripts/flow_matching/train.py --data <windows.h5> \
+    --cmd_array target_vel --extero_source depth --skip_distractors --wandb
 
 # 3. deploy: the teacher tracks the FM
-python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-play \
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
     --load_run <teacher-run> --fm_checkpoint <fm.pt> --clip <lib.h5> --clip_device cpu
 ```
 
