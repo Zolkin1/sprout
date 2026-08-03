@@ -135,12 +135,18 @@ class FmTrackingCommand(MotionSequenceCommand):
         if int(self.cfg.fm_update_every) < 1:
             raise ValueError(f"fm_update_every must be >= 1, got {self.cfg.fm_update_every}.")
 
+        # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to None
+        # without making the field un-overridable from hydra (see the cfg's docstring).
+        steps = int(self.cfg.fm_num_sampling_steps) or None
         self.ctx = load_fm_context(
             self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
-            num_sampling_steps=self.cfg.fm_num_sampling_steps,
+            num_sampling_steps=steps,
             zero_noise=self.cfg.fm_zero_noise,
             guidance_scale=self.cfg.fm_guidance_scale,
         )
+        if steps is not None:
+            print(f"[INFO FmTrackingCommand] fm_num_sampling_steps={steps} overrides the "
+                  f"checkpoint's; the flow is integrated in {steps} Euler steps.")
         if float(self.cfg.fm_guidance_scale) != 1.0:
             print(f"[INFO FmTrackingCommand] fm_guidance_scale={self.cfg.fm_guidance_scale}: "
                   "classifier-free guidance on the history branch (2x-batch forward per step).")

@@ -75,8 +75,19 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     Cost scales directly with this: the generator is ~99% of per-step inference, so K=1
     makes every control tick pay the full FM cost instead of one tick in K."""
 
-    fm_num_sampling_steps: int | None = None
-    """Override the checkpoint's Euler sampling-step count at inference (``None`` = trained)."""
+    fm_num_sampling_steps: int = 0
+    """Override the checkpoint's Euler sampling-step count at inference (``0`` = trained).
+
+    ``0`` rather than ``None`` because IsaacLab's configclass infers a field's type from its
+    DEFAULT VALUE, so a ``None`` default makes hydra reject every int:
+    ``Incorrect type under namespace /commands/traj_ref/fm_num_sampling_steps. Expected:
+    <class 'NoneType'>, Received: <class 'int'>``. The knob was therefore documented but
+    impossible to set from the command line, which is worse than not having it. Same trap as
+    the noise tensors that cannot live in a cfg at all.
+
+    Raising it reduces the flow's DISCRETISATION error without retraining, so it separates
+    "the sampler is under-resolved" from "the model is wrong". Costs latency in proportion --
+    the generator is ~99% of per-step inference."""
 
     fm_device: str | None = None
     """Device to load the flow-matching model on (``None`` uses the env device)."""

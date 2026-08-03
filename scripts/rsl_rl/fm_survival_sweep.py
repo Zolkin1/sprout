@@ -61,6 +61,17 @@ Four readings, and the first is why this file defaults to 50 envs:
    control has poor LINEAR error (0.617) while surviving best: tracking a clip faithfully is
    not the same as matching the joystick, and only yaw (0.358) shows its true advantage.
 
+Euler sampling steps are NOT the lever (capacity @ckpt_99, teacher-forced, 50 envs):
+
+    K=1  :  8 steps 42/50   32 steps 41/50
+    K=12 :  8 steps 39/50   32 steps 44/50
+
+At K=1 more steps do nothing, so the flow integration is already well resolved at 8 and the
+remaining gap to the clip control is MODEL error, not discretisation. The K=12 pair moved 5
+envs, which is either "plan quality matters more when a plan is served for 12 ticks" or
+run-to-run spread; the K=1 pair bounds the true step effect at about 1 env, so prefer the
+second reading until a second seed says otherwise.
+
 The 24-env K / guidance sweep, kept because it is the only re-plan-rate data and the trend
 survives even though the absolute numbers do not (ceiling there was 22/24):
 
@@ -341,7 +352,8 @@ def _check_assets(gen_names: list[str], ckpts: list[str], library: str,
 
 
 def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
-                  num_envs: int, max_steps: int, seed: int) -> list[str]:
+                  num_envs: int, max_steps: int, seed: int,
+                  sampling_steps: int | None = None) -> list[str]:
     """The full ``play.py`` argv for one measurement.
 
     Args:
@@ -350,6 +362,9 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
         library: Key into :data:`LIBRARIES`.
         k: ``fm_update_every`` (the re-plan period, in control steps).
         num_envs / max_steps / seed: Rollout size and determinism.
+        sampling_steps: Euler steps for the flow integration, or ``None`` to use whatever
+            the checkpoint trained with (8). More steps cut DISCRETISATION error without
+            retraining -- the free half of "is the gap the model or the sampler?".
 
     Returns:
         argv suitable for :func:`subprocess.run`.
@@ -364,6 +379,8 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
     ]
     argv += ["--fm_checkpoint", str(fm_path)]
     argv += [f"env.commands.traj_ref.fm_update_every={k}"]
+    if sampling_steps is not None:
+        argv += [f"env.commands.traj_ref.fm_num_sampling_steps={sampling_steps}"]
     argv += [f"env.commands.traj_ref.{key}={val}" for key, val in cfg.overrides.items()]
     argv += cfg.extra
     return argv
@@ -466,6 +483,12 @@ def main() -> None:
                    help="Comma-separated checkpoints per generator: 'best', 'ckpt_99' (most "
                         "trained), 'ckpt_40' (mid-training), ... Every named generator is "
                         "swept at every named checkpoint.")
+    p.add_argument("--sampling_steps", default="default",
+                   help="Comma-separated Euler step counts for the flow integration, or "
+                        "'default' to use the checkpoint's (8). Raising this is a "
+                        "no-retrain probe: it reduces integration error only, so a gap that "
+                        "closes here was the SAMPLER, not the model. Costs latency "
+                        "proportionally -- the FM is already ~99%% of the deploy budget.")
     p.add_argument("--num_envs", type=int, default=50,
                    help="Rollout width. 50 by default: at 24 the metric resolves to ~4%% per "
                         "env, which is too coarse to read a 2-3 env difference.")
@@ -492,6 +515,8 @@ def main() -> None:
             raise SystemExit(f"unknown {name}(s) {bad}; known: {list(known[1])}")
     ks = [int(v) for v in args.k.split(",")]
     ckpts = args.checkpoints.split(",")
+    steps_list = [None if v.strip() in ("", "default") else int(v)
+                  for v in args.sampling_steps.split(",")]
 
     _check_assets(models, ckpts, args.library, fatal=not args.dry_run)
 
@@ -499,17 +524,19 @@ def main() -> None:
     # (clip_control) gets exactly ONE cell however many generators were named -- running it
     # per generator would repeat an identical rollout and invite reading it as a per-model
     # number, which it is not.
-    cells: list[tuple[str, str, str, int]] = []
+    cells: list[tuple[str, str, str, int, int | None]] = []
     for cname in configs:
         cfg = CONFIGS[cname]
         k_values = ks if cfg.k_matters else ks[:1]
         for k in k_values:
-            if cfg.generator_independent:
-                # One cell. models[0] @ ckpts[0] is loaded only to satisfy the command term;
-                # nothing it predicts reaches the robot.
-                cells.append((models[0], ckpts[0], cname, k))
-            else:
-                cells += [(m, c, cname, k) for m in models for c in ckpts]
+            for st in steps_list:
+                if cfg.generator_independent:
+                    # One cell per (K, steps). models[0] @ ckpts[0] is loaded only to
+                    # satisfy the command term; nothing it predicts reaches the robot, so
+                    # neither axis can move it -- but keep them for a labelled control.
+                    cells.append((models[0], ckpts[0], cname, k, st))
+                else:
+                    cells += [(m, c, cname, k, st) for m in models for c in ckpts]
 
     out_dir = pathlib.Path(args.out) if args.out else (
         REPO / "logs" / "fm_survival" / time.strftime("%Y-%m-%d_%H-%M-%S"))
@@ -523,16 +550,24 @@ def main() -> None:
           f"steps, seed {args.seed} -> {out_dir}\n")
 
     results = []
-    for mname, ckpt, cname, k in cells:
+    for mname, ckpt, cname, k, st in cells:
         gen = GENERATORS[mname]
         independent = CONFIGS[cname].generator_independent
-        tag = f"{cname}_k{k}" if independent else f"{mname}_{ckpt}_{cname}_k{k}"
+        suffix = f"_k{k}" + (f"_s{st}" if st is not None else "")
+        tag = f"{cname}{suffix}" if independent else f"{mname}_{ckpt}_{cname}{suffix}"
         argv = build_command(gen.ckpt_path(ckpt), CONFIGS[cname], args.library, k,
-                             args.num_envs, args.max_steps, args.seed)
+                             args.num_envs, args.max_steps, args.seed, st)
         if args.dry_run:
             print(f"# {tag}\n{' '.join(argv)}\n")
             continue
         log = out_dir / f"{tag}.log"
+        # CLEAR the shared artifacts first. play.py writes stats.txt / tracking_stats.csv to
+        # ONE path per task, so a cell that dies leaves the PREVIOUS cell's files behind --
+        # and copying those reports the previous cell's survival for a run that never
+        # started. That happened: two failed 32-step cells printed their predecessor's
+        # 42/50 with only rc=1 to give it away.
+        for stale in ("stats.txt", "tracking_stats.csv"):
+            (_artifact_dir() / stale).unlink(missing_ok=True)
         print(f"[{time.strftime('%H:%M:%S')}] {tag} ...", flush=True)
         with log.open("w") as fh:
             rc = subprocess.run(argv, stdout=fh, stderr=subprocess.STDOUT,
@@ -550,12 +585,19 @@ def main() -> None:
             if src.is_file():
                 kept[fname] = out_dir / f"{tag}{suffix}"
                 shutil.copy2(src, kept[fname])
-        got = (parse_survival(kept["stats.txt"].read_text(errors="replace"))
-               if "stats.txt" in kept else None) or \
-              parse_survival(log.read_text(errors="replace"))
-        vel = parse_velocity_rmse(kept.get("tracking_stats.csv", pathlib.Path("/nonexistent")))
+        # A non-zero exit means nothing about this cell is trustworthy, so do not parse at
+        # all -- belt and braces with the artifact clearing above.
+        if rc != 0:
+            got, vel = None, {}
+        else:
+            got = (parse_survival(kept["stats.txt"].read_text(errors="replace"))
+                   if "stats.txt" in kept else None) or \
+                  parse_survival(log.read_text(errors="replace"))
+            vel = parse_velocity_rmse(
+                kept.get("tracking_stats.csv", pathlib.Path("/nonexistent")))
         row = {"generator": "-" if independent else mname,
                "checkpoint": "-" if independent else ckpt, "config": cname, "k": k,
+               "sampling_steps": st if st is not None else "ckpt",
                "loaded_checkpoint": str(gen.ckpt_path(ckpt)), "returncode": rc,
                "log": str(log), **(got or {}), **vel}
         results.append(row)
@@ -577,7 +619,8 @@ def main() -> None:
                         for m in models},
          "recordings": RECORDINGS, "results": results}, indent=2, default=str))
 
-    labels = [f"{r['generator']}@{r['checkpoint']} {r['config']} K={r['k']}" for r in results]
+    labels = [f"{r['generator']}@{r['checkpoint']} {r['config']} K={r['k']} "
+              f"s={r['sampling_steps']}" for r in results]
     width = max((len(x) for x in labels), default=20)
     print(f"\n=== {args.library} library, {args.num_envs} envs, seed {args.seed}, "
           f"{args.max_steps} steps ===")
@@ -585,10 +628,13 @@ def main() -> None:
     print(f"  {'':<{width}}  {'':>9}  {'m/s':>6}  {'m/s':>6}  {'rad/s':>6}")
     for label, r in zip(labels, results):
         got = (f"{r['envs_up']}/{r['envs_total']}" if "envs_up" in r
-               else f"rc={r['returncode']}")
+               else f"FAILED rc={r['returncode']}")
         v = [r.get(f"vel_rmse_{c}") for c in VEL_CHANNELS]
         vs = "  ".join(f"{x:6.3f}" if x is not None else "     -" for x in v)
         print(f"  {label:<{width}}  {got:>9}  {vs}")
+    n_failed = sum(1 for r in results if "envs_up" not in r)
+    if n_failed:
+        print(f"\n  !! {n_failed}/{len(results)} cell(s) FAILED -- their logs in {out_dir}")
     print("\n  survival = envs that stayed up for a full 20 s episode")
     print("  vx/vy/wz = RMSE of measured base velocity vs the COMMANDED joystick velocity,")
     print("             over EVERY logged step (so pre-fall flailing counts against a model);")
