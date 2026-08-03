@@ -1042,8 +1042,16 @@ class FmTrackingCommand(MotionSequenceCommand):
         whether or not the base drew anything, and :meth:`_draw_fm_prediction_ribbon` reads
         ``self.device`` -- another env-backed property. See
         :meth:`MotionSequenceCommand._scene_alive`.
+
+        Also bails when ``_post_init`` did not finish. Isaac Lab registers this callback
+        from ``CommandTerm.__init__``, i.e. BEFORE ``_post_init`` runs, so a config error in
+        there (a stale FM checkpoint, say) leaves a half-built term that the callback then
+        walks -- turning one legible ValueError into three stacked tracebacks with the real
+        cause buried in the middle. ``_fm_pred_specs`` is set late in ``_post_init``, after
+        the checkpoint load and every buffer the ribbon reads, so its absence is a good
+        proxy for "not finished building".
         """
-        if not self._scene_alive():
+        if not self._scene_alive() or getattr(self, "_fm_pred_specs", None) is None:
             return
         super()._debug_vis_callback(event)
         if self.fm_enabled and self.cfg.debug_vis_show_fm_prediction:
