@@ -60,8 +60,9 @@ from robot_rl.flow_matching.online import (
     build_extero_tokens,
     build_history_tokens,
     load_fm_context,
-    sample_world,
+    sample_window,
 )
+from robot_rl.flow_matching.window import window_to_world, world_to_window
 
 from .motion_sequence_cmd import MotionSequenceCommand
 from .fm_tracking_cmd_cfg import FmTrackingCommandCfg
@@ -95,10 +96,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._y_des_fm = self.y_des.clone()
         self._dy_des_fm = self.dy_des.clone()
         self._fm_wf_frames = self._wf_world_frames.clone()
-        # Allocated up front so :meth:`reset` and :attr:`fm_pred_idx` are safe on the
-        # no-generator path too.
+        # Allocated up front so :meth:`reset` is safe on the no-generator path too.
         self._pending_reset = torch.zeros(n, dtype=torch.bool, device=dev)
-        self._pred_idx = torch.zeros(n, dtype=torch.long, device=dev)
+        # Offset of the node being served. Always 0 -- fm_update_every is pinned to 1 --
+        # kept as a tensor so the look-ahead helpers take one code path.
+        self._zero_offset = torch.zeros(1, dtype=torch.long, device=dev)
 
         if not self.command_velocity_available:
             raise RuntimeError(
@@ -131,7 +133,11 @@ class FmTrackingCommand(MotionSequenceCommand):
             self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
             num_sampling_steps=self.cfg.fm_num_sampling_steps,
             zero_noise=self.cfg.fm_zero_noise,
+            guidance_scale=self.cfg.fm_guidance_scale,
         )
+        if float(self.cfg.fm_guidance_scale) != 1.0:
+            print(f"[INFO FmTrackingCommand] fm_guidance_scale={self.cfg.fm_guidance_scale}: "
+                  "classifier-free guidance on the history branch (2x-batch forward per step).")
         if self.cfg.fm_zero_noise:
             print("[INFO FmTrackingCommand] fm_zero_noise=True: the flow integrates from x0=0, "
                   "so predictions are deterministic given the conditioning (diagnostic mode, "
@@ -165,19 +171,19 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"frames {ee_frames}; re-record/-train the FM with matching --state_frames."
             )
 
-        # Rolling per-env history of the LIVE ROBOT state (N steps), in FM joint/frame order.
+        # Rolling per-env history of the N reference-window nodes this command last
+        # SERVED -- the generator's own output, not the robot's state. That is the
+        # autoregression, and it is why nothing here needs a base-pose estimate.
         self._history = BatchedHistory(n, self.ctx.N, dev)
 
         # World-frame index maps in FM frame order ([base] + FM ee), so the per-step write
         # aligns the FM frames with the output channels without a permutation.
         self._build_world_frame_maps([self.cfg.base_frame_name] + list(self.ctx.frame_names))
 
-        # Joint slots (clip-output order) + the two joint permutations. These are DIFFERENT
-        # maps and mixing them silently scrambles the reference:
-        #   _fm_jperm        : FM order -> clip-OUTPUT slot order (writing y_des/dy_des)
-        #   _robot_to_fm_jperm: robot order -> FM order (reading robot.data)
-        #   _fm_to_robot_jperm: FM order -> ROBOT order (serving get_future_joint_state,
-        #                       whose contract is the robot's own joint order)
+        # Joint slots (clip-output order) + the one remaining permutation:
+        #   _fm_jperm : ROBOT order -> clip-OUTPUT slot order, for writing y_des/dy_des.
+        # The read-side permutations are gone: the window's joint block is robot order,
+        # so the accessors serve it straight through (checked below).
         joint_out_names = [nm.split(":", 1)[1] for nm in self.ordered_pos_output_names if nm.startswith("joint:")]
         self._joint_slots_pos = torch.tensor(
             [self.ordered_pos_output_names.index(f"joint:{nm}") for nm in joint_out_names],
@@ -190,33 +196,63 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._fm_jperm = torch.tensor(
             [self.ctx.joint_names.index(nm) for nm in joint_out_names], dtype=torch.long, device=dev
         )
+        # The window's joint block is defined in the ROBOT's joint order (that is the
+        # ``reference_window`` contract, so the blocks line up elementwise with the
+        # proprioception terms), and the FM predicts window nodes -- so the checkpoint's
+        # joint order has to BE the robot's. There is no permutation to apply any more;
+        # check instead, because a mismatch would silently scramble every joint.
         robot_joints = list(self.robot.data.joint_names)
-        self._robot_to_fm_jperm = torch.tensor(
-            [robot_joints.index(nm) for nm in self.ctx.joint_names], dtype=torch.long, device=dev
-        )
-        # Inverse of the above: for a permutation, argsort IS the inverse.
-        self._fm_to_robot_jperm = torch.argsort(self._robot_to_fm_jperm)
-        self._ee_body_idx = (
-            torch.tensor([self.robot.body_names.index(f) for f in self.ctx.frame_names], dtype=torch.long, device=dev)
-            if self.ctx.num_extra_frames > 0 else None
-        )
+        if list(self.ctx.joint_names) != robot_joints:
+            raise ValueError(
+                "FM checkpoint joint order differs from the robot's, but the reference "
+                "window's joint block is defined in ROBOT order.\n"
+                f"  checkpoint: {list(self.ctx.joint_names)}\n"
+                f"  robot:      {robot_joints}\n"
+                "Re-record and retrain: the recorder's state_joint_names must be the "
+                "robot's joint order."
+            )
 
-        # Prediction buffers + cadence state (every env runs the FM). ``_pending_reset`` and
-        # ``_pred_idx`` are already allocated above, on the path shared with the
-        # no-generator control.
-        f, nj, k = self.ctx.F, self.ctx.nj, self.ctx.num_extra_frames
-        self._pred_root_pos = torch.zeros(n, f, 3, device=dev)
-        # Identity, not zeros: the buffers are read once before the first inference (the
-        # reset-time resample runs the whole update with no prediction yet), and a
-        # zero quaternion makes the world lift produce NaNs rather than a harmless
-        # placeholder pose. The values are overwritten on the next compute either way.
-        self._pred_root_quat = torch.zeros(n, f, 4, device=dev)
-        self._pred_root_quat[..., 3] = 1.0
-        self._pred_root_lin = torch.zeros(n, f, 3, device=dev)
-        self._pred_root_ang = torch.zeros(n, f, 3, device=dev)
-        self._pred_jp = torch.zeros(n, f, nj, device=dev)
-        self._pred_jv = torch.zeros(n, f, nj, device=dev)
-        self._pred_frame_pos = torch.zeros(n, f, k, 3, device=dev)
+        # ONE prediction buffer: the F reference-window nodes, in exactly the layout the
+        # policy observes. No world-frame mirror -- ``window_to_world`` derives that on
+        # demand for the diagnostic CLF and the debug ribbon, sim-side only.
+        if self.cfg.history_from not in ("generator", "clip"):
+            raise ValueError(
+                f"history_from={self.cfg.history_from!r} must be 'generator' or 'clip'."
+            )
+        # Printed UNCONDITIONALLY. Which history the generator is eating changes the
+        # result more than anything else on this command, and a message that appears only
+        # in the non-default case makes "no message" ambiguous with "I did not look".
+        if self.cfg.history_from == "clip":
+            print("[INFO FmTrackingCommand] history_from='clip': TEACHER FORCING. The "
+                  "generator conditions on the clip's nodes, not its own -- a diagnostic "
+                  "for separating a weak model from a diverging closed loop. This is NOT "
+                  "deployable; there is no clip on the robot.")
+        else:
+            print(f"[INFO FmTrackingCommand] history_from='generator': CLOSED LOOP -- the "
+                  f"generator conditions on its own last {self.ctx.N} served nodes. "
+                  f"re-plan K={self.cfg.fm_update_every}"
+                  + (" (nodes re-anchored onto the current robot each step)"
+                     if int(self.cfg.fm_update_every) > 1 else ""))
+        # Last step's CLIP node, for history_from="clip". The history row must be the
+        # PREVIOUS step's (see _push_served_node), and _advance_step has already moved the
+        # clip on by the time the push happens -- so it is stashed a step ahead.
+        self._prev_clip_node: torch.Tensor | None = None
+        self._clip_node_valid = torch.zeros(n, dtype=torch.bool, device=dev)
+
+        f, d, k = self.ctx.F, self.ctx.D, self.ctx.num_extra_frames
+        self._pred_window = torch.zeros(n, f, d, device=dev)
+        # Node currently being served within the window; 0 on a re-plan, +1 per step after.
+        self._pred_idx = torch.zeros(n, dtype=torch.long, device=dev)
+        # The robot pose the live prediction is expressed RELATIVE TO -- captured at the
+        # re-plan. With fm_update_every > 1 the robot moves away from it between re-plans,
+        # so every served node has to be re-anchored onto the robot NOW (see
+        # :meth:`_reanchor_to_now`). At K=1 these are the current pose and it is a no-op.
+        self._anchor_pos = torch.zeros(n, 3, device=dev)
+        self._anchor_quat = torch.zeros(n, 4, device=dev)
+        self._anchor_quat[:, 3] = 1.0
+        # Served node of the PREVIOUS step, already re-anchored onto the robot as it was
+        # then -- which is the frame the dataset's history rows use.
+        self._prev_served_node: torch.Tensor | None = None
         self._pred_valid = torch.zeros(n, dtype=torch.bool, device=dev)
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         self._last_step_seen = -1
@@ -233,15 +269,6 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._ee_zero_quat[..., 3] = 1.0
         self._ee_zero_vec = torch.zeros(n, max(k, 1), 3, device=dev)
 
-        # Last applied reference, for history_source="reference_partial" (see
-        # :meth:`_stash_applied_reference`). None until the first step has produced one.
-        self._applied_jp: torch.Tensor | None = None
-        self._applied_jv: torch.Tensor | None = None
-        self._applied_frames: torch.Tensor | None = None
-        if self.ctx.history_source == "reference_partial":
-            print("[INFO FmTrackingCommand] history_source='reference_partial': the FM "
-                  "conditions on its OWN last-applied joints/ee (measured root only).")
-
         self._build_strict_masks()
 
         # --- FM-prediction debug ribbon: map each ribbon frame (base built by the base
@@ -252,9 +279,9 @@ class FmTrackingCommand(MotionSequenceCommand):
                 self._fm_pred_specs.append((name, color, "base", -1))
             elif name in self.ctx.frame_names:
                 self._fm_pred_specs.append((name, color, "frame", self.ctx.frame_names.index(name)))
-        # Show EVERY predicted node in the FM ribbon (dense), independent of the
-        # clip ribbon's debug_vis_stride subsampling.
-        self._fm_debug_offsets = torch.arange(0, self.ctx.F, dtype=torch.long, device=dev)
+        # The ribbon draws EVERY predicted node (dense), independent of the clip
+        # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
+        # rather than through the cursor, so it needs no offset table.
 
     def _build_strict_masks(self) -> None:
         """Index the output channels the FM does NOT write, for ``strict_fm_only``.
@@ -353,7 +380,6 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._write_world_des(torch.cat([fm_base[:, None, :], fm_ee], dim=1))   # [N, nf, 13]
             self.y_des[:, self._joint_slots_pos] = fm_jp[:, self._fm_jperm]
             self.dy_des[:, self._joint_slots_vel] = fm_jv[:, self._fm_jperm]
-            self._stash_applied_reference(fm_jp, fm_jv, fm_ee)
             if self.cfg.strict_fm_only:
                 self.y_des[:, self._unwritten_pos] = torch.nan
                 self.dy_des[:, self._unwritten_vel] = torch.nan
@@ -437,11 +463,6 @@ class FmTrackingCommand(MotionSequenceCommand):
         return torch.full((self.num_envs,), self.cfg.reference_source == "fm",
                           dtype=torch.bool, device=self.device)
 
-    @property
-    def fm_pred_idx(self) -> torch.Tensor:
-        """``[N]`` node currently applied within the predicted window (0 on a re-plan)."""
-        return self._pred_idx
-
     def predicted_outputs_window(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The whole predicted horizon in the ``y_des`` / ``dy_des`` channel layout.
 
@@ -450,27 +471,30 @@ class FmTrackingCommand(MotionSequenceCommand):
         generator does not write are NaN under ``strict_fm_only``, matching the applied
         vector rather than quietly reading zero.
 
+        Diagnostic only -- it lifts the window to world through the robot's measured pose.
+
         Raises:
             RuntimeError: If this command was built without a generator.
         """
         if not self.fm_enabled:
             raise RuntimeError("predicted_outputs_window() needs a generator; none was loaded.")
         n, f, k = self.num_envs, self.ctx.F, self.ctx.num_extra_frames
+        w = self._pred_world(torch.arange(f, device=self.device))
         y = torch.zeros(n, f, self.y_des.shape[1], device=self.device)
         dy = torch.zeros(n, f, self.dy_des.shape[1], device=self.device)
         # [base] + ee, in _wf_frames order -- the same order _write_world_des scatters.
-        pos = torch.cat([self._pred_root_pos[:, :, None, :], self._pred_frame_pos[:, :, :k]], dim=2)
+        pos = torch.cat([w["base_pos_w"][:, :, None, :], w["ee_pos_w"][:, :, :k]], dim=2)
         y[:, :, self._wf_pos_flat] = pos.reshape(n, f, -1)
-        quat = torch.cat([self._pred_root_quat[:, :, None, :],
+        quat = torch.cat([w["base_quat_w"][:, :, None, :],
                           self._ee_zero_quat[:, None, :k].expand(n, f, k, 4)], dim=2)
         y[:, :, self._wf_ori_flat] = quat.reshape(n, f, -1)
         zeros_ee = self._ee_zero_vec[:, None, :k].expand(n, f, k, 3)
         dy[:, :, self._wf_lin_flat] = torch.cat(
-            [self._pred_root_lin[:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+            [w["base_lin_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
         dy[:, :, self._wf_ang_flat] = torch.cat(
-            [self._pred_root_ang[:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
-        y[:, :, self._joint_slots_pos] = self._pred_jp[..., self._fm_jperm]
-        dy[:, :, self._joint_slots_vel] = self._pred_jv[..., self._fm_jperm]
+            [w["base_ang_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+        y[:, :, self._joint_slots_pos] = w["joint_pos"][..., self._fm_jperm]
+        dy[:, :, self._joint_slots_vel] = w["joint_vel"][..., self._fm_jperm]
         if self.cfg.strict_fm_only:
             y[:, :, self._unwritten_pos] = torch.nan
             dy[:, :, self._unwritten_vel] = torch.nan
@@ -495,65 +519,60 @@ class FmTrackingCommand(MotionSequenceCommand):
             return
         super()._write_global_base_des()
 
-    def _stash_applied_reference(
-        self, fm_jp: torch.Tensor, fm_jv: torch.Tensor, fm_ee: torch.Tensor
-    ) -> None:
-        """Keep this step's applied reference for a partially autoregressive history.
+    def _clip_history_node(self) -> torch.Tensor:
+        """The CLIP's window node for the current step, anchored on the robot now.
 
-        Only used when the checkpoint says ``history_source="reference_partial"``; the next
-        step's :meth:`_robot_snapshot` reads it in place of the measured joints/ee. Storing
-        it here (in FM order, as ``_run_fm`` wants it) rather than re-deriving from ``y_des``
-        avoids a round trip through the clip-output permutation.
+        The teacher-forcing counterpart of the served node, and byte-for-byte the row the
+        DATASET builds a history from: ``MotionSequenceCommand.reference_window_obs`` at
+        offset 0 is the applied reference at this step expressed relative to the measured
+        robot at this step, which is exactly ``history_ref[h]`` against ``history_state[h]``.
 
-        The one-step lag is the convention, not an oversight: the recorder reads ``y_des``
-        pre-step and so captures step ``t-1``'s reference too. Autoregression cannot do
-        better -- this step's reference is what we are in the middle of computing.
+        Forces the clip branch through ``_serve_override`` rather than
+        :meth:`as_clip_reference`, deliberately: that context manager also swaps
+        ``y_des``/``dy_des`` in place, and this runs mid-way through building the generator's
+        reference, where clobbering the live output vector would be a real side effect. Only
+        the look-ahead accessors need redirecting.
         """
-        if self.ctx.history_source != "reference_partial":
-            return
-        self._applied_jp = fm_jp.clone()
-        self._applied_jv = fm_jv.clone()
-        # [N, K, 13] world frames -> the ee half only; the FM predicts position, and the
-        # snapshot's frame layout is [pos(3), quat(4), lin(3), ang(3)].
-        self._applied_frames = fm_ee.clone() if self.ctx.num_extra_frames > 0 else None
+        prev = self._serve_override
+        self._serve_override = "clip"
+        try:
+            return super().reference_window_obs(self._zero_offset)[:, 0]
+        finally:
+            self._serve_override = prev
 
-    # ------------------------------------------------------------------
-    # Robot-state history snapshot + inference (once per control step)
-    # ------------------------------------------------------------------
-    def _robot_snapshot(self, ids: torch.Tensor | slice = slice(None)) -> dict[str, torch.Tensor]:
-        """Snapshot one history row (FM joint/frame order, world frame) for ``ids``.
+    def _push_served_node(self) -> None:
+        """Push one row into the autoregressive history (see ``cfg.history_from``).
 
-        The root pose/twist is ALWAYS the measured robot -- that is what re-grounds the
-        generator in reality every re-plan, and it is also the frame everything else is
-        expressed in. Under ``history_source="reference_partial"`` the joints and ee
-        positions instead come from the reference applied last step (the generator's own
-        output), making the model partially autoregressive on the posture channels.
+        Normally the node this command SERVED last step -- node 0 of the previous
+        prediction, the reference the tracker was actually following. It is already
+        expressed relative to the robot as it was at that step, which is exactly the per-row
+        anchoring the dataset builds, so there is nothing to transform and no base pose to
+        estimate.
+
+        Under ``history_from="clip"`` it is instead the CLIP's node for the previous step:
+        teacher forcing, to tell a weak model apart from a diverging loop.
+
+        Either way the row is from the PREVIOUS step, which is the convention the dataset
+        uses (the history block is the N rows BEFORE node 0). For the clip that means
+        pushing the value stashed last step, not the one available now -- ``_advance_step``
+        has already moved the clip on to the current step by the time this runs.
+
+        Before the first inference (and for the first ``N`` steps after a reset) there is
+        nothing real to push; zeros go in and :meth:`BatchedHistory.null_mask` tells the model
+        to use its learned ``null_history`` embedding instead of reading them.
         """
-        d = self.robot.data
-        snap = {
-            "root_pos": wp.to_torch(d.root_pos_w)[ids].clone(),
-            "root_quat": wp.to_torch(d.root_quat_w)[ids].clone(),           # xyzw
-            "root_lin": wp.to_torch(d.root_link_lin_vel_w)[ids].clone(),
-            "root_ang": wp.to_torch(d.root_link_ang_vel_w)[ids].clone(),
-        }
-        applied_jp = getattr(self, "_applied_jp", None)
-        if self.ctx.history_source == "reference_partial" and applied_jp is not None:
-            snap["jp"] = applied_jp[ids].clone()
-            snap["jv"] = self._applied_jv[ids].clone()
-            if self._ee_body_idx is not None:
-                snap["frames"] = self._applied_frames[ids].clone()          # [.,K,13]
-            return snap
-
-        # Measured (the default, and the first step of a partially autoregressive run,
-        # before any reference has been applied).
-        snap["jp"] = wp.to_torch(d.joint_pos)[ids][:, self._robot_to_fm_jperm].clone()
-        snap["jv"] = wp.to_torch(d.joint_vel)[ids][:, self._robot_to_fm_jperm].clone()
-        if self._ee_body_idx is not None:
-            fp = wp.to_torch(d.body_pos_w)[ids][:, self._ee_body_idx]
-            fq = wp.to_torch(d.body_quat_w)[ids][:, self._ee_body_idx]
-            fl = wp.to_torch(d.body_link_vel_w)[ids][:, self._ee_body_idx]  # [.,K,6]
-            snap["frames"] = torch.cat([fp, fq, fl[..., :3], fl[..., 3:]], dim=-1).clone()  # [.,K,13]
-        return snap
+        if self.cfg.history_from == "clip":
+            stash = self._prev_clip_node
+            node = (torch.zeros_like(self._pred_window[:, 0]) if stash is None
+                    else torch.where(self._clip_node_valid[:, None], stash,
+                                     torch.zeros_like(stash)))
+            self._prev_clip_node = self._clip_history_node()
+            self._clip_node_valid = torch.ones_like(self._pred_valid)
+        else:
+            stash = self._prev_served_node
+            node = (torch.zeros_like(self._pred_window[:, 0]) if stash is None
+                    else torch.where(self._pred_valid[:, None], stash, torch.zeros_like(stash)))
+        self._history.append({"node": node})
 
     def _read_extero(self) -> torch.Tensor:
         """Live exteroception reading for the sensor this FM checkpoint was trained on.
@@ -577,7 +596,14 @@ class FmTrackingCommand(MotionSequenceCommand):
         raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
 
     def _snapshot_and_infer(self) -> None:
-        """Append the live robot state to history and (re-)run FM inference once per step."""
+        """Push the served node into history and re-run FM inference (once per step).
+
+        ``fm_update_every`` is pinned to 1 (checked in ``_post_init``), so this re-plans every
+        control step and node 0 is always "now" -- there is no cursor to advance. That is a
+        requirement, not a simplification: the prediction is expressed relative to the robot
+        AT THE RE-PLAN, so serving it a step later would need the egomotion since then to
+        re-anchor, and removing that dependency is the point of the representation.
+        """
         step = int(getattr(self.env, "common_step_counter", self._last_step_seen + 1))
         if step == self._last_step_seen:
             return
@@ -587,31 +613,37 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._pending_reset[just_reset] = False
         if bool(just_reset.any()):
             self._pred_valid = self._pred_valid & ~just_reset
-            self._pred_idx = torch.where(just_reset, torch.zeros_like(self._pred_idx), self._pred_idx)
+            self._pred_idx = torch.where(just_reset, torch.zeros_like(self._pred_idx),
+                                         self._pred_idx)
+            # The stashed clip node is from before the reset, so it describes a different
+            # episode on a different tile. ``_history.invalidate`` null-masks those rows
+            # anyway, but leaving stale data in the ring to be masked is the kind of thing
+            # that stops being masked the moment someone changes the warmup.
+            self._clip_node_valid = self._clip_node_valid & ~just_reset
 
         self._history.invalidate(just_reset)
-        self._history.append(self._robot_snapshot())
+        self._push_served_node()
 
-        # Envs whose window has not filled yet (post-reset) are sampled with the learned
-        # null-history embedding the FM was trained with, so the generator drives from step 0
-        # and no clip fallback is needed.
-        null_hist = self._history.null_mask()
+        # Re-plan on cadence, or wherever there is no live prediction to walk (post-reset).
         reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
         infer_mask = reinfer | ~self._pred_valid
-        self._fm_reinfer_mask = infer_mask
-        # Advance the applied index on steps that did not re-plan. The cursor can never reach
-        # the end of the horizon: re-planning every ``fm_update_every`` steps caps it at
-        # ``fm_update_every - 1``, and :meth:`_check_horizon` guarantees F covers that plus
-        # the largest look-ahead offset. Assert rather than clamp -- a clamp here would
-        # silently freeze the tail of the observed window.
+        # Advance the cursor only where we are NOT re-planning. _check_horizon guarantees F
+        # covers (K-1) + max_offset, so this can never run off the end; assert rather than
+        # clamp, because a clamp would silently freeze the tail of the observed window.
         advance = self._pred_valid & ~infer_mask
         self._pred_idx = torch.where(advance, self._pred_idx + 1, self._pred_idx)
         if bool((self._pred_idx >= self.ctx.F).any()):
             raise RuntimeError(
-                f"FM prediction cursor ran past the horizon (F={self.ctx.F}) with "
+                f"FM prediction cursor ran past the horizon (F={self.ctx.F}) at "
                 f"fm_update_every={self.cfg.fm_update_every}: the re-plan cadence is not "
                 "firing. Check episode_length_buf and the reset latch."
             )
+
+        # Envs whose window has not filled yet (post-reset, or the first steps of a run) are
+        # sampled with the learned null-history embedding the FM was trained with, so the
+        # generator drives from step 0 and no clip fallback is needed.
+        null_hist = self._history.null_mask()
+        self._fm_reinfer_mask = infer_mask
         if bool(infer_mask.any()):
             self._run_fm(infer_mask, null_hist)
         if not bool(self._pred_valid.all()):
@@ -619,103 +651,161 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "FmTrackingCommand has envs with no live FM prediction after inference; the "
                 "reference has no clip fallback, so this must never happen."
             )
+        # Stash the node being served THIS step, re-anchored onto the robot as it is now --
+        # that is the frame the dataset's history rows are in. Next step pushes it, so the
+        # ring always holds the last N SERVED nodes. With K>1 those are consecutive nodes of
+        # the previous solve, which is what "four frames from the last solve" means.
+        self._prev_served_node = self._reanchor_to_now(self._zero_offset)[:, 0]
 
     @torch.no_grad()
     def _run_fm(self, mask: torch.Tensor, null_hist: torch.Tensor | None = None) -> None:
-        """Run batched FM inference for the masked envs (robot-state history) and store predictions.
+        """Run batched FM inference for the masked envs and store the predicted window.
 
-        ``null_hist`` is the per-env "history not yet complete" mask; those envs are sampled with
-        the model's learned ``null_history`` embedding instead of their (incomplete, possibly
-        pre-reset) window. ``stack_padded`` is used so the window is always N long even on the
+        ``null_hist`` is the per-env "history not yet complete" mask; those envs are sampled
+        with the model's learned ``null_history`` embedding instead of their (incomplete,
+        possibly pre-reset) window. ``stack_padded`` keeps the window N long even on the
         first steps of a run -- its content is discarded wherever ``null_hist`` is set.
+
+        The result needs no lift: it IS the reference window, already relative to the robot
+        at this step.
         """
         ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-        rp = self._history.stack_padded("root_pos")[ids]    # [V,N,3] live robot history
-        rq = self._history.stack_padded("root_quat")[ids]
-        rl = self._history.stack_padded("root_lin")[ids]
-        ra = self._history.stack_padded("root_ang")[ids]
-        jp = self._history.stack_padded("jp")[ids]          # [V,N,nj] FM order
-        jv = self._history.stack_padded("jv")[ids]
-        frames = self._history.stack_padded("frames")[ids] if self.ctx.num_extra_frames > 0 else None
-
-        history = build_history_tokens(self.ctx, rp, rq, rl, ra, jp, jv, frames=frames)
+        nodes = self._history.stack_padded("node")[ids]      # [V, N, D] emitted nodes
+        history = build_history_tokens(self.ctx, nodes)
         # Exteroception tokens = the live reading at "now", from whichever sensor this FM
         # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
         # deployment conditions on exactly the training signal.
         height = build_extero_tokens(self.ctx, self._read_extero()[ids])
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
-        # Anchor = the robot NOW (the most-recent history step IS the live robot); the FM
-        # predicts in this xyz+yaw frame, so no re-centering is needed.
-        p_ref, q_ref = rp[:, -1].clone(), rq[:, -1].clone()
-        world = sample_world(self.ctx, history, height, cmd_tokens, p_ref, q_ref,
-                             history_null_mask=(None if null_hist is None else null_hist[ids]))
-
-        self._pred_root_pos[ids] = world["root_pos_w"]
-        self._pred_root_quat[ids] = world["root_quat_w"]
-        self._pred_root_lin[ids] = world["root_link_lin_vel_w"]
-        self._pred_root_ang[ids] = world["root_link_ang_vel_w"]
-        self._pred_jp[ids] = world["joint_pos"]
-        self._pred_jv[ids] = world["joint_vel"]
-        if self.ctx.num_extra_frames > 0:
-            self._pred_frame_pos[ids] = world["frame_pos_w"]
-        # Node 0 = "now" (the anchor step, offset ≈ 0). Track from node 0 and advance one
-        # per step, resetting to 0 at each re-plan -- exactly the recorded snap regime.
+        self._pred_window[ids] = sample_window(
+            self.ctx, history, height, cmd_tokens,
+            history_null_mask=(None if null_hist is None else null_hist[ids]),
+        )
+        # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
+        # Both are needed to serve the window later: the cursor to index it, the anchor to
+        # undo the staleness once the robot has moved on.
         self._pred_idx[ids] = 0
+        self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
+        self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
 
+    def _pred_world(self, offsets: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Lift the served nodes at ``offsets`` to the world frame -- SIMULATION ONLY.
+
+        Lifts through the RE-PLAN anchor, which is the frame the prediction is actually
+        expressed in. At ``fm_update_every=1`` that is the robot now and this is what it
+        always was; at K>1 using the current pose instead would silently shear the whole
+        prediction by however far the robot has walked since the re-plan.
+
+        Exists for the things that genuinely need world coordinates and only exist in sim:
+        the diagnostic CLF, the debug ribbon, ``fm_debug``'s overlays and the recorder.
+
+        Args:
+            offsets: Offsets from the CURRENT served node.
+
+        Returns:
+            The :func:`~robot_rl.flow_matching.window.window_to_world` mapping, ``[N, K, ...]``.
+        """
+        ar, idx = self._future_indices(offsets)
+        return window_to_world(self._pred_window[ar, idx], self._anchor_pos[:, None, :],
+                               self._anchor_quat[:, None, :], self.ctx.nj,
+                               self.ctx.num_extra_frames)
+
+    def _reanchor_to_now(self, offsets: torch.Tensor) -> torch.Tensor:
+        """Served nodes at ``offsets``, re-expressed relative to the robot RIGHT NOW.
+
+        The prediction is anchored on the robot as it was at the re-plan, but the
+        observation's contract is "relative to the robot's current actual base". Those
+        coincide only at ``fm_update_every=1``; at K>1 they differ by up to ``K-1`` steps of
+        egomotion, and serving the stale frame would hand the policy a window that is
+        wrong by exactly the distance walked since the re-plan.
+
+        Correcting it costs a world round trip through the MEASURED pose -- which is why
+        K=1 was worth pinning while it lasted: this is the odometry dependency the
+        representation otherwise does not have. It is exact in simulation.
+
+        Args:
+            offsets: Offsets from the current served node.
+
+        Returns:
+            ``[N, K, D]`` window nodes in the current robot frame.
+        """
+        w = self._pred_world(offsets)
+        rp = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]
+        rq = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]
+        return world_to_window(
+            rp, rq, w["base_pos_w"], w["base_quat_w"], w["base_lin_vel_w"],
+            w["base_ang_vel_w"], w["joint_pos"], w["joint_vel"], w["ee_pos_w"],
+        )
+
     def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Gather the FM prediction at each env's current advance index (world frame).
+        """The served node lifted to the world frame, for ``y_des`` (diagnostic CLF + viz).
 
         The ee half is ``[pos, identity quat, 0, 0]``: the FM predicts ee POSITION only, so
         the orientation/twist channels are placeholders that ``strict_fm_only`` then NaNs.
         """
-        ar, idx = self._arange_n, self._pred_idx
-        base = torch.cat([
-            self._pred_root_pos[ar, idx], self._pred_root_quat[ar, idx],
-            self._pred_root_lin[ar, idx], self._pred_root_ang[ar, idx],
-        ], dim=-1)  # [N,13]
+        w = self._pred_world(self._zero_offset)
+        base = torch.cat([w["base_pos_w"][:, 0], w["base_quat_w"][:, 0],
+                          w["base_lin_vel_w"][:, 0], w["base_ang_vel_w"][:, 0]], dim=-1)  # [N,13]
         k = self.ctx.num_extra_frames
         ee = torch.cat([
-            self._pred_frame_pos[ar, idx], self._ee_zero_quat[:, :k],
+            w["ee_pos_w"][:, 0], self._ee_zero_quat[:, :k],
             self._ee_zero_vec[:, :k], self._ee_zero_vec[:, :k],
         ], dim=-1)  # [N,K,13]
-        return base, ee, self._pred_jp[ar, idx], self._pred_jv[ar, idx]
+        return base, ee, w["joint_pos"][:, 0], w["joint_vel"][:, 0]
 
     # ------------------------------------------------------------------
     # Future window (always the FM prediction -- there is no clip source here)
     # ------------------------------------------------------------------
     def _check_horizon(self, offsets: torch.Tensor) -> None:
-        """Raise unless the trained horizon covers ``offsets`` at maximum cursor staleness.
+        """Raise unless the trained horizon covers ``offsets``.
 
         Done lazily on the first look-ahead call rather than in ``_post_init``, because the
         observation manager (which owns the offsets, via ``reference_window``'s ``num_steps``
         / ``stride``) is built after the command manager. Re-checks only when a caller asks
         for a larger offset than any seen so far.
 
-        The cursor is at most ``fm_update_every - 1`` nodes past the re-plan, so serving
-        offset ``o`` needs node ``o + fm_update_every - 1``, i.e. ``F >= o +
-        fm_update_every``. Nothing clamps: a short horizon is an error, not a frozen tail.
+        With ``fm_update_every`` pinned to 1 the requirement is exact -- ``F >= max_offset +
+        1`` -- and there is no staleness slack to carry. Nothing clamps: a short horizon is
+        an error, not a frozen tail.
         """
         max_off = int(offsets.max().item())
         if max_off <= self._checked_max_offset:
             return
-        required = max_off + int(self.cfg.fm_update_every)
-        if required > self.ctx.F:
+        k = int(self.cfg.fm_update_every)
+        need = max_off + k
+        if need > self.ctx.F:
             raise ValueError(
-                f"The FM checkpoint predicts F={self.ctx.F} nodes, but serving a look-ahead "
-                f"offset of {max_off} steps at a re-plan period of {self.cfg.fm_update_every} "
-                f"needs F >= {required} (the cursor is up to {self.cfg.fm_update_every - 1} "
-                "nodes stale when the furthest sample is read). Re-record with "
-                f"--ref_future_len {required} and retrain with --future_len {required}."
+                f"The FM checkpoint predicts F={self.ctx.F} nodes, but serving offset "
+                f"{max_off} at a re-plan period of {k} needs F >= {need} (the cursor is up "
+                f"to {k - 1} nodes past the re-plan when the furthest sample is read). "
+                f"Re-record with --ref_future_len >= {need} and retrain with "
+                f"--future_len {need}."
             )
         self._checked_max_offset = max_off
 
     def _future_indices(self, offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(env_index, node_index)`` broadcast pair for gathering ``offsets`` per env."""
+        """``(env_index, node_index)`` pair for gathering ``offsets`` from the served node.
+
+        Offsets are relative to the CURSOR, not to the start of the window: node
+        ``_pred_idx + offset``. The cursor is 0 on a re-plan and advances one node per step
+        between re-plans, so "offset 0" always means "now" whatever the re-plan period.
+        """
         self._check_horizon(offsets)
         idx = self._pred_idx[:, None] + offsets[None, :]        # [N, K]
         return self._arange_n[:, None].expand_as(idx), idx
+
+    def reference_window_obs(self, offsets: torch.Tensor) -> torch.Tensor:
+        """The predicted window, served straight through -- no world round-trip.
+
+        This is the payoff of the shared representation: the generator emits exactly the
+        vector ``mdp.reference_window`` feeds the policy, so on the FM branch this is a
+        gather. The clip branch still goes through the inherited world-frame maths.
+        """
+        if self._serving() == "clip":
+            return super().reference_window_obs(offsets)
+        return self._reanchor_to_now(offsets)
 
     def get_future_world_base(
         self, offsets: torch.Tensor
@@ -724,39 +814,32 @@ class FmTrackingCommand(MotionSequenceCommand):
 
         Defaults to ``cfg.reference_source``; inside :meth:`as_clip_reference` /
         :meth:`as_fm_reference` it answers for that one instead. The clip branch is the
-        inherited implementation verbatim.
+        inherited implementation verbatim; the FM branch lifts its window through the
+        robot's measured pose, which only simulation has (see :meth:`_pred_world`).
         """
         if self._serving() == "clip":
             return super().get_future_world_base(offsets)
-        ar, idx = self._future_indices(offsets)
-        return (
-            self._pred_root_pos[ar, idx], self._pred_root_quat[ar, idx],
-            self._pred_root_lin[ar, idx], self._pred_root_ang[ar, idx],
-        )
+        w = self._pred_world(offsets)
+        return w["base_pos_w"], w["base_quat_w"], w["base_lin_vel_w"], w["base_ang_vel_w"]
 
     def get_future_joint_state(self, offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Future joint pos/vel ``([N, K, nj], [N, K, nj])`` for the SERVED source.
 
-        Returned in the **robot's** joint order, matching the base-class contract (the clip
-        implementation gathers ``_base_idx["joint_pos"]``, which is built by iterating
-        ``robot.joint_names``). The prediction buffers are in FM order, so the permutation
-        is mandatory -- and it is ``_fm_to_robot_jperm``, NOT the clip-output ``_fm_jperm``
-        used when writing ``y_des``.
+        In the **robot's** joint order on both branches. On the FM branch that needs no
+        permutation any more: the window's joint block is defined in robot order and
+        ``_post_init`` refuses a checkpoint that disagrees.
         """
         if self._serving() == "clip":
             return super().get_future_joint_state(offsets)
-        ar, idx = self._future_indices(offsets)
-        perm = self._fm_to_robot_jperm
-        return self._pred_jp[ar, idx][..., perm], self._pred_jv[ar, idx][..., perm]
+        w = self._pred_world(offsets)
+        return w["joint_pos"], w["joint_vel"]
 
     def get_future_world_frames(self, frame_names: list[str], offsets: torch.Tensor) -> torch.Tensor:
         """Future end-effector state ``[N, K, F, 13]`` for the SERVED source.
 
         Layout matches the clip implementation -- ``[pos_w(3), quat_w(4 xyzw), lin_w(3),
         ang_w(3)]`` -- but the FM predicts POSITION only, so on that branch the trailing 10
-        channels are an identity quaternion and zeros. The one consumer,
-        ``mdp.reference_window``, reads the position; anything reaching for the rest is
-        reading a placeholder, which is why they are constants rather than a stale lift of
+        channels are an identity quaternion and zeros: placeholders, not a stale lift of
         clip data.
 
         Raises:
@@ -771,10 +854,9 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"not predict (it has {list(self.ctx.frame_names)}). There is no clip "
                 "fallback in this command."
             )
-        ar, idx = self._future_indices(offsets)
         sel = torch.tensor([self.ctx.frame_names.index(f) for f in frame_names],
                            dtype=torch.long, device=self.device)
-        pos = self._pred_frame_pos[ar, idx][:, :, sel]                    # [N, K, F, 3]
+        pos = self._pred_world(offsets)["ee_pos_w"][:, :, sel]            # [N, K, F, 3]
         shape = pos.shape[:-1]
         quat = torch.zeros(*shape, 4, device=pos.device, dtype=pos.dtype)
         quat[..., 3] = 1.0
@@ -825,11 +907,20 @@ class FmTrackingCommand(MotionSequenceCommand):
         if not self._fm_pred_specs:
             self._fm_markers.set_visibility(False)
             return
-        offs = self._fm_debug_offsets
+        # Lift the WHOLE predicted window directly, NOT through _pred_world/_future_indices.
+        # Those exist for SERVING: they offset from the cursor and apply the serving horizon
+        # check (F >= offset + fm_update_every). The ribbon wants absolute nodes 0..F-1, so
+        # routing it through them (a) raises as soon as fm_update_every > 1 -- offset F-1
+        # plus K exceeds F, which killed the callback every tick at K=12 -- and (b) poisons
+        # _checked_max_offset with a much larger offset than the observation ever asks for,
+        # so the real horizon check silently stops running.
+        world = window_to_world(self._pred_window, self._anchor_pos[:, None, :],
+                                self._anchor_quat[:, None, :], self.ctx.nj,
+                                self.ctx.num_extra_frames)
         translations, marker_indices = [], []
         for proto_idx, (_name, _color, kind, k) in enumerate(self._fm_pred_specs):
-            pts = (self._pred_root_pos[:, offs] if kind == "base"
-                   else self._pred_frame_pos[:, offs, k]).reshape(-1, 3)
+            pts = (world["base_pos_w"] if kind == "base"
+                   else world["ee_pos_w"][:, :, k]).reshape(-1, 3)
             translations.append(pts)
             marker_indices.append(torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device))
         self._fm_markers.set_visibility(True)

@@ -47,14 +47,17 @@ from robot_rl.flow_matching import (
     so3_log,
     state_to_absolute,
     target_state_dim,
+    window_block_slices,
+    window_dim,
     yaw_quat,
 )
+from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
 from robot_rl.flow_matching.online import (
     build_cmd_tokens,
-    build_height_token,
+    build_extero_tokens,
     build_history_tokens,
     load_fm_context,
-    sample_world,
+    sample_window,
 )
 
 
@@ -305,33 +308,42 @@ def test_so3_log_recovers_rotation_vector():
 
 
 def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> torch.Tensor:
-    """Self-consistent ``(1, F, D)`` traj: root pos integrates lin vel, ori integrates ang vel.
+    """Self-consistent ``(1, F, D)`` window: base_pose integrates base_vel.
 
-    Only the ROOT block is velocity-consistent -- the extra frames are position-only, so
-    they carry nothing for :func:`frame_consistency_terms` to tie and are filled with a
-    plain ramp.
+    ``base_pose[0:3]`` ramps at ``base_vel[0:3]``, and ``base_pose[3:6]`` is the rotation
+    vector of a constant-``omega`` rotation, so
+    ``Log(Exp(e_{t+1})T Exp(e_t)) / dt == omega == base_vel[3:6]`` exactly. Both hold
+    because every node shares one anchor -- that is the property the consistency loss
+    relies on.
+
+    The orientation ramp is NEGATIVE because ``base_pose[3:6]`` is currently
+    ``Log(R_refT R_act)`` (see ``window.BASE_POSE_CONVENTION``): a reference turning at
+    ``+omega`` away from the anchor makes that log map run the other way. Unifying the
+    base_pose sign flips this line and the transpose in ``frame_consistency_terms``
+    together.
+
+    The ee block is position-only, so it carries nothing to tie and is a plain ramp.
     """
     g = torch.Generator().manual_seed(seed)
-    d = target_state_dim(nj, k)
-    x = torch.zeros(1, nf, d, dtype=torch.float64)
+    blocks = window_block_slices(nj, k)
+    x = torch.zeros(1, nf, window_dim(nj, k), dtype=torch.float64)
 
-    b = frame_block_start(nj, 0)
     pos0 = torch.randn(3, generator=g, dtype=torch.float64)
     vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
     omega = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
     for t in range(nf):
-        r = _rodrigues((omega * (t * dt)).unsqueeze(0))[0]
-        x[0, t, b:b + 3] = pos0 + vel * (t * dt)
-        x[0, t, b + 3:b + 6] = vel
-        x[0, t, b + 6:b + 12] = matrix_to_rot6d(r)
-        x[0, t, b + 12:b + 15] = omega
+        x[0, t, 0:3] = pos0 + vel * (t * dt)
+        x[0, t, 3:6] = -omega * (t * dt)    # rotation VECTOR; so3_exp turns it into R
+        x[0, t, 6:9] = vel
+        x[0, t, 9:12] = omega
 
+    ee = blocks["ee_pos"]
     for kf in range(k):
-        eb = frame_block_start(nj, 1 + kf)
-        ee0 = torch.randn(3, generator=g, dtype=torch.float64)
-        ee_vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
+        e0 = ee.start + 3 * kf
+        base = torch.randn(3, generator=g, dtype=torch.float64)
+        rate = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
         for t in range(nf):
-            x[0, t, eb:eb + 3] = ee0 + ee_vel * (t * dt)
+            x[0, t, e0:e0 + 3] = base + rate * (t * dt)
     return x
 
 
@@ -347,7 +359,7 @@ def test_frame_consistency_penalizes_jump():
     nf, nj, k, dt = 6, 2, 1, 0.05
     x = _consistent_frame_traj(nf, nj, k, dt, seed=2)
     pred = x.clone()
-    pred[0, 3, frame_block_start(nj, 0):frame_block_start(nj, 0) + 3] += 1.0
+    pred[0, 3, 0:3] += 1.0
     vel, _ = frame_consistency_terms(pred, x, dt, nj)
     assert vel.max().item() > 1e-2
 
@@ -356,7 +368,7 @@ def test_joint_vel_consistency_penalizes_jump():
     nf, nj, k, dt = 6, 2, 1, 0.05
     x = _consistent_frame_traj(nf, nj, k, dt, seed=3)
     pred = x.clone()
-    pred[0, 3, 0:nj] += 0.5
+    pred[0, 3, window_block_slices(nj, k)["joint_pos"]] += 0.5
     assert joint_vel_consistency_term(pred, dt, nj).max().item() > 1e-2
 
 
@@ -409,22 +421,20 @@ def test_fk_matches_mujoco():
 def test_fk_consistency_zero_for_fk_consistent_state():
     chain = FKChain(_FK_MJCF, _FK_JOINTS, _FK_FRAMES, base_link="pelvis_link", dtype=torch.float64)
     nj, k = len(_FK_JOINTS), len(_FK_FRAMES)
-    d, nf = target_state_dim(nj, k), 4
+    d, nf = window_dim(nj, k), 4
+    blocks = window_block_slices(nj, k)
     rng = np.random.default_rng(1)
     q = torch.tensor(rng.uniform(-0.5, 0.5, size=(1, nf, nj)), dtype=torch.float64)
     qd = torch.tensor(rng.standard_normal((1, nf, nj)) * 0.3, dtype=torch.float64)
     fk_pos, _fk_rot, _jv, _jw = chain.pose_and_jacobian(q.reshape(nf, nj))
-    fk_pos = fk_pos.reshape(1, nf, k, 3)
     x = torch.zeros(1, nf, d, dtype=torch.float64)
-    x[..., 0:nj], x[..., nj:2 * nj] = q, qd
-    rb = frame_block_start(nj, 0)
-    x[..., rb + 6:rb + 12] = torch.tensor([1.0, 0, 0, 0, 1, 0], dtype=torch.float64)
-    for kf in range(k):
-        eb = frame_block_start(nj, 1 + kf)
-        x[..., eb:eb + 3] = fk_pos[:, :, kf]
+    x[..., blocks["joint_pos"]], x[..., blocks["joint_vel"]] = q, qd
+    # The window's ee block is already base-relative, which is the frame FKChain reports
+    # in -- so an FK-consistent state is a straight copy, with no root pose involved.
+    x[..., blocks["ee_pos"]] = fk_pos.reshape(1, nf, k * 3)
     pose_ps = fk_consistency_terms(x, nj, k, chain)
     assert pose_ps.max().item() < 1e-8
-    xb = x.clone(); xb[0, 1, frame_block_start(nj, 1):frame_block_start(nj, 1) + 3] += 0.1
+    xb = x.clone(); xb[0, 1, blocks["ee_pos"].start:blocks["ee_pos"].start + 3] += 0.1
     assert fk_consistency_terms(xb, nj, k, chain).max().item() > 1e-4
 
 
@@ -471,38 +481,21 @@ def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, Ksc=6, seed=0):
     """Synthesize a per-step recording plus its layout meta.
 
     Returns ``(data, meta, nj, K, F, state_dim)``. Note the two DIFFERENT widths:
-    ``raw_node`` = ``sum(state_term_dims)`` is what ``state``/``ref_future`` rows are
-    (world-frame, full 13 per extra frame), while ``state_dim`` is the narrower
-    relative-frame vector the dataset builds from them (extra frames position-only).
-    """
-    rng = np.random.default_rng(seed)
-    stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w", "joint_pos", "joint_vel"]
-    std = [3, 4, 3, 3, nj, nj]
-    frames = [f"f{i}" for i in range(K)]
-    for fr in frames:
-        stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
-        std += [3, 4, 3, 3]
-    raw_node = sum(std)
+    ``raw_node`` = ``sum(state_term_dims)`` is what ``state``/``ref_state``/``ref_future``
+    rows are (world-frame, full 13 per extra frame), while ``state_dim`` is the narrower
+    reference-window node the dataset builds from them (ee blocks position-only).
 
-    parts = []
-    for e in range(n_ep):
-        rows = [np.concatenate([rng.standard_normal(3), [0, 0, 0, 1.0], rng.standard_normal(3),
-                                rng.standard_normal(3), rng.standard_normal(2 * nj), rng.standard_normal(K * 13)])
-                for _ in range(L)]
-        s = np.stack(rows).astype(np.float32)
-        rfu = rng.standard_normal((L, F, raw_node)).astype(np.float32)
-        rfu[:, 0, 0:3] = s[:, 0:3]; rfu[:, 0, 3:7] = s[:, 3:7]  # node-0 ego-anchored on the robot
-        cf = rng.standard_normal((L, F, 3)).astype(np.float32)
-        hs = rng.standard_normal((L, Ksc)).astype(np.float32)  # per-step height scan (Ksc rays)
-        ra = (np.arange(L) % Kstep == 0).astype(np.uint8)
-        done = np.zeros(L, np.uint8); done[-1] = 1
-        parts.append((s, rfu, cf, hs, ra, np.full(L, e, np.int64), np.arange(L, dtype=np.int64), done))
-    keys = ["state", "ref_future", "cmd_future", "height_scan", "reanchor_active",
-            "episode_id", "step_in_episode", "done"]
-    data = {k: np.concatenate([p[i] for p in parts]) for i, k in enumerate(keys)}
+    The trajectory is smooth, tracked and near-upright -- see
+    :mod:`~robot_rl.flow_matching.tests.recording_fixtures` for why the dataset now
+    rejects white noise.
+    """
+    data, stn, std, frames = per_step_recording(
+        n_ep=n_ep, length=L, nj=nj, k=K, future_len=F, snap_every=Kstep,
+        num_scan_rays=Ksc, seed=seed,
+    )
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
                            state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F)
-    return data, meta, nj, K, F, target_state_dim(nj, K)
+    return data, meta, nj, K, F, window_dim(nj, K)
 
 
 def test_dataset_snap_windows_build():
@@ -524,10 +517,11 @@ def test_dataset_snap_windows_build():
     assert cfg.height_dim == ksc
     assert val is not None and len(val) > 0
     assert isinstance(train.val_episode_ids, list)
-    # node-0 target offset ~ 0 in the robot frame (ego-anchored), so the raw target root pos is small.
+    # node-0 base offset ~ 0 in the robot frame (ego-anchored): the target's base_pose
+    # position at node 0 is just the live tracking error.
     tgt = train.state_normalizer.denormalize(train.state)  # (Nw, F, D)
-    rb = frame_block_start(nj, 0)
-    assert tgt[:, 0, rb:rb + 3].norm(dim=-1).mean().item() < 0.15
+    bp = window_block_slices(nj, K)["base_pose"]
+    assert tgt[:, 0, bp.start:bp.start + 3].norm(dim=-1).mean().item() < 0.15
 
 
 def test_online_roundtrip():
@@ -556,117 +550,148 @@ def test_online_roundtrip():
     ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
     assert ctx.N == N and ctx.F == F and ctx.D == state_dim and ctx.num_extra_frames == K
     V = 5
-    rp = torch.randn(V, N, 3)
-    rq = torch.nn.functional.normalize(torch.randn(V, N, 4), dim=-1)
-    hist = build_history_tokens(ctx, rp, rq, torch.randn(V, N, 3), torch.randn(V, N, 3),
-                                torch.randn(V, N, nj), torch.randn(V, N, nj), frames=torch.randn(V, N, K, 13))
-    height = build_height_token(ctx, torch.randn(V, cfg.height_dim))
+    # The history is window nodes the generator emitted, not robot state -- so the online
+    # path takes the same (V, N, D) it produces, closing the autoregressive loop.
+    hist = build_history_tokens(ctx, torch.randn(V, N, state_dim))
+    height = build_extero_tokens(ctx, torch.randn(V, cfg.height_dim))
     cmd = build_cmd_tokens(ctx, torch.randn(V, F, 3))
     assert (hist.shape == (V, N, state_dim) and height.shape == (V, cfg.height_dim)
             and cmd.shape == (V, ctx.num_cmd_tokens, 3))
-    world = sample_world(ctx, hist, height, cmd, p_ref=torch.randn(V, 3),
-                         q_ref=torch.nn.functional.normalize(torch.randn(V, 4), dim=-1))
-    assert world["root_pos_w"].shape == (V, F, 3)
-    assert world["frame_pos_w"].shape == (V, F, K, 3)
-    assert torch.isfinite(world["root_pos_w"]).all() and torch.isfinite(world["joint_pos"]).all()
+    pred = sample_window(ctx, hist, height, cmd)
+    assert pred.shape == (V, F, state_dim)
+    assert torch.isfinite(pred).all()
+    # A node the model just emitted is directly re-usable as a context token.
+    assert build_history_tokens(ctx, pred[:, :N]).shape == (V, N, state_dim)
+    with pytest.raises(ValueError, match="window nodes"):
+        build_history_tokens(ctx, torch.randn(V, N, state_dim + 1))
+
+
 
 
 # ---------------------------------------------------------------------------
-# 11. Partially autoregressive history (history_source="reference_partial")
+# 11. Autoregressive reference-window history
 # ---------------------------------------------------------------------------
-def _recording_with_ref_history(**kw):
-    """A synthetic recording plus a DISTINCT ``ref_state`` array, for the mixed history.
-
-    The reference rows are the measured rows plus a constant offset, so a mixed history is
-    unambiguous: each block can be attributed to its source by inspection.
-    """
-    data, meta, nj, K, F, state_dim = _synthetic_recording(**kw)
-    data["ref_state"] = data["state"] + 7.0
-    # Keep the reference quaternion a unit quaternion (offsetting it would not be one), and
-    # keep the reference ROOT equal to the measured root -- the mixed history must ignore the
-    # reference's root block entirely, so making them equal would hide a bug. Offset it too.
-    q = data["ref_state"][:, 3:7]
-    data["ref_state"][:, 3:7] = q / np.linalg.norm(q, axis=-1, keepdims=True)
-    return data, meta, nj, K, F, state_dim
-
-
-def _built_history(history_source: str, data, meta, F):
-    """Build a dataset with the given history source and return its RAW history tensor."""
-    cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel",
-                             cmd_stride=4, extero_source="height_scan", target_source="ego_anchored_clip_future",
-                             val_fraction=0.34, seed=0, obs_noise=False,
-                             history_source=history_source)
+def _built(data, meta, F, N=2, **over):
+    """Build a dataset over a synthetic recording and return ``(raw_history, dataset)``."""
+    cfg = FlowMatchingConfig(
+        num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
+        extero_source="height_scan", target_source="ego_anchored_clip_future",
+        val_fraction=0.34, seed=0, obs_noise=False, **over,
+    )
     train, _ = build_train_val(data, meta, cfg)
     return train.state_normalizer.denormalize(train.history), train
 
 
-def test_partial_ar_history_mixes_measured_root_with_reference_joints():
+def test_history_is_the_applied_reference_not_the_measured_state():
+    """The context tokens come from ``ref_state``, which is the whole point.
+
+    Conditioning on the measured robot instead would still produce a correctly-shaped
+    history and a converging loss -- it would just not be the autoregressive model. Offset
+    the reference's joints so the two sources are distinguishable by inspection.
+    """
     torch.manual_seed(0)
-    data, meta, nj, K, F, state_dim = _recording_with_ref_history()
-    measured, _ = _built_history("measured", data, meta, F)
-    partial, ds = _built_history("reference_partial", data, meta, F)
-    assert ds.history_source == "reference_partial"
-    assert measured.shape == partial.shape
+    data, meta, nj, K, F, _ = _synthetic_recording()
+    blocks = window_block_slices(nj, K)
+    jp = blocks["joint_pos"]
 
-    rb = frame_block_start(nj, 0)
-    # Root block (pos / lin_vel / ori6d / ang_vel) is measured in BOTH -- it is also the
-    # anchor, so it must not move.
-    assert torch.allclose(measured[..., rb:rb + 15], partial[..., rb:rb + 15], atol=1e-5)
-    # Joints come from the reference, which is offset by +7 -- so they must differ.
-    assert not torch.allclose(measured[..., 0:2 * nj], partial[..., 0:2 * nj], atol=1e-3)
-    assert torch.allclose(partial[..., 0:2 * nj], measured[..., 0:2 * nj] + 7.0, atol=1e-4)
-    # Extra-frame positions also come from the reference.
-    eb = frame_block_start(nj, 1)
-    assert not torch.allclose(measured[..., eb:], partial[..., eb:], atol=1e-3)
+    base, _ = _built(data, meta, F)
+    shifted = {k: v.copy() for k, v in data.items()}
+    a = 13                                        # joint_pos start in the raw node layout
+    shifted["ref_state"][:, a:a + nj] += 0.3      # the APPLIED REFERENCE moves...
+    shifted["ref_future"][:, :, a:a + nj] += 0.3  # ...consistently, since node k IS ref[t+k]
+    moved, _ = _built(shifted, meta, F)
+
+    assert torch.allclose(moved[..., jp], base[..., jp] + 0.3, atol=1e-4), \
+        "history joints did not follow ref_state -- the history is not the applied reference"
 
 
-def test_partial_ar_leaves_the_target_alone():
-    """Only the CONDITIONING changes; the prediction target is the same either way."""
+def test_history_rows_are_anchored_on_their_own_step():
+    """Each context token uses the robot pose from ITS step, not the snap's.
+
+    This is what lets deploy push back the node it just emitted with no odometry: a row is
+    the window node as it was actually served. Perturbing the measured robot at the snap
+    must therefore leave the earlier history rows untouched while moving the target.
+    """
     torch.manual_seed(0)
-    data, meta, nj, K, F, _ = _recording_with_ref_history()
-    _, ds_m = _built_history("measured", data, meta, F)
-    _, ds_p = _built_history("reference_partial", data, meta, F)
-    assert torch.allclose(ds_m.state, ds_p.state, atol=1e-6)
+    data, meta, nj, K, F, _ = _synthetic_recording()
+    bp = window_block_slices(nj, K)["base_pose"]
+    base_h, ds = _built(data, meta, F, N=2)
+    base_t = ds.state
+
+    moved = {k: v.copy() for k, v in data.items()}
+    snaps = data["reanchor_active"].astype(bool)
+    moved["state"] = moved["state"].copy()
+    moved["state"][snaps, 0:3] += 0.05        # only the SNAP rows' measured robot moves
+    moved_h, ds2 = _built(moved, meta, F, N=2)
+
+    # The target is anchored on the snap robot, so it must move...
+    assert not torch.allclose(ds2.state[..., bp], base_t[..., bp], atol=1e-4)
+    # ...while the history rows, anchored on their own (untouched) steps, must not.
+    torch.testing.assert_close(moved_h, base_h, atol=1e-5, rtol=1e-5)
 
 
-def test_partial_ar_without_the_reference_array_raises():
+def test_history_excludes_the_snap_and_abuts_the_target():
+    """History row -1 is the step BEFORE node 0, so they are one control step apart."""
     torch.manual_seed(0)
-    data, meta, nj, K, F, _ = _synthetic_recording()   # no ref_state
-    with pytest.raises(ValueError, match="applied-reference history"):
-        _built_history("reference_partial", data, meta, F)
+    data, meta, nj, K, F, _ = _synthetic_recording()
+    jp = window_block_slices(nj, K)["joint_pos"]
+    hist, ds = _built(data, meta, F, N=3)
+    tgt = ds.state_normalizer.denormalize(ds.state)
+    gap = (hist[:, -1, jp] - tgt[:, 0, jp]).abs().max().item()
+    # One step of the fixture's random walk is ~0.01 rad; two would be visibly larger.
+    assert gap < 0.1, f"history[-1] is not one step before target[0] (gap {gap:.3f} rad)"
 
 
-def test_unknown_history_source_raises():
-    with pytest.raises(ValueError, match="history_source"):
-        FlowMatchingConfig(history_source="autoregressive").check_history_source()
+def test_history_needs_one_more_row_than_it_uses():
+    """The snap row is excluded from the history, so a window spans N+1 recorded steps.
 
-
-def test_history_source_travels_on_the_context():
-    """The runtime must read the mode off the CHECKPOINT, not the task config."""
+    (The windowed ``.h5`` path states this as ``H >= N + 1``; the per-step path simply runs
+    out of consecutive rows first -- see ``test_record_windows`` for the ``.h5`` guard.)
+    """
     torch.manual_seed(0)
-    data, meta, nj, K, F, state_dim = _recording_with_ref_history()
-    N = 2
-    cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
-                             cmd_stride=4, extero_source="height_scan", target_source="ego_anchored_clip_future",
-                             val_fraction=0.2, seed=0, d_model=32, nhead=4, num_layers=2,
-                             dim_feedforward=64, history_source="reference_partial")
-    train, _ = build_train_val(data, meta, cfg)
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
-        d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
-        dim_feedforward=cfg.dim_feedforward,
-    ).eval()
-    ckpt = {
-        "config": cfg.to_dict(),
-        "meta": {"state_joint_names": meta.state_joint_names,
-                 "target_frame_names": meta.state_frame_names, "fm_snap_every": 12},
-        "num_joints": nj,
-        "state_normalizer": train.state_normalizer.state_dict(),
-        "cmd_normalizer": train.cmd_normalizer.state_dict(),
-        "height_normalizer": train.height_normalizer.state_dict(),
-        "model": model.state_dict(),
-    }
-    ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
-    assert ctx.history_source == "reference_partial"
-    assert ctx.fm_snap_every == 12
+    data, meta, _, _, F, _ = _synthetic_recording(L=40, Kstep=4)
+    with pytest.raises(ValueError, match="No valid snap windows"):
+        _built(data, meta, F, N=64)
+
+
+def test_misaligned_reference_ring_is_rejected():
+    """``ref_state[t] != ref_future[t, 0]`` fails loudly rather than skewing the history.
+
+    An off-by-one between the recorder's applied-reference ring and its look-ahead gather
+    is invisible downstream: the shapes are right and the model trains.
+    """
+    torch.manual_seed(0)
+    data, meta, _, _, F, _ = _synthetic_recording()
+    bad = {k: v.copy() for k, v in data.items()}
+    bad["ref_state"] = np.roll(bad["ref_state"], 1, axis=0)
+    with pytest.raises(ValueError, match="history_ref\\[H-1\\] != ref_future\\[0\\]"):
+        _built(bad, meta, F)
+
+
+def test_orientation_past_the_branch_cut_is_rejected():
+    """base_pose's orientation half saturates at pi; a wrap has to be caught at build.
+
+    It would otherwise put a jump discontinuity in both the regression target and the
+    policy's observation.
+    """
+    torch.manual_seed(0)
+    data, meta, _, _, F, _ = _synthetic_recording()
+    bad = {k: v.copy() for k, v in data.items()}
+    # Turn the measured robot 180 deg away from the reference: quat (x,y,z,w) = (0,0,1,0).
+    bad["state"] = bad["state"].copy()
+    bad["state"][:, 3:7] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    with pytest.raises(ValueError, match="branch cut"):
+        _built(bad, meta, F)
+
+
+def test_unanchored_future_is_rejected():
+    """Node 0 must sit on the robot -- the ego-anchor invariant the paradigm assumes."""
+    torch.manual_seed(0)
+    data, meta, _, _, F, _ = _synthetic_recording()
+    bad = {k: v.copy() for k, v in data.items()}
+    bad["ref_state"] = bad["ref_state"] + 0.0
+    bad["ref_future"] = bad["ref_future"].copy()
+    bad["ref_state"][:, 0:3] += 5.0
+    bad["ref_future"][:, :, 0:3] += 5.0
+    with pytest.raises(ValueError, match="ego-anchored"):
+        _built(bad, meta, F)

@@ -1,6 +1,6 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Turn recorded teacher rollouts into robot-state-conditioned FM training items.
+"""Turn recorded teacher rollouts into autoregressive reference-window FM training items.
 
 The dataset operates on already-loaded numpy arrays plus a ``meta`` object (duck
 -typed; only its layout attributes are read), so it has no dependency on the
@@ -11,23 +11,36 @@ loads the ``.npz`` via ``recorded_data_io.load_recorded_data`` and passes
 Paradigm (``target_source="ego_anchored_clip_future"``): each training item is
 sampled at a **snap (re-anchor) event** of a recorded teacher rollout. It pairs
 
-* ``history``: the ``N`` most-recent REAL robot-state steps ending at the snap, in
-  the xyz+yaw ground frame anchored on the robot base at the snap (phase only);
+* ``history``: the ``N`` reference nodes APPLIED at the ``N`` steps before the snap --
+  what the tracker had just been tracking -- each expressed relative to the robot as it
+  was at *that* step;
 * ``height``: the exteroception tokens at the snap -- the pelvis height scan (one
   token) or the two depth cameras (one token each), per ``cfg.extero_source``;
 * ``cmd_tokens``: the strided FUTURE velocity command over the F-step window;
-* ``state`` (the target): the ``F``-node clip future **ego-anchored onto the robot**
-  at the snap (recorded ``ref_future``), re-expressed in the SAME robot xyz+yaw
-  frame -- node 0 offset ≈ 0 by construction.
+* ``state`` (the target): the ``F``-node clip future **ego-anchored onto the robot** at
+  the snap (recorded ``ref_future``), all in the snap robot's frame -- node 0's base
+  offset is the live tracking error, ≈ 0 by construction.
 
-One state normalizer (history + target share it), a command normalizer, and a 1-D
-height normalizer. Snap events are exactly the FM's deploy re-inference points, so
-the training anchors match the teacher's actual rollout.
+Both blocks are the same thing (:mod:`~robot_rl.flow_matching.window` nodes -- the exact
+vector ``mdp.reference_window`` feeds the policy), so history and target share one
+normalizer, and at deploy the model conditions on nodes it emitted itself. The measured
+robot enters only as the frame each block is expressed relative to, and it cancels.
+
+Nothing here needs a re-record beyond the window geometry: ``record_data.py`` already
+writes the applied-reference ring (``history_ref`` / per-step ``ref_state``) alongside the
+measured one, column-for-column in the same layout.
+
+The exposure-bias caveat is worth stating plainly: this history is the CLIP TEACHER's
+applied reference, never the model's own output, so training and deploy see different
+history distributions. ``cfg.null_cond_prob`` and the per-channel history noise
+(:meth:`FutureStateDataset._state_noise_std`) are what stand between them.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+import math
 
 import numpy as np
 import torch
@@ -35,14 +48,13 @@ from torch.utils.data import Dataset
 
 from .config import FlowMatchingConfig
 from .normalizer import Normalizer
-from .transforms import (
-    EE_BLOCK_DIM,
-    ROOT_BLOCK_DIM,
-    frame_block_start,
-    orientation_slices,
-    relative_state,
-    sanitize_extero,
-    target_state_dim,
+from .transforms import sanitize_extero
+from .window import (
+    REFERENCE_WINDOW_NOISE,
+    expand_window_blocks,
+    window_block_slices,
+    window_dim,
+    world_to_window,
 )
 
 
@@ -65,29 +77,58 @@ def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str)
     raise KeyError(f"term {target!r} not found in {term_names}")
 
 
-def _stack_frame_positions(
-    split_fn, frame_names: list[str], rows: int
-) -> torch.Tensor | None:
-    """Gather extra-frame world POSITIONS and flatten to ``(rows, K, 3)`` for relative_state.
+def _stack_frame_positions(split_fn, frame_names: list[str]) -> torch.Tensor:
+    """Gather extra-frame world POSITIONS as ``(..., K, 3)`` for :func:`world_to_window`.
 
-    The recording carries each frame's full ``pos/quat/lin_vel/ang_vel``, but the state
-    vector's extra frames are position-only (see
-    :mod:`~robot_rl.flow_matching.transforms`), so the other three are simply not read --
-    which is why widening the ee block back out needs no re-record.
+    The recording carries each frame's full ``pos/quat/lin_vel/ang_vel``, but the window's
+    ee block is position-only (see :mod:`~robot_rl.flow_matching.window`), so the other
+    three are simply not read -- which is why widening the ee block back out would need no
+    re-record.
 
     Args:
-        split_fn: ``name -> (..., dim)`` slicer over the windowed state (the local
-            ``_split``), where ``...`` flattens to ``rows``.
-        frame_names: Ordered extra body-frame names; ``[]`` returns ``None``.
-        rows: Flattened leading dimension.
+        split_fn: ``name -> (..., dim)`` slicer over the windowed rows.
+        frame_names: Ordered extra body-frame names; ``[]`` gives a ``(..., 0, 3)`` array.
 
     Returns:
-        ``frame_pos_w`` ``(rows, K, 3)``, or ``None`` when ``frame_names`` is empty.
+        ``frame_pos_w`` ``(..., K, 3)``.
     """
     if not frame_names:
-        return None
-    k = len(frame_names)
-    return torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2).reshape(rows, k, 3)
+        probe = split_fn("root_pos_w")
+        return probe.new_zeros(probe.shape[:-1] + (0, 3))
+    return torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2)
+
+
+def _rows_to_window(
+    split_fn,
+    anchor_pos: torch.Tensor,
+    anchor_quat: torch.Tensor,
+    frame_names: list[str],
+) -> torch.Tensor:
+    """Turn recorded world-frame reference rows into window nodes.
+
+    The one place the recorded column layout is mapped onto the window representation, used
+    for BOTH blocks the model sees: the ``F``-node future (one anchor for all nodes) and the
+    ``N``-node autoregressive history (a per-row anchor). The only difference between the
+    two calls is the shape of the anchor, which :func:`world_to_window` broadcasts.
+
+    Args:
+        split_fn: ``name -> (..., dim)`` slicer over the recorded rows, in the
+            ``meta.state_term_names`` layout.
+        anchor_pos: ``(..., 3)`` measured robot base position each node is expressed
+            relative to.
+        anchor_quat: ``(..., 4)`` measured robot base orientation (xyzw).
+        frame_names: Ordered extra body-frame names.
+
+    Returns:
+        ``(..., D)`` window nodes.
+    """
+    return world_to_window(
+        anchor_pos, anchor_quat,
+        split_fn("root_pos_w"), split_fn("root_quat_w"),
+        split_fn("root_link_lin_vel_w"), split_fn("root_link_ang_vel_w"),
+        split_fn("joint_pos"), split_fn("joint_vel"),
+        _stack_frame_positions(split_fn, frame_names),
+    )
 
 
 def snap_windows(
@@ -215,16 +256,27 @@ class FutureStateDataset(Dataset):
         recorded_frames = list(getattr(meta, "state_frame_names", []) or [])
         self.target_frame_names = list(recorded_frames)
         self.num_extra_frames = len(self.target_frame_names)
-        self.state_dim = target_state_dim(nj, self.num_extra_frames)
+        self.state_dim = window_dim(nj, self.num_extra_frames)
+        self.block_slices = window_block_slices(nj, self.num_extra_frames)
         cfg.state_dim = self.state_dim
         cfg.history_dim = self.state_dim
 
         rf = data["ref_future"]
-        if rf.shape[1] != f:
+        if rf.shape[1] < f:
             raise ValueError(
-                f"ref_future has F={rf.shape[1]} nodes but cfg.future_len={f}; "
-                "re-record with --ref_future_len matching future_len."
+                f"ref_future has F={rf.shape[1]} nodes but cfg.future_len={f}; the recording "
+                "is SHORTER than the horizon being trained. Re-record with "
+                f"--ref_future_len >= {f}."
             )
+        if rf.shape[1] > f:
+            # Truncating is safe and deliberate: node k is the reference k steps after the
+            # snap, so the first f of a longer recording ARE the f-node horizon. Recording
+            # with headroom therefore lets one file train every F <= it -- which matters
+            # because the horizon is set by the tracker's re-plan period
+            # (F >= max_window_offset + fm_update_every) and that is a thing you sweep.
+            print(f"[fm-data] ref_future has {rf.shape[1]} nodes; truncating to "
+                  f"future_len={f}.")
+            rf = rf[:, :f]
 
         # -- command (strided future velocity profile from cmd_future) --
         self.cmd_array = cfg.cmd_array
@@ -237,115 +289,97 @@ class FutureStateDataset(Dataset):
         self.cmd_steps = list(range(0, f, cfg.cmd_stride))
         self.num_cmd_tokens = len(self.cmd_steps) if cmd_dim > 0 else 0
 
-        # Two input formats produce the SAME five raw tensors (hw, p/q_anchor, tw, hs, cf);
-        # everything downstream (relative_state, normalizers, striding, noise) is shared.
-        #   per-step (.npz): ``windows`` = list of length-N row-index arrays into the
-        #     per-step arrays; ``ref_future``/``height_scan``/``cmd_future`` indexed at the
-        #     snap row (window[-1]); history = ``state`` at the N rows.
+        # Two input formats produce the SAME raw tensors; everything downstream
+        # (world_to_window, normalizers, striding, noise) is shared.
+        #
+        # BOTH blocks the model sees are the APPLIED REFERENCE -- the history is the
+        # reference this generator emitted at the previous steps, the target is the
+        # reference over the future window -- and the measured robot appears only as the
+        # ANCHOR each block is expressed relative to. That is what makes the model
+        # autoregressive over its own output at deploy: it pushes back the node it just
+        # emitted and needs no state estimate.
+        #
+        # The two anchors differ, and the difference is the whole design:
+        #   * TARGET: one anchor, the robot at the snap, shared by all F nodes -- so the
+        #     future is one rigid plan in the robot's current frame, exactly what the
+        #     policy's ``reference_window`` observation is.
+        #   * HISTORY: a PER-ROW anchor, the robot as it was at that row's own step -- so
+        #     each history token is literally the node this model emitted then. Re-anchoring
+        #     them onto the robot NOW would instead need the egomotion since, which is the
+        #     odometry the deploy path no longer carries.
+        #
+        # Row indexing: the recorded rings are pushed at one instant per control step
+        # (record_data.collect_windows), and ``command_manager.compute()`` runs before
+        # ``observation_manager.compute()`` inside ``env.step``, so ``history_ref[H-1]``,
+        # ``history_state[H-1]`` and ``ref_future[0]`` are all the SAME step. Node 0 of the
+        # target is therefore the CURRENT reference, and the N history rows are the N
+        # BEFORE it: indices ``H-1-n .. H-2``. (Guard 3 below pins this.)
+        #
+        #   per-step (.npz): ``windows`` = length-(N+1) row-index arrays; ``[:-1]`` are the
+        #     history rows, ``[-1]`` the snap.
         #   windowed (.h5): ``windows`` = a 1-D array of window indices into the pre-formed
-        #     arrays; ``history_state``/``ref_future``/... are already snap-formed.
+        #     arrays; ``history_state``/``history_ref``/``ref_future`` are already snap-formed.
         windowed = "history_state" in data
         root_pos_slc, root_quat_slc = s_slc["root_pos_w"], s_slc["root_quat_w"]
+        _p = lambda t: t[..., root_pos_slc[0]:root_pos_slc[1]]
+        _q = lambda t: t[..., root_quat_slc[0]:root_quat_slc[1]]
         rf_t = torch.from_numpy(np.ascontiguousarray(rf)).float()  # (P|W, F, node)
         if windowed:
             sel = np.asarray(windows, dtype=np.int64)  # (Nw,) window selector
             n_win = int(sel.shape[0])
             hs_state = torch.from_numpy(np.ascontiguousarray(data["history_state"])).float()
             H = int(hs_state.shape[1])
-            if n > H:
+            if n + 1 > H:
                 raise ValueError(
-                    f"num_history_states={n} > recorded history_len={H}; "
-                    "re-record with --history_len >= num_history_states."
+                    f"num_history_states={n} needs history_len >= {n + 1} (N context rows "
+                    f"plus the snap row they precede), but the recording has {H}; "
+                    f"re-record with --history_len >= {n + 1}."
                 )
-            hw = hs_state[sel][:, H - n:, :]  # (Nw, n, state_raw); last n of H, snap = last
-            tw = rf_t[sel]                    # (Nw, F, node)
-            p_anchor = hw[:, -1, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3) snap root pose
-            q_anchor = hw[:, -1, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
-            hw_ref = None
-            if data.get("history_ref") is not None:
-                hr = torch.from_numpy(np.ascontiguousarray(data["history_ref"])).float()
-                hw_ref = hr[sel][:, H - n:, :]
+            if data.get("history_ref") is None:
+                raise ValueError(
+                    "The autoregressive history is the APPLIED REFERENCE, which lives in the "
+                    "'history_ref' array; this recording has none. Re-record with the current "
+                    "record_data.py (it writes history_ref unconditionally)."
+                )
+            hr = torch.from_numpy(np.ascontiguousarray(data["history_ref"])).float()
+            hw_meas = hs_state[sel][:, H - 1 - n:H - 1, :]   # (Nw, n, node) anchors, lags n..1
+            hw_ref = hr[sel][:, H - 1 - n:H - 1, :]          # (Nw, n, node) applied reference
+            snap_meas = hs_state[sel][:, H - 1, :]           # (Nw, node) robot at the snap
+            snap_ref = hr[sel][:, H - 1, :]                  # (Nw, node) reference at the snap
+            tw = rf_t[sel]                                   # (Nw, F, node)
         else:
-            idx_hist = np.stack(windows).astype(np.int64)  # (Nw, N) history rows; last = snap
-            snap_rows = idx_hist[:, -1]                    # (Nw,)
-            n_win = idx_hist.shape[0]
+            idx_all = np.stack(windows).astype(np.int64)     # (Nw, N+1); last = snap
+            idx_hist, snap_rows = idx_all[:, :-1], idx_all[:, -1]
+            n_win = idx_all.shape[0]
             state_t = torch.from_numpy(np.ascontiguousarray(data["state"])).float()
-            # Anchor = robot base at the snap row (xyz+yaw, applied inside relative_state).
-            p_anchor = state_t[snap_rows, root_pos_slc[0]:root_pos_slc[1]]    # (Nw, 3)
-            q_anchor = state_t[snap_rows, root_quat_slc[0]:root_quat_slc[1]]  # (Nw, 4)
-            hw = state_t[idx_hist]  # (Nw, N, state_raw)
-            tw = rf_t[snap_rows]    # (Nw, F, node)
-            hw_ref = None
-            if data.get("ref_state") is not None:
-                hw_ref = torch.from_numpy(np.ascontiguousarray(data["ref_state"])).float()[idx_hist]
+            if data.get("ref_state") is None:
+                raise ValueError(
+                    "The autoregressive history is the APPLIED REFERENCE, which lives in the "
+                    "per-step 'ref_state' array; this recording has none. Re-record with the "
+                    "current record_data.py."
+                )
+            ref_t = torch.from_numpy(np.ascontiguousarray(data["ref_state"])).float()
+            hw_meas = state_t[idx_hist]                      # (Nw, N, node)
+            hw_ref = ref_t[idx_hist]                         # (Nw, N, node)
+            snap_meas = state_t[snap_rows]                   # (Nw, node)
+            snap_ref = ref_t[snap_rows]
+            tw = rf_t[snap_rows]                             # (Nw, F, node)
 
-        # -- history: measured, or (partially autoregressive) measured root + reference
-        #    joints/ee. The reference rows share the measured layout column-for-column
-        #    (``record_data._assemble_ref_state``), so the mix is a per-block source choice
-        #    over one term table -- and the ANCHOR stays the measured root either way, since
-        #    it is also what the prediction is lifted through at deploy.
-        cfg.check_history_source()
-        self.history_source = cfg.history_source
-        partial_ar = cfg.history_source == "reference_partial"
-        if partial_ar and hw_ref is None:
-            raise ValueError(
-                "history_source='reference_partial' needs the applied-reference history "
-                "(the windowed 'history_ref' array, or per-step 'ref_state'), which this "
-                "recording does not have. Re-record with the current record_data.py."
-            )
+        p_anchor, q_anchor = _p(snap_meas), _q(snap_meas)    # (Nw, 3) / (Nw, 4)
 
-        def _split_hist(name: str) -> torch.Tensor:
-            """Slice a history block, from the measured rows or the reference rows.
+        # -- history: the emitted reference at lags n..1, each in its OWN step's frame --
+        history = _rows_to_window(
+            lambda name: hw_ref[..., s_slc[name][0]:s_slc[name][1]],
+            _p(hw_meas), _q(hw_meas), self.target_frame_names,
+        ).contiguous()                                        # (Nw, n, D)
 
-            Root pose/twist always measured; joints and extra-frame positions follow
-            ``history_source``.
-            """
-            a, b = s_slc[name]
-            src = hw_ref if (partial_ar and not name.startswith("root_")) else hw
-            return src[..., a:b]
+        # -- target: the F-node ego-anchored clip future, all in the snap robot's frame --
+        target = _rows_to_window(
+            lambda name: tw[..., s_slc[name][0]:s_slc[name][1]],
+            p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names,
+        ).contiguous()                                        # (Nw, F, D)
 
-        m_h = n_win * n
-        pr_h = p_anchor[:, None, :].expand(n_win, n, 3).reshape(m_h, 3)
-        qr_h = q_anchor[:, None, :].expand(n_win, n, 4).reshape(m_h, 4)
-        fp = _stack_frame_positions(_split_hist, self.target_frame_names, m_h)
-        history = relative_state(
-            _split_hist("root_pos_w").reshape(m_h, 3), _split_hist("root_quat_w").reshape(m_h, 4),
-            _split_hist("root_link_lin_vel_w").reshape(m_h, 3), _split_hist("root_link_ang_vel_w").reshape(m_h, 3),
-            _split_hist("joint_pos").reshape(m_h, nj), _split_hist("joint_vel").reshape(m_h, nj),
-            pr_h, qr_h, frame_pos_w=fp,
-        ).reshape(n_win, n, self.state_dim).contiguous()
-
-        # -- target: the F-node ego-anchored clip future at the snap, in the same frame --
-        # (``tw`` gathered above, per input format)
-
-        def _split_tgt(name: str) -> torch.Tensor:
-            a, b = s_slc[name]
-            return tw[..., a:b]
-
-        m_t = n_win * f
-        pr_t = p_anchor[:, None, :].expand(n_win, f, 3).reshape(m_t, 3)
-        qr_t = q_anchor[:, None, :].expand(n_win, f, 4).reshape(m_t, 4)
-        fpt = _stack_frame_positions(_split_tgt, self.target_frame_names, m_t)
-        target = relative_state(
-            _split_tgt("root_pos_w").reshape(m_t, 3), _split_tgt("root_quat_w").reshape(m_t, 4),
-            _split_tgt("root_link_lin_vel_w").reshape(m_t, 3), _split_tgt("root_link_ang_vel_w").reshape(m_t, 3),
-            _split_tgt("joint_pos").reshape(m_t, nj), _split_tgt("joint_vel").reshape(m_t, nj),
-            pr_t, qr_t, frame_pos_w=fpt,
-        ).reshape(n_win, f, self.state_dim).contiguous()
-
-        # node-0 invariant: the clip ego-anchored at the snap sits on the robot root, so
-        # target node 0's root position ≈ 0 in the robot frame. This is the whole premise of
-        # the paradigm -- deployment lifts the prediction through the robot's own pose and
-        # assumes node 0 lands on it. A recording that violates it trains a generator whose
-        # every prediction starts displaced, so fail rather than print.
-        rb = frame_block_start(nj, 0)
-        node0_off = target[:, 0, rb:rb + 3].norm(dim=-1).mean().item()
-        if node0_off > 0.15:
-            raise ValueError(
-                f"target node-0 root offset mean={node0_off:.3f} m (> 0.15): the recorded "
-                "ref_future is not ego-anchored onto the robot at the snap. Re-record with "
-                "ego_anchor_fraction=1.0 on the teacher command."
-            )
+        self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
 
         # Exteroception tokens at the snap row. The recording carries either
         # ``height_scan`` (P|W, K) -- one token -- or ``depth`` (P|W, T, K) with one token
@@ -384,10 +418,17 @@ class FutureStateDataset(Dataset):
         else:
             cmd_strided = None
 
-        # -- normalizers (fit on train; ori6d blocks left raw) --
+        # -- normalizers (fit on train) --
+        # Every channel is standardized now. The old exemption existed for the 6D rotation
+        # block, whose components are structurally constrained (Gram-Schmidt) and would be
+        # broken by a per-column affine; base_pose's orientation is a plain radians
+        # 3-vector with no such constraint.
+        #
+        # Note the fit is over all (Nw * F) nodes, so base_pose's position std is set by the
+        # FAR nodes -- node 0's near-zero residual ends up squashed, and node 0 is the one
+        # the tracker's CLF reads. Structurally the same as before the representation
+        # change, but worth revisiting with per-node loss weighting.
         state_mask = torch.ones(self.state_dim, dtype=torch.bool)
-        for o0, o1 in orientation_slices(nj):
-            state_mask[o0:o1] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
         self.state_normalizer = state_normalizer
@@ -426,6 +467,105 @@ class FutureStateDataset(Dataset):
             (float(cfg.noise_extero) * float(cfg.noise_scale)) / height_normalizer.std
             if self.add_noise else None
         )
+
+    def _check_window_invariants(
+        self,
+        target: torch.Tensor,
+        history: torch.Tensor,
+        snap_ref: torch.Tensor,
+        future_node0: torch.Tensor,
+        s_slc: dict[str, tuple[int, int]],
+        f: int,
+    ) -> None:
+        """Fail on the recording defects that would otherwise train a plausible wrong model.
+
+        Every one of these is silent: the arrays are the right shape and the loss converges
+        either way, and the damage only shows up as a generator that steers oddly.
+
+        Args:
+            target: ``(Nw, F, D)`` future window nodes.
+            history: ``(Nw, N, D)`` autoregressive history nodes.
+            snap_ref: ``(Nw, node)`` recorded APPLIED reference at the snap step, raw world
+                layout -- the cross-check for the row alignment.
+            future_node0: ``(Nw, node)`` recorded ``ref_future`` node 0, same raw layout.
+            s_slc: Recorded term name -> ``(start, end)`` column slice.
+            f: ``cfg.future_len``.
+
+        Raises:
+            ValueError: On a violated invariant.
+        """
+        bp = self.block_slices["base_pose"]
+        pos0 = target[:, 0, bp.start:bp.start + 3]
+        ori = target[..., bp.start + 3:bp.start + 6]
+
+        # 1. Node-0 ego anchor. The clip anchored at the snap sits on the robot, so node 0's
+        #    base_pose position is the (small) live tracking error. The paradigm assumes it:
+        #    the policy reads node 0 as "where the reference is right now".
+        node0_off = pos0.norm(dim=-1).mean().item()
+        if node0_off > 0.15:
+            raise ValueError(
+                f"target node-0 base position offset mean={node0_off:.3f} m (> 0.15): the "
+                "recorded ref_future is not ego-anchored onto the robot at the snap. "
+                "Re-record with ego_anchor_fraction=1.0 on the teacher command."
+            )
+
+        # 2. The pi branch cut. base_pose's orientation half is a quat_box_minus log-map
+        #    value, so it saturates at pi: a reference that turns more than half a turn
+        #    relative to the anchor over F nodes WRAPS, and the target gains a jump
+        #    discontinuity that neither the flow loss nor the policy can interpret. This is a
+        #    property of the representation, not of the model -- the same wrap reaches the
+        #    observation -- so it is worth knowing about before blaming training.
+        max_ori = ori.norm(dim=-1).max().item()
+        if max_ori > 3.0:
+            raise ValueError(
+                f"target base_pose orientation reaches {max_ori:.2f} rad (> 3.0), at or past "
+                f"the quat_box_minus branch cut at pi. Over F={f} nodes "
+                f"({f * float(self.cfg.dt):.2f} s) the reference turns more than half a turn "
+                "relative to the anchor. Shorten future_len or cap the clip library's yaw rate."
+            )
+        if max_ori > 2.0:
+            print(f"[WARN] target base_pose orientation reaches {max_ori:.2f} rad; the "
+                  f"quat_box_minus branch cut is at pi ({math.pi:.2f}).")
+
+        # 3. History/target row alignment -- the highest-value guard here. ``history_ref``
+        #    and ``ref_future`` come from different accessors (the per-step world cache vs
+        #    the look-ahead gather), and the recorder pushes its rings one step per control
+        #    step, so an off-by-one is entirely possible and entirely invisible. They must
+        #    describe the SAME step: history row H-1 (which the history block excludes) is
+        #    the reference at the snap, and so is ref_future node 0. Comparing them also
+        #    catches history_ref carrying the GLOBALLY-placed clip base rather than the
+        #    anchored one, and a joint-order scramble between the two accessors.
+        a, b = s_slc["root_pos_w"]
+        jp_a, jp_b = s_slc["joint_pos"]
+        d_pos = (snap_ref[:, a:b] - future_node0[:, a:b]).norm(dim=-1).max().item()
+        d_joint = (snap_ref[:, jp_a:jp_b] - future_node0[:, jp_a:jp_b]).abs().max().item()
+        if d_pos > 1e-3 or d_joint > 1e-3:
+            raise ValueError(
+                "history_ref[H-1] != ref_future[0]: the recorded applied-reference ring and "
+                f"the look-ahead future disagree at the snap step (base {d_pos:.4f} m, joints "
+                f"{d_joint:.4f} rad). They must be the same step -- the history block is the N "
+                "rows BEFORE node 0. Either the recorder's ring is off by one against the "
+                "look-ahead, or history_ref is carrying the globally-placed clip base instead "
+                "of the anchored one."
+            )
+
+        # 4. The history's last row is ONE control step before node 0, so the gap between
+        #    them must look like one step. Calibrated against the gap between consecutive
+        #    TARGET nodes -- which is one step by construction -- rather than an absolute
+        #    threshold: the raw number is dominated by how fast the clip's joints move (a
+        #    18 rad/s joint covers 0.36 rad in a step all by itself), so any fixed tolerance
+        #    is either loose on slow clips or wrong on fast ones. An off-by-k history shows
+        #    up as a gap ~k times the one-step gap, which this catches at any joint speed.
+        jp = self.block_slices["joint_pos"]
+        one_step = (target[:, 1, jp] - target[:, 0, jp]).abs().mean().item()
+        hist_gap = (history[:, -1, jp] - target[:, 0, jp]).abs().mean().item()
+        if hist_gap > 3.0 * one_step + 1e-4:
+            raise ValueError(
+                f"history[-1] is {hist_gap / max(one_step, 1e-9):.1f} control steps away from "
+                f"target[0] in joint_pos (gap {hist_gap:.4f} rad vs {one_step:.4f} rad per "
+                "step): the autoregressive history rows are misaligned against the future "
+                "window. The history block is the N rows BEFORE node 0."
+            )
 
     @staticmethod
     def _resolve_extero_spec(
@@ -476,25 +616,22 @@ class FutureStateDataset(Dataset):
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
         """Per-channel uniform noise half-width (normalized space) for a history token.
 
-        Maps the config's physical per-group amplitudes onto the state layout
-        ``[joint_pos | joint_vel | root block | ee positions x K]``, scales by
-        ``cfg.noise_scale``, then divides by the normalizer std (ori6d channels have
-        std==1, so their noise stays in raw 6D units).
+        Expands :data:`~robot_rl.flow_matching.window.REFERENCE_WINDOW_NOISE` over the
+        window layout, scales by ``cfg.noise_scale``, then divides by the normalizer std.
+
+        It is the SAME table the policy's ``reference_window`` observation is corrupted
+        with, deliberately: both model the generator's prediction error, and at deploy this
+        model's history is its own past output, so that error is exactly what corrupts it.
+        This noise is also the main thing standing between the training history (the clip
+        teacher's applied reference) and the deploy history (the model's own) -- the
+        exposure-bias gap -- so it matters more here than it did when the history was
+        measured state.
         """
-        cfg = self.cfg
-        nj = self.num_joints
-        amp = torch.zeros(self.state_dim, dtype=self.state.dtype)
-        amp[0:nj] = cfg.noise_joint_pos
-        amp[nj : 2 * nj] = cfg.noise_joint_vel
-        rb = frame_block_start(nj, 0)
-        amp[rb : rb + 3] = cfg.noise_pos                    # pos(3)
-        amp[rb + 3 : rb + 6] = cfg.noise_lin_vel            # lin_vel(3)
-        amp[rb + 6 : rb + 12] = cfg.noise_ori               # ori6d(6)
-        amp[rb + 12 : rb + ROOT_BLOCK_DIM] = cfg.noise_ang_vel  # ang_vel(3)
-        for kf in range(self.num_extra_frames):
-            b = frame_block_start(nj, 1 + kf)
-            amp[b : b + EE_BLOCK_DIM] = cfg.noise_pos       # ee pos(3)
-        return (amp * cfg.noise_scale) / state_normalizer.std
+        amp = torch.tensor(
+            expand_window_blocks(self.num_joints, self.num_extra_frames, REFERENCE_WINDOW_NOISE),
+            dtype=self.state.dtype,
+        )
+        return (amp * self.cfg.noise_scale) / state_normalizer.std
 
     def __len__(self) -> int:
         return self.state.shape[0]
@@ -544,14 +681,16 @@ def build_train_val(
             "Recording has no 'reanchor_active' flag; the robot-state-conditioned FM trains "
             "on snap (re-anchor) events. Re-record with ego_anchor_fraction=1.0."
         )
+    # N+1 rows: the N autoregressive context rows plus the snap row they precede (the
+    # snap is node 0 of the future, so it is NOT part of the history block).
     windows = snap_windows(
         data["episode_id"], data["step_in_episode"], data["done"],
-        reanchor, cfg.num_history_states, cfg.stride,
+        reanchor, cfg.num_history_states + 1, cfg.stride,
     )
     if len(windows) == 0:
         raise ValueError(
-            "No valid snap windows; every snap lacks N prior consecutive steps. "
-            "Check ego_anchor_every >= num_history_states and the recording length."
+            "No valid snap windows; every snap lacks N+1 prior consecutive steps. "
+            "Check ego_anchor_every > num_history_states and the recording length."
         )
 
     ep_of_window = np.array([data["episode_id"][w[-1]] for w in windows])  # episode of the snap

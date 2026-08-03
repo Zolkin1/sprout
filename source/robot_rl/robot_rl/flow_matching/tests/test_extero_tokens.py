@@ -18,6 +18,7 @@ import torch
 
 from robot_rl.flow_matching.config import EXTERO_SOURCES, FlowMatchingConfig
 from robot_rl.flow_matching.dataset import build_train_val
+from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
 from robot_rl.flow_matching.model import FlowMatchingTransformer
 from robot_rl.flow_matching.transforms import (
     DEPTH_CLIP,
@@ -79,44 +80,20 @@ def _camera_spec(n_cameras: int, token_dim: int) -> list[dict]:
 def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=None, seed=0):
     """Synthetic recording with a height scan and optionally a depth array.
 
+    Delegates the trajectory itself to the shared fixture builder -- the dataset validates
+    the recording now, so it has to be a plausible rollout (see
+    :mod:`~robot_rl.flow_matching.tests.recording_fixtures`).
+
     Args:
         depth: ``(num_cameras, per_camera_dim)`` to add a ``depth`` array, or ``None``.
 
     Returns:
         ``(data, meta, nj, K, F, node_dim)``.
     """
-    rng = np.random.default_rng(seed)
-    node = 2 * nj + 15 * (1 + K)
-    parts = []
-    for e in range(n_ep):
-        rows = [np.concatenate([rng.standard_normal(3), [0, 0, 0, 1.0], rng.standard_normal(3),
-                                rng.standard_normal(3), rng.standard_normal(2 * nj),
-                                rng.standard_normal(K * 13)]) for _ in range(L)]
-        s = np.stack(rows).astype(np.float32)
-        rfu = rng.standard_normal((L, F, node)).astype(np.float32)
-        rfu[:, 0, 0:3] = s[:, 0:3]
-        rfu[:, 0, 3:7] = s[:, 3:7]
-        cf = rng.standard_normal((L, F, 3)).astype(np.float32)
-        hs = rng.standard_normal((L, Ksc)).astype(np.float32)
-        ra = (np.arange(L) % Kstep == 0).astype(np.uint8)
-        done = np.zeros(L, np.uint8)
-        done[-1] = 1
-        row = [s, rfu, cf, hs, ra, np.full(L, e, np.int64), np.arange(L, dtype=np.int64), done]
-        if depth is not None:
-            row.append(rng.standard_normal((L, depth[0], depth[1])).astype(np.float32))
-        parts.append(tuple(row))
-    keys = ["state", "ref_future", "cmd_future", "height_scan", "reanchor_active",
-            "episode_id", "step_in_episode", "done"]
-    if depth is not None:
-        keys.append("depth")
-    data = {k: np.concatenate([p[i] for p in parts]) for i, k in enumerate(keys)}
-    stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w",
-           "joint_pos", "joint_vel"]
-    std = [3, 4, 3, 3, nj, nj]
-    frames = [f"f{i}" for i in range(K)]
-    for fr in frames:
-        stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
-        std += [3, 4, 3, 3]
+    data, stn, std, frames = per_step_recording(
+        n_ep=n_ep, length=L, nj=nj, k=K, future_len=F, snap_every=Kstep,
+        num_scan_rays=Ksc, depth=depth, seed=seed,
+    )
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
                            state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F,
                            # Present only alongside a depth array, exactly as the recorder
@@ -124,7 +101,7 @@ def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=Non
                            # ARRAY (what test_missing_array_names_the_task_to_record_with
                            # pins) rather than on the missing contract.
                            depth_camera_spec=_camera_spec(depth[0], depth[1]) if depth else None)
-    return data, meta, nj, K, F, node
+    return data, meta, nj, K, F, sum(std)
 
 
 def _cfg(**kw) -> FlowMatchingConfig:

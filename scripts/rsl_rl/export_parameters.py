@@ -9,6 +9,7 @@ import torch
 import warp as wp
 import numpy as np
 
+from robot_rl.flow_matching.window import BASE_POSE_CONVENTION
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 
@@ -128,6 +129,12 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
             # explicitly because the two orders differ and nothing else here says which.
             "joint_order": "isaac",
             "ee_frame_names": list(cmd_term.resolve_ee_frames(None)),
+            # Direction and frame of the base_pose block's two difference terms. Recorded
+            # because a change here is INVISIBLE in the obs shape: the two halves currently
+            # point opposite ways, and a policy trained under either convention loads clean
+            # against the other and walks sideways. GenTrackerPolicy.load() refuses
+            # anything it does not know how to reproduce.
+            "base_pose_convention": BASE_POSE_CONVENTION,
         }
 
     cmd_spec = None

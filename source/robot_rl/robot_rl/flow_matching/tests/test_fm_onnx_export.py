@@ -22,12 +22,11 @@ import pytest
 import torch
 
 from robot_rl.flow_matching import (
-    EE_BLOCK_DIM,
     FlowMatchingConfig,
     FlowMatchingTransformer,
-    ROOT_BLOCK_DIM,
     build_train_val,
-    target_state_dim,
+    window_blocks,
+    window_dim,
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +43,8 @@ from test_extero_tokens import _synthetic_recording  # noqa: E402
 
 onnx = pytest.importorskip("onnx", exc_type=ImportError)
 from export_fm_onnx import export_fm_onnx  # noqa: E402
+sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
+from deploy.fm_session import _check_state_layout  # noqa: E402
 
 
 def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
@@ -55,7 +56,7 @@ def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
     torch.manual_seed(0)
     # Two cameras of 15 px: the shape of the deployable pairing, in miniature.
     data, meta, nj, k, f, _ = _synthetic_recording(depth=(2, 15))
-    state_dim = target_state_dim(nj, k)
+    state_dim = window_dim(nj, k)
     n = 2
     cfg = FlowMatchingConfig(
         num_history_states=n, future_len=f, cmd_array="target_vel", cmd_stride=4,
@@ -85,7 +86,7 @@ def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
         "height_normalizer": train.height_normalizer.state_dict(),
         "model": model.state_dict(),
     }, path)
-    assert state_dim == target_state_dim(nj, k)
+    assert state_dim == window_dim(nj, k)
     return path, n, f, nj, k
 
 
@@ -96,7 +97,7 @@ def test_fm_onnx_graph_signature(tmp_path):
     export_fm_onnx(ckpt, out, opset=18)
     model = onnx.load(out, load_external_data=False)
 
-    d = target_state_dim(nj, k)
+    d = window_dim(nj, k)
     got_in = {i.name: [dd.dim_value or dd.dim_param for dd in i.type.tensor_type.shape.dim]
               for i in model.graph.input}
     assert set(got_in) == {"history", "extero", "cmd_tokens", "noise", "history_null"}, got_in
@@ -127,22 +128,25 @@ def test_fm_meta_contract(tmp_path):
     # Everything transfer/deploy/fm_session.load_fm_context reads.
     required = {
         "joint_names", "target_frame_names", "N", "F", "D", "nj", "num_steps", "cmd_dim",
-        "cmd_steps", "num_cmd_tokens", "ground_z", "height_dim", "extero_source",
-        "extero_tokens", "extero_spec", "history_source", "fm_snap_every",
-        "root_block_dim", "ee_block_dim", "has_history_null",
+        "cmd_steps", "num_cmd_tokens", "height_dim", "extero_source",
+        "extero_tokens", "extero_spec", "fm_snap_every",
+        "window_blocks", "has_history_null",
     }
     assert required <= set(meta), f"fm_meta is missing {sorted(required - set(meta))}"
     assert (meta["N"], meta["F"], meta["nj"]) == (n, f, nj)
     assert len(meta["target_frame_names"]) == k
     assert len(meta["joint_names"]) == nj
     assert len(meta["cmd_steps"]) == meta["num_cmd_tokens"]
-    assert meta["history_source"] == "measured"
     assert meta["fm_snap_every"] == 12
-    # The state-layout guard: D must be reconstructible from the advertised block widths,
-    # which is the whole point of exporting them.
-    assert meta["root_block_dim"] == ROOT_BLOCK_DIM
-    assert meta["ee_block_dim"] == EE_BLOCK_DIM
-    assert meta["D"] == 2 * meta["nj"] + meta["root_block_dim"] + meta["ee_block_dim"] * k
+    # The state-layout guard. The generator's output goes straight into the tracker's
+    # observation, so the block table has to travel: D alone does not identify the layout.
+    assert [tuple(b) for b in meta["window_blocks"]] == window_blocks(nj, k)
+    assert meta["D"] == window_dim(nj, k) == sum(w for _, w in meta["window_blocks"])
+    # And a graph from before the representation change must be refused, not reinterpreted.
+    stale = {**meta}
+    stale.pop("window_blocks")
+    with pytest.raises(ValueError, match="window_blocks"):
+        _check_state_layout("stale.onnx", stale)
 
 
 def test_fm_onnx_matches_torch(tmp_path):

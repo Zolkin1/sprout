@@ -27,6 +27,7 @@ that artifact and skips cleanly without one. Run from ``transfer/sim``:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import glob
 import os
 import sys
@@ -37,10 +38,14 @@ import torch
 _SIM = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # transfer/sim
 sys.path.insert(0, _SIM)
 sys.path.insert(0, os.path.dirname(_SIM))                            # transfer/
-from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
+from deploy.gen_tracker import _BASE_POSE_CONVENTION, GenTrackerPolicy  # noqa: E402
+from deploy.tracker_session import TrackerSession  # noqa: E402
 
 import warp as wp  # noqa: E402
 import robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations as O  # noqa: E402
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (  # noqa: E402
+    MotionSequenceCommand,
+)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
@@ -64,6 +69,37 @@ def _find_run(explicit: str | None) -> str | None:
         return cand if os.path.exists(os.path.join(cand, "tracker.onnx")) else None
     hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
+
+
+@contextlib.contextmanager
+def _assume_current_base_pose_convention():
+    """Fill in ``base_pose_convention`` on artifacts exported before it was recorded.
+
+    ``GenTrackerPolicy.load()`` refuses a tracker whose ``reference_window_spec`` does not
+    name the convention it was trained under -- the ``base_pose`` block's two halves used
+    to disagree, and the mismatch is invisible in the obs shape, so a stale policy must not
+    load silently.
+
+    This test is the one place that exemption is safe: it drives BOTH sides with the same
+    SYNTHETIC references and compares them to each other, so what the policy was trained on
+    never enters. The artifact supplies only shapes, joint order and frame names. Skipping
+    instead would retire exactly the test that catches a packing bug in the numpy port,
+    every time the local export is a little old.
+    """
+    original = TrackerSession.get_reference_window_spec
+
+    def patched(self):
+        """The exported spec, with the convention key defaulted to the current one."""
+        spec = original(self)
+        if spec is not None and "base_pose_convention" not in spec:
+            spec = {**spec, "base_pose_convention": _BASE_POSE_CONVENTION}
+        return spec
+
+    TrackerSession.get_reference_window_spec = patched
+    try:
+        yield
+    finally:
+        TrackerSession.get_reference_window_spec = original
 
 
 def _rand_quat(n: int, g: torch.Generator) -> torch.Tensor:
@@ -120,6 +156,10 @@ class _MockCmd:
         """Commanded base velocity over the window, ``[N, K, 3]``."""
         return self._t["w_cmd"]
 
+    # The PRODUCTION window builder, bound onto the mock: it is the torch side of the
+    # comparison, so a copy here would only prove the test agrees with itself.
+    reference_window_obs = MotionSequenceCommand.reference_window_obs
+
 
 def _term_offsets(pol) -> dict[str, tuple[int, int]]:
     """Map each obs term name to its ``[lo, hi)`` slice of the assembled vector."""
@@ -167,7 +207,8 @@ def test_obs_parity(run: str | None = None) -> None:
     # Tracker-only: no fm.onnx, so the reference is injected directly (as clip playback
     # does), and the FM->isaac joint permutation is the identity.
     pol = GenTrackerPolicy(os.path.join(exported, "tracker.onnx"), None)
-    pol.load()
+    with _assume_current_base_pose_convention():
+        pol.load()
     isaac_jn = pol.get_joint_names()
     nj = len(isaac_jn)
     ee_frames = pol._trk.get_ee_frame_names() or []

@@ -18,8 +18,7 @@ relative-state future window back -- no torch, no separate normalizer stats.
   output : trajectory  (V, F, D)          denormalized relative-state FUTURE window;
                                           all F frames are novel (node 0 = "now")
 
-The world-frame lift (``state_to_absolute``) and the conditioning construction
-(``relative_state`` for the history + the sensor read) stay in the deployment glue --
+The conditioning assembly (the history push + the sensor read) stays in the deployment glue --
 they are cheap geometry that needs the per-step anchor.  Deployment metadata (frame
 names, dims, num_steps, joint order, ``ground_z``, which sensor feeds the exteroception
 tokens and its camera contract) is embedded in the ONNX ``metadata_props`` under key
@@ -41,7 +40,7 @@ import onnx
 import torch
 import torch.nn as nn
 
-from robot_rl.flow_matching.transforms import EE_BLOCK_DIM, ROOT_BLOCK_DIM
+from robot_rl.flow_matching.window import window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
 
@@ -104,7 +103,7 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
-        "ground_z": float(ctx.ground_z), "height_dim": int(ctx.model.height_dim),
+        "height_dim": int(ctx.model.height_dim),
         # Which sensor feeds the exteroception tokens, how many there are, and -- for the
         # depth cameras -- their full contract, so the deployment feeds the right reading
         # and can verify it describes the same physical sensor as the tracker's.
@@ -116,15 +115,14 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # deployment feeding a measured history to a partially autoregressive model, or
         # re-planning at a different period than the horizon was sized for, is silently
         # off-distribution. ``fm_session.load_fm_context`` checks them.
-        "history_source": str(ctx.history_source),
         "fm_snap_every": ctx.fm_snap_every,
-        # The state LAYOUT, which nothing else in the graph reveals: D, nj and the frame
-        # count are all unchanged by the position-only ee switch (block 15 -> 3), so a
-        # pre-switch graph otherwise loads into the current transforms with every frame
-        # offset wrong, every index still in range, and a silently garbage world lift.
-        # ``fm_session.load_fm_context`` checks D == 2*nj + root + ee*K against these.
-        "root_block_dim": int(ROOT_BLOCK_DIM),
-        "ee_block_dim": int(EE_BLOCK_DIM),
+        # The state LAYOUT, which nothing else in the graph reveals. The generator's
+        # output goes STRAIGHT into the tracker's observation now, so a layout
+        # disagreement is not a bad lift -- it is a scrambled observation the policy acts
+        # on. D, nj and the frame count do not pin it down (the previous relative-state
+        # layout is 3 channels wider for every nj/K, close enough to look plausible), so
+        # the block table travels explicitly. ``fm_session.load_fm_context`` requires it.
+        "window_blocks": [[name, int(w)] for name, w in window_blocks(ctx.nj, ctx.target_num_extra_frames)],
         # Signals to the deploy side that the graph accepts the history_null input, so it can
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.

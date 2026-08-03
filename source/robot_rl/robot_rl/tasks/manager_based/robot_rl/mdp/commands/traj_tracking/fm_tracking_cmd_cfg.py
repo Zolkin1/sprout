@@ -93,9 +93,64 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     Turn it off only to debug what a clip-sourced channel *would* have contained."""
 
+    history_from: str = "generator"
+    """Where the FM's ``N`` autoregressive context tokens come from. A DIAGNOSTIC switch.
+
+    * ``"generator"`` (default, and the only deployable one) -- the nodes this command
+      served at the previous ``N`` steps, i.e. the model's own output. This is the real
+      closed loop.
+    * ``"clip"`` -- the nodes the CLIP reference would have produced at those same steps,
+      anchored the same way. Teacher forcing: the generator still predicts the future and
+      the tracker still follows it, but the context it conditions on is always correct.
+
+    This is the experiment that separates the two failure modes that look identical from
+    the outside. The model is trained on clip history and deployed on its own, so if the
+    rollout is bad you cannot tell whether the MODEL is weak or whether the LOOP diverges
+    (exposure bias). Run both:
+
+    * ``"clip"`` good, ``"generator"`` bad -> the loop. Attack the exposure bias: more
+      history-token noise (``FlowMatchingConfig.noise_scale``), scheduled sampling, or a
+      shorter re-plan horizon.
+    * both bad -> the model. More data/epochs, or the conditioning is missing something.
+    * ``"clip"`` also bad in a way ``val_flow_mse`` did not predict -> the offline metric
+      is not measuring what the tracker needs.
+
+    Not available at deploy: there is no clip on the robot. ``transfer/deploy`` implements
+    the generator path only."""
+
+    fm_guidance_scale: float = 1.0
+    """Classifier-free guidance weight ``w`` over the FM's HISTORY conditioning.
+
+    ``1.0`` = off (plain conditional sampling). ``w > 1`` integrates
+    ``v_null + w (v_cond - v_null)``, extrapolating along the direction the history
+    contributes, so the sample adheres to it more strongly. Needs no retrain: the
+    checkpoint was trained with the history dropped on ``null_cond_prob`` of samples, so
+    ``v_null`` is a learned branch.
+
+    Why it is interesting for THIS model: the history is the previous OUTPUT, so
+    strengthening history adherence is strengthening the coupling between consecutive
+    predictions -- i.e. temporal coherence, which is the same axis as "the trajectory jumps
+    between re-plans". Conditioning adherence and temporal coherence are one knob here in a
+    way they are not for image models.
+
+    Expect it to help ``history_from="clip"`` more than ``"generator"``, and possibly to
+    HURT the latter past some ``w``: guidance makes the model trust the history, and in
+    closed loop that history is its own drifting output. Guidance also samples off the data
+    distribution, which matters more here than for images because the output has to be
+    dynamically feasible for the tracker to follow. Sweep against TRACKING, not flow MSE.
+
+    Costs one extra forward per integration step, batched as a single 2x-batch call.
+    NOT yet in the ONNX export -- ``export_fm_onnx`` folds the sampler into the graph, so a
+    guided deploy needs the guided loop baked in there too."""
+
     fm_zero_noise: bool = False
     """Integrate the flow from ``x0 = 0`` instead of Gaussian noise, so the prediction is a
     deterministic function of the conditioning.
+
+    Worth pairing with ``history_from`` when the complaint is that the prediction JUMPS
+    between consecutive inferences: at ``fm_update_every=1`` the generator re-samples every
+    control step, so with Gaussian noise some of that jump is just the fresh draw rather
+    than the conditioning changing.
 
     Default ``False`` = training-matched stochastic sampling; leave it there for training and
     for any run meant to represent real behaviour. Set it only for A-B diagnostics where the

@@ -32,17 +32,18 @@ from types import SimpleNamespace
 import pytest
 
 torch = pytest.importorskip("torch")
+wp = pytest.importorskip("warp", exc_type=ImportError)
 pytest.importorskip("isaaclab.utils.math", exc_type=ImportError)
+wp.init()
 
+from robot_rl.flow_matching.window import window_block_slices, window_to_world
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.fm_tracking_cmd import (  # noqa: E402
     FmTrackingCommand,
 )
 
 N_ENVS, NJ, K, F = 4, 6, 2, 20
+D = 12 + 2 * NJ + 3 * K   # one reference-window node
 FM_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
-# A deliberately scrambled FM<->robot joint mapping: an identity would let the wrong
-# permutation pass.
-ROBOT_TO_FM = [3, 0, 5, 1, 4, 2]
 
 
 class _BareFmCommand(FmTrackingCommand):
@@ -59,91 +60,148 @@ class _BareFmCommand(FmTrackingCommand):
     _debug_vis_handle = None
 
 
-def _stub(pred_idx: list[int], fm_update_every: int = 4) -> FmTrackingCommand:
-    """A bare command carrying only what the look-ahead accessors read."""
+def _stub(fm_update_every: int = 1, pred_idx: int = 0) -> FmTrackingCommand:
+    """A bare command carrying only what the look-ahead accessors read.
+
+    The prediction is ONE ``[N, F, D]`` buffer of reference-window nodes -- the same layout
+    the policy observes -- rather than the seven world-frame buffers the old lift needed.
+    ``robot.data`` is stubbed because the diagnostic accessors lift through the measured
+    pose; ``reference_window_obs`` does not touch it at all, which is the property that
+    matters at deploy.
+    """
     cmd = object.__new__(_BareFmCommand)
     cmd.cfg = SimpleNamespace(fm_update_every=fm_update_every, reference_source="fm")
-    cmd.ctx = SimpleNamespace(F=F, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
+    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
     # No diagnostic override in force: the accessors answer for cfg.reference_source.
     cmd._serve_override = None
     cmd.fm_enabled = True
     cmd._arange_n = torch.arange(N_ENVS)
-    cmd._pred_idx = torch.tensor(pred_idx, dtype=torch.long)
     cmd._checked_max_offset = -1
+    cmd._zero_offset = torch.zeros(1, dtype=torch.long)
+    # Cursor + the pose the live prediction is anchored on. At K=1 the anchor IS the robot
+    # now and re-anchoring is a no-op; at K>1 they diverge and the served window has to be
+    # corrected back onto the current pose before the policy sees it.
+    cmd._pred_idx = torch.full((N_ENVS,), pred_idx, dtype=torch.long)
+    cmd._anchor_pos = torch.zeros(N_ENVS, 3)
+    cmd._anchor_quat = torch.zeros(N_ENVS, 4)
+    cmd._anchor_quat[:, 3] = 1.0
     # Distinct, decodable contents: value == env*1000 + node*10 + channel.
-    grid = (torch.arange(N_ENVS)[:, None, None] * 1000
-            + torch.arange(F)[None, :, None] * 10)
-    cmd._pred_jp = grid + torch.arange(NJ)[None, None, :].float()
-    cmd._pred_jv = cmd._pred_jp + 0.5
-    cmd._pred_root_pos = grid + torch.arange(3)[None, None, :].float()
-    cmd._pred_root_quat = grid + torch.arange(4)[None, None, :].float()
-    cmd._pred_root_lin = cmd._pred_root_pos + 0.1
-    cmd._pred_root_ang = cmd._pred_root_pos + 0.2
-    cmd._pred_frame_pos = (grid[:, :, None, :] + torch.arange(K)[None, None, :, None] * 100
-                           + torch.arange(3)[None, None, None, :].float())
-    robot_to_fm = torch.tensor(ROBOT_TO_FM, dtype=torch.long)
-    cmd._robot_to_fm_jperm = robot_to_fm
-    cmd._fm_to_robot_jperm = torch.argsort(robot_to_fm)
+    cmd._pred_window = (torch.arange(N_ENVS)[:, None, None] * 1000.0
+                        + torch.arange(F)[None, :, None] * 10.0
+                        + torch.arange(D)[None, None, :].float())
+    # Small, plausible values in the blocks the world lift actually reads, so the lift is
+    # well-posed (the decodable ramp above would be a metres-scale base offset).
+    cmd._pred_window[..., 0:12] *= 1e-4
+    root_quat = torch.zeros(N_ENVS, 4)
+    root_quat[:, 3] = 1.0
+    cmd.robot = SimpleNamespace(data=SimpleNamespace(
+        root_pos_w=wp.from_torch(torch.zeros(N_ENVS, 3).contiguous()),
+        root_quat_w=wp.from_torch(root_quat.contiguous()),
+    ))
     return cmd
 
 
-def test_fm_to_robot_permutation_is_the_inverse():
-    """``argsort`` of a permutation IS its inverse -- the property the accessor relies on."""
-    robot_to_fm = torch.tensor(ROBOT_TO_FM, dtype=torch.long)
-    fm_to_robot = torch.argsort(robot_to_fm)
-    # Round-tripping robot -> FM -> robot must be the identity on values.
-    robot_vals = torch.arange(NJ).float()
-    fm_vals = robot_vals[robot_to_fm]
-    assert torch.equal(fm_vals[fm_to_robot], robot_vals)
-    # And it is genuinely non-trivial, so a wrong permutation cannot pass by accident.
-    assert not torch.equal(fm_to_robot, torch.arange(NJ))
-    assert not torch.equal(fm_to_robot, robot_to_fm)
+def test_reference_window_obs_is_the_prediction_when_the_anchor_is_current():
+    """At ``fm_update_every=1`` the re-anchor is a no-op, so the served window IS the
+    prediction.
+
+    The anchor is captured at the re-plan, and at K=1 that is this very step -- so the
+    round trip out to world and back lands where it started. Held to float tolerance rather
+    than equality because it really is a round trip through ``quat_box_minus``/``plus``.
+    """
+    cmd = _stub(fm_update_every=1)          # anchor == robot now (both identity/zero)
+    offsets = torch.tensor([0, 5, 10])
+    win = FmTrackingCommand.reference_window_obs(cmd, offsets)
+    assert win.shape == (N_ENVS, 3, D)
+    for k, off in enumerate(offsets.tolist()):
+        torch.testing.assert_close(win[:, k], cmd._pred_window[:, off], atol=1e-5, rtol=1e-5)
 
 
-def test_get_future_joint_state_returns_robot_order():
-    """The accessor permutes FM -> ROBOT, matching the base class's contract."""
-    cmd = _stub(pred_idx=[0, 1, 2, 3])
+def test_reference_window_obs_reanchors_onto_the_current_robot():
+    """At K>1 the prediction is stale, and the served window must be corrected onto NOW.
+
+    This is the property that replaced "the window ignores the robot pose". It had to: the
+    window means "reference relative to the robot's CURRENT base", so once the robot has
+    walked away from the re-plan anchor, serving the raw prediction would hand the policy a
+    window wrong by exactly that displacement. Correcting it is what costs odometry at
+    deploy -- see ``_reanchor_to_now``.
+    """
+    cmd = _stub(fm_update_every=6, pred_idx=7)
+    offsets = torch.tensor([0, 5])
+    before = FmTrackingCommand.reference_window_obs(cmd, offsets).clone()
+
+    # The robot walks 0.5 m since the re-plan; the anchor stays where it was.
+    moved = torch.zeros(N_ENVS, 3); moved[:, 0] = 0.5
+    cmd.robot.data.root_pos_w = wp.from_torch(moved.contiguous())
+    after = FmTrackingCommand.reference_window_obs(cmd, offsets)
+
+    # It MUST move, and by exactly the displacement, in the base position channels.
+    assert not torch.allclose(before, after, atol=1e-4)
+    torch.testing.assert_close(after[..., 0:3], before[..., 0:3] - moved[:, None, :],
+                               atol=1e-5, rtol=1e-5)
+    # Frame-invariant blocks are untouched by where the robot is.
+    jp = window_block_slices(NJ, K)["joint_pos"]
+    torch.testing.assert_close(after[..., jp], before[..., jp], atol=1e-6, rtol=1e-6)
+
+
+def test_cursor_offsets_index_from_the_served_node():
+    """Offsets are relative to the CURSOR, not the start of the window.
+
+    With K>1 the served node walks forward between re-plans, so "offset 0" has to keep
+    meaning "now". Reading from node 0 instead would replay the re-plan instant over and
+    over and freeze the reference.
+    """
+    cmd = _stub(fm_update_every=6, pred_idx=7)   # F=20 here, so 9 + 6 fits
+    ar, idx = FmTrackingCommand._future_indices(cmd, torch.tensor([0, 4, 9]))
+    assert idx[0].tolist() == [7, 11, 16]
+    assert torch.equal(ar[:, 0], torch.arange(N_ENVS))
+
+
+def test_get_future_joint_state_returns_robot_order_unpermuted():
+    """The joint block is served straight through: robot order by construction.
+
+    The window's ``joint_pos`` block IS in the robot's order (that is the
+    ``reference_window`` contract), so the FM predicts it that way and there is no
+    permutation left to get wrong -- ``_post_init`` refuses a checkpoint that disagrees.
+    """
+    cmd = _stub()
     offsets = torch.tensor([0, 5, 10])
     jp, jv = FmTrackingCommand.get_future_joint_state(cmd, offsets)
     assert jp.shape == (N_ENVS, 3, NJ) and jv.shape == (N_ENVS, 3, NJ)
-
-    fm_to_robot = torch.argsort(torch.tensor(ROBOT_TO_FM, dtype=torch.long))
-    for e in range(N_ENVS):
-        for k, off in enumerate(offsets.tolist()):
-            node = cmd._pred_idx[e].item() + off
-            assert torch.equal(jp[e, k], cmd._pred_jp[e, node][fm_to_robot])
-            assert torch.equal(jv[e, k], cmd._pred_jv[e, node][fm_to_robot])
-
-    # The clip-OUTPUT permutation would give a different answer -- so this test would fail
-    # if the two were swapped, which is the whole point.
-    wrong = cmd._pred_jp[0, 0][torch.tensor(ROBOT_TO_FM, dtype=torch.long)]
-    assert not torch.equal(jp[0, 0], wrong)
+    blocks = window_block_slices(NJ, K)
+    for k, off in enumerate(offsets.tolist()):
+        assert torch.equal(jp[:, k], cmd._pred_window[:, off, blocks["joint_pos"]])
+        assert torch.equal(jv[:, k], cmd._pred_window[:, off, blocks["joint_vel"]])
 
 
-def test_get_future_world_base_walks_the_cursor():
-    """Node index is ``_pred_idx + offset``, per env -- no clamping, no clip blend."""
-    cmd = _stub(pred_idx=[0, 1, 2, 3])
+def test_world_accessors_are_the_inverse_of_the_window():
+    """The diagnostic lift must reproduce exactly what the window encodes.
+
+    These accessors exist only for the CLF, the debug ribbon and the recorder -- simulation
+    has the measured pose the window was expressed against, and nothing off-sim calls them.
+    """
+    cmd = _stub()
     offsets = torch.tensor([0, 4, 8])
     pos, quat, lin, ang = FmTrackingCommand.get_future_world_base(cmd, offsets)
-    for e in range(N_ENVS):
-        for k, off in enumerate(offsets.tolist()):
-            node = cmd._pred_idx[e].item() + off
-            assert torch.equal(pos[e, k], cmd._pred_root_pos[e, node])
-            assert torch.equal(quat[e, k], cmd._pred_root_quat[e, node])
-            assert torch.equal(lin[e, k], cmd._pred_root_lin[e, node])
-            assert torch.equal(ang[e, k], cmd._pred_root_ang[e, node])
+    rp = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :]
+    rq = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :]
+    want = window_to_world(cmd._pred_window[:, offsets], rp, rq, NJ, K)
+    torch.testing.assert_close(pos, want["base_pos_w"])
+    torch.testing.assert_close(lin, want["base_lin_vel_w"])
+    torch.testing.assert_close(ang, want["base_ang_vel_w"])
+    torch.testing.assert_close(quat, want["base_quat_w"])
 
 
 def test_get_future_world_frames_position_only_placeholders():
     """Position comes from the FM; the other 10 channels are constants, not stale clip data."""
-    cmd = _stub(pred_idx=[0, 1, 2, 3])
+    cmd = _stub()
     offsets = torch.tensor([0, 6])
     out = FmTrackingCommand.get_future_world_frames(cmd, list(FM_FRAMES), offsets)
     assert out.shape == (N_ENVS, 2, K, 13)
-    for e in range(N_ENVS):
-        for k, off in enumerate(offsets.tolist()):
-            node = cmd._pred_idx[e].item() + off
-            assert torch.equal(out[e, k, :, 0:3], cmd._pred_frame_pos[e, node])
+    rp = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :]
+    rq = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :]
+    want = window_to_world(cmd._pred_window[:, offsets], rp, rq, NJ, K)
+    torch.testing.assert_close(out[..., 0:3], want["ee_pos_w"])
     assert torch.equal(out[..., 3:6], torch.zeros_like(out[..., 3:6]))   # quat xyz
     assert torch.equal(out[..., 6], torch.ones_like(out[..., 6]))        # quat w
     assert torch.equal(out[..., 7:13], torch.zeros_like(out[..., 7:13]))  # lin + ang
@@ -151,7 +209,7 @@ def test_get_future_world_frames_position_only_placeholders():
 
 def test_get_future_world_frames_reorders_by_name():
     """Frames come back in the ORDER ASKED FOR, not the checkpoint's order."""
-    cmd = _stub(pred_idx=[0, 0, 0, 0])
+    cmd = _stub()
     offsets = torch.tensor([0])
     fwd = FmTrackingCommand.get_future_world_frames(cmd, list(FM_FRAMES), offsets)
     rev = FmTrackingCommand.get_future_world_frames(cmd, list(reversed(FM_FRAMES)), offsets)
@@ -160,7 +218,7 @@ def test_get_future_world_frames_reorders_by_name():
 
 
 def test_unknown_frame_raises_rather_than_falling_back():
-    cmd = _stub(pred_idx=[0, 0, 0, 0])
+    cmd = _stub()
     with pytest.raises(ValueError, match="does not predict"):
         FmTrackingCommand.get_future_world_frames(cmd, ["left_wrist_yaw_link"], torch.tensor([0]))
 
@@ -169,27 +227,27 @@ def test_unknown_frame_raises_rather_than_falling_back():
 # No clamping: a horizon that cannot cover the request must RAISE.
 # ---------------------------------------------------------------------------
 def test_horizon_check_accepts_a_sufficient_window():
-    # F=20, re-plan every 4 -> the cursor is at most 3 stale, so offsets to 16 are servable.
-    cmd = _stub(pred_idx=[0, 0, 0, 0], fm_update_every=4)
-    FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 8, 16]))
-    assert cmd._checked_max_offset == 16
+    # F=20 and the re-plan is every step, so offsets up to 19 are servable.
+    cmd = _stub()
+    FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 8, 19]))
+    assert cmd._checked_max_offset == 19
 
 
 def test_horizon_check_raises_when_short():
-    """Offset 17 at period 4 needs F >= 21; F is 20, so this must not silently clamp."""
-    cmd = _stub(pred_idx=[0, 0, 0, 0], fm_update_every=4)
-    with pytest.raises(ValueError, match=r"needs F >= 21"):
-        FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 17]))
+    """Offset 20 needs F >= 21; F is 20, so this must not silently clamp."""
+    cmd = _stub()
+    with pytest.raises(ValueError, match=r"needs F >= 21|F >= 21"):
+        FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 20]))
 
 
 def test_horizon_check_rechecks_only_on_a_larger_offset():
     """Cached by the largest offset seen: a bigger ask must still be validated."""
-    cmd = _stub(pred_idx=[0, 0, 0, 0], fm_update_every=4)
+    cmd = _stub()
     FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 4]))
     FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 2]))       # smaller: no-op
     assert cmd._checked_max_offset == 4
     with pytest.raises(ValueError):
-        FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 19]))
+        FmTrackingCommand._check_horizon(cmd, torch.tensor([0, 25]))
 
 
 def test_teacher_window_fits_the_shipped_horizon():
@@ -208,10 +266,14 @@ def test_teacher_window_fits_the_shipped_horizon():
     )
 
     period = G1FmTrackerCommandsCfg().traj_ref.fm_update_every
-    required = (period - 1) + (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
+    assert period == 1, (
+        "the predicted window is anchored on the robot at the re-plan, so a period > 1 "
+        "would serve a stale anchor -- FmTrackingCommand refuses it."
+    )
+    required = (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
     assert FlowMatchingConfig().future_len >= required, (
         f"future_len must be >= {required} for a {REFERENCE_NUM_STEPS}-sample window at "
-        f"stride {REFERENCE_STRIDE} re-planned every {period} steps."
+        f"stride {REFERENCE_STRIDE}."
     )
 
 
@@ -228,7 +290,7 @@ POS_W, VEL_W = 30, 26
 CLIP_FILL = 9.0
 
 
-def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackingCommand:
+def _update_stub(reference_source: str = "fm") -> FmTrackingCommand:
     """A bare command with everything ``_update_command`` touches, stubbed and recorded.
 
     The CLIP half is stubbed to a constant fill (the real one is the inherited clip path,
@@ -236,7 +298,6 @@ def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackin
     run for real.
 
     Args:
-        history_source: The checkpoint's history source to simulate.
         reference_source: Which reference the command should apply.
 
     Returns:
@@ -246,8 +307,7 @@ def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackin
     cmd.calls: list[str] = []
     cmd.cfg = SimpleNamespace(fm_update_every=4, strict_fm_only=True,
                               reference_source=reference_source)
-    cmd.ctx = SimpleNamespace(F=F, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES),
-                              history_source=history_source)
+    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
     cmd._resampling = False
     cmd._building = None
     cmd._serve_override = None
@@ -265,8 +325,6 @@ def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackin
     cmd._unwritten_vel = torch.tensor([VEL_W - 1])
     cmd._zeros3 = torch.zeros(N_ENVS, 3)
     cmd._ident_quat = torch.zeros(N_ENVS, 4)
-    # As _post_init leaves them: no reference applied yet.
-    cmd._applied_jp = cmd._applied_jv = cmd._applied_frames = None
 
     def _clip_half():
         cmd.calls.append("clip")
@@ -297,39 +355,23 @@ def _update_stub(history_source: str, reference_source: str = "fm") -> FmTrackin
     return cmd
 
 
-@pytest.mark.parametrize("history_source", ["measured", "reference_partial"])
-def test_update_command_always_computes_measured_output_and_clf(history_source):
-    """The regression: this block used to be stranded inside ``_stash_applied_reference``.
-
-    Below that method's ``history_source != "reference_partial"`` early return, so on the
-    DEFAULT source it never ran and every tracking metric read zero.
-    """
-    cmd = _update_stub(history_source)
+def test_update_command_always_computes_measured_output_and_clf():
+    """The regression: this block was once stranded behind a conditional early return, so
+    on the default configuration it never ran and every tracking metric read zero."""
+    cmd = _update_stub()
     FmTrackingCommand._update_command(cmd)
 
-    assert "measured" in cmd.calls, f"compute_measured_output never ran ({history_source})"
-    assert "clf" in cmd.calls, f"the CLF never ran ({history_source})"
+    assert "measured" in cmd.calls, "compute_measured_output never ran"
+    assert "clf" in cmd.calls, "the CLF never ran"
     # Order matters: the CLF grades the measured output produced this step, not last step's.
     assert cmd.calls.index("measured") < cmd.calls.index("clf")
     assert torch.equal(cmd.v, torch.full((N_ENVS,), 7.0))
     assert torch.equal(cmd.vdot, torch.full((N_ENVS,), -1.0))
 
 
-def test_applied_reference_is_stashed_only_for_a_partially_autoregressive_checkpoint():
-    """The stash itself stays conditional -- that part of the early return was correct."""
-    measured = _update_stub("measured")
-    FmTrackingCommand._update_command(measured)
-    assert measured._applied_jp is None
-
-    partial = _update_stub("reference_partial")
-    FmTrackingCommand._update_command(partial)
-    assert partial._applied_jp is not None
-    assert partial._applied_frames is not None
-
-
 def test_strict_fm_only_nans_run_before_the_clf():
     """So a graded channel the FM does not write shows up as a NaN ``V``, not a plausible one."""
-    cmd = _update_stub("measured")
+    cmd = _update_stub()
     FmTrackingCommand._update_command(cmd)
     assert torch.isnan(cmd.y_des[:, POS_W - 1]).all()
     assert torch.isnan(cmd.dy_des[:, VEL_W - 1]).all()
@@ -345,7 +387,7 @@ def test_both_references_are_computed_every_step():
     references are produced from the SAME robot state on the same tick.
     """
     for source in ("fm", "clip"):
-        cmd = _update_stub("measured", reference_source=source)
+        cmd = _update_stub(reference_source=source)
         FmTrackingCommand._update_command(cmd)
         assert "clip" in cmd.calls and "infer" in cmd.calls, (source, cmd.calls)
         # The clip half runs first: the generator must be able to overwrite it.
@@ -356,11 +398,11 @@ def test_both_references_are_computed_every_step():
 
 def test_reference_source_selects_what_is_applied():
     """``y_des`` is the named source's cache -- the joint slots tell the two apart."""
-    fm = _update_stub("measured", reference_source="fm")
+    fm = _update_stub(reference_source="fm")
     FmTrackingCommand._update_command(fm)
     assert torch.equal(fm.y_des[:, :NJ], torch.zeros(N_ENVS, NJ))
 
-    clip = _update_stub("measured", reference_source="clip")
+    clip = _update_stub(reference_source="clip")
     FmTrackingCommand._update_command(clip)
     assert torch.equal(clip.y_des[:, :NJ], torch.full((N_ENVS, NJ), CLIP_FILL))
     # The clip reference is not NaN-poisoned: strict_fm_only guards the GENERATOR cache,
@@ -373,7 +415,7 @@ def test_reference_source_selects_what_is_applied():
 def test_as_other_reference_swaps_and_restores(source):
     """The context managers serve the other source, then put the configured one back."""
     other = "clip" if source == "fm" else "fm"
-    cmd = _update_stub("measured", reference_source=source)
+    cmd = _update_stub(reference_source=source)
     FmTrackingCommand._update_command(cmd)
     applied = cmd.y_des.clone()
 
@@ -392,7 +434,7 @@ def test_apply_source_keeps_one_stable_y_des_tensor():
     A rebinding ``_apply_source`` would alias the live vector onto a cache and the next
     step's clip gather would write straight into last step's snapshot.
     """
-    cmd = _update_stub("measured")
+    cmd = _update_stub()
     before = cmd.y_des
     FmTrackingCommand._update_command(cmd)
     assert cmd.y_des is before
@@ -401,7 +443,7 @@ def test_apply_source_keeps_one_stable_y_des_tensor():
 
 def test_serve_rejects_the_generator_when_none_was_loaded():
     """The pure-clip control has no generator to report on, and says so."""
-    cmd = _update_stub("measured", reference_source="clip")
+    cmd = _update_stub(reference_source="clip")
     cmd.fm_enabled = False
     with pytest.raises(RuntimeError, match="no fm_checkpoint"):
         with cmd.as_fm_reference():
@@ -424,7 +466,7 @@ def test_serving_dispatches_the_lookahead_to_the_clip(monkeypatch, accessor, arg
         MotionSequenceCommand,
     )
 
-    cmd = _stub(pred_idx=[0, 0, 0, 0])
+    cmd = _stub()
     seen: list[str] = []
     monkeypatch.setattr(MotionSequenceCommand, accessor,
                         lambda self, *a: seen.append("clip") or torch.zeros(1))
@@ -441,11 +483,11 @@ def test_serving_dispatches_the_lookahead_to_the_clip(monkeypatch, accessor, arg
 def test_predicted_outputs_window_lands_in_the_y_des_layout():
     """The whole horizon, scattered into the same channels the applied reference uses.
 
-    ``plot_fm_predictions`` fans these off the tracked line and can only do that if node
-    ``_pred_idx`` of the window equals what ``_fm_current_outputs`` applies -- same channel
-    slots, same joint permutation, same NaN mask.
+    ``plot_fm_predictions`` fans these off the tracked line and can only do that if node 0
+    of the window equals what ``_fm_current_outputs`` applies -- same channel slots, same
+    joint permutation, same NaN mask. Diagnostic only: it lifts through the measured pose.
     """
-    cmd = _stub(pred_idx=[0, 1, 2, 3])
+    cmd = _stub()
     cmd.cfg.strict_fm_only = True
     cmd.y_des = torch.zeros(N_ENVS, POS_W)
     cmd.dy_des = torch.zeros(N_ENVS, VEL_W)
@@ -456,7 +498,7 @@ def test_predicted_outputs_window_lands_in_the_y_des_layout():
     cmd._wf_ang_flat = torch.arange(3 * (1 + K), 6 * (1 + K))
     cmd._joint_slots_pos = torch.arange(POS_W - NJ - 1, POS_W - 1)
     cmd._joint_slots_vel = torch.arange(VEL_W - NJ - 1, VEL_W - 1)
-    cmd._fm_jperm = torch.tensor(ROBOT_TO_FM, dtype=torch.long)
+    cmd._fm_jperm = torch.arange(NJ)
     cmd._unwritten_pos = torch.tensor([POS_W - 1])
     cmd._unwritten_vel = torch.tensor([VEL_W - 1])
     cmd._ee_zero_quat = torch.zeros(N_ENVS, K, 4)
@@ -465,22 +507,25 @@ def test_predicted_outputs_window_lands_in_the_y_des_layout():
 
     y, dy = FmTrackingCommand.predicted_outputs_window(cmd)
     assert y.shape == (N_ENVS, F, POS_W) and dy.shape == (N_ENVS, F, VEL_W)
-    # The base position of every node is the prediction buffer, unpermuted.
-    torch.testing.assert_close(y[:, :, 0:3], cmd._pred_root_pos)
-    torch.testing.assert_close(y[:, :, 3:6], cmd._pred_frame_pos[:, :, 0])
+    # Every node's base + ee position is the window lifted through the measured pose.
+    rp = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :]
+    rq = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :]
+    want = window_to_world(cmd._pred_window, rp, rq, NJ, K)
+    torch.testing.assert_close(y[:, :, 0:3], want["base_pos_w"])
+    torch.testing.assert_close(y[:, :, 3:6], want["ee_pos_w"][:, :, 0])
     # Joints go through the clip-OUTPUT permutation, as the applied write does.
-    torch.testing.assert_close(y[:, :, cmd._joint_slots_pos], cmd._pred_jp[..., cmd._fm_jperm])
-    torch.testing.assert_close(dy[:, :, cmd._joint_slots_vel], cmd._pred_jv[..., cmd._fm_jperm])
+    torch.testing.assert_close(y[:, :, cmd._joint_slots_pos],
+                               want["joint_pos"][..., cmd._fm_jperm])
+    torch.testing.assert_close(dy[:, :, cmd._joint_slots_vel], want["joint_vel"][..., cmd._fm_jperm])
     assert torch.isnan(y[:, :, POS_W - 1]).all() and torch.isnan(dy[:, :, VEL_W - 1]).all()
 
-    # Node _pred_idx of the window == what _fm_current_outputs applies this step.
+    # Node 0 of the window == what _fm_current_outputs applies this step. (Always node 0:
+    # fm_update_every is pinned to 1, so there is no cursor to chase.)
     base, ee, jp, jv = FmTrackingCommand._fm_current_outputs(cmd)
-    for e in range(N_ENVS):
-        node = int(cmd._pred_idx[e])
-        torch.testing.assert_close(y[e, node, 0:3], base[e, 0:3])
-        torch.testing.assert_close(y[e, node, 3:6], ee[e, 0, 0:3])
-        torch.testing.assert_close(y[e, node, cmd._joint_slots_pos], jp[e][cmd._fm_jperm])
-        torch.testing.assert_close(dy[e, node, cmd._joint_slots_vel], jv[e][cmd._fm_jperm])
+    torch.testing.assert_close(y[:, 0, 0:3], base[:, 0:3])
+    torch.testing.assert_close(y[:, 0, 3:6], ee[:, 0, 0:3])
+    torch.testing.assert_close(y[:, 0, cmd._joint_slots_pos], jp[..., cmd._fm_jperm])
+    torch.testing.assert_close(dy[:, 0, cmd._joint_slots_vel], jv[..., cmd._fm_jperm])
 
 
 # ---------------------------------------------------------------------------
@@ -625,3 +670,32 @@ def test_clip_end_falls_back_when_no_window_term_exists():
 def test_clip_shorter_than_the_window_ends_immediately():
     """Rather than serving a reference that is frozen from the very first step."""
     assert _fired(clip_len=30, lookahead=50, episode_step=0)
+
+
+def test_full_window_lift_is_independent_of_the_serving_horizon():
+    """The debug ribbon draws ALL F nodes, and must not be gated by the serving check.
+
+    Regression. The ribbon used to ask for offsets ``0..F-1`` through ``_future_indices``,
+    which applies the SERVING requirement ``F >= offset + fm_update_every`` -- so at K>1 the
+    last offset needed ``F + K - 1`` nodes and the callback raised on every draw. It only
+    escaped notice because the ribbon returns early when there is no viewer, so every
+    headless run skipped it.
+
+    The second half of the bug was quieter: ``_check_horizon`` caches the largest offset it
+    has validated, so a ribbon-sized offset would mark the horizon "checked" far beyond
+    anything the observation asks for and the real check would stop running.
+    """
+    cmd = _stub(fm_update_every=6)
+    nj, k = NJ, K
+    rp = cmd._anchor_pos[:, None, :]
+    rq = cmd._anchor_quat[:, None, :]
+
+    # The whole window lifts, whatever K is -- no cursor, no horizon check.
+    world = window_to_world(cmd._pred_window, rp, rq, nj, k)
+    assert world["base_pos_w"].shape == (N_ENVS, F, 3)
+    assert world["ee_pos_w"].shape == (N_ENVS, F, k, 3)
+    assert cmd._checked_max_offset == -1, "drawing must not touch the serving horizon cache"
+
+    # ...while SERVING still refuses an offset the horizon cannot cover at this K.
+    with pytest.raises(ValueError, match="needs F >="):
+        FmTrackingCommand._check_horizon(cmd, torch.tensor([F - 1]))

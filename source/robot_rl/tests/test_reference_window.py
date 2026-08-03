@@ -33,8 +33,11 @@ try:
 except Exception as exc:  # pragma: no cover - environment without a usable warp runtime
     pytest.skip(f"warp runtime unavailable: {exc}", allow_module_level=True)
 
-from isaaclab.utils.math import quat_apply, quat_conjugate, quat_mul  # noqa: E402
+from isaaclab.utils.math import quat_apply, quat_box_minus, quat_conjugate, quat_mul  # noqa: E402
 
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (  # noqa: E402
+    MotionSequenceCommand,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (  # noqa: E402
     REFERENCE_WINDOW_NOISE,
     ReferenceWindowNoiseCfg,
@@ -195,6 +198,12 @@ class _StubCommand:
             dim=-1,
         )
 
+    # The window builder itself is the PRODUCTION method, bound onto the stub rather than
+    # re-implemented here: it is the thing under test, and a copy in the test would agree
+    # with itself no matter what the command actually does.  It only touches the accessor
+    # surface above plus ``self.robot.data``, so it runs unmodified against the stub.
+    reference_window_obs = MotionSequenceCommand.reference_window_obs
+
 
 class _StubEnv:
     """An environment exposing just ``command_manager.get_term`` and ``num_envs``."""
@@ -248,6 +257,50 @@ def test_sample_zero_matches_the_current_step_terms(env_cmd):
     torch.testing.assert_close(first[:, 0:6], base_pose_error(env, "traj_ref"))
     torch.testing.assert_close(first[:, 6:12], ref_base_velocity_local(env, "traj_ref"))
     torch.testing.assert_close(first[:, -3 * len(EE_FRAMES):], ee_ref_relative_to_base(env, "traj_ref"))
+
+
+def test_base_pose_uses_the_legacy_mixed_convention(env_cmd):
+    """``base_pose`` is position ``ref - actual`` and orientation ``actual - ref``.
+
+    Pinned against an independent expression rather than against the window's own inverse,
+    because every other check here is a round trip or a cross-check between two functions
+    that share the convention -- flip them together and nothing notices.
+
+    The two halves genuinely disagree (see
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`), and this test exists to
+    keep that FROM CHANGING BY ACCIDENT rather than to endorse it: the observation width is
+    identical either way, so a flip silently invalidates every trained policy. When the
+    convention is unified, this test and ``BASE_POSE_CONVENTION`` move together, and a
+    teacher retrain follows.
+    """
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, 11, 5)
+    ref_p, ref_q, _, _ = cmd.get_future_world_base(offs)
+    n, k = ref_p.shape[:2]
+    act_p = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :].expand(n, k, 3).reshape(-1, 3)
+    act_q = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :].expand(n, k, 4).reshape(-1, 4)
+
+    per_step = sum(w for _, w in reference_window_layout(cmd))
+    base_pose = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    base_pose = base_pose.reshape(n, k, per_step)[..., 0:6].reshape(-1, 6)
+
+    # position: R_act^T (p_ref - p_act)   -- points robot -> reference
+    want_pos = quat_apply(quat_conjugate(act_q), ref_p.reshape(-1, 3) - act_p)
+    # orientation: R_act^T Log(R_act R_ref^T) == Log(R_ref^T R_act)  -- the OTHER way
+    want_ori = quat_apply(
+        quat_conjugate(act_q), quat_box_minus(act_q, ref_q.reshape(-1, 4))
+    )
+    torch.testing.assert_close(base_pose[:, 0:3], want_pos, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(base_pose[:, 3:6], want_ori, atol=1e-6, rtol=1e-6)
+
+    # ...and both vanish together when the robot sits exactly on the reference. True under
+    # either convention, so not the discriminating check -- but it is the property a reader
+    # expects, and it fails loudly if either half ever picks up an offset.
+    cmd.robot.data.root_pos_w = _wp(ref_p[:, 0, :].contiguous())
+    cmd.robot.data.root_quat_w = _wp(ref_q[:, 0, :].contiguous())
+    on_ref = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:6]
+    torch.testing.assert_close(on_ref, torch.zeros_like(on_ref), atol=1e-6, rtol=1e-6)
 
 
 def test_layout_from_dims_matches_the_command_layout(env_cmd):
@@ -438,7 +491,7 @@ def test_noise_vector_matches_the_window_layout(env_cmd):
 def test_noise_vector_rejects_a_layout_mismatch():
     """A magnitudes dict that cannot fill the layout fails loudly, not silently."""
     bad = dict(REFERENCE_WINDOW_NOISE, ee_pos=[0.05, 0.05])  # 2 axes, not 3
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_noise_vector(2, N_JOINTS, len(EE_FRAMES), bad)
 
 
@@ -499,9 +552,9 @@ def test_scale_and_noise_share_one_layout():
     bad = {k: 1.0 for k in ("base_pos", "base_ori", "base_lin_vel", "base_ang_vel",
                             "joint_pos", "joint_vel")}
     bad["ee_pos"] = [1.0, 1.0]  # 2 axes, not 3
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_scale(2, N_JOINTS, len(EE_FRAMES), bad)
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_noise_vector(2, N_JOINTS, len(EE_FRAMES), bad)
 
 

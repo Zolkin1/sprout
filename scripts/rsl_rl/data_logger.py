@@ -768,7 +768,6 @@ class DataLogger:
                     self.metadata["fm_frame_names"] = list(ctx.frame_names)
                     self.metadata["fm_num_history"] = int(ctx.N)
                     self.metadata["fm_extero_source"] = str(ctx.extero_source)
-                    self.metadata["fm_history_source"] = str(ctx.history_source)
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)

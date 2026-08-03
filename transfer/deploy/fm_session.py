@@ -2,14 +2,23 @@
 
 """onnxruntime flow-matching generator session (numpy glue + ORT net).
 
-Numpy + onnxruntime counterpart of ``robot_rl.flow_matching.online`` (robot-state
-conditioned). The ONNX (``fm.onnx``, exported by
-``scripts/flow_matching/export_fm_onnx.py``) folds in the normalizers and the
-unrolled Euler sampler, so this builds the **raw** N history (phase) tokens (numpy
-``relative_state``), the **raw** exteroception tokens, and the raw strided command
-tokens, runs one ``session.run`` for the whole sampler, and lifts the predicted
-F-step future to the world frame (numpy ``state_to_absolute``). There is no
-inpainting / known mask -- conditioning is separate tokens. No torch.
+Numpy + onnxruntime counterpart of ``robot_rl.flow_matching.online``. The ONNX
+(``fm.onnx``, exported by ``scripts/flow_matching/export_fm_onnx.py``) folds in the
+normalizers and the unrolled Euler sampler, so this assembles the raw conditioning
+tokens, runs one ``session.run`` for the whole sampler, and returns the predicted
+window. There is no inpainting / known mask -- conditioning is separate tokens. No torch.
+
+There is also no geometry left here, which is the point. The generator predicts
+reference-window nodes directly (see ``robot_rl.flow_matching.window``), so:
+
+* the ``N`` history tokens are the nodes this runtime last served -- its own output --
+  and go in unchanged;
+* the ``F`` predicted nodes go straight into the tracker's ``reference_window``
+  observation, with no lift.
+
+The previous version built the history from measured world-frame root poses and lifted
+the prediction back out through them, which meant the generator could not run without a
+base-pose estimate. Nothing on this path needs one now.
 """
 
 from __future__ import annotations
@@ -22,7 +31,7 @@ import onnxruntime as ort
 
 from .depth_obs import parse_depth_spec, sanitize_extero_np
 from .tracker_session import make_session
-from .transforms_np import EE_BLOCK_DIM, ROOT_BLOCK_DIM, relative_state, state_to_absolute
+from .window_np import window_blocks, window_dim
 
 
 @dataclass
@@ -41,7 +50,6 @@ class FmContext:
     num_cmd_tokens: int
     joint_names: list[str]
     target_frame_names: list[str]
-    ground_z: float
     height_dim: int
     extero_source: str = "height_scan"
     """Which sensor feeds the exteroception tokens ("height_scan" or "depth")."""
@@ -81,43 +89,42 @@ _WARNED_NO_NULL = False
 
 
 def _check_state_layout(onnx_path: str, meta: dict) -> None:
-    """Refuse a graph whose state vector is not laid out the way this runtime slices it.
+    """Refuse a graph whose state vector is not the reference-window layout this runtime serves.
 
-    ``state_to_absolute`` reads frame blocks at fixed offsets derived from
-    :data:`transforms_np.ROOT_BLOCK_DIM` / :data:`transforms_np.EE_BLOCK_DIM`.  When the
-    extra frames went position-only those offsets moved, but nothing observable in the
-    graph did: ``D``, ``nj`` and ``len(target_frame_names)`` are identical between a
-    15-wide and a 3-wide ee block for a different joint count, so a stale ``fm.onnx``
-    loads clean, indexes in range, and produces a garbage world lift.  The torch side
-    raises on the same mismatch (``flow_matching.online``); this is the deploy half.
+    The generator now predicts window nodes DIRECTLY into the tracker's observation, so a
+    layout disagreement is not a bad lift any more -- it is a scrambled observation, fed to
+    a policy that will happily act on it. Nothing observable in the graph reveals it: ``D``,
+    ``nj`` and ``len(target_frame_names)`` can coincide between layouts, and the previous
+    (root-block / ee-block) layout is exactly 3 channels wider for every ``(nj, K)``, so an
+    old graph is close enough to look plausible.
 
     Args:
         onnx_path: Path of the graph being loaded, for the error message.
         meta: The parsed ``fm_meta`` mapping.
 
     Raises:
-        ValueError: If ``D`` disagrees with the advertised (or assumed) block widths.
+        ValueError: If the declared layout is missing, unknown, or inconsistent with ``D``.
     """
     nj, K, d = int(meta["nj"]), len(meta["target_frame_names"]), int(meta["D"])
-    # Absent on graphs exported before the layout was recorded. Assume the CURRENT
-    # widths: that is exactly the case worth catching, and a pre-switch graph then
-    # fails the arithmetic below instead of loading silently.
-    root = int(meta.get("root_block_dim", ROOT_BLOCK_DIM))
-    ee = int(meta.get("ee_block_dim", EE_BLOCK_DIM))
-    expected = 2 * nj + root + ee * K
-    if d != expected:
+    declared = meta.get("window_blocks")
+    if declared is None:
         raise ValueError(
-            f"{onnx_path}: fm_meta D={d} but its layout implies {expected} "
-            f"(2*nj={2 * nj} + root_block={root} + {K}*ee_block={ee * K}). "
-            f"This runtime slices frames at ROOT_BLOCK_DIM={ROOT_BLOCK_DIM} / "
-            f"EE_BLOCK_DIM={EE_BLOCK_DIM}; a graph exported before the extra frames "
-            "went position-only does not match. Re-export the FM checkpoint."
+            f"{onnx_path}: fm_meta has no 'window_blocks'. This graph predates the "
+            "reference-window representation -- it emits the old relative-state vector "
+            f"(2*nj + 15 + 3*K = {2 * nj + 15 + 3 * K} wide) rather than window nodes "
+            f"({window_dim(nj, K)} wide), and the two are not interchangeable. "
+            "Re-record, retrain and re-export."
         )
-    if root != ROOT_BLOCK_DIM or ee != EE_BLOCK_DIM:
+    expected = [[name, int(w)] for name, w in window_blocks(nj, K)]
+    if [[str(n), int(w)] for n, w in declared] != expected:
         raise ValueError(
-            f"{onnx_path}: fm_meta declares root_block_dim={root}, ee_block_dim={ee}, "
-            f"but this runtime slices at {ROOT_BLOCK_DIM} / {EE_BLOCK_DIM} "
-            "(transfer/deploy/transforms_np.py). Re-export, or port transforms_np."
+            f"{onnx_path}: fm_meta window_blocks {declared} != this runtime's {expected} "
+            f"(nj={nj}, K={K}). Re-export the FM checkpoint."
+        )
+    if d != window_dim(nj, K):
+        raise ValueError(
+            f"{onnx_path}: fm_meta D={d} but the window layout implies "
+            f"{window_dim(nj, K)} (nj={nj}, K={K})."
         )
 
 
@@ -129,20 +136,9 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
     m = json.loads(raw["fm_meta"])
     source = str(m.get("extero_source", "height_scan"))
-    history_source = str(m.get("history_source", "measured"))
-    if history_source != "measured":
-        # The deploy runtime builds its history from the MEASURED robot only
-        # (``GenTrackerPolicy._make_snapshot``). Serving a partially autoregressive model
-        # from it would feed conditioning the model never saw, with nothing in the shapes to
-        # reveal it -- so refuse rather than run off-distribution.
-        raise ValueError(
-            f"{onnx_path} was trained with history_source={history_source!r}, which the "
-            "torch-free deploy runtime does not implement: it would need the reference it "
-            "applied last step fed back as history (see FmTrackingCommand."
-            "_stash_applied_reference), alongside the observation-history port already "
-            "listed in gen_tracker._assemble's TODO. Export a history_source='measured' "
-            "checkpoint for deployment."
-        )
+    # The old history_source refusal is gone: the deploy runtime CAN produce this history,
+    # because the history is the runtime's own last output rather than a measured state it
+    # would have to estimate.
     _check_state_layout(onnx_path, m)
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
@@ -150,7 +146,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
-        ground_z=float(m.get("ground_z", 0.0)), height_dim=int(m.get("height_dim", 1)),
+        height_dim=int(m.get("height_dim", 1)),
         extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
         extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
@@ -159,37 +155,34 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
     )
 
 
-def build_history_tokens(ctx, root_pos, root_quat, root_lin_vel, root_ang_vel, joint_pos, joint_vel,
-                         frames=None) -> np.ndarray:
-    """Build the **raw** ``N`` history (phase) tokens ``(V, N, D)`` (relative-state).
+def build_history_tokens(ctx: FmContext, nodes: np.ndarray) -> np.ndarray:
+    """The ``N`` autoregressive context tokens ``(V, N, D)``, raw.
 
-    Unlike the torch ``flow_matching.online`` builder, this does NOT normalize -- the
-    ``fm.onnx`` graph folds in the state normalization. Inputs are the ``N``
-    most-recent real-robot steps ``(V, N, ·)`` in FM joint/frame order, world frame,
-    xyzw quats; ``frames`` is ``(V,N,K,13)`` (required when the model predicts extra
-    frames). The relative frame is the **xyz+yaw** ground frame at the most recent
-    step (index ``N-1``), matching training. Returns ONLY the N history tokens (no
-    length-F window, no known mask -- history is separate conditioning).
+    A shape check and nothing else. The history is the ``N`` reference-window nodes this
+    runtime last served -- its own output -- already expressed relative to the robot at the
+    step each was served, so there is nothing to transform. The ``fm.onnx`` graph folds in
+    the normalization.
+
+    That is what took odometry off the generator's critical path: the previous version
+    built these from measured world-frame root poses, which hardware only has via FAST-LIO.
+
+    Args:
+        ctx: Loaded FM context.
+        nodes: Raw window nodes ``(V, N, D)``, oldest first.
+
+    Returns:
+        ``(V, N, D)`` float64.
+
+    Raises:
+        ValueError: If ``nodes`` does not match the graph's ``(N, D)``.
     """
-    v, n = root_pos.shape[0], root_pos.shape[1]
-    nj, k, m = ctx.nj, ctx.target_num_extra_frames, root_pos.shape[0] * root_pos.shape[1]
-    p_ref = np.broadcast_to(root_pos[:, n - 1 : n], (v, n, 3)).reshape(m, 3)
-    q_ref = np.broadcast_to(root_quat[:, n - 1 : n], (v, n, 4)).reshape(m, 4)
-
-    fpos = None
-    if k > 0:
-        if frames is None:
-            raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
-        # Callers hand over the full 13-wide per-frame state; only the position is read
-        # (the state vector's extra frames are position-only).
-        fpos = frames.reshape(m, k, 13)[..., 0:3]
-
-    return relative_state(
-        root_pos.reshape(m, 3), root_quat.reshape(m, 4),
-        root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
-        joint_pos.reshape(m, nj), joint_vel.reshape(m, nj), p_ref, q_ref,
-        frame_pos_w=fpos,
-    ).reshape(v, n, ctx.D)
+    arr = np.asarray(nodes, dtype=np.float64)
+    if arr.shape[1:] != (ctx.N, ctx.D):
+        raise ValueError(
+            f"history must be (V, {ctx.N}, {ctx.D}) window nodes for this graph, "
+            f"got {arr.shape}."
+        )
+    return arr
 
 
 def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
@@ -242,29 +235,27 @@ def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
     return future_cmd[:, ctx.cmd_steps, :]
 
 
-def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, noise, history_null=None) -> dict:
-    """Run the ONNX sampler and lift the predicted F-step future to the world frame.
+def sample_window(ctx: FmContext, history, extero, cmd_tokens, noise, history_null=None) -> np.ndarray:
+    """Sample the ``F``-node reference window. No world lift -- the window IS the output.
 
-    All F frames are predicted FUTURE (node 0 = the current step, base offset ~= 0),
-    expressed relative to the **xyz+yaw** ground frame at ``p_ref``/``q_ref`` (the
-    current robot base pose = the anchor at step N-1).
+    Node 0 is the current step and every node is already relative to the robot at this
+    re-plan, in the layout the tracker's ``reference_window`` observation expects. The
+    caller slices the offsets it needs straight into the observation, and pushes node 0
+    back as the next step's history.
 
     Args:
         ctx: Loaded FM context.
-        history: Raw N history (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        extero: Raw exteroception tokens ``(V, T*height_dim)`` (from
-            :func:`build_extero_tokens`).
+        history: Raw context tokens ``(V, N, D)`` from :func:`build_history_tokens`.
+        extero: Raw exteroception tokens ``(V, T*height_dim)``.
         cmd_tokens: Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)``.
-        p_ref: World anchor position ``(V, 3)`` (the current robot base position).
-        q_ref: World anchor quaternion ``(V, 4, xyzw)``.
         noise: Sampling noise ``(V, F, D)`` (caller-supplied for determinism).
         history_null: Optional ``(V,)`` bool/float; where set, the graph swaps the history
-            content for the learned ``null_history`` embedding, so the generator can be sampled
-            before its history window has filled. Silently ignored (with a one-time warning) on
-            a graph exported without the ``history_null`` input.
+            content for the learned ``null_history`` embedding, so the generator can be
+            sampled before its history window has filled. Silently ignored (with a one-time
+            warning) on a graph exported without the ``history_null`` input.
 
     Returns:
-        World-frame prediction dict (same keys as ``flow_matching.online.sample_world``).
+        Denormalized window nodes ``(V, F, D)``.
     """
     feed = {
         "history": history.astype(np.float32),
@@ -283,21 +274,4 @@ def sample_world(ctx: FmContext, history, extero, cmd_tokens, p_ref, q_ref, nois
                   "null-history embedding cannot be used; the generator will condition on a "
                   "not-yet-full history window. Re-export with export_fm_onnx.py.")
             _WARNED_NO_NULL = True
-    pred = ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D) denormalized rel-state
-
-    v, f, k = pred.shape[0], ctx.F, ctx.target_num_extra_frames
-    p_ref_f = np.broadcast_to(p_ref[:, None, :], (v, f, 3)).reshape(v * f, 3)
-    q_ref_f = np.broadcast_to(q_ref[:, None, :], (v, f, 4)).reshape(v * f, 4)
-    world = state_to_absolute(pred.reshape(v * f, ctx.D), p_ref_f, q_ref_f, ctx.nj, num_extra_frames=k)
-
-    out = {
-        "root_pos_w": world["root_pos_w"].reshape(v, f, 3),
-        "root_quat_w": world["root_quat_w"].reshape(v, f, 4),
-        "root_link_lin_vel_w": world["root_link_lin_vel_w"].reshape(v, f, 3),
-        "root_link_ang_vel_w": world["root_link_ang_vel_w"].reshape(v, f, 3),
-        "joint_pos": world["joint_pos"].reshape(v, f, ctx.nj),
-        "joint_vel": world["joint_vel"].reshape(v, f, ctx.nj),
-    }
-    if k > 0:
-        out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-    return out
+    return ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D)

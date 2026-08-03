@@ -13,8 +13,6 @@ from typing import Any
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 
-#: Recognised :attr:`FlowMatchingConfig.history_source` values.
-HISTORY_SOURCES: tuple[str, ...] = ("measured", "reference_partial")
 
 
 @dataclass
@@ -25,72 +23,58 @@ class FlowMatchingConfig:
     depend on the joint/extra-frame count and the command width), so the defaults
     here are placeholders.
 
-    Architecture (single transformer, robot-state conditioned): tokens are assembled
-    as ``[history(N) | height(1) | cmd(Ncmd) | future(F)]``. The ``num_history_states``
-    real-robot-state history tokens (whose job is to supply *phase*), the height-scan
-    token (a ``height_dim``-ray ground-clearance vector embedded into ONE token), and
-    the strided future-command tokens are SEPARATE conditioning tokens
-    (never noised, not part of the denoised window). The model denoises the ``F``
-    future state tokens -- ALL future, no past echo, no inpainting / known-mask. During
-    training the history is replaced by a learned null embedding with probability
-    ``null_cond_prob`` (classifier-free-guidance / phase-agnostic nominal).
+    Architecture (single transformer): tokens are assembled as
+    ``[history(N) | extero(T) | cmd(Ncmd) | future(F)]``. The history, exteroception and
+    strided command tokens are SEPARATE conditioning tokens (never noised, not part of
+    the denoised window). The model denoises the ``F`` future tokens -- ALL future, no
+    past echo, no inpainting / known-mask.
+
+    **The model is AUTOREGRESSIVE over its own output.** Every token, history and future
+    alike, is one node of the reference window in ``flow_matching.window``'s
+    representation -- the exact vector ``mdp.reference_window`` feeds the policy. The
+    history tokens are the ``N`` nodes this model emitted at the ``N`` previous control
+    steps, each anchored on the robot as it was at *that* step. So the generator conditions
+    on the plan it is continuing rather than on a state estimate, its output IS the
+    observation, and nothing on the path from network to policy touches a world coordinate
+    -- in simulation or at deploy.
+
+    The consequence to keep in mind when reading results: at training time that history is
+    the CLIP TEACHER's applied reference, never the model's own, so this carries textbook
+    exposure bias. The defences are ``null_cond_prob`` (during training the history is
+    replaced by a learned null embedding, which also covers the first ``N`` steps after a
+    reset, when no history exists yet) and the per-channel history-token noise below.
     """
 
     # -- data / windowing --
-    # Future window length F: the full denoised state sequence (node 0 = the current /
-    # anchor step, ego-anchored onto the robot so its base offset ≈ 0; nodes 1..F-1 are
-    # the future). The relative-frame anchor is the robot base at the most recent history
-    # step.
+    # Future window length F: the denoised sequence of reference-window nodes. Node 0 is
+    # the CURRENT step, nodes 1..F-1 the future, all anchored on the measured robot at the
+    # re-plan -- the same anchor and the same representation the policy's
+    # ``mdp.reference_window`` observation uses (see ``flow_matching.window``).
     #
-    # F is set by what the POLICY asks of one prediction. ``FmTrackingCommand`` re-plans
-    # every ``fm_update_every`` steps and walks a cursor one node per step in between, so a
-    # prediction must still cover the teacher's whole look-ahead window on the LAST step
-    # before the next re-plan:
+    # F is set by what the POLICY asks of one prediction, and now exactly:
     #
-    #     F_min = (fm_update_every - 1) + (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
-    #           = (12 - 1)             + (11 - 1) * 5                                 + 1
-    #           = 62                                              # 1.24 s at dt = 0.02
+    #     F = (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
+    #       = (11 - 1)                 * 5                 + 1
+    #       = 51                                              # 1.0 s at dt = 0.02
     #
-    # (``fm_update_every`` = the tracker's re-plan period and the recording's
-    # ``fm_snap_every``; ``REFERENCE_NUM_STEPS`` / ``REFERENCE_STRIDE`` are the teacher's
-    # reference-window knobs in ``g1_teacher_env_cfg.py``.)  65 rounds that up to a multiple
-    # of cmd_stride (=5) -> 13 evenly-spaced command tokens, with 3 steps of slack.
-    # ``FmTrackingCommand`` re-derives F_min from the offsets it is actually asked for and
-    # raises if the checkpoint is short, so this never degrades into a silent clamp.
+    # (``REFERENCE_NUM_STEPS`` / ``REFERENCE_STRIDE`` are the teacher's reference-window
+    # knobs in ``g1_teacher_env_cfg.py``.)  There is no ``fm_update_every - 1`` slack term
+    # any more because ``fm_update_every`` is PINNED TO 1: the prediction is expressed
+    # relative to the robot at the re-plan, so serving it a step later would need the
+    # egomotion since then to re-anchor -- odometry the deploy path deliberately no longer
+    # carries. ``FmTrackingCommand`` raises rather than let the anchor go stale.
     #
-    # Raising F grows per-window memory and the recorded ``ref_future`` array; bump
-    # --stride / --num_workers if training OOMs.  It also requires RE-RECORDING
-    # (record_data.py cuts windows at this length) and retraining.
-    future_len: int = 65
-    # N history (phase) conditioning tokens. Default 2: enough to read gait phase (the FM
-    # predicts nominal phase-dependent motion, not recovery).
-    num_history_states: int = 2
-
-    # What the history tokens are made of.
+    # cmd_stride (=5) divides 50, so the 11 command tokens land exactly on the window
+    # offsets [0, 5, ..., 50].
     #
-    #   "measured"          -- the robot's ACTUAL state at each of the N steps. The default,
-    #                          and the paradigm that fixed the autoregressive z-drift: the
-    #                          generator is re-grounded in reality every re-plan.
-    #   "reference_partial" -- PARTIALLY AUTOREGRESSIVE. The root pose/twist still comes from
-    #                          the measured robot, but the joints and the extra-frame
-    #                          positions come from the reference that was actually APPLIED at
-    #                          those steps -- i.e. the generator's own recent output, closing
-    #                          the loop on the posture channels while the root stays honest.
-    #
-    # The frame is unchanged either way: everything is expressed relative to the measured
-    # robot base at the newest history row, which is also the anchor the prediction is lifted
-    # through, so node 0 still lands on the robot.
-    #
-    # Both are train-time choices over the SAME recording -- ``record_data.py`` stores the
-    # applied-reference history ring unconditionally -- so this is an A/B with no re-record.
-    # The runtime reads it off the CHECKPOINT, not the task config, so a partially
-    # autoregressive model cannot silently be fed a measured history.
-    #
-    # Caveat worth knowing before reading a bad result as a bug: with the root measured and
-    # the ee positions taken from the reference, the ee block sits relative to an anchor the
-    # reference has drifted from. Over the <= fm_update_every stale steps that drift is small,
-    # but it is not zero.
-    history_source: str = "measured"
+    # Changing F requires RE-RECORDING (record_data.py cuts windows at this length) and
+    # retraining.
+    future_len: int = 51
+    # N history (context) tokens: the reference frames the generator itself emitted at the
+    # 4 steps before this one. 4 rather than 2 because these are now a *plan* being
+    # continued rather than a state being read -- more of the recent trajectory to
+    # extrapolate from, and 0.08 s of it instead of 0.04 s.
+    num_history_states: int = 4
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
@@ -126,11 +110,13 @@ class FlowMatchingConfig:
     cmd_stride: int = 5
 
     # -- dimensions (resolved from the dataset at build time) --
-    # Per-step state width of every token: 2*nj + 15*(1 + num_extra_frames). History
-    # and predicted states share this single representation (one shared normalizer).
-    state_dim: int = 73        # 2*nj + 15 = 2*29 + 15 (nj=29); resolved from the dataset at build time
-    # Per-step history-token width (= state_dim; resolved at build time).
-    history_dim: int = 73
+    # Per-node width of every token: the reference-window layout,
+    # 12 + 2*nj + 3*num_extra_frames (see ``flow_matching.window.window_dim``). History
+    # and predicted nodes are the SAME representation -- the history is just nodes this
+    # model emitted earlier -- so they share one normalizer.
+    state_dim: int = 82        # 12 + 2*29 + 3*4 (nj=29, K=4); resolved at build time
+    # Per-node history-token width (= state_dim; resolved at build time).
+    history_dim: int = 82
     # Which recorded signal feeds the exteroception conditioning tokens.
     #   "depth"       -- the two torso depth cameras, ONE token each (T=2), from
     #                    ``G1-teacher-clf-terrain-depth*`` recordings. DEFAULT, because it
@@ -150,13 +136,6 @@ class FlowMatchingConfig:
     # recorded array at dataset build time (176x1 for the scan, 780x2 for the cameras).
     height_dim: int = 176
     extero_tokens: int = 1
-    # World floor height (flat ground -> 0.0). VESTIGIAL: it fed no conditioning token once
-    # the height scan replaced the root-z scalar, and its last real consumer (the
-    # terrain-penetration loss) is now deleted. It is still copied into ``FMContext`` and the
-    # exported ONNX ``fm_meta``, where nothing reads it back.
-    # TODO: drop the field together with the ``ground_z`` key in ``export_fm_onnx.py`` /
-    # ``transfer/deploy/fm_session.py`` and the unused ``transforms.height_above_ground``.
-    ground_z: float = 0.0
     # Std floor for the height-scan normalizer. On flat ground the per-ray scan is nearly
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
     # normalization; a larger floor (~1e-2 m) keeps a near-flat scan well-scaled.
@@ -182,14 +161,16 @@ class FlowMatchingConfig:
     # target; it is resampled every access and disabled for val/eval/deployment.
     # ``obs_noise`` is the master flag; ``noise_scale`` scales every amplitude at once.
     # Amplitudes are physical, uniform half-widths (the sample is U(-amp, amp)).
+    # History-token noise. The SHAPE comes from
+    # ``flow_matching.window.REFERENCE_WINDOW_NOISE`` -- the same table the policy's
+    # reference observation is corrupted with -- because both stand in for the same thing:
+    # the generator's own prediction error. At deploy the history IS this model's past
+    # output, so that is by construction the error corrupting it. The per-block fields that
+    # used to live here were calibrated as SENSOR noise (back when the history was measured
+    # robot state) and had drifted up to 10x from the observation side; they are gone.
+    # ``noise_scale`` is the one knob left, and it scales the whole table.
     obs_noise: bool = True
     noise_scale: float = 1.0
-    noise_joint_pos: float = 0.01   # rad        (RL match)
-    noise_joint_vel: float = 0.5    # rad/s      (RL match)
-    noise_pos: float = 0.02         # m          base + extra-frame positions (estimator)
-    noise_lin_vel: float = 0.1      # m/s        base + extra-frame lin vel (estimator)
-    noise_ori: float = 0.05         # ori6d cols (RL: projected_gravity)
-    noise_ang_vel: float = 0.2      # rad/s      (RL: gyro)
     # Per-element exteroception noise. The token is a real sensor at deploy, so noise it
     # in training too. Applied independently per element, train split only.
     # ``noise_height_scan`` is metres of ground clearance and matches the RL policy's
@@ -203,7 +184,6 @@ class FlowMatchingConfig:
 
     # -- flow --
     num_sampling_steps: int = 8
-    ori6d_aux_weight: float = 0.0
 
     # -- consistency / forward-kinematics regularization (finite-difference + FK) --
     # ``dt`` is the control step period (seconds), resolved from the recording meta at
@@ -272,17 +252,6 @@ class FlowMatchingConfig:
         if self.extero_source not in EXTERO_SOURCES:
             raise ValueError(
                 f"extero_source={self.extero_source!r} is not one of {list(EXTERO_SOURCES)}."
-            )
-
-    def check_history_source(self) -> None:
-        """Raise if :attr:`history_source` is not a recognised source.
-
-        Raises:
-            ValueError: On an unknown source name.
-        """
-        if self.history_source not in HISTORY_SOURCES:
-            raise ValueError(
-                f"history_source={self.history_source!r} is not one of {list(HISTORY_SOURCES)}."
             )
 
     def to_dict(self) -> dict[str, Any]:

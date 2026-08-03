@@ -17,12 +17,7 @@ from __future__ import annotations
 
 import torch
 
-from .transforms import (
-    frame_block_start,
-    ori6d_orthonormality_penalty,
-    rot6d_to_matrix,
-    so3_log,
-)
+from .transforms import so3_exp, so3_log
 
 
 def sample_flow_batch(
@@ -57,33 +52,42 @@ def frame_consistency_terms(
     data_phys: torch.Tensor,
     dt: float,
     num_joints: int,
+    num_extra_frames: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample velocity + acceleration finite-difference consistency for the ROOT block.
+    """Per-sample velocity + acceleration finite-difference consistency for the base block.
 
-    Operates on the root block only (joints are handled separately, and the extra
-    end-effector frames are position-only so they carry no velocity to tie), in
-    DENORMALIZED (physical) relative-frame units, over the pure F-step future prediction
-    (no clean-history stitch -- the history is separate conditioning tokens, not part of
-    the denoised window).
+    Operates on ``base_pose`` / ``base_vel`` only (joints are handled separately, and the ee
+    block is position-only so it carries no velocity to tie), in DENORMALIZED (physical)
+    units, over the pure F-node future prediction.
 
-    - velocity: forward finite difference of the root **pose** (position, and a proper
-      SO(3) difference of orientations) vs the predicted linear/angular velocities.
-    - acceleration: forward finite difference of the predicted velocities vs the same
-      finite difference of the **data** velocities.
+    Both halves are exact under the window representation, for the same reason: every node
+    shares ONE anchor, so the anchor cancels out of a difference between nodes.
+
+    - position: ``base_pose[0:3]`` is ``R_actT (p_ref - p_act)`` with ``p_act``, ``R_act``
+      constant across nodes, so its forward difference is exactly ``R_actT v_ref`` --
+      which is ``base_vel[0:3]``.
+    - orientation: ``base_pose[3:6]`` is a log map, and log values do NOT difference
+      additively, so this goes through the group. Under the legacy convention
+      ``Exp(e_k) = R_ref_kT R_act``, hence
+      ``Log(Exp(e_{k+1})T Exp(e_k)) = R_actT Log(R_ref_{k+1} R_ref_kT)`` -- the anchor
+      cancels (it conjugates out) and the result is comparable to ``base_vel[3:6]``
+      directly. NOTE the transpose is on the LEFT factor here; unifying the base_pose
+      sign swaps it to the right one. Going through Exp/Log also makes the term immune
+      to the wrap at ``pi``, which a naive ``(e_{k+1} - e_k)`` would not be.
 
     Returns:
         ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
     """
+    del num_extra_frames  # layout is fixed at the front of the node; kept for symmetry
     x = pred_phys
-    b = frame_block_start(num_joints, 0)
-    pos, lin = x[..., b:b + 3], x[..., b + 3:b + 6]
-    ori, ang = x[..., b + 6:b + 12], x[..., b + 12:b + 15]
-    data_lin, data_ang = data_phys[..., b + 3:b + 6], data_phys[..., b + 12:b + 15]
+    pos, ori = x[..., 0:3], x[..., 3:6]
+    lin, ang = x[..., 6:9], x[..., 9:12]
+    data_lin, data_ang = data_phys[..., 6:9], data_phys[..., 9:12]
 
     lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
     vel = ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
-    rmat = rot6d_to_matrix(ori)  # (B, F, 3, 3)
-    ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
+    rmat = so3_exp(ori)  # (B, F, 3, 3) = R_refT R_act  (legacy convention)
+    ang_fd = so3_log(rmat[:, 1:].transpose(-1, -2) @ rmat[:, :-1]) / dt
     vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
 
     accel = (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
@@ -94,13 +98,14 @@ def frame_consistency_terms(
 def joint_vel_consistency_term(
     pred_phys: torch.Tensor, dt: float, num_joints: int
 ) -> torch.Tensor:
-    """Per-sample joint-velocity consistency: ``(joint_pos[t+1]-joint_pos[t])/dt ≈ joint_vel[t]``.
+    """Per-sample joint-velocity consistency: ``(joint_pos[t+1]-joint_pos[t])/dt ~ joint_vel[t]``.
 
-    Returns ``(B,)`` in physical units (rad/s). Operates on the pure F-step prediction.
+    Returns ``(B,)`` in physical units (rad/s). Operates on the pure F-node prediction.
+    Frame-invariant blocks, so the window representation changes nothing but the offsets.
     """
     x = pred_phys
-    jp = x[..., 0:num_joints]
-    jv = x[..., num_joints:2 * num_joints]
+    jp = x[..., 12:12 + num_joints]
+    jv = x[..., 12 + num_joints:12 + 2 * num_joints]
     jp_fd = (jp[:, 1:] - jp[:, :-1]) / dt
     return ((jp_fd - jv[:, :-1]) ** 2).mean(dim=(1, 2))
 
@@ -113,17 +118,19 @@ def fk_consistency_terms(
 ) -> torch.Tensor:
     """Per-sample forward-kinematics POSITION consistency for the EE frames.
 
-    Ties each predicted end-effector position, expressed relative to the predicted root
-    (base frame), to the FK of the predicted joints. This is what couples the two halves
-    of the prediction: without it the joints and the ee positions are free to describe
-    different postures.
+    Ties each predicted end-effector position to the FK of the predicted joints. This is
+    what couples the two halves of the prediction: without it the joints and the ee
+    positions are free to describe different postures.
 
-    Position-only, because the state vector's extra frames are position-only (see
-    :mod:`~robot_rl.flow_matching.transforms`). The orientation residual and the
-    ``J(q)·q̇`` velocity residual that used to live here went with the ee orientation and
-    twist channels.
+    Direct under the window representation. The ``ee_pos`` block is already the position in
+    THAT node's own reference base frame, which is exactly the frame ``FKChain`` reports in
+    -- so this is a plain residual. It used to have to reconstruct the base frame from the
+    predicted root pose first, which also let a root error partially cancel an ee error;
+    the coupling this term exists to enforce is tighter now.
 
-    On the DENORMALIZED F-step prediction. ``fk`` is a
+    Position-only, because the window's ee block is position-only.
+
+    On the DENORMALIZED F-node prediction. ``fk`` is a
     :class:`~motion_gen.fk.FKChain` exposing ``pose_and_jacobian``.
 
     Returns:
@@ -133,22 +140,13 @@ def fk_consistency_terms(
     b_, f_, _ = x.shape
     nj, k = num_joints, num_extra_frames
 
-    q = x[..., 0:nj].reshape(b_ * f_, nj)
+    q = x[..., 12:12 + nj].reshape(b_ * f_, nj)
     fk_pos, _fk_rot, _jv, _jw = fk.pose_and_jacobian(q)            # (M,K,3), ...
     fk_pos = fk_pos.reshape(b_, f_, k, 3)
 
-    rb = frame_block_start(nj, 0)
-    p_root = x[..., rb:rb + 3]
-    R_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])               # (B,F,3,3) base->ref
-
-    pose_ps = x.new_zeros(b_)
-    for kf in range(k):
-        eb = frame_block_start(nj, 1 + kf)
-        rel = x[..., eb:eb + 3] - p_root
-        # EE position relative to the (predicted) base; R_rootᵀ via "...ji,...j->...i".
-        p_ee_base = torch.einsum("bfji,bfj->bfi", R_root, rel)
-        pose_ps = pose_ps + ((p_ee_base - fk_pos[:, :, kf]) ** 2).mean(dim=(1, 2))
-    return pose_ps / max(k, 1)
+    ee0 = 12 + 2 * nj
+    ee = x[..., ee0:ee0 + 3 * k].reshape(b_, f_, k, 3)
+    return ((ee - fk_pos) ** 2).mean(dim=(1, 2, 3))
 
 
 def flow_matching_loss(
@@ -158,8 +156,6 @@ def flow_matching_loss(
     height: torch.Tensor,
     cmd_tokens: torch.Tensor | None = None,
     history_null_mask: torch.Tensor | None = None,
-    ori_slice: tuple[int, int] | None = None,
-    aux_weight: float = 0.0,
     state_norm: object | None = None,
     dt: float = 0.02,
     num_joints: int = 0,
@@ -186,8 +182,6 @@ def flow_matching_loss(
         cmd_tokens: Strided future command tokens (normalized) or ``None``.
         history_null_mask: ``(B,)`` bool; where True the history is replaced by the
             model's learned null embedding (classifier-free-guidance / phase-agnostic).
-        ori_slice: ``(start, end)`` of the root 6D orientation block, for the aux loss.
-        aux_weight: Weight of the orientation orthonormality penalty (0 disables).
         state_norm: State :class:`Normalizer` (needed to denormalize); ``None`` disables
             all consistency/FK terms.
         dt: Control step period (seconds) for the finite differences.
@@ -199,8 +193,8 @@ def flow_matching_loss(
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
-        ``ori_aux`` / ``vel_consistency`` / ``accel_consistency`` /
-        ``joint_vel_consistency`` / ``fk_pose``.
+        ``vel_consistency`` / ``accel_consistency`` / ``joint_vel_consistency`` /
+        ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
     v = model(x_tau, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
@@ -209,14 +203,9 @@ def flow_matching_loss(
 
     do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
     do_fk = fk is not None and state_norm is not None and fk_pose_weight > 0.0
-    if (aux_weight > 0.0 and ori_slice is not None) or do_frame or do_fk:
+    if do_frame or do_fk:
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
-        if aux_weight > 0.0 and ori_slice is not None:
-            ori = x1_hat[..., ori_slice[0]:ori_slice[1]].reshape(-1, ori_slice[1] - ori_slice[0])
-            aux = ori6d_orthonormality_penalty(ori)
-            out["ori_aux"] = aux.detach()
-            out["loss"] = out["loss"] + aux_weight * aux
         if do_frame or do_fk:
             pred_phys = state_norm.denormalize(x1_hat)
             data_phys = state_norm.denormalize(x1)
@@ -254,6 +243,7 @@ def sample_trajectory(
     history_null_mask: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
     zero_noise: bool = False,
+    guidance_scale: float = 1.0,
 ) -> torch.Tensor:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
@@ -279,6 +269,21 @@ def sample_trajectory(
             distribution: ``x0 = 0`` is not a typical draw, so treat the output as a diagnostic
             trace rather than a representative rollout.
 
+        guidance_scale: Classifier-free guidance weight ``w`` over the HISTORY conditioning.
+            ``1.0`` (default) = plain conditional sampling, the historical behaviour.
+            ``w > 1`` integrates ``v_null + w (v_cond - v_null)``, extrapolating along the
+            direction the history contributes and so making the sample adhere to it more
+            strongly. The model already supports this: it was trained with the history
+            dropped on ``null_cond_prob`` of samples, so ``v_null`` is learned, not improvised.
+
+            Worth knowing before turning it up in a closed loop: guidance makes the model
+            trust the history MORE, and in autoregressive rollout the history is the model's
+            own (possibly drifting) output -- so it should help teacher forcing more than the
+            closed loop, and past some ``w`` it may make the closed loop worse by committing
+            harder to a bad plan. It also samples off the data distribution, which for a
+            reference the robot has to physically track is a sharper risk than it is for
+            images. Sweep it against TRACKING, not just flow MSE.
+
     Returns:
         Generated future window (standardized), shape ``(B, F, D)`` -- all F are novel.
     """
@@ -288,9 +293,29 @@ def sample_trajectory(
          else torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype,
                           generator=generator))
     dt = 1.0 / num_steps
+    guided = float(guidance_scale) != 1.0
+    if guided:
+        # Classifier-free guidance over the HISTORY only (that is the branch the model was
+        # trained to drop, at ``null_cond_prob``). Both halves go through ONE forward at 2x
+        # batch rather than two sequential passes -- on GPU that is far cheaper than 2x.
+        cond_mask = (torch.zeros(b, dtype=torch.bool, device=device)
+                     if history_null_mask is None else history_null_mask)
+        null_mask = torch.ones(b, dtype=torch.bool, device=device)
+        mask2 = torch.cat([cond_mask, null_mask], dim=0)
+        hist2, height2 = torch.cat([history] * 2, 0), torch.cat([height] * 2, 0)
+        cmd2 = None if cmd_tokens is None else torch.cat([cmd_tokens] * 2, 0)
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
-        v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+        if guided:
+            v2 = model(torch.cat([x, x], 0), torch.cat([tau, tau], 0), hist2, height2, cmd2,
+                       history_null_mask=mask2)
+            v_cond, v_null = v2[:b], v2[b:]
+            # v_null + w (v_cond - v_null): extrapolate along the direction the HISTORY
+            # contributes. Envs already null-masked have v_cond == v_null, so guidance is a
+            # no-op for them -- which is what you want for the first N steps after a reset.
+            v = v_null + guidance_scale * (v_cond - v_null)
+        else:
+            v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
         x = x + dt * v
     return x
 

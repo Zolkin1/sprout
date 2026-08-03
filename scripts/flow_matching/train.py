@@ -44,14 +44,13 @@ from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
     EXTERO_SOURCES,
-    HISTORY_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
     build_train_val,
     flow_matching_loss,
-    frame_block_start,
-    orientation_slice,
-    rot6d_to_matrix,
+    REFERENCE_WINDOW_NOISE,
+    so3_exp,
+    window_block_slices,
     sample_trajectory,
     snap_windows,
 )
@@ -87,15 +86,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="Window length F (state tokens). Effective novel horizon is "
                              "F - num_history_states (default from config.py, sized to cover the "
                              "deploy-time policy lookahead; see FlowMatchingConfig.future_len).")
-    parser.add_argument("--num_history_states", type=int, default=2,
-                        help="N most-recent states used as history (phase) conditioning tokens.")
-    parser.add_argument("--history_source", type=str, default=FlowMatchingConfig().history_source,
-                        choices=list(HISTORY_SOURCES),
-                        help="What the history tokens are made of. 'measured' (default) = the "
-                             "robot's actual state. 'reference_partial' = PARTIALLY "
-                             "AUTOREGRESSIVE: measured root pose/twist, but joints and ee "
-                             "positions from the reference applied at those steps. A train-time "
-                             "A/B over the same recording.")
+    parser.add_argument("--num_history_states", type=int,
+                        default=FlowMatchingConfig().num_history_states,
+                        help="N autoregressive context tokens: the reference-window nodes the "
+                             "generator emitted at the N previous control steps. Needs a "
+                             "recording with history_len >= N + 1.")
     parser.add_argument("--extero_source", type=str, default=FlowMatchingConfig().extero_source,
                         choices=list(EXTERO_SOURCES),
                         help="Which recorded exteroception feeds the conditioning tokens. "
@@ -142,7 +137,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     # single source of truth -- editing a default there changes a plain `train.py` run (a
     # bare `default=0.0` here would silently override the config and disable the loss).
     _wc = FlowMatchingConfig()
-    parser.add_argument("--ori6d_aux_weight", type=float, default=_wc.ori6d_aux_weight)
     # Frame finite-difference consistency regularizers (root + ee frames). dt defaults
     # to the recording's control period. The consistency losses are in physical units
     # (m/s, rad/s and m/s^2, rad/s^2).
@@ -181,12 +175,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     )
     parser.add_argument("--noise_scale", type=float, default=_dn.noise_scale,
                         help="Global multiplier on every noise amplitude.")
-    parser.add_argument("--noise_joint_pos", type=float, default=_dn.noise_joint_pos)
-    parser.add_argument("--noise_joint_vel", type=float, default=_dn.noise_joint_vel)
-    parser.add_argument("--noise_pos", type=float, default=_dn.noise_pos)
-    parser.add_argument("--noise_lin_vel", type=float, default=_dn.noise_lin_vel)
-    parser.add_argument("--noise_ori", type=float, default=_dn.noise_ori)
-    parser.add_argument("--noise_ang_vel", type=float, default=_dn.noise_ang_vel)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -197,14 +185,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
     cfg = FlowMatchingConfig(
         future_len=args.future_len, num_history_states=args.num_history_states,
-        history_source=args.history_source, extero_source=args.extero_source,
+        extero_source=args.extero_source,
         null_cond_prob=args.null_cond_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
         recovery_mode=args.recovery_mode,
         cmd_array=args.cmd_array, cmd_stride=args.cmd_stride,
         d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers,
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
-        num_sampling_steps=args.num_sampling_steps, ori6d_aux_weight=args.ori6d_aux_weight,
+        num_sampling_steps=args.num_sampling_steps,
         vel_consistency_weight=args.vel_consistency_weight,
         accel_consistency_weight=args.accel_consistency_weight,
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
@@ -214,9 +202,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
-        noise_joint_pos=args.noise_joint_pos, noise_joint_vel=args.noise_joint_vel,
-        noise_pos=args.noise_pos, noise_lin_vel=args.noise_lin_vel,
-        noise_ori=args.noise_ori, noise_ang_vel=args.noise_ang_vel,
     )
     return cfg, args
 
@@ -246,28 +231,27 @@ def channel_metrics(
     def _rmse(a: torch.Tensor, b: torch.Tensor) -> float:
         return torch.sqrt(torch.mean((a - b) ** 2)).item()
 
-    def _geodesic(o0: int, o1: int) -> float:
-        r_pred = rot6d_to_matrix(pred[..., o0:o1])
-        r_tgt = rot6d_to_matrix(tgt[..., o0:o1])
-        rel = r_pred.transpose(-1, -2) @ r_tgt
+    def _geodesic() -> float:
+        """Angle between the predicted and target base orientations, in radians.
+
+        Through ``Exp`` rather than differencing the log values, so the metric stays
+        meaningful (and wrap-immune) however far the reference has turned from the anchor.
+        """
+        rel = so3_exp(pred[..., 3:6]).transpose(-1, -2) @ so3_exp(tgt[..., 3:6])
         cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
         return torch.arccos(cos).mean().item()
 
-    bo0, bo1 = orientation_slice(nj)
+    b = window_block_slices(nj, num_extra_frames)
     out = {
-        "rmse_joint_pos": _rmse(pred[..., 0:nj], tgt[..., 0:nj]),
-        "rmse_joint_vel": _rmse(pred[..., nj:2 * nj], tgt[..., nj:2 * nj]),
-        "rmse_root_pos": _rmse(pred[..., 2 * nj:2 * nj + 3], tgt[..., 2 * nj:2 * nj + 3]),
-        "rmse_root_lin_vel": _rmse(pred[..., 2 * nj + 3:2 * nj + 6], tgt[..., 2 * nj + 3:2 * nj + 6]),
-        "rmse_root_ang_vel": _rmse(pred[..., 2 * nj + 12:2 * nj + 15], tgt[..., 2 * nj + 12:2 * nj + 15]),
-        "ori_geodesic_rad": _geodesic(bo0, bo1),
+        "rmse_base_pos": _rmse(pred[..., 0:3], tgt[..., 0:3]),
+        "rmse_base_lin_vel": _rmse(pred[..., 6:9], tgt[..., 6:9]),
+        "rmse_base_ang_vel": _rmse(pred[..., 9:12], tgt[..., 9:12]),
+        "rmse_joint_pos": _rmse(pred[..., b["joint_pos"]], tgt[..., b["joint_pos"]]),
+        "rmse_joint_vel": _rmse(pred[..., b["joint_vel"]], tgt[..., b["joint_vel"]]),
+        "ori_geodesic_rad": _geodesic(),
     }
     if num_extra_frames > 0:
-        pos_rmse = 0.0
-        for k in range(num_extra_frames):
-            b = frame_block_start(nj, 1 + k)
-            pos_rmse += _rmse(pred[..., b:b + 3], tgt[..., b:b + 3])
-        out["rmse_frame_pos"] = pos_rmse / num_extra_frames
+        out["rmse_ee_pos"] = _rmse(pred[..., b["ee_pos"]], tgt[..., b["ee_pos"]])
     return out
 
 
@@ -287,16 +271,12 @@ def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> N
     s = train_ds.state[:n_windows].to(device)
     x = train_ds.state_normalizer.denormalize(s)  # (W, F, D) physical
     w, f = x.shape[0], x.shape[1]
-    fk_pos, _, _, _ = fk.pose_and_jacobian(x[..., :nj].reshape(w * f, nj))
+    blocks = window_block_slices(nj, k)
+    fk_pos, _, _, _ = fk.pose_and_jacobian(x[..., blocks["joint_pos"]].reshape(w * f, nj))
     fk_pos = fk_pos.reshape(w, f, k, 3)
-    rb = frame_block_start(nj, 0)
-    p_root = x[..., rb:rb + 3]
-    r_root = rot6d_to_matrix(x[..., rb + 6:rb + 12])
-    errs = []
-    for kf in range(k):
-        eb = frame_block_start(nj, 1 + kf)
-        p_ee_base = torch.einsum("wfji,wfj->wfi", r_root, x[..., eb:eb + 3] - p_root)
-        errs.append(float((p_ee_base - fk_pos[:, :, kf]).norm(dim=-1).mean()))
+    # The window's ee block is ALREADY base-relative, so this is a direct residual.
+    ee = x[..., blocks["ee_pos"]].reshape(w, f, k, 3)
+    errs = [float((ee[:, :, kf] - fk_pos[:, :, kf]).norm(dim=-1).mean()) for kf in range(k)]
     mean_mm = 1000.0 * sum(errs) / max(len(errs), 1)
     print(f"[INFO] FK sanity (FK(recorded joints) vs recorded ee, base frame): "
           f"mean {mean_mm:.1f} mm | per-frame mm {[round(1000 * e, 1) for e in errs]}")
@@ -398,10 +378,10 @@ def main() -> None:
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
     if cfg.obs_noise:
-        print(f"[INFO] obs_noise=on (conditioning tokens, train split only), scale={cfg.noise_scale} | "
-              f"joint_pos={cfg.noise_joint_pos} joint_vel={cfg.noise_joint_vel} "
-              f"pos={cfg.noise_pos} lin_vel={cfg.noise_lin_vel} ori={cfg.noise_ori} "
-              f"ang_vel={cfg.noise_ang_vel}")
+        print(f"[INFO] obs_noise=on (conditioning tokens, train split only), "
+              f"scale={cfg.noise_scale} x window.REFERENCE_WINDOW_NOISE "
+              f"(the same table the policy's reference obs is corrupted with): "
+              + " ".join(f"{k}={v}" for k, v in REFERENCE_WINDOW_NOISE.items()))
     else:
         print("[INFO] obs_noise=off (clean conditioning tokens)")
 
@@ -477,7 +457,6 @@ def main() -> None:
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
     )
-    ori_slice = orientation_slice(num_joints)
 
     writer = SummaryWriter(log_dir=out_dir)
     wandb_run = None
@@ -511,7 +490,7 @@ def main() -> None:
             opt.zero_grad()
             out = flow_matching_loss(
                 model, state, history, height, cmd_tokens,
-                history_null_mask=null_mask, ori_slice=ori_slice, aux_weight=cfg.ori6d_aux_weight,
+                history_null_mask=null_mask,
                 state_norm=train_ds.state_normalizer,
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk),
             )

@@ -32,6 +32,7 @@ sys.path.insert(0, _TRANSFER)
 
 from deploy import quat_math_np as qn  # noqa: E402
 from deploy import transforms_np as tn  # noqa: E402
+from deploy import window_np as wn  # noqa: E402
 from torch_math import quat_math as qt  # noqa: E402
 
 
@@ -119,7 +120,49 @@ def test_deploy_parity_transforms() -> None:
     print("TRANSFORMS PARITY CHECKS PASSED")
 
 
+def test_deploy_parity_window():
+    """``window_np.world_to_window`` reproduces ``flow_matching.window.world_to_window``.
+
+    The reference window is the representation the policy observes AND the one the
+    generator predicts, so a divergence between the two implementations of it is a
+    sim2real gap that no shape check can see -- both sides produce a correctly-sized
+    observation either way.  The ``base_pose`` block is the sharp edge: its two halves
+    have to point the same way (reference minus actual) and live in the same frame.
+    """
+    wt = pytest.importorskip(
+        "robot_rl.flow_matching.window",
+        reason="needs the isaaclab env for the training-side window oracle",
+        exc_type=ImportError,
+    )
+    g = torch.Generator().manual_seed(1)
+    n, k, nj, K = 6, 11, 21, 4
+    np_ = lambda t: t.detach().numpy()
+
+    act_p = torch.randn(n, 1, 3, generator=g, dtype=torch.float64)
+    act_q = _rand_quat(n, g)[:, None, :]
+    ref_p = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    ref_q = _rand_quat(n * k, g).view(n, k, 4)
+    ref_l = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    ref_a = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    jp = torch.randn(n, k, nj, generator=g, dtype=torch.float64)
+    jv = torch.randn(n, k, nj, generator=g, dtype=torch.float64)
+    ee = torch.randn(n, k, K, 3, generator=g, dtype=torch.float64)
+
+    win_t = wt.world_to_window(act_p, act_q, ref_p, ref_q, ref_l, ref_a, jp, jv, ee)
+    win_np = wn.world_to_window(np_(act_p), np_(act_q), np_(ref_p), np_(ref_q), np_(ref_l),
+                                np_(ref_a), np_(jp), np_(jv), np_(ee))
+    _close("world_to_window", win_np, win_t, atol=1e-9)
+
+    # The layout tables must agree too -- the numpy side restates them, and a silent
+    # disagreement would slice the right width out of the wrong columns.
+    assert wn.window_blocks(nj, K) == [(n_, w) for n_, w in wt.window_blocks(nj, K)]
+    assert wn.window_dim(nj, K) == wt.window_dim(nj, K) == win_t.shape[-1]
+    assert wn.window_block_slices(nj, K) == wt.window_block_slices(nj, K)
+    print("WINDOW PARITY CHECKS PASSED")
+
+
 if __name__ == "__main__":
     test_deploy_parity_quat_math()
     test_deploy_parity_transforms()
+    test_deploy_parity_window()
     print("ALL DEPLOY-CORE PARITY CHECKS PASSED")

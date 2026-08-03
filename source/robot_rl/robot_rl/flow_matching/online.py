@@ -28,12 +28,8 @@ from .config import FlowMatchingConfig
 from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
-from .transforms import (
-    relative_state as _relative_state,
-    sanitize_extero,
-    state_to_absolute,
-    target_state_dim,
-)
+from .transforms import sanitize_extero
+from .window import window_dim
 
 
 # ----------------------------------------------------------------------
@@ -127,11 +123,11 @@ class FmOnlineContext:
         state_norm: Normalizer for the state tokens (history conditioning + future).
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
         height_norm: Normalizer for the height-scan token.
-        ground_z: World floor height for the terrain-penetration loss only (no longer feeds any FM token).
-        N: Number of history (phase) conditioning tokens.
+        N: Number of history (context) tokens -- the reference-window nodes this model
+            emitted at the N previous control steps.
         F: Future window length (all F are predicted; node 0 = current step).
-        D: State width (= ``2*nj + ROOT_BLOCK_DIM + EE_BLOCK_DIM*target_num_extra_frames``,
-            i.e. ``2*nj + 15 + 3*K`` -- the extra frames are position-only); also history_dim.
+        D: Window-node width (``window_dim(nj, target_num_extra_frames)`` =
+            ``12 + 2*nj + 3*K``); history and future share it.
         nj: Number of joints.
         target_num_extra_frames: Extra body frames the generator predicts (and that
             the history carries).
@@ -153,7 +149,6 @@ class FmOnlineContext:
     state_norm: Normalizer
     cmd_norm: Normalizer | None
     height_norm: Normalizer
-    ground_z: float
     N: int
     F: int
     D: int
@@ -173,14 +168,6 @@ class FmOnlineContext:
     checkpoint rather than on whatever the task config happens to say.  Defaults to the
     height scan, which is also what a checkpoint predating the selector resolves to.
     """
-    history_source: str = "measured"
-    """What the history tokens the model was TRAINED on are made of.
-
-    ``"measured"`` = the robot's actual state; ``"reference_partial"`` = measured root
-    pose/twist plus the applied reference's joints and ee positions (partially
-    autoregressive). Carried on the context -- like :attr:`extero_source` -- so the runtime
-    feeds what the checkpoint expects rather than what the task config happens to say.
-    """
     fm_snap_every: int | None = None
     """Control steps between snap (re-plan) events in the recording this model trained on.
 
@@ -198,6 +185,12 @@ class FmOnlineContext:
     the height scan, whose grid travels in the tracker's ``height_scan_spec`` instead.
     """
     zero_noise: bool = False
+    guidance_scale: float = 1.0
+    """Classifier-free guidance weight over the HISTORY conditioning (1.0 = off).
+
+    See :func:`~robot_rl.flow_matching.flow.sample_trajectory` for what it does and why it
+    is expected to help teacher forcing more than a closed-loop rollout.
+    """
 
     @property
     def frame_names(self) -> list[str]:
@@ -216,6 +209,7 @@ def load_fm_context(
     num_sampling_steps: int | None = None,
     map_location: str = "cpu",
     zero_noise: bool = False,
+    guidance_scale: float = 1.0,
 ) -> FmOnlineContext:
     """Load a flow-matching checkpoint into an inference-ready context.
 
@@ -229,6 +223,7 @@ def load_fm_context(
         num_sampling_steps: Override the checkpoint's Euler step count (or ``None``).
         map_location: ``torch.load`` map location when ``checkpoint`` is a path.
         zero_noise: Sample deterministically from ``x0 = 0`` (see :class:`FmOnlineContext`).
+        guidance_scale: Classifier-free guidance weight over the history (1.0 = off).
 
     Returns:
         A populated :class:`FmOnlineContext`.
@@ -266,7 +261,7 @@ def load_fm_context(
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    target_d = target_state_dim(nj, target_k)
+    target_d = window_dim(nj, target_k)
     if target_d != cfg.state_dim:
         raise ValueError(
             f"target_frame_names implies state_dim {target_d} (nj={nj}, K={target_k}) "
@@ -277,7 +272,7 @@ def load_fm_context(
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
-        height_norm=height_norm, ground_z=float(cfg.ground_z),
+        height_norm=height_norm,
         N=cfg.num_history_states, F=cfg.future_len, D=target_d, nj=nj,
         target_num_extra_frames=target_k,
         num_steps=int(num_sampling_steps or cfg.num_sampling_steps),
@@ -285,7 +280,7 @@ def load_fm_context(
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
         zero_noise=bool(zero_noise),
-        history_source=str(cfg.history_source),
+        guidance_scale=float(guidance_scale),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
         extero_spec=(meta.get("extero_spec") or None),
@@ -295,55 +290,34 @@ def load_fm_context(
 # ----------------------------------------------------------------------
 # Conditioning construction + world-frame sampling.
 # ----------------------------------------------------------------------
-def build_history_tokens(
-    ctx: FmOnlineContext,
-    root_pos: torch.Tensor,
-    root_quat: torch.Tensor,
-    root_lin_vel: torch.Tensor,
-    root_ang_vel: torch.Tensor,
-    joint_pos: torch.Tensor,
-    joint_vel: torch.Tensor,
-    frames: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Build the ``N`` history (phase) conditioning tokens ``(V, N, D)`` (normalized).
+def build_history_tokens(ctx: FmOnlineContext, nodes: torch.Tensor) -> torch.Tensor:
+    """Normalize the ``N`` history (context) tokens ``(V, N, D)``.
 
-    All raw inputs are the ``N`` most-recent real-robot steps ``(V, N, ·)`` in the FM's
-    joint/frame order, world frame. The relative frame is the **xyz+yaw** ground frame
-    at the most recent step (index ``N-1``), matching training. Returns ONLY the N
-    history tokens (no length-F window, no known mask -- history is separate conditioning).
+    There is no geometry left to do here. The history is the ``N`` reference-window nodes
+    this model emitted at the ``N`` previous control steps, each already expressed relative
+    to the robot at its own step -- so a caller pushes back the node it just served and this
+    only applies the shared normalizer.
+
+    That is what makes the deploy loop odometry-free: the previous transform-based version
+    took world-frame robot state and re-expressed it against the newest step, which needed a
+    base pose in some fixed frame.
 
     Args:
         ctx: The loaded context.
-        root_pos/root_quat/root_lin_vel/root_ang_vel: Root world quantities ``(V,N,·)``.
-        joint_pos/joint_vel: Joint quantities ``(V,N,nj)`` in FM joint order.
-        frames: Extra-frame world state ``(V,N,K,13)`` =
-            ``[pos(3), quat(4 xyzw), lin_vel(3), ang_vel(3)]`` (required when the model
-            predicts extra frames), or None.
+        nodes: Raw (unnormalized) window nodes ``(V, N, D)``, oldest first.
 
     Returns:
         Normalized history tokens ``(V, N, D)``.
+
+    Raises:
+        ValueError: If ``nodes`` does not match the checkpoint's ``(N, D)``.
     """
-    v, n = root_pos.shape[0], root_pos.shape[1]
-    nj, k = ctx.nj, ctx.target_num_extra_frames
-    m = v * n
-    p_ref = root_pos[:, n - 1 : n].expand(v, n, 3).reshape(m, 3)
-    q_ref = root_quat[:, n - 1 : n].expand(v, n, 4).reshape(m, 4)
-
-    fpos = None
-    if k > 0:
-        if frames is None:
-            raise ValueError(f"Context predicts {k} extra frames but no history frames were provided.")
-        # Callers hand over the full 13-wide per-frame state; only the position is read
-        # (the state vector's extra frames are position-only).
-        fpos = frames.reshape(m, k, 13)[..., 0:3]
-
-    rel = _relative_state(
-        root_pos.reshape(m, 3), root_quat.reshape(m, 4),
-        root_lin_vel.reshape(m, 3), root_ang_vel.reshape(m, 3),
-        joint_pos.reshape(m, nj), joint_vel.reshape(m, nj),
-        p_ref, q_ref, frame_pos_w=fpos,
-    ).reshape(v, n, ctx.D)
-    return ctx.state_norm.normalize(rel)
+    if nodes.shape[1:] != (ctx.N, ctx.D):
+        raise ValueError(
+            f"history must be (V, {ctx.N}, {ctx.D}) window nodes for this checkpoint, "
+            f"got {tuple(nodes.shape)}."
+        )
+    return ctx.state_norm.normalize(nodes)
 
 
 def build_extero_tokens(ctx: FmOnlineContext, values: torch.Tensor) -> torch.Tensor:
@@ -367,19 +341,6 @@ def build_extero_tokens(ctx: FmOnlineContext, values: torch.Tensor) -> torch.Ten
     return ctx.height_norm.normalize(sanitize_extero(flat, ctx.extero_source))
 
 
-def build_height_token(ctx: FmOnlineContext, height_scan: torch.Tensor) -> torch.Tensor:
-    """Backwards-compatible wrapper for :func:`build_extero_tokens`.
-
-    Args:
-        ctx: The loaded context.
-        height_scan: Raw reading at the anchor step.
-
-    Returns:
-        Normalized exteroception tokens.
-    """
-    return build_extero_tokens(ctx, height_scan)
-
-
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:
     """Build the strided, normalized command tokens from a window command profile.
 
@@ -399,63 +360,40 @@ def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Te
 
 
 @torch.no_grad()
-def sample_world(
+def sample_window(
     ctx: FmOnlineContext,
     history: torch.Tensor,
     height: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
-    p_ref: torch.Tensor,
-    q_ref: torch.Tensor,
     history_null_mask: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Sample the ``F``-step future window and lift it to the world frame.
+) -> torch.Tensor:
+    """Sample the ``F``-node future window, denormalized.
 
-    All F frames are predicted FUTURE (node 0 = the current step, base offset ≈ 0).
-    Every frame is expressed relative to the **xyz+yaw** ground frame at
-    ``p_ref``/``q_ref`` (the current robot base pose = the anchor at step N-1), so no
-    re-centering is needed.
+    The return value IS the reference window: node 0 is the current step and every node is
+    already expressed relative to the robot at this re-plan, in the layout
+    ``mdp.observations.reference_window`` feeds the policy. There is no world lift, which is
+    the point -- nothing between the network and the policy needs a world pose, in
+    simulation or at deploy. Use ``window.window_to_world`` if a DIAGNOSTIC needs world
+    coordinates and has the anchor to supply.
 
     Args:
         ctx: The loaded context.
-        history: History (phase) tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        height: Normalized height-scan token ``(V, height_dim)`` (from :func:`build_height_token`).
+        history: History tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
+        height: Normalized exteroception tokens ``(V, T*height_dim)``.
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
-        p_ref: World reference position ``(V, 3)`` (the current robot base position).
-        q_ref: World reference quaternion ``(V, 4, xyzw)``.
-        history_null_mask: Optional ``(V,)`` bool; where True the history content is replaced by
-            the model's learned ``null_history`` embedding. Pass
-            :meth:`BatchedHistory.null_mask` to sample before the window has filled instead of
-            falling back to a clip or a fabricated static history.
+        history_null_mask: Optional ``(V,)`` bool; where True the history content is
+            replaced by the model's learned ``null_history`` embedding. Pass
+            :meth:`BatchedHistory.null_mask` to sample before the window has filled --
+            which is also the first ``N`` steps after a reset, when the generator has
+            emitted nothing to condition on yet.
 
     Returns:
-        World-frame prediction dict with ``root_pos_w (V,F,3)``,
-        ``root_quat_w (V,F,4)``, ``root_link_lin_vel_w (V,F,3)``,
-        ``root_link_ang_vel_w (V,F,3)``, ``joint_pos (V,F,nj)``,
-        ``joint_vel (V,F,nj)`` and, when the model predicts extra frames,
-        ``frame_pos_w (V,F,K_target,3)`` (extra frames are position-only).
+        Raw (denormalized) window nodes ``(V, F, D)``.
     """
-    v = history.shape[0]
-    f, d, nj, k = ctx.F, ctx.D, ctx.nj, ctx.target_num_extra_frames
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
-
-    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, f, d, ctx.num_steps,
-                                 history_null_mask=history_null_mask,
-                                 zero_noise=ctx.zero_noise)
-    pred = ctx.state_norm.denormalize(pred_std)  # (V, F, D)
-
-    p_ref_f = p_ref[:, None, :].expand(v, f, 3).reshape(v * f, 3)
-    q_ref_f = q_ref[:, None, :].expand(v, f, 4).reshape(v * f, 4)
-    world = state_to_absolute(pred.reshape(v * f, d), p_ref_f, q_ref_f, nj, num_extra_frames=k)
-
-    out = {
-        "root_pos_w": world["root_pos_w"].reshape(v, f, 3),
-        "root_quat_w": world["root_quat_w"].reshape(v, f, 4),
-        "root_link_lin_vel_w": world["root_link_lin_vel_w"].reshape(v, f, 3),
-        "root_link_ang_vel_w": world["root_link_ang_vel_w"].reshape(v, f, 3),
-        "joint_pos": world["joint_pos"].reshape(v, f, nj),
-        "joint_vel": world["joint_vel"].reshape(v, f, nj),
-    }
-    if k > 0:
-        out["frame_pos_w"] = world["frame_pos_w"].reshape(v, f, k, 3)
-    return out
+    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, ctx.F, ctx.D,
+                                 ctx.num_steps, history_null_mask=history_null_mask,
+                                 zero_noise=ctx.zero_noise,
+                                 guidance_scale=ctx.guidance_scale)
+    return ctx.state_norm.denormalize(pred_std)

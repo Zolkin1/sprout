@@ -28,6 +28,8 @@ import torch
 import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
+from robot_rl.flow_matching.window import world_to_window
+
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from motion_gen.joint_names import is_root_frame, root_frame_name
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
@@ -890,6 +892,36 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 lift_vector_batched(wquat, dy[:, :, fi["ang_vel"]]),
             ], dim=-1))
         return torch.stack(out, dim=2)  # [N, K, F, 13]
+
+    def reference_window_obs(self, offsets: torch.Tensor) -> torch.Tensor:
+        """The reference window over ``offsets``, in the observation's representation.
+
+        The producer behind ``mdp.reference_window``.  Lives on the command rather than in
+        the observation function because the flow-matching generator predicts this
+        representation *directly*: :class:`~.fm_tracking_cmd.FmTrackingCommand` overrides
+        this to serve its prediction with no world round-trip, in simulation and at deploy
+        alike.  Here -- the clip reference -- the world-frame look-ahead is what exists, so
+        it goes through :func:`~robot_rl.flow_matching.window.world_to_window`.
+
+        Overriding ONE accessor rather than branching inside the observation also keeps the
+        clip/generator swap honest: ``as_clip_reference()`` / ``as_fm_reference()`` flip
+        ``_serving()``, and every look-ahead consumer follows in step.
+
+        Args:
+            offsets: Future step offsets ``[K]`` (``0`` = the current step).
+
+        Returns:
+            ``[N, K, D]`` window nodes, ``D = window_dim(nj, num_ee_frames)``.
+        """
+        pos_w, quat_w, lin_w, ang_w = self.get_future_world_base(offsets)   # [N,K,·]
+        joint_pos, joint_vel = self.get_future_joint_state(offsets)         # [N,K,nj]
+        ee_w = self.get_future_world_frames(self.resolve_ee_frames(None), offsets)  # [N,K,E,13]
+        root_pos_w = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]    # [N,1,3]
+        root_quat_w = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]  # [N,1,4] xyzw
+        return world_to_window(
+            root_pos_w, root_quat_w, pos_w, quat_w, lin_w, ang_w,
+            joint_pos, joint_vel, ee_w[..., 0:3],
+        )
 
     # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)

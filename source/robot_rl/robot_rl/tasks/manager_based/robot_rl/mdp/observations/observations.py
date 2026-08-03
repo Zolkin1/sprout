@@ -8,8 +8,15 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_box_minus, quat_box_plus, quat_inv
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_box_minus, quat_inv
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
+
+from robot_rl.flow_matching.window import (
+    REFERENCE_WINDOW_NOISE,
+    expand_window_blocks,
+    window_blocks,
+    window_to_world,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -48,6 +55,11 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     frame, measured against the clip on its reset-time terrain cell -- the same reference
     the pose-drift termination uses.
 
+    Position is ``ref - actual``, orientation is ``actual - ref`` -- the legacy mixed
+    convention, matching :func:`base_pose_error` and the ``reference_window``.  See
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION` for why they still disagree
+    and what unifying them costs.
+
     This is the drift :func:`tracking_error_local` deliberately cannot see: the reward
     forgives planar drift, but the episode still ends on it, so without this the critic
     would be predicting a termination it has no way to anticipate.
@@ -58,7 +70,7 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)
     return torch.cat([
         state[:, 0:3] - root_pos_w,
-        quat_box_minus(root_quat_w, state[:, 3:7]),
+        quat_box_minus(root_quat_w, state[:, 3:7]),   # actual - reference (legacy)
     ], dim=-1)
 
 
@@ -80,13 +92,18 @@ def _joint_output_indices(ordered_names: list[str]) -> list[int]:
 def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
     """Reference-vs-actual base pose error, expressed in the actual base frame.
 
-    Returns ``[N, 6]`` = position error (3) + orientation error (3), *both*
-    rotated into the robot's current base frame, so the observation is fully
-    heading-invariant (no absolute world heading leaks) and deployable sim2real.
-    The orientation half is the world-frame ``quat_box_minus`` rotation vector
-    (a spatial error whose roll/pitch axes would otherwise rotate with heading)
-    re-expressed in the base frame to match the position half.  Same base
-    tracking error the CLF penalises, surfaced as a base-relative observation.
+    Returns ``[N, 6]`` = position error (3) + orientation error (3), rotated into
+    the robot's current base frame, so the observation is fully heading-invariant
+    (no absolute world heading leaks) and deployable sim2real.
+
+    The two halves point OPPOSITE WAYS -- position ``ref - actual``, orientation
+    ``actual - ref`` -- which is the legacy convention the trained policies were
+    fitted to.  See :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
+
+    Identical to node 0 of :func:`reference_window`'s ``base_pose`` block, and
+    computed through the same :func:`~robot_rl.flow_matching.window.world_to_window`
+    convention -- ``test_reference_window`` asserts the two agree, which is what keeps
+    them from drifting apart.
     """
     cmd = env.command_manager.get_term(command_name)
     state = cmd.reference_world_state()                 # [N, 3+4+3+3+2nj]
@@ -94,11 +111,10 @@ def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     ref_quat_w = state[:, 3:7]                          # xyzw
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # xyzw
-    inv_root_quat = quat_inv(root_quat_w)
 
-    pos_err_b = quat_apply(inv_root_quat, ref_pos_w - root_pos_w)
-    ori_err_w = quat_box_minus(root_quat_w, ref_quat_w)  # actual ⊟ reference (world frame)
-    ori_err_b = quat_apply(inv_root_quat, ori_err_w)     # -> current base frame
+    pos_err_b = quat_apply_inverse(root_quat_w, ref_pos_w - root_pos_w)
+    ori_err_w = quat_box_minus(root_quat_w, ref_quat_w)     # actual ⊟ reference (world)
+    ori_err_b = quat_apply_inverse(root_quat_w, ori_err_w)  # -> current base frame
     return torch.cat([pos_err_b, ori_err_b], dim=-1)
 
 
@@ -238,10 +254,11 @@ def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
 def reference_window_layout_from_dims(num_joints: int, num_ee_frames: int) -> list[tuple[str, int]]:
     """Per-step block layout of :func:`reference_window` from raw dimensions.
 
-    The single source of truth for how one step of the window is packed.  Split from
-    :func:`reference_window_layout` so consumers that have only the numbers -- the offline
-    inverse (:func:`reference_window_to_world`) and its tests -- share the same definition
-    rather than restating it.
+    Kept as the name this side of the codebase reaches for (``export_parameters``,
+    ``data_logger``, the noise/scale expansion below), but the layout itself now lives in
+    :func:`robot_rl.flow_matching.window.window_blocks` -- the flow-matching generator
+    predicts in exactly this representation, so the definition has to be shared rather than
+    restated on each side.
 
     Args:
         num_joints: Robot joint count.
@@ -250,13 +267,7 @@ def reference_window_layout_from_dims(num_joints: int, num_ee_frames: int) -> li
     Returns:
         ``[(block_name, width), ...]`` in packing order.
     """
-    return [
-        ("base_pose", 6),
-        ("base_vel", 6),
-        ("joint_pos", num_joints),
-        ("joint_vel", num_joints),
-        ("ee_pos", 3 * num_ee_frames),
-    ]
+    return window_blocks(num_joints, num_ee_frames)
 
 
 def reference_window_layout(cmd) -> list[tuple[str, int]]:
@@ -272,22 +283,10 @@ def reference_window_layout(cmd) -> list[tuple[str, int]]:
     )
 
 
-#: Default per-block uniform-noise HALF-WIDTHS for :func:`reference_window`.
-#:
-#: The window merges quantities on very different scales -- metres, radians, rad/s -- so a
-#: single scalar cannot serve them all: the level that is right for a joint angle is
-#: negligible for a joint velocity.  These stand in for the FM's prediction error at
-#: deploy, which is what the reference noise exists to simulate.  Position-like entries are
-#: per-axis ``(x, y, z)``; the vertical axis is tighter than the horizontal ones.
-REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
-    "base_pos": [0.05, 0.05, 0.01],   # reference base position error, metres
-    "base_ori": 0.03,                 # reference base orientation error, radians
-    "base_lin_vel": 0.25,             # m/s
-    "base_ang_vel": 0.25,             # rad/s
-    "joint_pos": 0.1,                 # rad
-    "joint_vel": 0.5,                 # rad/s
-    "ee_pos": [0.05, 0.05, 0.01],     # ee position rel. reference base, metres
-}
+# ``REFERENCE_WINDOW_NOISE`` is defined in ``robot_rl.flow_matching.window`` and imported
+# above: the FM's autoregressive history noise reads the SAME table, because both model
+# the generator's prediction error. Re-exported here so the env cfgs keep importing it
+# from mdp. See that module for why forking it would be a bug.
 
 
 #: Per-block multipliers applied to :func:`reference_window` AFTER noise and clipping.
@@ -352,26 +351,7 @@ def _expand_reference_blocks(
     Raises:
         ValueError: If the built per-step width disagrees with the block layout.
     """
-    def axes(key: str) -> list[float]:
-        """The block's value as three per-axis entries."""
-        value = per_block[key]
-        return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * 3
-
-    per_step = (
-        axes("base_pos") + axes("base_ori")                        # base_pose  (6)
-        + axes("base_lin_vel") + axes("base_ang_vel")              # base_vel   (6)
-        + [float(per_block["joint_pos"])] * num_joints             # joint_pos  (nj)
-        + [float(per_block["joint_vel"])] * num_joints             # joint_vel  (nj)
-        + axes("ee_pos") * num_ee_frames                           # ee_pos     (3F)
-    )
-    expected = 6 + 6 + 2 * num_joints + 3 * num_ee_frames
-    if len(per_step) != expected:
-        raise ValueError(
-            f"Built {len(per_step)} per-step channels, expected {expected} "
-            f"(nj={num_joints}, ee={num_ee_frames}). The per-block expansion has drifted "
-            "from reference_window_layout."
-        )
-    return per_step * int(num_steps)
+    return expand_window_blocks(num_joints, num_ee_frames, per_block) * int(num_steps)
 
 
 def reference_window_noise_vector(
@@ -522,9 +502,10 @@ def reference_window(
     :func:`reference_window_layout` order:
 
     * ``base_pose`` (6) -- reference base position + orientation error relative to
-      the robot's *current actual* base, matching :func:`base_pose_error` (the
-      orientation half is the world-frame ``quat_box_minus`` rotation vector
-      re-expressed in the base frame).
+      the robot's *current actual* base, matching :func:`base_pose_error`.  The two
+      halves point opposite ways (position ``ref - actual``, orientation
+      ``actual - ref``) -- the legacy convention; see
+      :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
     * ``base_vel`` (6) -- reference base linear+angular velocity rotated into the
       current actual base frame, matching :func:`ref_base_velocity_local`.
     * ``joint_pos`` / ``joint_vel`` (nj each) -- frame-invariant reference joint
@@ -540,47 +521,19 @@ def reference_window(
     the policy.  Flattened as ``[step0(D), step1(D), ...]`` -- the per-step layout
     the symmetry tiler expects.
 
+    The window is built by the COMMAND (``reference_window_obs``), not here: the
+    flow-matching generator predicts this representation directly, so its command term
+    overrides that accessor and returns its prediction rather than round-tripping it
+    through the world.  This function only resolves the offsets and flattens.
+
     Note the window saturates on the clip's final padded frame near the end of a
     clip (``_future_step_indices`` clamps to the padded library length); the
     episode is truncated by ``clip_end_reached`` before that matters.
     """
     cmd = env.command_manager.get_term(command_name)
     offs = _window_offsets(cmd, num_steps, stride)
-
-    # World-frame reference base over the window; also the anchor the ee block uses.
-    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offs)  # [N,K,3] [N,K,4] [N,K,3] [N,K,3]
-    n, k, _ = pos_w.shape
-
-    root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)            # [N, 3]
-    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)          # [N, 4] xyzw
-    inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
-    root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
-
-    pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
-    ori_err_w = quat_box_minus(root_q, quat_w.reshape(n * k, 4))   # actual ⊟ reference (world)
-    ori_err_b = quat_apply(inv_root, ori_err_w)                    # -> current base frame
-    base_pose = torch.cat([pos_err_b, ori_err_b], dim=-1).reshape(n, k, 6)
-
-    lin_b = quat_apply(inv_root, lin_w.reshape(n * k, 3)).reshape(n, k, 3)
-    ang_b = quat_apply(inv_root, ang_w.reshape(n * k, 3)).reshape(n, k, 3)
-    base_vel = torch.cat([lin_b, ang_b], dim=-1)                   # [N, K, 6]
-
-    joint_pos, joint_vel = cmd.get_future_joint_state(offs)        # [N, K, nj] each
-
-    # ee positions relative to the reference base AT THE SAME STEP: the world lift is
-    # rigid, so differencing and unrotating recovers exactly the clip-frame posture
-    # that ee_ref_relative_to_base reports at offset 0.
-    frames = cmd.resolve_ee_frames(None)
-    ee_w = cmd.get_future_world_frames(frames, offs)               # [N, K, F, 13]
-    inv_ref_q = quat_inv(quat_w.reshape(n * k, 4))
-    ee_rel = [
-        quat_apply(inv_ref_q, (ee_w[:, :, i, 0:3] - pos_w).reshape(n * k, 3)).reshape(n, k, 3)
-        for i in range(len(frames))
-    ]
-    ee_pos = torch.cat(ee_rel, dim=-1)                             # [N, K, 3F]
-
-    out = torch.cat([base_pose, base_vel, joint_pos, joint_vel, ee_pos], dim=-1)
-    return out.reshape(n, -1)
+    win = cmd.reference_window_obs(offs)            # [N, K, D]
+    return win.reshape(win.shape[0], -1)
 
 
 def reference_window_to_world(
@@ -639,44 +592,13 @@ def reference_window_to_world(
             f"nj={num_joints}, ee={num_ee_frames})."
         )
     n = window.shape[0]
-    stacked = window.reshape(n, k, per_step)
-    blocks: dict[str, torch.Tensor] = {}
-    offset = 0
-    for name, width in layout:
-        blocks[name] = stacked[..., offset:offset + width]
-        offset += width
-
-    root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
-    root_p = root_pos_w[:, None, :].expand(n, k, 3).reshape(n * k, 3)
-
-    # base_pose = [pos_err_b(3), ori_err_b(3)], both expressed in the CURRENT base frame.
-    pos_err_b = blocks["base_pose"][..., 0:3].reshape(n * k, 3)
-    ori_err_b = blocks["base_pose"][..., 3:6].reshape(n * k, 3)
-    pos_w = root_p + quat_apply(root_q, pos_err_b)
-    # Forward: ori_err_w = quat_box_minus(root_q, quat_w), i.e. exp(ori_err_w) * quat_w =
-    # root_q.  So quat_w = exp(-ori_err_w) * root_q = quat_box_plus(root_q, -ori_err_w).
-    ori_err_w = quat_apply(root_q, ori_err_b)
-    quat_w = quat_box_plus(root_q, -ori_err_w)
-
-    lin_w = quat_apply(root_q, blocks["base_vel"][..., 0:3].reshape(n * k, 3))
-    ang_w = quat_apply(root_q, blocks["base_vel"][..., 3:6].reshape(n * k, 3))
-
-    # ee positions are relative to THAT step's reference base, so they lift through
-    # (pos_w, quat_w) -- not through the robot's own pose.
-    ee_pos_w = torch.zeros(n, k, num_ee_frames, 3, device=window.device, dtype=window.dtype)
-    for i in range(num_ee_frames):
-        rel = blocks["ee_pos"][..., 3 * i:3 * i + 3].reshape(n * k, 3)
-        ee_pos_w[:, :, i, :] = (pos_w + quat_apply(quat_w, rel)).reshape(n, k, 3)
-
-    return {
-        "base_pos_w": pos_w.reshape(n, k, 3),
-        "base_quat_w": quat_w.reshape(n, k, 4),
-        "base_lin_vel_w": lin_w.reshape(n, k, 3),
-        "base_ang_vel_w": ang_w.reshape(n, k, 3),
-        "joint_pos": blocks["joint_pos"].clone(),
-        "joint_vel": blocks["joint_vel"].clone(),
-        "ee_pos_w": ee_pos_w,
-    }
+    return window_to_world(
+        window.reshape(n, k, per_step),
+        root_pos_w[:, None, :],
+        root_quat_w[:, None, :],
+        num_joints,
+        num_ee_frames,
+    )
 
 
 def command_window(

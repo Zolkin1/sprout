@@ -23,6 +23,7 @@ import torch
 
 from robot_rl.flow_matching.config import FlowMatchingConfig
 from robot_rl.flow_matching.dataset import build_train_val, snap_windows
+from robot_rl.flow_matching.tests.recording_fixtures import episode_arrays
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +107,6 @@ def _meta():
     )
 
 
-def _norm_quats(arr: np.ndarray) -> np.ndarray:
-    """Normalize the root_quat_w block (cols 3:7 of the node) so relative_state is well-posed."""
-    q = arr[..., 3:7]
-    arr[..., 3:7] = q / np.clip(np.linalg.norm(q, axis=-1, keepdims=True), 1e-6, None)
-    return arr
-
-
 def _cfg():
     # extero_source is explicit because these fixtures emit a height scan and no depth
     # array; the config default is "depth" (the deployable signal). This file is about the
@@ -125,52 +119,49 @@ def _cfg():
 
 
 def _synthetic_per_step(seed=0):
-    """A per-step recording: 4 episodes x 20 consecutive steps, snaps at steps 5/10/15."""
+    """A per-step recording: 4 episodes x 20 consecutive steps, snaps at steps 5/10/15.
+
+    Built from the shared plausible-rollout fixture rather than from noise: the dataset
+    validates the recording (smooth, tracked, inside the ``quat_box_minus`` branch cut, and
+    ``ref_state[t] == ref_future[t, 0]``), so white noise no longer builds. This file is
+    about the windowed writer matching the per-step path, which those properties do not
+    affect.
+    """
     rng = np.random.default_rng(seed)
     n_ep, L, F, K = 4, 20, 4, 5
     P = n_ep * L
-    episode_id = np.repeat(np.arange(n_ep), L).astype(np.int64)
     step_in_episode = np.tile(np.arange(L), n_ep).astype(np.int64)
-    done = (step_in_episode == L - 1).astype(np.uint8)  # reset at the last step of each episode
-    reanchor = np.isin(step_in_episode, [5, 10, 15]).astype(np.uint8)
-    state = _norm_quats(rng.standard_normal((P, _NODE)).astype(np.float32))
-    ref_future = _norm_quats(rng.standard_normal((P, F, _NODE)).astype(np.float32))
-    # Node 0 of the future sits ON the robot -- the ego-anchor invariant the dataset
-    # enforces. Without it the build raises before it can be compared.
-    ref_future[:, 0, 0:3] = state[:, 0:3]
-    ref_future[:, 0, 3:7] = state[:, 3:7]
-    data = {
-        "state": state,
-        "ref_future": ref_future,
-        "height_scan": rng.standard_normal((P, K)).astype(np.float32),
-        "cmd_future": rng.standard_normal((P, F, 3)).astype(np.float32),
-        "reanchor_active": reanchor,
-        "episode_id": episode_id,
-        "step_in_episode": step_in_episode,
-        "done": done,
-    }
+    per_ep = [episode_arrays(rng, L, F, _NJ, 0, snap_every=1) for _ in range(n_ep)]
+    data = {k: np.concatenate([ep[k] for ep in per_ep]) for k in per_ep[0]}
+    data["reanchor_active"] = np.isin(step_in_episode, [5, 10, 15]).astype(np.uint8)
+    data["done"] = (step_in_episode == L - 1).astype(np.uint8)
+    data["height_scan"] = rng.standard_normal((P, K)).astype(np.float32)
+    data["cmd_future"] = rng.standard_normal((P, F, 3)).astype(np.float32)
+    data["episode_id"] = np.repeat(np.arange(n_ep), L).astype(np.int64)
+    data["step_in_episode"] = step_in_episode
     return data
 
 
 def _to_windowed(data, N):
-    """Pre-form the windows snap_windows would build (H == N), in the same order."""
+    """Pre-form the windows snap_windows would build, in the same order.
+
+    ``H == N + 1``: the N autoregressive context rows plus the snap row they precede (the
+    snap is node 0 of the future, so it is not part of the history block).
+    """
     wins = snap_windows(data["episode_id"], data["step_in_episode"], data["done"],
-                        data["reanchor_active"], N, 1)
-    idx = np.stack(wins).astype(np.int64)   # (W, N)
+                        data["reanchor_active"], N + 1, 1)
+    idx = np.stack(wins).astype(np.int64)   # (W, N+1)
     snap = idx[:, -1]
-    out = {
-        "history_state": data["state"][idx],        # (W, N, node)  -> H == N
+    return {
+        "history_state": data["state"][idx],         # (W, H, node)  -> H == N + 1
+        # The applied-reference ring, gathered at the SAME rows as the measured one. That
+        # alignment is what the dataset's history/target guard checks.
+        "history_ref": data["ref_state"][idx],       # (W, H, node)
         "ref_future": data["ref_future"][snap],      # (W, F, node)
         "height_scan": data["height_scan"][snap],    # (W, K)
-        "cmd_future": data["cmd_future"][snap],       # (W, F, 3)
-        "episode_id": data["episode_id"][snap],       # (W,)
+        "cmd_future": data["cmd_future"][snap],      # (W, F, 3)
+        "episode_id": data["episode_id"][snap],      # (W,)
     }
-    # The applied-reference ring, gathered at the SAME rows as the measured one -- that
-    # alignment is what makes history_source="reference_partial" equivalent across the two
-    # recording formats.
-    if data.get("ref_state") is not None:
-        out["history_ref"] = data["ref_state"][idx]  # (W, N, node)
-    return out
 
 
 def test_windowed_dataset_matches_per_step():
@@ -197,44 +188,13 @@ def test_windowed_dataset_matches_per_step():
         _same(vl, vw)
 
 
-def test_windowed_matches_per_step_with_a_partially_autoregressive_history():
-    """The mixed history is built identically from ``history_ref`` and from ``ref_state``.
-
-    Both formats have to produce the same conditioning, or an A/B between them would be
-    comparing recording formats rather than history sources.
-    """
-    data = _synthetic_per_step()
-    rng = np.random.default_rng(1)
-    data["ref_state"] = _norm_quats(rng.standard_normal(data["state"].shape).astype(np.float32))
-    meta = _meta()
-    N = 2
-
-    cfg_m, cfg_p = _cfg(), _cfg()
-    cfg_p.history_source = "reference_partial"
-
-    tl, _ = build_train_val(data, meta, cfg_p)                       # legacy per-step
-    tw, _ = build_train_val(_to_windowed(data, N), meta, _cfg_partial())  # windowed
-    assert torch.allclose(tl.history, tw.history, atol=1e-5)
-
-    # And it is genuinely a different history than the measured one.
-    tm, _ = build_train_val(data, meta, cfg_m)
-    assert not torch.allclose(tm.history, tl.history, atol=1e-3)
-
-
-def _cfg_partial():
-    """``_cfg()`` with the partially autoregressive history source."""
-    cfg = _cfg()
-    cfg.history_source = "reference_partial"
-    return cfg
-
-
 def test_windowed_rejects_too_short_history():
     """Training with num_history_states > recorded H raises a clear error."""
     import pytest
 
     data = _synthetic_per_step()
-    windowed = _to_windowed(data, 2)  # H == 2
+    windowed = _to_windowed(data, 2)  # H == 3
     cfg = _cfg()
-    cfg.num_history_states = 4        # > H
+    cfg.num_history_states = 4        # needs H >= 5
     with pytest.raises(ValueError, match="history_len"):
         build_train_val(windowed, _meta(), cfg)

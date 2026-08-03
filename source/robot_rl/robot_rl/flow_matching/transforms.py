@@ -122,6 +122,44 @@ def so3_log(r: torch.Tensor) -> torch.Tensor:
     return v_raw * factor.unsqueeze(-1)
 
 
+def so3_exp(v: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices ``(..., 3, 3)`` from rotation vectors ``(..., 3)`` (Rodrigues).
+
+    The inverse of :func:`so3_log`, and what turns the window's ``base_pose`` orientation
+    channel back into a rotation: that channel is a ``quat_box_minus`` log map, so
+    ``so3_exp(base_pose[3:6]) = R_actT R_ref``.
+
+    Routing the finite-difference angular-velocity loss through this rather than
+    differencing the log values directly is what makes that loss immune to the branch cut
+    at ``pi`` -- ``exp`` of a wrapped rotation vector is the same rotation, while the naive
+    difference would see a jump.
+
+    Small-angle safe: the series limits are taken explicitly, so the gradient at ``theta =
+    0`` is finite.
+
+    Args:
+        v: Rotation vectors (axis * angle), shape ``(..., 3)``.
+
+    Returns:
+        Rotation matrices, shape ``(..., 3, 3)``.
+    """
+    theta = torch.linalg.norm(v, dim=-1, keepdim=True)                 # (..., 1)
+    small = theta < 1e-6
+    # sin(t)/t and (1-cos t)/t^2, both with their finite t->0 limits.
+    t2 = theta * theta
+    a = torch.where(small, 1.0 - t2 / 6.0, torch.sin(theta) / theta.clamp_min(1e-12))
+    b = torch.where(small, 0.5 - t2 / 24.0, (1.0 - torch.cos(theta)) / t2.clamp_min(1e-24))
+    x, y, z = v[..., 0], v[..., 1], v[..., 2]
+    zero = torch.zeros_like(x)
+    k = torch.stack([
+        torch.stack([zero, -z, y], dim=-1),
+        torch.stack([z, zero, -x], dim=-1),
+        torch.stack([-y, x, zero], dim=-1),
+    ], dim=-2)                                                          # (..., 3, 3) skew
+    eye = torch.eye(3, dtype=v.dtype, device=v.device).expand(k.shape)
+    return eye + a[..., None] * k + b[..., None] * (k @ k)
+
+
 # Root (base) block width: [pos(3), lin_vel(3), ori6d(6), ang_vel(3)].
 ROOT_BLOCK_DIM = 3 + 3 + 6 + 3  # = 15
 
