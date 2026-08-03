@@ -901,3 +901,58 @@ def test_ema_copies_integer_buffers_rather_than_averaging_them():
     ema.update(m)
     assert ema.shadow["counter"].item() == 7
     assert ema.shadow["counter"].dtype == torch.long
+
+
+# ---------------------------------------------------------------------------
+# Clip-family filtering (--skip_families).
+# ---------------------------------------------------------------------------
+def _windowed_with_families(codes, names):
+    """A minimal windowed recording carrying a per-window clip_family tag."""
+    from robot_rl.flow_matching.dataset import _family_keep_mask
+    data = {"clip_family": np.asarray(codes, dtype=np.uint8)}
+    meta = SimpleNamespace(family_names=list(names))
+    return _family_keep_mask, data, meta
+
+
+def test_skip_families_drops_only_the_named_family():
+    """The point of recording a family CODE: any family becomes a train-time switch.
+
+    ``family_jump_off`` is the backwards jump-off-a-box family, which the forward-facing
+    depth cameras cannot observe -- so those windows ask the generator to predict something
+    invisible. Nothing else should move.
+    """
+    keep_mask, data, meta = _windowed_with_families(
+        [0, 1, 2, 1, 2, 0], ["unknown", "family_jump_off", "family_stairs_up"])
+    cfg = FlowMatchingConfig(skip_families=["family_jump_off"])
+    keep = keep_mask(data, meta, cfg, 6)
+    assert keep.tolist() == [True, False, True, False, True, True]
+
+
+def test_skip_families_is_a_noop_when_nothing_is_requested():
+    """No flag, no copy: the common path must not pay for the filter."""
+    keep_mask, data, meta = _windowed_with_families([0, 1], ["unknown", "family_jump_off"])
+    assert keep_mask(data, meta, FlowMatchingConfig(), 2) is None
+
+
+def test_skip_families_refuses_a_recording_without_the_tag():
+    """Silently training on the family you asked to exclude is the failure to avoid."""
+    from robot_rl.flow_matching.dataset import _family_keep_mask
+    cfg = FlowMatchingConfig(skip_families=["family_jump_off"])
+    with pytest.raises(ValueError, match="predates them"):
+        _family_keep_mask({}, SimpleNamespace(family_names=[]), cfg, 4)
+
+
+def test_skip_families_refuses_a_name_the_recording_does_not_have():
+    """A typo would otherwise read as 'nothing to drop' -- i.e. as success."""
+    keep_mask, data, meta = _windowed_with_families([0, 1], ["unknown", "family_jump_off"])
+    cfg = FlowMatchingConfig(skip_families=["family_jumpoff"])     # typo
+    with pytest.raises(ValueError, match="does not contain"):
+        keep_mask(data, meta, cfg, 2)
+
+
+def test_skip_families_refuses_to_drop_everything():
+    """Nothing left to train on is a configuration error, not an empty dataset."""
+    keep_mask, data, meta = _windowed_with_families([1, 1, 1], ["unknown", "family_jump_off"])
+    cfg = FlowMatchingConfig(skip_families=["family_jump_off"])
+    with pytest.raises(ValueError, match="drop ALL"):
+        keep_mask(data, meta, cfg, 3)

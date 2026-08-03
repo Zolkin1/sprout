@@ -171,6 +171,15 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "tau >= this (velocity/joint-velocity stay ungated).")
     parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
                         help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
+    parser.add_argument(
+        "--skip_families", type=str, default=None,
+        help="Comma-separated clip FAMILIES to drop (see the recording's family_names, e.g. "
+             "'family_jump_off'). A train-time switch like --skip_distractors: the recording "
+             "tags every window with its family, so A/B-ing one costs no re-record. The case "
+             "this exists for is family_jump_off -- the BACKWARDS jump-off-a-box family, "
+             "which the forward-facing depth cameras cannot observe at all. Errors if the "
+             "recording predates the tag or a named family is not in it.",
+    )
     parser.add_argument("--skip_distractors", action="store_true", default=_wc.skip_distractors,
                         help="Drop DISTRACTOR-family windows (boxes the robot walks AROUND, not "
                              "onto). Train-time switch -- recordings tag every window with "
@@ -223,6 +232,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         fk_pose_weight=args.fk_pose_weight,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         skip_distractors=args.skip_distractors,
+        skip_families=([f.strip() for f in args.skip_families.split(",") if f.strip()]
+                       if args.skip_families else None),
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,

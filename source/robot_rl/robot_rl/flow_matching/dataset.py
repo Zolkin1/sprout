@@ -927,6 +927,66 @@ def _distractor_keep_mask(
     return ~tag
 
 
+def _family_keep_mask(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
+) -> np.ndarray | None:
+    """Boolean keep-mask dropping the ``cfg.skip_families`` clip families, or ``None``.
+
+    The general form of :func:`_distractor_keep_mask`. Reads the per-window ``clip_family``
+    code and ``meta.family_names``, both written at record time, so any family is a
+    train-time choice.
+
+    Args:
+        data: The loaded recording arrays.
+        meta: Layout metadata (``family_names`` is read).
+        cfg: Config; ``skip_families`` names what to drop.
+        num_windows: ``W``, for validating the tag's length.
+
+    Returns:
+        ``(W,)`` bool array (True = keep), or ``None`` when nothing is requested.
+
+    Raises:
+        ValueError: If the recording predates the tag, a named family is absent from it, or
+            the filter would drop every window. Each of those would otherwise look like a
+            successful no-op.
+    """
+    wanted = [f for f in (cfg.skip_families or []) if f]
+    if not wanted:
+        return None
+    codes = data.get("clip_family")
+    names = list(getattr(meta, "family_names", []) or [])
+    if codes is None or not names:
+        raise ValueError(
+            f"--skip_families {wanted} needs the per-window 'clip_family' tag and the "
+            "recording's family_names; this recording predates them. Re-record with the "
+            "current record_data.py (it writes both unconditionally), or drop the flag -- "
+            "silently training on those families would misreport what was excluded."
+        )
+    unknown = [f for f in wanted if f not in names]
+    if unknown:
+        raise ValueError(
+            f"--skip_families named {unknown}, which this recording does not contain. Its "
+            f"families are {names}. A typo here would silently drop nothing."
+        )
+    codes = np.asarray(codes).reshape(-1).astype(np.int64)
+    if codes.shape[0] != num_windows:
+        raise ValueError(
+            f"'clip_family' has {codes.shape[0]} entries but there are {num_windows} windows."
+        )
+    drop = np.isin(codes, [names.index(f) for f in wanted])
+    n_drop = int(drop.sum())
+    if n_drop == num_windows:
+        raise ValueError(
+            f"--skip_families {wanted} would drop ALL {num_windows} windows; nothing left."
+        )
+    if n_drop == 0:
+        print(f"[fm-data] --skip_families {wanted}: no such windows in this recording (no-op).")
+        return None
+    print(f"[fm-data] --skip_families {wanted}: dropping {n_drop}/{num_windows} windows "
+          f"({100.0 * n_drop / num_windows:.1f}%).")
+    return ~drop
+
+
 def _build_train_val_windowed(
     data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig
 ) -> tuple[FutureStateDataset, FutureStateDataset | None]:
@@ -941,6 +1001,8 @@ def _build_train_val_windowed(
     W = int(data["history_state"].shape[0])
     ep = np.asarray(data["episode_id"]).reshape(-1)  # (W,) snap-row episode id per window
     keep = _distractor_keep_mask(data, cfg, W)
+    fam_keep = _family_keep_mask(data, meta, cfg, W)
+    keep = fam_keep if keep is None else (keep if fam_keep is None else (keep & fam_keep))
     if keep is not None:
         ep = ep[keep]
         data = {**data, **{k: v[keep] for k, v in data.items()

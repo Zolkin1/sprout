@@ -102,6 +102,18 @@ class FlowMatchingConfig:
     # A/B it. Errors (rather than silently training on them) if the recording has no tag.
     skip_distractors: bool = False
 
+    # Clip FAMILIES to drop, by name (see RecordingMeta.family_names; the ".h5" the composer
+    # stamps is already stripped, so write "family_jump_off"). A train-time switch for the
+    # same reason skip_distractors is one: the recording tags every window with its family,
+    # so A/B-ing a family costs no re-record.
+    #
+    # The case this exists for: "family_jump_off" is the BACKWARDS jump-off-a-box family, and
+    # the depth cameras face forward -- the drop behind the robot is not observable, so those
+    # windows ask the generator to predict something it cannot see. Errors (rather than
+    # silently training on them) if the recording predates the tag, or if a named family is
+    # not in the recording at all -- a typo would otherwise read as "nothing to drop".
+    skip_families: list[str] | None = None
+
     # Dedicated recorded command array (e.g. "target_vel") giving the per-step
     # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
     # (indices 0, cmd_stride, ...) and each sample becomes its own conditioning token

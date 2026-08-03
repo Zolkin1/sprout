@@ -110,6 +110,11 @@ class RecordingMeta:
     """Control steps between snap (re-plan) events in this recording, from the command's
     ``fm_snap_every``. The FM tracker's ``fm_update_every`` must equal it -- the horizon is
     sized from the period and the targets were cut at that cadence. 0 = not recorded."""
+    family_names: list[str] = field(default_factory=list)
+    """Clip-family names indexed by the per-window ``clip_family`` code (0 = ``unknown``).
+
+    Empty for a recording written before the tag existed, or from a library with no terrain
+    manifest -- in both cases every ``clip_family`` is 0 and no family filter can match."""
     reference_blocks: list[str] | None = None
     """Reference-window blocks the RECORDING TEACHER's policy observed
     (``mdp.reference_window_selection``), in packing order.
@@ -286,6 +291,7 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
         # Nullable list, so JSON for the same reason.
         reference_blocks=np.array(json.dumps(meta.reference_blocks)),
+        family_names=np.array(json.dumps(meta.family_names)),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -367,6 +373,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         reference_blocks=(
             json.loads(str(z["reference_blocks"])) if "reference_blocks" in z.files else None
         ),
+        family_names=(
+            json.loads(str(z["family_names"])) if "family_names" in z.files else []
+        ),
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
     return data, meta
@@ -405,6 +414,11 @@ _WINDOW_DTYPES: dict[str, str] = {
     # around rather than onto). Recorded unconditionally so training can drop those windows with
     # ``train.py --skip_distractors`` without a re-record. Absent in older recordings.
     "is_distractor": "uint8",
+    # Per-window clip FAMILY code, indexing RecordingMeta.family_names (0 = unknown). The
+    # general form of is_distractor: any family can be dropped at train time via
+    # train.py --skip_families, which is why this is recorded rather than re-derived from a
+    # library that may have changed. 0 everywhere for a library with no terrain manifest.
+    "clip_family": "uint8",
 }
 
 

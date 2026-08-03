@@ -328,6 +328,64 @@ def _distractor_clip_mask(ref_cmd):
     return flags
 
 
+def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
+    """Per-clip family index plus the family names, from the library's ``terrain_manifest``.
+
+    The general form of :func:`_distractor_clip_mask`. That one answers a single yes/no
+    question and so could only ever support ``--skip_distractors``; every other family
+    question -- and there are eight families in the v5 library -- needed a re-record to ask.
+    Recording the family as a CODE makes any of them a train-time switch
+    (``train.py --skip_families``), which is the same reasoning that put the distractor flag
+    in the recording rather than in the library.
+
+    The concrete motivation: ``family_jump_off`` is the BACKWARDS jump-off-a-box family, and
+    with forward-facing depth cameras the drop behind the robot is not observable at all --
+    so those windows ask the generator to predict something it cannot see.
+
+    Clips on a tile with no manifest entry (and every clip of a flat-only library) get code
+    0 = ``"unknown"``, which no filter matches.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (``None`` -> no clips).
+
+    Returns:
+        ``([num_clips] long tensor of family codes, [family names])``. ``(None, [])`` when
+        the library carries no manifest or no terrain ids.
+    """
+    mgr = getattr(ref_cmd, "manager", None)
+    lib = getattr(mgr, "lib", None)
+    if lib is None or getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
+        return None, []
+    manifest = lib.attrs.get("terrain_manifest") if hasattr(lib, "attrs") else None
+    if not manifest:
+        return None, []
+    if isinstance(manifest, str):
+        manifest = json.loads(manifest)
+
+    # Family name -> code, with 0 reserved for "no manifest entry".
+    names = ["unknown"]
+    tid_to_code: dict[int, int] = {}
+    for entry in manifest:
+        if "terrain_id" not in entry:
+            continue
+        fam = str(entry.get("family") or "unknown")
+        # Strip the .h5 the composer stamps, so a filter reads family_jump_off not
+        # family_jump_off.h5 -- the extension is an artefact of how the family was stored.
+        fam = fam[:-3] if fam.endswith(".h5") else fam
+        if fam not in names:
+            names.append(fam)
+        tid_to_code[int(entry["terrain_id"])] = names.index(fam)
+
+    tid = lib.terrain_id.to(torch.long)
+    codes = torch.zeros(tid.shape[0], dtype=torch.long, device=tid.device)
+    for t, code in tid_to_code.items():
+        codes[tid == t] = code
+    counts = {names[c]: int((codes == c).sum()) for c in sorted(set(codes.tolist()))}
+    print(f"[INFO] clip families -> per-window 'clip_family' so train.py --skip_families can "
+          f"drop any of them later: {counts}")
+    return codes, names
+
+
 def _build_recording_meta(
     env: RslRlVecEnvWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
@@ -902,6 +960,13 @@ def collect_windows(
                 if distractor_clips is not None
                 else np.zeros(idx.numel(), dtype=np.uint8)
             )
+            # Per-window family code (see _clip_family_codes). Superset of is_distractor:
+            # that flag stays for the recordings and flags that already exist.
+            batch["clip_family"] = (
+                family_codes[cid.to(family_codes.device)].to(torch.uint8).cpu().numpy()
+                if family_codes is not None
+                else np.zeros(idx.numel(), dtype=np.uint8)
+            )
             if has_scan:
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
@@ -1079,8 +1144,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Per-clip distractor flag, recorded so `train.py --skip_distractors` can drop those
         # windows later without re-recording.
         distractor_clips = _distractor_clip_mask(ref_cmd)
+        family_codes, family_names = _clip_family_codes(ref_cmd)
 
         meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_records, state_frames)
+        # The code -> name table for the per-window 'clip_family' tag. Meaningless without
+        # it, so it travels in the recording rather than being reconstructed from a library
+        # that may have moved on.
+        meta.family_names = list(family_names)
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
         # command exposes the look-ahead accessors + a command velocity, unless disabled.
