@@ -489,9 +489,12 @@ def main() -> None:
                         "no-retrain probe: it reduces integration error only, so a gap that "
                         "closes here was the SAMPLER, not the model. Costs latency "
                         "proportionally -- the FM is already ~99%% of the deploy budget.")
-    p.add_argument("--num_envs", type=int, default=50,
-                   help="Rollout width. 50 by default: at 24 the metric resolves to ~4%% per "
-                        "env, which is too coarse to read a 2-3 env difference.")
+    p.add_argument("--num_envs", type=int, default=200,
+                   help="Rollout width, and the metric's resolution: 1/num_envs. 200 by "
+                        "default (0.5%% per env). The history here is a warning -- at 24 envs "
+                        "a sweep put one model's exposure-bias gap at 3 envs when 50 envs "
+                        "showed 16, and differences of 2-3 envs were being read as real when "
+                        "they were quantisation. Costs wall time roughly linearly.")
     p.add_argument("--max_steps", type=int, default=1100,
                    help="Must exceed the 1000-step episode; the metric only counts episodes "
                         "that ended via time_out.")
