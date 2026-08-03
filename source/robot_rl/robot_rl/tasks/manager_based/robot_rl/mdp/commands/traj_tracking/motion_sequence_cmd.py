@@ -28,7 +28,7 @@ import torch
 import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
-from robot_rl.flow_matching.window import world_to_window
+from robot_rl.flow_matching.window import resolve_reference_blocks, world_to_window
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from motion_gen.joint_names import is_root_frame, root_frame_name
@@ -376,7 +376,18 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._wf_world_frames = torch.zeros(self.num_envs, len(self._wf_frames), 13, device=self.device)
 
     def _update_command(self) -> None:
-        """Advance the step, build world-frame desired + measured, update CLF."""
+        """Advance the step, build world-frame desired + measured, update CLF.
+
+        TODO(perf): this term is 13.1 ms/frame, ~10% of the env step -- second only to the
+        observations and the physics themselves.  Profiled with the trained depth_v3 at
+        1024 envs (``play.py --profile``, see the phase table in ``profiling.py``'s report):
+        the instrumented children only account for 7.9 of it (``compute_measured`` 5.4,
+        ``clf`` 1.6, ``desired`` 0.9), so ~5 ms is spread across the uninstrumented steps
+        below -- the re-anchor, the placement refresh and the world lifts, all of which run
+        for EVERY env EVERY step.  Worth a look before touching anything behavioural: it is
+        pure bookkeeping, so any win here is free.  Start by timing the four unlabelled
+        calls individually rather than guessing which one it is.
+        """
         self._advance_step()
         self._reanchor_ego_envs()                  # ego-centric re-anchor snapshot (subset of envs)
         self._refresh_current_placement()          # placement for THIS step's segment mask
@@ -893,7 +904,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             ], dim=-1))
         return torch.stack(out, dim=2)  # [N, K, F, 13]
 
-    def reference_window_obs(self, offsets: torch.Tensor) -> torch.Tensor:
+    def reference_window_obs(self, offsets: torch.Tensor, blocks=None) -> torch.Tensor:
         """The reference window over ``offsets``, in the observation's representation.
 
         The producer behind ``mdp.reference_window``.  Lives on the command rather than in
@@ -909,18 +920,28 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
 
         Args:
             offsets: Future step offsets ``[K]`` (``0`` = the current step).
+            blocks: Layout blocks to include; defaults to all of them. A dropped block is
+                not GATHERED either -- the look-ahead accessors are the expensive part here,
+                and the observation manager is the largest phase of the env step.
 
         Returns:
-            ``[N, K, D]`` window nodes, ``D = window_dim(nj, num_ee_frames)``.
+            ``[N, K, D]`` window nodes, ``D = window_dim(nj, num_ee_frames, blocks)``.
         """
+        selected = resolve_reference_blocks(blocks)
         pos_w, quat_w, lin_w, ang_w = self.get_future_world_base(offsets)   # [N,K,·]
-        joint_pos, joint_vel = self.get_future_joint_state(offsets)         # [N,K,nj]
-        ee_w = self.get_future_world_frames(self.resolve_ee_frames(None), offsets)  # [N,K,E,13]
+        if "joint_pos" in selected or "joint_vel" in selected:
+            joint_pos, joint_vel = self.get_future_joint_state(offsets)     # [N,K,nj]
+        else:
+            joint_pos = joint_vel = pos_w.new_zeros(pos_w.shape[:2] + (0,))
+        if "ee_pos" in selected:
+            ee_w = self.get_future_world_frames(self.resolve_ee_frames(None), offsets)
+        else:
+            ee_w = pos_w.new_zeros(pos_w.shape[:2] + (0, 13))
         root_pos_w = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]    # [N,1,3]
         root_quat_w = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]  # [N,1,4] xyzw
         return world_to_window(
             root_pos_w, root_quat_w, pos_w, quat_w, lin_w, ang_w,
-            joint_pos, joint_vel, ee_w[..., 0:3],
+            joint_pos, joint_vel, ee_w[..., 0:3], blocks=selected,
         )
 
     # ------------------------------------------------------------------

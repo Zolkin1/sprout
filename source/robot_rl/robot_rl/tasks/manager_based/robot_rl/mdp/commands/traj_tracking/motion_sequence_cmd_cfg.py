@@ -51,6 +51,23 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     immediately hit ``clip_end_reached``). Ignored when ``random_start_phase``
     is False."""
 
+    random_start_before_terrain_end: bool = True
+    """Cap the random start at the last frame of the clip's terrain-PINNED run.
+
+    A transition or box clip is ego approach, then a pinned run over the terrain (the stair
+    climb, the box mount or dismount), then ego walking on the raised top or away from it.
+    Without this cap a start drawn past the pinned run spawns the robot AFTER its one chance
+    to interact with the terrain, and the episode is just flat walking that the flat clips
+    already cover -- on ``g1_mb_v5_body.h5`` that is 8.5% of all resets, and up to 70% on
+    individual jump-off clips.  With it, a start may land anywhere from frame 0 through the
+    last pinned frame, and never after.
+
+    No-op for clips with no pinned run (flat, distractors) and for clips pinned to their end
+    (pure stairs, one-sided box), where ``random_start_min_remaining_s`` already binds first.
+    Only the terrain reset event honours this; the flat teacher has no terrain to miss.
+    Post-terrain frames are still TRAINED -- episodes run forward through them; they just
+    stop being entry points.  Ignored when ``random_start_phase`` is False."""
+
     randomize_heading: bool = False
     """If True, each clip is placed at a random world yaw at reset."""
 

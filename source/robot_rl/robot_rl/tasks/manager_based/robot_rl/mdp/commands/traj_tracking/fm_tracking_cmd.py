@@ -796,7 +796,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         idx = self._pred_idx[:, None] + offsets[None, :]        # [N, K]
         return self._arange_n[:, None].expand_as(idx), idx
 
-    def reference_window_obs(self, offsets: torch.Tensor) -> torch.Tensor:
+    def reference_window_obs(self, offsets: torch.Tensor, blocks=None) -> torch.Tensor:
         """The predicted window, served straight through -- no world round-trip.
 
         This is the payoff of the shared representation: the generator emits exactly the
@@ -804,7 +804,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         gather. The clip branch still goes through the inherited world-frame maths.
         """
         if self._serving() == "clip":
-            return super().reference_window_obs(offsets)
+            return super().reference_window_obs(offsets, blocks)
+        # The generator already predicts exactly the configured selection, so there is
+        # nothing to drop here -- its D was resolved from the same block list at train time
+        # and the ONNX layout guard refuses a checkpoint that disagrees.
         return self._reanchor_to_now(offsets)
 
     def get_future_world_base(

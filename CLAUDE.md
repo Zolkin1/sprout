@@ -70,8 +70,14 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
 - These extend the BODY-tracking terrain teacher, so they default to `tracking_mode="body"` and pair
   with a widened (`@root`) clip library — the depth-vs-height-scan A/B is against
   `G1-teacher-clf-terrain-body` with exteroception as the only variable. Override per-run with
-  `env.commands.traj_ref.tracking_mode=joint`. Costs ~20% more per iteration than the scan (measured
-  at 512 envs).
+  `env.commands.traj_ref.tracking_mode=joint`. Costs ~19% more per iteration than the scan
+  (139 vs 116 ms/frame at 1024 envs), almost all of it in `obs`.
+- PROFILE (trained depth_v3, 1024 envs, `play.py --profile`; profile with a LOADED policy — an
+  untrained one dies every step and doubles the apparent reset cost): of a 129 ms env step,
+  `obs` 50.8 ms (39%) and physics/render ~47 ms (37%) dominate, then `command` 13.1, `events`
+  7.8, `reward` 7.6, `termination` 2.5. ~19 ms of `obs` is the two depth cameras. `TODO(perf)`
+  notes sit on `mdp.observations.reference_window` and `MotionSequenceCommand._update_command`;
+  neither is instrumented per-term yet, so a breakdown comes before any optimisation.
 - The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 
@@ -93,11 +99,17 @@ term the way training did instead of consulting a hardcoded table (kept only as 
   group 0 (collision) stays out because the foot there is a box, not the visual foot.
 - `transfer/deploy/depth_obs.py` — the torch-free normalization port + spec parse/agreement, shared
   with hardware. `transfer/sim/verify_depth_cameras.py` checks geometry/coverage/self-occlusion,
-  `scripts/rsl_rl/compare_depth_sim2sim.py` diffs IsaacLab vs MuJoCo pixel-by-pixel (they agree
-  exactly except for the hand delta below).
-- KNOWN DELTA: MuJoCo group 1 includes the HAND meshes, which `SELF_SCAN_LINKS` excludes (~60/780
-  near-camera px). Kept deliberately until the hardware camera's occlusion geometry is known; TODOs
-  in `g1_self_scan.py` and `transfer/sim/depth_camera.py`.
+  `scripts/rsl_rl/compare_depth_sim2sim.py` diffs IsaacLab vs MuJoCo pixel-by-pixel (they now
+  agree everywhere, hands included, to a few mm). `--save_dir` writes labelled colour panels and
+  `--dump` feeds `scripts/rsl_rl/view_depth_compare_viser.py`, which shows both sims' robots,
+  camera frames and hit clouds in 3-D.
+- The HANDS must stay real fixed-joint links (`robot_assets/g1/g1_21j/make_hand_links_urdf.py`,
+  asset `g1_21j_box_merged_29j_hands`). As bare `<visual>` elements on the wrist — how the stock
+  URDF ships them — the importer gives them a non-identity mesh->body offset, and
+  `MultiMeshRayCaster` does not intersect meshes on that path: the cameras saw every limb EXCEPT
+  the hands while the viewer looked perfect. They are the only meshes that ever used that path,
+  which is why nothing else was affected. Joint count/order are unchanged by the fix (29, same
+  order), so checkpoints still load; only `body_names` grows 30 -> 46, old list an exact prefix.
 - sim2sim is ONNX-ONLY (the torch `gen_tracker_policy.py` is gone). The vendored torch FM copy
   (`transfer/fm`) is gone too — once deployment moved to ONNX and `fm_test_bench.py` was deleted,
   nothing loaded a model through it. What survives is `transfer/torch_math/quat_math.py`, the

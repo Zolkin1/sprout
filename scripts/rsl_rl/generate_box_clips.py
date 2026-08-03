@@ -388,17 +388,23 @@ def _make_box_clip(matcher, builder, ts, tid, approach_vx, args, dev,
         overlays[0].update(vp)
     size_x = float(hi[0] - lo[0]) + 2 * m       # margin on BOTH sides (was one-sided)
     size_y = float(hi[1] - lo[1]) + 2 * m
-    # TODO(dp-box-frame-yaw): this tile carries NO ``frame_yaw``, so the loader defaults it to 0 and the
-    # RL anchor mask resolves downrange / lateral on the TILE's axes -- which is wrong for this path and
-    # is the bug the terrain frame exists to fix.  ``yaw_normalize`` here cancels the BOX's yaw (the
-    # box ends axis-aligned) but NOT the traversal heading, so the robot crosses the box at ~-91 deg and
-    # "free lateral" gets handed the traversal axis: a slow robot drags the reference off the box along
-    # the direction of travel.  The value cannot be derived from the geometry (a box has four
-    # approachable faces) nor from ``ts`` alone (it depends on the post-splice transform ``gq_t``), so
-    # it is deliberately NOT guessed here -- omitting the key preserves today's behavior exactly rather
-    # than inventing a number.  Fix = measure the traversal heading over the box segment of the
-    # NORMALIZED clip and author it, or switch this path to ``align="facing"`` as the MB path did
-    # (``mb_terrain_clips._place``), which puts the traversal on +x and makes 0 correct.
+    # DEPRECATED-PATH CAVEAT (dp-box-frame-yaw): this tile carries NO ``frame_yaw``, so the loader
+    # defaults it to 0 and the RL anchor mask resolves downrange / lateral on the TILE's axes.
+    # ``yaw_normalize`` here cancels the BOX's yaw (the box ends axis-aligned) but NOT the traversal
+    # heading, so the robot crosses the box at ~-91 deg and "free lateral" gets handed the traversal
+    # axis: a slow robot drags the reference off the box along the direction of travel.
+    #
+    # NOT an open bug on the live pipeline.  The MB path fixed it the second way this note used to
+    # propose: ``mb_terrain_clips._place`` uses ``align="facing"``, which puts the traversal on the
+    # tile's +x, and ``mb_terrain_clips`` then AUTHORS ``frame_yaw: 0.0`` to say so.  Every family in
+    # the shipped library carries it (distractors excepted, and they are fully ego-anchored so no bit
+    # resolves in the terrain frame).  This module is retained for ablations only.
+    #
+    # So: only if you revive this path.  Then either measure the traversal heading over the box
+    # segment of the NORMALIZED clip and author it, or switch to ``align="facing"`` as MB did.  It
+    # cannot be derived from the geometry (a box has four approachable faces) nor from ``ts`` alone
+    # (it depends on the post-splice transform ``gq_t``), which is why it is omitted rather than
+    # guessed -- omitting preserves this path's existing behaviour exactly.
     manifest_entry = {"terrain_id": tid, "type": "box", "size_x": size_x, "size_y": size_y,
                       "overlays": overlays}
     # TWO-VELOCITY SPLIT (the RL command != the DP generation command). The DP RAMPS the command
@@ -787,8 +793,8 @@ def _make_box_tile_clip(matcher, builder, ts, tile, approach_vx, args, dev,
     T = Wp.shape[0]
     amt = build_anchor_mask_t(T, bounds, seg_masks, device=dev)
     # NOTE(dp-box-frame-yaw): no ``frame_yaw`` authored -- see the long note on the first box
-    # manifest in ``_make_box_clip``. Omitting it keeps today's (tile-axis) masking rather than
-    # guessing a heading this path does not normalize away.
+    # manifest in ``_make_box_clip``. Only affects this DEPRECATED path; the live MB pipeline
+    # authors it (and aligns the traversal to +x so 0.0 is correct).
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
                       "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)
@@ -843,8 +849,8 @@ def _make_box_off_tile_clip(matcher, builder, ts, tile, args, dev,
     T = Wp.shape[0]
     amt = build_anchor_mask_t(T, keep, seg_masks, device=dev)
     # NOTE(dp-box-frame-yaw): no ``frame_yaw`` authored -- see the long note on the first box
-    # manifest in ``_make_box_clip``. Omitting it keeps today's (tile-axis) masking rather than
-    # guessing a heading this path does not normalize away.
+    # manifest in ``_make_box_clip``. Only affects this DEPRECATED path; the live MB pipeline
+    # authors it (and aligns the traversal to +x so 0.0 is correct).
     manifest_entry = {"terrain_id": int(tile.terrain_id), "type": "box",
                       "size_x": float(size_x), "size_y": float(size_y), "overlays": [overlay]}
     tvel = torch.full((T, 3), 0.0, dtype=torch.float32, device=dev)

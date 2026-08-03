@@ -19,6 +19,17 @@ The camera contract comes from an exported ``tracker.onnx`` when one is given (t
 deployment path), otherwise from the training env cfg via ``--from_env_cfg`` (which needs
 isaaclab importable, but no simulator).
 
+``--from_env_cfg`` reads the LIVE ``G1-teacher-clf-terrain-depth`` cfgs
+(``G1TeacherTerrainDepthObservationsCfg`` policy group + ``G1TeacherTerrainDepthSceneCfg``,
+i.e. ``g1_depth_env_cfg``'s ``_NEAR`` / ``_FAR``), so it always reflects what the task
+currently declares.  The robot geometry is separate and comes from the MuJoCo model
+(``--robot_name`` / ``--scene``, default ``robots/g1/g1_29j_basic_scene.xml``).
+
+``--viewer`` opens the MuJoCo viewer with the live hit cloud (yellow = near, cyan-green =
+far) plus each camera's mount frame as RGB axes -- red is +x, the optical axis, which is
+the quickest way to eyeball a mount pitch.  No simulator, no policy and no trained
+checkpoint are involved in either mode.
+
 Run from ``transfer/sim``:
 
     python verify_depth_cameras.py --from_env_cfg
@@ -95,6 +106,40 @@ def spec_from_env_cfg() -> list[dict]:
 def denormalise(image: np.ndarray, cam: dict) -> np.ndarray:
     """Recover metres from a normalised image, via the deploy runtime's own inverse."""
     return denormalize_depth_np(image, float(cam["offset"]), float(cam["scale"]))
+
+
+def draw_frame_axes(scn, pos: np.ndarray, rot: np.ndarray,
+                    length: float = 0.15, radius: float = 0.006) -> None:
+    """Draw a coordinate frame as three RGB arrows in a viewer scene.
+
+    Red / green / blue are the frame's +x / +y / +z.  For a depth camera +x is the
+    optical axis, so the red arrow is where the camera actually looks -- the quickest way
+    to sanity-check a mount pitch by eye.
+
+    An ``mjGEOM_ARROW`` points along its own local +z, so each axis is drawn with the
+    frame's columns cyclically permuted to put the wanted one third.  All three
+    permutations are cyclic, hence still right-handed (det +1) and safe as rotations.
+
+    Args:
+        scn: The viewer's ``user_scn`` to append geoms to.
+        pos: ``(3,)`` frame origin in world coordinates.
+        rot: ``(3, 3)`` frame orientation, columns = the frame's axes in world.
+        length: Arrow length, metres.
+        radius: Arrow shaft radius, metres.
+    """
+    size = np.array([radius, radius, length])
+    for axis, rgba in enumerate(((1.0, 0.2, 0.2, 1.0),      # +x, optical axis
+                                 (0.2, 1.0, 0.2, 1.0),      # +y
+                                 (0.3, 0.45, 1.0, 1.0))):   # +z
+        if scn.ngeom >= scn.maxgeom:
+            return
+        mat = rot[:, [(axis + 1) % 3, (axis + 2) % 3, axis]]
+        mujoco.mjv_initGeom(
+            scn.geoms[scn.ngeom], mujoco.mjtGeom.mjGEOM_ARROW,
+            size, pos, np.ascontiguousarray(mat).flatten(),
+            np.array(rgba, dtype=np.float32),
+        )
+        scn.ngeom += 1
 
 
 def check_geometry(model, data, cams: MujocoDepthCameras, spec: list[dict]) -> bool:
@@ -253,7 +298,8 @@ def main() -> None:
                         help="Knee angle (rad) for the articulation check.")
     parser.add_argument("--save_dir", default=None, help="Write per-camera depth PNGs here.")
     parser.add_argument("--viewer", action="store_true", default=False,
-                        help="Open the MuJoCo viewer with the depth hit cloud drawn.")
+                        help="Open the MuJoCo viewer with the depth hit cloud and each "
+                             "camera's mount frame (RGB axes) drawn.")
     parser.add_argument("--depth_noise", action="store_true", default=False,
                         help="Apply the training sensor noise (for eyeballing its effect).")
     args = parser.parse_args()
@@ -323,12 +369,20 @@ def main() -> None:
         from mujoco import viewer as mj_viewer
 
         print("\n[INFO] Viewer: yellow = near camera hits, cyan-green = far camera hits.")
+        print("[INFO] Each camera's mount frame is drawn as RGB axes "
+              "(red = +x / optical axis, green = +y, blue = +z).")
+        for cam, camera in zip(spec, cams.cameras):
+            pos, _ = camera.pose(data)
+            print(f"         {cam['sensor']:20s} origin {np.array2string(pos, precision=3)}")
         with mj_viewer.launch_passive(model, data) as viewer:
             while viewer.is_running():
                 mujoco.mj_forward(model, data)
                 _, hits = cams.compute(data, want_hits=True)
                 scn = viewer.user_scn
                 scn.ngeom = 0
+                # Axes first, so they are never the geoms dropped by the maxgeom guard.
+                for camera in cams.cameras:
+                    draw_frame_axes(scn, *camera.pose(data))
                 for cam_i, cam_hits in enumerate(hits):
                     rgba = np.array([1.0, 0.85, 0.1, 0.8] if cam_i == 0
                                     else [0.1, 0.9, 0.6, 0.8], dtype=np.float32)

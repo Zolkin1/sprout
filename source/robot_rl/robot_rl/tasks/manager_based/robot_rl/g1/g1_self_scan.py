@@ -24,12 +24,15 @@ generating instead of hand-writing:
    flexion would be invisible.  Pointing at the INNER Xform yields exactly that
    link's own visual mesh: one target, one rigid body, one transform.
 
-Hence the doubled tail on every expression: ``.../left_knee_link/left_knee_link``.
+Hence the doubled tail on every link with children: ``.../left_knee_link/left_knee_link``.
+LEAF links are the exception -- the converter gives them a single Xform, so they are NOT
+doubled; see :func:`visual_prim_path`.
 
 The link topology below mirrors the joint graph of
-``robot_assets/g1/g1_21j/g1_21j_box_merged_29j``.  ``tests/test_g1_self_scan.py``
-re-derives it from that USD and fails if the two drift apart -- the guard against a
-re-exported asset silently invalidating these paths.
+``robot_assets/g1/g1_21j/g1_21j_box_merged_29j_hands`` -- 29 revolute joints plus the 16
+fixed joints that weld the hands on.  ``tests/test_g1_self_scan.py`` re-derives it from that
+USD and fails if the two drift apart -- the guard against a re-exported asset silently
+invalidating these paths.
 """
 
 from __future__ import annotations
@@ -80,6 +83,11 @@ _PARENT: dict[str, str] = {
     "right_wrist_roll_link": "right_elbow_link",
     "right_wrist_pitch_link": "right_wrist_roll_link",
     "right_wrist_yaw_link": "right_wrist_pitch_link",
+    # hands -- FIXED joints onto the wrist (see HAND_LINKS)
+    **{f"{side}_hand_{part}_link": f"{side}_wrist_yaw_link"
+       for side in ("left", "right")
+       for part in ("palm", "thumb_0", "thumb_1", "thumb_2",
+                    "middle_0", "middle_1", "index_0", "index_1")},
 }
 
 LEG_LINKS: tuple[str, ...] = tuple(
@@ -95,11 +103,40 @@ ARM_LINKS: tuple[str, ...] = tuple(
                   "wrist_roll", "wrist_pitch", "wrist_yaw")
 )
 
+# The hand: eight links per side, welded to ``*_wrist_yaw_link`` by FIXED joints.  They are
+# real links in the joint graph (see ``_PARENT`` above) and therefore real rigid bodies.
+#
+# They were not always.  The stock URDF hung all eight meshes off the wrist as extra
+# ``<visual>`` elements, which the importer turned into bare Xforms carrying a NON-IDENTITY
+# mesh->body offset -- the only such meshes in the robot.  ``MultiMeshRayCaster`` does not
+# intersect meshes on that path, so the depth cameras saw every limb except the hands while
+# the renderer showed them correctly.  ``robot_assets/g1/g1_21j/make_hand_links_urdf.py``
+# promotes them to fixed-joint links, which restores an identity offset and makes them cast
+# like everything else.
+HAND_LINKS: tuple[str, ...] = tuple(
+    f"{side}_hand_{part}_link"
+    for side in ("left", "right")
+    for part in ("palm", "thumb_0", "thumb_1", "thumb_2",
+                 "middle_0", "middle_1", "index_0", "index_1")
+)
+
+# Links whose Xform holds the visual mesh DIRECTLY, with no inner same-named Xform.
+#
+# The converter only emits the inner wrapper for a link that has CHILD links; a leaf gets
+# one Xform doing both jobs.  Every hand link is a leaf, so their ray-cast targets are
+# undoubled -- see :func:`visual_prim_path`.
+_LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS)
+
 # Links a torso-mounted, downward-looking camera can actually see.  The arms are in
 # frame as much as the legs are -- both cameras hang off the torso and look forward
 # and down -- so they are included; the spine links (waist_*, torso) are the mount
 # itself and are excluded as they cannot occlude their own camera usefully.
-SELF_SCAN_LINKS: tuple[str, ...] = LEG_LINKS + ARM_LINKS
+#
+# The hands are included to MATCH the MuJoCo sim2sim caster, whose geom group 1 contains
+# them: with them absent here the two disagreed by ~60/780 near-camera pixels
+# (``transfer/sim/depth_camera.py``).  They are real occluders in front of a
+# downward-looking chest camera, so the agreeing answer is to cast them on both sides.
+SELF_SCAN_LINKS: tuple[str, ...] = LEG_LINKS + ARM_LINKS + HAND_LINKS
 
 
 def link_chain(link: str) -> tuple[str, ...]:
@@ -142,7 +179,20 @@ def link_prim_path(link: str, root: str = DEFAULT_GEOMETRY_ROOT) -> str:
 
 
 def visual_prim_path(link: str, root: str = DEFAULT_GEOMETRY_ROOT) -> str:
-    """Path of a link's INNER visual-mesh Xform -- the correct ray-cast target.
+    """Path of a link's visual-mesh Xform -- the correct ray-cast target.
+
+    Two conventions, because the hands sit one level shallower than jointed links:
+
+    * a JOINTED link is an outer kinematic Xform wrapping an inner, same-named
+      instanceable Xform, so its target is the doubled tail
+      ``.../left_knee_link/left_knee_link``;
+    * a LEAF link (every hand link) has no child links, so the converter gives it a single
+      Xform that is both the kinematic node and the geometry holder.  Its target is
+      therefore undoubled: ``.../left_wrist_yaw_link/left_hand_palm_link``.
+
+    Doubling a hand path would name a prim that does not exist, and the failure is quiet:
+    the ray caster logs "No mesh prims found" and that part of the hand is simply absent
+    from the depth image.
 
     Args:
         link: Name of the link.
@@ -159,6 +209,8 @@ def visual_prim_path(link: str, root: str = DEFAULT_GEOMETRY_ROOT) -> str:
             f"{ROOT_LINK!r} has no inner same-named visual Xform; "
             "use root_visual_prim_paths() instead."
         )
+    if link in _LEAF_LINKS:
+        return link_prim_path(link, root)
     return f"{link_prim_path(link, root)}/{link}"
 
 

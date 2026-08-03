@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import warp as wp
+from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
@@ -12,8 +13,11 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_box_minus, 
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
 
 from robot_rl.flow_matching.window import (
+    REFERENCE_BLOCK_KEYS as _REFERENCE_BLOCK_KEYS,
+    REFERENCE_WINDOW_BLOCK_NAMES as REFERENCE_WINDOW_BLOCKS,
     REFERENCE_WINDOW_NOISE,
     expand_window_blocks,
+    resolve_reference_blocks,
     window_blocks,
     window_to_world,
 )
@@ -218,10 +222,13 @@ def command_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> 
     "joystick" would supply -- rather than the achieved reference base velocity
     (:func:`ref_base_velocity`, ``dy_des``).  Heading-invariant (planar linear
     velocity + yaw rate in the base/heading frame) and available at deployment.
-    Pairs with the ``command_lin_vel_xy_tracking_exp`` /
-    ``command_ang_vel_z_tracking_exp`` rewards so the command they grade against
-    is observable to the policy.  Returns ``[N, 3]``.  Requires a clip library
-    carrying ``target_vel``.
+    Returns ``[N, 3]``.  Requires a clip library carrying ``target_vel``.
+
+    NOTE this used to pair with the ``command_lin_vel_xy_tracking_exp`` /
+    ``command_ang_vel_z_tracking_exp`` rewards, which no task registers any more -- the
+    teacher's CLF already grades the base twist.  The command is still worth OBSERVING
+    (it is what the reference was generated from, and the deployment joystick supplies
+    it); it is simply no longer separately rewarded.
     """
     cmd = env.command_manager.get_term(command_name)
     return cmd.get_command_velocity().clone()
@@ -251,35 +258,42 @@ def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
     return torch.arange(n, device=cmd.device, dtype=torch.long) * s
 
 
-def reference_window_layout_from_dims(num_joints: int, num_ee_frames: int) -> list[tuple[str, int]]:
+def reference_window_layout_from_dims(
+    num_joints: int, num_ee_frames: int, blocks=None
+) -> list[tuple[str, int]]:
     """Per-step block layout of :func:`reference_window` from raw dimensions.
 
     Kept as the name this side of the codebase reaches for (``export_parameters``,
-    ``data_logger``, the noise/scale expansion below), but the layout itself now lives in
+    ``data_logger``, the noise/scale expansion below), but the layout itself lives in
     :func:`robot_rl.flow_matching.window.window_blocks` -- the flow-matching generator
-    predicts in exactly this representation, so the definition has to be shared rather than
-    restated on each side.
+    predicts in exactly this representation and honours the same block SELECTION, so the
+    definition has to be shared rather than restated on each side.
 
     Args:
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the clip library exposes.
+        blocks: Subset to include; defaults to all of them.
 
     Returns:
         ``[(block_name, width), ...]`` in packing order.
     """
-    return window_blocks(num_joints, num_ee_frames)
+    return window_blocks(num_joints, num_ee_frames, blocks)
 
 
-def reference_window_layout(cmd) -> list[tuple[str, int]]:
+def reference_window_layout(cmd, blocks=None) -> list[tuple[str, int]]:
     """Per-step block layout of :func:`reference_window` as ``[(name, width), ...]``.
 
     Resolves the robot's joint count and the clip library's ee-frame count off the command
     term, then defers to :func:`reference_window_layout_from_dims`.  Used by the diagnostics
     (``scripts/rsl_rl/data_logger.py``) to slice the flat term back into named blocks
     without restating the layout.
+
+    Args:
+        cmd: The trajectory command term.
+        blocks: Subset to include; defaults to all of them.
     """
     return reference_window_layout_from_dims(
-        len(cmd.robot.joint_names), len(cmd.resolve_ee_frames(None))
+        len(cmd.robot.joint_names), len(cmd.resolve_ee_frames(None)), blocks
     )
 
 
@@ -299,8 +313,8 @@ def reference_window_layout(cmd) -> list[tuple[str, int]]:
 #: since the noise is applied before the scale and so the signal-to-noise ratio is
 #: untouched.
 #:
-#: TODO(scaling): this is a first pass, tuned only to put the blocks in the same ballpark.
-#: Two things to revisit once there is a trained baseline to compare against:
+#: DEFERRED (no compute to spend on it now, not a dead end): this is a first pass, tuned
+#: only to put the blocks in the same ballpark.  Two things to revisit:
 #:
 #: 1. These numbers are NOT normalization -- they are hand-picked, and the remaining
 #:    spread is still ~5x (measured p99 after scaling: base_pose 0.68, base_vel 1.14,
@@ -316,6 +330,13 @@ def reference_window_layout(cmd) -> list[tuple[str, int]]:
 #:    ``RefEncoderMLPModel.reconstruction_loss`` rather than by distorting this scale
 #:    further -- this one also feeds the actor's forward pass, so the two cannot be tuned
 #:    independently through it.
+#:
+#: When it IS worth spending a run on: (1) is a one-flag A/B
+#: (``agent.actor.obs_normalization=true``, and the critic's) and (2) is dormant while the
+#: reconstruction loss is off (``reconstruction=False``, ``coeff=0.0``), so the two can be
+#: taken one at a time.  The cheap moment for (1) is a round that already breaks baseline
+#: comparability for other reasons -- it needs its own run either way, or it cannot be told
+#: apart from whatever else moved.
 REFERENCE_WINDOW_SCALE: dict[str, float | list[float]] = {
     "base_pos": 1.0,
     "base_ori": 1.0,
@@ -332,6 +353,7 @@ def _expand_reference_blocks(
     num_joints: int,
     num_ee_frames: int,
     per_block: dict[str, float | list[float]],
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block values to one value per :func:`reference_window` channel.
 
@@ -351,7 +373,7 @@ def _expand_reference_blocks(
     Raises:
         ValueError: If the built per-step width disagrees with the block layout.
     """
-    return expand_window_blocks(num_joints, num_ee_frames, per_block) * int(num_steps)
+    return expand_window_blocks(num_joints, num_ee_frames, per_block, blocks) * int(num_steps)
 
 
 def reference_window_noise_vector(
@@ -359,6 +381,7 @@ def reference_window_noise_vector(
     num_joints: int,
     num_ee_frames: int,
     magnitudes: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block noise magnitudes to one half-width per :func:`reference_window` channel.
 
@@ -379,7 +402,7 @@ def reference_window_noise_vector(
         ``num_steps * D`` half-widths, in the channel order the window packs.
     """
     mags = REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes
-    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags)
+    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags, blocks)
 
 
 def reference_window_scale(
@@ -387,6 +410,7 @@ def reference_window_scale(
     num_joints: int,
     num_ee_frames: int,
     factors: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> tuple[float, ...]:
     """Per-channel multiplier for a :func:`reference_window` observation term.
 
@@ -403,7 +427,7 @@ def reference_window_scale(
         ``num_steps * D`` multipliers, in the channel order the window packs.
     """
     facs = REFERENCE_WINDOW_SCALE if factors is None else factors
-    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs))
+    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs, blocks))
 
 
 def per_channel_uniform_noise(data: torch.Tensor, cfg) -> torch.Tensor:
@@ -473,6 +497,7 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         num_joints: int,
         num_ee_frames: int,
         magnitudes: dict[str, float | list[float]] | None = None,
+        blocks: Sequence[str] | None = None,
     ) -> "ReferenceWindowNoiseCfg":
         """Build the config by expanding per-block magnitudes over the window layout.
 
@@ -487,13 +512,14 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         """
         mags = dict(REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes)
         return cls(
-            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags),
+            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags, blocks),
             magnitudes=mags,
         )
 
 
 def reference_window(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
+    blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """The full reference trajectory over a look-ahead window (``[N, num_steps * D]``).
 
@@ -529,10 +555,21 @@ def reference_window(
     Note the window saturates on the clip's final padded frame near the end of a
     clip (``_future_step_indices`` clamps to the padded library length); the
     episode is truncated by ``clip_end_reached`` before that matters.
+
+    TODO(perf): the observation manager is the single largest phase of the env step --
+    50.8 ms/frame, ~39%, tied with physics (profiled with the trained depth_v3 at 1024
+    envs via ``play.py --profile``).  Roughly 19 ms of that is the two depth cameras
+    (measured by A/B against ``G1-teacher-clf-terrain-body``, which is otherwise
+    identical), leaving ~31 ms across this window, the critic's height scan and the
+    tracking-error terms.  This term is the prime suspect for the remainder: it gathers
+    ``num_steps`` future frames of base + joints + ee for every env every step, then does
+    several quaternion ops on an ``[N*K, .]`` flattening.  Nothing here is instrumented
+    individually, so the first move is a per-term breakdown rather than an optimisation --
+    the manager total is all we currently know.
     """
     cmd = env.command_manager.get_term(command_name)
     offs = _window_offsets(cmd, num_steps, stride)
-    win = cmd.reference_window_obs(offs)            # [N, K, D]
+    win = cmd.reference_window_obs(offs, blocks)    # [N, K, D]
     return win.reshape(win.shape[0], -1)
 
 

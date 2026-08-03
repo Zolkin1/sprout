@@ -61,6 +61,7 @@ All quaternions are ``(x, y, z, w)``, matching ``robot.data`` and ``isaaclab.uti
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import torch
 
@@ -111,108 +112,156 @@ REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
 }
 
 
+#: Blocks a window node packs, in order, when none are selected explicitly.
+#:
+#: A block can be dropped to ask what the policy actually needs from the reference. The
+#: selection threads through the observation term, the noise / scale builders, AND the FM's
+#: dataset, losses and export -- everything reads this one list, so a subset cannot land in
+#: one place and not another. Dropping a block also skips computing it, which is not free:
+#: the observation manager is the largest phase of the env step, and the generator's output
+#: space shrinks with it.
+REFERENCE_WINDOW_BLOCK_NAMES: tuple[str, ...] = (
+    "base_pose", "base_vel", "joint_pos", "joint_vel", "ee_pos",
+)
+
+#: Layout block -> the per-block keys in :data:`REFERENCE_WINDOW_NOISE` (and the
+#: observation's SCALE table) that expand into it. ``base_pose`` and ``base_vel`` are each
+#: two 3-axis halves, which is why those tables key more finely than the layout does.
+REFERENCE_BLOCK_KEYS: dict[str, tuple[str, ...]] = {
+    "base_pose": ("base_pos", "base_ori"),
+    "base_vel": ("base_lin_vel", "base_ang_vel"),
+    "joint_pos": ("joint_pos",),
+    "joint_vel": ("joint_vel",),
+    "ee_pos": ("ee_pos",),
+}
+
+
+def resolve_reference_blocks(blocks: Sequence[str] | None) -> tuple[str, ...]:
+    """Validate a block selection and put it in canonical packing order.
+
+    Args:
+        blocks: Requested block names, or ``None`` for
+            :data:`REFERENCE_WINDOW_BLOCK_NAMES`.
+
+    Returns:
+        The selection, ordered as a window node packs it.
+
+    Raises:
+        ValueError: On an unknown name or an empty selection.
+    """
+    if blocks is None:
+        return REFERENCE_WINDOW_BLOCK_NAMES
+    wanted = set(blocks)
+    unknown = wanted - set(REFERENCE_WINDOW_BLOCK_NAMES)
+    if unknown:
+        raise ValueError(
+            f"unknown reference-window block(s) {sorted(unknown)}; "
+            f"expected a subset of {list(REFERENCE_WINDOW_BLOCK_NAMES)}"
+        )
+    if not wanted:
+        raise ValueError("a reference window needs at least one block")
+    return tuple(b for b in REFERENCE_WINDOW_BLOCK_NAMES if b in wanted)
+
+
+def window_blocks(
+    num_joints: int, num_ee_frames: int, blocks: Sequence[str] | None = None
+) -> list[tuple[str, int]]:
+    """Per-node block layout as ``[(name, width), ...]`` in packing order.
+
+    The single source of truth for how one window node is packed. Everything that slices a
+    window derives its offsets from here rather than restating them.
+
+    Args:
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames the clip library exposes ``K``.
+        blocks: Subset to include; defaults to all of them.
+
+    Returns:
+        ``[(name, width), ...]`` for the selection.
+    """
+    widths = {
+        "base_pose": 6,
+        "base_vel": 6,
+        "joint_pos": num_joints,
+        "joint_vel": num_joints,
+        "ee_pos": 3 * num_ee_frames,
+    }
+    return [(b, widths[b]) for b in resolve_reference_blocks(blocks)]
+
+
+def window_dim(
+    num_joints: int, num_ee_frames: int, blocks: Sequence[str] | None = None
+) -> int:
+    """Width ``D`` of one window node for the given selection."""
+    return sum(w for _, w in window_blocks(num_joints, num_ee_frames, blocks))
+
+
+def window_block_slices(
+    num_joints: int, num_ee_frames: int, blocks: Sequence[str] | None = None
+) -> dict[str, slice]:
+    """Column slice of each selected block within one window node."""
+    out: dict[str, slice] = {}
+    offset = 0
+    for name, width in window_blocks(num_joints, num_ee_frames, blocks):
+        out[name] = slice(offset, offset + width)
+        offset += width
+    return out
+
+
 def expand_window_blocks(
     num_joints: int,
     num_ee_frames: int,
     per_block: dict[str, float | list[float]],
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block values to one value per channel of ONE window node.
 
-    Shared by everything that needs a per-channel vector over the layout -- the
-    observation's noise and scale, the FM's history noise -- so a layout change cannot land
-    in one and not the others.
+    Shared by everything needing a per-channel vector over the layout -- the observation's
+    noise and scale, the FM's history noise -- so a layout change or a block SELECTION
+    cannot land in one and not the others.
 
     Args:
         num_joints: Robot joint count ``nj``.
         num_ee_frames: End-effector frames ``K``.
-        per_block: Value per block name; position-like blocks (``base_pos``, ``base_ori``,
-            ``base_lin_vel``, ``base_ang_vel``, ``ee_pos``) accept a scalar or an
-            ``(x, y, z)`` triple.
+        per_block: Value per :data:`REFERENCE_BLOCK_KEYS` key; position-like keys accept a
+            scalar or an ``(x, y, z)`` triple.
+        blocks: Subset to include; defaults to all of them.
 
     Returns:
-        ``D`` values, in the channel order the node packs.
+        ``window_dim(nj, K, blocks)`` values, in packing order.
 
     Raises:
-        ValueError: If the built width disagrees with the block layout.
+        ValueError: If the built width disagrees with the layout.
     """
     def axes(key: str) -> list[float]:
         """The block's value as three per-axis entries."""
         value = per_block[key]
         return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * 3
 
-    out = (
-        axes("base_pos") + axes("base_ori")                        # base_pose  (6)
-        + axes("base_lin_vel") + axes("base_ang_vel")              # base_vel   (6)
-        + [float(per_block["joint_pos"])] * num_joints             # joint_pos  (nj)
-        + [float(per_block["joint_vel"])] * num_joints             # joint_vel  (nj)
-        + axes("ee_pos") * num_ee_frames                           # ee_pos     (3K)
-    )
-    expected = window_dim(num_joints, num_ee_frames)
+    builders = {
+        "base_pose": lambda: axes("base_pos") + axes("base_ori"),
+        "base_vel": lambda: axes("base_lin_vel") + axes("base_ang_vel"),
+        "joint_pos": lambda: [float(per_block["joint_pos"])] * num_joints,
+        "joint_vel": lambda: [float(per_block["joint_vel"])] * num_joints,
+        "ee_pos": lambda: axes("ee_pos") * num_ee_frames,
+    }
+    selected = resolve_reference_blocks(blocks)
+    out: list[float] = []
+    for name in selected:
+        out += builders[name]()
+    expected = window_dim(num_joints, num_ee_frames, selected)
     if len(out) != expected:
         raise ValueError(
-            f"Built {len(out)} channels, expected {expected} (nj={num_joints}, "
-            f"ee={num_ee_frames}). The per-block expansion has drifted from window_blocks."
+            f"Built {len(out)} channels, expected {expected} (blocks={list(selected)}, "
+            f"nj={num_joints}, ee={num_ee_frames}). The per-block expansion has drifted "
+            "from window_blocks."
         )
     return out
 
 
-def window_blocks(num_joints: int, num_ee_frames: int) -> list[tuple[str, int]]:
-    """Per-node block layout as ``[(name, width), ...]`` in packing order.
-
-    The single source of truth for how one window node is packed. Everything that slices a
-    window -- the observation's noise/scale expansion, the FM's normalizer, the ONNX layout
-    guard, the diagnostics -- derives its offsets from here rather than restating them.
-
-    Args:
-        num_joints: Robot joint count ``nj``.
-        num_ee_frames: End-effector frames the clip library exposes ``K``.
-
-    Returns:
-        ``[("base_pose", 6), ("base_vel", 6), ("joint_pos", nj), ("joint_vel", nj),
-        ("ee_pos", 3 * K)]``.
-    """
-    return [
-        ("base_pose", 6),
-        ("base_vel", 6),
-        ("joint_pos", num_joints),
-        ("joint_vel", num_joints),
-        ("ee_pos", 3 * num_ee_frames),
-    ]
-
-
-def window_dim(num_joints: int, num_ee_frames: int) -> int:
-    """Width ``D`` of one window node.
-
-    Args:
-        num_joints: Robot joint count ``nj``.
-        num_ee_frames: End-effector frames ``K``.
-
-    Returns:
-        ``12 + 2 * nj + 3 * K``.
-    """
-    return sum(width for _, width in window_blocks(num_joints, num_ee_frames))
-
-
-def window_block_slices(num_joints: int, num_ee_frames: int) -> dict[str, slice]:
-    """Column slice of each block within one window node.
-
-    Args:
-        num_joints: Robot joint count ``nj``.
-        num_ee_frames: End-effector frames ``K``.
-
-    Returns:
-        Block name -> ``slice`` into the last axis of a ``[..., D]`` window.
-    """
-    out: dict[str, slice] = {}
-    offset = 0
-    for name, width in window_blocks(num_joints, num_ee_frames):
-        out[name] = slice(offset, offset + width)
-        offset += width
-    return out
-
-
 def split_window(
-    window: torch.Tensor, num_joints: int, num_ee_frames: int
+    window: torch.Tensor, num_joints: int, num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Split a ``[..., D]`` window into its named blocks (views, not copies).
 
@@ -227,15 +276,16 @@ def split_window(
     Raises:
         ValueError: If ``window``'s last axis disagrees with the layout.
     """
-    expected = window_dim(num_joints, num_ee_frames)
+    expected = window_dim(num_joints, num_ee_frames, blocks)
     if window.shape[-1] != expected:
         raise ValueError(
             f"window is {window.shape[-1]} wide but the layout implies {expected} "
-            f"(nj={num_joints}, ee={num_ee_frames})."
+            f"(blocks={list(resolve_reference_blocks(blocks))}, nj={num_joints}, "
+            f"ee={num_ee_frames})."
         )
     return {
         name: window[..., slc]
-        for name, slc in window_block_slices(num_joints, num_ee_frames).items()
+        for name, slc in window_block_slices(num_joints, num_ee_frames, blocks).items()
     }
 
 
@@ -268,6 +318,7 @@ def world_to_window(
     joint_pos: torch.Tensor,
     joint_vel: torch.Tensor,
     ee_pos_w: torch.Tensor,
+    blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """Build window nodes from world-frame reference state and a measured anchor.
 
@@ -289,9 +340,13 @@ def world_to_window(
         joint_vel: ``[..., K, nj]`` reference joint velocities, robot joint order.
         ee_pos_w: ``[..., K, E, 3]`` reference end-effector positions, world frame.
 
+        blocks: Layout blocks to emit; defaults to all of them. A dropped block is not
+            computed at all.
+
     Returns:
-        ``[..., K, D]`` window nodes, ``D = window_dim(nj, E)``.
+        ``[..., K, D]`` window nodes, ``D = window_dim(nj, E, blocks)``.
     """
+    selected = resolve_reference_blocks(blocks)
     node_shape = ref_pos_w.shape[:-1]                        # (..., K)
     flat = math.prod(node_shape)
 
@@ -318,18 +373,14 @@ def world_to_window(
         ee_q, (ee_flat - ref_p[:, None, :]).reshape(-1, 3)
     ).reshape(flat, num_ee * 3)
 
-    node = torch.cat(
-        [
-            pos_err_b,
-            ori_err_b,
-            lin_b,
-            ang_b,
-            joint_pos.reshape(flat, -1),
-            joint_vel.reshape(flat, -1),
-            ee_rel,
-        ],
-        dim=-1,
-    )
+    built = {
+        "base_pose": lambda: torch.cat([pos_err_b, ori_err_b], dim=-1),
+        "base_vel": lambda: torch.cat([lin_b, ang_b], dim=-1),
+        "joint_pos": lambda: joint_pos.reshape(flat, -1),
+        "joint_vel": lambda: joint_vel.reshape(flat, -1),
+        "ee_pos": lambda: ee_rel,
+    }
+    node = torch.cat([built[b]() for b in selected], dim=-1)
     return node.reshape(tuple(node_shape) + (node.shape[-1],))
 
 
@@ -339,69 +390,82 @@ def window_to_world(
     root_quat_w: torch.Tensor,
     num_joints: int,
     num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Exact inverse of :func:`world_to_window`: put the window back in the world.
 
     A window is entirely relative by design -- that is what keeps world coordinates away
     from the policy -- which also makes it impossible to eyeball. Given the anchor the
     forward direction divided out, this reconstructs the world-frame reference it encodes,
-    so a viewer can draw *what the policy actually saw*, and so the FM tracker can still
-    feed a world-frame CLF and debug markers in simulation. Nothing on the deploy path
-    calls it.
+    so a viewer can draw *what the policy actually saw*, and so the FM tracker can feed a
+    world-frame CLF and debug markers in simulation. Nothing on the deploy path calls it.
+
+    Only the SELECTED blocks come back. A caller that dropped a block gets it absent from
+    the result rather than zero-filled -- the ``y_des`` writer and the debug ribbon both
+    branch on presence, and a plausible zero would be silently drawn and graded.
 
     Feed a CLEAN window, not a corrupted observation: noise, ``clip`` and ``scale`` are
     applied by the observation manager AFTER this layout and are not inverted here.
 
     Args:
         window: ``[..., K, D]`` window nodes.
-        root_pos_w: ``[..., 3]`` anchor position, broadcast over nodes as in
-            :func:`world_to_window`.
+        root_pos_w: ``[..., 3]`` anchor position, broadcast over nodes.
         root_quat_w: ``[..., 4]`` anchor orientation (xyzw).
         num_joints: Robot joint count ``nj``.
         num_ee_frames: End-effector frames ``K``.
+        blocks: The selection ``window`` was packed with; defaults to all of them.
 
     Returns:
-        Mapping with ``base_pos_w`` / ``base_lin_vel_w`` / ``base_ang_vel_w`` ``[..., K, 3]``,
-        ``base_quat_w`` ``[..., K, 4]`` (xyzw), ``joint_pos`` / ``joint_vel`` ``[..., K, nj]``
-        (frame-invariant, passed through), and ``ee_pos_w`` ``[..., K, E, 3]``.
+        Mapping with whichever of ``base_pos_w`` / ``base_quat_w`` / ``base_lin_vel_w`` /
+        ``base_ang_vel_w`` / ``joint_pos`` / ``joint_vel`` / ``ee_pos_w`` the selection
+        supports.
+
+    Raises:
+        ValueError: If ``ee_pos`` is selected without ``base_pose`` (it lifts through that
+            node's own reference base, which the base block carries).
 
     Note:
         ``base_quat_w`` comes back through ``quat_box_plus``, which normalises the sign
         (``quat_unique``), so it may be the negation of the quaternion that went in. That is
         the same rotation; compare rotations, not raw components.
     """
-    blocks = split_window(window, num_joints, num_ee_frames)
-    node_shape = window.shape[:-1]                            # (..., K)
+    selected = resolve_reference_blocks(blocks)
+    parts = split_window(window, num_joints, num_ee_frames, selected)
+    node_shape = window.shape[:-1]
     flat = math.prod(node_shape)
-
     act_p = _broadcast_anchor(root_pos_w, node_shape)
     act_q = _broadcast_anchor(root_quat_w, node_shape)
-
-    pos_err_b = blocks["base_pose"][..., 0:3].reshape(flat, 3)
-    ori_err_b = blocks["base_pose"][..., 3:6].reshape(flat, 3)
-    pos_w = act_p + quat_apply(act_q, pos_err_b)
-    # Forward: ori_err_w = Log(R_act R_refT), i.e. Exp(ori_err_w) * q_ref = q_act, so
-    # q_ref = Exp(-ori_err_w) * q_act. The minus is the legacy convention's, not a bug.
-    quat_w = quat_box_plus(act_q, -quat_apply(act_q, ori_err_b))
-
-    lin_w = quat_apply(act_q, blocks["base_vel"][..., 0:3].reshape(flat, 3))
-    ang_w = quat_apply(act_q, blocks["base_vel"][..., 3:6].reshape(flat, 3))
-
-    # ee positions are relative to THAT node's reference base, so they lift through
-    # (pos_w, quat_w) -- not through the anchor.
-    ee_rel = blocks["ee_pos"].reshape(flat, num_ee_frames, 3)
-    ee_q = quat_w[:, None, :].expand(flat, num_ee_frames, 4).reshape(-1, 4)
-    ee_pos_w = pos_w[:, None, :] + quat_apply(ee_q, ee_rel.reshape(-1, 3)).reshape(
-        flat, num_ee_frames, 3
-    )
-
     shape3 = tuple(node_shape) + (3,)
-    return {
-        "base_pos_w": pos_w.reshape(shape3),
-        "base_quat_w": quat_w.reshape(tuple(node_shape) + (4,)),
-        "base_lin_vel_w": lin_w.reshape(shape3),
-        "base_ang_vel_w": ang_w.reshape(shape3),
-        "joint_pos": blocks["joint_pos"].clone(),
-        "joint_vel": blocks["joint_vel"].clone(),
-        "ee_pos_w": ee_pos_w.reshape(tuple(node_shape) + (num_ee_frames, 3)),
-    }
+    out: dict[str, torch.Tensor] = {}
+
+    pos_w = quat_w = None
+    if "base_pose" in parts:
+        pos_err_b = parts["base_pose"][..., 0:3].reshape(flat, 3)
+        ori_err_b = parts["base_pose"][..., 3:6].reshape(flat, 3)
+        pos_w = act_p + quat_apply(act_q, pos_err_b)
+        # Forward: ori_err_w = Log(R_act R_refT), i.e. Exp(ori_err_w) * q_ref = q_act, so
+        # q_ref = Exp(-ori_err_w) * q_act. The minus is the legacy convention's, not a bug.
+        quat_w = quat_box_plus(act_q, -quat_apply(act_q, ori_err_b))
+        out["base_pos_w"] = pos_w.reshape(shape3)
+        out["base_quat_w"] = quat_w.reshape(tuple(node_shape) + (4,))
+    if "base_vel" in parts:
+        out["base_lin_vel_w"] = quat_apply(
+            act_q, parts["base_vel"][..., 0:3].reshape(flat, 3)).reshape(shape3)
+        out["base_ang_vel_w"] = quat_apply(
+            act_q, parts["base_vel"][..., 3:6].reshape(flat, 3)).reshape(shape3)
+    if "joint_pos" in parts:
+        out["joint_pos"] = parts["joint_pos"].clone()
+    if "joint_vel" in parts:
+        out["joint_vel"] = parts["joint_vel"].clone()
+    if "ee_pos" in parts:
+        if pos_w is None:
+            raise ValueError(
+                "ee_pos lifts through THAT node's own reference base, so window_to_world "
+                "cannot place it unless base_pose is in the same selection."
+            )
+        ee_rel = parts["ee_pos"].reshape(flat, num_ee_frames, 3)
+        ee_q = quat_w[:, None, :].expand(flat, num_ee_frames, 4).reshape(-1, 4)
+        out["ee_pos_w"] = (pos_w[:, None, :] + quat_apply(
+            ee_q, ee_rel.reshape(-1, 3)).reshape(flat, num_ee_frames, 3)
+        ).reshape(tuple(node_shape) + (num_ee_frames, 3))
+    return out
