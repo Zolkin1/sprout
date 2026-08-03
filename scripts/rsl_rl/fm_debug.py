@@ -398,7 +398,7 @@ def contract_report(env, cmd, args, manifest: dict) -> str:
         rows += [
             ("horizon F", f"{ctx.F}  (need >= {needed})"),
             ("horizon OK", "OK" if ctx.F >= needed else "TOO SHORT"),
-            ("history N / source", f"{ctx.N} / {ctx.history_source}"),
+            ("history N (autoregressive)", f"{ctx.N}"),
             ("state_dim / nj / extra frames", f"{ctx.D} / {ctx.nj} / {ctx.num_extra_frames}"),
             ("extero source", ctx.extero_source),
             ("live extero reading shape", tuple(cmd._read_extero().shape)),
@@ -409,10 +409,16 @@ def contract_report(env, cmd, args, manifest: dict) -> str:
             ("frames == command ee frames",
              "OK" if list(ctx.frame_names) == list(cmd.resolve_ee_frames(None))
              else f"MISMATCH: command has {cmd.resolve_ee_frames(None)}"),
-            ("joint order permutes onto robot",
-             "OK" if torch.equal(cmd._fm_to_robot_jperm[cmd._robot_to_fm_jperm],
-                                 torch.arange(ctx.nj, device=cmd.device))
-             else "BROKEN"),
+            # No permutation left to verify: the window's joint block is DEFINED in robot
+            # order, so the checkpoint's order has to equal the robot's and _post_init
+            # refuses it otherwise. Report the equality itself.
+            ("joint order == robot order",
+             "OK" if list(ctx.joint_names) == list(cmd.robot.data.joint_names)
+             else f"MISMATCH: checkpoint {list(ctx.joint_names)[:3]}... vs robot "
+                  f"{list(cmd.robot.data.joint_names)[:3]}..."),
+            ("history source", cmd.cfg.history_from),
+            ("re-plan period K", cmd.cfg.fm_update_every),
+            ("guidance scale", cmd.cfg.fm_guidance_scale),
         ]
     _add("generator", rows)
 
