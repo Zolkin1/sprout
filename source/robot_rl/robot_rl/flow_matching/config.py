@@ -109,6 +109,20 @@ class FlowMatchingConfig:
     cmd_array: str | None = None
     cmd_stride: int = 5
 
+    # TODO(fm-blocks): make this half block-aware. The teacher now packs only a SUBSET of
+    # the window (g1 REFERENCE_WINDOW_BLOCKS = base_pose, base_vel, joint_pos -> 41/node,
+    # 451 total), but the dataset still resolves state_dim from window_dim(nj, K) with no
+    # selection -> 82. Nothing couples the two, so the suite stays green and a newly trained
+    # FM is silently the wrong width, failing only at play time.
+    #
+    #   * carry the selection here and pass it to world_to_window in dataset.py
+    #   * flow.py: fk_pose_weight and joint_vel_consistency must GO -- both index blocks
+    #     that no longer exist
+    #   * export_fm_onnx / fm_session: make the window_blocks guard selection-aware (that
+    #     guard is precisely what would have caught this)
+    #   * fm_tracking_cmd._fm_current_outputs writes ee frames the FM no longer predicts
+    #   * add the missing load-time check: the FM's selection must equal the teacher's,
+    #     same shape of guard as base_pose_convention
     # -- dimensions (resolved from the dataset at build time) --
     # Per-node width of every token: the reference-window layout,
     # 12 + 2*nj + 3*num_extra_frames (see ``flow_matching.window.window_dim``). History
