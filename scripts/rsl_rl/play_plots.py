@@ -1804,6 +1804,7 @@ def _emit_tracking_stats(
     metadata: dict[str, Any],
     mask: np.ndarray | None,
     csv_prefix: str,
+    _vec: Callable | None = None,
 ) -> None:
     """Emit the V / norm-sq / position / velocity tracking blocks.
 
@@ -1811,6 +1812,11 @@ def _emit_tracking_stats(
     given), then reduced across envs. ``mask=None`` reproduces the original
     all-steps stats; a step mask restricts to a subset (e.g. successful
     episodes). ``csv_prefix`` namespaces the CSV keys for the masked block.
+
+    ``_vec``, when given, also receives the PER-ENV vector behind each scalar. Two numbers
+    (mean and std) cannot be compared as a distribution, and with clips pinned per env
+    (``mdp.events.resolve_pinned_clips``) the per-env vector is per-CLIP -- which is what a
+    cross-simulator comparison needs.
     """
     # Mean Lyapunov V
     if "v" in data:
@@ -1843,6 +1849,8 @@ def _emit_tracking_stats(
         _log(f"  Std  across envs: {np.nanstd(per_env_mean):.6f}")
         _csv(f"{csv_prefix}norm_sq_error_mean", float(np.nanmean(per_env_mean)))
         _csv(f"{csv_prefix}norm_sq_error_std", float(np.nanstd(per_env_mean)))
+        if _vec is not None:
+            _vec(f"{csv_prefix}norm_sq_error", per_env_mean)
 
     # Position errors
     if "y_des" in data and "y_act" in data:
@@ -1862,7 +1870,21 @@ def _emit_tracking_stats(
             name = pos_names[i] if i < len(pos_names) else f"Dim {i}"
             _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
 
-        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs, f"{csv_prefix}pos_error")
+        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs,
+                               f"{csv_prefix}pos_error", per_env_mean_err, _vec)
+
+        # Per-env BASE position error, the one dimension group a MuJoCo run can be compared
+        # against (its reference_tracking.pos_* is the same quantity). The base is the frame
+        # of the first pos entry -- the tracked set is packed base-first -- and only that
+        # frame is emitted, because the ee dims are nan whenever ee_pos is not predicted and
+        # a wall of nan columns would obscure the ones that mean something.
+        if _vec is not None and pos_names and ":" in str(pos_names[0]):
+            base_frame = str(pos_names[0]).split(":")[0]
+            for i in range(n_dims):
+                name = str(pos_names[i]) if i < len(pos_names) else ""
+                if name.startswith(f"{base_frame}:"):
+                    axis = name.split(":", 1)[1]
+                    _vec(f"{csv_prefix}base_{axis}_mse", per_env_mean_err[:, i])
 
     # Velocity errors
     if "dy_des" in data and "dy_act" in data:
@@ -1900,6 +1922,8 @@ def _emit_tracking_stats(
             _log(f"  {chan_names[i]:<14s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
             _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_mean", float(mean_over_envs[i]))
             _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_std", float(std_over_envs[i]))
+            if _vec is not None:
+                _vec(f"{csv_prefix}vel_track_{chan_names[i]}_mse", per_env_mean[:, i])
 
 
 def compute_and_save_stats(
@@ -1930,6 +1954,14 @@ def compute_and_save_stats(
 
     def _csv(metric: str, value: float) -> None:
         csv_rows.append({"metric": metric, "value": f"{value:.6f}"})
+
+    # Per-ENV columns behind the scalars above (see _emit_tracking_stats' ``_vec``). With
+    # clips pinned per env this is per-CLIP, which is what makes a distribution -- and a
+    # cross-simulator comparison -- possible at all.
+    per_env_cols: dict[str, np.ndarray] = {}
+
+    def _vec(metric: str, values: np.ndarray) -> None:
+        per_env_cols[metric] = np.asarray(values, dtype=np.float64).reshape(-1)
 
     _log("=" * 60)
     _log("  Play Statistics")
@@ -1969,7 +2001,7 @@ def compute_and_save_stats(
     _log("-" * 60)
     _log("  All Steps  (every logged step, all envs)")
     _log("-" * 60)
-    _emit_tracking_stats(_log, _csv, data, metadata, mask=None, csv_prefix="")
+    _emit_tracking_stats(_log, _csv, data, metadata, mask=None, csv_prefix="", _vec=_vec)
 
     # --- Successful-tracking block (steps in time_out episodes only) ---
     mask = data.get("_timeout_mask")
@@ -1985,13 +2017,17 @@ def compute_and_save_stats(
         _log("-" * 60)
         _log(f"  steps kept: {n_keep}/{total} ({pct:.1f}%)   "
              f"envs with >=1 kept step: {envs_with}/{n_envs_mask}")
+        # Per-env survival, the one metric that needs no time-averaging: did this env's
+        # episode end via time_out rather than a fall.
+        per_env_cols["survived"] = mask.any(axis=0).astype(np.float64)
         _log("  note: keeps only logged steps in episodes that ended via time_out;")
         _log("        excludes fallen/early-terminated and trailing in-progress episodes.")
         if n_keep == 0:
             _log("")
             _log("  (no time_out episodes captured — nothing to report)")
         else:
-            _emit_tracking_stats(_log, _csv, data, metadata, mask=mask, csv_prefix="timeout_")
+            _emit_tracking_stats(_log, _csv, data, metadata, mask=mask,
+                                 csv_prefix="timeout_", _vec=_vec)
 
     _log("")
     _log("=" * 60)
@@ -2012,6 +2048,21 @@ def compute_and_save_stats(
             writer.writerows(csv_rows)
         print(f"CSV saved to: {csv_path}")
 
+    if per_env_cols:
+        # One ROW per env, one column per metric -- the long-form the A/B driver joins on.
+        n = max(v.shape[0] for v in per_env_cols.values())
+        names = sorted(per_env_cols)
+        pe_path = os.path.join(save_dir, "tracking_per_env.csv")
+        with open(pe_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["env_id", *names])
+            for i in range(n):
+                w.writerow([i] + [
+                    (f"{per_env_cols[k][i]:.6f}" if i < per_env_cols[k].shape[0] else "")
+                    for k in names
+                ])
+        print(f"Per-env CSV saved to: {pe_path}")
+
 
 def _print_group_summaries(
     _log: Callable,
@@ -2020,8 +2071,15 @@ def _print_group_summaries(
     mean_over_envs: np.ndarray,
     std_over_envs: np.ndarray,
     csv_prefix: str,
+    per_env: np.ndarray | None = None,
+    _vec: Callable | None = None,
 ) -> None:
-    """Print group summaries (Positions, Orientations, Joints) for error stats."""
+    """Print group summaries (Positions, Orientations, Joints) for error stats.
+
+    With ``per_env`` (``[n_envs, n_dims]``) and ``_vec``, also emits each group's per-env
+    mean. That is the cross-simulator quantity: a MuJoCo run reports the same groups
+    (reference_tracking / joint_tracking), while the individual dimensions do not line up.
+    """
     groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
     _log("")
     _log(f"  Group Summaries:")
@@ -2035,6 +2093,8 @@ def _print_group_summaries(
             _log(f"  {group_name:<40s} {g_mean:12.6f} {g_std:12.6f}")
             _csv(f"{csv_prefix}_{group_name.lower()}_mean", float(g_mean))
             _csv(f"{csv_prefix}_{group_name.lower()}_std", float(g_std))
+            if per_env is not None and _vec is not None:
+                _vec(f"{csv_prefix}_{group_name.lower()}", per_env[:, idxs].mean(axis=1))
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from typing import TYPE_CHECKING
 
@@ -26,6 +28,8 @@ def reset_on_motion_sequence(
     command_name: str,
     base_frame_name: str = "pelvis_link",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    pin_clip_ids=None,
+    pin_start_step: int | None = None,
 ):
     """Reset each env onto a randomly chosen pre-generated motion clip.
 
@@ -45,6 +49,11 @@ def reset_on_motion_sequence(
         command_name: The :class:`MotionSequenceCommand` term name.
         base_frame_name: Trajectory base frame (must match the command cfg).
         asset_cfg: Robot asset config.
+        pin_clip_ids: Evaluation only -- pin env ``i`` to a stated clip instead of sampling
+            (see :func:`resolve_pinned_clips`).
+        pin_start_step: Evaluation only -- start every env at this clip step instead of
+            sampling one. Negative (the default) means sample; ``0`` matches a MuJoCo
+            ``--clip_start_time 0`` playback.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
@@ -54,9 +63,18 @@ def reset_on_motion_sequence(
     device = env.device
     num_clips = cmd.manager.num_clips
 
-    # 1. Sample a clip and a start step per env.
-    clip_id = torch.randint(0, num_clips, (k,), device=device)
-    start_step = sample_start_step(cmd, clip_id, device, cap_at_terrain_end=False)
+    # 1. Sample a clip and a start step per env (or take the pinned evaluation set).
+    clip_id = resolve_pinned_clips(env_ids, pin_clip_ids, device)
+    if clip_id is None:
+        clip_id = torch.randint(0, num_clips, (k,), device=device)
+    elif bool((clip_id >= num_clips).any()):
+        raise ValueError(
+            f"pin_clip_ids indexes clip {int(clip_id.max())} but the library has "
+            f"{num_clips} clips."
+        )
+    start_step = (sample_start_step(cmd, clip_id, device, cap_at_terrain_end=False)
+                  if pin_start_step is None or int(pin_start_step) < 0
+                  else torch.full((k,), int(pin_start_step), dtype=torch.long, device=device))
 
     # 2. World placement of the clip frame (optional random yaw): re-zero only the
     #    downrange (x, y) placement so a mid-clip start spawns the base at the env
@@ -165,6 +183,57 @@ def _commit_clip_reset(
     asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
 
+def resolve_pinned_clips(
+    env_ids: torch.Tensor,
+    pin_clip_ids,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Deterministic clip assignment for evaluation: env ``i`` always gets the same clip.
+
+    Both reset events otherwise draw ``clip_id`` uniformly at random, which makes a run
+    un-reproducible at the clip level and makes any cross-sim or cross-``num_envs``
+    comparison unsound -- the survival sweep's own docstring warns that "a different env
+    count samples different clips out of the 1500". Pinning removes that: the clip set is
+    stated, not sampled, so the same 100 clips can be played in Isaac Lab and in MuJoCo and
+    the two numbers mean the same thing.
+
+    Assignment is ``pinned[env_id % len(pinned)]`` -- keyed on the ENV INDEX, not on the
+    position within ``env_ids``, so a partial reset (only some envs terminating) keeps every
+    env on its own clip instead of reshuffling.
+
+    Args:
+        env_ids: Env indices being reset.
+        pin_clip_ids: OFF as ``None`` or ``""`` (sample as usual). Otherwise a sequence of
+            clip indices, a comma-separated string of them, or a path to a JSON file holding
+            the sequence. The file form exists because a hydra override of 100+ ids is
+            unwieldy; the empty-string "off" exists because Isaac Lab's configclass types a
+            param from its default, so the event's default cannot be ``None``.
+        device: Env device for the returned tensor.
+
+    Returns:
+        ``[len(env_ids)]`` long tensor of clip indices, or ``None`` to sample as usual.
+
+    Raises:
+        ValueError: If the pin list is empty, or holds a negative index.
+    """
+    if pin_clip_ids is None or (isinstance(pin_clip_ids, str) and not pin_clip_ids.strip()):
+        return None
+    if isinstance(pin_clip_ids, str):
+        text = pin_clip_ids.strip()
+        if os.path.isfile(text):
+            import json  # noqa: PLC0415
+            with open(text) as f:
+                pin_clip_ids = json.load(f)
+        else:
+            pin_clip_ids = [p for p in text.replace(",", " ").split() if p]
+    ids = torch.as_tensor([int(c) for c in pin_clip_ids], dtype=torch.long, device=device)
+    if ids.numel() == 0:
+        raise ValueError("pin_clip_ids is empty; pass None to sample clips as usual.")
+    if bool((ids < 0).any()):
+        raise ValueError(f"pin_clip_ids holds a negative clip index: {ids.min().item()}")
+    return ids[env_ids.to(device) % ids.numel()]
+
+
 def sample_start_step(
     cmd,
     clip_id: torch.Tensor,
@@ -252,6 +321,8 @@ def reset_on_terrain_motion_sequence(
     command_name: str,
     base_frame_name: str = "pelvis_link",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    pin_clip_ids=None,
+    pin_start_step: int | None = None,
 ):
     """Reset each env onto a clip whose terrain matches the env's terrain tile.
 
@@ -277,6 +348,11 @@ def reset_on_terrain_motion_sequence(
         command_name: The :class:`MotionSequenceCommand` term name.
         base_frame_name: Trajectory base frame (must match the command cfg).
         asset_cfg: Robot asset config.
+        pin_clip_ids: Evaluation only -- pin env ``i`` to a stated clip instead of sampling
+            (see :func:`resolve_pinned_clips`). Every pinned clip must sit on its env's
+            tile, which a flat-only library guarantees.
+        pin_start_step: Evaluation only -- start every env at this clip step. Negative
+            (the default) means sample.
     """
     from motion_gen.clips.clip_io import (
         group_clips_by_terrain,
@@ -318,11 +394,30 @@ def reset_on_terrain_motion_sequence(
 
     # 1. Per-env terrain id -> sample a matching clip + a start step.
     env_tid = importer.env_terrain_id[env_ids].to(torch.long)
-    clip_id = sample_terrain_clips(env_tid, groups)
+    clip_id = resolve_pinned_clips(env_ids, pin_clip_ids, device)
+    if clip_id is None:
+        clip_id = sample_terrain_clips(env_tid, groups)
+    else:
+        # A pinned clip still has to belong on the env's TILE: placement below puts it on
+        # that tile's corner, so a terrain clip on the wrong tile would ride treads that are
+        # not there. Harmless on a flat-only library (every tile and clip is terrain_id -1),
+        # which is the case this exists for; loud everywhere else.
+        pinned_tid = cmd.manager.lib.terrain_id.to(device)[clip_id].to(torch.long)
+        bad = pinned_tid != env_tid
+        if bool(bad.any()):
+            i = int(torch.nonzero(bad)[0])
+            raise ValueError(
+                f"pin_clip_ids put clip {int(clip_id[i])} (terrain_id {int(pinned_tid[i])}) on "
+                f"env {int(env_ids[i])}, whose tile is terrain_id {int(env_tid[i])}. Pinned "
+                "evaluation needs a library whose clips all match their tiles -- use a "
+                "flat-only library, or pin ids grouped by terrain."
+            )
     # Capped at the end of the clip's terrain-pinned run: a start past it would spawn the
     # robot AFTER the stair climb / box mount, on the flat top or walking away, so the
     # episode never sees the terrain the tile exists for.
-    start_step = sample_start_step(cmd, clip_id, device, cap_at_terrain_end=True)
+    start_step = (sample_start_step(cmd, clip_id, device, cap_at_terrain_end=True)
+                  if pin_start_step is None or int(pin_start_step) < 0
+                  else torch.full((k,), int(pin_start_step), dtype=torch.long, device=device))
 
     # 2. Place each clip on its tile (identity heading -- clips are baked axis-aligned
     #    with the staircase, so alignment is a pure translation). Terrain / transition

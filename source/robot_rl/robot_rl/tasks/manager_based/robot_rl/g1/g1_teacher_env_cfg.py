@@ -350,7 +350,16 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
     reset_on_clip = EventTerm(
         func=mdp.reset_on_motion_sequence,
         mode="reset",
-        params={"command_name": "traj_ref", "base_frame_name": "pelvis_link"},
+        # ``pin_*`` are evaluation knobs and default to OFF (sample a clip + start step per
+        # reset, as training wants). Declared here rather than left to the function
+        # signature because hydra refuses to override a key absent from the config.
+        #
+        # The sentinels are typed, not None: Isaac Lab's configclass infers a param's type
+        # from its default, so a ``None`` default makes the field NoneType and rejects the
+        # string/int the override supplies. Hence "" and -1 for "off".
+        # See mdp.events.resets.resolve_pinned_clips.
+        params={"command_name": "traj_ref", "base_frame_name": "pelvis_link",
+                "pin_clip_ids": "", "pin_start_step": -1},
     )
 
 

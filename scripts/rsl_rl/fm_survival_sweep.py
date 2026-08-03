@@ -162,8 +162,22 @@ class Teacher:
 
     @property
     def path(self) -> pathlib.Path:
-        """Absolute checkpoint path."""
-        return REPO / "logs" / "rsl_rl" / "g1" / self.run / self.checkpoint
+        """Absolute path of the DEFAULT checkpoint."""
+        return self.ckpt_path(self.checkpoint)
+
+    def ckpt_path(self, name: str) -> pathlib.Path:
+        """Absolute path of one checkpoint of this run.
+
+        Args:
+            name: ``model_19999`` / ``model_19999.pt`` / an absolute path.
+
+        Returns:
+            The checkpoint path, which may not exist -- callers check.
+        """
+        if os.path.isabs(name):
+            return pathlib.Path(name)
+        stem = name if name.endswith(".pt") else f"{name}.pt"
+        return REPO / "logs" / "rsl_rl" / "g1" / self.run / stem
 
 
 #: The 41/node teacher every generator below was trained against. Its reference_window packs
@@ -260,6 +274,15 @@ GENERATORS: dict[str, Generator] = {
         note="the one that worked: closed loop 2/24 -> 16/24. Still underfitting "
              "(val 0.1025 < train 0.1073), so more capacity may keep paying.",
     ),
+    "xl_ema": Generator(
+        run="2026-08-03_11-12-14_ar_window_v5_f62_41node_xl_ema",
+        params="27.3M (as xl) + cosine + weight EMA (decay 0.999)",
+        trained_on="depth_v5_200k",
+        note="xl with --ema_decay 0.999. EMA moved NOTHING on val: val_ema/flow_mse 0.0842 "
+             "vs val/flow_mse 0.0836, rmse_base_pos identical at 0.0419. Swept because val "
+             "has mispredicted closed-loop twice. load_fm_context prefers the EMA weights; "
+             "pass use_ema=False for the raw ones.",
+    ),
     "xl": Generator(
         run="2026-08-03_08-23-05_ar_window_v5_f62_41node_xl",
         params="27.3M (d_model 512, 8 layers, ff 2048) + cosine",
@@ -319,7 +342,7 @@ CONFIGS: dict[str, Config] = {
 }
 
 
-def _check_assets(gen_names: list[str], ckpts: list[str], library: str,
+def _check_assets(gen_names: list[str], ckpts: list[str], library: str, teacher_ckpt: str,
                   fatal: bool = True) -> None:
     """Fail before launching anything if a named asset is not on disk.
 
@@ -331,13 +354,14 @@ def _check_assets(gen_names: list[str], ckpts: list[str], library: str,
         gen_names: Generators about to be swept.
         ckpts: Checkpoint names each will be swept at.
         library: Clip-library key.
+        teacher_ckpt: Teacher checkpoint name being evaluated.
         fatal: Raise on a missing asset (``False`` warns and continues).
 
     Raises:
         SystemExit: With the offending paths, when ``fatal``.
     """
-    missing = [f"{TEACHER.run}/{TEACHER.checkpoint} -> {TEACHER.path}"] \
-        if not TEACHER.path.is_file() else []
+    tpath = TEACHER.ckpt_path(teacher_ckpt)
+    missing = [f"teacher {TEACHER.run}/{teacher_ckpt} -> {tpath}"] if not tpath.is_file() else []
     missing += [f"generator {n} @ {c} -> {GENERATORS[n].ckpt_path(c)}"
                 for n in gen_names for c in ckpts
                 if not GENERATORS[n].ckpt_path(c).is_file()]
@@ -353,7 +377,8 @@ def _check_assets(gen_names: list[str], ckpts: list[str], library: str,
 
 def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
                   num_envs: int, max_steps: int, seed: int,
-                  sampling_steps: int | None = None) -> list[str]:
+                  sampling_steps: int | None = None,
+                  teacher_path: pathlib.Path | None = None) -> list[str]:
     """The full ``play.py`` argv for one measurement.
 
     Args:
@@ -362,6 +387,7 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
         library: Key into :data:`LIBRARIES`.
         k: ``fm_update_every`` (the re-plan period, in control steps).
         num_envs / max_steps / seed: Rollout size and determinism.
+        teacher_path: Teacher checkpoint to load; defaults to the registry's.
         sampling_steps: Euler steps for the flow integration, or ``None`` to use whatever
             the checkpoint trained with (8). More steps cut DISCRETISATION error without
             retraining -- the free half of "is the gap the model or the sampler?".
@@ -369,10 +395,11 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
     Returns:
         argv suitable for :func:`subprocess.run`.
     """
+    teacher_path = teacher_path or TEACHER.path
     argv = [
         PYTHON, str(REPO / "scripts" / "rsl_rl" / "play.py"),
         "--task", TASK,
-        "--load_run", TEACHER.run, "--checkpoint", str(TEACHER.path),
+        "--load_run", TEACHER.run, "--checkpoint", str(teacher_path),
         "--clip", LIBRARIES[library].path, "--clip_device", "cpu",
         "--num_envs", str(num_envs), "--max_steps", str(max_steps),
         "--seed", str(seed), "--headless",
@@ -476,6 +503,12 @@ def main() -> None:
                         f"{','.join(CONFIGS)}")
     p.add_argument("--k", default="1",
                    help="Comma-separated fm_update_every values (re-plan period).")
+    p.add_argument("--teacher_checkpoint", default=None,
+                   help=f"Teacher iteration to evaluate, e.g. 'model_19999' (default "
+                        f"{TEACHER.checkpoint}). The teacher sets EVERY ceiling in this "
+                        "sweep -- clip_control is its own tracking ability with the "
+                        "generator switched off -- so a newer one moves all of them, and "
+                        "generator numbers are only comparable at a FIXED teacher.")
     p.add_argument("--library", default="flat", choices=sorted(LIBRARIES),
                    help="Clip library, which also picks the TERRAIN. Default flat, which is "
                         "what every recorded number was measured on.")
@@ -521,7 +554,8 @@ def main() -> None:
     steps_list = [None if v.strip() in ("", "default") else int(v)
                   for v in args.sampling_steps.split(",")]
 
-    _check_assets(models, ckpts, args.library, fatal=not args.dry_run)
+    teacher_ckpt = args.teacher_checkpoint or TEACHER.checkpoint
+    _check_assets(models, ckpts, args.library, teacher_ckpt, fatal=not args.dry_run)
 
     # One cell per (generator, config, K). A configuration that ignores the generator
     # (clip_control) gets exactly ONE cell however many generators were named -- running it
@@ -546,7 +580,7 @@ def main() -> None:
     if not args.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[fm-survival] teacher   {TEACHER.run}/{TEACHER.checkpoint}")
+    print(f"[fm-survival] teacher   {TEACHER.run}/{teacher_ckpt}")
     print(f"[fm-survival]           {TEACHER.note}")
     print(f"[fm-survival] library   {args.library}: {LIBRARIES[args.library].note}")
     print(f"[fm-survival] {len(cells)} cell(s), {args.num_envs} envs x {args.max_steps} "
@@ -559,7 +593,8 @@ def main() -> None:
         suffix = f"_k{k}" + (f"_s{st}" if st is not None else "")
         tag = f"{cname}{suffix}" if independent else f"{mname}_{ckpt}_{cname}{suffix}"
         argv = build_command(gen.ckpt_path(ckpt), CONFIGS[cname], args.library, k,
-                             args.num_envs, args.max_steps, args.seed, st)
+                             args.num_envs, args.max_steps, args.seed, st,
+                             TEACHER.ckpt_path(teacher_ckpt))
         if args.dry_run:
             print(f"# {tag}\n{' '.join(argv)}\n")
             continue
@@ -616,7 +651,8 @@ def main() -> None:
         return
 
     (out_dir / "results.json").write_text(json.dumps(
-        {"teacher": TEACHER.__dict__, "library": args.library,
+        {"teacher": TEACHER.__dict__ | {"checkpoint_used": teacher_ckpt},
+         "library": args.library,
          "num_envs": args.num_envs, "max_steps": args.max_steps, "seed": args.seed,
          "generators": {m: GENERATORS[m].__dict__ | {"path": str(GENERATORS[m].path)}
                         for m in models},

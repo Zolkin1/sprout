@@ -1098,6 +1098,11 @@ def main() -> None:
                         help="Draw every Nth depth pixel's hit point in the viewer (1560 hits per "
                              "step would exceed the scene's geom capacity).")
     parser.add_argument("--log", action="store_true", default=False)
+    parser.add_argument("--log_dir", type=str, default=None,
+                        help="Where --log writes sim_log.csv + metrics (default: "
+                             "<run_dir>/mujoco_gen_tracker_logs). That default is ONE fixed "
+                             "path per run dir, so concurrent runs clobber each other; give "
+                             "each a separate --log_dir to sweep clips in parallel.")
     parser.add_argument("--max_vx", type=float, default=1.0)
     parser.add_argument("--max_vy", type=float, default=0.5)
     parser.add_argument("--max_wz", type=float, default=1.0)
@@ -1193,7 +1198,9 @@ def main() -> None:
 
     log_path = None
     if args.log:
-        log_dir = os.path.join(run_dir, "mujoco_gen_tracker_logs")
+        # Default is one FIXED path per run dir, so two concurrent runs would overwrite each
+        # other's CSV; --log_dir is what lets a sweep fan out over clips in parallel.
+        log_dir = args.log_dir or os.path.join(run_dir, "mujoco_gen_tracker_logs")
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, "sim_log.csv")
 
