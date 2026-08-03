@@ -297,6 +297,53 @@ def reference_window_layout(cmd, blocks=None) -> list[tuple[str, int]]:
     )
 
 
+def reference_window_selection(
+    env: ManagerBasedRLEnv, groups: Sequence[str] | None = None
+) -> tuple[str, ...] | None:
+    """The block selection this environment's :func:`reference_window` term packs.
+
+    The ONE producer of the teacher's selection, for the same reason
+    :func:`~robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth.depth_camera_specs`
+    is the one producer of the camera contract: the generator has to predict exactly the
+    blocks the policy consumes, and both the recording (which sets the generator's training
+    width) and the exported tracker parameters (which the deploy checks the generator
+    against) have to state the same thing. A subset that lands in one and not the others is
+    invisible -- every array is still the right shape for whoever built it.
+
+    Args:
+        env: The environment instance.
+        groups: Observation groups to look in, or ``None`` for all of them.
+
+    Returns:
+        The selection in canonical packing order, or ``None`` when no group observes a
+        ``reference_window`` term.
+
+    Raises:
+        ValueError: If two groups observe the term with DIFFERENT selections. They are
+            fed by one command term and one layout; disagreeing means one of them is
+            reading a window that is not the one being built.
+    """
+    obs_mgr = env.observation_manager
+    wanted = list(groups) if groups is not None else list(obs_mgr.active_terms.keys())
+    found: dict[str, tuple[str, ...]] = {}
+    for group in wanted:
+        names = list(obs_mgr.active_terms.get(group, []))
+        if "reference_window" not in names:
+            continue
+        cfg = obs_mgr._group_obs_term_cfgs[group][names.index("reference_window")]
+        found[group] = resolve_reference_blocks((cfg.params or {}).get("blocks"))
+    if not found:
+        return None
+    selections = set(found.values())
+    if len(selections) > 1:
+        raise ValueError(
+            f"the 'reference_window' term is configured with different block selections "
+            f"per group: { {g: list(b) for g, b in found.items()} }. One command term "
+            "builds one window; the groups must agree on which blocks it packs."
+        )
+    return next(iter(selections))
+
+
 # ``REFERENCE_WINDOW_NOISE`` is defined in ``robot_rl.flow_matching.window`` and imported
 # above: the FM's autoregressive history noise reads the SAME table, because both model
 # the generator's prediction error. Re-exported here so the env cfgs keep importing it
@@ -580,6 +627,7 @@ def reference_window_to_world(
     num_steps: int,
     num_joints: int,
     num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Exact inverse of :func:`reference_window`: put the observation back in the world.
 
@@ -603,12 +651,17 @@ def reference_window_to_world(
         num_steps: Samples in the window.
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the window carries.
+        blocks: The selection the window was packed with (the observation term's own
+            ``blocks``); defaults to all of them.  Pass the term's, or this both mis-sizes
+            the window and reports blocks it does not contain.
 
     Returns:
-        Mapping with ``base_pos_w`` ``[N, K, 3]``, ``base_quat_w`` ``[N, K, 4]`` (xyzw),
-        ``base_lin_vel_w`` / ``base_ang_vel_w`` ``[N, K, 3]``, ``joint_pos`` / ``joint_vel``
-        ``[N, K, nj]`` (robot joint order, frame-invariant so passed through), and
-        ``ee_pos_w`` ``[N, K, E, 3]``.
+        Mapping with whichever of ``base_pos_w`` ``[N, K, 3]``, ``base_quat_w``
+        ``[N, K, 4]`` (xyzw), ``base_lin_vel_w`` / ``base_ang_vel_w`` ``[N, K, 3]``,
+        ``joint_pos`` / ``joint_vel`` ``[N, K, nj]`` (robot joint order, frame-invariant
+        so passed through) and ``ee_pos_w`` ``[N, K, E, 3]`` the selection supports.  A
+        dropped block is ABSENT rather than zero-filled -- a zero here would be drawn as a
+        reference standing at the origin.
 
     Raises:
         ValueError: If ``window``'s width disagrees with the layout implied by the
@@ -619,14 +672,15 @@ def reference_window_to_world(
         (``quat_unique``), so it may be the negation of the quaternion that went in.  That
         is the same rotation; compare rotations, not raw components.
     """
-    layout = reference_window_layout_from_dims(num_joints, num_ee_frames)
+    layout = reference_window_layout_from_dims(num_joints, num_ee_frames, blocks)
     per_step = sum(width for _, width in layout)
     k = max(1, int(num_steps))
     if window.shape[-1] != k * per_step:
         raise ValueError(
             f"reference_window_to_world got a {window.shape[-1]}-wide window but the layout "
             f"implies {k} x {per_step} = {k * per_step} (num_steps={num_steps}, "
-            f"nj={num_joints}, ee={num_ee_frames})."
+            f"nj={num_joints}, ee={num_ee_frames}, "
+            f"blocks={[n_ for n_, _ in layout]})."
         )
     n = window.shape[0]
     return window_to_world(
@@ -635,6 +689,7 @@ def reference_window_to_world(
         root_quat_w[:, None, :],
         num_joints,
         num_ee_frames,
+        blocks,
     )
 
 

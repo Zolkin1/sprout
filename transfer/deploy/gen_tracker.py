@@ -373,6 +373,29 @@ class GenTrackerPolicy:
                 "retrain if it was not."
             )
 
+        # Which BLOCKS the term packs. A teacher can drop blocks it does not need, so this
+        # is the tracker's own list rather than the full five, and it is what the clip path
+        # builds with.
+        self.reference_blocks = tuple(str(name) for name, _ in ref_spec["blocks"])
+        if not self.fm_enabled:
+            return
+        # The generator's output goes into this term verbatim, so the two artifacts must
+        # name the same blocks. A disagreement is invisible where it matters: drop
+        # ``joint_vel`` on one side only and the widths differ (caught late, as a shape
+        # error deep in the obs assembly); drop it on both sides but in a different ORDER
+        # -- or swap which one is missing between two same-width blocks -- and nothing
+        # differs in shape at all, the policy just reads velocities as positions.
+        if tuple(self.ctx.reference_blocks) != self.reference_blocks:
+            raise ValueError(
+                f"fm.onnx predicts window blocks {list(self.ctx.reference_blocks)} but "
+                f"tracker.onnx observes {list(self.reference_blocks)}. The generator's "
+                "output IS the tracker's reference_window observation -- there is no "
+                "translation layer between them -- so the two have to be the same vector. "
+                "Retrain the generator against this teacher (train.py resolves the blocks "
+                "from the recording, so re-record with this teacher), or pair the tracker "
+                "with a generator trained for it."
+            )
+
     def _check_horizon(self) -> None:
         """Refuse a generator whose horizon cannot cover the tracker's window.
 
@@ -578,6 +601,9 @@ class GenTrackerPolicy:
         -- reference end-effector positions in *that step's* reference base frame.
         Flattened ``[step0(D), step1(D), ...]``.
 
+        Only the blocks the tracker's ``reference_window_spec`` names are packed -- a
+        teacher can drop the ones it does not need, and this has to match it exactly.
+
         Every block is relative, so no world coordinate reaches the policy.
 
         Args:
@@ -586,7 +612,7 @@ class GenTrackerPolicy:
             root_quat: The robot's measured base orientation, world xyzw.
 
         Returns:
-            The flat window, ``[num_steps * (12 + 2*nj + 3*n_ee)]``.
+            The flat window, ``[num_steps * D]`` for the selected blocks.
         """
         f64 = lambda x: np.asarray(x, dtype=np.float64)
         n_ee = self.ctx.target_num_extra_frames
@@ -606,8 +632,9 @@ class GenTrackerPolicy:
         nodes = world_to_window(
             f64(root_pos)[None, :], f64(root_quat)[None, :],
             ref_pos, ref_quat, ref_lin, ref_ang, jp, jv, ee,
+            blocks=self.reference_blocks,
         )                                                                        # [K,D]
-        assert nodes.shape == (k, window_dim(nj, n_ee)), nodes.shape
+        assert nodes.shape == (k, window_dim(nj, n_ee, self.reference_blocks)), nodes.shape
         return nodes.reshape(-1)
 
     def _build_obs(self, state: dict, reference: dict | None) -> np.ndarray:

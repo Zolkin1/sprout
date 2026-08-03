@@ -621,7 +621,7 @@ class DataLogger:
         frames = cmd.resolve_ee_frames(None)
         ns, st = self._ref_num_steps, self._ref_stride
 
-        def _capture(prefix: str) -> None:
+        def _capture(prefix: str, available: tuple[str, ...] | None = None) -> None:
             """Store the served source's look-ahead window in world coordinates.
 
             Sample 0 is the ANCHORED current-step reference -- what the policy observes --
@@ -630,24 +630,43 @@ class DataLogger:
             ``MotionSequenceCommand._write_global_base_des`` so the reward and the drift
             termination grade the same datum. Both are worth having; conflating them makes
             accumulated global drift look like a reference error.
+
+            Args:
+                prefix: Key prefix naming the source.
+                available: Window blocks this source can actually serve, or ``None`` for
+                    "all of them". The GENERATOR is limited to the blocks it was trained
+                    to predict, and its accessors raise rather than invent the rest -- so
+                    asking for an ee frame from a generator that predicts none would
+                    abort the whole capture, including the clip source's.
             """
+            def has(block: str) -> bool:
+                """Whether this source carries ``block``."""
+                return available is None or block in available
+
             offs = torch.arange(ns, device=cmd.device, dtype=torch.long) * st
             pos_w, quat_w, _, _ = cmd.get_future_world_base(offs)
             step[f"refwin_{prefix}_base_pos"] = pos_w.clone()
             step[f"refwin_{prefix}_base_quat"] = quat_w.clone()
             # [N, n_offsets, n_frames, 13] -- offset first, matching the layout
             # ``reference_window_to_world`` returns, so the two are directly comparable.
-            ee = cmd.get_future_world_frames(frames, offs)
-            step[f"refwin_{prefix}_ee_pos"] = ee[..., 0:3].clone()
-            joint_pos, _ = cmd.get_future_joint_state(offs)          # robot joint order
-            step[f"refwin_{prefix}_joint_pos"] = joint_pos.clone()
+            if has("ee_pos"):
+                ee = cmd.get_future_world_frames(frames, offs)
+                step[f"refwin_{prefix}_ee_pos"] = ee[..., 0:3].clone()
+            if has("joint_pos"):
+                # Positions only -- the velocity half comes back NaN on a window without
+                # joint_vel, and this is what the viewer poses its ghost from.
+                joint_pos, _ = cmd.get_future_joint_state(offs)      # robot joint order
+                step[f"refwin_{prefix}_joint_pos"] = joint_pos.clone()
 
         try:
             if hasattr(cmd, "as_clip_reference"):
                 managers = {"clip": cmd.as_clip_reference, "fm": cmd.as_fm_reference}
                 for src in (["clip", "fm"] if getattr(cmd, "fm_enabled", False) else ["clip"]):
                     with managers[src]():
-                        _capture(src)
+                        # The clip carries the whole reference; the generator carries only
+                        # the blocks it predicts (== the observation term's, checked at
+                        # load), so that is what it is asked for.
+                        _capture(src, self._ref_blocks if src == "fm" else None)
             else:
                 _capture("applied")        # a plain clip command: one source, no swapping
         except Exception as exc:
@@ -658,15 +677,25 @@ class DataLogger:
         try:
             root_pos = _to_torch(cmd.robot.data.root_pos_w)
             root_quat = _to_torch(cmd.robot.data.root_quat_w)
-            clean = reference_window(unwrapped, self._traj_term_name, num_steps=ns, stride=st)
+            # The term's OWN block selection on both halves: build the clean window the
+            # way the policy's term does, and take it apart the same way. Defaulting to
+            # all five here would both mis-size the window and invent channels the policy
+            # never saw.
+            blocks = self._ref_blocks
+            clean = reference_window(unwrapped, self._traj_term_name, num_steps=ns, stride=st,
+                                     blocks=blocks)
             for tag, win in (("obs", clean), ("noisy", self._observed_window(unwrapped, policy_obs))):
                 if win is None:
                     continue
-                world = reference_window_to_world(win, root_pos, root_quat, ns, nj, len(frames))
-                step[f"refwin_{tag}_base_pos"] = world["base_pos_w"].clone()
-                step[f"refwin_{tag}_base_quat"] = world["base_quat_w"].clone()
-                step[f"refwin_{tag}_ee_pos"] = world["ee_pos_w"].clone()
-                step[f"refwin_{tag}_joint_pos"] = world["joint_pos"].clone()
+                world = reference_window_to_world(win, root_pos, root_quat, ns, nj, len(frames),
+                                                  blocks)
+                # Only what the selection carries -- a dropped block is absent from
+                # ``world`` rather than zero, so this logs nothing instead of a zero the
+                # plots would draw as a reference sitting at the origin.
+                for key, name in (("base_pos_w", "base_pos"), ("base_quat_w", "base_quat"),
+                                  ("ee_pos_w", "ee_pos"), ("joint_pos", "joint_pos")):
+                    if key in world:
+                        step[f"refwin_{tag}_{name}"] = world[key].clone()
         except Exception as exc:
             self._warn("refwin_obs", f"Could not lift the reference window to world: {exc}")
 

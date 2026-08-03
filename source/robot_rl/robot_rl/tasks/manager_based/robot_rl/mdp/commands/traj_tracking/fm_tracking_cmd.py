@@ -62,7 +62,13 @@ from robot_rl.flow_matching.online import (
     load_fm_context,
     sample_window,
 )
-from robot_rl.flow_matching.window import window_to_world, world_to_window
+from isaaclab.utils.math import quat_apply
+
+from robot_rl.flow_matching.window import (
+    reanchor_window,
+    resolve_reference_blocks,
+    window_to_world,
+)
 
 from .motion_sequence_cmd import MotionSequenceCommand
 from .fm_tracking_cmd_cfg import FmTrackingCommandCfg
@@ -212,6 +218,21 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "robot's joint order."
             )
 
+        # Which blocks this checkpoint predicts. A teacher can pack a SUBSET of the
+        # window, and the generator must predict the same subset -- ``reference_window_obs``
+        # checks that against the observation term. Everything the FM cannot supply
+        # (velocities, ee frames, joints) then becomes an unwritten y_des channel; see
+        # :meth:`_build_strict_masks`.
+        self._fm_blocks = tuple(self.ctx.reference_blocks)
+        if "base_pose" not in self._fm_blocks:
+            raise ValueError(
+                f"the FM checkpoint predicts {list(self._fm_blocks)}, with no 'base_pose'. "
+                "This command lifts the prediction to the world for y_des, the diagnostic "
+                "CLF and the debug ribbon, and base_pose is the only block that carries "
+                "where the reference IS -- without it there is nothing to place. Train the "
+                "generator on a window that includes it."
+            )
+
         # ONE prediction buffer: the F reference-window nodes, in exactly the layout the
         # policy observes. No world-frame mirror -- ``window_to_world`` derives that on
         # demand for the diagnostic CLF and the debug ribbon, sim-side only.
@@ -274,10 +295,16 @@ class FmTrackingCommand(MotionSequenceCommand):
         # --- FM-prediction debug ribbon: map each ribbon frame (base built by the base
         # _post_init, re-ordered above) to its slot in the FM prediction buffers.
         self._fm_pred_specs: list[tuple[str, tuple[float, float, float], str, int]] = []
+        # The ee frames come either from the predicted ee_pos block or, when the window
+        # drops it, from FK of the predicted joints (viz only -- see _fk_ee_positions).
+        # Without either there is nothing to draw but the base, and plotting the
+        # placeholder would put every foot at the world origin.
+        self._fk_chain = self._build_fk_chain()
+        draw_ee = "ee_pos" in self._fm_blocks or self._fk_chain is not None
         for name, color in zip(self._debug_frame_names, self._debug_frame_colors):
             if name == self.cfg.base_frame_name:
                 self._fm_pred_specs.append((name, color, "base", -1))
-            elif name in self.ctx.frame_names:
+            elif name in self.ctx.frame_names and draw_ee:
                 self._fm_pred_specs.append((name, color, "frame", self.ctx.frame_names.index(name)))
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
@@ -286,12 +313,31 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _build_strict_masks(self) -> None:
         """Index the output channels the FM does NOT write, for ``strict_fm_only``.
 
-        The FM writes the base + ee Cartesian channels (``_wf_*_flat``) and the joints
-        (``_joint_slots_*``). Everything else in ``y_des``/``dy_des`` -- the COM block, the
-        ``@root`` body-link blocks, any frame the checkpoint does not predict -- is
+        Everything in ``y_des``/``dy_des`` the generator cannot supply -- the COM block,
+        the ``@root`` body-link blocks, any frame the checkpoint does not predict -- is
         clip-derived and must not be read here.
+
+        What it *can* supply is decided by its BLOCK SELECTION, which is why this is not a
+        fixed list. A window without ``base_vel`` says nothing about how fast the reference
+        base is moving; without ``ee_pos`` it places no end effector; without ``joint_vel``
+        it has no joint rates. Those channels are filled with placeholders on the write
+        path and NaN'd here, so a CLF that grades one of them fails loudly instead of
+        being handed a zero that looks like a perfectly tracked reference.
+
+        Unchanged from before the selection existed: an ee frame the FM DOES predict
+        counts as written across all four of its channel groups, even though only its
+        position is real (the orientation is an identity quaternion and the twist is
+        zero). That is a deliberate looseness -- the ee block has always been
+        position-only, and narrowing it here would silently change what an existing
+        tracker's CLF grades.
+
+        The ``_wf_*_flat`` scatter indices are frame-major (``[base] + ee``, in
+        ``_wf_frames`` order), so the base's own channels are the leading entries and the
+        ee frames' are the tail.
         """
         dev = self.device
+        blocks = self._fm_blocks
+        has_ee = "ee_pos" in blocks
 
         def _complement(width: int, written: list[torch.Tensor]) -> torch.Tensor:
             keep = torch.ones(width, dtype=torch.bool, device=dev)
@@ -299,12 +345,34 @@ class FmTrackingCommand(MotionSequenceCommand):
                 keep[idx] = False
             return torch.nonzero(keep, as_tuple=False).squeeze(-1)
 
-        self._unwritten_pos = _complement(
-            self.y_des.shape[1], [self._wf_pos_flat, self._wf_ori_flat, self._joint_slots_pos]
-        )
-        self._unwritten_vel = _complement(
-            self.dy_des.shape[1], [self._wf_lin_flat, self._wf_ang_flat, self._joint_slots_vel]
-        )
+        def _frames(flat: torch.Tensor, base_width: int) -> torch.Tensor:
+            """The whole frame-major index list, or just the base's leading slice."""
+            return flat if has_ee else flat[:base_width]
+
+        # base_pose is required (checked in _post_init), so the base's pose channels are
+        # always written.
+        pos_written = [_frames(self._wf_pos_flat, 3), _frames(self._wf_ori_flat, 4)]
+        if "joint_pos" in blocks:
+            pos_written.append(self._joint_slots_pos)
+        # The base's twist comes from base_vel; the ee twists are the zero placeholders,
+        # written whenever the frames themselves are.
+        vel_written: list[torch.Tensor] = []
+        if "base_vel" in blocks:
+            vel_written += [self._wf_lin_flat[:3], self._wf_ang_flat[:3]]
+        if has_ee:
+            vel_written += [self._wf_lin_flat[3:], self._wf_ang_flat[3:]]
+        if "joint_vel" in blocks:
+            vel_written.append(self._joint_slots_vel)
+
+        self._unwritten_pos = _complement(self.y_des.shape[1], pos_written)
+        self._unwritten_vel = _complement(self.dy_des.shape[1], vel_written)
+        print(f"[INFO FmTrackingCommand] window blocks {list(blocks)}: the generator "
+              f"writes {self.y_des.shape[1] - self._unwritten_pos.numel()}/"
+              f"{self.y_des.shape[1]} position and "
+              f"{self.dy_des.shape[1] - self._unwritten_vel.numel()}/"
+              f"{self.dy_des.shape[1]} velocity output channels"
+              + (" (the rest are NaN under strict_fm_only -- a CLF grading one of them "
+                 "will produce a NaN v)" if self.cfg.strict_fm_only else ""))
 
     def reset(self, env_ids=None):
         """Latch the per-env episode reset (consumed in :meth:`_snapshot_and_infer`)."""
@@ -376,10 +444,12 @@ class FmTrackingCommand(MotionSequenceCommand):
 
         self._building = "fm"
         try:
-            fm_base, fm_ee, fm_jp, fm_jv = self._fm_current_outputs()
+            fm_base, fm_ee, fm_joints = self._fm_current_outputs()
             self._write_world_des(torch.cat([fm_base[:, None, :], fm_ee], dim=1))   # [N, nf, 13]
-            self.y_des[:, self._joint_slots_pos] = fm_jp[:, self._fm_jperm]
-            self.dy_des[:, self._joint_slots_vel] = fm_jv[:, self._fm_jperm]
+            if "joint_pos" in fm_joints:
+                self.y_des[:, self._joint_slots_pos] = fm_joints["joint_pos"][:, self._fm_jperm]
+            if "joint_vel" in fm_joints:
+                self.dy_des[:, self._joint_slots_vel] = fm_joints["joint_vel"][:, self._fm_jperm]
             if self.cfg.strict_fm_only:
                 self.y_des[:, self._unwritten_pos] = torch.nan
                 self.dy_des[:, self._unwritten_vel] = torch.nan
@@ -482,19 +552,25 @@ class FmTrackingCommand(MotionSequenceCommand):
         w = self._pred_world(torch.arange(f, device=self.device))
         y = torch.zeros(n, f, self.y_des.shape[1], device=self.device)
         dy = torch.zeros(n, f, self.dy_des.shape[1], device=self.device)
+        zeros_ee = self._ee_zero_vec[:, None, :k].expand(n, f, k, 3)
         # [base] + ee, in _wf_frames order -- the same order _write_world_des scatters.
-        pos = torch.cat([w["base_pos_w"][:, :, None, :], w["ee_pos_w"][:, :, :k]], dim=2)
+        # Anything the block selection leaves out stays at its placeholder and is NaN'd
+        # below, exactly as on the live write path.
+        ee_pos = w["ee_pos_w"][:, :, :k] if "ee_pos" in self._fm_blocks else zeros_ee
+        pos = torch.cat([w["base_pos_w"][:, :, None, :], ee_pos], dim=2)
         y[:, :, self._wf_pos_flat] = pos.reshape(n, f, -1)
         quat = torch.cat([w["base_quat_w"][:, :, None, :],
                           self._ee_zero_quat[:, None, :k].expand(n, f, k, 4)], dim=2)
         y[:, :, self._wf_ori_flat] = quat.reshape(n, f, -1)
-        zeros_ee = self._ee_zero_vec[:, None, :k].expand(n, f, k, 3)
-        dy[:, :, self._wf_lin_flat] = torch.cat(
-            [w["base_lin_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
-        dy[:, :, self._wf_ang_flat] = torch.cat(
-            [w["base_ang_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
-        y[:, :, self._joint_slots_pos] = w["joint_pos"][..., self._fm_jperm]
-        dy[:, :, self._joint_slots_vel] = w["joint_vel"][..., self._fm_jperm]
+        if "base_vel" in self._fm_blocks:
+            dy[:, :, self._wf_lin_flat] = torch.cat(
+                [w["base_lin_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+            dy[:, :, self._wf_ang_flat] = torch.cat(
+                [w["base_ang_vel_w"][:, :, None, :], zeros_ee], dim=2).reshape(n, f, -1)
+        if "joint_pos" in self._fm_blocks:
+            y[:, :, self._joint_slots_pos] = w["joint_pos"][..., self._fm_jperm]
+        if "joint_vel" in self._fm_blocks:
+            dy[:, :, self._joint_slots_vel] = w["joint_vel"][..., self._fm_jperm]
         if self.cfg.strict_fm_only:
             y[:, :, self._unwritten_pos] = torch.nan
             dy[:, :, self._unwritten_vel] = torch.nan
@@ -527,6 +603,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         offset 0 is the applied reference at this step expressed relative to the measured
         robot at this step, which is exactly ``history_ref[h]`` against ``history_state[h]``.
 
+        Built with the CHECKPOINT's block selection, not the layout default: this row goes
+        into the same history ring as the generator's own nodes, so an 82-wide clip node
+        cannot be stacked against 41-wide predictions. (It could not, and this is the one
+        path that finds out -- ``history_from="clip"`` is the only caller.)
+
         Forces the clip branch through ``_serve_override`` rather than
         :meth:`as_clip_reference`, deliberately: that context manager also swaps
         ``y_des``/``dy_des`` in place, and this runs mid-way through building the generator's
@@ -536,7 +617,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         prev = self._serve_override
         self._serve_override = "clip"
         try:
-            return super().reference_window_obs(self._zero_offset)[:, 0]
+            return super().reference_window_obs(self._zero_offset, self._fm_blocks)[:, 0]
         finally:
             self._serve_override = prev
 
@@ -705,12 +786,14 @@ class FmTrackingCommand(MotionSequenceCommand):
             offsets: Offsets from the CURRENT served node.
 
         Returns:
-            The :func:`~robot_rl.flow_matching.window.window_to_world` mapping, ``[N, K, ...]``.
+            The :func:`~robot_rl.flow_matching.window.window_to_world` mapping,
+            ``[N, K, ...]`` -- carrying only the blocks the checkpoint predicts, so a
+            caller reading e.g. ``base_lin_vel_w`` has to check it is there.
         """
         ar, idx = self._future_indices(offsets)
         return window_to_world(self._pred_window[ar, idx], self._anchor_pos[:, None, :],
                                self._anchor_quat[:, None, :], self.ctx.nj,
-                               self.ctx.num_extra_frames)
+                               self.ctx.num_extra_frames, self._fm_blocks)
 
     def _reanchor_to_now(self, offsets: torch.Tensor) -> torch.Tensor:
         """Served nodes at ``offsets``, re-expressed relative to the robot RIGHT NOW.
@@ -725,35 +808,58 @@ class FmTrackingCommand(MotionSequenceCommand):
         K=1 was worth pinning while it lasted: this is the odometry dependency the
         representation otherwise does not have. It is exact in simulation.
 
+        Goes through :func:`~robot_rl.flow_matching.window.reanchor_window` rather than
+        lifting to the world and back, because only ``base_pose`` and ``base_vel``
+        actually reference the anchor -- and because the round trip cannot be completed at
+        all for a window that drops a block (the return leg needs every one of them).
+
         Args:
             offsets: Offsets from the current served node.
 
         Returns:
             ``[N, K, D]`` window nodes in the current robot frame.
         """
-        w = self._pred_world(offsets)
-        rp = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]
-        rq = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]
-        return world_to_window(
-            rp, rq, w["base_pos_w"], w["base_quat_w"], w["base_lin_vel_w"],
-            w["base_ang_vel_w"], w["joint_pos"], w["joint_vel"], w["ee_pos_w"],
+        ar, idx = self._future_indices(offsets)
+        return reanchor_window(
+            self._pred_window[ar, idx],
+            self._anchor_pos[:, None, :], self._anchor_quat[:, None, :],
+            wp.to_torch(self.robot.data.root_pos_w)[:, None, :],
+            wp.to_torch(self.robot.data.root_quat_w)[:, None, :],
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
         )
 
-    def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """The served node lifted to the world frame, for ``y_des`` (diagnostic CLF + viz).
 
-        The ee half is ``[pos, identity quat, 0, 0]``: the FM predicts ee POSITION only, so
-        the orientation/twist channels are placeholders that ``strict_fm_only`` then NaNs.
+        Only what the checkpoint's block selection actually predicts is real; the rest is
+        a placeholder that :meth:`_build_strict_masks` has already marked unwritten, so
+        ``strict_fm_only`` NaNs it. Concretely: the ee half is
+        ``[pos, identity quat, 0, 0]`` because the ee block is position-only, the ee rows
+        are all-placeholder when ``ee_pos`` is not predicted, and the base twist is zero
+        when ``base_vel`` is not.
+
+        Returns:
+            ``(base [N,13], ee [N,K,13], joints)`` where ``joints`` maps
+            ``"joint_pos"`` / ``"joint_vel"`` to ``[N, nj]`` for whichever of the two the
+            generator predicts.
         """
         w = self._pred_world(self._zero_offset)
-        base = torch.cat([w["base_pos_w"][:, 0], w["base_quat_w"][:, 0],
-                          w["base_lin_vel_w"][:, 0], w["base_ang_vel_w"][:, 0]], dim=-1)  # [N,13]
         k = self.ctx.num_extra_frames
+        zero3 = self._ee_zero_vec[:, 0]                                       # [N,3]
+        base = torch.cat([
+            w["base_pos_w"][:, 0], w["base_quat_w"][:, 0],
+            w["base_lin_vel_w"][:, 0] if "base_vel" in self._fm_blocks else zero3,
+            w["base_ang_vel_w"][:, 0] if "base_vel" in self._fm_blocks else zero3,
+        ], dim=-1)                                                            # [N,13]
+        ee_pos = (w["ee_pos_w"][:, 0] if "ee_pos" in self._fm_blocks
+                  else self._ee_zero_vec[:, :k])
         ee = torch.cat([
-            w["ee_pos_w"][:, 0], self._ee_zero_quat[:, :k],
+            ee_pos, self._ee_zero_quat[:, :k],
             self._ee_zero_vec[:, :k], self._ee_zero_vec[:, :k],
-        ], dim=-1)  # [N,K,13]
-        return base, ee, w["joint_pos"][:, 0], w["joint_vel"][:, 0]
+        ], dim=-1)                                                            # [N,K,13]
+        joints = {name: w[name][:, 0] for name in ("joint_pos", "joint_vel")
+                  if name in self._fm_blocks}
+        return base, ee, joints
 
     # ------------------------------------------------------------------
     # Future window (always the FM prediction -- there is no clip source here)
@@ -802,12 +908,25 @@ class FmTrackingCommand(MotionSequenceCommand):
         This is the payoff of the shared representation: the generator emits exactly the
         vector ``mdp.reference_window`` feeds the policy, so on the FM branch this is a
         gather. The clip branch still goes through the inherited world-frame maths.
+
+        Raises:
+            ValueError: If the observation term asks for a different block selection than
+                the checkpoint predicts. There is nothing to drop or reorder here -- the
+                prediction goes into the observation verbatim -- so a disagreement means
+                the policy would read one block's numbers under another's name.
         """
         if self._serving() == "clip":
             return super().reference_window_obs(offsets, blocks)
-        # The generator already predicts exactly the configured selection, so there is
-        # nothing to drop here -- its D was resolved from the same block list at train time
-        # and the ONNX layout guard refuses a checkpoint that disagrees.
+        wanted = resolve_reference_blocks(blocks)
+        if wanted != self._fm_blocks:
+            raise ValueError(
+                f"the reference_window observation asks for blocks {list(wanted)} but the "
+                f"FM checkpoint predicts {list(self._fm_blocks)}. The generator's output "
+                "IS this observation, so the two must be the same vector. Retrain the "
+                "generator against this task's window (train.py takes the selection from "
+                "the recording, so re-record with this teacher), or set the term's "
+                "`blocks` to the checkpoint's."
+            )
         return self._reanchor_to_now(offsets)
 
     def get_future_world_base(
@@ -819,9 +938,20 @@ class FmTrackingCommand(MotionSequenceCommand):
         :meth:`as_fm_reference` it answers for that one instead. The clip branch is the
         inherited implementation verbatim; the FM branch lifts its window through the
         robot's measured pose, which only simulation has (see :meth:`_pred_world`).
+
+        Raises:
+            ValueError: On the FM branch, if the checkpoint does not predict ``base_vel``
+                -- there is no velocity to return and a zero would be read as "the
+                reference is standing still".
         """
         if self._serving() == "clip":
             return super().get_future_world_base(offsets)
+        if "base_vel" not in self._fm_blocks:
+            raise ValueError(
+                "get_future_world_base returns the reference base VELOCITY, which this FM "
+                f"checkpoint does not predict (its window packs {list(self._fm_blocks)}). "
+                "Ask for the pose alone, or train a generator that includes base_vel."
+            )
         w = self._pred_world(offsets)
         return w["base_pos_w"], w["base_quat_w"], w["base_lin_vel_w"], w["base_ang_vel_w"]
 
@@ -831,11 +961,28 @@ class FmTrackingCommand(MotionSequenceCommand):
         In the **robot's** joint order on both branches. On the FM branch that needs no
         permutation any more: the window's joint block is defined in robot order and
         ``_post_init`` refuses a checkpoint that disagrees.
+
+        A window may carry ``joint_pos`` without ``joint_vel`` (the g1 default does), and
+        the two halves are asked for separately in practice -- the diagnostics pose a ghost
+        from the positions alone. So a missing VELOCITY half comes back NaN rather than
+        taking the positions down with it; a missing position half is fatal, since there is
+        nothing useful left to return.
+
+        Raises:
+            ValueError: On the FM branch, if the checkpoint does not predict ``joint_pos``.
         """
         if self._serving() == "clip":
             return super().get_future_joint_state(offsets)
+        if "joint_pos" not in self._fm_blocks:
+            raise ValueError(
+                "get_future_joint_state needs 'joint_pos', which this FM checkpoint does "
+                f"not predict (its window packs {list(self._fm_blocks)}). There is no clip "
+                "fallback in this command."
+            )
         w = self._pred_world(offsets)
-        return w["joint_pos"], w["joint_vel"]
+        jp = w["joint_pos"]
+        jv = w["joint_vel"] if "joint_vel" in self._fm_blocks else torch.full_like(jp, torch.nan)
+        return jp, jv
 
     def get_future_world_frames(self, frame_names: list[str], offsets: torch.Tensor) -> torch.Tensor:
         """Future end-effector state ``[N, K, F, 13]`` for the SERVED source.
@@ -846,10 +993,17 @@ class FmTrackingCommand(MotionSequenceCommand):
         clip data.
 
         Raises:
-            ValueError: If a requested frame is not one the checkpoint predicts.
+            ValueError: If a requested frame is not one the checkpoint predicts, or if the
+                checkpoint's window has no ``ee_pos`` block at all.
         """
         if self._serving() == "clip":
             return super().get_future_world_frames(frame_names, offsets)
+        if frame_names and "ee_pos" not in self._fm_blocks:
+            raise ValueError(
+                f"get_future_world_frames asked for {list(frame_names)}, but this FM "
+                f"checkpoint's window packs {list(self._fm_blocks)} -- it predicts no end "
+                "effector positions at all. There is no clip fallback in this command."
+            )
         missing = [f for f in frame_names if f not in self.ctx.frame_names]
         if missing:
             raise ValueError(
@@ -901,6 +1055,65 @@ class FmTrackingCommand(MotionSequenceCommand):
             return None
         return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+    def _fk_ee_positions(self, world: dict[str, torch.Tensor]) -> torch.Tensor:
+        """End-effector positions implied by the predicted JOINTS -- viz only.
+
+        A window that drops ``ee_pos`` has not lost the end effectors, only the explicit
+        channels: the posture is still fully determined by ``joint_pos``, and the base
+        pose places it in the world. Running FK recovers what the ee block used to carry
+        -- indeed the ``fk_pose`` loss existed precisely to force the two to agree, so on
+        a window that HAS both they are the same thing to within that loss.
+
+        **Diagnostic only, deliberately.** Nothing feeds this back into ``y_des``, the CLF
+        or the observation: those must show what the generator actually predicted, and a
+        channel reconstructed from a different block is not that. It is here so the ribbon
+        can draw a recognisable pose instead of a single base dot.
+
+        Args:
+            world: The :func:`window_to_world` mapping for the predicted window; must
+                carry ``base_pos_w`` / ``base_quat_w`` / ``joint_pos``.
+
+        Returns:
+            ``[N, F, K, 3]`` world-frame ee positions, or a zero-width tensor when the FK
+            chain is unavailable (no joints predicted, or the MJCF failed to load).
+        """
+        n, f = world["base_pos_w"].shape[:2]
+        k = self.ctx.num_extra_frames
+        if self._fk_chain is None or "joint_pos" not in world:
+            return world["base_pos_w"].new_zeros(n, f, k, 3)
+        q = world["joint_pos"].reshape(n * f, self.ctx.nj)
+        rel, _rot, _jv, _jw = self._fk_chain.pose_and_jacobian(q)      # (n*f, K, 3), base frame
+        rel = rel.reshape(n, f, k, 3)
+        base_q = world["base_quat_w"][:, :, None, :].expand(n, f, k, 4).reshape(-1, 4)
+        return (world["base_pos_w"][:, :, None, :]
+                + quat_apply(base_q, rel.reshape(-1, 3)).reshape(n, f, k, 3))
+
+    def _build_fk_chain(self):
+        """An :class:`~motion_gen.fk.FKChain` for the ribbon, or ``None``.
+
+        Built only when the ribbon would otherwise have nothing but the base to draw --
+        i.e. the window predicts joints but not ee positions. Failure is non-fatal: the
+        ribbon degrades to the base dot rather than taking the run down for a viz.
+        """
+        if "ee_pos" in self._fm_blocks or "joint_pos" not in self._fm_blocks:
+            return None
+        if not self.ctx.frame_names:
+            return None
+        try:
+            from motion_gen.features import DEFAULT_MJCF                    # noqa: PLC0415
+            from motion_gen.fk import FKChain                               # noqa: PLC0415
+            chain = FKChain(DEFAULT_MJCF, list(self.ctx.joint_names),
+                            list(self.ctx.frame_names),
+                            base_link=self.cfg.base_frame_name).to(self.device)
+        except Exception as exc:
+            print(f"[WARN FmTrackingCommand] FM ribbon: could not build the FK chain for the "
+                  f"ee frames ({exc}); drawing the predicted base only.")
+            return None
+        print(f"[INFO FmTrackingCommand] FM ribbon: this window predicts no ee_pos, so the "
+              f"{len(self.ctx.frame_names)} ee frames are drawn from FK of the predicted "
+              "joints (viz only -- y_des and the CLF still see only what was predicted).")
+        return chain
+
     def _draw_fm_prediction_ribbon(self) -> None:
         """Draw the FM's predicted world-frame trajectory as per-frame spheres."""
         if self._fm_markers is None:
@@ -919,7 +1132,9 @@ class FmTrackingCommand(MotionSequenceCommand):
         # so the real horizon check silently stops running.
         world = window_to_world(self._pred_window, self._anchor_pos[:, None, :],
                                 self._anchor_quat[:, None, :], self.ctx.nj,
-                                self.ctx.num_extra_frames)
+                                self.ctx.num_extra_frames, self._fm_blocks)
+        if "ee_pos_w" not in world:
+            world["ee_pos_w"] = self._fk_ee_positions(world)
         translations, marker_indices = [], []
         for proto_idx, (_name, _color, kind, k) in enumerate(self._fm_pred_specs):
             pts = (world["base_pos_w"] if kind == "base"

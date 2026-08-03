@@ -109,26 +109,29 @@ class FlowMatchingConfig:
     cmd_array: str | None = None
     cmd_stride: int = 5
 
-    # TODO(fm-blocks): make this half block-aware. The teacher now packs only a SUBSET of
-    # the window (g1 REFERENCE_WINDOW_BLOCKS = base_pose, base_vel, joint_pos -> 41/node,
-    # 451 total), but the dataset still resolves state_dim from window_dim(nj, K) with no
-    # selection -> 82. Nothing couples the two, so the suite stays green and a newly trained
-    # FM is silently the wrong width, failing only at play time.
+    # -- what one node of the window contains --
+    # The blocks a window node packs, in packing order, out of
+    # ``window.REFERENCE_WINDOW_BLOCK_NAMES`` (base_pose, base_vel, joint_pos, joint_vel,
+    # ee_pos). This has to be the TEACHER's selection: the generator's output IS the
+    # policy's ``reference_window`` observation, so predicting a different set of blocks
+    # is not a lossy approximation, it is a scrambled observation of the wrong width.
     #
-    #   * carry the selection here and pass it to world_to_window in dataset.py
-    #   * flow.py: fk_pose_weight and joint_vel_consistency must GO -- both index blocks
-    #     that no longer exist
-    #   * export_fm_onnx / fm_session: make the window_blocks guard selection-aware (that
-    #     guard is precisely what would have caught this)
-    #   * fm_tracking_cmd._fm_current_outputs writes ee frames the FM no longer predicts
-    #   * add the missing load-time check: the FM's selection must equal the teacher's,
-    #     same shape of guard as base_pose_convention
+    # ``None`` means "resolve from the recording" -- ``RecordingMeta.reference_blocks``
+    # records what the teacher that produced it observed, and a recording predating that
+    # field is necessarily a full five-block one. Leave it None unless you are deliberately
+    # training a generator for a DIFFERENT teacher than the one that was recorded; the
+    # agreement is then checked where both sides are actually present, at load
+    # (``FmTrackingCommand``) and at deploy (``GenTrackerPolicy.load``).
+    #
+    # Dropping a block also drops the loss terms that index it -- see
+    # ``dataset.resolve_block_selection``, which zeroes them and says so.
+    reference_blocks: list[str] | None = None
     # -- dimensions (resolved from the dataset at build time) --
-    # Per-node width of every token: the reference-window layout,
-    # 12 + 2*nj + 3*num_extra_frames (see ``flow_matching.window.window_dim``). History
-    # and predicted nodes are the SAME representation -- the history is just nodes this
-    # model emitted earlier -- so they share one normalizer.
-    state_dim: int = 82        # 12 + 2*29 + 3*4 (nj=29, K=4); resolved at build time
+    # Per-node width of every token: the reference-window layout for
+    # ``reference_blocks`` (see ``flow_matching.window.window_dim``). History and
+    # predicted nodes are the SAME representation -- the history is just nodes this model
+    # emitted earlier -- so they share one normalizer.
+    state_dim: int = 82        # all five blocks at nj=29, K=4; resolved at build time
     # Per-node history-token width (= state_dim; resolved at build time).
     history_dim: int = 82
     # Which recorded signal feeds the exteroception conditioning tokens.
@@ -213,9 +216,15 @@ class FlowMatchingConfig:
     # of the clean target); velocity/joint-velocity stay ungated.
     #
     # The frame terms cover the ROOT only and the FK residual is position-only, because
-    # the extra frames are position-only in the state vector (see ``transforms.py``). The
+    # the extra frames are position-only in the state vector (see ``window.py``). The
     # ee-orientation FK residual and the ``J(q)·q̇`` term (the old ``fk_vel_weight``) went
     # with those channels.
+    #
+    # Every term needs the blocks it ties together to BE in ``reference_blocks``:
+    # velocity needs base_pose+base_vel, acceleration base_vel, joint-velocity
+    # joint_pos+joint_vel, FK joint_pos+ee_pos. A weight whose blocks are absent is zeroed
+    # at dataset build with a printed line -- the term has nothing to relate, and the
+    # default selection (base_pose, base_vel, joint_pos) already switches two of them off.
     dt: float = 0.02
     vel_consistency_weight: float = 0.01 #0.0
     accel_consistency_weight: float = 0.0

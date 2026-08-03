@@ -29,7 +29,7 @@ from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import sanitize_extero
-from .window import window_dim
+from .window import REFERENCE_WINDOW_BLOCK_NAMES, resolve_reference_blocks, window_dim
 
 
 # ----------------------------------------------------------------------
@@ -126,8 +126,8 @@ class FmOnlineContext:
         N: Number of history (context) tokens -- the reference-window nodes this model
             emitted at the N previous control steps.
         F: Future window length (all F are predicted; node 0 = current step).
-        D: Window-node width (``window_dim(nj, target_num_extra_frames)`` =
-            ``12 + 2*nj + 3*K``); history and future share it.
+        D: Window-node width (``window_dim(nj, target_num_extra_frames,
+            reference_blocks)``); history and future share it.
         nj: Number of joints.
         target_num_extra_frames: Extra body frames the generator predicts (and that
             the history carries).
@@ -161,6 +161,13 @@ class FmOnlineContext:
     joint_names: list[str]
     target_frame_names: list[str]
     device: torch.device
+    reference_blocks: tuple[str, ...] = REFERENCE_WINDOW_BLOCK_NAMES
+    """Which reference-window blocks this checkpoint PREDICTS, in packing order.
+
+    The generator's output is the policy's observation, so this is a contract rather than
+    a description: a consumer whose ``reference_window`` term packs a different selection
+    is being handed a scrambled vector of (possibly) the right width. Defaults to all five,
+    which is what a checkpoint predating the selector trained on."""
     extero_source: str = "height_scan"
     """Which sensor the checkpoint was TRAINED on ("height_scan" or "depth").
 
@@ -261,11 +268,15 @@ def load_fm_context(
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    target_d = window_dim(nj, target_k)
+    # A checkpoint predating the selector has no reference_blocks and was necessarily
+    # trained on all five, which is what resolve_reference_blocks(None) returns.
+    blocks = resolve_reference_blocks(cfg.reference_blocks)
+    target_d = window_dim(nj, target_k, blocks)
     if target_d != cfg.state_dim:
         raise ValueError(
-            f"target_frame_names implies state_dim {target_d} (nj={nj}, K={target_k}) "
-            f"but the checkpoint config has state_dim={cfg.state_dim}."
+            f"blocks={list(blocks)} + target_frame_names imply state_dim {target_d} "
+            f"(nj={nj}, K={target_k}) but the checkpoint config has "
+            f"state_dim={cfg.state_dim}."
         )
     if cfg.cmd_dim > 0 and cmd_norm is None:
         raise ValueError("Checkpoint is command-conditioned (cmd_dim>0) but has no cmd_normalizer.")
@@ -279,6 +290,7 @@ def load_fm_context(
         cmd_dim=cfg.cmd_dim, cmd_steps=cmd_steps,
         num_cmd_tokens=(len(cmd_steps) if cfg.cmd_dim > 0 else 0),
         joint_names=joint_names, target_frame_names=target_frame_names, device=dev,
+        reference_blocks=blocks,
         zero_noise=bool(zero_noise),
         guidance_scale=float(guidance_scale),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,

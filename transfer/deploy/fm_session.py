@@ -31,7 +31,7 @@ import onnxruntime as ort
 
 from .depth_obs import parse_depth_spec, sanitize_extero_np
 from .tracker_session import make_session
-from .window_np import window_blocks, window_dim
+from .window_np import REFERENCE_WINDOW_BLOCK_NAMES, window_blocks, window_dim
 
 
 @dataclass
@@ -51,6 +51,11 @@ class FmContext:
     joint_names: list[str]
     target_frame_names: list[str]
     height_dim: int
+    reference_blocks: tuple[str, ...] = REFERENCE_WINDOW_BLOCK_NAMES
+    """Which reference-window blocks this graph PREDICTS, in packing order.
+
+    Must equal the tracker's ``reference_window_spec['blocks']`` -- the prediction is fed
+    to it verbatim. ``GenTrackerPolicy.load`` is where the two meet."""
     extero_source: str = "height_scan"
     """Which sensor feeds the exteroception tokens ("height_scan" or "depth")."""
     extero_tokens: int = 1
@@ -88,19 +93,28 @@ class FmContext:
 _WARNED_NO_NULL = False
 
 
-def _check_state_layout(onnx_path: str, meta: dict) -> None:
-    """Refuse a graph whose state vector is not the reference-window layout this runtime serves.
+def _check_state_layout(onnx_path: str, meta: dict) -> tuple[str, ...]:
+    """Validate the graph's declared state layout and return the blocks it predicts.
 
-    The generator now predicts window nodes DIRECTLY into the tracker's observation, so a
+    The generator predicts window nodes DIRECTLY into the tracker's observation, so a
     layout disagreement is not a bad lift any more -- it is a scrambled observation, fed to
     a policy that will happily act on it. Nothing observable in the graph reveals it: ``D``,
     ``nj`` and ``len(target_frame_names)`` can coincide between layouts, and the previous
     (root-block / ee-block) layout is exactly 3 channels wider for every ``(nj, K)``, so an
     old graph is close enough to look plausible.
 
+    What is checked here is that the declaration is INTERNALLY coherent -- known block
+    names, canonical order, widths and ``D`` all agreeing with ``(nj, K)``. Which selection
+    is the RIGHT one is not knowable from the generator alone: it has to equal the
+    tracker's, and that comparison happens in ``GenTrackerPolicy.load`` where both
+    artifacts are in hand.
+
     Args:
         onnx_path: Path of the graph being loaded, for the error message.
         meta: The parsed ``fm_meta`` mapping.
+
+    Returns:
+        The declared block names, in packing order.
 
     Raises:
         ValueError: If the declared layout is missing, unknown, or inconsistent with ``D``.
@@ -115,17 +129,25 @@ def _check_state_layout(onnx_path: str, meta: dict) -> None:
             f"({window_dim(nj, K)} wide), and the two are not interchangeable. "
             "Re-record, retrain and re-export."
         )
-    expected = [[name, int(w)] for name, w in window_blocks(nj, K)]
-    if [[str(n), int(w)] for n, w in declared] != expected:
+    names = tuple(str(n) for n, _ in declared)
+    widths = [int(w) for _, w in declared]
+    expected = window_blocks(nj, K, names)   # raises on an unknown name
+    if [n for n, _ in expected] != list(names):
         raise ValueError(
-            f"{onnx_path}: fm_meta window_blocks {declared} != this runtime's {expected} "
-            f"(nj={nj}, K={K}). Re-export the FM checkpoint."
+            f"{onnx_path}: fm_meta window_blocks are out of packing order: {list(names)} "
+            f"should be {[n for n, _ in expected]}. A window is a concatenation in a fixed "
+            "order, so this is a different vector, not the same one relabelled."
         )
-    if d != window_dim(nj, K):
+    if [w for _, w in expected] != widths:
         raise ValueError(
-            f"{onnx_path}: fm_meta D={d} but the window layout implies "
-            f"{window_dim(nj, K)} (nj={nj}, K={K})."
+            f"{onnx_path}: fm_meta window_blocks widths {widths} != this runtime's "
+            f"{[w for _, w in expected]} for nj={nj}, K={K}. Re-export the FM checkpoint."
         )
+    if d != sum(widths):
+        raise ValueError(
+            f"{onnx_path}: fm_meta D={d} but its own window_blocks sum to {sum(widths)}."
+        )
+    return names
 
 
 def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmContext:
@@ -139,9 +161,10 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
     # The old history_source refusal is gone: the deploy runtime CAN produce this history,
     # because the history is the runtime's own last output rather than a measured state it
     # would have to estimate.
-    _check_state_layout(onnx_path, m)
+    blocks = _check_state_layout(onnx_path, m)
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
+        reference_blocks=blocks,
         target_num_extra_frames=len(m["target_frame_names"]),
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],

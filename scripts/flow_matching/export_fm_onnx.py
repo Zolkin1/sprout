@@ -120,9 +120,14 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # output goes STRAIGHT into the tracker's observation now, so a layout
         # disagreement is not a bad lift -- it is a scrambled observation the policy acts
         # on. D, nj and the frame count do not pin it down (the previous relative-state
-        # layout is 3 channels wider for every nj/K, close enough to look plausible), so
-        # the block table travels explicitly. ``fm_session.load_fm_context`` requires it.
-        "window_blocks": [[name, int(w)] for name, w in window_blocks(ctx.nj, ctx.target_num_extra_frames)],
+        # layout is 3 channels wider for every nj/K, close enough to look plausible; and a
+        # window that drops a block is narrower but just as loadable), so the block table
+        # travels explicitly -- with the SELECTION this checkpoint trained on, not the
+        # full five. ``fm_session.load_fm_context`` requires it, and
+        # ``GenTrackerPolicy.load`` requires it to equal the tracker's.
+        "window_blocks": [[name, int(w)] for name, w in
+                          window_blocks(ctx.nj, ctx.target_num_extra_frames,
+                                        ctx.reference_blocks)],
         # Signals to the deploy side that the graph accepts the history_null input, so it can
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.

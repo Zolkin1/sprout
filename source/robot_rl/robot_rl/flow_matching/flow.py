@@ -15,9 +15,12 @@ fraction of samples via ``history_null_mask`` (classifier-free-guidance / phase-
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 
 from .transforms import so3_exp, so3_log
+from .window import resolve_reference_blocks, window_block_slices
 
 
 def sample_flow_batch(
@@ -53,6 +56,7 @@ def frame_consistency_terms(
     dt: float,
     num_joints: int,
     num_extra_frames: int = 0,
+    blocks: Sequence[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-sample velocity + acceleration finite-difference consistency for the base block.
 
@@ -75,14 +79,31 @@ def frame_consistency_terms(
       sign swaps it to the right one. Going through Exp/Log also makes the term immune
       to the wrap at ``pi``, which a naive ``(e_{k+1} - e_k)`` would not be.
 
+    Args:
+        pred_phys / data_phys: ``(B, F, D)`` predicted / target window, physical units.
+        dt: Control step period.
+        num_joints: ``nj``; num_extra_frames: ``K``; blocks: the packed selection.
+
     Returns:
         ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
+
+    Raises:
+        ValueError: If the selection lacks ``base_pose`` or ``base_vel`` -- the caller
+            gates on that (see :func:`flow_matching_loss`), so reaching here means a
+            weight outlived the block it relates.
     """
-    del num_extra_frames  # layout is fixed at the front of the node; kept for symmetry
+    slc = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "base_pose" not in slc or "base_vel" not in slc:
+        raise ValueError(
+            "frame_consistency_terms ties base_pose to base_vel, but this window packs "
+            f"{sorted(slc)}. Zero vel_consistency_weight / accel_consistency_weight for "
+            "this block selection."
+        )
+    bp, bv = slc["base_pose"].start, slc["base_vel"].start
     x = pred_phys
-    pos, ori = x[..., 0:3], x[..., 3:6]
-    lin, ang = x[..., 6:9], x[..., 9:12]
-    data_lin, data_ang = data_phys[..., 6:9], data_phys[..., 9:12]
+    pos, ori = x[..., bp:bp + 3], x[..., bp + 3:bp + 6]
+    lin, ang = x[..., bv:bv + 3], x[..., bv + 3:bv + 6]
+    data_lin, data_ang = data_phys[..., bv:bv + 3], data_phys[..., bv + 3:bv + 6]
 
     lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
     vel = ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
@@ -96,16 +117,28 @@ def frame_consistency_terms(
 
 
 def joint_vel_consistency_term(
-    pred_phys: torch.Tensor, dt: float, num_joints: int
+    pred_phys: torch.Tensor,
+    dt: float,
+    num_joints: int,
+    num_extra_frames: int = 0,
+    blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """Per-sample joint-velocity consistency: ``(joint_pos[t+1]-joint_pos[t])/dt ~ joint_vel[t]``.
 
     Returns ``(B,)`` in physical units (rad/s). Operates on the pure F-node prediction.
     Frame-invariant blocks, so the window representation changes nothing but the offsets.
+
+    Raises:
+        ValueError: If the selection lacks ``joint_pos`` or ``joint_vel``.
     """
-    x = pred_phys
-    jp = x[..., 12:12 + num_joints]
-    jv = x[..., 12 + num_joints:12 + 2 * num_joints]
+    slc = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "joint_pos" not in slc or "joint_vel" not in slc:
+        raise ValueError(
+            "joint_vel_consistency_term ties joint_pos to joint_vel, but this window packs "
+            f"{sorted(slc)}. Zero joint_vel_consistency_weight for this block selection."
+        )
+    jp = pred_phys[..., slc["joint_pos"]]
+    jv = pred_phys[..., slc["joint_vel"]]
     jp_fd = (jp[:, 1:] - jp[:, :-1]) / dt
     return ((jp_fd - jv[:, :-1]) ** 2).mean(dim=(1, 2))
 
@@ -115,6 +148,7 @@ def fk_consistency_terms(
     num_joints: int,
     num_extra_frames: int,
     fk: object,
+    blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
     """Per-sample forward-kinematics POSITION consistency for the EE frames.
 
@@ -135,17 +169,26 @@ def fk_consistency_terms(
 
     Returns:
         ``fk_pose_per_sample``, shape ``(B,)``.
+
+    Raises:
+        ValueError: If the selection lacks ``joint_pos`` or ``ee_pos`` -- there is no
+            posture to couple without both.
     """
     x = pred_phys
     b_, f_, _ = x.shape
     nj, k = num_joints, num_extra_frames
 
-    q = x[..., 12:12 + nj].reshape(b_ * f_, nj)
+    slc = window_block_slices(nj, k, blocks)
+    if "joint_pos" not in slc or "ee_pos" not in slc:
+        raise ValueError(
+            "fk_consistency_terms couples joint_pos to ee_pos, but this window packs "
+            f"{sorted(slc)}. Zero fk_pose_weight for this block selection."
+        )
+    q = x[..., slc["joint_pos"]].reshape(b_ * f_, nj)
     fk_pos, _fk_rot, _jv, _jw = fk.pose_and_jacobian(q)            # (M,K,3), ...
     fk_pos = fk_pos.reshape(b_, f_, k, 3)
 
-    ee0 = 12 + 2 * nj
-    ee = x[..., ee0:ee0 + 3 * k].reshape(b_, f_, k, 3)
+    ee = x[..., slc["ee_pos"]].reshape(b_, f_, k, 3)
     return ((ee - fk_pos) ** 2).mean(dim=(1, 2, 3))
 
 
@@ -166,6 +209,7 @@ def flow_matching_loss(
     fk: object | None = None,
     fk_pose_weight: float = 0.0,
     tau_min: float = 0.0,
+    blocks: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
 
@@ -173,6 +217,11 @@ def flow_matching_loss(
     part of the window). All auxiliary terms act on the predicted endpoint ``x1_hat``
     (denormalized). Velocity + joint-velocity consistency are ungated; the acceleration
     and FK terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``).
+
+    Every auxiliary term relates two blocks, so each is skipped unless ``blocks`` packs
+    both. ``dataset.resolve_block_selection`` already zeroes the corresponding weight at
+    build time; this is the second line of the same defence, for a caller that assembles
+    the kwargs itself.
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
@@ -190,6 +239,7 @@ def flow_matching_loss(
         fk: An :class:`~motion_gen.fk.FKChain` (or ``None``).
         fk_pose_weight: FK position-consistency weight.
         tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
+        blocks: The window's block selection; defaults to all five.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
@@ -201,29 +251,38 @@ def flow_matching_loss(
     flow_mse = ((v - target_v) ** 2).mean()
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
 
-    do_frame = state_norm is not None and (vel_weight > 0.0 or accel_weight > 0.0 or joint_vel_weight > 0.0)
-    do_fk = fk is not None and state_norm is not None and fk_pose_weight > 0.0
-    if do_frame or do_fk:
+    packed = set(resolve_reference_blocks(blocks))
+    has_base = {"base_pose", "base_vel"} <= packed
+    has_joints = {"joint_pos", "joint_vel"} <= packed
+    do_base = state_norm is not None and has_base and (vel_weight > 0.0 or accel_weight > 0.0)
+    do_jvel = state_norm is not None and has_joints and joint_vel_weight > 0.0
+    do_fk = (fk is not None and state_norm is not None and fk_pose_weight > 0.0
+             and {"joint_pos", "ee_pos"} <= packed)
+    if do_base or do_jvel or do_fk:
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
-        if do_frame or do_fk:
-            pred_phys = state_norm.denormalize(x1_hat)
-            data_phys = state_norm.denormalize(x1)
-            gate = tau >= tau_min  # (B,) bool; gates the accel + FK terms
-        if do_frame:
-            vel_ps, accel_ps = frame_consistency_terms(pred_phys, data_phys, dt, num_joints)
-            jvel_ps = joint_vel_consistency_term(pred_phys, dt, num_joints)
-            vel, jvel = vel_ps.mean(), jvel_ps.mean()           # ungated
+        pred_phys = state_norm.denormalize(x1_hat)
+        data_phys = state_norm.denormalize(x1)
+        gate = tau >= tau_min  # (B,) bool; gates the accel + FK terms
+        if do_base:
+            vel_ps, accel_ps = frame_consistency_terms(
+                pred_phys, data_phys, dt, num_joints, num_extra_frames, blocks)
+            vel = vel_ps.mean()                                 # ungated
             accel = _masked_mean(accel_ps, gate)                # τ-gated
             out["vel_consistency"] = vel.detach()
             out["accel_consistency"] = accel.detach()
+            out["loss"] = out["loss"] + vel_weight * vel + accel_weight * accel
+        if do_jvel:
+            jvel = joint_vel_consistency_term(
+                pred_phys, dt, num_joints, num_extra_frames, blocks).mean()   # ungated
             out["joint_vel_consistency"] = jvel.detach()
-            out["loss"] = out["loss"] + vel_weight * vel + accel_weight * accel + joint_vel_weight * jvel
+            out["loss"] = out["loss"] + joint_vel_weight * jvel
         if do_fk:
             # Run FK only on the τ-gated samples (it is the expensive term).
             idx = gate.nonzero(as_tuple=True)[0]
             if idx.numel() > 0:
-                fkp = fk_consistency_terms(pred_phys[idx], num_joints, num_extra_frames, fk).mean()
+                fkp = fk_consistency_terms(
+                    pred_phys[idx], num_joints, num_extra_frames, fk, blocks).mean()
             else:
                 fkp = flow_mse.new_zeros(())
             out["fk_pose"] = fkp.detach()

@@ -39,6 +39,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_seq
     MotionSequenceCommand,
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (  # noqa: E402
+    REFERENCE_WINDOW_BLOCKS,
     REFERENCE_WINDOW_NOISE,
     ReferenceWindowNoiseCfg,
     _window_offsets,
@@ -584,3 +585,104 @@ def test_noise_cfg_from_layout_is_hydra_safe(env_cmd):
     assert isinstance(cfg.n_half, list) and len(cfg.n_half) == 3 * per_step
     assert all(isinstance(v, float) for v in cfg.n_half)
     assert cfg.magnitudes == REFERENCE_WINDOW_NOISE
+
+
+# ---------------------------------------------------------------------------
+# The block selection, as the rest of the pipeline reads it.
+# ---------------------------------------------------------------------------
+def _obs_manager(**groups):
+    """A stub observation manager exposing ``blocks`` per group.
+
+    Args:
+        **groups: ``group_name=blocks`` (``blocks`` may be ``None`` for the default), or
+            ``group_name=None`` for a group with no ``reference_window`` term at all.
+
+    Returns:
+        An object with the two attributes :func:`reference_window_selection` reads.
+    """
+    active, cfgs = {}, {}
+    for name, blocks in groups.items():
+        if blocks is _NO_TERM:
+            active[name], cfgs[name] = ["joint_pos"], [SimpleNamespace(params={})]
+            continue
+        active[name] = ["joint_pos", "reference_window"]
+        cfgs[name] = [SimpleNamespace(params={}),
+                      SimpleNamespace(params={"num_steps": 11, "blocks": blocks})]
+    return SimpleNamespace(active_terms=active, _group_obs_term_cfgs=cfgs)
+
+
+_NO_TERM = object()   #: sentinel for "this group does not observe the window"
+
+
+def test_reference_window_selection_is_the_single_producer():
+    """One function answers "which blocks does this teacher pack" for every consumer.
+
+    ``record_data`` stamps it on the recording (setting the generator's training width)
+    and ``export_parameters`` puts it in ``tracker.onnx`` (where the deploy checks the
+    generator against it). Both restating the lookup is how the two came to disagree in
+    the first place.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+        reference_window_selection,
+    )
+    slim = ("base_pose", "base_vel", "joint_pos")
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=list(slim)))
+    assert reference_window_selection(env) == slim
+
+    # Canonical packing order, whatever order the cfg names them in.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=["joint_pos", "base_vel",
+                                                                  "base_pose"]))
+    assert reference_window_selection(env) == slim
+
+    # No selection on the term means all five, not "unknown".
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=None))
+    assert reference_window_selection(env) == REFERENCE_WINDOW_BLOCKS
+    assert len(REFERENCE_WINDOW_BLOCKS) == 5
+
+    # A task without the term: nothing to state, and no exception.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=_NO_TERM))
+    assert reference_window_selection(env) is None
+
+    # Restricting the search to one group is what the exporter does, so a critic-only
+    # window never lands in a contract the actor's policy does not read.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=_NO_TERM, critic=list(slim)))
+    assert reference_window_selection(env, groups=["policy"]) is None
+    assert reference_window_selection(env) == slim
+
+
+def test_reference_window_selection_refuses_disagreeing_groups():
+    """One command builds one window; two groups reading different ones is a bug.
+
+    Silent otherwise: each group's term is internally consistent and correctly sized, so
+    only the thing that has to state ONE selection off-sim would ever notice.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+        reference_window_selection,
+    )
+    env = SimpleNamespace(observation_manager=_obs_manager(
+        policy=["base_pose", "base_vel", "joint_pos"], critic=["base_pose", "joint_pos"]))
+    with pytest.raises(ValueError, match="different block selections"):
+        reference_window_selection(env)
+
+
+def test_g1_teacher_wires_its_selection_into_the_term():
+    """The env cfg's constant must reach the term's ``params``, or nothing downstream sees it.
+
+    ``reference_window_selection`` reads the TERM, so a term built without ``blocks``
+    would report all five while the observation packs a subset -- and the generator would
+    be trained at the wrong width with every array still the right shape for whoever made
+    it.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_teacher_env_cfg as tcfg
+    obs = tcfg.G1TeacherEnvCfg().observations
+    found = []
+    for group_name in vars(obs):
+        group = getattr(obs, group_name)
+        term = getattr(group, "reference_window", None)
+        if term is not None:
+            found.append((group_name, tuple((term.params or {}).get("blocks") or ())))
+    assert found, "no observation group carries a reference_window term"
+    for group_name, blocks in found:
+        assert blocks == tuple(tcfg.REFERENCE_WINDOW_BLOCKS), (
+            f"{group_name}'s reference_window does not carry REFERENCE_WINDOW_BLOCKS")

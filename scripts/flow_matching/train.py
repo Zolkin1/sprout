@@ -48,7 +48,9 @@ from robot_rl.flow_matching import (  # noqa: E402
     FutureStateDataset,
     build_train_val,
     flow_matching_loss,
+    REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
+    REFERENCE_BLOCK_KEYS,
     so3_exp,
     window_block_slices,
     sample_trajectory,
@@ -99,6 +101,15 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "A/B over one recording. 'depth' is the deployable choice on a "
                              "robot with cameras and no heightmap; the tracker it is paired "
                              "with must agree (checked at load in deploy/gen_tracker.py).")
+    parser.add_argument(
+        "--reference_blocks", type=str, default=None,
+        help="Comma-separated reference-window blocks the generator predicts, out of "
+             f"{','.join(REFERENCE_WINDOW_BLOCK_NAMES)}. Default: whatever the RECORDING's "
+             "teacher observed (RecordingMeta.reference_blocks), which is what the "
+             "generator has to predict to drive that policy. Set this only to train for a "
+             "DIFFERENT teacher than the one recorded -- the agreement is enforced at play "
+             "time and at deploy load, not here.",
+    )
     parser.add_argument("--null_cond_prob", type=float, default=FlowMatchingConfig().null_cond_prob,
                         help="Probability a training sample's history (phase) tokens are replaced by "
                              "the model's learned null embedding (classifier-free guidance / phase-agnostic).")
@@ -186,6 +197,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     cfg = FlowMatchingConfig(
         future_len=args.future_len, num_history_states=args.num_history_states,
         extero_source=args.extero_source,
+        reference_blocks=(
+            [b.strip() for b in args.reference_blocks.split(",") if b.strip()]
+            if args.reference_blocks else None
+        ),
         null_cond_prob=args.null_cond_prob, stride=args.stride,
         val_fraction=args.val_fraction, target_source=args.target_source,
         recovery_mode=args.recovery_mode,
@@ -207,14 +222,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
 
 
 def channel_metrics(
-    pred: torch.Tensor, tgt: torch.Tensor, num_joints: int, num_extra_frames: int = 0
+    pred: torch.Tensor, tgt: torch.Tensor, num_joints: int, num_extra_frames: int = 0,
+    blocks=None,
 ) -> dict[str, float]:
     """Per-channel physical-units error between predicted and target futures.
 
-    The base (root) + joint channels occupy a fixed prefix unchanged by extra
-    frames, so their offsets are stable. When ``num_extra_frames > 0`` the extra
-    body-frame position RMSE is aggregated (mean over frames) into
-    ``rmse_frame_pos``; extra frames are position-only, so there is no per-frame
+    Reports only the blocks the window actually packs -- a metric for an absent block
+    would either index a neighbour's columns or invent a zero, and both read as "that
+    channel is fine". Extra frames are position-only, so there is no per-frame
     orientation geodesic.
 
     Args:
@@ -222,36 +237,40 @@ def channel_metrics(
         tgt: Target future states (denormalized), shape ``(B, F, D)``.
         num_joints: Number of joints ``nj``.
         num_extra_frames: Number of extra body frames ``K`` appended to the state.
+        blocks: The window's block selection; defaults to all five.
 
     Returns:
-        Dict of RMSEs per channel plus the orientation geodesic error (radians).
+        Dict of RMSEs per selected channel plus, with ``base_pose``, the orientation
+        geodesic error (radians).
     """
-    nj = num_joints
+    def _rmse(slc: slice) -> float:
+        return torch.sqrt(torch.mean((pred[..., slc] - tgt[..., slc]) ** 2)).item()
 
-    def _rmse(a: torch.Tensor, b: torch.Tensor) -> float:
-        return torch.sqrt(torch.mean((a - b) ** 2)).item()
-
-    def _geodesic() -> float:
+    def _geodesic(slc: slice) -> float:
         """Angle between the predicted and target base orientations, in radians.
 
         Through ``Exp`` rather than differencing the log values, so the metric stays
         meaningful (and wrap-immune) however far the reference has turned from the anchor.
         """
-        rel = so3_exp(pred[..., 3:6]).transpose(-1, -2) @ so3_exp(tgt[..., 3:6])
+        rel = so3_exp(pred[..., slc]).transpose(-1, -2) @ so3_exp(tgt[..., slc])
         cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
         return torch.arccos(cos).mean().item()
 
-    b = window_block_slices(nj, num_extra_frames)
-    out = {
-        "rmse_base_pos": _rmse(pred[..., 0:3], tgt[..., 0:3]),
-        "rmse_base_lin_vel": _rmse(pred[..., 6:9], tgt[..., 6:9]),
-        "rmse_base_ang_vel": _rmse(pred[..., 9:12], tgt[..., 9:12]),
-        "rmse_joint_pos": _rmse(pred[..., b["joint_pos"]], tgt[..., b["joint_pos"]]),
-        "rmse_joint_vel": _rmse(pred[..., b["joint_vel"]], tgt[..., b["joint_vel"]]),
-        "ori_geodesic_rad": _geodesic(),
-    }
-    if num_extra_frames > 0:
-        out["rmse_ee_pos"] = _rmse(pred[..., b["ee_pos"]], tgt[..., b["ee_pos"]])
+    b = window_block_slices(num_joints, num_extra_frames, blocks)
+    out: dict[str, float] = {}
+    if "base_pose" in b:
+        start = b["base_pose"].start
+        out["rmse_base_pos"] = _rmse(slice(start, start + 3))
+        out["ori_geodesic_rad"] = _geodesic(slice(start + 3, start + 6))
+    if "base_vel" in b:
+        start = b["base_vel"].start
+        out["rmse_base_lin_vel"] = _rmse(slice(start, start + 3))
+        out["rmse_base_ang_vel"] = _rmse(slice(start + 3, start + 6))
+    for name, key in (("joint_pos", "rmse_joint_pos"), ("joint_vel", "rmse_joint_vel")):
+        if name in b:
+            out[key] = _rmse(b[name])
+    if "ee_pos" in b and num_extra_frames > 0:
+        out["rmse_ee_pos"] = _rmse(b["ee_pos"])
     return out
 
 
@@ -271,7 +290,7 @@ def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> N
     s = train_ds.state[:n_windows].to(device)
     x = train_ds.state_normalizer.denormalize(s)  # (W, F, D) physical
     w, f = x.shape[0], x.shape[1]
-    blocks = window_block_slices(nj, k)
+    blocks = window_block_slices(nj, k, train_ds.blocks)
     fk_pos, _, _, _ = fk.pose_and_jacobian(x[..., blocks["joint_pos"]].reshape(w * f, nj))
     fk_pos = fk_pos.reshape(w, f, k, 3)
     # The window's ee block is ALREADY base-relative, so this is a direct residual.
@@ -292,7 +311,7 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk) -> dict:
         vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
         joint_vel_weight=cfg.joint_vel_consistency_weight,
         fk=fk, fk_pose_weight=cfg.fk_pose_weight,
-        tau_min=cfg.consistency_tau_min,
+        tau_min=cfg.consistency_tau_min, blocks=cfg.reference_blocks,
     )
 
 
@@ -331,7 +350,8 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
         )
         pred_full = state_normalizer.denormalize(pred)
         tgt_d = state_normalizer.denormalize(state)
-        for k, v in channel_metrics(pred_full, tgt_d, num_joints, num_extra_frames).items():
+        for k, v in channel_metrics(pred_full, tgt_d, num_joints, num_extra_frames,
+                                    cfg.reference_blocks).items():
             metric_sums[k] = metric_sums.get(k, 0.0) + v
     out = {
         "flow_mse": flow_sum / max(n_batches, 1),
@@ -371,6 +391,9 @@ def main() -> None:
     print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
+    print(f"[INFO] window blocks={list(train_ds.blocks)} -> {cfg.state_dim}/node "
+          f"({cfg.future_len * cfg.state_dim} over the horizon); the policy this drives "
+          "must pack exactly these.")
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
           f"extero={cfg.extero_source} ({cfg.extero_tokens}x{cfg.height_dim}), "
@@ -378,10 +401,13 @@ def main() -> None:
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
     if cfg.obs_noise:
+        # Only the keys feeding a SELECTED block -- the others are not in the window and
+        # so are not applied, and printing them would suggest otherwise.
+        live = [k for b in train_ds.blocks for k in REFERENCE_BLOCK_KEYS[b]]
         print(f"[INFO] obs_noise=on (conditioning tokens, train split only), "
               f"scale={cfg.noise_scale} x window.REFERENCE_WINDOW_NOISE "
               f"(the same table the policy's reference obs is corrupted with): "
-              + " ".join(f"{k}={v}" for k, v in REFERENCE_WINDOW_NOISE.items()))
+              + " ".join(f"{k}={REFERENCE_WINDOW_NOISE[k]}" for k in live))
     else:
         print("[INFO] obs_noise=off (clean conditioning tokens)")
 
@@ -443,6 +469,8 @@ def main() -> None:
         train_ds.cmd_normalizer.to(device)
 
     # Forward-kinematics chain for the FK consistency losses (only when weighted).
+    # ``resolve_block_selection`` has already zeroed this weight if the window does not
+    # pack joint_pos + ee_pos, so reaching here means the blocks are there.
     fk = None
     if cfg.fk_pose_weight > 0.0:
         if train_ds.num_extra_frames == 0:

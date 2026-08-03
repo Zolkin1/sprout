@@ -3,9 +3,9 @@
 # Flow-Matching Workflow
 
 A conditional flow-matching transformer that predicts the teacher's **`reference_window`
-observation vector directly** — `[base_pose(6), base_vel(6), joint_pos(nj), joint_vel(nj),
-ee_pos(3K)]` per node, `D = 82` for the G1 — from **its own recent output + exteroception +
-a velocity command**.
+observation vector directly** — up to `[base_pose(6), base_vel(6), joint_pos(nj),
+joint_vel(nj), ee_pos(3K)]` per node — from **its own recent output + exteroception + a
+velocity command**.
 
 Two things follow from that, and they are the point of the design:
 
@@ -13,6 +13,14 @@ Two things follow from that, and they are the point of the design:
   the path from the network to the tracker, in simulation or at deploy. The state layout is
   `robot_rl/flow_matching/window.py`, shared by the observation, the dataset and the
   torch-free deploy port so it cannot drift between them.
+- **It predicts exactly the blocks that teacher observes**, not always all five. The g1
+  teacher packs `(base_pose, base_vel, joint_pos)` today → `D = 41` (`451` over the
+  11-sample window), and the FM resolves the same selection from the recording
+  (`RecordingMeta.reference_blocks`) rather than assuming the full `D = 82`. A dropped
+  block also drops the loss terms that index it, and the agreement is checked where both
+  artifacts meet: `FmTrackingCommand.reference_window_obs` in sim,
+  `GenTrackerPolicy.load()` at deploy. Override with `--reference_blocks` only to train
+  for a teacher other than the recorded one.
 - **It is autoregressive over itself.** The `N` context tokens are the nodes it emitted at
   the `N` previous control steps, each already relative to the robot as it was at that step,
   so deploy pushes back what it just served — no base-pose estimate anywhere on the FM path.

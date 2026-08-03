@@ -36,7 +36,12 @@ wp = pytest.importorskip("warp", exc_type=ImportError)
 pytest.importorskip("isaaclab.utils.math", exc_type=ImportError)
 wp.init()
 
-from robot_rl.flow_matching.window import window_block_slices, window_to_world
+from robot_rl.flow_matching.window import (
+    REFERENCE_WINDOW_BLOCK_NAMES as ALL_BLOCKS,
+    window_block_slices,
+    window_dim,
+    window_to_world,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.fm_tracking_cmd import (  # noqa: E402
     FmTrackingCommand,
 )
@@ -71,7 +76,9 @@ def _stub(fm_update_every: int = 1, pred_idx: int = 0) -> FmTrackingCommand:
     """
     cmd = object.__new__(_BareFmCommand)
     cmd.cfg = SimpleNamespace(fm_update_every=fm_update_every, reference_source="fm")
-    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
+    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES),
+                              reference_blocks=ALL_BLOCKS)
+    cmd._fm_blocks = ALL_BLOCKS
     # No diagnostic override in force: the accessors answer for cfg.reference_source.
     cmd._serve_override = None
     cmd.fm_enabled = True
@@ -142,6 +149,88 @@ def test_reference_window_obs_reanchors_onto_the_current_robot():
     # Frame-invariant blocks are untouched by where the robot is.
     jp = window_block_slices(NJ, K)["joint_pos"]
     torch.testing.assert_close(after[..., jp], before[..., jp], atol=1e-6, rtol=1e-6)
+
+
+def test_reference_window_obs_refuses_a_selection_the_checkpoint_did_not_train_on():
+    """The observation term and the generator must name the SAME blocks.
+
+    The prediction is fed to the term verbatim, so a disagreement is not something to drop
+    or reorder around -- the policy would read one block's numbers under another's name.
+    Two same-width blocks (``joint_pos`` / ``joint_vel``) make it a silent swap rather than
+    a shape error, which is why this is checked by name.
+    """
+    cmd = _stub()                                  # trained on all five
+    with pytest.raises(ValueError, match="asks for blocks"):
+        FmTrackingCommand.reference_window_obs(
+            cmd, torch.tensor([0]), blocks=("base_pose", "base_vel", "joint_pos"))
+    # Naming the same five in a different order is the same window, and is accepted.
+    win = FmTrackingCommand.reference_window_obs(
+        cmd, torch.tensor([0]), blocks=tuple(reversed(ALL_BLOCKS)))
+    assert win.shape == (N_ENVS, 1, D)
+
+
+def test_reference_window_obs_serves_a_slim_window_at_its_own_width():
+    """A generator trained on a subset serves that subset, re-anchored the same way.
+
+    The blocks that survive are exactly the ones the teacher packs; the re-anchor has to
+    keep working without the dropped ones, which is why it is per-block rather than a
+    world round trip (that leg needs every block to reconstruct the node).
+    """
+    slim = ("base_pose", "base_vel", "joint_pos")
+    d_slim = window_dim(NJ, K, slim)
+    cmd = _stub(fm_update_every=6, pred_idx=7)
+    cmd._fm_blocks = slim
+    cmd.ctx.reference_blocks = slim
+    cmd.ctx.D = d_slim
+    cmd._pred_window = cmd._pred_window[..., :d_slim].contiguous()
+
+    offsets = torch.tensor([0, 5])
+    before = FmTrackingCommand.reference_window_obs(cmd, offsets, blocks=slim).clone()
+    assert before.shape == (N_ENVS, 2, d_slim) and d_slim < D
+
+    moved = torch.zeros(N_ENVS, 3); moved[:, 0] = 0.5
+    cmd.robot.data.root_pos_w = wp.from_torch(moved.contiguous())
+    after = FmTrackingCommand.reference_window_obs(cmd, offsets, blocks=slim)
+    torch.testing.assert_close(after[..., 0:3], before[..., 0:3] - moved[:, None, :],
+                               atol=1e-5, rtol=1e-5)
+    jp = window_block_slices(NJ, K, slim)["joint_pos"]
+    torch.testing.assert_close(after[..., jp], before[..., jp], atol=1e-6, rtol=1e-6)
+
+
+def test_clip_history_node_is_built_in_the_checkpoints_layout():
+    """``history_from="clip"`` must push a node the FM's own history ring can hold.
+
+    The teacher-forcing row comes from the CLIP branch, which defaults to the full
+    five-block layout -- so on a slim checkpoint it produced an 82-wide node to stack
+    against 41-wide predictions, and the run died inside ``BatchedHistory.stack_padded``
+    on the first inference. Only this path builds a clip node, so nothing else catches it.
+    """
+    slim = ("base_pose", "base_vel", "joint_pos")
+    d_slim = window_dim(NJ, K, slim)
+    cmd = _stub()
+    cmd._fm_blocks = slim
+    cmd.ctx.reference_blocks = slim
+
+    seen = {}
+
+    def _fake_super(offsets, blocks=None):
+        """Stand in for the clip branch, recording the selection it was asked for."""
+        seen["blocks"] = blocks
+        return torch.zeros(N_ENVS, len(offsets), window_dim(NJ, K, blocks))
+
+    # _clip_history_node reaches the clip branch through super(); patch the bound name it
+    # resolves to, then check both the request and the width that comes back.
+    import robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd as ms
+    original = ms.MotionSequenceCommand.reference_window_obs
+    ms.MotionSequenceCommand.reference_window_obs = staticmethod(_fake_super)
+    try:
+        node = FmTrackingCommand._clip_history_node(cmd)
+    finally:
+        ms.MotionSequenceCommand.reference_window_obs = original
+
+    assert tuple(seen["blocks"]) == slim, "the clip node was built with the wrong selection"
+    assert node.shape == (N_ENVS, d_slim), (
+        f"clip history node is {node.shape[-1]} wide but the ring holds {d_slim}")
 
 
 def test_cursor_offsets_index_from_the_served_node():
@@ -307,7 +396,9 @@ def _update_stub(reference_source: str = "fm") -> FmTrackingCommand:
     cmd.calls: list[str] = []
     cmd.cfg = SimpleNamespace(fm_update_every=4, strict_fm_only=True,
                               reference_source=reference_source)
-    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES))
+    cmd.ctx = SimpleNamespace(F=F, D=D, nj=NJ, num_extra_frames=K, frame_names=list(FM_FRAMES),
+                              reference_blocks=ALL_BLOCKS)
+    cmd._fm_blocks = ALL_BLOCKS
     cmd._resampling = False
     cmd._building = None
     cmd._serve_override = None
@@ -340,7 +431,7 @@ def _update_stub(reference_source: str = "fm") -> FmTrackingCommand:
     cmd._write_world_des = lambda frames: cmd.calls.append("write_des")
     cmd._fm_current_outputs = lambda: (
         torch.zeros(N_ENVS, 13), torch.zeros(N_ENVS, K, 13),
-        torch.zeros(N_ENVS, NJ), torch.zeros(N_ENVS, NJ),
+        {"joint_pos": torch.zeros(N_ENVS, NJ), "joint_vel": torch.zeros(N_ENVS, NJ)},
     )
 
     def _measured(pos, quat):
@@ -521,11 +612,13 @@ def test_predicted_outputs_window_lands_in_the_y_des_layout():
 
     # Node 0 of the window == what _fm_current_outputs applies this step. (Always node 0:
     # fm_update_every is pinned to 1, so there is no cursor to chase.)
-    base, ee, jp, jv = FmTrackingCommand._fm_current_outputs(cmd)
+    base, ee, joints = FmTrackingCommand._fm_current_outputs(cmd)
     torch.testing.assert_close(y[:, 0, 0:3], base[:, 0:3])
     torch.testing.assert_close(y[:, 0, 3:6], ee[:, 0, 0:3])
-    torch.testing.assert_close(y[:, 0, cmd._joint_slots_pos], jp[..., cmd._fm_jperm])
-    torch.testing.assert_close(dy[:, 0, cmd._joint_slots_vel], jv[..., cmd._fm_jperm])
+    torch.testing.assert_close(y[:, 0, cmd._joint_slots_pos],
+                               joints["joint_pos"][..., cmd._fm_jperm])
+    torch.testing.assert_close(dy[:, 0, cmd._joint_slots_vel],
+                               joints["joint_vel"][..., cmd._fm_jperm])
 
 
 # ---------------------------------------------------------------------------

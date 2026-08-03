@@ -372,6 +372,8 @@ def _build_recording_meta(
         state_term_names += [f"{f}:pos_w", f"{f}:quat_w", f"{f}:lin_vel_w", f"{f}:ang_vel_w"]
         state_term_dims += [3, 4, 3, 3]
 
+    ref_blocks = mdp.reference_window_selection(env.unwrapped)
+
     return RecordingMeta(
         checkpoint_path=os.path.abspath(resume_path),
         checkpoint_sha256=sha256_file(resume_path),
@@ -398,6 +400,12 @@ def _build_recording_meta(
         # The same producer the tracker export uses, so an FM trained on this recording
         # and the tracker deployed beside it describe one physical camera pair.
         depth_camera_spec=mdp.depth_camera_specs(env.unwrapped) or None,
+        # Which reference-window blocks THIS teacher observes. The recorded arrays are
+        # world-frame rows, so any selection can be packed from them -- but the generator
+        # trained on this file has to predict what the policy consumes, so the teacher's
+        # selection is the default the FM dataset resolves. Same producer the tracker
+        # export reads, so the two artifacts cannot describe different windows.
+        reference_blocks=(list(ref_blocks) if ref_blocks else None),
     )
 
 

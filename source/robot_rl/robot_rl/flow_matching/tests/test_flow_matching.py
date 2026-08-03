@@ -24,6 +24,7 @@ from robot_rl.flow_matching import (
     FKChain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
+    FutureStateDataset,
     Normalizer,
     build_train_val,
     fk_consistency_terms,
@@ -524,6 +525,85 @@ def test_dataset_snap_windows_build():
     assert tgt[:, 0, bp.start:bp.start + 3].norm(dim=-1).mean().item() < 0.15
 
 
+def _slim_cfg(F, **kw):
+    """A config for the three-block window the g1 teacher packs today."""
+    return FlowMatchingConfig(
+        num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
+        extero_source="height_scan", target_source="ego_anchored_clip_future",
+        val_fraction=0.34, seed=0, **kw,
+    )
+
+
+def test_dataset_defaults_the_selection_to_the_recording_teacher():
+    """An FM trained on a recording predicts what THAT teacher observed, by default.
+
+    The recorded arrays are world-frame rows, so any selection could be packed from them --
+    which is exactly why the width has to be pinned to something rather than left at "all
+    five". The generator's output is the policy's observation, so the only right answer is
+    the teacher's own window.
+    """
+    torch.manual_seed(0)
+    data, meta, nj, K, F, _ = _synthetic_recording()
+    slim = ["base_pose", "base_vel", "joint_pos"]
+    meta.reference_blocks = slim
+
+    cfg = _slim_cfg(F)
+    train, _ = build_train_val(data, meta, cfg)
+    d_slim = window_dim(nj, K, slim)
+    assert d_slim == 12 + nj < window_dim(nj, K)
+    assert cfg.reference_blocks == slim and cfg.state_dim == d_slim
+    assert train.state_dim == d_slim and tuple(train.blocks) == tuple(slim)
+    assert train[0]["state"].shape == (F, d_slim)
+    assert train[0]["history"].shape == (2, d_slim)
+    # The blocks that ARE packed carry the same numbers they would in the full window --
+    # dropping one changes the width, never the content of its neighbours.
+    meta.reference_blocks = None
+    full, _ = build_train_val(data, meta, _slim_cfg(F))
+    a = train.state_normalizer.denormalize(train.state)
+    b = full.state_normalizer.denormalize(full.state)
+    torch.testing.assert_close(a[..., :d_slim], b[..., :d_slim], atol=1e-5, rtol=1e-5)
+
+
+def test_dataset_disables_the_loss_terms_the_selection_cannot_support():
+    """A consistency weight whose blocks are gone is zeroed, not left to index a neighbour.
+
+    ``joint_vel_consistency`` ties joint_pos to joint_vel and ``fk_pose`` ties joint_pos to
+    ee_pos; with neither second block present there is nothing to relate, and the column
+    range each used to read now belongs to a different block entirely.
+    """
+    torch.manual_seed(0)
+    data, meta, nj, K, F, _ = _synthetic_recording()
+    meta.reference_blocks = ["base_pose", "base_vel", "joint_pos"]
+    cfg = _slim_cfg(F, joint_vel_consistency_weight=0.01, fk_pose_weight=0.01,
+                    vel_consistency_weight=0.01)
+    build_train_val(data, meta, cfg)
+    assert cfg.joint_vel_consistency_weight == 0.0
+    assert cfg.fk_pose_weight == 0.0
+    # base_pose + base_vel both survive, so the velocity term is still live.
+    assert cfg.vel_consistency_weight == 0.01
+
+
+def test_flow_loss_skips_the_terms_whose_blocks_are_absent():
+    """The second line of the same defence, for a caller assembling the kwargs itself."""
+    torch.manual_seed(0)
+    b, f, nj, k = 3, 5, 4, 2
+    slim = ("base_pose", "base_vel", "joint_pos")
+    d = window_dim(nj, k, slim)
+    model = FlowMatchingTransformer(
+        state_dim=d, future_len=f, num_history_states=2, history_dim=d, height_dim=6,
+        cmd_dim=0, d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
+    )
+    norm = Normalizer(torch.zeros(d), torch.ones(d), torch.ones(d, dtype=torch.bool))
+    out = flow_matching_loss(
+        model, torch.randn(b, f, d), torch.randn(b, 2, d), torch.randn(b, 6),
+        state_norm=norm, num_joints=nj, num_extra_frames=k, blocks=slim,
+        vel_weight=0.01, joint_vel_weight=0.01, fk_pose_weight=0.01, fk=object(),
+    )
+    assert "vel_consistency" in out                 # base_pose + base_vel are both there
+    assert "joint_vel_consistency" not in out       # no joint_vel block
+    assert "fk_pose" not in out                     # no ee_pos block
+
+
 def test_online_roundtrip():
     torch.manual_seed(0)
     data, meta, nj, K, F, state_dim = _synthetic_recording()
@@ -682,6 +762,54 @@ def test_orientation_past_the_branch_cut_is_rejected():
     bad["state"][:, 3:7] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
     with pytest.raises(ValueError, match="branch cut"):
         _built(bad, meta, F)
+
+
+def _wrap_stub(nj=4, k=2, dt=0.02):
+    """A bare dataset carrying only what ``_wrap_keep_mask`` reads."""
+    ds = object.__new__(FutureStateDataset)
+    ds.block_slices = window_block_slices(nj, k)
+    ds.cfg = FlowMatchingConfig(dt=dt)
+    return ds
+
+
+def _target_with_wraps(n_win, n_bad, f=8, nj=4, k=2):
+    """``(n_win, f, D)`` targets, ``n_bad`` of which cross the branch cut mid-horizon."""
+    d = window_dim(nj, k)
+    t = torch.zeros(n_win, f, d)
+    ori = window_block_slices(nj, k)["base_pose"].start + 3
+    t[:, :, ori] = 0.2                                   # everything else well inside
+    t[:n_bad, f // 2, ori] = 3.12                        # a wrap partway through
+    return t
+
+
+def test_a_few_wrapped_windows_are_dropped_not_fatal():
+    """One fast-spinning clip must not take the whole build down with it.
+
+    Measured on the depth_v5 recording: 4 windows in 181426 (0.002%), all from one clip,
+    wrapping at nodes 9-44. Shortening the horizon cannot help -- a window that wraps at
+    node 9 wraps at every future_len worth training -- so dropping is the only proportionate
+    response, and it has to be a per-window decision rather than a per-build one.
+    """
+    ds = _wrap_stub()
+    keep = ds._wrap_keep_mask(_target_with_wraps(1000, 4))
+    assert keep is not None
+    assert int((~keep).sum()) == 4 and keep[:4].sum() == 0 and keep[4:].all()
+
+
+def test_a_clean_recording_skips_the_filter_entirely():
+    """No wraps -> ``None``, so the common path does not copy every array."""
+    assert _wrap_stub()._wrap_keep_mask(_target_with_wraps(50, 0)) is None
+
+
+def test_widespread_wrapping_is_fatal_rather_than_filtered():
+    """Past the ceiling it is the horizon that is wrong, not the windows.
+
+    Dropping at that scale would quietly bias the dataset away from exactly the turns the
+    generator most needs to learn, and leave a model that cannot represent them.
+    """
+    ds = _wrap_stub()
+    with pytest.raises(ValueError, match="incompatible"):
+        ds._wrap_keep_mask(_target_with_wraps(100, 5))   # 5% > the 1% ceiling
 
 
 def test_unanchored_future_is_rejected():

@@ -149,6 +149,36 @@ def test_fm_meta_contract(tmp_path):
         _check_state_layout("stale.onnx", stale)
 
 
+def test_state_layout_guard_accepts_a_subset_but_not_an_incoherent_one():
+    """A window may drop blocks; what it may not do is misdescribe itself.
+
+    Which subset is the RIGHT one cannot be known from the generator alone -- that is
+    ``GenTrackerPolicy.load``'s job, where the tracker is also in hand. What IS checkable
+    here is internal coherence, and each failure below is one a shape check would miss:
+    an unknown name, the canonical order broken (the same names, a different vector), a
+    width that does not follow from ``(nj, K)``, and a ``D`` that contradicts the table.
+    """
+    nj, k = 5, 2
+    slim = ("base_pose", "base_vel", "joint_pos")
+    ok = {"nj": nj, "target_frame_names": ["a", "b"],
+          "window_blocks": [[n_, w] for n_, w in window_blocks(nj, k, slim)],
+          "D": window_dim(nj, k, slim)}
+    assert _check_state_layout("ok.onnx", ok) == slim
+
+    with pytest.raises(ValueError, match="unknown reference-window block"):
+        _check_state_layout("x.onnx", {**ok, "window_blocks": [["base_pose", 6], ["elbow", 3]]})
+    swapped = [[n_, w] for n_, w in window_blocks(nj, k, slim)][::-1]
+    with pytest.raises(ValueError, match="out of packing order"):
+        _check_state_layout("x.onnx", {**ok, "window_blocks": swapped})
+    bad_width = [[n_, w] for n_, w in window_blocks(nj, k, slim)]
+    bad_width[2] = [bad_width[2][0], nj + 1]
+    with pytest.raises(ValueError, match="widths"):
+        _check_state_layout("x.onnx", {**ok, "window_blocks": bad_width,
+                                       "D": sum(w for _, w in bad_width)})
+    with pytest.raises(ValueError, match="window_blocks sum"):
+        _check_state_layout("x.onnx", {**ok, "D": ok["D"] + 1})
+
+
 def test_fm_onnx_matches_torch(tmp_path):
     """The exported graph must reproduce the torch sampler it was traced from."""
     ort = pytest.importorskip("onnxruntime", exc_type=ImportError)

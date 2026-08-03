@@ -110,6 +110,15 @@ class RecordingMeta:
     """Control steps between snap (re-plan) events in this recording, from the command's
     ``fm_snap_every``. The FM tracker's ``fm_update_every`` must equal it -- the horizon is
     sized from the period and the targets were cut at that cadence. 0 = not recorded."""
+    reference_blocks: list[str] | None = None
+    """Reference-window blocks the RECORDING TEACHER's policy observed
+    (``mdp.reference_window_selection``), in packing order.
+
+    Not a property of the recorded arrays -- those are world-frame state rows, from which
+    any selection can be packed -- but of the teacher that produced them, and so the right
+    DEFAULT for the generator trained on this file: an FM must predict exactly the blocks
+    the policy it drives consumes. ``None`` for a recording written before the selection
+    existed, which is necessarily a full five-block one."""
 
 
 def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
@@ -275,6 +284,8 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         # Nested structure, so JSON rather than an array -- the file stays
         # ``allow_pickle=False`` loadable.
         depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
+        # Nullable list, so JSON for the same reason.
+        reference_blocks=np.array(json.dumps(meta.reference_blocks)),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -352,6 +363,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         height_scan_dim=int(z["height_scan_dim"]) if "height_scan_dim" in z.files else 0,
         depth_camera_spec=(
             json.loads(str(z["depth_camera_spec"])) if "depth_camera_spec" in z.files else None
+        ),
+        reference_blocks=(
+            json.loads(str(z["reference_blocks"])) if "reference_blocks" in z.files else None
         ),
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )

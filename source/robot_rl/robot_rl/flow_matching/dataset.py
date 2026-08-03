@@ -38,7 +38,7 @@ history distributions. ``cfg.null_cond_prob`` and the per-channel history noise
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import math
 
@@ -52,10 +52,80 @@ from .transforms import sanitize_extero
 from .window import (
     REFERENCE_WINDOW_NOISE,
     expand_window_blocks,
+    resolve_reference_blocks,
     window_block_slices,
     window_dim,
     world_to_window,
 )
+
+
+#: Orientation magnitude (radians) at which a window's ``base_pose`` target is treated as
+#: having crossed the ``quat_box_minus`` branch cut at pi. Just under pi, so a target that
+#: reaches it is within a rounding error of wrapping.
+WRAP_LIMIT_RAD: float = 3.0
+
+#: Largest share of windows that may be dropped for wrapping before the build gives up.
+#: A few is one fast-turning clip in the library; a material fraction means the horizon is
+#: too long for the library's yaw rate, or the representation is wrong for this data --
+#: and quietly training on what is left would hide that, having also biased the dataset
+#: away from exactly the turns the model most needs to learn.
+WRAP_DROP_CEILING: float = 0.01
+
+#: Loss weight -> the window blocks the term relates. A term whose blocks are not all
+#: selected has nothing to tie together, so :func:`resolve_block_selection` zeroes its
+#: weight rather than letting it index columns that are not there.
+_LOSS_TERM_BLOCKS: dict[str, tuple[str, ...]] = {
+    "vel_consistency_weight": ("base_pose", "base_vel"),
+    "accel_consistency_weight": ("base_vel",),
+    "joint_vel_consistency_weight": ("joint_pos", "joint_vel"),
+    "fk_pose_weight": ("joint_pos", "ee_pos"),
+}
+
+
+def resolve_block_selection(cfg: FlowMatchingConfig, meta: Any) -> tuple[str, ...]:
+    """Settle which window blocks this model predicts, and disable what they cannot support.
+
+    Order of authority: an explicit ``cfg.reference_blocks``, else the teacher that
+    produced the recording (``meta.reference_blocks``), else all five -- which is what a
+    recording predating the field necessarily was.
+
+    The selection is written back onto ``cfg`` so the checkpoint records what was actually
+    trained, and any consistency weight whose blocks are absent is zeroed here (with a
+    printed line). Leaving such a weight live is the failure this whole plumbing exists to
+    prevent: the term would index columns belonging to a different block and quietly
+    regularize toward nonsense.
+
+    Args:
+        cfg: The training config; ``reference_blocks`` and the loss weights are updated.
+        meta: Recording layout metadata (only ``reference_blocks`` is read).
+
+    Returns:
+        The selection in canonical packing order.
+    """
+    recorded = list(getattr(meta, "reference_blocks", None) or []) or None
+    requested = list(cfg.reference_blocks or []) or None
+    selected = resolve_reference_blocks(requested if requested is not None else recorded)
+    if requested is not None and recorded is not None and tuple(recorded) != selected:
+        # Legal -- the FM can be trained for a teacher other than the recorded one -- but
+        # it is the setup where a width mismatch bites at play time, so say it out loud.
+        print(f"[fm-data] reference_blocks={list(selected)} OVERRIDES the recording's "
+              f"teacher, which observed {recorded}. The generator will only drive a "
+              "policy whose reference_window packs the requested blocks.")
+    elif recorded is None and requested is None:
+        # Only on the FIRST resolution -- the val/eval datasets re-enter this with the
+        # selection already written back, and repeating the note would read as a fresh
+        # finding about a different recording.
+        print(f"[fm-data] the recording states no reference_blocks (it predates the "
+              f"field, so its teacher observed all five); using {list(selected)}.")
+    cfg.reference_blocks = list(selected)
+
+    for weight_name, needed in _LOSS_TERM_BLOCKS.items():
+        missing = [b for b in needed if b not in selected]
+        if missing and float(getattr(cfg, weight_name)) > 0.0:
+            print(f"[fm-data] {weight_name}={getattr(cfg, weight_name)} -> 0.0: it ties "
+                  f"{list(needed)} and this window has no {missing}.")
+            setattr(cfg, weight_name, 0.0)
+    return selected
 
 
 def resolve_term_slice(term_names: list[str], term_dims: list[int], target: str) -> tuple[int, int]:
@@ -103,6 +173,7 @@ def _rows_to_window(
     anchor_pos: torch.Tensor,
     anchor_quat: torch.Tensor,
     frame_names: list[str],
+    blocks: Sequence[str],
 ) -> torch.Tensor:
     """Turn recorded world-frame reference rows into window nodes.
 
@@ -118,16 +189,21 @@ def _rows_to_window(
             relative to.
         anchor_quat: ``(..., 4)`` measured robot base orientation (xyzw).
         frame_names: Ordered extra body-frame names.
+        blocks: The block selection to pack.
 
     Returns:
         ``(..., D)`` window nodes.
     """
+    # The recorded columns for a dropped block are read but never used, which costs one
+    # slice of an already-materialised array -- ``world_to_window`` does not compute the
+    # block itself. Reading them unconditionally keeps this mapping in one shape.
     return world_to_window(
         anchor_pos, anchor_quat,
         split_fn("root_pos_w"), split_fn("root_quat_w"),
         split_fn("root_link_lin_vel_w"), split_fn("root_link_ang_vel_w"),
         split_fn("joint_pos"), split_fn("joint_vel"),
         _stack_frame_positions(split_fn, frame_names),
+        blocks=blocks,
     )
 
 
@@ -207,8 +283,9 @@ class FutureStateDataset(Dataset):
         Args:
             data: Recorded arrays (``state``, ``ref_future``, ``cmd_future``).
             meta: Layout metadata (``state_term_names/dims``, ``state_frame_names``,
-                ``ref_future_term_names/dims``, ``ref_future_len``).
-            cfg: Config; ``state_dim``/``cmd_dim``/``history_dim`` written back here.
+                ``ref_future_term_names/dims``, ``ref_future_len``, ``reference_blocks``).
+            cfg: Config; ``reference_blocks``, ``state_dim``, ``cmd_dim``, ``history_dim``
+                and any unsupportable loss weight are written back here.
             windows: History-row windows (length ``N``) from :func:`snap_windows`.
             state_normalizer / cmd_normalizer / height_normalizer: reused on the val
                 split; fit on the train split when ``None``.
@@ -256,8 +333,12 @@ class FutureStateDataset(Dataset):
         recorded_frames = list(getattr(meta, "state_frame_names", []) or [])
         self.target_frame_names = list(recorded_frames)
         self.num_extra_frames = len(self.target_frame_names)
-        self.state_dim = window_dim(nj, self.num_extra_frames)
-        self.block_slices = window_block_slices(nj, self.num_extra_frames)
+        # Which blocks a node packs -- the teacher's selection, resolved from the recording
+        # unless the config names one. Everything downstream (D, the slices, the noise
+        # table, the losses, the export) derives from this one call.
+        self.blocks = resolve_block_selection(cfg, meta)
+        self.state_dim = window_dim(nj, self.num_extra_frames, self.blocks)
+        self.block_slices = window_block_slices(nj, self.num_extra_frames, self.blocks)
         cfg.state_dim = self.state_dim
         cfg.history_dim = self.state_dim
 
@@ -370,14 +451,29 @@ class FutureStateDataset(Dataset):
         # -- history: the emitted reference at lags n..1, each in its OWN step's frame --
         history = _rows_to_window(
             lambda name: hw_ref[..., s_slc[name][0]:s_slc[name][1]],
-            _p(hw_meas), _q(hw_meas), self.target_frame_names,
+            _p(hw_meas), _q(hw_meas), self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, n, D)
 
         # -- target: the F-node ego-anchored clip future, all in the snap robot's frame --
         target = _rows_to_window(
             lambda name: tw[..., s_slc[name][0]:s_slc[name][1]],
-            p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names,
+            p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, F, D)
+
+        # Drop the individual windows whose target crosses the pi branch cut, before
+        # anything is fitted to them. A handful is a property of the clip library (one
+        # fast-spinning clip sampled a few times), not of the recording; a large share is
+        # systemic and raises instead -- see :meth:`_drop_wrapped_windows`.
+        keep = self._wrap_keep_mask(target)
+        if keep is not None:
+            target, history = target[keep], history[keep]
+            p_anchor, q_anchor = p_anchor[keep], q_anchor[keep]
+            snap_ref, tw = snap_ref[keep], tw[keep]
+            k_np = keep.numpy()
+            if windowed:
+                sel = sel[k_np]
+            else:
+                snap_rows = snap_rows[k_np]
 
         self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
 
@@ -468,6 +564,62 @@ class FutureStateDataset(Dataset):
             if self.add_noise else None
         )
 
+    def _wrap_keep_mask(self, target: torch.Tensor) -> torch.Tensor | None:
+        """Which windows to keep, dropping those whose target crosses the branch cut.
+
+        ``base_pose``'s orientation half is a ``quat_box_minus`` log map, so it saturates
+        at pi: a reference that turns more than half a turn relative to the anchor
+        somewhere in the horizon WRAPS, and that node's target jumps discontinuously.
+        Such a window is not a hard example, it is an uninterpretable one -- no model can
+        fit both sides of the cut, and the same wrap reaches the policy's observation.
+
+        Dropping beats shortening the horizon, which is the remedy the wrap reads like it
+        wants: the turn can land at any node, so a window that wraps at node 9 wraps at
+        every ``future_len`` worth training. It also beats failing the build, at this
+        scale -- measured on the depth_v5 recording, 4 windows in 181426 (0.002%), all
+        from one fast-spinning clip.
+
+        What is NOT dropped quietly is a material fraction: past
+        :data:`WRAP_DROP_CEILING` the library's yaw rate and the horizon are simply
+        incompatible, and silently keeping the slow turns would bias the dataset away from
+        the turns the generator most needs.
+
+        Args:
+            target: ``(Nw, F, D)`` future window nodes, raw units.
+
+        Returns:
+            A ``(Nw,)`` bool mask, or ``None`` when every window is fine (the common case,
+            so the caller can skip the copy entirely).
+
+        Raises:
+            ValueError: If more than :data:`WRAP_DROP_CEILING` of the windows wrap.
+        """
+        if "base_pose" not in self.block_slices:
+            return None
+        start = self.block_slices["base_pose"].start
+        worst = target[..., start + 3:start + 6].norm(dim=-1).amax(dim=1)   # (Nw,)
+        keep = worst <= WRAP_LIMIT_RAD
+        n_drop = int((~keep).sum())
+        if n_drop == 0:
+            return None
+        frac = n_drop / keep.numel()
+        if frac > WRAP_DROP_CEILING:
+            raise ValueError(
+                f"{n_drop}/{keep.numel()} windows ({100 * frac:.2f}%) have a base_pose "
+                f"orientation target reaching {worst.max():.2f} rad, at or past the "
+                f"quat_box_minus branch cut at pi ({math.pi:.2f}) -- more than the "
+                f"{100 * WRAP_DROP_CEILING:.0f}% this drops quietly. Over F={target.shape[1]} "
+                f"nodes ({target.shape[1] * float(self.cfg.dt):.2f} s) that much of the "
+                "library turns more than half a turn relative to the anchor, so the horizon "
+                "and the library's yaw rate are incompatible: shorten future_len, or cap the "
+                "yaw rate when generating clips. Dropping this many would bias the dataset "
+                "away from precisely the turns the generator needs to learn."
+            )
+        print(f"[fm-data] dropping {n_drop}/{keep.numel()} windows ({100 * frac:.4f}%) whose "
+              f"base_pose orientation target crosses the pi branch cut (max "
+              f"{worst.max():.2f} rad); their targets are discontinuous, not merely hard.")
+        return keep
+
     def _check_window_invariants(
         self,
         target: torch.Tensor,
@@ -482,6 +634,11 @@ class FutureStateDataset(Dataset):
         Every one of these is silent: the arrays are the right shape and the loss converges
         either way, and the damage only shows up as a generator that steers oddly.
 
+        Guards 1, 2 and 4 read a block out of the packed window, so they are skipped when
+        the selection has dropped it. Guard 3 works on the RAW recorded rows and always
+        runs -- it is the one that pins the recorder's off-by-one, and it is worth having
+        whatever the window is packing.
+
         Args:
             target: ``(Nw, F, D)`` future window nodes.
             history: ``(Nw, N, D)`` autoregressive history nodes.
@@ -494,38 +651,38 @@ class FutureStateDataset(Dataset):
         Raises:
             ValueError: On a violated invariant.
         """
-        bp = self.block_slices["base_pose"]
-        pos0 = target[:, 0, bp.start:bp.start + 3]
-        ori = target[..., bp.start + 3:bp.start + 6]
+        if "base_pose" in self.block_slices:
+            bp = self.block_slices["base_pose"]
+            pos0 = target[:, 0, bp.start:bp.start + 3]
+            ori = target[..., bp.start + 3:bp.start + 6]
 
-        # 1. Node-0 ego anchor. The clip anchored at the snap sits on the robot, so node 0's
-        #    base_pose position is the (small) live tracking error. The paradigm assumes it:
-        #    the policy reads node 0 as "where the reference is right now".
-        node0_off = pos0.norm(dim=-1).mean().item()
-        if node0_off > 0.15:
-            raise ValueError(
-                f"target node-0 base position offset mean={node0_off:.3f} m (> 0.15): the "
-                "recorded ref_future is not ego-anchored onto the robot at the snap. "
-                "Re-record with ego_anchor_fraction=1.0 on the teacher command."
-            )
+            # 1. Node-0 ego anchor. The clip anchored at the snap sits on the robot, so
+            #    node 0's base_pose position is the (small) live tracking error. The
+            #    paradigm assumes it: the policy reads node 0 as "where the reference is
+            #    right now".
+            node0_off = pos0.norm(dim=-1).mean().item()
+            if node0_off > 0.15:
+                raise ValueError(
+                    f"target node-0 base position offset mean={node0_off:.3f} m (> 0.15): the "
+                    "recorded ref_future is not ego-anchored onto the robot at the snap. "
+                    "Re-record with ego_anchor_fraction=1.0 on the teacher command."
+                )
 
-        # 2. The pi branch cut. base_pose's orientation half is a quat_box_minus log-map
-        #    value, so it saturates at pi: a reference that turns more than half a turn
-        #    relative to the anchor over F nodes WRAPS, and the target gains a jump
-        #    discontinuity that neither the flow loss nor the policy can interpret. This is a
-        #    property of the representation, not of the model -- the same wrap reaches the
-        #    observation -- so it is worth knowing about before blaming training.
-        max_ori = ori.norm(dim=-1).max().item()
-        if max_ori > 3.0:
-            raise ValueError(
-                f"target base_pose orientation reaches {max_ori:.2f} rad (> 3.0), at or past "
-                f"the quat_box_minus branch cut at pi. Over F={f} nodes "
-                f"({f * float(self.cfg.dt):.2f} s) the reference turns more than half a turn "
-                "relative to the anchor. Shorten future_len or cap the clip library's yaw rate."
-            )
-        if max_ori > 2.0:
-            print(f"[WARN] target base_pose orientation reaches {max_ori:.2f} rad; the "
-                  f"quat_box_minus branch cut is at pi ({math.pi:.2f}).")
+            # 2. The pi branch cut -- a BACKSTOP. :meth:`_wrap_keep_mask` has already
+            #    dropped the windows that cross it (or raised if too many did), so this can
+            #    only fire if the two came apart. Kept because the failure it guards is
+            #    silent: a wrapped target is a jump discontinuity neither the flow loss nor
+            #    the policy can interpret, and the same wrap reaches the observation.
+            max_ori = ori.norm(dim=-1).max().item()
+            if max_ori > WRAP_LIMIT_RAD:
+                raise ValueError(
+                    f"target base_pose orientation reaches {max_ori:.2f} rad "
+                    f"(> {WRAP_LIMIT_RAD}) AFTER the wrap filter ran -- these two have "
+                    "drifted apart. _wrap_keep_mask should have dropped this window."
+                )
+            if max_ori > 2.0:
+                print(f"[WARN] target base_pose orientation reaches {max_ori:.2f} rad; the "
+                      f"quat_box_minus branch cut is at pi ({math.pi:.2f}).")
 
         # 3. History/target row alignment -- the highest-value guard here. ``history_ref``
         #    and ``ref_future`` come from different accessors (the per-step world cache vs
@@ -556,6 +713,8 @@ class FutureStateDataset(Dataset):
         #    18 rad/s joint covers 0.36 rad in a step all by itself), so any fixed tolerance
         #    is either loose on slow clips or wrong on fast ones. An off-by-k history shows
         #    up as a gap ~k times the one-step gap, which this catches at any joint speed.
+        if "joint_pos" not in self.block_slices:
+            return
         jp = self.block_slices["joint_pos"]
         one_step = (target[:, 1, jp] - target[:, 0, jp]).abs().mean().item()
         hist_gap = (history[:, -1, jp] - target[:, 0, jp]).abs().mean().item()
@@ -628,7 +787,8 @@ class FutureStateDataset(Dataset):
         measured state.
         """
         amp = torch.tensor(
-            expand_window_blocks(self.num_joints, self.num_extra_frames, REFERENCE_WINDOW_NOISE),
+            expand_window_blocks(self.num_joints, self.num_extra_frames,
+                                 REFERENCE_WINDOW_NOISE, self.blocks),
             dtype=self.state.dtype,
         )
         return (amp * self.cfg.noise_scale) / state_normalizer.std

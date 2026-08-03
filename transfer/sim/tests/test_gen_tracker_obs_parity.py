@@ -249,7 +249,12 @@ def test_obs_parity(run: str | None = None) -> None:
     wp.to_torch = lambda a: a if isinstance(a, torch.Tensor) else orig(a)
     try:
         isaac_terms = {
-            "reference_window": O.reference_window(env, "x", num_steps, stride),
+            # The BLOCKS come from the exported spec, not from the layout's default: a
+            # teacher may pack a subset, and defaulting here would build a 902-wide window
+            # to compare against the artifact's 451 -- restating the layout is the very
+            # drift this test exists to catch.
+            "reference_window": O.reference_window(
+                env, "x", num_steps, stride, blocks=[n for n, _ in spec["blocks"]]),
             "command_window": O.command_window(env, "x", num_steps, stride),
         }
     finally:

@@ -39,6 +39,7 @@ def _meta(W: int, H: int, F: int, K: int) -> RecordingMeta:
         ref_future_term_names=["root_pos_w", "root_quat_w", "joint_pos"],
         ref_future_term_dims=[3, 4, 3], height_scan_dim=K,
         format="windowed_h5", history_len=H,
+        reference_blocks=["base_pose", "base_vel", "joint_pos"],
     )
 
 
@@ -72,6 +73,10 @@ def test_writer_roundtrip_bit_exact():
         assert m2.format == "windowed_h5"
         assert m2.state_term_names == meta.state_term_names
         assert m2.state_frame_names == meta.state_frame_names
+        # The recording teacher's window selection: it is what the FM dataset resolves the
+        # generator's WIDTH from, so losing it in the round trip would silently train the
+        # next generator on all five blocks again.
+        assert m2.reference_blocks == meta.reference_blocks
         assert m2.content_sha256 == fingerprint_windows(arrs)
 
 

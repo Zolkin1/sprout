@@ -121,8 +121,12 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
             "stride": s,
             "offsets": offs,
             # [[block_name, width], ...] for ONE step; the term is these blocks
-            # concatenated, then the steps concatenated.
-            "blocks": [[name, int(width)] for name, width in mdp.reference_window_layout(cmd_term)],
+            # concatenated, then the steps concatenated. The term's OWN selection, not
+            # the full five: a teacher that drops a block observes a narrower window, and
+            # a generator paired with it has to predict exactly this list
+            # (checked in GenTrackerPolicy.load against fm_meta's window_blocks).
+            "blocks": [[name, int(width)] for name, width in mdp.reference_window_layout(
+                cmd_term, (ref_cfg.params or {}).get("blocks"))],
             # The window's joint blocks are in the ROBOT's own joint order (so they line
             # up elementwise with the joint_pos / joint_vel / actions proprioception
             # terms), NOT the `joint_out_names` order that joint_pos_ref used. Recorded

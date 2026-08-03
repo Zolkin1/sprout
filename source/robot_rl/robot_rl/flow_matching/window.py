@@ -355,32 +355,115 @@ def world_to_window(
     ref_p = ref_pos_w.reshape(flat, 3)
     ref_q = ref_quat_w.reshape(flat, 4)
 
-    # base_pose. NOTE the two halves disagree -- see the module docstring; this is the
-    # legacy convention, kept until the teacher can be retrained.
-    pos_err_b = quat_apply_inverse(act_q, ref_p - act_p)      # ref - actual, robot frame
-    ori_err_w = quat_box_minus(act_q, ref_q)                  # Log(R_act R_refT)
-    ori_err_b = quat_apply_inverse(act_q, ori_err_w)          # = Log(R_refT R_act)
+    def base_pose() -> torch.Tensor:
+        """``[pos_err, ori_err]`` in the anchor's frame -- the LEGACY mixed convention.
 
-    lin_b = quat_apply_inverse(act_q, ref_lin_w.reshape(flat, 3))
-    ang_b = quat_apply_inverse(act_q, ref_ang_w.reshape(flat, 3))
+        The two halves point opposite ways; see the module docstring.
+        """
+        pos_err_b = quat_apply_inverse(act_q, ref_p - act_p)  # ref - actual, robot frame
+        ori_err_w = quat_box_minus(act_q, ref_q)              # Log(R_act R_refT)
+        return torch.cat([pos_err_b, quat_apply_inverse(act_q, ori_err_w)], dim=-1)
 
-    # ee positions relative to THAT node's own reference base: posture, free of the
-    # tracking error that base_pose already carries.
-    num_ee = ee_pos_w.shape[-2]
-    ee_flat = ee_pos_w.reshape(flat, num_ee, 3)
-    ee_q = ref_q[:, None, :].expand(flat, num_ee, 4).reshape(-1, 4)
-    ee_rel = quat_apply_inverse(
-        ee_q, (ee_flat - ref_p[:, None, :]).reshape(-1, 3)
-    ).reshape(flat, num_ee * 3)
+    def base_vel() -> torch.Tensor:
+        """Reference base linear+angular velocity rotated into the anchor frame."""
+        return torch.cat([
+            quat_apply_inverse(act_q, ref_lin_w.reshape(flat, 3)),
+            quat_apply_inverse(act_q, ref_ang_w.reshape(flat, 3)),
+        ], dim=-1)
 
+    def ee_pos() -> torch.Tensor:
+        """EE positions relative to THAT node's own reference base.
+
+        Posture, free of the tracking error ``base_pose`` already carries.
+        """
+        num_ee = ee_pos_w.shape[-2]
+        ee_flat = ee_pos_w.reshape(flat, num_ee, 3)
+        ee_q = ref_q[:, None, :].expand(flat, num_ee, 4).reshape(-1, 4)
+        return quat_apply_inverse(
+            ee_q, (ee_flat - ref_p[:, None, :]).reshape(-1, 3)
+        ).reshape(flat, num_ee * 3)
+
+    # Each block is built ONLY if selected -- these are the largest phase of the env step
+    # on the observation side, and a dropped block should cost nothing.
     built = {
-        "base_pose": lambda: torch.cat([pos_err_b, ori_err_b], dim=-1),
-        "base_vel": lambda: torch.cat([lin_b, ang_b], dim=-1),
+        "base_pose": base_pose,
+        "base_vel": base_vel,
         "joint_pos": lambda: joint_pos.reshape(flat, -1),
         "joint_vel": lambda: joint_vel.reshape(flat, -1),
-        "ee_pos": lambda: ee_rel,
+        "ee_pos": ee_pos,
     }
     node = torch.cat([built[b]() for b in selected], dim=-1)
+    return node.reshape(tuple(node_shape) + (node.shape[-1],))
+
+
+def reanchor_window(
+    window: torch.Tensor,
+    old_pos_w: torch.Tensor,
+    old_quat_w: torch.Tensor,
+    new_pos_w: torch.Tensor,
+    new_quat_w: torch.Tensor,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """Re-express window nodes against a DIFFERENT anchor, block by block.
+
+    A window is relative to one measured robot pose; when the robot has moved on and the
+    same nodes must be served against where it is now, only the blocks that reference the
+    anchor need touching:
+
+    * ``base_pose`` -- reconstruct the node's world-frame reference base and difference it
+      against the new anchor (the one block that genuinely round-trips);
+    * ``base_vel`` -- a pure rotation ``R_newT R_old``, no position involved;
+    * ``joint_pos`` / ``joint_vel`` -- frame-invariant, copied;
+    * ``ee_pos`` -- relative to *that node's own* reference base, so anchor-invariant too,
+      copied.
+
+    Doing it per block rather than lifting the whole node to the world and back is what
+    makes this work for a block SELECTION at all: the world round trip needs every block
+    to be present on the way back, and a window that drops ``joint_vel`` or ``ee_pos``
+    cannot supply them.
+
+    Args:
+        window: ``[..., K, D]`` window nodes anchored on the old pose.
+        old_pos_w / old_quat_w: ``[..., 3]`` / ``[..., 4]`` anchor the nodes are in.
+        new_pos_w / new_quat_w: the anchor to express them against.
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection ``window`` is packed with; defaults to all of them.
+
+    Returns:
+        ``[..., K, D]`` nodes in the new anchor's frame, same layout.
+    """
+    selected = resolve_reference_blocks(blocks)
+    parts = split_window(window, num_joints, num_ee_frames, selected)
+    node_shape = window.shape[:-1]
+    flat = math.prod(node_shape)
+    old_p = _broadcast_anchor(old_pos_w, node_shape)
+    old_q = _broadcast_anchor(old_quat_w, node_shape)
+    new_p = _broadcast_anchor(new_pos_w, node_shape)
+    new_q = _broadcast_anchor(new_quat_w, node_shape)
+
+    out: list[torch.Tensor] = []
+    for name in selected:
+        block = parts[name]
+        if name == "base_pose":
+            # Up to the world through the old anchor, straight back down through the new.
+            # Both directions are the legacy mixed convention -- see the module docstring.
+            ref_p = old_p + quat_apply(old_q, block[..., 0:3].reshape(flat, 3))
+            ref_q = quat_box_plus(old_q, -quat_apply(old_q, block[..., 3:6].reshape(flat, 3)))
+            out.append(torch.cat([
+                quat_apply_inverse(new_q, ref_p - new_p),
+                quat_apply_inverse(new_q, quat_box_minus(new_q, ref_q)),
+            ], dim=-1))
+        elif name == "base_vel":
+            out.append(torch.cat([
+                quat_apply_inverse(new_q, quat_apply(old_q, block[..., 0:3].reshape(flat, 3))),
+                quat_apply_inverse(new_q, quat_apply(old_q, block[..., 3:6].reshape(flat, 3))),
+            ], dim=-1))
+        else:
+            out.append(block.reshape(flat, -1))
+    node = torch.cat(out, dim=-1)
     return node.reshape(tuple(node_shape) + (node.shape[-1],))
 
 

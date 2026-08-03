@@ -158,6 +158,23 @@ def test_deploy_parity_window():
     assert wn.window_blocks(nj, K) == [(n_, w) for n_, w in wt.window_blocks(nj, K)]
     assert wn.window_dim(nj, K) == wt.window_dim(nj, K) == win_t.shape[-1]
     assert wn.window_block_slices(nj, K) == wt.window_block_slices(nj, K)
+
+    # A teacher may pack a SUBSET, and both sides have to drop the same columns -- the
+    # deploy builds the clip-path window from its tracker's list, so a port that ignored
+    # the selection would hand the policy a differently-shaped (or differently-ordered)
+    # vector than the one it trained on.
+    slim = ("base_pose", "base_vel", "joint_pos")
+    slim_t = wt.world_to_window(act_p, act_q, ref_p, ref_q, ref_l, ref_a, jp, jv, ee,
+                                blocks=slim)
+    slim_np = wn.world_to_window(np_(act_p), np_(act_q), np_(ref_p), np_(ref_q), np_(ref_l),
+                                 np_(ref_a), np_(jp), np_(jv), np_(ee), blocks=slim)
+    _close("world_to_window[slim]", slim_np, slim_t, atol=1e-9)
+    assert wn.window_blocks(nj, K, slim) == [(n_, w) for n_, w in wt.window_blocks(nj, K, slim)]
+    assert wn.window_dim(nj, K, slim) == wt.window_dim(nj, K, slim) == slim_t.shape[-1]
+    assert wn.window_block_slices(nj, K, slim) == wt.window_block_slices(nj, K, slim)
+    # Naming the blocks out of order still packs them in canonical order, on both sides.
+    assert (wn.resolve_reference_blocks(("joint_pos", "base_pose", "base_vel"))
+            == wt.resolve_reference_blocks(("joint_pos", "base_pose", "base_vel")) == slim)
     print("WINDOW PARITY CHECKS PASSED")
 
 
