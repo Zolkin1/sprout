@@ -56,6 +56,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     sample_trajectory,
     snap_windows,
 )
+from robot_rl.flow_matching.ema import WeightEMA  # noqa: E402
 
 
 def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
@@ -186,6 +187,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     )
     parser.add_argument("--noise_scale", type=float, default=_dn.noise_scale,
                         help="Global multiplier on every noise amplitude.")
+    parser.add_argument(
+        "--ema_decay", type=float, default=0.999,
+        help="Exponential moving average of the weights, updated EVERY optimizer step and "
+             "saved into each checkpoint beside the raw ones (0 disables). Validation runs "
+             "through BOTH, logged as val/* and val_ema/*, so what EMA bought is visible in "
+             "the run rather than assumed -- and best.pt is selected on the EMA metric when "
+             "this is on, since the EMA weights are what would be deployed.",
+    )
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -481,6 +490,14 @@ def main() -> None:
             fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)
             _fk_sanity_check(fk, train_ds, num_joints, device)
 
+    # EMA of the weights. Built AFTER .to(device) so the shadow lives on the same device,
+    # and after any warning prints so the enable line lands next to them.
+    ema = None
+    if args.ema_decay > 0.0:
+        ema = WeightEMA(model, decay=args.ema_decay)
+        print(f"[INFO] weight EMA on, decay={args.ema_decay} (~{1/(1-args.ema_decay):.0f} "
+              f"step window, warmed in). best.pt will be selected on val_ema/flow_mse.")
+
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
@@ -525,6 +542,8 @@ def main() -> None:
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
+            if ema is not None:
+                ema.update(model)
             epoch_loss += out["loss"].item()
             n += 1
             global_step += 1
@@ -550,12 +569,28 @@ def main() -> None:
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             log_line += "  " + "  ".join(f"val_{k}={v:.4f}" for k, v in val.items())
-            if val["flow_mse"] < best_val:
-                best_val = val["flow_mse"]
+            # The same validation through the AVERAGED weights. Logged separately rather
+            # than replacing val/*, so a run answers "did EMA help?" on its own evidence.
+            val_ema = None
+            if ema is not None:
+                with ema.swapped_in(model):
+                    val_ema = evaluate(
+                        model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
+                        num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                    )
+                for k, v in val_ema.items():
+                    writer.add_scalar(f"val_ema/{k}", v, epoch)
+                log_line += "  " + "  ".join(f"valema_{k}={v:.4f}" for k, v in val_ema.items())
+            # Select on whichever weights would actually be deployed.
+            selector = val_ema["flow_mse"] if val_ema is not None else val["flow_mse"]
+            if selector < best_val:
+                best_val = selector
                 _save_ckpt(os.path.join(out_dir, "best.pt"), model, opt, cfg, train_ds, meta, epoch,
-                           data_path=data_path_abs, data_sha256=data_sha256)
+                           data_path=data_path_abs, data_sha256=data_sha256, ema=ema)
             if wandb_run is not None:
-                wandb_run.log({**{f"val/{k}": v for k, v in val.items()}, "epoch": epoch})
+                wandb_run.log({**{f"val/{k}": v for k, v in val.items()},
+                               **{f"val_ema/{k}": v for k, v in (val_ema or {}).items()},
+                               "epoch": epoch})
 
         if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             ev = evaluate(
@@ -572,7 +607,7 @@ def main() -> None:
         if wandb_run is not None:
             wandb_run.log({"train/loss_epoch": train_loss, "train/epoch_time_s": epoch_time, "epoch": epoch})
         if epoch % args.ckpt_every == 0 or epoch == cfg.num_epochs - 1:
-            _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch,
+            _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch, ema=ema,
                        data_path=data_path_abs, data_sha256=data_sha256)
 
     writer.close()
@@ -669,8 +704,13 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
     return ds
 
 
-def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_sha256="") -> None:
+def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_sha256="",
+               ema=None) -> None:
     """Save model weights, optimizer, config, normalizers, and dataset provenance.
+
+    When an EMA is running its shadow weights go in as ``model_ema`` ALONGSIDE the raw
+    ``model``, so one file serves either and nothing has to be decided at training time.
+    ``online.load_fm_context`` prefers ``model_ema`` when present.
 
     ``data_path``/``data_sha256`` record exactly which recorded dataset trained this
     checkpoint, so a ``.pt`` is self-describing without the separate params YAML.
@@ -699,6 +739,9 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     }
     if train_ds.cmd_normalizer is not None:
         ckpt["cmd_normalizer"] = train_ds.cmd_normalizer.state_dict()
+    if ema is not None:
+        ckpt["model_ema"] = ema.shadow
+        ckpt["ema_state"] = {k: v for k, v in ema.state_dict().items() if k != "shadow"}
     torch.save(ckpt, path)
 
 

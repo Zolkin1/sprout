@@ -217,6 +217,7 @@ def load_fm_context(
     map_location: str = "cpu",
     zero_noise: bool = False,
     guidance_scale: float = 1.0,
+    use_ema: bool = True,
 ) -> FmOnlineContext:
     """Load a flow-matching checkpoint into an inference-ready context.
 
@@ -231,6 +232,10 @@ def load_fm_context(
         map_location: ``torch.load`` map location when ``checkpoint`` is a path.
         zero_noise: Sample deterministically from ``x0 = 0`` (see :class:`FmOnlineContext`).
         guidance_scale: Classifier-free guidance weight over the history (1.0 = off).
+        use_ema: Load the averaged ``model_ema`` weights when the checkpoint has them
+            (the default, since they are what training selected ``best.pt`` on and what
+            would be deployed). Set False to inspect the raw weights instead. Checkpoints
+            written before the EMA existed have only raw weights and are unaffected.
 
     Returns:
         A populated :class:`FmOnlineContext`.
@@ -265,8 +270,15 @@ def load_fm_context(
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
     ).to(dev)
-    model.load_state_dict(ckpt["model"])
+    weights, which = ckpt["model"], "raw"
+    if use_ema and ckpt.get("model_ema") is not None:
+        weights, which = ckpt["model_ema"], "EMA"
+    model.load_state_dict(weights)
     model.eval()
+    if which == "EMA":
+        st = ckpt.get("ema_state") or {}
+        print(f"[INFO load_fm_context] using EMA weights (decay {st.get('decay', '?')}, "
+              f"{st.get('step', '?')} updates). Pass use_ema=False for the raw ones.")
 
     # A checkpoint predating the selector has no reference_blocks and was necessarily
     # trained on all five, which is what resolve_reference_blocks(None) returns.

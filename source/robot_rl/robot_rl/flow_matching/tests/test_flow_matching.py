@@ -823,3 +823,81 @@ def test_unanchored_future_is_rejected():
     bad["ref_future"][:, :, 0:3] += 5.0
     with pytest.raises(ValueError, match="ego-anchored"):
         _built(bad, meta, F)
+
+
+# ---------------------------------------------------------------------------
+# Weight EMA.
+# ---------------------------------------------------------------------------
+def _tiny_model(d=8):
+    """A minimal module with a float parameter and an integer buffer."""
+    m = torch.nn.Linear(d, d)
+    m.register_buffer("counter", torch.zeros(1, dtype=torch.long))
+    return m
+
+
+def test_ema_tracks_a_lagged_average_not_the_latest_weights():
+    """The whole point: the shadow is an AVERAGE of the trajectory, not a copy of it.
+
+    An EMA refreshed only when a checkpoint is written would equal the live weights, which
+    buys nothing -- so this pins that it lags, and that repeated updates pull it toward the
+    current value rather than snapping to it.
+    """
+    from robot_rl.flow_matching import WeightEMA
+    torch.manual_seed(0)
+    m = _tiny_model()
+    ema = WeightEMA(m, decay=0.9, warmup=False)
+    start = m.weight.detach().clone()
+
+    with torch.no_grad():
+        m.weight.add_(1.0)                      # a big step away from the start
+    ema.update(m)
+    # One update at decay 0.9 moves a tenth of the way, so it is neither the old nor the new.
+    assert torch.allclose(ema.shadow["weight"], start + 0.1, atol=1e-6)
+    for _ in range(80):
+        ema.update(m)
+    # Many updates with the weights held still converge onto them.
+    torch.testing.assert_close(ema.shadow["weight"], m.weight.detach(), atol=1e-3, rtol=0)
+
+
+def test_ema_warmup_avoids_being_dominated_by_the_initialisation():
+    """Without warmup the first ~1/(1-decay) steps are mostly the random init.
+
+    At decay 0.999 that is 1000 steps -- most of a short run -- so the ramp matters rather
+    than being a nicety.
+    """
+    from robot_rl.flow_matching import WeightEMA
+    m = _tiny_model()
+    warm, cold = WeightEMA(m, decay=0.999), WeightEMA(m, decay=0.999, warmup=False)
+    with torch.no_grad():
+        m.weight.add_(1.0)
+    warm.update(m)
+    cold.update(m)
+    moved_warm = (warm.shadow["weight"] - cold.shadow["weight"]).abs().mean()
+    assert moved_warm > 0.05, "warmup should track the live weights far faster at step 1"
+    assert warm.effective_decay() < warm.decay
+
+
+def test_ema_swapped_in_restores_the_raw_weights():
+    """Validation must not leave the trainer optimising the shadow copy."""
+    from robot_rl.flow_matching import WeightEMA
+    m = _tiny_model()
+    ema = WeightEMA(m, decay=0.5, warmup=False)
+    with torch.no_grad():
+        m.weight.add_(2.0)
+    ema.update(m)
+    raw = m.weight.detach().clone()
+    with ema.swapped_in(m):
+        assert not torch.allclose(m.weight, raw)          # EMA weights are installed
+    torch.testing.assert_close(m.weight.detach(), raw)     # and the raw ones come back
+
+
+def test_ema_copies_integer_buffers_rather_than_averaging_them():
+    """Averaging an index or a counter is meaningless, so those are copied through."""
+    from robot_rl.flow_matching import WeightEMA
+    m = _tiny_model()
+    ema = WeightEMA(m, decay=0.9, warmup=False)
+    with torch.no_grad():
+        m.counter.fill_(7)
+    ema.update(m)
+    assert ema.shadow["counter"].item() == 7
+    assert ema.shadow["counter"].dtype == torch.long

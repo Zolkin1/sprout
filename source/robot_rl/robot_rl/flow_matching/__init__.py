@@ -9,6 +9,7 @@ commanded-velocity profile, generating a future trajectory in the current root f
 """
 
 from .config import EXTERO_SOURCES, FlowMatchingConfig
+from .ema import WeightEMA
 from .dataset import (
     FutureStateDataset,
     build_train_val,
@@ -64,6 +65,7 @@ from .window import (
 
 __all__ = [
     "FlowMatchingConfig",
+    "WeightEMA",
     "EXTERO_SOURCES",
     "FlowMatchingTransformer",
     "FutureStateDataset",
