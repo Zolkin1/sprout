@@ -33,9 +33,15 @@ import numpy as np
 from .depth_obs import assert_depth_specs_agree
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_box_minus, quat_box_plus, quat_inv
+from .quat_math_np import quat_apply, quat_inv, quat_mul
 from .tracker_session import TrackerSession
-from .window_np import reanchor_window, window_block_slices, window_dim, world_to_window
+from .window_np import (
+    reanchor_window,
+    rot6d_to_quat,
+    window_block_slices,
+    window_dim,
+    world_to_window,
+)
 
 # Fallback clips for artifacts exported before the obs terms carried their own ``clip``
 # (``export_parameters.py`` now emits it per term, and the metadata value wins). Anything
@@ -43,9 +49,10 @@ from .window_np import reanchor_window, window_block_slices, window_dim, world_t
 _LEGACY_TERM_CLIP = {"actions": 20.0, "height_scan": 1.0}
 
 # The ``base_pose`` convention this runtime implements, checked against the tracker's
-# exported ``reference_window_spec``. See ``robot_rl.flow_matching.window`` for what the
-# two halves mean and why the pairing is worth pinning: it is invisible in the obs shape.
-_BASE_POSE_CONVENTION = "legacy_mixed_pos_ref_minus_actual_ori_actual_minus_ref"
+# exported ``reference_window_spec``. See ``robot_rl.flow_matching.window``: the block is
+# ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]``. Worth pinning because the SIGN of the
+# orientation half is invisible in the obs shape.
+_BASE_POSE_CONVENTION = "pose_in_anchor_frame_pos_ref_minus_actual_ori_rot6d"
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -374,13 +381,23 @@ class GenTrackerPolicy:
             )
         self.window_offsets = [int(o) for o in ref_spec["offsets"]]
 
-        # The one thing about this term that a shape check cannot catch. ``base_pose``
-        # mixes its two halves -- position ref-minus-actual in the robot frame, orientation
-        # actual-minus-ref in the REFERENCE frame -- and a tracker trained under either
-        # convention loads clean against the other: same width, same everything, and it
-        # simply steers wrong. Absent on artifacts exported before the key existed, which
-        # were all trained under this same (legacy) convention, so those are accepted.
-        convention = ref_spec.get("base_pose_convention", _BASE_POSE_CONVENTION)
+        # The one thing about this term that a shape check cannot catch: which way round
+        # ``base_pose``'s orientation half points. A tracker trained under the other
+        # convention loads clean -- same width, same everything -- and simply steers wrong.
+        #
+        # REQUIRED, not defaulted. It used to fall back to this runtime's own value for
+        # artifacts exported before the key existed, which was safe only while there was one
+        # convention in history; now that the sign has actually changed, that default would
+        # wave through every pre-key artifact as if it agreed.
+        convention = ref_spec.get("base_pose_convention")
+        if convention is None:
+            raise ValueError(
+                "tracker.onnx reference_window_spec carries no base_pose_convention. It "
+                "predates the key, so it was exported under the legacy mixed convention "
+                f"(position ref-minus-actual, orientation actual-minus-ref) and not "
+                f"{_BASE_POSE_CONVENTION!r}. Re-export from the training run if the policy "
+                "was trained under this runtime's convention; retrain if it was not."
+            )
         if convention != _BASE_POSE_CONVENTION:
             raise ValueError(
                 f"tracker.onnx reference_window base_pose_convention is {convention!r}, but "
@@ -678,7 +695,7 @@ class GenTrackerPolicy:
         Returns:
             ``([F, 3] positions, [F, 4] xyzw orientations)``, or ``None`` when there is no
             live prediction yet or the window has no ``base_pose`` block to invert. The
-            quaternions come back sign-normalised (see :func:`quat_box_plus`).
+            quaternions come back sign-normalised (see :func:`quat_from_matrix`).
         """
         if not self._pred_valid:
             return None
@@ -687,10 +704,12 @@ class GenTrackerPolicy:
         ).get("base_pose")
         if sl is None:
             return None
-        block = self._pred[0, :, sl]                                          # [F,6]
+        block = self._pred[0, :, sl]                                          # [F,9]
         q = np.broadcast_to(self._anchor_quat, (block.shape[0], 4))
         ref_p = self._anchor_pos + quat_apply(q, block[:, 0:3])
-        ref_q = quat_box_plus(q, -quat_apply(q, block[:, 3:6]))
+        # R_ref = R_act (R_actT R_ref); the 6D pair has to become a matrix here, so this is
+        # where Gram-Schmidt runs (inside rot6d_to_quat).
+        ref_q = quat_mul(q, rot6d_to_quat(block[:, 3:9]))
         return ref_p, ref_q
 
     def predicted_root_path_w(self) -> np.ndarray | None:
@@ -740,9 +759,9 @@ class GenTrackerPolicy:
     def _reference_window(self, window: list[dict], root_pos, root_quat) -> np.ndarray:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
 
-        Per step, in ``reference_window_layout`` order: ``base_pose`` (6) -- reference
-        base position + orientation error against the robot's CURRENT actual base, both
-        halves REFERENCE MINUS ACTUAL and both in the robot's base frame; ``base_vel``
+        Per step, in ``reference_window_layout`` order: ``base_pose`` (9) -- the reference
+        base pose in the robot's CURRENT actual base frame, position ``ref - actual`` (3)
+        plus ``R_actT R_ref`` as a 6D rotation (6); ``base_vel``
         (6) -- reference base lin+ang velocity rotated into that same current base frame;
         ``joint_pos`` / ``joint_vel`` (nj each) -- **in the robot's own joint order**, so
         they line up elementwise with the proprioception terms; ``ee_pos`` (3 per frame)

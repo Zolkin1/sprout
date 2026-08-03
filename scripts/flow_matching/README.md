@@ -3,7 +3,7 @@
 # Flow-Matching Workflow
 
 A conditional flow-matching transformer that predicts the teacher's **`reference_window`
-observation vector directly** — up to `[base_pose(6), base_vel(6), joint_pos(nj),
+observation vector directly** — up to `[base_pose(9), base_vel(6), joint_pos(nj),
 joint_vel(nj), ee_pos(3K)]` per node — from **its own recent output + exteroception + a
 velocity command**.
 
@@ -14,7 +14,7 @@ Two things follow from that, and they are the point of the design:
   `robot_rl/flow_matching/window.py`, shared by the observation, the dataset and the
   torch-free deploy port so it cannot drift between them.
 - **It predicts exactly the blocks that teacher observes**, not always all five. The g1
-  teacher packs `(base_pose, base_vel, joint_pos)` today → `D = 41` (`451` over the
+  teacher packs `(base_pose, base_vel, joint_pos)` today → `D = 44` (`572` over the
   11-sample window), and the FM resolves the same selection from the recording
   (`RecordingMeta.reference_blocks`) rather than assuming the full `D = 82`. A dropped
   block also drops the loss terms that index it, and the agreement is checked where both

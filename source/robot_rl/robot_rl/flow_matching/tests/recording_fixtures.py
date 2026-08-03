@@ -39,7 +39,7 @@ def _small_quats(rng: np.random.Generator, t: int, tilt: float = 0.08) -> np.nda
         tilt: Scale of the rotation-vector random walk.
 
     Returns:
-        Near-upright unit quaternions, well inside the ``quat_box_minus`` branch cut.
+        Near-upright unit quaternions.
     """
     axis = np.cumsum(rng.standard_normal((t, 3)) * tilt * 0.1, axis=0) * tilt
     return _unit(np.concatenate([axis, np.ones((t, 1))], axis=-1))

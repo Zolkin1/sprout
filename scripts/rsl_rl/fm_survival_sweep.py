@@ -186,7 +186,12 @@ class Teacher:
 TEACHER = Teacher(
     run="2026-08-01_08-49-20_depth_v5_refslim",
     checkpoint="model_12000.pt",
-    note="12000 it, body-mode depth teacher, 41/node (451) reference window. Trained on talos.",
+    note="12000 it, body-mode depth teacher, 41/node (451) reference window. Trained on talos. "
+         "PREDATES the reference-window rework (base_pose 6 -> 9 with the sign unified, and "
+         "13 sample offsets instead of 11), so it and every generator below are 41/node and "
+         "will be REFUSED at load: play.py raises on the base_pose_convention mismatch. Kept "
+         "as the record of what the 200-env table was measured on; register the retrained "
+         "teacher and its generators alongside rather than editing these.",
 )
 
 

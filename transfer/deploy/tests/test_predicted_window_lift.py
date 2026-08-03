@@ -30,7 +30,7 @@ from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # n
 from deploy.quat_math_np import (  # noqa: E402
     quat_box_minus, quat_box_plus, quat_from_axis_angle, quat_unique,
 )
-from deploy.window_np import world_to_window  # noqa: E402
+from deploy.window_np import matrix_from_quat, window_dim, world_to_window  # noqa: E402
 
 NJ, K, F = 29, 4, 7
 SLIM = ("base_pose", "base_vel", "joint_pos")
@@ -39,6 +39,16 @@ SLIM = ("base_pose", "base_vel", "joint_pos")
 def _unit(a: np.ndarray) -> np.ndarray:
     """Normalise along the last axis."""
     return a / np.linalg.norm(a, axis=-1, keepdims=True)
+
+
+def _rot_err(got: np.ndarray, want: np.ndarray) -> float:
+    """Largest elementwise difference between two quaternion sets AS ROTATIONS.
+
+    ``q`` and ``-q`` are the same rotation, and the lift returns whichever sign
+    ``quat_from_matrix`` produces, so raw components cannot be compared. (The old log-map
+    lift went through ``quat_box_plus``, which sign-normalised, and could be.)
+    """
+    return float(np.abs(matrix_from_quat(got) - matrix_from_quat(want)).max())
 
 
 def _policy(pred: np.ndarray, blocks, valid: bool = True, anchor=None,
@@ -138,8 +148,7 @@ def test_lift_recovers_the_world_reference_pose_exactly():
     got_p, got_q = pol.predicted_base_pose_w()
     assert got_p.shape == (F, 3) and got_q.shape == (F, 4)
     assert np.abs(got_p - ref_p).max() < 1e-12
-    # quat_box_plus sign-normalises, so compare rotations rather than raw components.
-    assert np.abs(got_q - quat_unique(ref_q)).max() < 1e-12
+    assert _rot_err(got_q, ref_q) < 1e-12
 
 
 def test_root_path_is_the_position_half_of_the_pose():
@@ -167,7 +176,7 @@ def test_lift_matches_the_torch_window_to_world_it_mirrors():
     out = win.window_to_world(t(pred[0]), t(anchor_p), t(anchor_q), NJ, K, blocks=SLIM)
     got_p, got_q = _policy(pred, SLIM, anchor=(anchor_p, anchor_q)).predicted_base_pose_w()
     assert np.abs(got_p - out["base_pos_w"].numpy()).max() < 1e-12
-    assert np.abs(got_q - out["base_quat_w"].numpy()).max() < 1e-12
+    assert _rot_err(got_q, out["base_quat_w"].numpy()) < 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +184,7 @@ def test_lift_matches_the_torch_window_to_world_it_mirrors():
 # ---------------------------------------------------------------------------
 def test_lift_is_none_before_the_first_prediction():
     """The viewer draws nothing rather than a ribbon of zeros during warmup."""
-    pol = _policy(np.zeros((1, F, 41)), SLIM, valid=False)
+    pol = _policy(np.zeros((1, F, window_dim(NJ, K, SLIM))), SLIM, valid=False)
     assert pol.predicted_base_pose_w() is None
     assert pol.predicted_root_path_w() is None
     assert pol.predicted_joint_pos() is None
@@ -216,7 +225,7 @@ def test_lift_finds_its_blocks_at_every_selection_width(blocks):
     pol = _policy(pred, blocks, anchor=(anchor_p, anchor_q))
     got_p, got_q = pol.predicted_base_pose_w()
     assert np.abs(got_p - ref_p).max() < 1e-12
-    assert np.abs(got_q - quat_unique(ref_q)).max() < 1e-12
+    assert _rot_err(got_q, ref_q) < 1e-12
     if "joint_pos" in blocks:
         assert np.abs(pol.predicted_joint_pos() - jp).max() < 1e-12
 

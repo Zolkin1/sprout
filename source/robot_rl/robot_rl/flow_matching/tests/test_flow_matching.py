@@ -36,10 +36,12 @@ from robot_rl.flow_matching import (
     matrix_to_rot6d,
     orientation_slice,
     orientation_slices,
+    project_window_rotations,
     quat_to_rot6d,
     relative_state,
     relative_state_from_window,
     rot6d_to_matrix,
+    reanchor_window,
     rot6d_to_quat,
     sample_flow_batch,
     sample_trajectory,
@@ -50,8 +52,11 @@ from robot_rl.flow_matching import (
     target_state_dim,
     window_block_slices,
     window_dim,
+    window_to_world,
+    world_to_window,
     yaw_quat,
 )
+from isaaclab.utils.math import quat_conjugate, quat_mul
 from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
 from robot_rl.flow_matching.online import (
     build_cmd_tokens,
@@ -92,6 +97,105 @@ def test_rot6d_orthonormal_from_garbage():
     eye = torch.eye(3, dtype=torch.float64).expand_as(r)
     assert torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-6)
     assert torch.allclose(torch.linalg.det(r), torch.ones(100, dtype=torch.float64), atol=1e-6)
+
+
+def _window_case(seed: int, nf: int = 5, nj: int = 4, k: int = 2):
+    """A random anchor + world reference path, and the window that encodes it."""
+    g = torch.Generator().manual_seed(seed)
+
+    def rq(n: int) -> torch.Tensor:
+        """``n`` random unit quaternions (xyzw)."""
+        q = torch.randn(n, 4, generator=g, dtype=torch.float64)
+        return q / q.norm(dim=-1, keepdim=True)
+
+    n = 3
+    ap, aq = torch.randn(n, 3, generator=g, dtype=torch.float64), rq(n)
+    rp, rqq = torch.randn(n, nf, 3, generator=g, dtype=torch.float64), rq(n * nf).view(n, nf, 4)
+    win = world_to_window(
+        ap[:, None, :], aq[:, None, :], rp, rqq,
+        torch.randn(n, nf, 3, generator=g, dtype=torch.float64),
+        torch.randn(n, nf, 3, generator=g, dtype=torch.float64),
+        torch.randn(n, nf, nj, generator=g, dtype=torch.float64),
+        torch.randn(n, nf, nj, generator=g, dtype=torch.float64),
+        torch.randn(n, nf, k, 3, generator=g, dtype=torch.float64),
+    )
+    return (ap, aq, rp, rqq, win, nj, k)
+
+
+def test_base_pose_encodes_the_reference_pose_in_the_anchor_frame():
+    """``base_pose[3:9]`` decodes to ``R_actT R_ref`` -- the SIGN, pinned independently.
+
+    Asserted against a directly-built relative rotation rather than through the window's own
+    inverse, which would agree with any consistent sign. Together with
+    ``BASE_POSE_CONVENTION`` this is what stops the orientation half being flipped back by
+    accident: the width would not change, so a stale policy would load clean.
+    """
+    ap, aq, rp, rqq, win, nj, k = _window_case(0)
+    n, nf = rqq.shape[:2]
+    slc = window_block_slices(nj, k)["base_pose"]
+    want = matrix_from_quat(
+        quat_mul(quat_conjugate(aq[:, None, :].expand(n, nf, 4).reshape(-1, 4)),
+                 rqq.reshape(-1, 4))
+    )
+    got = rot6d_to_matrix(win[..., slc.start + 3:slc.start + 9].reshape(-1, 6))
+    assert torch.allclose(got, want, atol=1e-10)
+
+
+def test_window_to_world_inverts_world_to_window():
+    """Forward then inverse returns the world reference it started from."""
+    ap, aq, rp, rqq, win, nj, k = _window_case(1)
+    back = window_to_world(win, ap[:, None, :], aq[:, None, :], nj, k)
+    assert torch.allclose(back["base_pos_w"], rp, atol=1e-10)
+    # Compare ROTATIONS: the inverse goes through quat_from_matrix, which fixes the sign, so
+    # a quaternion may come back negated -- the same rotation.
+    assert torch.allclose(matrix_from_quat(back["base_quat_w"].reshape(-1, 4)),
+                          matrix_from_quat(rqq.reshape(-1, 4)), atol=1e-10)
+
+
+def test_reanchor_preserves_the_world_reference():
+    """Re-anchoring is a change of frame, not of content -- for BOTH halves of base_pose.
+
+    The orientation half is where this could go wrong quietly: it does not round-trip
+    through the world like the position half does, but rotates its two stored columns by the
+    anchor delta (``R_newT R_ref = (R_newT R_old)(R_oldT R_ref)``). That identity holds only
+    because the block IS those columns, so it is worth pinning against an independent lift.
+    Nothing else covers it -- the tracker's own re-anchor test checks the position half only.
+    """
+    ap, aq, rp, rqq, win, nj, k = _window_case(2)
+    g = torch.Generator().manual_seed(99)
+    n = ap.shape[0]
+    np_, nq = torch.randn(n, 3, generator=g, dtype=torch.float64), torch.randn(
+        n, 4, generator=g, dtype=torch.float64)
+    nq = nq / nq.norm(dim=-1, keepdim=True)
+
+    moved = reanchor_window(win, ap[:, None, :], aq[:, None, :],
+                            np_[:, None, :], nq[:, None, :], nj, k)
+    back = window_to_world(moved, np_[:, None, :], nq[:, None, :], nj, k)
+    assert torch.allclose(back["base_pos_w"], rp, atol=1e-10)
+    assert torch.allclose(matrix_from_quat(back["base_quat_w"].reshape(-1, 4)),
+                          matrix_from_quat(rqq.reshape(-1, 4)), atol=1e-10)
+
+
+def test_project_window_rotations_is_idempotent_and_fixes_garbage():
+    """The generator's output projection: exact on rotations, valid on anything else."""
+    ap, aq, rp, rqq, win, nj, k = _window_case(3)
+    slc = window_block_slices(nj, k)["base_pose"]
+    ori = slice(slc.start + 3, slc.start + 9)
+
+    # A window built from real quaternions is already on the manifold, so projecting is a
+    # no-op -- otherwise the projection would be silently perturbing honest references.
+    assert torch.allclose(project_window_rotations(win, nj, k), win, atol=1e-10)
+
+    # A raw 9-vector is not a rotation; after projecting, it is.
+    garbage = win.clone()
+    garbage[..., ori] = torch.randn_like(garbage[..., ori])
+    fixed = project_window_rotations(garbage, nj, k)
+    r = rot6d_to_matrix(fixed[..., ori].reshape(-1, 6))
+    eye = torch.eye(3, dtype=r.dtype).expand_as(r)
+    assert torch.allclose(r.transpose(-1, -2) @ r, eye, atol=1e-10)
+    # ...and every other channel is untouched.
+    assert torch.equal(fixed[..., :ori.start], garbage[..., :ori.start])
+    assert torch.equal(fixed[..., ori.stop:], garbage[..., ori.stop:])
 
 
 # ---------------------------------------------------------------------------
@@ -311,17 +415,18 @@ def test_so3_log_recovers_rotation_vector():
 def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> torch.Tensor:
     """Self-consistent ``(1, F, D)`` window: base_pose integrates base_vel.
 
-    ``base_pose[0:3]`` ramps at ``base_vel[0:3]``, and ``base_pose[3:6]`` is the rotation
-    vector of a constant-``omega`` rotation, so
-    ``Log(Exp(e_{t+1})T Exp(e_t)) / dt == omega == base_vel[3:6]`` exactly. Both hold
-    because every node shares one anchor -- that is the property the consistency loss
-    relies on.
+    ``base_pose[0:3]`` ramps at ``base_vel[0:3]``, and ``base_pose[3:9]`` is the 6D
+    representation of a constant-``omega`` rotation ``R_t = Exp(omega * t * dt)``, so
+    ``Log(R_{t+1} R_tT) / dt == omega == base_vel[3:6]`` exactly. Both hold because every
+    node shares one anchor -- that is the property the consistency loss relies on.
 
-    The orientation ramp is NEGATIVE because ``base_pose[3:6]`` is currently
-    ``Log(R_refT R_act)`` (see ``window.BASE_POSE_CONVENTION``): a reference turning at
-    ``+omega`` away from the anchor makes that log map run the other way. Unifying the
-    base_pose sign flips this line and the transpose in ``frame_consistency_terms``
-    together.
+    The orientation ramp is POSITIVE: ``base_pose[3:9]`` encodes ``R_actT R_ref``, so a
+    reference turning at ``+omega`` relative to the anchor turns the block the same way. It
+    used to be negated, back when the block was ``Log(R_refT R_act)``; that sign and the
+    transpose in ``frame_consistency_terms`` moved together.
+
+    Offsets come from the layout rather than being written out, since ``base_pose`` is now 9
+    wide and ``base_vel`` no longer starts at 6.
 
     The ee block is position-only, so it carries nothing to tie and is a plain ramp.
     """
@@ -329,14 +434,15 @@ def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> to
     blocks = window_block_slices(nj, k)
     x = torch.zeros(1, nf, window_dim(nj, k), dtype=torch.float64)
 
+    bp, bv = blocks["base_pose"].start, blocks["base_vel"].start
     pos0 = torch.randn(3, generator=g, dtype=torch.float64)
     vel = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
     omega = torch.randn(3, generator=g, dtype=torch.float64) * 0.5
     for t in range(nf):
-        x[0, t, 0:3] = pos0 + vel * (t * dt)
-        x[0, t, 3:6] = -omega * (t * dt)    # rotation VECTOR; so3_exp turns it into R
-        x[0, t, 6:9] = vel
-        x[0, t, 9:12] = omega
+        x[0, t, bp:bp + 3] = pos0 + vel * (t * dt)
+        x[0, t, bp + 3:bp + 9] = matrix_to_rot6d(_rodrigues((omega * (t * dt))[None, :]))[0]
+        x[0, t, bv:bv + 3] = vel
+        x[0, t, bv + 3:bv + 6] = omega
 
     ee = blocks["ee_pos"]
     for kf in range(k):
@@ -550,7 +656,7 @@ def test_dataset_defaults_the_selection_to_the_recording_teacher():
     cfg = _slim_cfg(F)
     train, _ = build_train_val(data, meta, cfg)
     d_slim = window_dim(nj, K, slim)
-    assert d_slim == 12 + nj < window_dim(nj, K)
+    assert d_slim == 15 + nj < window_dim(nj, K)   # base_pose(9) + base_vel(6) + nj
     assert cfg.reference_blocks == slim and cfg.state_dim == d_slim
     assert train.state_dim == d_slim and tuple(train.blocks) == tuple(slim)
     assert train[0]["state"].shape == (F, d_slim)
@@ -746,70 +852,6 @@ def test_misaligned_reference_ring_is_rejected():
     bad["ref_state"] = np.roll(bad["ref_state"], 1, axis=0)
     with pytest.raises(ValueError, match="history_ref\\[H-1\\] != ref_future\\[0\\]"):
         _built(bad, meta, F)
-
-
-def test_orientation_past_the_branch_cut_is_rejected():
-    """base_pose's orientation half saturates at pi; a wrap has to be caught at build.
-
-    It would otherwise put a jump discontinuity in both the regression target and the
-    policy's observation.
-    """
-    torch.manual_seed(0)
-    data, meta, _, _, F, _ = _synthetic_recording()
-    bad = {k: v.copy() for k, v in data.items()}
-    # Turn the measured robot 180 deg away from the reference: quat (x,y,z,w) = (0,0,1,0).
-    bad["state"] = bad["state"].copy()
-    bad["state"][:, 3:7] = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
-    with pytest.raises(ValueError, match="branch cut"):
-        _built(bad, meta, F)
-
-
-def _wrap_stub(nj=4, k=2, dt=0.02):
-    """A bare dataset carrying only what ``_wrap_keep_mask`` reads."""
-    ds = object.__new__(FutureStateDataset)
-    ds.block_slices = window_block_slices(nj, k)
-    ds.cfg = FlowMatchingConfig(dt=dt)
-    return ds
-
-
-def _target_with_wraps(n_win, n_bad, f=8, nj=4, k=2):
-    """``(n_win, f, D)`` targets, ``n_bad`` of which cross the branch cut mid-horizon."""
-    d = window_dim(nj, k)
-    t = torch.zeros(n_win, f, d)
-    ori = window_block_slices(nj, k)["base_pose"].start + 3
-    t[:, :, ori] = 0.2                                   # everything else well inside
-    t[:n_bad, f // 2, ori] = 3.12                        # a wrap partway through
-    return t
-
-
-def test_a_few_wrapped_windows_are_dropped_not_fatal():
-    """One fast-spinning clip must not take the whole build down with it.
-
-    Measured on the depth_v5 recording: 4 windows in 181426 (0.002%), all from one clip,
-    wrapping at nodes 9-44. Shortening the horizon cannot help -- a window that wraps at
-    node 9 wraps at every future_len worth training -- so dropping is the only proportionate
-    response, and it has to be a per-window decision rather than a per-build one.
-    """
-    ds = _wrap_stub()
-    keep = ds._wrap_keep_mask(_target_with_wraps(1000, 4))
-    assert keep is not None
-    assert int((~keep).sum()) == 4 and keep[:4].sum() == 0 and keep[4:].all()
-
-
-def test_a_clean_recording_skips_the_filter_entirely():
-    """No wraps -> ``None``, so the common path does not copy every array."""
-    assert _wrap_stub()._wrap_keep_mask(_target_with_wraps(50, 0)) is None
-
-
-def test_widespread_wrapping_is_fatal_rather_than_filtered():
-    """Past the ceiling it is the horizon that is wrong, not the windows.
-
-    Dropping at that scale would quietly bias the dataset away from exactly the turns the
-    generator most needs to learn, and leave a model that cannot represent them.
-    """
-    ds = _wrap_stub()
-    with pytest.raises(ValueError, match="incompatible"):
-        ds._wrap_keep_mask(_target_with_wraps(100, 5))   # 5% > the 1% ceiling
 
 
 def test_unanchored_future_is_rejected():

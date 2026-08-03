@@ -29,7 +29,12 @@ from .flow import sample_trajectory
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import sanitize_extero
-from .window import REFERENCE_WINDOW_BLOCK_NAMES, resolve_reference_blocks, window_dim
+from .window import (
+    REFERENCE_WINDOW_BLOCK_NAMES,
+    project_window_rotations,
+    resolve_reference_blocks,
+    window_dim,
+)
 
 
 # ----------------------------------------------------------------------
@@ -420,4 +425,10 @@ def sample_window(
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
                                  guidance_scale=ctx.guidance_scale)
-    return ctx.state_norm.denormalize(pred_std)
+    # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
+    # served window is both a reference pose and the next step's history token. The exported
+    # ONNX module does the same, so sim and deploy agree.
+    return project_window_rotations(
+        ctx.state_norm.denormalize(pred_std),
+        ctx.nj, ctx.target_num_extra_frames, ctx.reference_blocks,
+    )

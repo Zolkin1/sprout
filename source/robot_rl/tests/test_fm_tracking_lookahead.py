@@ -47,7 +47,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.fm_trackin
 )
 
 N_ENVS, NJ, K, F = 4, 6, 2, 20
-D = 12 + 2 * NJ + 3 * K   # one reference-window node
+D = window_dim(NJ, K)     # one reference-window node, all five blocks
 FM_FRAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 

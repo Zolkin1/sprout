@@ -27,7 +27,6 @@ that artifact and skips cleanly without one. Run from ``transfer/sim``:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import glob
 import os
 import sys
@@ -38,8 +37,7 @@ import torch
 _SIM = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # transfer/sim
 sys.path.insert(0, _SIM)
 sys.path.insert(0, os.path.dirname(_SIM))                            # transfer/
-from deploy.gen_tracker import _BASE_POSE_CONVENTION, GenTrackerPolicy  # noqa: E402
-from deploy.tracker_session import TrackerSession  # noqa: E402
+from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 
 import warp as wp  # noqa: E402
 import robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations as O  # noqa: E402
@@ -69,37 +67,6 @@ def _find_run(explicit: str | None) -> str | None:
         return cand if os.path.exists(os.path.join(cand, "tracker.onnx")) else None
     hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
-
-
-@contextlib.contextmanager
-def _assume_current_base_pose_convention():
-    """Fill in ``base_pose_convention`` on artifacts exported before it was recorded.
-
-    ``GenTrackerPolicy.load()`` refuses a tracker whose ``reference_window_spec`` does not
-    name the convention it was trained under -- the ``base_pose`` block's two halves used
-    to disagree, and the mismatch is invisible in the obs shape, so a stale policy must not
-    load silently.
-
-    This test is the one place that exemption is safe: it drives BOTH sides with the same
-    SYNTHETIC references and compares them to each other, so what the policy was trained on
-    never enters. The artifact supplies only shapes, joint order and frame names. Skipping
-    instead would retire exactly the test that catches a packing bug in the numpy port,
-    every time the local export is a little old.
-    """
-    original = TrackerSession.get_reference_window_spec
-
-    def patched(self):
-        """The exported spec, with the convention key defaulted to the current one."""
-        spec = original(self)
-        if spec is not None and "base_pose_convention" not in spec:
-            spec = {**spec, "base_pose_convention": _BASE_POSE_CONVENTION}
-        return spec
-
-    TrackerSession.get_reference_window_spec = patched
-    try:
-        yield
-    finally:
-        TrackerSession.get_reference_window_spec = original
 
 
 def _rand_quat(n: int, g: torch.Generator) -> torch.Tensor:
@@ -207,8 +174,21 @@ def test_obs_parity(run: str | None = None) -> None:
     # Tracker-only: no fm.onnx, so the reference is injected directly (as clip playback
     # does), and the FM->isaac joint permutation is the identity.
     pol = GenTrackerPolicy(os.path.join(exported, "tracker.onnx"), None)
-    with _assume_current_base_pose_convention():
+    try:
         pol.load()
+    except ValueError as exc:
+        # A stale artifact cannot be compared against the current port, and must not be
+        # made to look comparable. This used to patch the missing base_pose_convention key
+        # in, on the grounds that the test drives BOTH sides with synthetic references so
+        # what the policy was trained on never enters. That reasoning died with the 6 -> 9
+        # base_pose widening: the artifact also supplies the per-term SHAPES this test
+        # slices with, and those are the old width, so patching the convention only moves
+        # the failure somewhere less legible.
+        if "base_pose_convention" in str(exc) or "window_blocks" in str(exc):
+            print(f"[SKIP] {exported} predates the current reference-window layout "
+                  f"({exc}). Re-export with scripts/rsl_rl/play.py to run this test.")
+            return
+        raise
     isaac_jn = pol.get_joint_names()
     nj = len(isaac_jn)
     ee_frames = pol._trk.get_ee_frame_names() or []
@@ -249,9 +229,9 @@ def test_obs_parity(run: str | None = None) -> None:
     try:
         isaac_terms = {
             # The BLOCKS come from the exported spec, not from the layout's default: a
-            # teacher may pack a subset, and defaulting here would build a 902-wide window
-            # to compare against the artifact's 451 -- restating the layout is the very
-            # drift this test exists to catch.
+            # teacher may pack a subset, and defaulting here would build a full-five-block
+            # window to compare against the artifact's narrower one -- restating the layout
+            # is the very drift this test exists to catch.
             "reference_window": O.reference_window(
                 env, "x", offsets=offs, blocks=[n for n, _ in spec["blocks"]]),
             "command_window": O.command_window(env, "x", offsets=offs),

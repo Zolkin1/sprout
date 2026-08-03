@@ -19,7 +19,7 @@ from typing import Sequence
 
 import torch
 
-from .transforms import so3_exp, so3_log
+from .transforms import rot6d_to_matrix, so3_log
 from .window import resolve_reference_blocks, window_block_slices
 
 
@@ -70,14 +70,13 @@ def frame_consistency_terms(
     - position: ``base_pose[0:3]`` is ``R_actT (p_ref - p_act)`` with ``p_act``, ``R_act``
       constant across nodes, so its forward difference is exactly ``R_actT v_ref`` --
       which is ``base_vel[0:3]``.
-    - orientation: ``base_pose[3:6]`` is a log map, and log values do NOT difference
-      additively, so this goes through the group. Under the legacy convention
-      ``Exp(e_k) = R_ref_kT R_act``, hence
-      ``Log(Exp(e_{k+1})T Exp(e_k)) = R_actT Log(R_ref_{k+1} R_ref_kT)`` -- the anchor
-      cancels (it conjugates out) and the result is comparable to ``base_vel[3:6]``
-      directly. NOTE the transpose is on the LEFT factor here; unifying the base_pose
-      sign swaps it to the right one. Going through Exp/Log also makes the term immune
-      to the wrap at ``pi``, which a naive ``(e_{k+1} - e_k)`` would not be.
+    - orientation: ``base_pose[3:9]`` is a rotation, and rotations do NOT difference
+      additively, so this goes through the group. The block decodes to
+      ``R_k = R_actT R_ref_k``, hence
+      ``Log(R_{k+1} R_kT) = R_actT Log(R_ref_{k+1} R_ref_kT)`` -- the anchor cancels (it
+      conjugates out) and the result is comparable to ``base_vel[3:6]`` directly. The
+      transpose is on the RIGHT factor; it was on the left while ``base_pose`` carried the
+      opposite sign.
 
     Args:
         pred_phys / data_phys: ``(B, F, D)`` predicted / target window, physical units.
@@ -101,14 +100,16 @@ def frame_consistency_terms(
         )
     bp, bv = slc["base_pose"].start, slc["base_vel"].start
     x = pred_phys
-    pos, ori = x[..., bp:bp + 3], x[..., bp + 3:bp + 6]
+    pos, ori6d = x[..., bp:bp + 3], x[..., bp + 3:bp + 9]
     lin, ang = x[..., bv:bv + 3], x[..., bv + 3:bv + 6]
     data_lin, data_ang = data_phys[..., bv:bv + 3], data_phys[..., bv + 3:bv + 6]
 
     lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
     vel = ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
-    rmat = so3_exp(ori)  # (B, F, 3, 3) = R_refT R_act  (legacy convention)
-    ang_fd = so3_log(rmat[:, 1:].transpose(-1, -2) @ rmat[:, :-1]) / dt
+    # Gram-Schmidt: the prediction is a raw 9-vector, so it is only approximately a
+    # rotation, and so3_log needs a real one.
+    rmat = rot6d_to_matrix(ori6d)                 # (B, F, 3, 3) = R_actT R_ref
+    ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
     vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
 
     accel = (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))

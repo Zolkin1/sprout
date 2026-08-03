@@ -33,7 +33,15 @@ try:
 except Exception as exc:  # pragma: no cover - environment without a usable warp runtime
     pytest.skip(f"warp runtime unavailable: {exc}", allow_module_level=True)
 
-from isaaclab.utils.math import quat_apply, quat_box_minus, quat_conjugate, quat_mul  # noqa: E402
+from isaaclab.utils.math import (  # noqa: E402
+    matrix_from_quat,
+    quat_apply,
+    quat_box_minus,
+    quat_conjugate,
+    quat_mul,
+)
+
+from robot_rl.flow_matching.transforms import rot6d_to_matrix  # noqa: E402
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (  # noqa: E402
     MotionSequenceCommand,
@@ -262,7 +270,7 @@ def test_layout_matches_the_robot_and_clip(env_cmd):
     """Block widths follow the joint count and ee frame count."""
     _, cmd = env_cmd
     assert reference_window_layout(cmd) == [
-        ("base_pose", 6), ("base_vel", 6),
+        ("base_pose", 9), ("base_vel", 6),
         ("joint_pos", N_JOINTS), ("joint_vel", N_JOINTS),
         ("ee_pos", 3 * len(EE_FRAMES)),
     ]
@@ -282,24 +290,24 @@ def test_sample_zero_matches_the_current_step_terms(env_cmd):
     per_step = sum(w for _, w in reference_window_layout(cmd))
     first = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))[:, :per_step]
 
-    torch.testing.assert_close(first[:, 0:6], base_pose_error(env, "traj_ref"))
-    torch.testing.assert_close(first[:, 6:12], ref_base_velocity_local(env, "traj_ref"))
+    torch.testing.assert_close(first[:, 0:9], base_pose_error(env, "traj_ref"))
+    torch.testing.assert_close(first[:, 9:15], ref_base_velocity_local(env, "traj_ref"))
     torch.testing.assert_close(first[:, -3 * len(EE_FRAMES):], ee_ref_relative_to_base(env, "traj_ref"))
 
 
-def test_base_pose_uses_the_legacy_mixed_convention(env_cmd):
-    """``base_pose`` is position ``ref - actual`` and orientation ``actual - ref``.
+def test_base_pose_is_the_reference_pose_in_the_anchor_frame(env_cmd):
+    """``base_pose`` is ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]``.
 
     Pinned against an independent expression rather than against the window's own inverse,
     because every other check here is a round trip or a cross-check between two functions
     that share the convention -- flip them together and nothing notices.
 
-    The two halves genuinely disagree (see
-    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`), and this test exists to
-    keep that FROM CHANGING BY ACCIDENT rather than to endorse it: the observation width is
-    identical either way, so a flip silently invalidates every trained policy. When the
-    convention is unified, this test and ``BASE_POSE_CONVENTION`` move together, and a
-    teacher retrain follows.
+    This is the test that guards the SIGN. It used to assert the opposite orientation
+    convention (``Log(R_refT R_act)``, position and orientation pointing opposite ways);
+    that half of ``base_pose`` was flipped so both halves mean the same thing, and this test
+    moved with :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`. The observation
+    width would be identical either way if only the sign changed, so nothing but this and
+    that string stands between a stale policy and a clean-looking load.
     """
     env, cmd = env_cmd
     offs = _window_offsets(cmd, strided_offsets(11, 5))
@@ -310,25 +318,27 @@ def test_base_pose_uses_the_legacy_mixed_convention(env_cmd):
 
     per_step = sum(w for _, w in reference_window_layout(cmd))
     base_pose = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
-    base_pose = base_pose.reshape(n, k, per_step)[..., 0:6].reshape(-1, 6)
+    base_pose = base_pose.reshape(n, k, per_step)[..., 0:9].reshape(-1, 9)
 
-    # position: R_act^T (p_ref - p_act)   -- points robot -> reference
+    # position: R_actT (p_ref - p_act) -- robot -> reference, in the anchor frame
     want_pos = quat_apply(quat_conjugate(act_q), ref_p.reshape(-1, 3) - act_p)
-    # orientation: R_act^T Log(R_act R_ref^T) == Log(R_ref^T R_act)  -- the OTHER way
-    want_ori = quat_apply(
-        quat_conjugate(act_q), quat_box_minus(act_q, ref_q.reshape(-1, 4))
-    )
+    # orientation: R_actT R_ref, the SAME direction. Compared as a rotation matrix, since
+    # that is what the 6D pair encodes and it is insensitive to quaternion sign.
+    want_rot = matrix_from_quat(quat_mul(quat_conjugate(act_q), ref_q.reshape(-1, 4)))
     torch.testing.assert_close(base_pose[:, 0:3], want_pos, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(base_pose[:, 3:6], want_ori, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rot6d_to_matrix(base_pose[:, 3:9]), want_rot,
+                               atol=1e-6, rtol=1e-6)
 
-    # ...and both vanish together when the robot sits exactly on the reference. True under
-    # either convention, so not the discriminating check -- but it is the property a reader
-    # expects, and it fails loudly if either half ever picks up an offset.
+    # ...and on the reference, position vanishes and the rotation becomes the identity --
+    # whose 6D encoding is (1,0,0, 0,1,0), NOT zero. Worth asserting explicitly: the old
+    # log-map block went to zero here, so anything still expecting an all-zero base_pose
+    # node is reading the previous representation.
     cmd.robot.data.root_pos_w = _wp(ref_p[:, 0, :].contiguous())
     cmd.robot.data.root_quat_w = _wp(ref_q[:, 0, :].contiguous())
     on_ref = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
-    on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:6]
-    torch.testing.assert_close(on_ref, torch.zeros_like(on_ref), atol=1e-6, rtol=1e-6)
+    on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:9]
+    identity = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    torch.testing.assert_close(on_ref, identity.expand_as(on_ref), atol=1e-6, rtol=1e-6)
 
 
 def test_layout_from_dims_matches_the_command_layout(env_cmd):
@@ -405,7 +415,7 @@ def test_joint_block_is_in_robot_order(env_cmd):
     """
     env, cmd = env_cmd
     first = reference_window(env, "traj_ref", offsets=strided_offsets(1, 5))
-    joint_block = first[:, 12:12 + N_JOINTS]
+    joint_block = first[:, 15:15 + N_JOINTS]
     torch.testing.assert_close(joint_block, cmd._cur(cmd.joint_pos))
     # Same values, opposite order: a permutation, not a different quantity.
     torch.testing.assert_close(joint_block, joint_pos_ref(env, "traj_ref").flip(-1))
@@ -421,7 +431,7 @@ def test_later_samples_read_later_clip_steps(env_cmd):
     )
     offsets = _window_offsets(cmd, strided_offsets(num_steps, stride))
     expected = cmd._gather(cmd.joint_pos, offsets)
-    torch.testing.assert_close(win[:, :, 12:12 + N_JOINTS], expected)
+    torch.testing.assert_close(win[:, :, 15:15 + N_JOINTS], expected)
 
 
 def test_base_blocks_are_heading_invariant(env_cmd):
@@ -506,12 +516,12 @@ def test_noise_vector_matches_the_window_layout(env_cmd):
     step = vec[:per_step]
     m = REFERENCE_WINDOW_NOISE
     assert step[0:3] == list(m["base_pos"])                       # per-axis, z tighter
-    assert step[3:6] == [m["base_ori"]] * 3
-    assert step[6:9] == [m["base_lin_vel"]] * 3
-    assert step[9:12] == [m["base_ang_vel"]] * 3
-    assert step[12:12 + N_JOINTS] == [m["joint_pos"]] * N_JOINTS
-    assert step[12 + N_JOINTS:12 + 2 * N_JOINTS] == [m["joint_vel"]] * N_JOINTS
-    assert step[12 + 2 * N_JOINTS:] == list(m["ee_pos"]) * len(EE_FRAMES)
+    assert step[3:9] == [m["base_ori"]] * 6                       # 6D rotation: 6 channels
+    assert step[9:12] == [m["base_lin_vel"]] * 3
+    assert step[12:15] == [m["base_ang_vel"]] * 3
+    assert step[15:15 + N_JOINTS] == [m["joint_pos"]] * N_JOINTS
+    assert step[15 + N_JOINTS:15 + 2 * N_JOINTS] == [m["joint_vel"]] * N_JOINTS
+    assert step[15 + 2 * N_JOINTS:] == list(m["ee_pos"]) * len(EE_FRAMES)
     # Every sample in the window carries the same magnitudes.
     assert vec[-per_step:] == step
 
@@ -566,7 +576,7 @@ def test_only_the_joint_velocity_block_is_scaled(env_cmd):
     num_steps = 3
     per_step = sum(w for _, w in reference_window_layout(cmd))
     step = reference_window_scale(num_steps, N_JOINTS, len(EE_FRAMES))[:per_step]
-    jv = slice(12 + N_JOINTS, 12 + 2 * N_JOINTS)
+    jv = slice(15 + N_JOINTS, 15 + 2 * N_JOINTS)
     assert set(step[jv]) == {0.05}
     assert set(step[:jv.start]) == {1.0}
     assert set(step[jv.stop:]) == {1.0}
@@ -595,7 +605,7 @@ def test_noise_is_specified_before_scaling(env_cmd):
     """
     _, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    jv = slice(12 + N_JOINTS, 12 + 2 * N_JOINTS)
+    jv = slice(15 + N_JOINTS, 15 + 2 * N_JOINTS)
     noise = reference_window_noise_vector(1, N_JOINTS, len(EE_FRAMES))[:per_step]
     scale = reference_window_scale(1, N_JOINTS, len(EE_FRAMES))[:per_step]
     assert set(noise[jv]) == {0.5}      # rad/s, pre-scale

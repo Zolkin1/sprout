@@ -51,7 +51,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
     REFERENCE_BLOCK_KEYS,
-    so3_exp,
+    rot6d_to_matrix,
     window_block_slices,
     sample_trajectory,
     snap_windows,
@@ -269,10 +269,11 @@ def channel_metrics(
     def _geodesic(slc: slice) -> float:
         """Angle between the predicted and target base orientations, in radians.
 
-        Through ``Exp`` rather than differencing the log values, so the metric stays
-        meaningful (and wrap-immune) however far the reference has turned from the anchor.
+        Through the rotation group rather than differencing the raw channels, so the metric
+        is a real angle -- and so the prediction's Gram-Schmidt residual is projected out
+        rather than counted as orientation error.
         """
-        rel = so3_exp(pred[..., slc]).transpose(-1, -2) @ so3_exp(tgt[..., slc])
+        rel = rot6d_to_matrix(pred[..., slc]).transpose(-1, -2) @ rot6d_to_matrix(tgt[..., slc])
         cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
         return torch.arccos(cos).mean().item()
 
@@ -281,7 +282,7 @@ def channel_metrics(
     if "base_pose" in b:
         start = b["base_pose"].start
         out["rmse_base_pos"] = _rmse(slice(start, start + 3))
-        out["ori_geodesic_rad"] = _geodesic(slice(start + 3, start + 6))
+        out["ori_geodesic_rad"] = _geodesic(slice(start + 3, start + 9))
     if "base_vel" in b:
         start = b["base_vel"].start
         out["rmse_base_lin_vel"] = _rmse(slice(start, start + 3))

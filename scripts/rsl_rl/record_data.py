@@ -494,7 +494,7 @@ def _assemble_state(robot, state_frames, frame_body_idx, n_envs) -> torch.Tensor
 
 # TODO(latent-fm): also record the reference ENCODER LATENT per window, so a latent-space
 # FM can be trained without re-deriving it. The teacher is a RefEncoderMLPModel: the
-# `reference` group (reference_window 902 + command_window 33 = 935) goes through
+# `reference` group (reference_window 13 samples x D + command_window 13 x 3) goes through
 # [1024, 512, 512] and the trunk only ever sees the resulting 512-d latent. That latent is
 # ~half the width of the window it replaces, so recording it is cheap (~2 KB/window).
 #

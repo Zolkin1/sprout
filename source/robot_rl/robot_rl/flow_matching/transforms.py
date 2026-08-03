@@ -125,14 +125,10 @@ def so3_log(r: torch.Tensor) -> torch.Tensor:
 def so3_exp(v: torch.Tensor) -> torch.Tensor:
     """Rotation matrices ``(..., 3, 3)`` from rotation vectors ``(..., 3)`` (Rodrigues).
 
-    The inverse of :func:`so3_log`, and what turns the window's ``base_pose`` orientation
-    channel back into a rotation: that channel is a ``quat_box_minus`` log map, so
-    ``so3_exp(base_pose[3:6]) = R_actT R_ref``.
-
-    Routing the finite-difference angular-velocity loss through this rather than
-    differencing the log values directly is what makes that loss immune to the branch cut
-    at ``pi`` -- ``exp`` of a wrapped rotation vector is the same rotation, while the naive
-    difference would see a jump.
+    The inverse of :func:`so3_log`.  No longer used by the window: ``base_pose``'s
+    orientation half is a 6D rotation now, so :func:`rot6d_to_matrix` is what decodes it.
+    This survives for the tests and as the natural partner of ``so3_log``, which the
+    angular finite-difference loss still needs to turn a relative rotation into a rate.
 
     Small-angle safe: the series limits are taken explicitly, so the gradient at ``theta =
     0`` is finite.

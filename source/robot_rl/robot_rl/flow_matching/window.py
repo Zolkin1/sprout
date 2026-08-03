@@ -5,34 +5,39 @@
 A *window node* is one timestep of reference, expressed relative to a measured robot pose
 (the **anchor**). Per node, in packing order::
 
-    [base_pose(6), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
+    [base_pose(9), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
 
 with
 
 * ``base_pose[0:3]`` -- ``R_actT (p_ref - p_act)``, the reference base position relative to
   the anchor, in the anchor's base frame;
-* ``base_pose[3:6]`` -- ``R_actT Log(R_act R_refT) = Log(R_refT R_act)``, the reference base
-  orientation error;
+* ``base_pose[3:9]`` -- ``R_actT R_ref`` in the 6D rotation representation (its first two
+  COLUMNS), i.e. the reference base orientation expressed in the anchor's frame;
 * ``base_vel`` -- the reference base linear+angular velocity rotated into the anchor frame;
 * ``joint_pos`` / ``joint_vel`` -- frame-invariant, in the **robot's** joint order;
 * ``ee_pos`` -- each end-effector position relative to **that node's own reference base**
   (posture, free of tracking error), 3 per frame.
 
-.. admonition:: The two halves of ``base_pose`` disagree, deliberately, for now
+Both halves of ``base_pose`` are now the same thing measured the same way: *the reference
+pose, in the anchor's frame*. They used to disagree -- position was ``ref - actual`` in the
+robot frame while orientation was ``actual - ref`` in the reference frame, two vectors
+pointing opposite ways packed as one error vector -- which is what
+:data:`BASE_POSE_CONVENTION` records and refuses to mix.
 
-    Position is ``ref - actual`` in the ROBOT's frame; orientation is ``actual - ref`` in the
-    REFERENCE's frame. So the 6-vector is not one error vector -- it is two, pointing opposite
-    ways in different frames. This is a known defect, kept **only** because flipping it
-    silently invalidates every trained policy: the observation width does not change, so a
-    stale teacher loads clean and steers wrong.
+.. admonition:: Why 6D rather than a log map
 
-    Fixing it is a one-line change here (``quat_box_minus(ref_q, act_q)``) plus the matching
-    line in :func:`window_to_world` (``quat_box_plus`` loses its ``-``), the numpy port in
-    ``transfer/deploy/window_np.py``, ``mdp.base_pose_error`` /
-    ``mdp.tracking_error_global``, the angular finite-difference ordering in
-    ``flow.frame_consistency_terms``, and :data:`BASE_POSE_CONVENTION` below -- and then a
-    TEACHER RETRAIN. Do it as its own change; ``BASE_POSE_CONVENTION`` travels into the
-    exported artifacts so the two generations cannot be mixed by accident.
+    ``base_pose[3:6]`` was a ``quat_box_minus`` rotation vector, whose magnitude saturates
+    at ``pi``: a reference rotating more than ``pi`` rad relative to the anchor over the
+    horizon **wrapped**, putting a jump discontinuity in both the generator's regression
+    target and the policy's observation. The 6D representation has no branch cut, so the
+    whole class of wrap defect is gone -- along with the dataset filter that existed to drop
+    the affected training windows.
+
+    The cost is that a raw 9-vector is not necessarily a rotation. Nothing here assumes it
+    is: :func:`window_to_world` Gram-Schmidts on the way out (``rot6d_to_matrix``), and
+    :func:`reanchor_window` is exactly linear in the two columns, so it neither needs nor
+    silently applies a projection. The generator projects its own output once, where it is
+    produced.
 
 Everything here is relative, so no world coordinate survives into a window. The anchor is
 divided out on the way in and only reappears if you deliberately call
@@ -48,13 +53,6 @@ Three producers share this module so the representation cannot drift between the
 Because the FM predicts in exactly this representation, its output *is* the observation: no
 world lift, in sim or at deploy.
 
-.. warning::
-    ``base_pose[3:6]`` is a ``quat_box_minus`` log-map value, so its magnitude saturates at
-    ``pi``. A reference that rotates more than ``pi`` rad relative to the anchor over the
-    horizon **wraps**, putting a jump discontinuity in both the FM's regression target and
-    the policy's observation. The dataset build guards against it; see
-    ``flow_matching.dataset``.
-
 All quaternions are ``(x, y, z, w)``, matching ``robot.data`` and ``isaaclab.utils.math``.
 """
 
@@ -68,15 +66,21 @@ import torch
 from isaaclab.utils.math import (
     quat_apply,
     quat_apply_inverse,
-    quat_box_minus,
-    quat_box_plus,
+    quat_conjugate,
+    quat_mul,
 )
 
-#: Direction and frame of ``base_pose``'s two difference terms, carried into the exported
-#: tracker parameters and checked at deploy load. A change here is INVISIBLE in the
-#: observation's shape, so this string is the only thing standing between a stale policy and
-#: a clean-looking load. Bump it in the same commit as the maths. See the module docstring.
-BASE_POSE_CONVENTION = "legacy_mixed_pos_ref_minus_actual_ori_actual_minus_ref"
+from .transforms import matrix_to_rot6d, quat_to_rot6d, rot6d_to_matrix, rot6d_to_quat
+
+#: Content and frame of the ``base_pose`` block, carried into the exported tracker
+#: parameters and checked at deploy load.
+#:
+#: The width change from 6 to 9 is caught on its own by every layout check
+#: (``fm_session._check_state_layout``, ``deploy.gen_tracker._build_window``), so what this
+#: string really guards is the SIGN: flipping the orientation half was invisible in the
+#: observation's shape, and a policy trained under either convention loads clean against the
+#: other and walks sideways. Bump it in the same commit as the maths.
+BASE_POSE_CONVENTION = "pose_in_anchor_frame_pos_ref_minus_actual_ori_rot6d"
 
 
 #: Per-block uniform-noise HALF-WIDTHS over one window node, in RAW units.
@@ -103,7 +107,11 @@ BASE_POSE_CONVENTION = "legacy_mixed_pos_ref_minus_actual_ori_actual_minus_ref"
 #: Position-like entries are per-axis ``(x, y, z)``; the vertical axis is tighter.
 REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
     "base_pos": [0.05, 0.05, 0.01],   # reference base position error, metres
-    "base_ori": 0.03,                 # reference base orientation error, radians
+    # Perturbation of each of the 6 rot6d components. DIMENSIONLESS, not radians -- but the
+    # number carries over from when it was: the two columns are unit vectors, so displacing
+    # a component by eps tilts the frame by ~eps rad for small eps. Kept at the old 0.03 so
+    # the level the policy and the generator's history see is unchanged in practice.
+    "base_ori": 0.03,
     "base_lin_vel": 0.25,             # m/s
     "base_ang_vel": 0.25,             # rad/s
     "joint_pos": 0.1,                 # rad
@@ -126,7 +134,8 @@ REFERENCE_WINDOW_BLOCK_NAMES: tuple[str, ...] = (
 
 #: Layout block -> the per-block keys in :data:`REFERENCE_WINDOW_NOISE` (and the
 #: observation's SCALE table) that expand into it. ``base_pose`` and ``base_vel`` are each
-#: two 3-axis halves, which is why those tables key more finely than the layout does.
+#: two halves in different units, which is why those tables key more finely than the layout
+#: does; ``base_pos`` and both ``base_vel`` halves are 3 channels, ``base_ori`` is 6.
 REFERENCE_BLOCK_KEYS: dict[str, tuple[str, ...]] = {
     "base_pose": ("base_pos", "base_ori"),
     "base_vel": ("base_lin_vel", "base_ang_vel"),
@@ -180,7 +189,7 @@ def window_blocks(
         ``[(name, width), ...]`` for the selection.
     """
     widths = {
-        "base_pose": 6,
+        "base_pose": 9,   # position(3) + the 6D rotation representation(6)
         "base_vel": 6,
         "joint_pos": num_joints,
         "joint_vel": num_joints,
@@ -233,13 +242,18 @@ def expand_window_blocks(
     Raises:
         ValueError: If the built width disagrees with the layout.
     """
-    def axes(key: str) -> list[float]:
-        """The block's value as three per-axis entries."""
+    def axes(key: str, n: int = 3) -> list[float]:
+        """The block's value as ``n`` per-channel entries.
+
+        A sequence is taken verbatim (and must already be the right length); a scalar is
+        repeated. ``n`` defaults to 3 because every key but ``base_ori`` is a 3-vector.
+        """
         value = per_block[key]
-        return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * 3
+        return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * n
 
     builders = {
-        "base_pose": lambda: axes("base_pos") + axes("base_ori"),
+        # base_ori is the 6D rotation representation: 6 channels, one value each.
+        "base_pose": lambda: axes("base_pos") + axes("base_ori", 6),
         "base_vel": lambda: axes("base_lin_vel") + axes("base_ang_vel"),
         "joint_pos": lambda: [float(per_block["joint_pos"])] * num_joints,
         "joint_vel": lambda: [float(per_block["joint_vel"])] * num_joints,
@@ -287,6 +301,45 @@ def split_window(
         name: window[..., slc]
         for name, slc in window_block_slices(num_joints, num_ee_frames, blocks).items()
     }
+
+
+def project_window_rotations(
+    window: torch.Tensor,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """Re-orthonormalize ``base_pose``'s 6D rotation block of raw generator output.
+
+    A network emitting 6 free numbers produces something only approximately a rotation.
+    This projects it back -- Gram-Schmidt, then read the two columns off again -- so the
+    served reference is a real pose and the autoregressive history stays on the manifold it
+    was trained on.
+
+    Preferred over an orthonormality PENALTY: the penalty trades prediction accuracy
+    against a constraint that can be satisfied exactly and for free after the fact, and it
+    would still leave the served value slightly off. Applied once, where the prediction is
+    produced -- :func:`flow_matching.online.sample_window` in simulation and the exported
+    ONNX module at deploy -- so nothing downstream (including the numpy port) has to know.
+
+    A no-op when ``base_pose`` is not in the selection, and safe on already-orthonormal
+    input.
+
+    Args:
+        window: ``[..., D]`` raw window nodes in physical units.
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection ``window`` is packed with; defaults to all of them.
+
+    Returns:
+        ``[..., D]``, same layout, with the rotation block on SO(3).
+    """
+    slices = window_block_slices(num_joints, num_ee_frames, blocks)
+    if "base_pose" not in slices:
+        return window
+    start = slices["base_pose"].start + 3
+    projected = matrix_to_rot6d(rot6d_to_matrix(window[..., start:start + 6]))
+    return torch.cat([window[..., :start], projected, window[..., start + 6:]], dim=-1)
 
 
 def _broadcast_anchor(anchor: torch.Tensor, node_shape: torch.Size) -> torch.Tensor:
@@ -356,13 +409,16 @@ def world_to_window(
     ref_q = ref_quat_w.reshape(flat, 4)
 
     def base_pose() -> torch.Tensor:
-        """``[pos_err, ori_err]`` in the anchor's frame -- the LEGACY mixed convention.
+        """The reference base pose in the anchor's frame: ``[pos(3), rot6d(6)]``.
 
-        The two halves point opposite ways; see the module docstring.
+        Both halves measure the same thing the same way -- position ``ref - actual`` rotated
+        into the anchor frame, and the reference orientation ``R_actT R_ref`` as its first
+        two columns.
         """
-        pos_err_b = quat_apply_inverse(act_q, ref_p - act_p)  # ref - actual, robot frame
-        ori_err_w = quat_box_minus(act_q, ref_q)              # Log(R_act R_refT)
-        return torch.cat([pos_err_b, quat_apply_inverse(act_q, ori_err_w)], dim=-1)
+        return torch.cat([
+            quat_apply_inverse(act_q, ref_p - act_p),
+            quat_to_rot6d(quat_mul(quat_conjugate(act_q), ref_q)),   # R_actT R_ref
+        ], dim=-1)
 
     def base_vel() -> torch.Tensor:
         """Reference base linear+angular velocity rotated into the anchor frame."""
@@ -412,8 +468,9 @@ def reanchor_window(
     same nodes must be served against where it is now, only the blocks that reference the
     anchor need touching:
 
-    * ``base_pose`` -- reconstruct the node's world-frame reference base and difference it
-      against the new anchor (the one block that genuinely round-trips);
+    * ``base_pose`` -- position goes up to the world through the old anchor and back down
+      through the new; the orientation half is a pure rotation of its two columns by the
+      anchor delta, so it never leaves the 6D representation;
     * ``base_vel`` -- a pure rotation ``R_newT R_old``, no position involved;
     * ``joint_pos`` / ``joint_vel`` -- frame-invariant, copied;
     * ``ee_pos`` -- relative to *that node's own* reference base, so anchor-invariant too,
@@ -448,13 +505,19 @@ def reanchor_window(
     for name in selected:
         block = parts[name]
         if name == "base_pose":
-            # Up to the world through the old anchor, straight back down through the new.
-            # Both directions are the legacy mixed convention -- see the module docstring.
+            # Position: up to the world through the old anchor, back down through the new.
+            #
+            # Orientation: no round trip at all. The block holds the two leading COLUMNS of
+            # R_oldT R_ref, and R_newT R_ref = (R_newT R_old)(R_oldT R_ref), so each column
+            # is simply rotated by the anchor delta. Exactly linear, which is why this
+            # neither needs Gram-Schmidt nor quietly projects a raw generator output onto
+            # SO(3) behind the caller's back.
             ref_p = old_p + quat_apply(old_q, block[..., 0:3].reshape(flat, 3))
-            ref_q = quat_box_plus(old_q, -quat_apply(old_q, block[..., 3:6].reshape(flat, 3)))
+            q_delta = quat_mul(quat_conjugate(new_q), old_q)          # R_newT R_old
             out.append(torch.cat([
                 quat_apply_inverse(new_q, ref_p - new_p),
-                quat_apply_inverse(new_q, quat_box_minus(new_q, ref_q)),
+                quat_apply(q_delta, block[..., 3:6].reshape(flat, 3)),
+                quat_apply(q_delta, block[..., 6:9].reshape(flat, 3)),
             ], dim=-1))
         elif name == "base_vel":
             out.append(torch.cat([
@@ -508,9 +571,9 @@ def window_to_world(
             node's own reference base, which the base block carries).
 
     Note:
-        ``base_quat_w`` comes back through ``quat_box_plus``, which normalises the sign
-        (``quat_unique``), so it may be the negation of the quaternion that went in. That is
-        the same rotation; compare rotations, not raw components.
+        ``base_quat_w`` comes back through ``quat_from_matrix``, which fixes the sign, so it
+        may be the negation of the quaternion that went in. That is the same rotation;
+        compare rotations, not raw components.
     """
     selected = resolve_reference_blocks(blocks)
     parts = split_window(window, num_joints, num_ee_frames, selected)
@@ -524,11 +587,13 @@ def window_to_world(
     pos_w = quat_w = None
     if "base_pose" in parts:
         pos_err_b = parts["base_pose"][..., 0:3].reshape(flat, 3)
-        ori_err_b = parts["base_pose"][..., 3:6].reshape(flat, 3)
+        ori6d_b = parts["base_pose"][..., 3:9].reshape(flat, 6)
         pos_w = act_p + quat_apply(act_q, pos_err_b)
-        # Forward: ori_err_w = Log(R_act R_refT), i.e. Exp(ori_err_w) * q_ref = q_act, so
-        # q_ref = Exp(-ori_err_w) * q_act. The minus is the legacy convention's, not a bug.
-        quat_w = quat_box_plus(act_q, -quat_apply(act_q, ori_err_b))
+        # Forward: the block is R_actT R_ref, so R_ref = R_act (R_actT R_ref). This is the
+        # one place a rotation MATRIX has to come back out of the 6D pair, so it is also the
+        # one place Gram-Schmidt runs (inside rot6d_to_quat) -- a raw generator output is
+        # only approximately orthonormal, and a quaternion has nowhere to put the residual.
+        quat_w = quat_mul(act_q, rot6d_to_quat(ori6d_b))
         out["base_pos_w"] = pos_w.reshape(shape3)
         out["base_quat_w"] = quat_w.reshape(tuple(node_shape) + (4,))
     if "base_vel" in parts:

@@ -40,7 +40,7 @@ import onnx
 import torch
 import torch.nn as nn
 
-from robot_rl.flow_matching.window import window_blocks
+from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
 
@@ -59,6 +59,10 @@ class _FmSamplerOnnx(nn.Module):
         super().__init__()
         self.model = ctx.model
         self.num_steps = int(ctx.num_steps)
+        # Plain ints/tuples, so the SO(3) projection below traces as fixed slicing.
+        self.nj = int(ctx.nj)
+        self.num_extra_frames = int(ctx.target_num_extra_frames)
+        self.reference_blocks = tuple(ctx.reference_blocks)
         self.register_buffer("s_mean", ctx.state_norm.mean.detach().clone())
         self.register_buffer("s_std", ctx.state_norm.std.detach().clone())
         self.register_buffer("c_mean", ctx.cmd_norm.mean.detach().clone())
@@ -93,7 +97,14 @@ class _FmSamplerOnnx(nn.Module):
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
             v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
             x = x + dt * v
-        return x * self.s_std + self.s_mean
+        # Project the rotation block back onto SO(3), exactly as
+        # ``flow_matching.online.sample_window`` does for simulation -- the model emits 6
+        # free numbers, and this window is both a reference pose and the next step's history
+        # token. Inside the graph so the torch-free runtime needs no rotation maths.
+        return project_window_rotations(
+            x * self.s_std + self.s_mean,
+            self.nj, self.num_extra_frames, self.reference_blocks,
+        )
 
 
 def _fm_meta(ctx: FmOnlineContext) -> dict:

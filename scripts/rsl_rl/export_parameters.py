@@ -134,9 +134,9 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
             "joint_order": "isaac",
             "ee_frame_names": list(cmd_term.resolve_ee_frames(None)),
             # Direction and frame of the base_pose block's two difference terms. Recorded
-            # because a change here is INVISIBLE in the obs shape: the two halves currently
-            # point opposite ways, and a policy trained under either convention loads clean
-            # against the other and walks sideways. GenTrackerPolicy.load() refuses
+            # because the SIGN of the orientation half is invisible in the obs shape: a
+            # policy trained under either convention loads clean against the other and
+            # walks sideways. GenTrackerPolicy.load() requires this key and refuses
             # anything it does not know how to reproduce.
             "base_pose_convention": BASE_POSE_CONVENTION,
         }

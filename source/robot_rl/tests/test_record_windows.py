@@ -122,7 +122,7 @@ def _synthetic_per_step(seed=0):
     """A per-step recording: 4 episodes x 20 consecutive steps, snaps at steps 5/10/15.
 
     Built from the shared plausible-rollout fixture rather than from noise: the dataset
-    validates the recording (smooth, tracked, inside the ``quat_box_minus`` branch cut, and
+    validates the recording (smooth, tracked, and
     ``ref_state[t] == ref_future[t, 0]``), so white noise no longer builds. This file is
     about the windowed writer matching the per-step path, which those properties do not
     affect.

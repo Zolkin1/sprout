@@ -149,9 +149,9 @@ class FlowMatchingConfig:
     # ``reference_blocks`` (see ``flow_matching.window.window_dim``). History and
     # predicted nodes are the SAME representation -- the history is just nodes this model
     # emitted earlier -- so they share one normalizer.
-    state_dim: int = 82        # all five blocks at nj=29, K=4; resolved at build time
+    state_dim: int = 94        # all five blocks at nj=29, K=4; resolved at build time
     # Per-node history-token width (= state_dim; resolved at build time).
-    history_dim: int = 82
+    history_dim: int = 94
     # Which recorded signal feeds the exteroception conditioning tokens.
     #   "depth"       -- the two torso depth cameras, ONE token each (T=2), from
     #                    ``G1-teacher-clf-terrain-depth*`` recordings. DEFAULT, because it

@@ -40,7 +40,6 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-import math
 
 import numpy as np
 import torch
@@ -58,18 +57,6 @@ from .window import (
     world_to_window,
 )
 
-
-#: Orientation magnitude (radians) at which a window's ``base_pose`` target is treated as
-#: having crossed the ``quat_box_minus`` branch cut at pi. Just under pi, so a target that
-#: reaches it is within a rounding error of wrapping.
-WRAP_LIMIT_RAD: float = 3.0
-
-#: Largest share of windows that may be dropped for wrapping before the build gives up.
-#: A few is one fast-turning clip in the library; a material fraction means the horizon is
-#: too long for the library's yaw rate, or the representation is wrong for this data --
-#: and quietly training on what is left would hide that, having also biased the dataset
-#: away from exactly the turns the model most needs to learn.
-WRAP_DROP_CEILING: float = 0.01
 
 #: Loss weight -> the window blocks the term relates. A term whose blocks are not all
 #: selected has nothing to tie together, so :func:`resolve_block_selection` zeroes its
@@ -460,21 +447,6 @@ class FutureStateDataset(Dataset):
             p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, F, D)
 
-        # Drop the individual windows whose target crosses the pi branch cut, before
-        # anything is fitted to them. A handful is a property of the clip library (one
-        # fast-spinning clip sampled a few times), not of the recording; a large share is
-        # systemic and raises instead -- see :meth:`_drop_wrapped_windows`.
-        keep = self._wrap_keep_mask(target)
-        if keep is not None:
-            target, history = target[keep], history[keep]
-            p_anchor, q_anchor = p_anchor[keep], q_anchor[keep]
-            snap_ref, tw = snap_ref[keep], tw[keep]
-            k_np = keep.numpy()
-            if windowed:
-                sel = sel[k_np]
-            else:
-                snap_rows = snap_rows[k_np]
-
         self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
 
         # Exteroception tokens at the snap row. The recording carries either
@@ -515,16 +487,21 @@ class FutureStateDataset(Dataset):
             cmd_strided = None
 
         # -- normalizers (fit on train) --
-        # Every channel is standardized now. The old exemption existed for the 6D rotation
-        # block, whose components are structurally constrained (Gram-Schmidt) and would be
-        # broken by a per-column affine; base_pose's orientation is a plain radians
-        # 3-vector with no such constraint.
+        # base_pose's orientation half is EXEMPT from standardization -- the reason the
+        # normalizer carries a mask at all (see ``normalizer`` module docstring). Its six
+        # channels are two orthonormal columns: already O(1) and unit-scaled, and a
+        # per-channel affine would shear them off the manifold, so the model would be
+        # regressing towards targets that are no longer rotations and the Gram-Schmidt on
+        # the way out would silently absorb the difference. Everything else is standardized.
         #
         # Note the fit is over all (Nw * F) nodes, so base_pose's position std is set by the
         # FAR nodes -- node 0's near-zero residual ends up squashed, and node 0 is the one
-        # the tracker's CLF reads. Structurally the same as before the representation
-        # change, but worth revisiting with per-node loss weighting.
+        # the tracker's CLF reads. Unchanged by the representation change, but worth
+        # revisiting with per-node loss weighting.
         state_mask = torch.ones(self.state_dim, dtype=torch.bool)
+        if "base_pose" in self.block_slices:
+            bp = self.block_slices["base_pose"].start
+            state_mask[bp + 3:bp + 9] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
         self.state_normalizer = state_normalizer
@@ -564,62 +541,6 @@ class FutureStateDataset(Dataset):
             if self.add_noise else None
         )
 
-    def _wrap_keep_mask(self, target: torch.Tensor) -> torch.Tensor | None:
-        """Which windows to keep, dropping those whose target crosses the branch cut.
-
-        ``base_pose``'s orientation half is a ``quat_box_minus`` log map, so it saturates
-        at pi: a reference that turns more than half a turn relative to the anchor
-        somewhere in the horizon WRAPS, and that node's target jumps discontinuously.
-        Such a window is not a hard example, it is an uninterpretable one -- no model can
-        fit both sides of the cut, and the same wrap reaches the policy's observation.
-
-        Dropping beats shortening the horizon, which is the remedy the wrap reads like it
-        wants: the turn can land at any node, so a window that wraps at node 9 wraps at
-        every ``future_len`` worth training. It also beats failing the build, at this
-        scale -- measured on the depth_v5 recording, 4 windows in 181426 (0.002%), all
-        from one fast-spinning clip.
-
-        What is NOT dropped quietly is a material fraction: past
-        :data:`WRAP_DROP_CEILING` the library's yaw rate and the horizon are simply
-        incompatible, and silently keeping the slow turns would bias the dataset away from
-        the turns the generator most needs.
-
-        Args:
-            target: ``(Nw, F, D)`` future window nodes, raw units.
-
-        Returns:
-            A ``(Nw,)`` bool mask, or ``None`` when every window is fine (the common case,
-            so the caller can skip the copy entirely).
-
-        Raises:
-            ValueError: If more than :data:`WRAP_DROP_CEILING` of the windows wrap.
-        """
-        if "base_pose" not in self.block_slices:
-            return None
-        start = self.block_slices["base_pose"].start
-        worst = target[..., start + 3:start + 6].norm(dim=-1).amax(dim=1)   # (Nw,)
-        keep = worst <= WRAP_LIMIT_RAD
-        n_drop = int((~keep).sum())
-        if n_drop == 0:
-            return None
-        frac = n_drop / keep.numel()
-        if frac > WRAP_DROP_CEILING:
-            raise ValueError(
-                f"{n_drop}/{keep.numel()} windows ({100 * frac:.2f}%) have a base_pose "
-                f"orientation target reaching {worst.max():.2f} rad, at or past the "
-                f"quat_box_minus branch cut at pi ({math.pi:.2f}) -- more than the "
-                f"{100 * WRAP_DROP_CEILING:.0f}% this drops quietly. Over F={target.shape[1]} "
-                f"nodes ({target.shape[1] * float(self.cfg.dt):.2f} s) that much of the "
-                "library turns more than half a turn relative to the anchor, so the horizon "
-                "and the library's yaw rate are incompatible: shorten future_len, or cap the "
-                "yaw rate when generating clips. Dropping this many would bias the dataset "
-                "away from precisely the turns the generator needs to learn."
-            )
-        print(f"[fm-data] dropping {n_drop}/{keep.numel()} windows ({100 * frac:.4f}%) whose "
-              f"base_pose orientation target crosses the pi branch cut (max "
-              f"{worst.max():.2f} rad); their targets are discontinuous, not merely hard.")
-        return keep
-
     def _check_window_invariants(
         self,
         target: torch.Tensor,
@@ -654,7 +575,7 @@ class FutureStateDataset(Dataset):
         if "base_pose" in self.block_slices:
             bp = self.block_slices["base_pose"]
             pos0 = target[:, 0, bp.start:bp.start + 3]
-            ori = target[..., bp.start + 3:bp.start + 6]
+            ori6d = target[..., bp.start + 3:bp.start + 9]
 
             # 1. Node-0 ego anchor. The clip anchored at the snap sits on the robot, so
             #    node 0's base_pose position is the (small) live tracking error. The
@@ -668,21 +589,27 @@ class FutureStateDataset(Dataset):
                     "Re-record with ego_anchor_fraction=1.0 on the teacher command."
                 )
 
-            # 2. The pi branch cut -- a BACKSTOP. :meth:`_wrap_keep_mask` has already
-            #    dropped the windows that cross it (or raised if too many did), so this can
-            #    only fire if the two came apart. Kept because the failure it guards is
-            #    silent: a wrapped target is a jump discontinuity neither the flow loss nor
-            #    the policy can interpret, and the same wrap reaches the observation.
-            max_ori = ori.norm(dim=-1).max().item()
-            if max_ori > WRAP_LIMIT_RAD:
+            # 2. The orientation half really is a rotation. The TARGET is built from
+            #    recorded unit quaternions, so its two 6D columns must be orthonormal to
+            #    float precision -- the model's output need not be, but the thing it
+            #    regresses towards does. This replaces the old pi-branch-cut guard, which
+            #    the 6D representation makes unfireable: what it protected against was a
+            #    log map wrapping, and there is no longer a log map. A packing bug (wrong
+            #    slice, transposed columns, a stale 6-wide recording read as 9) lands here
+            #    instead of surviving as a plausible-looking target.
+            c0, c1 = ori6d[..., 0:3], ori6d[..., 3:6]
+            worst = max(
+                (c0.norm(dim=-1) - 1.0).abs().max().item(),
+                (c1.norm(dim=-1) - 1.0).abs().max().item(),
+                (c0 * c1).sum(dim=-1).abs().max().item(),
+            )
+            if worst > 1e-3:
                 raise ValueError(
-                    f"target base_pose orientation reaches {max_ori:.2f} rad "
-                    f"(> {WRAP_LIMIT_RAD}) AFTER the wrap filter ran -- these two have "
-                    "drifted apart. _wrap_keep_mask should have dropped this window."
+                    f"target base_pose orientation is not a rotation: worst deviation from "
+                    f"two orthonormal columns is {worst:.2e} (> 1e-3). The 6D block is "
+                    "built from recorded unit quaternions, so this is a packing bug, not "
+                    "data -- check the base_pose slice and the recording's width."
                 )
-            if max_ori > 2.0:
-                print(f"[WARN] target base_pose orientation reaches {max_ori:.2f} rad; the "
-                      f"quat_box_minus branch cut is at pi ({math.pi:.2f}).")
 
         # 3. History/target row alignment -- the highest-value guard here. ``history_ref``
         #    and ``ref_future`` come from different accessors (the per-step world cache vs

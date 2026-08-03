@@ -126,8 +126,9 @@ def test_deploy_parity_window():
     The reference window is the representation the policy observes AND the one the
     generator predicts, so a divergence between the two implementations of it is a
     sim2real gap that no shape check can see -- both sides produce a correctly-sized
-    observation either way.  The ``base_pose`` block is the sharp edge: its two halves
-    have to point the same way (reference minus actual) and live in the same frame.
+    observation either way.  The ``base_pose`` block is the sharp edge: both halves are the
+    reference pose in the anchor's frame, and the orientation half is a 6D rotation whose
+    two columns have to come out in the same order on both sides.
     """
     wt = pytest.importorskip(
         "robot_rl.flow_matching.window",

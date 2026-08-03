@@ -4,12 +4,14 @@
 
 Mirror of :mod:`robot_rl.flow_matching.window` for the torch-free deployment runtime,
 parity-tested against it directly in ``transfer/deploy/tests/test_deploy_parity.py``.
-See that module for what the blocks mean and why ``base_pose``'s two halves currently do
-NOT point the same way; this file restates only the arithmetic.
+See that module for what the blocks mean; this file restates only the arithmetic.
 
 Per node::
 
-    [base_pose(6), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
+    [base_pose(9), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
+
+``base_pose`` is ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]`` -- the reference pose in
+the anchor's frame, both halves the same way round.
 
 Two maps live here:
 
@@ -33,7 +35,57 @@ from typing import Sequence
 
 import numpy as np
 
-from .quat_math_np import quat_apply, quat_apply_inverse, quat_box_minus, quat_box_plus
+from .quat_math_np import (
+    matrix_from_quat,
+    quat_apply,
+    quat_apply_inverse,
+    quat_conjugate,
+    quat_from_matrix,
+    quat_mul,
+)
+
+
+def matrix_to_rot6d(matrix: np.ndarray) -> np.ndarray:
+    """First two COLUMNS of a rotation matrix, concatenated.
+
+    Args:
+        matrix: ``[..., 3, 3]`` rotation matrices.
+
+    Returns:
+        ``[..., 6]``.
+    """
+    return np.concatenate([matrix[..., :, 0], matrix[..., :, 1]], axis=-1)
+
+
+def rot6d_to_matrix(d6: np.ndarray) -> np.ndarray:
+    """Rotation matrix from the 6D representation, via Gram-Schmidt.
+
+    Robust to non-orthonormal input, which is the point: the generator emits a raw
+    9-vector and only approximately satisfies the constraint.
+
+    Args:
+        d6: ``[..., 6]`` 6D rotation representation.
+
+    Returns:
+        ``[..., 3, 3]`` orthonormal matrices, the recovered vectors as COLUMNS.
+    """
+    def unit(v: np.ndarray) -> np.ndarray:
+        """Normalize along the last axis, guarding a zero row."""
+        return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-8)
+
+    b1 = unit(d6[..., 0:3])
+    b2 = unit(d6[..., 3:6] - (b1 * d6[..., 3:6]).sum(axis=-1, keepdims=True) * b1)
+    return np.stack([b1, b2, np.cross(b1, b2)], axis=-1)
+
+
+def quat_to_rot6d(q: np.ndarray) -> np.ndarray:
+    """6D rotation representation of quaternions ``(x, y, z, w)``."""
+    return matrix_to_rot6d(matrix_from_quat(q))
+
+
+def rot6d_to_quat(d6: np.ndarray) -> np.ndarray:
+    """Quaternion ``(x, y, z, w)`` from the 6D rotation representation."""
+    return quat_from_matrix(rot6d_to_matrix(d6))
 
 #: Blocks a window node packs, in order, when none are selected explicitly. Mirrors
 #: ``robot_rl.flow_matching.window.REFERENCE_WINDOW_BLOCK_NAMES``.
@@ -82,7 +134,7 @@ def window_blocks(
         The same table :func:`robot_rl.flow_matching.window.window_blocks` returns.
     """
     widths = {
-        "base_pose": 6,
+        "base_pose": 9,   # position(3) + rot6d(6)
         "base_vel": 6,
         "joint_pos": num_joints,
         "joint_vel": num_joints,
@@ -148,16 +200,11 @@ def world_to_window(
     ref_q = np.asarray(ref_quat_w, dtype=np.float64)
 
     def base_pose() -> np.ndarray:
-        """``[pos_err, ori_err]``, in the LEGACY mixed convention.
-
-        Position ref-minus-actual in the robot frame, orientation actual-minus-ref in the
-        reference frame. See ``robot_rl.flow_matching.window`` for why that is still the
-        case and what flipping it costs; these lines and those move together.
-        """
+        """The reference base pose in the anchor's frame: ``[pos(3), rot6d(6)]``."""
         return np.concatenate([
             quat_apply_inverse(act_q, ref_p - act_p),
-            quat_apply_inverse(
-                act_q, quat_box_minus(np.broadcast_to(act_q, ref_q.shape), ref_q)),
+            quat_to_rot6d(quat_mul(np.broadcast_to(quat_conjugate(act_q), ref_q.shape),
+                                   ref_q)),                        # R_actT R_ref
         ], axis=-1)
 
     def base_vel() -> np.ndarray:
@@ -240,12 +287,15 @@ def reanchor_window(
     for name in selected:
         block = win[..., sl[name]]
         if name == "base_pose":
+            # Position round-trips through the world; the orientation half does not need
+            # to. R_newT R_ref = (R_newT R_old)(R_oldT R_ref), so each stored column is
+            # just rotated by the anchor delta -- exactly linear, no Gram-Schmidt.
             ref_p = old_p + quat_apply(old_q, block[..., 0:3])
-            ref_q = quat_box_plus(old_q, -quat_apply(old_q, block[..., 3:6]))
+            q_delta = quat_mul(quat_conjugate(new_q), old_q)        # R_newT R_old
             out.append(np.concatenate([
                 quat_apply_inverse(new_q, ref_p - new_p),
-                quat_apply_inverse(new_q, quat_box_minus(
-                    np.broadcast_to(new_q, ref_q.shape), ref_q)),
+                quat_apply(q_delta, block[..., 3:6]),
+                quat_apply(q_delta, block[..., 6:9]),
             ], axis=-1))
         elif name == "base_vel":
             out.append(np.concatenate([

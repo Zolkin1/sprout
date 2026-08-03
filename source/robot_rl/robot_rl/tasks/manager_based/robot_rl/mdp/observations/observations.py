@@ -9,9 +9,17 @@ from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_apply_inverse, quat_box_minus, quat_inv
+from isaaclab.utils.math import (
+    quat_apply,
+    quat_apply_inverse,
+    quat_box_minus,
+    quat_conjugate,
+    quat_inv,
+    quat_mul,
+)
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
 
+from robot_rl.flow_matching.transforms import quat_to_rot6d
 from robot_rl.flow_matching.window import (
     REFERENCE_BLOCK_KEYS as _REFERENCE_BLOCK_KEYS,
     REFERENCE_WINDOW_BLOCK_NAMES as REFERENCE_WINDOW_BLOCKS,
@@ -59,10 +67,12 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     frame, measured against the clip on its reset-time terrain cell -- the same reference
     the pose-drift termination uses.
 
-    Position is ``ref - actual``, orientation is ``actual - ref`` -- the legacy mixed
-    convention, matching :func:`base_pose_error` and the ``reference_window``.  See
-    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION` for why they still disagree
-    and what unifying them costs.
+    Both halves are ``ref - actual``, matching :func:`base_pose_error` and the
+    ``reference_window`` -- see
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.  Kept as a log-map
+    3-vector rather than widened to the window's 6D form: this is privileged, never
+    exported, and global drift is bounded well inside the branch cut by the pose-drift
+    termination that grades the same datum.
 
     This is the drift :func:`tracking_error_local` deliberately cannot see: the reward
     forgives planar drift, but the episode still ends on it, so without this the critic
@@ -74,7 +84,7 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)
     return torch.cat([
         state[:, 0:3] - root_pos_w,
-        quat_box_minus(root_quat_w, state[:, 3:7]),   # actual - reference (legacy)
+        quat_box_minus(state[:, 3:7], root_quat_w),   # reference - actual
     ], dim=-1)
 
 
@@ -94,20 +104,21 @@ def _joint_output_indices(ordered_names: list[str]) -> list[int]:
 
 
 def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
-    """Reference-vs-actual base pose error, expressed in the actual base frame.
+    """The reference base pose in the robot's current base frame.
 
-    Returns ``[N, 6]`` = position error (3) + orientation error (3), rotated into
-    the robot's current base frame, so the observation is fully heading-invariant
-    (no absolute world heading leaks) and deployable sim2real.
+    Returns ``[N, 9]`` = position ``ref - actual`` (3) rotated into the robot's current base
+    frame, plus ``R_actT R_ref`` in the 6D rotation representation (6).  Fully
+    heading-invariant -- no absolute world heading leaks -- and deployable sim2real.
 
-    The two halves point OPPOSITE WAYS -- position ``ref - actual``, orientation
-    ``actual - ref`` -- which is the legacy convention the trained policies were
-    fitted to.  See :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
+    Identical to node 0 of :func:`reference_window`'s ``base_pose`` block, and computed
+    through the same :func:`~robot_rl.flow_matching.window.world_to_window` convention --
+    ``test_reference_window`` asserts the two agree, which is what keeps them from drifting
+    apart.  See :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
 
-    Identical to node 0 of :func:`reference_window`'s ``base_pose`` block, and
-    computed through the same :func:`~robot_rl.flow_matching.window.world_to_window`
-    convention -- ``test_reference_window`` asserts the two agree, which is what keeps
-    them from drifting apart.
+    No observation group carries this term any more (``reference_window`` replaced it, and
+    node 0 IS this).  It survives as that test's independent oracle and as a diagnostic
+    signal in ``data_logger``, so it has to move with the window rather than be left behind
+    at the old convention.
     """
     cmd = env.command_manager.get_term(command_name)
     state = cmd.reference_world_state()                 # [N, 3+4+3+3+2nj]
@@ -116,10 +127,10 @@ def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # xyzw
 
-    pos_err_b = quat_apply_inverse(root_quat_w, ref_pos_w - root_pos_w)
-    ori_err_w = quat_box_minus(root_quat_w, ref_quat_w)     # actual ⊟ reference (world)
-    ori_err_b = quat_apply_inverse(root_quat_w, ori_err_w)  # -> current base frame
-    return torch.cat([pos_err_b, ori_err_b], dim=-1)
+    return torch.cat([
+        quat_apply_inverse(root_quat_w, ref_pos_w - root_pos_w),
+        quat_to_rot6d(quat_mul(quat_conjugate(root_quat_w), ref_quat_w)),   # R_actT R_ref
+    ], dim=-1)
 
 
 def joint_pos_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
@@ -615,10 +626,9 @@ def reference_window(
     look-ahead terms into ONE observation.  Per step, in
     :func:`reference_window_layout` order:
 
-    * ``base_pose`` (6) -- reference base position + orientation error relative to
-      the robot's *current actual* base, matching :func:`base_pose_error`.  The two
-      halves point opposite ways (position ``ref - actual``, orientation
-      ``actual - ref``) -- the legacy convention; see
+    * ``base_pose`` (9) -- the reference base pose in the robot's *current actual*
+      base frame: position ``ref - actual`` (3) plus ``R_actT R_ref`` as a 6D
+      rotation (6).  Matches :func:`base_pose_error`; see
       :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
     * ``base_vel`` (6) -- reference base linear+angular velocity rotated into the
       current actual base frame, matching :func:`ref_base_velocity_local`.
