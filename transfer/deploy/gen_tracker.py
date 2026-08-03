@@ -33,9 +33,9 @@ import numpy as np
 from .depth_obs import assert_depth_specs_agree
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_box_minus, quat_inv
+from .quat_math_np import quat_apply, quat_box_minus, quat_box_plus, quat_inv
 from .tracker_session import TrackerSession
-from .window_np import window_dim, world_to_window
+from .window_np import reanchor_window, window_block_slices, window_dim, world_to_window
 
 # Fallback clips for artifacts exported before the obs terms carried their own ``clip``
 # (``export_parameters.py`` now emits it per term, and the metadata value wins). Anything
@@ -51,6 +51,11 @@ _BASE_POSE_CONVENTION = "legacy_mixed_pos_ref_minus_actual_ori_actual_minus_ref"
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
     """Reorder a ``(w, x, y, z)`` quaternion (MuJoCo) to ``(x, y, z, w)`` (FM/Isaac)."""
     return np.array([q[1], q[2], q[3], q[0]], dtype=np.float64)
+
+
+def xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
+    """Reorder an ``(x, y, z, w)`` quaternion (FM/Isaac) to ``(w, x, y, z)`` (MuJoCo)."""
+    return np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
 
 
 class _TrackerOnlyCtx:
@@ -177,6 +182,18 @@ class GenTrackerPolicy:
         self._pred = np.zeros((1, self.ctx.F, self.ctx.D))
         self._pred_valid = False
         self._ctrl_step = -1
+        # -- receding-horizon serving state (mirrors FmTrackingCommand) --
+        # Node currently being served within the window; 0 on a re-plan, +1 per step after.
+        self._pred_idx = 0
+        # The robot pose the live prediction is expressed RELATIVE TO, captured at the
+        # re-plan. At fm_update_every > 1 the robot moves away from it, so every served node
+        # is re-anchored onto the robot now (see _serve_nodes). At K=1 this IS the current
+        # pose and the re-anchor is an identity to ~2e-15.
+        self._anchor_pos = np.zeros(3)
+        self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        # Node served on the PREVIOUS step, already re-anchored onto the robot as it was
+        # then -- the frame the dataset's history rows use. None until the first serve.
+        self._prev_served_node: np.ndarray | None = None
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
         # Per-term observation-history windows, keyed by term name (see _push_history).
         self._obs_history: dict[str, list[np.ndarray]] = {}
@@ -399,44 +416,33 @@ class GenTrackerPolicy:
     def _check_horizon(self) -> None:
         """Refuse a generator whose horizon cannot cover the tracker's window.
 
-        The deploy half of ``FmTrackingCommand._check_horizon``. With ``fm_update_every``
-        pinned to 1 the requirement is exact: serving offset ``o`` reads node ``o``, so
-        ``F >= max_offset + 1``. Nothing clamps -- a short horizon would silently freeze the
-        far end of the window, which looks like a tracking bug rather than a horizon one.
-
-        Also pins the re-plan period. The generator predicts the window relative to the
-        robot AT THE RE-PLAN, so serving node ``k`` on a later step would need the egomotion
-        since then to re-anchor -- odometry this path deliberately does without.
+        The deploy half of ``FmTrackingCommand._check_horizon``, same rule: the cursor sits
+        up to ``K - 1`` nodes past the re-plan when the furthest sample is read, so serving
+        offset ``o`` at a re-plan period of ``K`` needs ``F >= o + K``. Nothing clamps -- a
+        short horizon would silently freeze the far end of the window, which reads as a
+        tracking bug rather than a horizon one.
 
         Raises:
-            ValueError: If the horizon is too short, or the re-plan period is not 1.
+            ValueError: If the horizon cannot cover the window at this re-plan period.
         """
         if not self.fm_enabled:
             return
-        if self.fm_update_every != 1:
-            # TODO(deploy-k>1): the Isaac side supports K>1 by re-anchoring every served
-            # node onto the current robot (FmTrackingCommand._reanchor_to_now:
-            # window_to_world at the stale re-plan anchor, then world_to_window at the
-            # current pose). Porting it here needs window_to_world in window_np -- which was
-            # deliberately left out, since nothing off-sim needed a world-frame reference
-            # until now -- plus a measured base pose every step, i.e. odometry. That last
-            # part is the whole reason K=1 was worth having, so this is a real decision
-            # rather than missing plumbing.
-            raise ValueError(
-                f"This runtime serves fm_update_every=1 only; the tracker artifact says "
-                f"{self.fm_update_every}. The predicted window is anchored on the robot at "
-                "the re-plan, so serving it a step later needs the egomotion since then -- "
-                "the world-frame dependency the reference-window representation exists to "
-                "remove. Isaac implements the re-anchor; the torch-free port does not yet "
-                "(see TODO(deploy-k>1) above). Export a K=1 tracker for deployment."
-            )
         max_off = max(self.window_offsets)
-        if max_off + 1 > self.ctx.F:
+        need = max_off + self.fm_update_every
+        if need > self.ctx.F:
             raise ValueError(
-                f"The FM predicts F={self.ctx.F} nodes, but the tracker's window reaches "
-                f"offset {max_off}, needing F >= {max_off + 1}. Re-record with "
-                f"--ref_future_len {max_off + 1} and retrain with --future_len {max_off + 1}."
+                f"The FM predicts F={self.ctx.F} nodes, but serving offset {max_off} at a "
+                f"re-plan period of {self.fm_update_every} needs F >= {need} (the cursor is "
+                f"up to {self.fm_update_every - 1} nodes past the re-plan when the furthest "
+                f"sample is read). Lower fm_update_every, or re-record with "
+                f"--ref_future_len {need} and retrain with --future_len {need}."
             )
+        if self.fm_update_every > 1:
+            print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every}: served "
+                  "nodes are re-anchored onto the measured base each step, so the base pose "
+                  f"in `state` must be good over {self.fm_update_every - 1} steps "
+                  f"({(self.fm_update_every - 1) * self.get_dt():.2f} s) of egomotion. Only "
+                  "the RELATIVE motion since the re-plan matters, not a global pose.")
 
     # ------------------------------------------------------------------
     # Snapshot + generator inference
@@ -453,7 +459,8 @@ class GenTrackerPolicy:
 
         ``command`` rides along for the held-command fallback in :meth:`_run_fm`.
         """
-        node = self._pred[:, 0].copy() if self._pred_valid else np.zeros((1, self.ctx.D))
+        node = (np.zeros((1, self.ctx.D)) if self._prev_served_node is None
+                else self._prev_served_node.reshape(1, self.ctx.D).copy())
         return {"node": node, "cmd": np.array(state["command"], dtype=np.float64, copy=True)[None]}
 
     def warm_start(self, state: dict) -> None:
@@ -487,21 +494,47 @@ class GenTrackerPolicy:
         self._history.append(self._make_snapshot(state))
 
     def _update_generator(self, state: dict) -> None:
-        """Push the served node into history and re-sample the window.
+        """Advance the receding horizon by one control step.
 
-        Every control step: ``fm_update_every`` is pinned to 1, so there is no cursor to
-        advance and node 0 is always "now". The pushed row is the generator's OWN last
-        output, mirroring ``FmTrackingCommand._snapshot_and_infer``.
+        The step order IS the algorithm, and it mirrors
+        ``FmTrackingCommand._snapshot_and_infer`` exactly:
+
+        1. push the node served LAST step into the history (already in that step's frame);
+        2. decide whether to re-plan -- on cadence, or whenever there is no live plan;
+        3. otherwise advance the cursor one node into the existing plan;
+        4. re-plan where asked, which resets the cursor and re-captures the anchor;
+        5. stash the node served THIS step, re-anchored onto the robot as it is now, for
+           the next step's push.
+
+        The cadence is ``_ctrl_step % K``, an ABSOLUTE counter, matching Isaac's
+        ``episode_length_buf % K``. A forced off-cadence re-plan (no live plan, e.g. after a
+        reset or a stand warmup) therefore leaves the first segment SHORTER than ``K`` and
+        exact thereafter -- Isaac behaves the same way, so this is deliberate.
         """
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
         null_hist = bool(self._history.null_mask()[0])
         use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
+
+        reinfer = (self._ctrl_step % max(self.fm_update_every, 1)) == 0
+        infer = reinfer or not self._pred_valid
+        if self._pred_valid and not infer:
+            # Walk one node further into the live plan. Assert rather than clamp: freezing
+            # the tail silently would look like a tracking failure, not a horizon one.
+            self._pred_idx += 1
+            if self._pred_idx >= self.ctx.F:
+                raise RuntimeError(
+                    f"FM prediction cursor ran past the horizon (F={self.ctx.F}) at "
+                    f"fm_update_every={self.fm_update_every}: the re-plan cadence is not "
+                    "firing. Check _ctrl_step and the reset path."
+                )
         # Gate: normally "history complete", but with the null-history warmup the generator runs
         # from step 0 and the incomplete window is replaced by the learned embedding -- the same
         # flow as FmTrackingCommand, so RL and deploy agree on the first N-1 steps.
-        if (not null_hist) or use_null:
+        if infer and ((not null_hist) or use_null):
             self._run_fm(state, history_null=(null_hist and use_null))
+        if self._pred_valid:
+            self._prev_served_node = self._serve_nodes(state, (0,))[0]
 
     def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample the F-node reference window for this control step.
@@ -540,6 +573,12 @@ class GenTrackerPolicy:
         self._pred = sample_window(ctx, history, height, cmd_tokens, noise,
                                    history_null=np.array([bool(history_null)]))
         self._fm_infer_s += time.perf_counter() - t0
+        # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
+        # Both are needed to serve the window later: the cursor to index it, the anchor to
+        # undo the staleness once the robot has moved on.
+        self._pred_idx = 0
+        self._anchor_pos = np.asarray(state["root_pos"], dtype=np.float64).copy()
+        self._anchor_quat = np.asarray(state["root_quat"], dtype=np.float64).copy()
         self._pred_valid = True
 
     def _sample_noise(self) -> np.ndarray:
@@ -564,15 +603,124 @@ class GenTrackerPolicy:
         shape = (1, self.ctx.F, self.ctx.D)
         return np.zeros(shape) if self.zero_noise else self._rng.standard_normal(shape)
 
-    def _fm_reference_window(self) -> np.ndarray:
+    def _serve_nodes(self, state: dict, offsets) -> np.ndarray:
+        """Served nodes at ``offsets``, re-expressed relative to the robot RIGHT NOW.
+
+        The deploy half of ``FmTrackingCommand._reanchor_to_now``. Offsets are relative to
+        the CURSOR (node ``_pred_idx + offset``), not to the start of the window, so "offset
+        0" means "now" whatever the re-plan period.
+
+        The prediction is anchored on the robot as it was at the re-plan, but the
+        observation's contract is "relative to the robot's current actual base". Those
+        coincide only at ``fm_update_every=1``; at K>1 they differ by up to ``K-1`` steps of
+        egomotion, and serving the stale frame would hand the policy a window wrong by
+        exactly the distance travelled since the re-plan.
+
+        Applied unconditionally, including at K=1, because that is what Isaac does -- and it
+        is an identity there to ~2e-15, so there is nothing to save by special-casing it.
+
+        Goes through :func:`~window_np.reanchor_window` rather than lifting to the world and
+        back, because only ``base_pose`` and ``base_vel`` reference the anchor and the round
+        trip cannot be completed for a block subset at all.
+
+        Args:
+            state: The step's state dict, supplying the measured base pose.
+            offsets: Offsets from the current served node.
+
+        Returns:
+            ``[len(offsets), D]`` window nodes in the current robot frame.
+        """
+        idx = self._pred_idx + np.asarray(offsets, dtype=int)
+        return reanchor_window(
+            self._pred[0, idx],
+            self._anchor_pos[None, :], self._anchor_quat[None, :],
+            np.asarray(state["root_pos"], dtype=np.float64)[None, :],
+            np.asarray(state["root_quat"], dtype=np.float64)[None, :],
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks,
+        )
+
+    def _fm_reference_window(self, state: dict) -> np.ndarray:
         """The predicted nodes at the tracker's window offsets, flattened for the obs.
 
-        A gather. The generator emits exactly the vector
+        A gather plus a re-anchor. The generator emits exactly the vector
         ``mdp.observations.reference_window`` feeds the policy, so nothing between the
-        network and the observation transforms anything -- which is what keeps the whole
-        FM path free of a world pose.
+        network and the observation reinterprets anything -- the only transform is the frame
+        correction :meth:`_serve_nodes` applies, which is an identity at ``K=1``.
         """
-        return self._pred[0, self.window_offsets].reshape(-1)
+        return self._serve_nodes(state, self.window_offsets).reshape(-1)
+
+    def predicted_base_pose_w(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The predicted window's reference base pose, lifted to the world frame.
+
+        FOR DIAGNOSTICS ONLY. The live path never needs this -- the prediction IS the
+        observation, which is the whole reason no world pose appears anywhere in the FM
+        branch. A viewer that wants to draw the plan has to invert the one block that
+        references the anchor. This is the numpy half of
+        ``flow_matching.window.window_to_world``'s ``base_pose`` case and must stay
+        identical to it:
+
+        * position: forward is ``quat_apply_inverse(q_a, ref_p - p_a)``, so
+          ``ref_p = p_a + quat_apply(q_a, block)``;
+        * orientation: forward is ``Log(R_a R_refT)`` expressed in the anchor frame, so
+          ``ref_q = Exp(-quat_apply(q_a, block)) * q_a`` -- the minus belongs to the legacy
+          mixed convention, not to a sign slip.
+
+        Lifts through the STORED re-plan anchor, like ``FmTrackingCommand._pred_world``, and
+        takes no pose argument on purpose: the frame the prediction is expressed in is a
+        property of the prediction, not of the caller. Handing in the current pose would be
+        right only at ``fm_update_every=1`` and would silently shear the whole ribbon by the
+        egomotion since the re-plan at any larger period.
+
+        Returns ALL ``F`` nodes, absolute -- not offset from the cursor. The ribbon wants the
+        whole plan, and routing it through the serving path would also apply the serving
+        horizon check, which offset ``F-1`` cannot satisfy at ``K > 1``.
+
+        Returns:
+            ``([F, 3] positions, [F, 4] xyzw orientations)``, or ``None`` when there is no
+            live prediction yet or the window has no ``base_pose`` block to invert. The
+            quaternions come back sign-normalised (see :func:`quat_box_plus`).
+        """
+        if not self._pred_valid:
+            return None
+        sl = window_block_slices(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks
+        ).get("base_pose")
+        if sl is None:
+            return None
+        block = self._pred[0, :, sl]                                          # [F,6]
+        q = np.broadcast_to(self._anchor_quat, (block.shape[0], 4))
+        ref_p = self._anchor_pos + quat_apply(q, block[:, 0:3])
+        ref_q = quat_box_plus(q, -quat_apply(q, block[:, 3:6]))
+        return ref_p, ref_q
+
+    def predicted_root_path_w(self) -> np.ndarray | None:
+        """Just the position half of :meth:`predicted_base_pose_w` (``[F, 3]`` or ``None``)."""
+        lifted = self.predicted_base_pose_w()
+        return None if lifted is None else lifted[0]
+
+    @property
+    def served_node_index(self) -> int:
+        """Absolute index of the window node being served this step (the cursor).
+
+        ``0`` on a re-plan and ``+1`` per step until the next one, so it is always 0 at
+        ``fm_update_every=1``. Diagnostics that want "the reference at this step" out of the
+        absolute-node accessors above have to index with this rather than assume node 0.
+        """
+        return int(self._pred_idx)
+
+    def predicted_joint_pos(self) -> np.ndarray | None:
+        """The predicted window's reference joint angles, ``[F, nj]`` in ISAAC order.
+
+        Frame-invariant, so unlike the base pose there is nothing to lift -- the block is
+        served verbatim. ``None`` when there is no live prediction or no ``joint_pos``
+        block.
+        """
+        if not self._pred_valid:
+            return None
+        sl = window_block_slices(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks
+        ).get("joint_pos")
+        return None if sl is None else np.asarray(self._pred[0, :, sl], dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Observation construction
@@ -665,7 +813,7 @@ class GenTrackerPolicy:
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "reference_window": (self._fm_reference_window() if window is None
+            "reference_window": (self._fm_reference_window(state) if window is None
                                  else self._reference_window(window, root_pos, root_quat)),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
@@ -825,6 +973,14 @@ class GenTrackerPolicy:
             self._pred_valid = False
             self._ctrl_step = -1
             self._future_cmd_override = None
+            # Receding-horizon state. The stash in particular describes a pose from before
+            # the reset, so keeping it would push a row from another episode into the
+            # history -- ``_pred_valid`` already gates it, but leaving stale data to be
+            # gated is the kind of thing that stops being gated when the warmup changes.
+            self._pred_idx = 0
+            self._anchor_pos = np.zeros(3)
+            self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+            self._prev_served_node = None
             self._reset_timing()
 
     def get_dt(self) -> float:

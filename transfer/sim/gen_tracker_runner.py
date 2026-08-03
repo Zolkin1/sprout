@@ -36,9 +36,10 @@ import yaml
 
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw  # noqa: E402
+from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
+from deploy.window_np import window_block_slices  # noqa: E402
 
 from robot import Robot  # noqa: E402
 from clip_reference import ClipReference  # noqa: E402
@@ -261,6 +262,56 @@ def _rpy_from_xyzw(q: np.ndarray) -> tuple[float, float, float]:
     return roll, pitch, yaw
 
 
+def _print_collider_inventory(model) -> None:
+    """List which bodies actually own a COLLIDING geom, and which only look solid.
+
+    Worth printing rather than eyeballing: MuJoCo renders geom groups 0, 1 and 2 by
+    default, so a collision geom and the visual mesh it duplicates are drawn on top of each
+    other. A geom whose contact is disabled therefore looks exactly like one that collides,
+    and a limb with no collider at all looks exactly like one that has a full mesh. Neither
+    is visible in the viewer without turning groups off (``--viz_geomgroup``).
+    """
+    name = lambda b: mujoco.mj_name2id and mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, b)
+    colliding, inert = {}, {}
+    for g in range(model.ngeom):
+        b = name(model.geom_bodyid[g])
+        if b == "world":
+            continue
+        tgt = colliding if (model.geom_contype[g] or model.geom_conaffinity[g]) else inert
+        tgt[b] = tgt.get(b, 0) + 1
+    solid_only = sorted(set(inert) - set(colliding))
+    print(f"[INFO] MuJoCo colliders: {len(colliding)} bodies collide, "
+          f"{len(solid_only)} are drawn but CANNOT collide.")
+    print(f"       collide : {', '.join(sorted(colliding))}")
+    print(f"       drawn-only: {', '.join(solid_only)}")
+
+
+def _apply_viz_options(viewer, model, geomgroup: list[int] | None, contacts: bool) -> None:
+    """Set the viewer's geom-group + contact visualisation options.
+
+    Args:
+        viewer: The passive viewer handle.
+        model: The MuJoCo model (for the collider inventory print).
+        geomgroup: Groups to RENDER (0 = collision, 1 = visual meshes, 2 = terrain). ``None``
+            keeps MuJoCo's default, which renders 0, 1 and 2 together.
+        contacts: Show contact points + forces, and make geoms transparent so the points are
+            not hidden inside the meshes.
+    """
+    if geomgroup is not None:
+        for i in range(len(viewer.opt.geomgroup)):
+            viewer.opt.geomgroup[i] = 1 if i in geomgroup else 0
+        print(f"[INFO] rendering geom groups {sorted(geomgroup)} only "
+              "(0 = collision, 1 = visual, 2 = terrain).")
+    if contacts:
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = 1
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = 1
+        viewer.opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = 1
+        print("[INFO] contact points + forces on, geoms transparent. NOTE: nothing will be "
+              "drawn where nothing touches -- an empty view means no contact, which for a "
+              "self-collision question is the answer rather than a failure.")
+    _print_collider_inventory(model)
+
+
 def _add_sphere(scn, pos: np.ndarray, rgba: tuple, radius: float) -> None:
     """Append a sphere geom to a viewer ``user_scn`` (no-op if at capacity)."""
     if scn.ngeom >= scn.maxgeom:
@@ -318,7 +369,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip_spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
-        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8) -> bool:
+        depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
+        viz_geomgroup: list[int] | None = None, viz_contacts: bool = False) -> bool:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
@@ -535,10 +587,125 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         robot.apply_action(action)
         return action, state
 
+    # ------------------------------------------------------------------
+    # Forward kinematics of the PREDICTED window (viewer ribbon + log columns).
+    # ------------------------------------------------------------------
+    # A scratch MjData on the sim's own model, so FK of a hypothetical pose never disturbs
+    # the live one. `mj_kinematics` is the whole cost -- no dynamics, no collision.
+    _fk_data = mujoco.MjData(robot.mj_model)
+    _fk_body_ids = [mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, n)
+                    for n in policy.ctx.target_frame_names]
+    _fk_missing = [n for n, i in zip(policy.ctx.target_frame_names, _fk_body_ids) if i < 0]
+    if _fk_missing:
+        print(f"[WARN] FK frames absent from the MJCF, so no predicted-frame ribbon: {_fk_missing}")
+
+    def _fm_frame_paths_w(node_idxs) -> np.ndarray | None:
+        """World positions of the FM target frames implied by the predicted window.
+
+        The slim window predicts ``joint_pos`` but no ``ee_pos``, so the frames are not
+        served -- they are IMPLIED, and forward kinematics recovers them: set the reference
+        base pose + reference joints on a scratch ``MjData`` and read the body positions
+        back. MuJoCo is the right engine for it here because the sim is already holding the
+        very model the FM's FK losses are defined against
+        (``FlowMatchingConfig.fk_model_path`` is this MJCF), so nothing can drift between
+        the two.
+
+        What this DOES mean: the frames are exactly where the predicted joints put them,
+        given the predicted base. That is a stronger statement than the retired ``ee_pos``
+        block made -- that one was predicted INDEPENDENTLY and could disagree with FK of the
+        same node's joints. Here disagreement is impossible by construction, so the ribbon
+        shows the pose the tracker is being asked to achieve, not a second opinion about it.
+        Both inputs carry the generator's error, and the joint error reaches the frames
+        amplified by the link lengths.
+
+        Takes no pose: the lift goes through the prediction's own stored re-plan anchor, so
+        the result is correct at any ``fm_update_every`` and there is no stale-frame trap for
+        the caller to fall into.
+
+        Args:
+            node_idxs: ABSOLUTE window node indices to evaluate (0..F-1, not offsets from
+                the cursor), so the caller pays only for the nodes it draws.
+
+        Returns:
+            ``[len(node_idxs), n_frames, 3]`` world positions, or ``None`` when the window
+            cannot supply a base pose or joints (or no frame resolved in the MJCF).
+        """
+        lifted = policy.predicted_base_pose_w()
+        jp_isaac = policy.predicted_joint_pos()
+        if lifted is None or jp_isaac is None or not any(i >= 0 for i in _fk_body_ids):
+            return None
+        ref_p, ref_q = lifted
+        idxs = np.asarray(node_idxs, dtype=int)
+        out = np.full((idxs.size, len(_fk_body_ids), 3), np.nan)
+        for row, n in enumerate(idxs):
+            # qpos = [pos(3), quat(4, WXYZ), joints(nj in MUJOCO order)].
+            _fk_data.qpos[0:3] = ref_p[n]
+            _fk_data.qpos[3:7] = xyzw_to_wxyz(ref_q[n])
+            _fk_data.qpos[7:] = convert_joint_order(jp_isaac[n], isaac, robot.joint_names)
+            mujoco.mj_kinematics(robot.mj_model, _fk_data)
+            for f, bid in enumerate(_fk_body_ids):
+                if bid >= 0:
+                    out[row, f] = _fk_data.xpos[bid]
+        return out
+
+    # One-shot latch for the "--log FM branch has NaN columns" notice (a list so the
+    # closure can append without a nonlocal).
+    _warned_fm_log_nan: list[bool] = []
+
+    def _fm_log_reference() -> dict:
+        """A ``log_step`` reference for the FM branch, rebuilt from the predicted window.
+
+        The clip branch hands ``log_step`` a real world-frame reference; the FM branch has
+        none to hand it, because the prediction IS the observation -- that is the point of
+        the representation. So every column is reconstructed from the predicted window, and
+        the shape stays identical so the column contract ``gen_tracker_metrics`` /
+        ``compare_sim2sim`` read does not move:
+
+        * ``root_pos`` / ``root_quat`` -- lifted back through the prediction's own re-plan
+          anchor, so correct at any ``fm_update_every``;
+        * ``jp`` -- the ``joint_pos`` block verbatim (already in isaac order, so it lines
+          up elementwise with ``state["joint_pos"]``);
+        * ``frame_pos`` -- FK of those joints on that base (see :func:`_fm_frame_paths_w`),
+          not a served ``ee_pos`` block, which this window does not carry.
+
+        Reads the node at the CURSOR, not node 0: at ``K > 1`` node 0 is the last re-plan,
+        which is up to ``K-1`` steps stale, while the tracker is following
+        ``served_node_index``.
+
+        A block the window does drop leaves its columns NaN rather than zero, and says so
+        once -- a zero would be silently averaged into the metrics.
+
+        Returns:
+            ``{"window": [<served reference>]}``, matching the clip branch's shape.
+        """
+        nj, k_fr = len(policy.get_joint_names()), len(ee_names)
+        n = policy.served_node_index
+        lifted = policy.predicted_base_pose_w()
+        jp = policy.predicted_joint_pos()
+        fp = _fm_frame_paths_w([n])
+        cur = {
+            "root_pos": lifted[0][n] if lifted is not None else np.full(3, np.nan),
+            "root_quat": lifted[1][n] if lifted is not None else np.full(4, np.nan),
+            "jp": jp[n] if jp is not None else np.full(nj, np.nan),
+            "frame_pos": fp[0] if fp is not None else np.full((k_fr, 3), np.nan),
+        }
+        # Announce once, but only once a prediction EXISTS: before that every field is
+        # legitimately NaN (warmup), and reporting it then would name the whole reference as
+        # unavailable when nothing is actually missing.
+        if policy._pred_valid and not _warned_fm_log_nan:
+            _warned_fm_log_nan.append(True)
+            missing = [k for k, v in cur.items() if not np.isfinite(v).all()]
+            print(f"[INFO] --log on the FM branch: reference columns rebuilt from the "
+                  f"predicted window (blocks {policy.reference_blocks}); the ee*_ columns "
+                  f"are FK of the predicted joints, not a served ee_pos block."
+                  + (f" NaN (no block supplies them): {missing}." if missing
+                     else " Every reference column is populated."))
+        return {"window": [cur]}
+
     def log_step(state: dict, ref: dict | None = None) -> None:
         if not writer:
             return
-        ref = ref if ref is not None else policy._reference_from_fm()
+        ref = ref if ref is not None else _fm_log_reference()
         cur = ref["window"][0]          # offset 0 = the current step
         rq = np.asarray(state["root_quat"], dtype=np.float64)
         root_pos = np.asarray(state["root_pos"], dtype=np.float64)
@@ -568,12 +735,14 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         if "height_scan" in state:
             scan_rows.append(np.asarray(state["height_scan"], dtype=np.float32).ravel())
         f_len, k_fr = int(policy.ctx.F), len(ee_names)
-        if policy._pred_valid:
-            pred_rows.append(np.asarray(policy._pred["root_pos"][0], dtype=np.float32))
-            predf_rows.append(np.asarray(policy._pred["frame_pos"][0], dtype=np.float32))
-        else:
-            pred_rows.append(np.full((f_len, 3), np.nan, dtype=np.float32))
-            predf_rows.append(np.full((f_len, k_fr, 3), np.nan, dtype=np.float32))
+        # Per-step predicted WINDOW sidecars: the same lift + FK draw_viz uses, over EVERY
+        # node (the viewer may stride, a replay should not).
+        pred_path = policy.predicted_root_path_w()
+        pred_rows.append(np.asarray(pred_path, dtype=np.float32) if pred_path is not None
+                         else np.full((f_len, 3), np.nan, dtype=np.float32))
+        pred_frames = _fm_frame_paths_w(np.arange(f_len))
+        predf_rows.append(np.asarray(pred_frames, dtype=np.float32) if pred_frames is not None
+                          else np.full((f_len, k_fr, 3), np.nan, dtype=np.float32))
         writer.writerow([robot.mj_data.time, *state["command"].tolist(),
                          float(lin_b[0]), float(lin_b[1]), float(state["base_ang_vel"][2]),
                          pos_err, ori_err, jp_err,
@@ -615,14 +784,24 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             else:
                 n_pts = max(1, min(fm_traj_points, policy.ctx.F))
                 idxs = np.unique(np.linspace(0, policy.ctx.F - 1, n_pts).astype(int))
-            rp = policy._pred["root_pos"][0]  # (F, 3) predicted root path
-            for i in idxs:
-                _add_sphere(scn, rp[int(i)], (1.0, 0.55, 0.0, 0.85), 0.02)
-            if foot_idx:
-                fp = policy._pred["frame_pos"][0]  # (F, k, 3) predicted feet paths
+            # The prediction is a reference WINDOW in the anchor's frame, not a world path:
+            # lift it back through the anchor to draw it. Exact at fm_update_every=1 (the
+            # only cadence this runtime serves), where the anchor is the robot in `state`.
+            rp = policy.predicted_root_path_w()
+            if rp is not None:                                   # (F, 3) predicted root path
                 for i in idxs:
-                    for fi in foot_idx:
-                        _add_sphere(scn, fp[int(i), fi], (0.0, 0.9, 1.0, 0.95), 0.02)
+                    _add_sphere(scn, rp[int(i)], (1.0, 0.55, 0.0, 0.85), 0.02)
+            # Feet: the slim window predicts joints but no ee_pos, so the feet are IMPLIED
+            # rather than served -- FK of the predicted joints on the predicted base
+            # recovers them (see _fm_frame_paths_w).
+            if foot_idx:
+                fp = _fm_frame_paths_w(idxs)
+                if fp is not None:
+                    for row in range(fp.shape[0]):
+                        for fi in foot_idx:
+                            p = fp[row, fi]
+                            if np.isfinite(p).all():
+                                _add_sphere(scn, p, (0.0, 0.9, 1.0, 0.95), 0.02)
         # Velocity arrows above the pelvis: green = desired (joystick), blue = actual.
         head = base_pos + np.array([0.0, 0.0, vel_arrow_height])
         yaw = _yaw_from_xyzw(np.asarray(state["root_quat"], dtype=np.float64))
@@ -775,6 +954,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
             viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+            _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
             success = loop_fn(viewer)
 
     if log_file:
@@ -812,9 +992,14 @@ def main() -> None:
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
     parser.add_argument("--fm_update_every", type=int, default=1,
-                        help="Generator re-inference cadence (control steps); 1 = every step. "
+                        help="Generator re-inference cadence K (control steps); 1 = every step, "
+                             "which is the only cadence that pays the full FM cost every tick. "
                              "Fallback only: overridden by 'fm_update_every' in the tracker "
-                             "metadata if present. Every tick pays the full FM cost at 1.")
+                             "metadata if present, so pin K at EXPORT to choose it. K>1 serves "
+                             "each plan for K steps, re-anchoring the served nodes onto the "
+                             "measured base -- exact in MuJoCo, but on hardware it needs the "
+                             "base pose to be good over K-1 steps of egomotion. Needs "
+                             "F >= max_window_offset + K (F=62, offset 50 => K <= 12).")
     # FM sampler noise. Zero noise is the sim2sim DEFAULT because it visibly tracks better in
     # MuJoCo than drawing x0 ~ N(0, I); the deploy library default stays Gaussian, so hardware
     # keeps the training-matched stochastic sampling unless it opts in too.
@@ -897,6 +1082,18 @@ def main() -> None:
                              "default, matching the -play task the policy was exported from.")
     parser.add_argument("--depth_noise_seed", type=int, default=0,
                         help="Seed for --depth_noise.")
+    parser.add_argument("--viz_geomgroup", type=str, default=None, metavar="LIST",
+                        help="Comma-separated geom GROUPS to render: 0 = collision geoms, "
+                             "1 = visual meshes, 2 = terrain. MuJoCo's default renders 0, 1 "
+                             "and 2 TOGETHER, which is why a collider and the visual mesh it "
+                             "duplicates are indistinguishable, and why disabling a geom's "
+                             "contact changes nothing on screen. Use '0,2' to see only what "
+                             "can actually collide, or '1,2' for only what the depth cameras "
+                             "ray-cast.")
+    parser.add_argument("--viz_contacts", action="store_true", default=False,
+                        help="Show contact points + forces and make geoms transparent. An "
+                             "empty view means nothing is touching -- which for a "
+                             "self-collision question is the answer, not a failure.")
     parser.add_argument("--depth_viz_stride", type=int, default=8,
                         help="Draw every Nth depth pixel's hit point in the viewer (1560 hits per "
                              "step would exceed the scene's geom capacity).")
@@ -1054,6 +1251,9 @@ def main() -> None:
                   args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
                   args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
                   args.cmd_max_acc, args.fm_traj_points,
+                  viz_geomgroup=([int(g) for g in args.viz_geomgroup.split(",") if g.strip() != ""]
+                                 if args.viz_geomgroup else None),
+                  viz_contacts=args.viz_contacts,
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)

@@ -11,11 +11,17 @@ Per node::
 
     [base_pose(6), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
 
-Only the FORWARD map lives here. The deploy runtime needs it for the CLIP reference path
-(tracker-only playback, where a world-frame reference is handed in); the generator predicts
-window nodes directly, so nothing on the FM path transforms anything. The inverse
-(``window_to_world``) is a simulation-side diagnostic and is deliberately not ported --
-add it here only if something off-sim genuinely needs to draw a world-frame reference.
+Two maps live here:
+
+* ``world_to_window`` -- the FORWARD map, needed for the CLIP reference path (tracker-only
+  playback, where a world-frame reference is handed in).
+* ``reanchor_window`` -- re-express nodes against a different anchor, needed to serve a
+  prediction more than one control step after it was made (``fm_update_every > 1``).
+
+The full inverse (``window_to_world``) stays a simulation-side diagnostic and is
+deliberately NOT ported: it cannot even be completed for a block subset, since the return
+leg needs every block. ``GenTrackerPolicy.predicted_base_pose_w`` ports just the
+``base_pose`` case, which is all any off-sim viewer has ever needed.
 
 All quaternions are ``(x, y, z, w)``. Unlike the torch original, every helper here
 broadcasts, so the anchor needs no explicit expansion.
@@ -27,7 +33,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .quat_math_np import quat_apply_inverse, quat_box_minus
+from .quat_math_np import quat_apply, quat_apply_inverse, quat_box_minus, quat_box_plus
 
 #: Blocks a window node packs, in order, when none are selected explicitly. Mirrors
 #: ``robot_rl.flow_matching.window.REFERENCE_WINDOW_BLOCK_NAMES``.
@@ -175,3 +181,77 @@ def world_to_window(
         "ee_pos": ee_pos,
     }
     return np.concatenate([built[b]() for b in selected], axis=-1)
+
+
+def reanchor_window(
+    window: np.ndarray,
+    old_pos_w: np.ndarray,
+    old_quat_w: np.ndarray,
+    new_pos_w: np.ndarray,
+    new_quat_w: np.ndarray,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+) -> np.ndarray:
+    """Re-express window nodes against a DIFFERENT anchor, block by block.
+
+    Port of ``robot_rl.flow_matching.window.reanchor_window``; parity-tested against it.
+
+    A window is relative to one measured robot pose. Serving the same nodes a few control
+    steps later (``fm_update_every > 1``) means expressing them against where the robot is
+    NOW, and only the blocks that reference the anchor need touching:
+
+    * ``base_pose`` -- up to the world through the old anchor, straight back down through
+      the new (the one block that genuinely round-trips);
+    * ``base_vel`` -- a pure rotation ``R_newT R_old``, no position involved;
+    * ``joint_pos`` / ``joint_vel`` -- frame-invariant, copied;
+    * ``ee_pos`` -- relative to *that node's own* reference base, so anchor-invariant too,
+      copied.
+
+    Per block rather than through the world and back, which is what makes it work for a
+    block SELECTION at all: the world round trip needs every block present on the return
+    leg, and a window that drops ``joint_vel`` or ``ee_pos`` cannot supply them.
+
+    Only the RELATIVE transform between the two anchors matters -- a common translation
+    cancels and a common rotation is equivariant. Off-sim that is the useful property:
+    serving at ``K > 1`` needs the base motion since the re-plan, not a global pose.
+
+    Args:
+        window: ``[..., K, D]`` window nodes anchored on the old pose.
+        old_pos_w / old_quat_w: ``[..., 1, 3]`` / ``[..., 1, 4]`` anchor the nodes are in
+            (or any shape that broadcasts against the node axis).
+        new_pos_w / new_quat_w: The anchor to express them against.
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection ``window`` is packed with; defaults to all of them.
+
+    Returns:
+        ``[..., K, D]`` nodes in the new anchor's frame, same layout.
+    """
+    selected = resolve_reference_blocks(blocks)
+    sl = window_block_slices(num_joints, num_ee_frames, selected)
+    win = np.asarray(window, dtype=np.float64)
+    old_p = np.asarray(old_pos_w, dtype=np.float64)
+    old_q = np.asarray(old_quat_w, dtype=np.float64)
+    new_p = np.asarray(new_pos_w, dtype=np.float64)
+    new_q = np.asarray(new_quat_w, dtype=np.float64)
+
+    out: list[np.ndarray] = []
+    for name in selected:
+        block = win[..., sl[name]]
+        if name == "base_pose":
+            ref_p = old_p + quat_apply(old_q, block[..., 0:3])
+            ref_q = quat_box_plus(old_q, -quat_apply(old_q, block[..., 3:6]))
+            out.append(np.concatenate([
+                quat_apply_inverse(new_q, ref_p - new_p),
+                quat_apply_inverse(new_q, quat_box_minus(
+                    np.broadcast_to(new_q, ref_q.shape), ref_q)),
+            ], axis=-1))
+        elif name == "base_vel":
+            out.append(np.concatenate([
+                quat_apply_inverse(new_q, quat_apply(old_q, block[..., 0:3])),
+                quat_apply_inverse(new_q, quat_apply(old_q, block[..., 3:6])),
+            ], axis=-1))
+        else:
+            out.append(block)
+    return np.concatenate(out, axis=-1)

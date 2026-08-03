@@ -65,15 +65,16 @@ def test_hardware_offline() -> None:
     try:
         policy.load()
     except ValueError as exc:
-        stale = (("base_pose_convention" in str(exc)) or ("window_blocks" in str(exc))
-                 or ("fm_update_every=1 only" in str(exc)))
+        stale = ("base_pose_convention" in str(exc)) or ("window_blocks" in str(exc))
         if not stale:
             raise
         # Refusing an artifact from before the reference-window representation (or before
         # the base_pose sign fix) is the runtime doing its job -- the whole point of those
         # guards. There is no policy here to drive until one is retrained and re-exported.
-        # A K>1 artifact is not stale, it is ahead of this runtime -- see
-        # TODO(deploy-k>1) in gen_tracker. Either way there is no policy here to drive.
+        # NOTE: a K>1 artifact is no longer in this list -- the runtime serves any
+        # fm_update_every whose horizon fits. A horizon that does NOT fit
+        # ("needs F >= ...") is an unservable export rather than a stale one, so it is
+        # deliberately left to raise: the fix is a config or a retrain, not a skip.
         print(f"[SKIP] {exp} cannot be served by this runtime: {exc}")
         return
     stacked = [t["name"] for t in policy.get_obs_terms() if int(t.get("history_length", 0)) > 0]
