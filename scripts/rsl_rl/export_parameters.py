@@ -106,19 +106,19 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
         return None, None
 
     def _offsets(cfg):
-        """Sample offsets ``[0, stride, ...]`` in CONTROL steps, matching _window_offsets."""
-        p = cfg.params or {}
-        n = max(1, int(p.get("num_steps", 1)))
-        s = max(1, int(p.get("stride", 1)))
-        return n, s, [i * s for i in range(n)]
+        """The term's own sample offsets in CONTROL steps, verbatim.
+
+        Read off the live term rather than rebuilt from a (count, stride) pair: the window
+        is deliberately non-uniform (it samples offsets 0, 1, 2 and then every 5th step),
+        so no stride describes it and there is nothing to reconstruct it from.
+        """
+        return [int(o) for o in (cfg.params or {})["offsets"]]
 
     ref_spec = None
     if ref_cfg is not None:
-        n, s, offs = _offsets(ref_cfg)
+        offs = _offsets(ref_cfg)
         cmd_term = unwrapped_env.command_manager.get_term((ref_cfg.params or {}).get("command_name", "traj_ref"))
         ref_spec = {
-            "num_steps": n,
-            "stride": s,
             "offsets": offs,
             # [[block_name, width], ...] for ONE step; the term is these blocks
             # concatenated, then the steps concatenated. The term's OWN selection, not
@@ -143,10 +143,10 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
 
     cmd_spec = None
     if cmd_cfg is not None:
-        n, s, offs = _offsets(cmd_cfg)
+        offs = _offsets(cmd_cfg)
         flat = term_table["command_window"]["shape"]
         flat = int(np.prod(flat)) if isinstance(flat, (list, tuple)) else int(flat)
-        cmd_spec = {"num_steps": n, "stride": s, "offsets": offs, "cmd_dim": flat // n}
+        cmd_spec = {"offsets": offs, "cmd_dim": flat // len(offs)}
 
     return ref_spec, cmd_spec
 

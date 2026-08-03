@@ -1350,9 +1350,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             for group, terms in om.active_terms.items():
                 if "reference_window" in terms:
                     p = om._group_obs_term_cfgs[group][list(terms).index("reference_window")].params
-                    ns = max(1, int(p.get("num_steps", 11)))
-                    st = max(1, int(p.get("stride", 5)))
-                    self._obs_win_offsets = torch.arange(ns, device=self.device, dtype=torch.long) * st
+                    # No default: the term itself requires ``offsets``, so a missing key
+                    # means the cfg is broken, and falling back to a guessed window would
+                    # silently reserve the wrong truncation margin.
+                    self._obs_win_offsets = torch.tensor(
+                        [int(o) for o in p["offsets"]], device=self.device, dtype=torch.long
+                    )
                     break
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not read reference_window params: {exc}")

@@ -53,19 +53,25 @@ class FlowMatchingConfig:
     #
     # F is set by what the POLICY asks of one prediction, and now exactly:
     #
-    #     F = (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
-    #       = (11 - 1)                 * 5                 + 1
-    #       = 51                                              # 1.0 s at dt = 0.02
+    #     F = max(REFERENCE_OFFSETS) + 1
+    #       = 50                     + 1
+    #       = 51                            # 1.0 s at dt = 0.02
     #
-    # (``REFERENCE_NUM_STEPS`` / ``REFERENCE_STRIDE`` are the teacher's reference-window
-    # knobs in ``g1_teacher_env_cfg.py``.)  There is no ``fm_update_every - 1`` slack term
+    # (``REFERENCE_OFFSETS`` is the teacher's reference-window contract in
+    # ``g1_teacher_env_cfg.py``: ``(0, 1, 2, 5, 10, ... 50)``, 13 samples.)  Note the bound
+    # is the FURTHEST offset, not the sample count -- the window is non-uniform, and its
+    # three near samples ask for nodes the prediction already contains, so they cost no
+    # horizon.  There is no ``fm_update_every - 1`` slack term
     # any more because ``fm_update_every`` is PINNED TO 1: the prediction is expressed
     # relative to the robot at the re-plan, so serving it a step later would need the
     # egomotion since then to re-anchor -- odometry the deploy path deliberately no longer
     # carries. ``FmTrackingCommand`` raises rather than let the anchor go stale.
     #
-    # cmd_stride (=5) divides 50, so the 11 command tokens land exactly on the window
-    # offsets [0, 5, ..., 50].
+    # cmd_stride (=5) divides 50, so the 11 command tokens land on nodes [0, 5, ..., 50] --
+    # the STRIDED tail of the teacher's window. They do not cover its two near samples
+    # (offsets 1 and 2), and do not need to: these are the generator's own conditioning
+    # tokens, not the policy's ``command_window`` observation, and the commanded velocity
+    # is piecewise constant over a 0.04 s gap.
     #
     # Changing F requires RE-RECORDING (record_data.py cuts windows at this length) and
     # retraining.

@@ -28,7 +28,7 @@ Two things follow from that, and they are the point of the design:
 `fm_update_every` is pinned to **1**: the window is anchored on the robot at the re-plan, so
 serving it a step later would need the egomotion since then, which is exactly the
 dependency this representation removes. `F = 51` follows
-(`(REFERENCE_NUM_STEPS-1)*REFERENCE_STRIDE + 1`).
+(`max(REFERENCE_OFFSETS) + 1`).
 
 The caveat to keep in mind when reading results: at training time the history is the CLIP
 TEACHER's applied reference, never the model's own, so this carries textbook **exposure

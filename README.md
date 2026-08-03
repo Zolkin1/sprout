@@ -272,11 +272,15 @@ The teacher's actor takes **two** observation groups and routes them to two bran
 | Group | Contents | Path |
 |---|---|---|
 | `policy` | 5 proprioception terms, each stacked over `PROPRIO_HISTORY_LENGTH` = 10 consecutive 50 Hz control steps (current + 9 back), plus the height scan (no history) | straight to the trunk |
-| `reference` | `reference_window` (base pose/vel + joint pos/vel + ee positions at `REFERENCE_NUM_STEPS` = 11 samples, `REFERENCE_STRIDE` = 5 steps apart → 0.0 … 1.0 s) and the clean `command_window` | through a `[1024, 512, 512]` MLP encoder |
+| `reference` | `reference_window` (base pose/vel + joint pos/vel + ee positions at the 13 `REFERENCE_OFFSETS` = `0, 1, 2, 5, 10, … 50` control steps: the current step, the two right after it, then a 0.1 s tail out to 1.0 s) and the clean `command_window` | through a `[1024, 512, 512]` MLP encoder |
 
-The three constants live at the top of `g1_teacher_env_cfg.py`; setting either count to 1
-degenerates to current-step-only. The critic sees the same history and the same
-(uncorrupted) window, plus the privileged world-frame CLF vectors.
+The constants live at the top of `g1_teacher_env_cfg.py`; `PROPRIO_HISTORY_LENGTH = 1` or
+`REFERENCE_OFFSETS = (0,)` degenerates to current-step-only. `REFERENCE_OFFSETS` is the one
+window contract — the observation, its noise/scale vectors, the truncation margin, the
+generator's required horizon and the exported deploy spec are all derived from it, and the
+`reference` and `critic` groups' two window terms must all declare the same list (the deploy
+runtime refuses a tracker whose two exported specs disagree). The critic sees the same
+history and the same (uncorrupted) window, plus the privileged world-frame CLF vectors.
 
 An **optional** auxiliary loss reconstructs the reference window from the encoder latent.
 It is off by default so it can be ablated, and needs no code change to turn on:
@@ -313,11 +317,13 @@ observes is generated. Enforcing that, rather than assuming it:
 The generator's horizon is sized from the re-plan period, not guessed:
 
 ```
-future_len >= (fm_update_every - 1) + (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
-           =  11                    +  50                                          + 1  = 62
+future_len >= max(REFERENCE_OFFSETS) + 1
+           =  50                     + 1  = 51
 ```
 
-`FlowMatchingConfig.future_len = 65` rounds that to a multiple of `cmd_stride`.
+There is no `fm_update_every - 1` slack term: the period is pinned to 1, so the requirement
+is exact. Note the bound is the FURTHEST offset, not the sample count — the near samples
+(offsets 1 and 2) cost no horizon at all. `FlowMatchingConfig.future_len = 51`.
 `FmTrackingCommand` re-derives the requirement from the offsets it is actually asked for and
 **raises** if the checkpoint is short — nothing clamps, because a clamp would silently freeze
 the tail of the observed window. The same rule applies at record time (windows whose future

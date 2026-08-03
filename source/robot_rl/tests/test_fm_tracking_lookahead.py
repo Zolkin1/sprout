@@ -343,13 +343,15 @@ def test_teacher_window_fits_the_shipped_horizon():
     """The shipped F actually covers the shipped teacher window at the shipped cadence.
 
     This is the arithmetic in ``FlowMatchingConfig.future_len``'s comment, asserted against
-    the three constants it is derived from -- so moving any of them without moving F fails
-    here rather than at the first play step.
+    the constants it is derived from -- so widening the teacher's window without moving F
+    fails here rather than at the first play step.
+
+    The requirement is ``max(offsets) + 1``, NOT ``len(offsets)``: the window is
+    non-uniform (offsets 0, 1, 2 then every 5th step), so what the generator has to cover
+    is the furthest offset, and adding near offsets costs no horizon at all.
     """
     from robot_rl.flow_matching import FlowMatchingConfig
-    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
-        REFERENCE_NUM_STEPS, REFERENCE_STRIDE,
-    )
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import REFERENCE_OFFSETS
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
         G1FmTrackerCommandsCfg,
     )
@@ -359,10 +361,10 @@ def test_teacher_window_fits_the_shipped_horizon():
         "the predicted window is anchored on the robot at the re-plan, so a period > 1 "
         "would serve a stale anchor -- FmTrackingCommand refuses it."
     )
-    required = (REFERENCE_NUM_STEPS - 1) * REFERENCE_STRIDE + 1
+    required = max(REFERENCE_OFFSETS) + 1
     assert FlowMatchingConfig().future_len >= required, (
-        f"future_len must be >= {required} for a {REFERENCE_NUM_STEPS}-sample window at "
-        f"stride {REFERENCE_STRIDE}."
+        f"future_len must be >= {required} for a window reaching offset "
+        f"{max(REFERENCE_OFFSETS)} ({len(REFERENCE_OFFSETS)} samples)."
     )
 
 

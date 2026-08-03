@@ -92,7 +92,8 @@ if not _registered:
     #    slim-down: the same error reproduces on the old G1-teacher-clf-sym at 681a624.
     #    The unhandled terms are now `reference_window` and `command_window` (the merged
     #    look-ahead that replaced base_vel_ref / ee_ref / future_base_*). reference_window
-    #    is the harder one: it is [step0(D), step1(D), ...] where each step packs
+    #    is the harder one: it is [sample0(D), sample1(D), ...] over the 13
+    #    REFERENCE_OFFSETS, where each sample packs
     #    base_pose(6) + base_vel(6) + joint_pos(nj) + joint_vel(nj) + ee_pos(3*n_ee), so
     #    the handler must reflect per BLOCK within each step -- reuse
     #    mdp.observations.reference_window_layout for the widths, and note the joint block

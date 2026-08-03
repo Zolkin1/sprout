@@ -235,27 +235,68 @@ def command_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> 
 
 
 # ----------------------------------------------------------------------
-# Merged reference window (current step + strided look-ahead).
+# Merged reference window (current step + look-ahead).
 #
 # One term carries the WHOLE reference trajectory -- base pose/velocity, joint
-# angles, joint velocities and end-effector positions -- at ``num_steps`` clip
-# steps spaced ``stride`` control steps apart, starting at the CURRENT step
-# (offset 0).  ``num_steps=1`` therefore degenerates to the current step alone.
+# angles, joint velocities and end-effector positions -- at an explicit list of
+# clip-step ``offsets``, the first of which is always the CURRENT step (0).
+# ``offsets=(0,)`` therefore degenerates to the current step alone.
+#
+# The offsets are a LIST rather than a (count, stride) pair because the window is
+# deliberately non-uniform: it samples the two steps immediately after the current
+# one AND a 0.1 s-spaced tail, so no single stride describes it.  See
+# ``g1_teacher_env_cfg.REFERENCE_OFFSETS``.
 #
 # The proprioceptive history is a separate mechanism (per-term
 # ``ObservationTermCfg.history_length``, one entry per control step); only the
-# FUTURE is decimated by ``stride``.
+# FUTURE is decimated.
 # ----------------------------------------------------------------------
 
-def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
-    """Clip-step offsets ``[0, stride, 2*stride, ...]`` with ``num_steps`` entries.
+def strided_offsets(num_steps: int, stride: int) -> tuple[int, ...]:
+    """Uniformly strided window offsets ``(0, stride, ..., (num_steps - 1) * stride)``.
 
-    ``num_steps=1`` -> ``[0]`` (current step only).  At the 0.02 s control dt,
-    ``num_steps=11, stride=5`` -> ``[0, 5, ..., 50]`` = 0.0 .. 1.0 s.
+    A builder for the strided TAIL of a window's offset list, so it does not have to be
+    typed out.  At the 0.02 s control dt, ``strided_offsets(11, 5)`` spans 0.0 .. 1.0 s.
+
+    Args:
+        num_steps: Samples to emit, the leading ``0`` included.  Clamped to ``>= 1``.
+        stride: Control steps between samples.  Clamped to ``>= 1``.
+
+    Returns:
+        ``num_steps`` ascending offsets, starting at 0.
     """
-    n = max(1, int(num_steps))
-    s = max(1, int(stride))
-    return torch.arange(n, device=cmd.device, dtype=torch.long) * s
+    return tuple(i * max(1, int(stride)) for i in range(max(1, int(num_steps))))
+
+
+def _window_offsets(cmd, offsets: Sequence[int]) -> torch.Tensor:
+    """Validate a window offset list and put it on the command's device.
+
+    Args:
+        cmd: The trajectory command term (supplies the device).
+        offsets: Clip-step offsets, strictly ascending, starting at 0.
+
+    Returns:
+        ``[len(offsets)]`` long tensor.
+
+    Raises:
+        ValueError: If empty, if the first entry is not 0, or if the list is not strictly
+            ascending.  Three consumers depend on exactly those properties and none of
+            them would fail visibly: ``mdp.clip_end_reached`` reserves ``max(offsets)``
+            steps of look-ahead, ``FmTrackingCommand`` checks the generator's horizon
+            against the same maximum, and node 0 is both the step the CLF grades and the
+            one that enters the generator's autoregressive history.
+    """
+    offs = tuple(int(o) for o in offsets)
+    if not offs:
+        raise ValueError("a reference window needs at least one offset, e.g. (0,)")
+    if offs[0] != 0:
+        raise ValueError(
+            f"reference-window offsets must start at the current step (0), got {offs[0]}. "
+            "Node 0 is what the CLF grades and what enters the generator's history."
+        )
+    if any(b <= a for a, b in zip(offs, offs[1:])):
+        raise ValueError(f"reference-window offsets must be strictly ascending, got {offs}")
+    return torch.tensor(offs, device=cmd.device, dtype=torch.long)
 
 
 def reference_window_layout_from_dims(
@@ -440,7 +481,7 @@ def reference_window_noise_vector(
     :class:`ReferenceWindowNoiseCfg`.
 
     Args:
-        num_steps: Samples in the window (``REFERENCE_NUM_STEPS``).
+        num_steps: Samples in the window (``len(REFERENCE_OFFSETS)``).
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the clip library exposes.
         magnitudes: Per-block half-widths; defaults to :data:`REFERENCE_WINDOW_NOISE`.
@@ -465,7 +506,7 @@ def reference_window_scale(
     or ``tuple`` -- a list is rejected outright by the observation manager.
 
     Args:
-        num_steps: Samples in the window (``REFERENCE_NUM_STEPS``).
+        num_steps: Samples in the window (``len(REFERENCE_OFFSETS)``).
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the clip library exposes.
         factors: Per-block multipliers; defaults to :data:`REFERENCE_WINDOW_SCALE`.
@@ -565,10 +606,10 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
 
 
 def reference_window(
-    env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
-    blocks: Sequence[str] | None = None,
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *,
+    offsets: Sequence[int], blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
-    """The full reference trajectory over a look-ahead window (``[N, num_steps * D]``).
+    """The full reference trajectory over a look-ahead window (``[N, len(offsets) * D]``).
 
     Merges what used to be five separate current-step terms and two root-only
     look-ahead terms into ONE observation.  Per step, in
@@ -603,19 +644,32 @@ def reference_window(
     clip (``_future_step_indices`` clamps to the padded library length); the
     episode is truncated by ``clip_end_reached`` before that matters.
 
+    Args:
+        env: The environment instance.
+        command_name: The trajectory command term to read.
+        offsets: Clip-step offsets to sample, ascending from 0 (see
+            :func:`strided_offsets` and ``g1_teacher_env_cfg.REFERENCE_OFFSETS``).
+            Deliberately has no default: the FM's horizon, the episode truncation margin
+            and the exported deploy contract are all derived from it, so a silent
+            fallback would put a different window in one of them.
+        blocks: Layout blocks to pack; defaults to all of them.
+
+    Returns:
+        ``[N, len(offsets) * D]``.
+
     TODO(perf): the observation manager is the single largest phase of the env step --
     50.8 ms/frame, ~39%, tied with physics (profiled with the trained depth_v3 at 1024
     envs via ``play.py --profile``).  Roughly 19 ms of that is the two depth cameras
     (measured by A/B against ``G1-teacher-clf-terrain-body``, which is otherwise
     identical), leaving ~31 ms across this window, the critic's height scan and the
     tracking-error terms.  This term is the prime suspect for the remainder: it gathers
-    ``num_steps`` future frames of base + joints + ee for every env every step, then does
-    several quaternion ops on an ``[N*K, .]`` flattening.  Nothing here is instrumented
-    individually, so the first move is a per-term breakdown rather than an optimisation --
-    the manager total is all we currently know.
+    ``len(offsets)`` future frames of base + joints + ee for every env every step, then
+    does several quaternion ops on an ``[N*K, .]`` flattening.  Nothing here is
+    instrumented individually, so the first move is a per-term breakdown rather than an
+    optimisation -- the manager total is all we currently know.
     """
     cmd = env.command_manager.get_term(command_name)
-    offs = _window_offsets(cmd, num_steps, stride)
+    offs = _window_offsets(cmd, offsets)
     win = cmd.reference_window_obs(offs, blocks)    # [N, K, D]
     return win.reshape(win.shape[0], -1)
 
@@ -694,20 +748,33 @@ def reference_window_to_world(
 
 
 def command_window(
-    env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *, offsets: Sequence[int],
 ) -> torch.Tensor:
-    """Joystick-level velocity command over the same window (``[N, num_steps * 3]``).
+    """Joystick-level velocity command over the same window (``[N, len(offsets) * 3]``).
 
-    The upstream ``target_vel`` ``(vx, vy, wz)`` (heading frame) at offsets
-    ``[0, stride, ...]``, so index 0 is the current command and the rest is the
-    look-ahead.  Deliberately a SEPARATE term from :func:`reference_window` so it
-    can stay noise-free: at deploy this comes from the joystick / scripted
-    profile, not from the flow-matching generator, so corrupting it would train
-    the policy against noise it will never see.  Requires a clip library carrying
-    ``target_vel``.  Flattened as ``[step0(3), step1(3), ...]``.
+    The upstream ``target_vel`` ``(vx, vy, wz)`` (heading frame) at ``offsets``, so index 0
+    is the current command and the rest is the look-ahead.  Deliberately a SEPARATE term
+    from :func:`reference_window` so it can stay noise-free: at deploy this comes from the
+    joystick / scripted profile, not from the flow-matching generator, so corrupting it
+    would train the policy against noise it will never see.  Requires a clip library
+    carrying ``target_vel``.  Flattened as ``[step0(3), step1(3), ...]``.
+
+    Takes the SAME ``offsets`` as :func:`reference_window`, and must: the deploy runtime
+    refuses to load a tracker whose two window specs disagree
+    (``deploy.gen_tracker._resolve_window_offsets``), since one flat observation is
+    assembled from both.
+
+    Args:
+        env: The environment instance.
+        command_name: The trajectory command term to read.
+        offsets: Clip-step offsets, ascending from 0.  No default, for the reason given in
+            :func:`reference_window`.
+
+    Returns:
+        ``[N, len(offsets) * 3]``.
     """
     cmd = env.command_manager.get_term(command_name)
-    offs = _window_offsets(cmd, num_steps, stride)
+    offs = _window_offsets(cmd, offsets)
     return cmd.get_future_command_velocity(offs).reshape(env.num_envs, -1)
 
 

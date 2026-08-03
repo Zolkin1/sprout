@@ -36,6 +36,11 @@ from deploy.window_np import window_blocks  # noqa: E402
 
 NJ, K = 29, 4
 
+#: The shipped teacher's window: the current step, the two after it, then a 0.1 s
+#: tail out to 1.0 s. Non-uniform on purpose -- stated once here so the assertions below
+#: compare against the fixture rather than restating a stride the window does not have.
+OFFSETS = [0, 1, 2, *(i * 5 for i in range(1, 11))]
+
 
 def _policy(tracker_blocks, fm_blocks):
     """A bare policy whose two artifacts declare the given block selections.
@@ -52,7 +57,7 @@ def _policy(tracker_blocks, fm_blocks):
     pol.fm_enabled = fm_blocks is not None
     pol.ctx = SimpleNamespace(reference_blocks=tuple(fm_blocks or ()))
     spec = {
-        "num_steps": 11, "stride": 5, "offsets": [i * 5 for i in range(11)],
+        "offsets": list(OFFSETS),
         "blocks": [[n, w] for n, w in window_blocks(NJ, K, tracker_blocks)],
         "joint_order": "isaac", "ee_frame_names": [],
         "base_pose_convention": _BASE_POSE_CONVENTION,
@@ -71,7 +76,7 @@ def test_matching_selections_load():
     pol = _policy(slim, slim)
     pol._build_window()
     assert pol.reference_blocks == slim
-    assert pol.window_offsets == [i * 5 for i in range(11)]
+    assert pol.window_offsets == OFFSETS
 
 
 @pytest.mark.parametrize("tracker_blocks,fm_blocks", [

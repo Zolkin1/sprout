@@ -68,13 +68,32 @@ FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
 #: step); only the reference look-ahead below is decimated.  Set to 1 for no history.
 PROPRIO_HISTORY_LENGTH = 10
 
-#: Reference window length in samples, current step included.  11 = the current step
-#: plus 10 future ones.  Set to 1 to observe only the current reference.
-REFERENCE_NUM_STEPS = 11
+#: Samples in the STRIDED tail of the reference window, and their spacing in control
+#: steps.  5 * 0.02 s = 0.1 s, so 11 samples span 0.0 .. 1.0 s of look-ahead.  These two
+#: only parameterize the tail; :data:`REFERENCE_OFFSETS` below is the actual contract.
+REFERENCE_TAIL_NUM_STEPS = 11
+REFERENCE_TAIL_STRIDE = 5
 
-#: Control steps between reference samples.  5 * 0.02 s = 0.1 s, so 11 samples span
-#: 0.0 .. 1.0 s of look-ahead.
-REFERENCE_STRIDE = 5
+#: Clip-step offsets the reference window samples, current step (0) first.  THE window
+#: contract: the observation, its noise/scale vectors, the episode truncation margin
+#: (``mdp.clip_end_reached``), the flow-matching generator's required horizon and the
+#: exported deploy spec are all derived from this one tuple.
+#:
+#: Two regimes, deliberately non-uniform:
+#:
+#: * ``0, 1, 2`` -- the current step and the two immediately after it.  The strided tail
+#:   is spaced 0.1 s apart, which is far too coarse to show what happens NEXT; these give
+#:   the policy the 50 Hz structure around the current step, so it can see where it is
+#:   going rather than only where it will be in a tenth of a second.
+#: * ``5, 10, ... 50`` -- the 0.1 s-spaced tail, out to 1.0 s.
+#:
+#: 13 samples.  ``max(REFERENCE_OFFSETS) + 1`` = 51 is the number of nodes the generator
+#: must predict (``FlowMatchingConfig.future_len``); ``test_fm_tracking_lookahead``
+#: asserts it, so adding a FURTHER offset without widening ``future_len`` fails there
+#: rather than at the first play step.
+REFERENCE_OFFSETS: tuple[int, ...] = (
+    0, 1, 2, *mdp.strided_offsets(REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE)[1:],
+)
 
 #: End-effector frames the reference window carries (clip output frames minus the base:
 #: both ankles + both wrists).  Only needed to size the per-channel noise vector below;
@@ -100,8 +119,7 @@ REFERENCE_WINDOW_BLOCKS = ("base_pose", "base_vel", "joint_pos")
 #: ``reference_window`` below.
 _REF_PARAMS = {
     "command_name": "traj_ref",
-    "num_steps": REFERENCE_NUM_STEPS,
-    "stride": REFERENCE_STRIDE,
+    "offsets": REFERENCE_OFFSETS,
 }
 
 _REF_WINDOW_PARAMS = {**_REF_PARAMS, "blocks": REFERENCE_WINDOW_BLOCKS}
@@ -112,7 +130,7 @@ _REF_WINDOW_PARAMS = {**_REF_PARAMS, "blocks": REFERENCE_WINDOW_BLOCKS}
 #: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over whatever
 #: ``REFERENCE_WINDOW_BLOCKS`` selects.
 _REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
-    num_steps=REFERENCE_NUM_STEPS,
+    num_steps=len(REFERENCE_OFFSETS),
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
     blocks=REFERENCE_WINDOW_BLOCKS,
@@ -124,7 +142,7 @@ _REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
 #: ``mdp.REFERENCE_WINDOW_SCALE``.  Because the scale comes last, the noise half-widths
 #: and the +-20 clip above stay in raw units, exactly as the old joint_vel_ref term had.
 _REF_SCALE = mdp.reference_window_scale(
-    num_steps=REFERENCE_NUM_STEPS,
+    num_steps=len(REFERENCE_OFFSETS),
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
     blocks=REFERENCE_WINDOW_BLOCKS,
@@ -215,7 +233,7 @@ class G1TeacherObservationsCfg:
       :data:`PROPRIO_HISTORY_LENGTH` consecutive control steps, plus the height
       scan (exteroception, no history).
     * ``reference`` -- the whole reference trajectory over
-      :data:`REFERENCE_NUM_STEPS` samples, all relative / heading-invariant so no
+      :data:`REFERENCE_OFFSETS` samples, all relative / heading-invariant so no
       world coordinate reaches the policy.
     * ``critic`` -- the same history and reference, uncorrupted, plus privileged
       state and the world-frame CLF tracking vectors.

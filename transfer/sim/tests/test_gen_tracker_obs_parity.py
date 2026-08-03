@@ -213,14 +213,13 @@ def test_obs_parity(run: str | None = None) -> None:
     nj = len(isaac_jn)
     ee_frames = pol._trk.get_ee_frame_names() or []
     spec = pol.reference_window_spec
-    num_steps, stride = int(spec["num_steps"]), int(spec["stride"])
     offs = pol.window_offsets
     K = len(offs)
     depth_spec = pol.get_depth_camera_spec()
     term_dims = {t["name"]: t["shape"] for t in pol._trk.get_obs_terms()}
     term_off = _term_offsets(pol)
 
-    print(f"window: num_steps={num_steps} stride={stride} offsets={offs}")
+    print(f"window: {len(offs)} samples, offsets={offs}")
     print(f"blocks: {spec['blocks']}  ee_frames={ee_frames}  joint_order={spec['joint_order']}")
 
     g = torch.Generator().manual_seed(3)
@@ -254,8 +253,8 @@ def test_obs_parity(run: str | None = None) -> None:
             # to compare against the artifact's 451 -- restating the layout is the very
             # drift this test exists to catch.
             "reference_window": O.reference_window(
-                env, "x", num_steps, stride, blocks=[n for n, _ in spec["blocks"]]),
-            "command_window": O.command_window(env, "x", num_steps, stride),
+                env, "x", offsets=offs, blocks=[n for n, _ in spec["blocks"]]),
+            "command_window": O.command_window(env, "x", offsets=offs),
         }
     finally:
         wp.to_torch = orig

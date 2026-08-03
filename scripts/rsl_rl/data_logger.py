@@ -142,10 +142,12 @@ class DataLogger:
         self._warned_sources: set[str] = set()
         self._log_fm_window = log_fm_window
         self._log_world = log_world
-        # Reference-window shape; overridden from the obs cfg in _collect_metadata so the
-        # logged obs match exactly what the policy is fed.
-        self._ref_num_steps: int = 11
-        self._ref_stride: int = 5
+        # Reference-window sample offsets; overridden from the obs cfg in _collect_metadata
+        # so the logged obs match exactly what the policy is fed. The fallback is the
+        # current step alone rather than a guessed strided window: the offsets are
+        # non-uniform, so there is nothing to guess, and logging one node is obviously
+        # thin where logging the wrong 13 would look right.
+        self._ref_offsets: tuple[int, ...] = (0,)
         # Which reference blocks the term actually packs; None = the full default set.
         # Read from the obs cfg below, so a task that drops blocks is sliced correctly.
         self._ref_blocks: tuple[str, ...] | None = None
@@ -305,7 +307,8 @@ class DataLogger:
         # expose the reference (the helpers raise).
         if self._traj_term_name is not None:
             name = self._traj_term_name
-            ns, st, blocks = self._ref_num_steps, self._ref_stride, self._ref_blocks
+            offsets, blocks = self._ref_offsets, self._ref_blocks
+            ns = len(offsets)
             def _traj_obs() -> dict[str, torch.Tensor]:
                 out = {
                     "base_pose_error": base_pose_error(unwrapped, name).clone(),
@@ -319,7 +322,7 @@ class DataLogger:
                 # CURRENT step (the window starts at offset 0), so block 0 should
                 # track the matching current-step term above.
                 cmd = unwrapped.command_manager.get_term(name)
-                win = reference_window(unwrapped, name, num_steps=ns, stride=st, blocks=blocks)
+                win = reference_window(unwrapped, name, offsets=offsets, blocks=blocks)
                 out.update(_split_reference_window(
                     win, reference_window_layout(cmd, blocks), ns))
                 return out
@@ -619,7 +622,8 @@ class DataLogger:
             return
         nj = len(cmd.robot.joint_names)
         frames = cmd.resolve_ee_frames(None)
-        ns, st = self._ref_num_steps, self._ref_stride
+        offsets = self._ref_offsets
+        ns = len(offsets)
 
         def _capture(prefix: str, available: tuple[str, ...] | None = None) -> None:
             """Store the served source's look-ahead window in world coordinates.
@@ -643,7 +647,7 @@ class DataLogger:
                 """Whether this source carries ``block``."""
                 return available is None or block in available
 
-            offs = torch.arange(ns, device=cmd.device, dtype=torch.long) * st
+            offs = torch.tensor(offsets, device=cmd.device, dtype=torch.long)
             pos_w, quat_w, _, _ = cmd.get_future_world_base(offs)
             step[f"refwin_{prefix}_base_pos"] = pos_w.clone()
             step[f"refwin_{prefix}_base_quat"] = quat_w.clone()
@@ -682,7 +686,7 @@ class DataLogger:
             # all five here would both mis-size the window and invent channels the policy
             # never saw.
             blocks = self._ref_blocks
-            clean = reference_window(unwrapped, self._traj_term_name, num_steps=ns, stride=st,
+            clean = reference_window(unwrapped, self._traj_term_name, offsets=offsets,
                                      blocks=blocks)
             for tag, win in (("obs", clean), ("noisy", self._observed_window(unwrapped, policy_obs))):
                 if win is None:
@@ -824,13 +828,12 @@ class DataLogger:
                     cfg = obs_mgr._group_obs_term_cfgs[group_name][
                         list(group_terms).index("reference_window")
                     ]
-                    self._ref_num_steps = int(cfg.params.get("num_steps", self._ref_num_steps))
-                    self._ref_stride = int(cfg.params.get("stride", self._ref_stride))
+                    self._ref_offsets = tuple(int(o) for o in cfg.params["offsets"])
                     blocks = cfg.params.get("blocks")
                     self._ref_blocks = tuple(blocks) if blocks else None
                     break
-            self.metadata["reference_num_steps"] = self._ref_num_steps
-            self.metadata["future_stride"] = self._ref_stride
+            self.metadata["reference_offsets"] = list(self._ref_offsets)
+            self.metadata["reference_num_steps"] = len(self._ref_offsets)
             self.metadata["reference_blocks"] = list(
                 self._ref_blocks) if self._ref_blocks else "all"
         except Exception as exc:

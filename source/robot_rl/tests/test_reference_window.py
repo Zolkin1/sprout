@@ -55,6 +55,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
     reference_window_noise_vector,
     reference_window_scale,
     reference_window_to_world,
+    strided_offsets,
 )
 
 N_ENVS, N_JOINTS, T = 3, 4, 60
@@ -222,13 +223,39 @@ def env_cmd():
     return _StubEnv(cmd), cmd
 
 
-def test_window_offsets_include_the_current_step():
-    """Offsets start at 0, so ``num_steps=1`` is the current step alone."""
-    cmd = SimpleNamespace(device="cpu")
-    assert _window_offsets(cmd, 1, 5).tolist() == [0]
-    assert _window_offsets(cmd, 11, 5).tolist() == [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+def test_strided_offsets_include_the_current_step():
+    """The strided builder starts at 0, so ``num_steps=1`` is the current step alone."""
+    assert strided_offsets(1, 5) == (0,)
+    assert strided_offsets(11, 5) == (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
     # Degenerate inputs clamp rather than producing an empty window.
-    assert _window_offsets(cmd, 0, 0).tolist() == [0]
+    assert strided_offsets(0, 0) == (0,)
+
+
+def test_window_offsets_accept_a_non_uniform_list():
+    """The shipped window is NOT strided: offsets 1 and 2 sit inside a 0.1 s tail."""
+    cmd = SimpleNamespace(device="cpu")
+    shipped = (0, 1, 2, *strided_offsets(11, 5)[1:])
+    assert _window_offsets(cmd, shipped).tolist() == [0, 1, 2, 5, 10, 15, 20, 25, 30,
+                                                      35, 40, 45, 50]
+    assert len(shipped) == 13
+
+
+@pytest.mark.parametrize("bad, match", [
+    ((), "at least one offset"),
+    ((1, 2, 5), "must start at the current step"),
+    ((0, 5, 5), "strictly ascending"),
+    ((0, 10, 5), "strictly ascending"),
+])
+def test_window_offsets_reject_a_list_nothing_downstream_could_use(bad, match):
+    """Three consumers assume offset 0 first and a well-defined maximum; see the docstring.
+
+    Node 0 is what the CLF grades and what enters the generator's autoregressive history,
+    and ``max(offsets)`` is both the episode truncation margin and the horizon the
+    generator is checked against -- none of which would fail visibly.
+    """
+    cmd = SimpleNamespace(device="cpu")
+    with pytest.raises(ValueError, match=match):
+        _window_offsets(cmd, bad)
 
 
 def test_layout_matches_the_robot_and_clip(env_cmd):
@@ -245,15 +272,15 @@ def test_window_shape(env_cmd):
     """``[N, num_steps * D]`` with D from the layout."""
     env, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    assert reference_window(env, "traj_ref", num_steps=11, stride=5).shape == (N_ENVS, 11 * per_step)
-    assert reference_window(env, "traj_ref", num_steps=1, stride=5).shape == (N_ENVS, per_step)
+    assert reference_window(env, "traj_ref", offsets=strided_offsets(11, 5)).shape == (N_ENVS, 11 * per_step)
+    assert reference_window(env, "traj_ref", offsets=strided_offsets(1, 5)).shape == (N_ENVS, per_step)
 
 
 def test_sample_zero_matches_the_current_step_terms(env_cmd):
     """Offset 0 reproduces the single-step observations the window replaced."""
     env, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    first = reference_window(env, "traj_ref", num_steps=11, stride=5)[:, :per_step]
+    first = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))[:, :per_step]
 
     torch.testing.assert_close(first[:, 0:6], base_pose_error(env, "traj_ref"))
     torch.testing.assert_close(first[:, 6:12], ref_base_velocity_local(env, "traj_ref"))
@@ -275,14 +302,14 @@ def test_base_pose_uses_the_legacy_mixed_convention(env_cmd):
     teacher retrain follows.
     """
     env, cmd = env_cmd
-    offs = _window_offsets(cmd, 11, 5)
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
     ref_p, ref_q, _, _ = cmd.get_future_world_base(offs)
     n, k = ref_p.shape[:2]
     act_p = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :].expand(n, k, 3).reshape(-1, 3)
     act_q = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :].expand(n, k, 4).reshape(-1, 4)
 
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    base_pose = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    base_pose = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
     base_pose = base_pose.reshape(n, k, per_step)[..., 0:6].reshape(-1, 6)
 
     # position: R_act^T (p_ref - p_act)   -- points robot -> reference
@@ -299,7 +326,7 @@ def test_base_pose_uses_the_legacy_mixed_convention(env_cmd):
     # expects, and it fails loudly if either half ever picks up an offset.
     cmd.robot.data.root_pos_w = _wp(ref_p[:, 0, :].contiguous())
     cmd.robot.data.root_quat_w = _wp(ref_q[:, 0, :].contiguous())
-    on_ref = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    on_ref = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
     on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:6]
     torch.testing.assert_close(on_ref, torch.zeros_like(on_ref), atol=1e-6, rtol=1e-6)
 
@@ -312,7 +339,7 @@ def test_layout_from_dims_matches_the_command_layout(env_cmd):
 
 def _to_world(env, cmd, num_steps: int = 11, stride: int = 5) -> dict:
     """Round-trip the window back to world through :func:`reference_window_to_world`."""
-    window = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride)
+    window = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride))
     return reference_window_to_world(
         window,
         wp.to_torch(cmd.robot.data.root_pos_w),
@@ -329,7 +356,7 @@ def test_window_to_world_recovers_the_reference(env_cmd):
     forward transform ever disagree the overlay would show a phantom frame error.
     """
     env, cmd = env_cmd
-    offs = _window_offsets(cmd, 11, 5)
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
     pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offs)
     out = _to_world(env, cmd)
 
@@ -348,7 +375,7 @@ def test_window_to_world_recovers_the_reference(env_cmd):
 def test_window_to_world_recovers_the_ee_frames_and_joints(env_cmd):
     """ee positions come back in world; the joint blocks pass through untouched."""
     env, cmd = env_cmd
-    offs = _window_offsets(cmd, 11, 5)
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
     ee_w = cmd.get_future_world_frames(EE_FRAMES, offs)[..., 0:3]   # [N, K, F, 3]
     joint_pos, joint_vel = cmd.get_future_joint_state(offs)
     out = _to_world(env, cmd)
@@ -361,7 +388,7 @@ def test_window_to_world_recovers_the_ee_frames_and_joints(env_cmd):
 def test_window_to_world_rejects_a_width_mismatch(env_cmd):
     """A window built for a different layout fails loudly instead of reshaping silently."""
     env, cmd = env_cmd
-    window = reference_window(env, "traj_ref", num_steps=11, stride=5)
+    window = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
     with pytest.raises(ValueError, match="implies"):
         reference_window_to_world(
             window, wp.to_torch(cmd.robot.data.root_pos_w), wp.to_torch(cmd.robot.data.root_quat_w),
@@ -377,7 +404,7 @@ def test_joint_block_is_in_robot_order(env_cmd):
     reversed relative to robot order, so a naive implementation would fail here.
     """
     env, cmd = env_cmd
-    first = reference_window(env, "traj_ref", num_steps=1, stride=5)
+    first = reference_window(env, "traj_ref", offsets=strided_offsets(1, 5))
     joint_block = first[:, 12:12 + N_JOINTS]
     torch.testing.assert_close(joint_block, cmd._cur(cmd.joint_pos))
     # Same values, opposite order: a permutation, not a different quantity.
@@ -389,10 +416,10 @@ def test_later_samples_read_later_clip_steps(env_cmd):
     env, cmd = env_cmd
     num_steps, stride = 4, 5
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride).view(
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride)).view(
         N_ENVS, num_steps, per_step
     )
-    offsets = _window_offsets(cmd, num_steps, stride)
+    offsets = _window_offsets(cmd, strided_offsets(num_steps, stride))
     expected = cmd._gather(cmd.joint_pos, offsets)
     torch.testing.assert_close(win[:, :, 12:12 + N_JOINTS], expected)
 
@@ -404,7 +431,7 @@ def test_base_blocks_are_heading_invariant(env_cmd):
     move the observation -- that is what makes it deployable.
     """
     env, cmd = env_cmd
-    before = reference_window(env, "traj_ref", num_steps=6, stride=5)
+    before = reference_window(env, "traj_ref", offsets=strided_offsets(6, 5))
 
     yaw = torch.tensor(0.7)
     rot = torch.tensor([0.0, 0.0, torch.sin(yaw / 2), torch.cos(yaw / 2)]).expand(N_ENVS, 4).contiguous()
@@ -423,7 +450,7 @@ def test_base_blocks_are_heading_invariant(env_cmd):
     cmd.robot.data.root_pos_w = _wp(quat_apply(rot, wp.to_torch(cmd.robot.data.root_pos_w)))
     cmd.robot.data.root_quat_w = _wp(quat_mul(rot, wp.to_torch(cmd.robot.data.root_quat_w)))
 
-    torch.testing.assert_close(reference_window(env, "traj_ref", num_steps=6, stride=5), before,
+    torch.testing.assert_close(reference_window(env, "traj_ref", offsets=strided_offsets(6, 5)), before,
                                atol=1e-5, rtol=1e-5)
 
 
@@ -432,10 +459,10 @@ def test_ee_block_is_relative_to_its_own_reference_base(env_cmd):
     env, cmd = env_cmd
     num_steps, stride = 3, 5
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride).view(
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride)).view(
         N_ENVS, num_steps, per_step
     )
-    offsets = _window_offsets(cmd, num_steps, stride)
+    offsets = _window_offsets(cmd, strided_offsets(num_steps, stride))
     torch.testing.assert_close(
         win[:, :, -3 * len(EE_FRAMES):],
         cmd._gather(cmd.ee_local, offsets).flatten(start_dim=2),
@@ -447,8 +474,8 @@ def test_command_window(env_cmd):
     """The joystick window is the raw command at the same offsets."""
     env, cmd = env_cmd
     num_steps, stride = 4, 5
-    got = command_window(env, "traj_ref", num_steps=num_steps, stride=stride)
-    expected = cmd._gather(cmd.target_vel, _window_offsets(cmd, num_steps, stride))
+    got = command_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride))
+    expected = cmd._gather(cmd.target_vel, _window_offsets(cmd, strided_offsets(num_steps, stride)))
     assert got.shape == (N_ENVS, num_steps * 3)
     torch.testing.assert_close(got.view(N_ENVS, num_steps, 3), expected)
 
@@ -458,7 +485,7 @@ def test_window_saturates_at_the_clip_end(env_cmd):
     env, cmd = env_cmd
     cmd._step0 = torch.full((N_ENVS,), T - 3)
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=5, stride=5).view(N_ENVS, 5, per_step)
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(5, 5)).view(N_ENVS, 5, per_step)
     # Samples 1..4 all land past the end, so they hold the final frame.
     for k in range(2, 5):
         torch.testing.assert_close(win[:, k], win[:, 1])
@@ -607,7 +634,7 @@ def _obs_manager(**groups):
             continue
         active[name] = ["joint_pos", "reference_window"]
         cfgs[name] = [SimpleNamespace(params={}),
-                      SimpleNamespace(params={"num_steps": 11, "blocks": blocks})]
+                      SimpleNamespace(params={"offsets": (0, 5), "blocks": blocks})]
     return SimpleNamespace(active_terms=active, _group_obs_term_cfgs=cfgs)
 
 
@@ -686,3 +713,52 @@ def test_g1_teacher_wires_its_selection_into_the_term():
     for group_name, blocks in found:
         assert blocks == tuple(tcfg.REFERENCE_WINDOW_BLOCKS), (
             f"{group_name}'s reference_window does not carry REFERENCE_WINDOW_BLOCKS")
+
+
+def test_g1_teacher_wires_the_same_offsets_into_every_window_term():
+    """All four window terms -- both groups, both terms -- must share one offset list.
+
+    Two separate reasons, both invisible if broken:
+
+    * ``reference_window`` and ``command_window`` are assembled into ONE flat observation,
+      and the deploy runtime refuses a tracker whose two exported specs disagree
+      (``deploy.gen_tracker._resolve_window_offsets``). Catching it here means the export
+      is never written rather than rejected at load.
+    * the ``reference`` and ``critic`` groups are fed by one command term, so a group
+      observing different offsets is reading a window that is not the one being built --
+      the same failure ``reference_window_selection`` guards for ``blocks``.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_teacher_env_cfg as tcfg
+    obs = tcfg.G1TeacherEnvCfg().observations
+    want = tuple(tcfg.REFERENCE_OFFSETS)
+    found = []
+    for group_name in vars(obs):
+        group = getattr(obs, group_name)
+        for term_name in ("reference_window", "command_window"):
+            term = getattr(group, term_name, None)
+            if term is not None:
+                found.append((f"{group_name}.{term_name}",
+                              tuple((term.params or {}).get("offsets") or ())))
+    assert len(found) == 4, f"expected 4 window terms, found {[n for n, _ in found]}"
+    for where, offsets in found:
+        assert offsets == want, f"{where} declares {offsets}, not REFERENCE_OFFSETS"
+
+
+def test_shipped_offsets_carry_the_short_offset_head():
+    """The point of the non-uniform window: the two steps right after the current one.
+
+    A 0.1 s-spaced window cannot show what happens NEXT, only where the reference will be
+    a tenth of a second from now. Offsets 1 and 2 are what give the policy 50 Hz structure
+    around the present, and they cost no generator horizon -- ``max(offsets)`` is unchanged.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
+        REFERENCE_OFFSETS, REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE,
+    )
+    tail = strided_offsets(REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE)
+    assert REFERENCE_OFFSETS[:3] == (0, 1, 2)
+    assert REFERENCE_OFFSETS == (0, 1, 2, *tail[1:])
+    # The near samples are pure gain: the horizon the generator must cover is the FURTHEST
+    # offset, which the strided tail alone already sets.
+    assert max(REFERENCE_OFFSETS) == max(tail)
