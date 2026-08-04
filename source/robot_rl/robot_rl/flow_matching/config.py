@@ -13,6 +13,15 @@ from typing import Any
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 
+#: Largest re-plan period ``fm_update_every`` a shipped horizon must be able to serve.
+#:
+#: The deployed default is K=1, but a checkpoint sized for K=1 alone CANNOT be used at any
+#: larger period -- the horizon check refuses it -- and K=12 measured 7.5 pts of survival
+#: better than K=1. Since recovering that costs a full retrain, every generator is trained
+#: with the headroom whether or not the run that uses it wants K>1. See
+#: :attr:`FlowMatchingConfig.future_len` for the arithmetic and what the slack costs.
+MAX_SERVABLE_REPLAN_PERIOD: int = 12
+
 
 
 @dataclass
@@ -51,31 +60,43 @@ class FlowMatchingConfig:
     # re-plan -- the same anchor and the same representation the policy's
     # ``mdp.reference_window`` observation uses (see ``flow_matching.window``).
     #
-    # F is set by what the POLICY asks of one prediction, and now exactly:
+    # F is what the POLICY asks of one prediction, plus the re-plan slack:
     #
-    #     F = max(REFERENCE_OFFSETS) + 1
-    #       = 50                     + 1
-    #       = 51                            # 1.0 s at dt = 0.02
+    #     F = max(REFERENCE_OFFSETS) + MAX_SERVABLE_REPLAN_PERIOD
+    #       = 50                     + 12
+    #       = 62
     #
     # (``REFERENCE_OFFSETS`` is the teacher's reference-window contract in
-    # ``g1_teacher_env_cfg.py``: ``(0, 1, 2, 5, 10, ... 50)``, 13 samples.)  Note the bound
-    # is the FURTHEST offset, not the sample count -- the window is non-uniform, and its
-    # three near samples ask for nodes the prediction already contains, so they cost no
-    # horizon.  There is no ``fm_update_every - 1`` slack term
-    # any more because ``fm_update_every`` is PINNED TO 1: the prediction is expressed
-    # relative to the robot at the re-plan, so serving it a step later would need the
-    # egomotion since then to re-anchor -- odometry the deploy path deliberately no longer
-    # carries. ``FmTrackingCommand`` raises rather than let the anchor go stale.
+    # ``g1_teacher_env_cfg.py``: ``(0, 1, 2, 5, 10, ... 50)``, 13 samples.)  Note the first
+    # bound is the FURTHEST offset, not the sample count -- the window is non-uniform, and
+    # its three near samples ask for nodes the prediction already contains, so they cost no
+    # horizon.
     #
-    # cmd_stride (=5) divides 50, so the 11 command tokens land on nodes [0, 5, ..., 50] --
-    # the STRIDED tail of the teacher's window. They do not cover its two near samples
-    # (offsets 1 and 2), and do not need to: these are the generator's own conditioning
-    # tokens, not the policy's ``command_window`` observation, and the commanded velocity
-    # is piecewise constant over a 0.04 s gap.
+    # THE SLACK TERM IS LOAD-BEARING, which is worth stating because it was briefly dropped.
+    # A prediction served ``j`` steps after the re-plan has its cursor ``j`` nodes in, so the
+    # furthest sample reads node ``max_offset + j`` -- hence ``F >= max_offset + K`` for a
+    # re-plan period K (``FmTrackingCommand._check_horizon``; nothing clamps, a short horizon
+    # raises). Sizing F to ``max_offset + 1`` makes a checkpoint K=1-ONLY, and K=12 measured
+    # 7.5 pts better than K=1 on the 24-env sweep, so that is headroom worth paying for: it
+    # is one retrain to get back and cannot be recovered from an existing checkpoint.
+    # ``test_teacher_window_fits_the_shipped_horizon`` asserts this bound so it cannot be
+    # removed silently again.
     #
-    # Changing F requires RE-RECORDING (record_data.py cuts windows at this length) and
-    # retraining.
-    future_len: int = 51
+    # The cost of the slack, so it is a choice and not an accident: 11 extra tokens to
+    # denoise per re-plan (~15-20% slower per step), and at K=1 nodes 51..61 are predicted
+    # and never read. The FM is ~99% of the deploy step budget, so that is not free.
+    #
+    # cmd_stride (=5) divides F, so the 13 command tokens land on nodes [0, 5, ..., 60].
+    # The first 11 cover the STRIDED tail of the teacher's window; they do not cover its two
+    # near samples (offsets 1 and 2), and do not need to -- these are the generator's own
+    # conditioning tokens, not the policy's ``command_window`` observation, and the commanded
+    # velocity is piecewise constant over a 0.04 s gap.
+    #
+    # RAISING F needs a recording with at least that many ref_future nodes (record_data.py
+    # cuts at ``--ref_future_len``, default this value) and a retrain -- but NOT necessarily
+    # a re-record: the dataset truncates a longer recording to F, so the 75-node depth_v5
+    # recording already serves anything up to 75.
+    future_len: int = 62
     # N history (context) tokens: the reference frames the generator itself emitted at the
     # 4 steps before this one. 4 rather than 2 because these are now a *plan* being
     # continued rather than a state being read -- more of the recent trajectory to
@@ -237,12 +258,12 @@ class FlowMatchingConfig:
     # the extra frames are position-only in the state vector (see ``window.py``). The
     # ee-orientation FK residual and the ``J(q)·q̇`` term (the old ``fk_vel_weight``) went
     # with those channels.
-    #
     # Every term needs the blocks it ties together to BE in ``reference_blocks``:
     # velocity needs base_pose+base_vel, acceleration base_vel, joint-velocity
-    # joint_pos+joint_vel, FK joint_pos+ee_pos. A weight whose blocks are absent is zeroed
-    # at dataset build with a printed line -- the term has nothing to relate, and the
-    # default selection (base_pose, base_vel, joint_pos) already switches two of them off.
+    # joint_pos+joint_vel, FK joint_pos+ee_pos, body-pose joint_pos (+base_pose for the
+    # world half). A weight whose blocks are absent is zeroed at dataset build with a
+    # printed line -- the term has nothing to relate, and the default selection
+    # (base_pose, base_vel, joint_pos) already switches two of them off.
     dt: float = 0.02
     vel_consistency_weight: float = 0.01 #0.0
     accel_consistency_weight: float = 0.0

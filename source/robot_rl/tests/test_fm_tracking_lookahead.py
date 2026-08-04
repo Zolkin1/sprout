@@ -351,6 +351,7 @@ def test_teacher_window_fits_the_shipped_horizon():
     is the furthest offset, and adding near offsets costs no horizon at all.
     """
     from robot_rl.flow_matching import FlowMatchingConfig
+    from robot_rl.flow_matching.config import MAX_SERVABLE_REPLAN_PERIOD
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import REFERENCE_OFFSETS
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
         G1FmTrackerCommandsCfg,
@@ -358,13 +359,20 @@ def test_teacher_window_fits_the_shipped_horizon():
 
     period = G1FmTrackerCommandsCfg().traj_ref.fm_update_every
     assert period == 1, (
-        "the predicted window is anchored on the robot at the re-plan, so a period > 1 "
-        "would serve a stale anchor -- FmTrackingCommand refuses it."
+        "the DEPLOYED period is 1. That is a separate question from what the horizon can "
+        "serve -- see the headroom assertion below."
     )
-    required = max(REFERENCE_OFFSETS) + 1
+    # The deployed period is 1, but the horizon must cover the largest period we ever want
+    # to be able to SELECT, because a checkpoint cannot gain horizon after the fact: at
+    # period K the cursor sits up to K-1 nodes past the re-plan, so the furthest sample
+    # reads node max_offset + K. Sizing F to max_offset + 1 silently makes a checkpoint
+    # K=1-only, which happened once and cost a retrain to undo.
+    required = max(REFERENCE_OFFSETS) + MAX_SERVABLE_REPLAN_PERIOD
     assert FlowMatchingConfig().future_len >= required, (
-        f"future_len must be >= {required} for a window reaching offset "
-        f"{max(REFERENCE_OFFSETS)} ({len(REFERENCE_OFFSETS)} samples)."
+        f"future_len={FlowMatchingConfig().future_len} must be >= {required} = "
+        f"max(REFERENCE_OFFSETS) {max(REFERENCE_OFFSETS)} + MAX_SERVABLE_REPLAN_PERIOD "
+        f"{MAX_SERVABLE_REPLAN_PERIOD}, or generators trained with it cannot be served at "
+        f"K={MAX_SERVABLE_REPLAN_PERIOD} at all."
     )
 
 
