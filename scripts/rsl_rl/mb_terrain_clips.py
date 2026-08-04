@@ -40,10 +40,11 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import zlib
 
 import numpy as np
 import torch
+
+from motion_gen.command_schedule import from_json, rasterize
 
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.terrain.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
@@ -343,6 +344,12 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
                    "pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
                    "yaw": float(b.get("yaw", 0.0))} for b in boxes],
         "reference": ts.name, "reference_speed": ref_speed, "rl_vx": float(rl_vx),
+        # The band rl_vx was drawn from; _rl_command_track samples the varied command from it.
+        "rl_vel_range": [float(v) for v in getattr(args, "rl_vel_range", RL_CMD_VEL_RANGE)],
+        # The per-clip command schedule, authored in pass A. Pass B generated the approach and exit
+        # motion by TRACKING this, so writing it verbatim as target_vel is what makes the command the
+        # RL sees and the motion it sees agree outside the terrain override.
+        "rl_cmd_schedule": getattr(args, "rl_cmd_schedule", None),
         "terrain_id": int(args.terrain_id), "footprint_margin": float(args.footprint_margin),
         "family_blurb": family.blurb, "exit_sign": float(family.exit_sign),
         "lower_z": float(lower_z), "upper_z": float(upper_z),
@@ -406,56 +413,37 @@ def _load_segment(path: str | None, dt: float, dev):
     return (Wp, Wq, Wj), dict(raw.provenance or {})
 
 
-def _rl_command_track(T: int, bounds, rl_vx: float, args, dt: float, seed: int) -> np.ndarray:
-    """Per-step RL forward-velocity command ``[T]`` for one terrain clip.
+# RL-command variation defaults, defined ONCE here and used both as the CLI defaults and as the
+# fallbacks in _rl_command_track. ``clip_from_plan`` is called with a hand-built namespace by
+# ``mb_assemble_library`` (the real library-build path) as well as from this file's own CLI, so a
+# fallback of "off" would mean the feature silently does nothing in the pipeline that matters.
+# Fallback band, used only when a plan predates ``rl_vel_range`` in its meta. Live plans carry the
+# band their own family drew from, which is what a varied command is sampled from.
+RL_CMD_VEL_RANGE = (0.2, 3.5)
 
-    The command stays TERRAIN-AGNOSTIC -- it is what a user or planner asked for, never derived
-    from the motion (see the note at the call site: the reference is terrain-aware, the command is
-    not, and bridging that gap is what the flow model is for). What it adds is planner-like
-    VARIATION, so terrain clips stop being a single held value from end to end.
 
-    Two rules make the variation safe:
+def _rl_command_track(T: int, plan, dt: float) -> np.ndarray:
+    """Per-step RL forward command ``[T]``, read from the schedule pass A authored.
 
-    * The command is HELD at ``rl_vx`` across the terrain-interaction window (``bounds[1]``, the
-      replay) and across any segment that touches it. The traversal was planned at one speed and
-      the geometry was authored for it, so a command change mid-stair is a change the motion could
-      never reflect even in principle -- that is a different and much larger mismatch than the
-      intended terrain-agnostic one, and it lands exactly where the hardest tracking already is.
-    * Segments outside it scale ``rl_vx`` by ``--rl-cmd-scale-range`` rather than redrawing from
-      the whole band, so the approach and exit stay recognisably the same traversal.
+    NOT sampled here. Pass B GENERATED this clip's approach and exit motion by tracking this same
+    schedule, so writing it verbatim is what makes the command the RL sees and the motion it sees
+    agree -- everywhere except the terrain override (the last ``ramp_s`` of the approach and the
+    interaction itself), which is the only place the motion is allowed to disregard it.
 
-    Deterministic in ``seed`` (derived from the plan), so re-running pass 2 on the same plan
-    reproduces the same clip.
+    An earlier version sampled a fresh random command HERE, in pass C. That could not possibly
+    align: the motion already existed by then, generated at a single constant speed, so the command
+    and the motion disagreed across the whole approach and exit -- the two phases where they must
+    match -- while agreeing only through the interaction, where divergence is expected. Exactly
+    inverted.
 
-    Args:
-        T: Clip length in steps.
-        bounds: Per-phase ``(start, end)`` step ranges; ``bounds[1]`` is the terrain interaction.
-        rl_vx: The clip's steady command (signed; negative for a backward family).
-        args: CLI namespace supplying the ``rl_cmd_*`` knobs.
-        dt: Step period (s).
-        seed: Deterministic per-clip seed.
-
-    Returns:
-        ``[T]`` float32 forward command, sign-preserving.
+    Falls back to the clip's steady ``rl_vx`` for a plan that predates the schedule, which is at
+    least aligned: the approach and exit were generated at that speed.
     """
-    cmd = np.full(int(T), float(rl_vx), dtype=np.float32)
-    if not getattr(args, "rl_cmd_vary", False) or T <= 0:
-        return cmd
-    ta, tb = int(bounds[1][0]), int(bounds[1][1])
-    lo_s, hi_s = (float(v) for v in args.rl_cmd_seg_dur_range)
-    lo_k, hi_k = (float(v) for v in args.rl_cmd_scale_range)
-    v_lo, v_hi = (float(v) for v in args.rl_cmd_vel_range)
-    sign = -1.0 if rl_vx < 0 else 1.0
-    rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
-    t = 0
-    while t < T:
-        n = max(1, int(round(float(rng.uniform(lo_s, hi_s)) / dt)))
-        end = min(int(T), t + n)
-        if not (end > ta and t < tb):                     # untouched by the interaction window
-            mag = float(np.clip(abs(rl_vx) * float(rng.uniform(lo_k, hi_k)), v_lo, v_hi))
-            cmd[t:end] = sign * mag
-        t = end
-    return cmd
+    raw = plan.meta.get("rl_cmd_schedule")
+    if not raw:
+        return np.full(int(T), float(plan.meta["rl_vx"]), dtype=np.float32)
+    sign = -1.0 if float(plan.meta["rl_vx"]) < 0 else 1.0
+    return (sign * rasterize(from_json(raw), int(T), float(dt))[:, 0]).astype(np.float32)
 
 
 def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
@@ -540,17 +528,7 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             f"plan for {plan.skill} predates the RL-command split: it has "
             f"{'terrain_vx' if 'terrain_vx' in plan.meta else 'neither rl_vx nor terrain_vx'}, not 'rl_vx'. "
             f"Re-run pass 1 (mb_terrain_clips --dump-plan / mb_plan_library) to regenerate the plans.")
-    # Planner-like variation around that steady value, held across the terrain interaction; see
-    # _rl_command_track. Seeded from the plan's own identity so pass 2 is reproducible and two
-    # clips on the same tile at different speeds get different tracks.
-    # crc32, NOT hash(): Python randomises str hashing per process (PYTHONHASHSEED), so hash()
-    # here would give a different command track on every run of the same plan.
-    _seed = zlib.crc32(
-        f"{int(plan.meta.get('terrain_id', 0))}|{plan.skill}|"
-        f"{float(plan.meta['rl_vx']):.4f}|{int(T)}".encode())
-    tvel[:, 0] = torch.as_tensor(
-        _rl_command_track(T, bounds, float(plan.meta["rl_vx"]), args, dt, _seed),
-        dtype=tvel.dtype, device=dev)
+    tvel[:, 0] = torch.as_tensor(_rl_command_track(T, plan, dt), dtype=tvel.dtype, device=dev)
 
     # ``frame_yaw``: the heading of the TERRAIN's own frame within the tile -- the axis the traversal
     # crosses it along.  The RL anchor mask resolves its downrange / lateral bits in this frame
@@ -734,24 +712,6 @@ def main() -> int:
     p.add_argument("--box-nav-width", type=float, default=0.0,
                    help="[box] y-width (m) to widen the box AND its top platform to (expand-only); "
                         "0 keeps the reference box's own extents.")
-    p.add_argument("--rl-cmd-vary", action=argparse.BooleanOptionalAction, default=True,
-                   help="Give the RL command planner-like variation over the clip instead of one "
-                        "held value. The terrain-interaction window always holds the steady value; "
-                        "only the approach and exit vary. --no-rl-cmd-vary restores the old "
-                        "constant-per-clip behaviour.")
-    p.add_argument("--rl-cmd-seg-dur-range", type=float, nargs=2, default=(1.0, 3.0),
-                   metavar=("MIN", "MAX"),
-                   help="Command-segment duration band (s). Shorter than the flat path's "
-                        "--seg-dur-range (1.5-5.5) because terrain clips are ~3x shorter (median "
-                        "10.3 s terrain / 7.3 s transition vs 20 s flat) and the interaction window "
-                        "holds the middle of them, so a flat-sized band leaves room for barely one "
-                        "change per clip.")
-    p.add_argument("--rl-cmd-scale-range", type=float, nargs=2, default=(0.5, 1.5),
-                   metavar=("MIN", "MAX"),
-                   help="Approach/exit command as a multiple of the clip's steady speed. Kept "
-                        "near 1 so the clip stays recognisably the same traversal.")
-    p.add_argument("--rl-cmd-vel-range", type=float, nargs=2, default=(0.2, 3.5),
-                   metavar=("MIN", "MAX"), help="Absolute clamp (m/s) on the varied command.")
     p.add_argument("--terrain-speed", type=float, default=0.6,
                    help="Target speed for the reference pick (m/s); also the stair traversal command.")
     p.add_argument("--approach-vx", type=float, default=None,

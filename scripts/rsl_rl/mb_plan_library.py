@@ -47,6 +47,8 @@ from mb_terrain_clips import (                                            # noqa
     plan_from_spec,
 )
 
+from motion_gen.command_schedule import (as_json, sample_command_schedule,  # noqa: E402
+                                        total_duration)
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
                                     save_terrain_plan)
@@ -55,6 +57,9 @@ from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   #
 # frame (its planning horizon / context), so a window this long covers everything the model can see.
 _KEY_WINDOW = 64
 _STAIR_SKILLS = ("stairs_up", "stairs_down")
+# Slack added to a clip's schedule duration to cover the terrain interaction, whose length is
+# only known once the replay is placed. cmd_at saturates past the end, so over-long is safe.
+_INTERACTION_BUDGET_S = 12.0
 
 
 def _quantize(v: float, step: float) -> float:
@@ -88,7 +93,8 @@ def _round_key(*vals) -> str:
     return h.hexdigest()[:16]
 
 
-def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = "stand") -> tuple[str, str]:
+def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = "stand",
+                  schedule=None, unique_salt: str | None = None) -> tuple[str, str]:
     """``(approach_key, exit_key)`` -- identical keys iff Motion Bricks would see identical input.
 
     Keyed on exactly what ``mb_terrain_segments`` feeds the model, no more:
@@ -111,6 +117,18 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = 
     # different motions for the same command, so they must not share a generated segment.
     a_parts = [f"{plan.skill}|{plan.approach_mode}|{approach_pin}|{approach_start}|approach", a_scalars]
     x_parts = [f"{plan.skill}|{plan.exit_mode}|{exit_pin}|exit", x_scalars]
+    # The SCHEDULE is part of what Motion Bricks is conditioned on now: pass B tracks it to generate
+    # both segments, so two clips whose schedules differ are two different motions and must not share
+    # a cached segment. Sampled per clip, so in practice this alone drops reuse to ~0.
+    if schedule is not None:
+        flat = [v for seg in schedule for v in seg]
+        a_parts.append(flat)
+        x_parts.append(flat)
+    # ``unique_salt`` forces a segment per clip even if two schedules DID collide -- an explicit
+    # guarantee rather than one inferred from the sampler's variety.
+    if unique_salt is not None:
+        a_parts.append(f"|salt|{unique_salt}")
+        x_parts.append(f"|salt|{unique_salt}")
     if approach_pin == "hard":
         a_win = rep[max(0, ef - 1):ef + _KEY_WINDOW].copy()
         a_win[:, 2] -= plan.approach_surf_z                 # as approach_pin_window supplies it
@@ -218,6 +236,29 @@ def _cmd_mag(vx: float, sign: float, args) -> float:
     return min(abs(float(vx)), float(args.backward_vx_max)) if float(sign) < 0.0 else abs(float(vx))
 
 
+def _clip_schedule(rng, family_kind: str, approach_s: float, exit_s: float,
+                   steady_vx: float, args):
+    """Per-clip command schedule for a terrain clip, spanning approach + interaction + exit.
+
+    Forward-only: a traversal is authored along the tile's +x, so a lateral or yaw command would walk
+    the robot off it. Everything else comes from the SHARED sampler every family uses -- the flat
+    family calls it with the full command space, this calls it with one band.
+
+    The duration covers the whole clip generously; the interaction's own length is not known until
+    the replay is placed, and ``cmd_at`` saturates past the end, so an over-long schedule is
+    harmless while a short one would leave the tail uncommanded.
+    """
+    band = tuple(args.stair_vel_range) if family_kind == "stairs" else tuple(args.box_vel_range)
+    total = float(approach_s) + float(exit_s) + _INTERACTION_BUDGET_S
+    if not args.rl_cmd_vary:
+        # Ablation: ONE held value for the whole clip. Still aligned -- pass B generates both
+        # segments by tracking it, so a constant schedule reproduces the old behaviour exactly
+        # rather than approximately.
+        return [(total, float(steady_vx), 0.0, 0.0)]
+    return sample_command_schedule(
+        rng, duration=total, seg_dur_range=tuple(args.rl_cmd_seg_dur_range), vx_range=band)
+
+
 def _clip_speeds(rng, family_kind: str, args, cpt: int, vx_max: float | None = None) -> list[float]:
     """Per-clip GROUND-level traversal/approach speeds for one tile.
 
@@ -260,6 +301,20 @@ def main() -> int:
     p.add_argument("--stair-tiles", type=int, default=20, help="TRANSITION tiles per stair direction.")
     p.add_argument("--box-tiles", default="20,15,15", help="jump_on,jump_off,jump_off_front tile counts.")
     p.add_argument("--clips-per-tile", type=int, default=50)
+    p.add_argument("--rl-cmd-vary", action=argparse.BooleanOptionalAction, default=True,
+                   help="Sample a varying command schedule per terrain clip. --no-rl-cmd-vary gives "
+                        "ONE held value, which is the pre-schedule behaviour and a clean ablation.")
+    p.add_argument("--rl-cmd-seg-dur-range", type=float, nargs=2, default=(1.0, 3.0),
+                   metavar=("MIN", "MAX"),
+                   help="Seconds per segment of a terrain clip's command schedule. Sampled HERE "
+                        "(pass A) because pass B generates the motion by tracking the schedule, so "
+                        "it must exist before the motion does.")
+    p.add_argument("--segment-reuse", action=argparse.BooleanOptionalAction, default=False,
+                   help="Share a generated MB segment between clips whose conditioning is identical. "
+                        "OFF by default: with per-clip command schedules two clips are only "
+                        "interchangeable if their whole schedules match, and paying ~1.5x the "
+                        "segment generation buys the guarantee that every clip's approach and exit "
+                        "were generated for THAT clip.")
     p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.2, 2.6), metavar=("MIN", "MAX"),
                    help="GROUND-level speed band for the stair families (-> the terrain and "
                         "transition clip families). The floor was 0.6, which left the library with "
@@ -419,6 +474,22 @@ def main() -> int:
                     # not just in which reference was matched.  The elevated side is per TILE, because the
                     # platform it walks on is authored from it.
                     terrain_speed=vx, approach_vx=a_mag, exit_vx=x_mag,
+                    # The band this clip's steady speed was drawn FROM, carried into the plan so
+                    # pass 2 can vary the command within the family's own range. Per family:
+                    # the stair band tops out at 2.6 and the box band at 3.5, so a single
+                    # pipeline-wide value would let stair clips be commanded faster than any
+                    # stair clip is ever generated.
+                    rl_vel_range=(tuple(args.stair_vel_range) if kind == "stairs"
+                                  else tuple(args.box_vel_range)),
+                    # The per-clip command SCHEDULE, sampled here in pass A rather than when the clip
+                    # is written in pass C. It has to exist before pass B, because Motion Bricks
+                    # GENERATES the approach and exit motion by tracking it -- a schedule invented
+                    # afterwards would be a command the motion never followed. The terrain overrides
+                    # it only near the interaction (mb_terrain_segments); everywhere else the motion
+                    # tracks it, which is the whole point.
+                    rl_cmd_schedule=as_json(_clip_schedule(
+                        np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
+                        kind, a_s, x_s, float(family.exit_sign) * abs(float(vx)), args)),
                     platform_vx=plat_vx, platform_top_vx=top_mag,
                     approach_s=a_s, exit_s=x_s,
                     entry_pick=args.entry_pick, exit_pick=args.exit_pick,
@@ -442,7 +513,10 @@ def main() -> int:
                         skip_reasons.get(f"{skill}:{type(e).__name__}", 0) + 1
                     continue
                 save_terrain_plan(os.path.join(work, rel), plan)
-                a_key, x_key = _segment_keys(plan, args.approach_pin, args.exit_pin, a_start)
+                a_key, x_key = _segment_keys(
+                    plan, args.approach_pin, args.exit_pin, a_start,
+                    schedule=job_args.rl_cmd_schedule,
+                    unique_salt=(None if args.segment_reuse else f"{skill}|{tid}|{ci}"))
                 # A one-sided box tile has no ELEVATED segment: don't request it and don't record its key,
                 # so pass B never generates it and pass C knows to splice that side as None.
                 drop = elevated_side(family) if (kind == "box" and not two_sided) else None

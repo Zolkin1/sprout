@@ -489,6 +489,7 @@ class ClipScene:
         # Pinned-keyframe ghost pool (gold) -- the Phase-2 target poses fed to Motion Bricks' predict().
         # Populated only when a --keyframes sidecar is supplied; sized on first set_keyframes.
         self._keyframes: dict[int, dict] | None = None
+        self._kf_max = 12                 # pool cap; see _ensure_kf_pool
         # One entry per keyframe slot: {"stride": (frame, urdf), "terrain": (frame, urdf)}.
         self._kf_ghosts: list[dict[str, tuple[viser.FrameHandle, ViserUrdf]]] = []
         self._kf_markers: viser.SceneNodeHandle | None = None
@@ -679,15 +680,26 @@ class ClipScene:
         self._refresh_keyframes()
         self.set_frame(0)
 
-    def set_keyframes(self, kf_by_clip: dict[int, dict]) -> None:
-        """Attach pinned-keyframe data and build the ghost pool sized to the busiest clip.
-
-        Two ghosts per slot -- gold and red -- because ``ViserUrdf`` takes its colour at construction and
-        slots are reused as you switch clips, so a slot cannot be recoloured in place.  Exactly one of
-        each pair is ever visible (see :meth:`_refresh_keyframes`).
-        """
+    def set_keyframes(self, kf_by_clip: dict[int, dict], max_ghosts: int = 12) -> None:
+        """Attach pinned-keyframe data. Builds NO geometry -- see :meth:`_ensure_kf_pool`."""
         self._keyframes = kf_by_clip
-        pool = max((len(v["pos"]) for v in kf_by_clip.values()), default=0)
+        self._kf_max = int(max_ghosts)
+
+    def _ensure_kf_pool(self) -> None:
+        """Build the keyframe ghost pool, ONCE, the first time they are actually shown.
+
+        Deliberately lazy and capped. Two ghosts per slot -- gold and red -- because ``ViserUrdf``
+        fixes its colour at construction and slots are reused as you switch clips, so a slot cannot
+        be recoloured in place. That doubling is what makes an eager pool expensive: sizing it to the
+        busiest clip built 37 x 2 = 74 full G1 URDFs (~2000 meshes) at STARTUP even though
+        ``show_keyframes`` defaults off, which hung the browser before a single keyframe was
+        requested. Now nothing is built until the toggle goes on, and never more than ``--max-
+        keyframes`` slots; a clip with more keyframes than that is SUBSAMPLED evenly (reported, not
+        silently truncated -- see :meth:`_refresh_keyframes`).
+        """
+        if self._kf_ghosts or not self._keyframes:
+            return
+        pool = min(self._kf_max, max((len(v["pos"]) for v in self._keyframes.values()), default=0))
         for s in range(pool):
             pair = {}
             for tag, col in (("stride", _KEYFRAME_COLOR), ("terrain", _KEYFRAME_TERRAIN_COLOR)):
@@ -696,6 +708,15 @@ class ClipScene:
                                mesh_color_override=(*col, _KEYFRAME_ALPHA))
                 pair[tag] = (fr, gh)
             self._kf_ghosts.append(pair)
+        print(f"[view_clip_viser] built {pool} keyframe ghost slots on first show "
+              f"({2 * pool} robots)")
+
+    def _kf_slots(self, kf: dict) -> np.ndarray:
+        """Which of this clip's keyframes get a ghost: all of them, or an even subsample."""
+        n = len(kf["pos"])
+        if n <= len(self._kf_ghosts):
+            return np.arange(n)
+        return np.unique(np.round(np.linspace(0, n - 1, len(self._kf_ghosts))).astype(int))
 
     def _refresh_keyframes(self) -> None:
         """Pose the keyframe ghosts (+ root markers) for the current clip; hide the rest.
@@ -706,17 +727,23 @@ class ClipScene:
         commanded velocity, not of where the terrain actually is.
         """
         kf = (self._keyframes or {}).get(self.clip_idx)
+        if self.show_keyframes and kf is not None:
+            self._ensure_kf_pool()
         if self._kf_markers is not None:
             self._kf_markers.remove()
             self._kf_markers = None
+        # ROOT markers below show EVERY keyframe; only the posed robots are subsampled, so a capped
+        # pool still tells you where all of them are.
+        sel = self._kf_slots(kf) if (kf is not None and self._kf_ghosts) else np.zeros(0, int)
         for s, pair in enumerate(self._kf_ghosts):
-            live = (kf is not None and self.show_keyframes and s < len(kf["pos"]))
-            tag = str(kf["kind"][s]) if live else ""
+            live = (kf is not None and self.show_keyframes and s < len(sel))
+            src = int(sel[s]) if live else 0
+            tag = str(kf["kind"][src]) if live else ""
             for name, (fr, gh) in pair.items():
                 if live and name == (tag if tag in pair else "stride"):
-                    fr.position = kf["pos"][s]
-                    fr.wxyz = kf["wxyz"][s]
-                    gh.update_cfg(kf["cfg"][s])
+                    fr.position = kf["pos"][src]
+                    fr.wxyz = kf["wxyz"][src]
+                    gh.update_cfg(kf["cfg"][src])
                     fr.visible = True
                 else:
                     fr.visible = False
@@ -807,6 +834,10 @@ def main() -> int:
                    help="Base-pose-error termination distance (m); radius of the corridor tube.")
     p.add_argument("--keyframes", default=None,
                    help="Optional mb_encode.py _keyframes.npz sidecar: overlay the pinned target poses (gold).")
+    p.add_argument("--max-keyframes", type=int, default=12,
+                   help="Posed keyframe robots to build (each costs TWO URDFs, gold + red). Built "
+                        "lazily on first show; a clip with more keyframes is subsampled evenly, "
+                        "while the root markers still show every one.")
     args = p.parse_args()
 
     lib = load_clip_library(args.lib, "cpu")
@@ -820,7 +851,7 @@ def main() -> int:
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
     keyframes = _load_keyframe_sidecar(args.keyframes, urdf) if args.keyframes else None
     if keyframes is not None:
-        scene.set_keyframes(keyframes)
+        scene.set_keyframes(keyframes, max_ghosts=args.max_keyframes)
         nkf = sum(len(v["pos"]) for v in keyframes.values())
         print(f"[view_clip_viser] loaded {nkf} pinned keyframes over {len(keyframes)} clips from {args.keyframes}")
 

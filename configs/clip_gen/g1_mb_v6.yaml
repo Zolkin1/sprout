@@ -1,0 +1,89 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Clip-library recipe for scripts/rsl_rl/generate_mb_library.py.
+#
+# This file IS the library's definition: every distribution and scale knob lives here, nothing
+# is defaulted behind your back, and a library is reproducible from (this file + --source + --seed).
+# The driver forwards EVERY value below to the stage that consumes it, so the sub-scripts' own
+# argparse defaults never apply to a driver run -- that is deliberate, because a default declared in
+# two places is a default that drifts (it already did: the driver used to redeclare the velocity
+# bands with stale floors and silently override mb_plan_library).
+#
+# Loading is STRICT: an unknown key or a missing key is an error, never a silent default. A typo in
+# a distribution parameter is otherwise invisible until you measure the finished library.
+#
+# Full scale: 20+20 transition + 15+15 pure stairs + 20/15/15 box + 60 flat tiles, x 50 clips.
+
+# ---------------------------------------------------------------- reproducibility
+seed: 0
+
+# ---------------------------------------------------------------- scale (tiles x clips)
+clips_per_tile: 50
+stair_tiles: 20                 # TRANSITION stair tiles per direction (up/down)
+pure_stair_tiles: 15            # PURE stair tiles per direction (one long staircase, no approach)
+box_tiles: [20, 15, 15]         # jump_on, jump_off, jump_off_front
+flat_tiles: 60
+distractor_tiles: 20
+distractor_s: 6.0               # distractor clip duration (s)
+
+# ---------------------------------------------------------------- flat family
+# The command schedule the flat clips are GENERATED with (mb_encode). Bands are explicit (min, max)
+# ranges, not scale x fraction: the old form could not express a floor, which is why nothing below
+# 0.45 m/s existed. walk and run are contiguous so forward speed covers [0.1, 3.0] with no hole,
+# while keeping the 60/40 walk/run weighting.
+flat_clip_length: 20.0          # s; every flat clip is this long, all real motion
+flat_seg_dur_range: [1.5, 5.5]  # s per command segment
+flat_walk_vx_range: [0.1, 1.0]  # also the base band for turn / diagonal segments
+flat_run_vx_range: [1.0, 3.0]   # used on the 40% of forward segments that run
+flat_back_vx_range: [0.1, 1.5]  # magnitudes; emitted as negative vx
+flat_side_vy: 1.0               # lateral (sidestep) scale
+flat_turn_max: 0.8              # yaw-rate scale (rad/s)
+
+# ---------------------------------------------------------------- stair families
+# vel_range feeds BOTH stair families: the transition tiles (mb_plan_library, via Motion Bricks) and
+# the pure tiles (mb_pure_stair_clips, matcher-free). One band by construction -- they used to be
+# two hand-matched grids kept equal by eye.
+stair_vel_range: [0.2, 2.6]
+stair_floor_frac: 0.5           # fraction of tiles with a flat ground plane under the stairs
+stair_float_frac: 0.3           # fraction with FLOATING treads
+stair_float_thick_range: [0.03, 0.06]
+pure_seconds: 6.0               # pure-tile length in s at the stride's horizontal speed;
+                                # the CLIP runs ~2x that (climbing covers ground more slowly)
+
+# ---------------------------------------------------------------- box families
+box_vel_range: [0.2, 3.5]       # GROUND-level run-up / walk-away band
+box_approach_s_range: [2.5, 4.0]
+box_exit_s_range: [2.5, 6.0]
+box_top_vx_range: [0.2, 0.7]    # speed ON the box top
+box_two_sided_frac: 0.5
+box_platform_buffer: 1.0
+box_nav_width: -1.0             # -1 = derive from the tile width
+backward_vx_max: 1.0            # caps the band top for a BACKWARD family (jump_off)
+
+# ---------------------------------------------------------------- shared terrain knobs
+steady_approach_frac: 0.5       # fraction of terrain clips entered already walking (vs from a stand)
+pin_lead: 1.0
+pin_cmd: ramp                   # 'ramp' decelerates the approach command to the terrain's entry
+                                # speed; 'hold' keeps the steady command and assumes arriving at a
+                                # fixed boundary sheds the speed by itself. MEASURED false: under
+                                # 'hold' the approach reaches the stairs at 2.4 m/s against a replay
+                                # starting near 0.7, a -12 m/s^2 velocity discontinuity at the splice
+ramp_s: 1.5                     # seconds to bleed the approach command down to the entry speed. 0.8
+                                # cannot shed ~2 m/s at any rate a walking robot achieves; the
+                                # measured speed-change response is ~1.5 s                   # s of replay the MB approach is pinned against
+
+# ---------------------------------------------------------------- RL-visible command
+# The command written into the clip is TERRAIN-AGNOSTIC by design -- what a user or planner asked
+# for, with no knowledge of the terrain -- while the reference motion is terrain-aware. Bridging
+# that gap is what the flow model is for, so this is never derived from the motion.
+rl_cmd_vary: true               # vary it over each terrain clip instead of one held value
+rl_cmd_seg_dur_range: [2.5, 5.5]  # s per command segment; shorter than flat's, terrain clips are shorter
+segment_reuse: false            # share a generated MB segment between clips with identical
+                                # conditioning. OFF: with per-clip schedules two clips are only
+                                # interchangeable if their whole schedules match, and ~1.5x the
+                                # segment cost buys "every clip's motion was generated for it"
+rl_vels: raw                    # raw | snapped -- which velocity channel the flat clips carry
+
+# ---------------------------------------------------------------- composition
+extra_mix: ""                   # "path.h5:tiles, ..." for genuinely EXTERNAL families; the standard
+                                # families (incl. pure stairs) are folded in automatically

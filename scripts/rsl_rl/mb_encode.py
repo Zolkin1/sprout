@@ -43,70 +43,31 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mb_env  # noqa: E402
+from motion_gen.command_schedule import sample_command_schedule  # noqa: E402
 
-
-def _seg_vel(rng: np.random.Generator, args) -> tuple[float, float, float, str]:
-    """Random ``(vx, vy, wz, label)`` for one MOVING segment, covering the whole command space.
-
-    Modes follow ``generate_mm_clips._seg_vel``: forward / backward / sidestep / turn-while-walking /
-    diagonal, forward over-weighted 3:1, with a 30% chance of a superimposed turn on a forward segment.
-
-    The SPEEDS come from explicit bands (``--walk-vx-range`` / ``--run-vx-range`` / ``--back-vx-range``)
-    rather than the old scale-times-fraction form, which could not express a floor: forward used to be
-    ``U(0.45, 1.0) * scale``, so walk covered [0.45, 1.0] and run [1.125, 2.5] with a hole between them
-    and nothing at all below 0.45. Every forward-bearing mode now starts at the walk band's floor, so
-    slow locomotion is sampled directly instead of appearing only in the ramps between segments.
-    Turn and diagonal stay slower than a straight walk by capping at 70% / 80% of the walk band's top.
-    """
-    mode = str(rng.choice(["forward", "forward", "forward", "backward", "sidestep", "turn", "diagonal"]))
-    w_lo, w_hi = (float(v) for v in args.walk_vx_range)
-    vx = vy = wz = 0.0
-    if mode == "forward":
-        lo, hi = (args.run_vx_range if rng.random() < 0.4 else (w_lo, w_hi))
-        vx = float(rng.uniform(float(lo), float(hi)))
-        wz = float(rng.uniform(-1.0, 1.0)) * args.turn_max if rng.random() < 0.3 else 0.0
-    elif mode == "backward":
-        b_lo, b_hi = (float(v) for v in args.back_vx_range)
-        vx = -float(rng.uniform(b_lo, b_hi))
-    elif mode == "sidestep":
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.4, 1.0)) * args.side_vy
-    elif mode == "turn":
-        vx = float(rng.uniform(w_lo, 0.7 * w_hi))
-        wz = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.5, 1.0)) * args.turn_max
-    elif mode == "diagonal":
-        vx = float(rng.uniform(w_lo, 0.8 * w_hi))
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.3, 0.7)) * args.side_vy
-    return vx, vy, wz, mode
+# Historical flat-family shape, kept explicit now that the sampler is shared: a clean
+# standing lead-in so every clip starts settled, and a 12% chance a segment is a pause.
+_LEAD_IN_S = 1.0
+_STAND_FRAC = 0.12
 
 
 def sample_schedule(rng: np.random.Generator, args) -> list[tuple]:
     """One randomized ``[(duration_s, vx, vy, wz), ...]`` schedule for a clip of ``args.clip_length``.
 
-    A clean standing lead-in (so every clip starts from a settled stand), then mostly-moving segments of
-    ``U(*--seg-dur-range)`` s with a 12% chance of a pause -- the ``generate_mm_clips._schedule`` recipe. The
-    velocity is what MB is COMMANDED; the target pose is snapped to the nearest bank stride, so the
-    achieved steady velocity is the snapped one (see ``--rl-vels`` on the Stage-2 side).
+    Delegates to :func:`motion_gen.command_schedule.sample_command_schedule`, the ONE sampler every
+    clip family uses. The flat family passes the full command space -- forward / backward / sidestep
+    / turn / diagonal, a standing lead-in and pauses -- and nothing overrides the result, so the
+    generated motion tracks this schedule end to end. The terrain families call the same function
+    with forward-only bands and let the terrain override it near the interaction.
 
-    The final segment is stretched/trimmed so the schedule totals EXACTLY ``clip_length``. Stage 2 fits to
-    that length either way, so an overshoot would be generated GPU time thrown away and an undershoot would
-    be repeat-last padding; pinning the total makes every clip full-length real motion (``clip_len == T``).
-    The trim is bounded by the segment band's width, so the final segment can end up anywhere in
-    ``(0.5, max)`` s -- wider than the band itself. It can never be zeroed or negative: the loop exits with
-    ``t >= clip_length - 0.5``, which makes the adjusted duration ``clip_length - (t - d) > 0.5`` s.
+    Velocity is what MB is COMMANDED; the target pose is snapped to the nearest bank stride, so the
+    achieved steady velocity is the snapped one (see ``--rl-vels`` on the Stage-2 side).
     """
-    segs = [(1.0, 0.0, 0.0, 0.0)]
-    t = 1.0
-    while t < args.clip_length - 0.5:
-        if rng.random() < 0.12:
-            vx, vy, wz = 0.0, 0.0, 0.0
-        else:
-            vx, vy, wz, _ = _seg_vel(rng, args)
-        dur = float(rng.uniform(*(float(v) for v in args.seg_dur_range)))
-        segs.append((dur, vx, vy, wz))
-        t += dur
-    d, vx, vy, wz = segs[-1]
-    segs[-1] = (d + (float(args.clip_length) - t), vx, vy, wz)
-    return segs
+    return sample_command_schedule(
+        rng, duration=float(args.clip_length), seg_dur_range=tuple(args.seg_dur_range),
+        vx_range=tuple(args.walk_vx_range), run_vx_range=tuple(args.run_vx_range),
+        back_vx_range=tuple(args.back_vx_range), side_vy=float(args.side_vy),
+        turn_max=float(args.turn_max), stand_frac=_STAND_FRAC, lead_in_s=_LEAD_IN_S)
 
 
 def _schedule_set(name: str) -> list[dict]:

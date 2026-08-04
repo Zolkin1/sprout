@@ -13,7 +13,8 @@ stage script                                env            product
 a     ``mb_plan_library.py``                env_isaaclab   sampled tiles + per-clip plans + requests
 b     ``mb_terrain_segments.py --requests``  motionbricks   every unique approach / exit segment
 b     ``mb_encode.py --n-clips``             motionbricks   the flat family's raw motions
-c     ``mb_assemble_library.py``             env_isaaclab   per-family terrain ``.h5``
+c     ``mb_assemble_library.py``             env_isaaclab   per-family TRANSITION + box ``.h5``
+c     ``mb_pure_stair_clips.py``             env_isaaclab   the PURE stair families (no MB needed)
 c     ``generate_mb_clips.py``               env_isaaclab   the flat ``.h5``
 d     ``compose_terrain_library.py``         env_isaaclab   ONE training library
 ===== ===================================== ============== =========================================
@@ -23,9 +24,13 @@ Every stage is skip-if-done, so a killed run resumes where it stopped, and ``--s
 two scripts loads the model ONCE and then generates everything it owns, which is the difference between one
 checkpoint load and thousands.
 
-PURE stair tiles and distractors need no Motion Bricks (a pure tile is a bare looped traversal, matcher-free)
--- generate those with ``generate_box_clips.py`` / ``generate_distractor_clips.py`` and fold them in with
-``--extra-mix "path.h5:tiles, ..."``. Example::
+PURE stair tiles need no Motion Bricks -- a pure tile is one long platform-less staircase with no approach
+or exit, so there is nothing to in-between and ``mb_plan_library`` hardcodes ``n_pure=0``. They are built in
+stage c by ``mb_pure_stair_clips.py`` (matcher-free, reusing the same ``place_periodic_on_tile`` the
+transition path uses) and folded into stage d automatically. They previously came from the DEPRECATED
+``generate_box_clips.py`` and had to be stapled on with ``--extra-mix``, which is how the first v3 build
+silently shipped ZERO pure stairs; ``--extra-mix`` is still there for genuinely external families.
+Example::
 
     python scripts/rsl_rl/generate_mb_library.py \
         --work-dir mb_raw/lib_v1 --out clips/g1_mb_v1.h5 \
@@ -39,9 +44,13 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from clip_gen_config import load_clip_gen_config  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))          # <repo>/scripts/rsl_rl -> <repo>
@@ -117,70 +126,13 @@ def main() -> int:
     p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d"])
     p.add_argument("--device", default="cpu")
     p.add_argument("--workers", type=int, default=0)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--quick", action="store_true", help="Small/fast scale for an end-to-end check.")
-    # --- scale (DP parity by default: 200 tiles x 50 clips = 10k) ---
-    p.add_argument("--clips-per-tile", type=int, default=50)
-    p.add_argument("--stair-tiles", type=int, default=20, help="TRANSITION tiles per direction (up/down).")
-    p.add_argument("--box-tiles", default="20,15,15", help="jump_on,jump_off,jump_off_front tile counts.")
-    p.add_argument("--flat-tiles", type=int, default=60)
-    p.add_argument("--distractor-tiles", type=int, default=20,
-                   help="Distractor tiles (a box SEEN but not touched). MB-generated: no DP anywhere.")
-    p.add_argument("--distractor-s", type=float, default=6.0, help="Distractor clip duration (s).")
-    p.add_argument("--flat-clip-length", type=float, default=20.0,
-                   help="Flat clip duration (s). 20 s matches the teacher's episode_length_s, so one clip "
-                        "is one episode; it is passed to BOTH the MB generation and the Stage-2 ingest.")
-    p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
-    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
-                   help="GROUND-level speed band for the box families (the run-up / walk-away).")
-    p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
-                   metavar=("MIN", "MAX"),
-                   help="Duration (s) of a box clip's LEAD-IN (the segment before the interaction). Keyed by "
-                        "ORDER, not level: jump_on leads in on the ground, the dismounts along the box top.")
-    p.add_argument("--box-exit-s-range", type=float, nargs=2, default=(2.5, 6.0), metavar=("MIN", "MAX"),
-                   help="Duration (s) of a box clip's TRAIL-AWAY (the segment after the interaction).")
-    p.add_argument("--box-top-vx-range", type=float, nargs=2, default=(0.3, 0.7), metavar=("MIN", "MAX"),
-                   help="Speed band (m/s) of a box clip's ELEVATED segment (see --box-top-s-range); "
-                        "platform length is roughly their product.")
-    p.add_argument("--box-two-sided-frac", type=float, default=0.5,
-                   help="Fraction of box tiles with the top platform + an elevated segment; the rest are "
-                        "the bare box with the ground side only.")
-    p.add_argument("--box-platform-buffer", type=float, default=1.0,
-                   help="Extra metres of top platform beyond the elevated segment's nominal travel, so the "
-                        "reference cannot walk off the far edge (the ground side needs none -- the tile "
-                        "keeps its floor there).")
-    p.add_argument("--box-nav-width", type=float, default=-1.0,
-                   help="y-width (m) the box + its top platform are widened to; -1 = the tile's corridor "
-                        "width, 0 = the reference box's own narrow extents.")
-    p.add_argument("--backward-vx-max", type=float, default=1.0,
-                   help="Cap (m/s) on any BACKWARD command (the jump_off dismount), where the clean "
-                        "library's walk_backwards strides stop.")
-    p.add_argument("--stair-floor-frac", type=float, default=0.5)
-    p.add_argument("--stair-float-frac", type=float, default=0.0,
-                   help="Fraction of stair TILES with FLOATING (riser-less) treads -- thin slabs with an "
-                        "open gap beneath. Same tread tops, so the same references are reused.")
-    p.add_argument("--stair-float-thick-range", type=float, nargs=2, default=(0.03, 0.06),
-                   metavar=("MIN", "MAX"), help="Floating-tread slab thickness band (m), per tile.")
-    p.add_argument("--steady-approach-frac", type=float, default=0.5,
-                   help="Fraction of terrain clips whose approach starts ALREADY AT SPEED rather than from "
-                        "a stand (see mb_terrain_segments --approach-start).")
-    p.add_argument("--pin-lead", type=float, default=1.0,
-                   help="FLOOR (s) on when the terrain pose pin engages. The primary trigger is now "
-                        "proximity (mb_terrain_segments --pin-dist), so this is only the safety net for a "
-                        "robot that never closes the distance. It used to be 2.0, which combined with "
-                        "--approach-s-range (1.5,3.5) meant the pin was on from frame ONE on most clips -- "
-                        "no stride keyframes at all, and the model holding a standing pre-jump crouch as "
-                        "its target through the whole run-up.")
-    p.add_argument("--rl-vels", default="raw", choices=["raw", "snapped"],
-                   help="Which command channel the flat clips expose to the RL (see generate_mb_clips.py).")
-    p.add_argument("--extra-mix", default="",
-                   help="Extra 'path.h5:tiles, ...' folded into the compose (pure stairs, distractors).")
+    p.add_argument("--config", required=True,
+                   help="Clip-library recipe (configs/clip_gen/*.yaml). Holds every scale and "
+                        "distribution parameter; see clip_gen_config.py. Loading is STRICT -- an "
+                        "unknown or missing key is an error, not a default.")
     args = p.parse_args()
-
-    if args.quick:
-        args.clips_per_tile, args.stair_tiles, args.box_tiles = 4, 2, "2,1,1"
-        args.flat_tiles, args.flat_clip_length = 4, 20.0
-        args.distractor_tiles = 3
+    cfg = load_clip_gen_config(args.config)
+    print(f"[mb] recipe {cfg.config_path}")
 
     work = args.work_dir
     fam_dir = args.families_dir or os.path.join(work, "families")
@@ -191,13 +143,16 @@ def main() -> int:
     flat_h5 = os.path.join(fam_dir, "family_flat.h5")
     dis_h5 = os.path.join(fam_dir, "family_distractor.h5")
     os.makedirs(os.path.join(_REPO, work), exist_ok=True)
+    # Copy the recipe next to the artifacts it produced. A work dir is resumable and long-lived, so
+    # "which parameters built this" has to travel with it rather than living only in a shell history.
+    shutil.copyfile(cfg.config_path, os.path.join(_REPO, work, "clip_gen_config.yaml"))
     os.makedirs(os.path.join(_REPO, fam_dir), exist_ok=True)
-    stage, cpt = args.stage, int(args.clips_per_tile)
-    dis_argv = ["--source", args.source, "--num-tiles", str(args.distractor_tiles),
-                "--clips-per-tile", str(cpt), "--short-s", str(args.distractor_s),
-                "--seed", str(args.seed), "--device", args.device]
-    box_on, box_off, box_off_front = (int(x) for x in args.box_tiles.split(","))
-    n_flat_clips = args.flat_tiles * cpt
+    stage, cpt = args.stage, int(cfg.clips_per_tile)
+    dis_argv = ["--source", args.source, "--num-tiles", str(cfg.distractor_tiles),
+                "--clips-per-tile", str(cpt), "--short-s", str(cfg.distractor_s),
+                "--seed", str(cfg.seed), "--device", args.device]
+    box_on, box_off, box_off_front = (int(x) for x in cfg.box_tiles)
+    n_flat_clips = cfg.flat_tiles * cpt
     t0 = time.time()
 
     # --- stage 0: the stride bank the MB pose pin is driven from -------------------------------------
@@ -209,22 +164,25 @@ def main() -> int:
     if stage in ("all", "a") and not os.path.exists(os.path.join(_REPO, work, "jobs.json")):
         _run("plan", "mb_plan_library.py", [
             "--work-dir", work, "--source", args.source, "--library", args.library,
-            "--stair-tiles", str(args.stair_tiles), "--box-tiles", args.box_tiles,
-            "--clips-per-tile", str(cpt), "--seed", str(args.seed), "--device", args.device,
-            "--stair-vel-range", *(str(v) for v in args.stair_vel_range),
-            "--box-vel-range", *(str(v) for v in args.box_vel_range),
-            "--box-approach-s-range", *(str(v) for v in args.box_approach_s_range),
-            "--box-exit-s-range", *(str(v) for v in args.box_exit_s_range),
-            "--box-top-vx-range", *(str(v) for v in args.box_top_vx_range),
-            "--box-two-sided-frac", str(args.box_two_sided_frac),
-            "--box-platform-buffer", str(args.box_platform_buffer),
-            "--box-nav-width", str(args.box_nav_width),
-            "--backward-vx-max", str(args.backward_vx_max),
-            "--stair-floor-frac", str(args.stair_floor_frac),
-            "--stair-float-frac", str(args.stair_float_frac),
-            "--stair-float-thick-range", *(str(v) for v in args.stair_float_thick_range),
-            "--steady-approach-frac", str(args.steady_approach_frac)])
-    if stage in ("all", "a") and args.distractor_tiles > 0 \
+            "--stair-tiles", str(cfg.stair_tiles), "--box-tiles", ",".join(str(x) for x in cfg.box_tiles),
+            "--clips-per-tile", str(cpt), "--seed", str(cfg.seed), "--device", args.device,
+            "--rl-cmd-seg-dur-range", *(str(v) for v in cfg.rl_cmd_seg_dur_range),
+            *([] if cfg.rl_cmd_vary else ["--no-rl-cmd-vary"]),
+            *([] if cfg.segment_reuse else ["--no-segment-reuse"]),
+            "--stair-vel-range", *(str(v) for v in cfg.stair_vel_range),
+            "--box-vel-range", *(str(v) for v in cfg.box_vel_range),
+            "--box-approach-s-range", *(str(v) for v in cfg.box_approach_s_range),
+            "--box-exit-s-range", *(str(v) for v in cfg.box_exit_s_range),
+            "--box-top-vx-range", *(str(v) for v in cfg.box_top_vx_range),
+            "--box-two-sided-frac", str(cfg.box_two_sided_frac),
+            "--box-platform-buffer", str(cfg.box_platform_buffer),
+            "--box-nav-width", str(cfg.box_nav_width),
+            "--backward-vx-max", str(cfg.backward_vx_max),
+            "--stair-floor-frac", str(cfg.stair_floor_frac),
+            "--stair-float-frac", str(cfg.stair_float_frac),
+            "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
+            "--steady-approach-frac", str(cfg.steady_approach_frac)])
+    if stage in ("all", "a") and cfg.distractor_tiles > 0 \
             and not os.path.exists(os.path.join(_REPO, dis_sched)):
         _run("distract-plan", "mb_distractor_clips.py", dis_argv + ["--dump-schedules", dis_sched])
 
@@ -240,25 +198,38 @@ def main() -> int:
             _run("segments", "mb_terrain_segments.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank,
                 "--requests", os.path.join(work, "requests.json"), "--work-dir", work,
-                "--pin-lead", str(args.pin_lead)],
+                "--pin-lead", str(cfg.pin_lead),
+                # Neither of these was reachable through this driver, so the ramp that decelerates
+                # an approach into the terrain could only be changed by editing
+                # mb_terrain_segments' defaults -- and its default ('hold') switches the ramp OFF.
+                "--pin-cmd", cfg.pin_cmd, "--ramp-s", str(cfg.ramp_s)],
                 conda_env=args.conda_env)
         else:
             print(f"\n===== [segments] all present, skipping")
         n_have = len(glob.glob(os.path.join(_REPO, raw_flat, "*.npz")))
         if n_have < n_flat_clips:
+            # The flat velocity bands are forwarded EXPLICITLY. They are mb_encode's own args and
+            # this driver never passed them, so the only way to change the flat family's speed
+            # distribution was to edit that file's defaults -- i.e. a library was not reproducible
+            # from the command that built it. The recipe owns them now.
             _run("flat-gen", "mb_encode.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank, "--out-dir", raw_flat,
-                "--n-clips", str(n_flat_clips), "--clip-length", str(args.flat_clip_length),
-                "--seed", str(args.seed)], conda_env=args.conda_env)
+                "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
+                "--seg-dur-range", *(str(v) for v in cfg.flat_seg_dur_range),
+                "--walk-vx-range", *(str(v) for v in cfg.flat_walk_vx_range),
+                "--run-vx-range", *(str(v) for v in cfg.flat_run_vx_range),
+                "--back-vx-range", *(str(v) for v in cfg.flat_back_vx_range),
+                "--side-vy", str(cfg.flat_side_vy), "--turn-max", str(cfg.flat_turn_max),
+                "--seed", str(cfg.seed)], conda_env=args.conda_env)
         else:
             print(f"\n===== [flat-gen] {n_have} raw flat motions present, skipping")
-        if args.distractor_tiles > 0:
+        if cfg.distractor_tiles > 0:
             n_want = _n_schedules(os.path.join(_REPO, dis_sched))
             n_got = len(glob.glob(os.path.join(_REPO, raw_dis, "*.npz")))
             if n_got < n_want:
                 _run("distract-gen", "mb_encode.py", [
                     "--mb-root", args.mb_root, "--stride-bank", bank, "--out-dir", raw_dis,
-                    "--schedules", dis_sched, "--seed", str(args.seed)], conda_env=args.conda_env)
+                    "--schedules", dis_sched, "--seed", str(cfg.seed)], conda_env=args.conda_env)
             else:
                 print(f"\n===== [distract-gen] {n_got} raw distractor motions present, skipping")
 
@@ -268,30 +239,59 @@ def main() -> int:
             _run("assemble", "mb_assemble_library.py", [
                 "--work-dir", work, "--source", args.source, "--out-dir", fam_dir,
                 "--device", args.device, "--workers", str(args.workers)])
+        # PURE stair tiles: no approach or exit, so Motion Bricks has nothing to in-between and
+        # mb_plan_library hardcodes n_pure=0. They used to come from the DEPRECATED
+        # generate_box_clips.py and be stapled on by hand with --extra-mix, which is how the first
+        # v3 build silently shipped ZERO pure stairs. Generated here instead, from the same
+        # --stair-vel-range as the transition tiles so the two stair families cannot drift apart.
+        for direction in ("stairs_up", "stairs_down"):
+            pure_h5 = os.path.join(fam_dir, f"family_pure_{direction}.h5")
+            if cfg.pure_stair_tiles > 0 and not os.path.exists(os.path.join(_REPO, pure_h5)):
+                _run(f"pure-{direction}", "mb_pure_stair_clips.py", [
+                    "--source", args.source, "--terrain-lib", args.library,
+                    "--terrain-skills", direction, "--out", pure_h5,
+                    "--n-tiles", str(cfg.pure_stair_tiles),
+                    "--clips-per-tile", str(cpt),
+                    "--stair-vel-range", *(str(v) for v in cfg.stair_vel_range),
+                    "--pure-seconds", str(cfg.pure_seconds),
+                    "--stair-floor-frac", str(cfg.stair_floor_frac),
+                    "--stair-float-frac", str(cfg.stair_float_frac),
+                    "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
+                    "--tile-seed", str(cfg.seed), "--device", args.device])
         if not os.path.exists(os.path.join(_REPO, flat_h5)):
             _run("flat-clips", "generate_mb_clips.py", [
                 "--raw-dir", raw_flat, "--source", args.source, "--out", flat_h5,
-                "--clip-length", str(args.flat_clip_length), "--device", args.device,
-                "--rl-vels", args.rl_vels, "--workers", str(args.workers)])
-        if args.distractor_tiles > 0 and not os.path.exists(os.path.join(_REPO, dis_h5)):
+                "--clip-length", str(cfg.flat_clip_length), "--device", args.device,
+                "--rl-vels", cfg.rl_vels, "--workers", str(args.workers)])
+        if cfg.distractor_tiles > 0 and not os.path.exists(os.path.join(_REPO, dis_h5)):
             _run("distract-clips", "mb_distractor_clips.py",
                  dis_argv + ["--mb-raw-dir", raw_dis, "--out", dis_h5, "--workers", str(args.workers)])
 
     # --- stage d: one training library at the requested tile proportions ---------------------------
     if stage in ("all", "d"):
-        counts = {"stairs_up": args.stair_tiles, "stairs_down": args.stair_tiles,
+        counts = {"stairs_up": cfg.stair_tiles, "stairs_down": cfg.stair_tiles,
                   "jump_on": box_on, "jump_off": box_off, "jump_off_front": box_off_front,
-                  "distractor": args.distractor_tiles}
+                  "distractor": cfg.distractor_tiles,
+                  # PURE stair tiles, from mb_pure_stair_clips in stage c. Folded in HERE rather
+                  # than left to --extra-mix: a whole terrain class silently missing from the
+                  # library is not something a caller should have to remember to prevent.
+                  "pure_stairs_up": cfg.pure_stair_tiles,
+                  "pure_stairs_down": cfg.pure_stair_tiles}
         mix = [f"{fam_dir}/family_{k}.h5:{n}" for k, n in counts.items()
                if n > 0 and os.path.exists(os.path.join(_REPO, fam_dir, f"family_{k}.h5"))]
-        if args.extra_mix.strip():
-            mix += [e.strip() for e in args.extra_mix.split(",") if e.strip()]
+        for k, n in (("pure_stairs_up", cfg.pure_stair_tiles),
+                     ("pure_stairs_down", cfg.pure_stair_tiles)):
+            if n > 0 and not os.path.exists(os.path.join(_REPO, fam_dir, f"family_{k}.h5")):
+                print(f"[compose][WARN] {k} requested ({n} tiles) but "
+                      f"{fam_dir}/family_{k}.h5 is missing -- the library will have NO {k}.")
+        if cfg.extra_mix.strip():
+            mix += [e.strip() for e in cfg.extra_mix.split(",") if e.strip()]
         if not mix:
             raise SystemExit("[compose] no family libraries found; run stage c first")
         compose = ["--mix", ", ".join(mix), "--max-clips-per-tile", str(cpt),
                    "--out", args.out, "--device", args.device]
         if os.path.exists(os.path.join(_REPO, flat_h5)):
-            compose += ["--flat-from", flat_h5, "--flat-tiles", str(args.flat_tiles),
+            compose += ["--flat-from", flat_h5, "--flat-tiles", str(cfg.flat_tiles),
                         "--flat-clips", str(n_flat_clips)]
         _run("compose", "compose_terrain_library.py", compose)
 
