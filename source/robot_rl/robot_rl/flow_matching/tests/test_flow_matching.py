@@ -57,7 +57,7 @@ from robot_rl.flow_matching import (
     world_to_window,
     yaw_quat,
 )
-from isaaclab.utils.math import quat_conjugate, quat_mul
+from isaaclab.utils.math import quat_conjugate, quat_mul, yaw_quat
 from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
 from robot_rl.flow_matching.online import (
     build_cmd_tokens,
@@ -123,19 +123,22 @@ def _window_case(seed: int, nf: int = 5, nj: int = 4, k: int = 2):
     return (ap, aq, rp, rqq, win, nj, k)
 
 
-def test_base_pose_encodes_the_reference_pose_in_the_anchor_frame():
-    """``base_pose[3:9]`` decodes to ``R_actT R_ref`` -- the SIGN, pinned independently.
+def test_base_pose_encodes_the_reference_pose_in_the_anchor_yaw_frame():
+    """``base_pose[3:9]`` decodes to ``R_yawT R_ref`` -- SIGN and FRAME, pinned independently.
 
     Asserted against a directly-built relative rotation rather than through the window's own
-    inverse, which would agree with any consistent sign. Together with
-    ``BASE_POSE_CONVENTION`` this is what stops the orientation half being flipped back by
-    accident: the width would not change, so a stale policy would load clean.
+    inverse, which would agree with any consistent sign or frame. Together with
+    ``BASE_POSE_CONVENTION`` this is what stops either being changed back by accident: the
+    width would not move, so a stale policy would load clean and steer wrong.
+
+    The anchor is YAW-ONLY, so the robot's roll and pitch are absent from the frame while the
+    reference's are retained in full.
     """
     ap, aq, rp, rqq, win, nj, k = _window_case(0)
     n, nf = rqq.shape[:2]
     slc = window_block_slices(nj, k)["base_pose"]
     want = matrix_from_quat(
-        quat_mul(quat_conjugate(aq[:, None, :].expand(n, nf, 4).reshape(-1, 4)),
+        quat_mul(quat_conjugate(yaw_quat(aq)[:, None, :].expand(n, nf, 4).reshape(-1, 4)),
                  rqq.reshape(-1, 4))
     )
     got = rot6d_to_matrix(win[..., slc.start + 3:slc.start + 9].reshape(-1, 6))
@@ -1179,3 +1182,47 @@ def test_body_pose_terms_need_joint_pos():
     pred, tgt, chain, nj, k = _body_case(5)
     with pytest.raises(ValueError, match="body_pose_terms"):
         body_pose_terms(pred[..., :9], tgt[..., :9], nj, k, chain, blocks=("base_pose",))
+
+
+def test_window_is_invariant_to_the_anchor_s_roll_and_pitch():
+    """The property the yaw frame exists for: tilting the robot changes NOTHING in the window.
+
+    This is what makes a roll/pitch domain randomization camera-only by construction -- it
+    perturbs what the depth cameras see and leaves every window node bit-identical, with no
+    bookkeeping on the reference side. Under the previous full-rotation anchor the same
+    perturbation rotated the whole base block.
+
+    Held at 1e-13 rather than exact equality. The anchor reaches the base blocks only through
+    ``yaw_quat``, so the invariance is exact in real arithmetic -- but ``yaw_quat`` recovers the
+    heading through ``atan2`` then ``sin``/``cos``, so two quaternions with mathematically
+    equal yaw give the same heading only to rounding. Measured residual: 1.3e-15, about 6
+    float64 eps, against a signal of order 1.
+    """
+    from isaaclab.utils.math import quat_from_euler_xyz
+    nj, k, nf, n = 5, 2, 3, 4
+    g = torch.Generator().manual_seed(11)
+
+    def rq(m):
+        """``m`` random unit quaternions (xyzw)."""
+        q = torch.randn(m, 4, generator=g, dtype=torch.float64)
+        return q / q.norm(dim=-1, keepdim=True)
+
+    ap = torch.randn(n, 3, generator=g, dtype=torch.float64)
+    args = (torch.randn(n, nf, 3, generator=g, dtype=torch.float64), rq(n * nf).view(n, nf, 4),
+            torch.randn(n, nf, 3, generator=g, dtype=torch.float64),
+            torch.randn(n, nf, 3, generator=g, dtype=torch.float64),
+            torch.randn(n, nf, nj, generator=g, dtype=torch.float64),
+            torch.randn(n, nf, nj, generator=g, dtype=torch.float64),
+            torch.randn(n, nf, k, 3, generator=g, dtype=torch.float64))
+
+    yaw = torch.rand(n, generator=g, dtype=torch.float64) * 6.0 - 3.0
+    zero = torch.zeros(n, dtype=torch.float64)
+    flat = quat_from_euler_xyz(zero, zero, yaw)
+    tilted = quat_from_euler_xyz(zero + 0.35, zero - 0.22, yaw)      # same yaw, big tilt
+    assert torch.allclose(yaw_quat(flat), yaw_quat(tilted), atol=1e-12)
+
+    w_flat = world_to_window(ap[:, None, :], flat[:, None, :], *args)
+    w_tilted = world_to_window(ap[:, None, :], tilted[:, None, :], *args)
+    torch.testing.assert_close(w_flat, w_tilted, atol=1e-13, rtol=0.0)
+    # ...and it is not vacuous: the block genuinely varies across nodes.
+    assert w_flat[..., 0:9].std() > 0.1

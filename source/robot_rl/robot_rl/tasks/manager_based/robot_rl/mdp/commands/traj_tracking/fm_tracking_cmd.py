@@ -104,7 +104,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._fm_wf_frames = self._wf_world_frames.clone()
         # Allocated up front so :meth:`reset` is safe on the no-generator path too.
         self._pending_reset = torch.zeros(n, dtype=torch.bool, device=dev)
-        # Offset of the node being served. Always 0 -- fm_update_every is pinned to 1 --
+        # Offset of the node being served within the live plan: 0 on a re-plan, +1 per step
         # kept as a tensor so the look-ahead helpers take one code path.
         self._zero_offset = torch.zeros(1, dtype=torch.long, device=dev)
 
@@ -132,8 +132,9 @@ class FmTrackingCommand(MotionSequenceCommand):
             )
         if not os.path.isfile(self.cfg.fm_checkpoint):
             raise FileNotFoundError(f"FmTrackingCommandCfg.fm_checkpoint '{self.cfg.fm_checkpoint}' does not exist.")
-        if int(self.cfg.fm_update_every) < 1:
-            raise ValueError(f"fm_update_every must be >= 1, got {self.cfg.fm_update_every}.")
+        k = int(self.cfg.fm_update_every)
+        if k < 1:
+            raise ValueError(f"fm_update_every must be >= 1, got {k}.")
 
         # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to None
         # without making the field un-overridable from hydra (see the cfg's docstring).
@@ -144,6 +145,21 @@ class FmTrackingCommand(MotionSequenceCommand):
             zero_noise=self.cfg.fm_zero_noise,
             guidance_scale=self.cfg.fm_guidance_scale,
         )
+
+        # K must be 1 or >= N: the history is the previous plan's TAIL (cursor K-N .. K-1), so
+        # all N rows come from one plan only at K >= N. Between 2 and N-1 the ring straddles
+        # two plans, mixing two anchor frames in one history -- silently, since the shapes are
+        # identical either way. K=1 is fine: every row is node 0 of its own plan, which is the
+        # same statement with N frames that each coincide with the robot at that step.
+        #
+        # Checked HERE rather than with the other cfg validation above, because N is a property
+        # of the checkpoint and ``self.ctx`` does not exist until it is loaded.
+        if 1 < k < self.ctx.N:
+            raise ValueError(
+                f"fm_update_every={k} is between 2 and N-1 (N={self.ctx.N} history tokens on "
+                "this checkpoint). The generator's history is a slice of ONE plan's tail, so K "
+                f"must be either 1 or >= N. Use 1, or {self.ctx.N} or more."
+            )
         if steps is not None:
             print(f"[INFO FmTrackingCommand] fm_num_sampling_steps={steps} overrides the "
                   f"checkpoint's; the flow is integrated in {steps} Euler steps.")
@@ -685,11 +701,12 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _snapshot_and_infer(self) -> None:
         """Push the served node into history and re-run FM inference (once per step).
 
-        ``fm_update_every`` is pinned to 1 (checked in ``_post_init``), so this re-plans every
-        control step and node 0 is always "now" -- there is no cursor to advance. That is a
-        requirement, not a simplification: the prediction is expressed relative to the robot
-        AT THE RE-PLAN, so serving it a step later would need the egomotion since then to
-        re-anchor, and removing that dependency is the point of the representation.
+        Re-plans every ``fm_update_every`` (= K) control steps. At K=1 node 0 is always "now"
+        and there is no cursor; at K>1 the cursor walks the live plan and every SERVED node is
+        re-anchored onto the robot as it is now -- which costs the relative egomotion since the
+        re-plan (see :meth:`_reanchor_to_now`). That odometry is on the serving path only. The
+        HISTORY is pushed raw, in its plan's own frame, so the generator's own observation
+        never depends on measured state.
         """
         step = int(getattr(self.env, "common_step_counter", self._last_step_seen + 1))
         if step == self._last_step_seen:
@@ -738,11 +755,23 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "FmTrackingCommand has envs with no live FM prediction after inference; the "
                 "reference has no clip fallback, so this must never happen."
             )
-        # Stash the node being served THIS step, re-anchored onto the robot as it is now --
-        # that is the frame the dataset's history rows are in. Next step pushes it, so the
-        # ring always holds the last N SERVED nodes. With K>1 those are consecutive nodes of
-        # the previous solve, which is what "four frames from the last solve" means.
-        self._prev_served_node = self._reanchor_to_now(self._zero_offset)[:, 0]
+        # Stash the node being served THIS step, RAW -- in the frame of the plan it came
+        # from, NOT re-anchored onto the robot now.
+        #
+        # That is what keeps odometry out of the FM's observation: the history says "this was
+        # my plan", a statement about the model's own past output and nothing else. Since
+        # inference only happens at a re-plan, and the N pushes before it all come from the
+        # previous plan (cursor K-N .. K-1), the ring holds that plan's tail in ONE frame --
+        # exactly ``prev_pred[:, K-N:K]``.
+        #
+        # At K=1 this is bit-identical to re-anchoring, because the cursor is 0 and the
+        # plan's anchor IS the robot now, so the re-anchor was a no-op. It only diverges at
+        # K>1, where re-anchoring per step used to difference each row against a DIFFERENT
+        # robot pose -- cancelling the reference's motion and collapsing the N rows onto one
+        # number (measured: corr 0.87-0.98 across rows).
+        #
+        # Needs K >= N for all N rows to come from one plan; ``_post_init`` enforces it.
+        self._prev_served_node = self._pred_window[self._arange_n, self._pred_idx].clone()
 
     @torch.no_grad()
     def _run_fm(self, mask: torch.Tensor, null_hist: torch.Tensor | None = None) -> None:
@@ -878,9 +907,9 @@ class FmTrackingCommand(MotionSequenceCommand):
         / ``stride``) is built after the command manager. Re-checks only when a caller asks
         for a larger offset than any seen so far.
 
-        With ``fm_update_every`` pinned to 1 the requirement is exact -- ``F >= max_offset +
-        1`` -- and there is no staleness slack to carry. Nothing clamps: a short horizon is
-        an error, not a frozen tail.
+        The requirement is ``F >= max_offset + K``: at a re-plan period of K the cursor sits
+        up to K-1 nodes past the re-plan when the furthest sample is read. Nothing clamps: a
+        short horizon is an error, not a frozen tail.
         """
         max_off = int(offsets.max().item())
         if max_off <= self._checked_max_offset:

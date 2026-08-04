@@ -38,6 +38,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # local imports
 import cli_args  # isort: skip
+from provenance import check_run_conventions  # isort: skip
 from data_logger import DataLogger  # isort: skip
 from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
@@ -268,6 +269,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
+
+        # HARD refusal before anything is built: this run's checkpoints are only meaningful
+        # under the observation conventions they were trained with, and a mismatch is
+        # invisible in every shape. Absence counts as a mismatch -- see check_run_conventions.
+        check_run_conventions(log_dir, env_cfg)
 
         # Trajectory-library version check: the saved env.yaml records the
         # portable content fingerprint of the library this policy trained

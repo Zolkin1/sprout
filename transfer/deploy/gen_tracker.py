@@ -33,7 +33,7 @@ import numpy as np
 from .depth_obs import assert_depth_specs_agree
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_inv, quat_mul
+from .quat_math_np import quat_apply, quat_inv, quat_mul, yaw_quat
 from .tracker_session import TrackerSession
 from .window_np import (
     reanchor_window,
@@ -50,9 +50,10 @@ _LEGACY_TERM_CLIP = {"actions": 20.0, "height_scan": 1.0}
 
 # The ``base_pose`` convention this runtime implements, checked against the tracker's
 # exported ``reference_window_spec``. See ``robot_rl.flow_matching.window``: the block is
-# ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]``. Worth pinning because the SIGN of the
-# orientation half is invisible in the obs shape.
-_BASE_POSE_CONVENTION = "pose_in_anchor_frame_pos_ref_minus_actual_ori_rot6d"
+# ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]``, in the anchor's YAW frame. Worth pinning
+# because neither the yaw-vs-full frame nor the SIGN of the orientation half is visible in the
+# obs shape -- both change the observation's MEANING at identical width.
+_BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 
 
 def wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
@@ -551,7 +552,11 @@ class GenTrackerPolicy:
         if infer and ((not null_hist) or use_null):
             self._run_fm(state, history_null=(null_hist and use_null))
         if self._pred_valid:
-            self._prev_served_node = self._serve_nodes(state, (0,))[0]
+            # RAW node at the cursor, in its plan's own frame -- never re-anchored onto the
+            # robot now. Keeps odometry out of the FM's observation; see the Isaac-side
+            # _push_served_node for why, and note _serve_nodes (which DOES re-anchor) is
+            # still what feeds the POLICY.
+            self._prev_served_node = self._pred[0, int(self._pred_idx)].copy()
 
     def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample the F-node reference window for this control step.
@@ -705,9 +710,12 @@ class GenTrackerPolicy:
         if sl is None:
             return None
         block = self._pred[0, :, sl]                                          # [F,9]
-        q = np.broadcast_to(self._anchor_quat, (block.shape[0], 4))
+        # YAW-only, matching how the block was built: the anchor contributes heading, so
+        # lifting through the full anchor rotation would tilt the whole ribbon by the robot's
+        # roll/pitch at the re-plan.
+        q = np.broadcast_to(yaw_quat(self._anchor_quat), (block.shape[0], 4))
         ref_p = self._anchor_pos + quat_apply(q, block[:, 0:3])
-        # R_ref = R_act (R_actT R_ref); the 6D pair has to become a matrix here, so this is
+        # R_ref = R_yaw (R_yawT R_ref); the 6D pair has to become a matrix here, so this is
         # where Gram-Schmidt runs (inside rot6d_to_quat).
         ref_q = quat_mul(q, rot6d_to_quat(block[:, 3:9]))
         return ref_p, ref_q
@@ -760,8 +768,8 @@ class GenTrackerPolicy:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
 
         Per step, in ``reference_window_layout`` order: ``base_pose`` (9) -- the reference
-        base pose in the robot's CURRENT actual base frame, position ``ref - actual`` (3)
-        plus ``R_actT R_ref`` as a 6D rotation (6); ``base_vel``
+        base pose in the robot's CURRENT YAW frame, position ``ref - actual`` (3) plus
+        ``R_yawT R_ref`` as a 6D rotation (6); ``base_vel``
         (6) -- reference base lin+ang velocity rotated into that same current base frame;
         ``joint_pos`` / ``joint_vel`` (nj each) -- **in the robot's own joint order**, so
         they line up elementwise with the proprioception terms; ``ee_pos`` (3 per frame)

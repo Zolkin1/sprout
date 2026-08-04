@@ -39,6 +39,7 @@ from isaaclab.utils.math import (  # noqa: E402
     quat_box_minus,
     quat_conjugate,
     quat_mul,
+    yaw_quat,
 )
 
 from robot_rl.flow_matching.transforms import rot6d_to_matrix  # noqa: E402
@@ -295,19 +296,19 @@ def test_sample_zero_matches_the_current_step_terms(env_cmd):
     torch.testing.assert_close(first[:, -3 * len(EE_FRAMES):], ee_ref_relative_to_base(env, "traj_ref"))
 
 
-def test_base_pose_is_the_reference_pose_in_the_anchor_frame(env_cmd):
-    """``base_pose`` is ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]``.
+def test_base_pose_is_the_reference_pose_in_the_anchor_yaw_frame(env_cmd):
+    """``base_pose`` is ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]``.
 
     Pinned against an independent expression rather than against the window's own inverse,
     because every other check here is a round trip or a cross-check between two functions
     that share the convention -- flip them together and nothing notices.
 
-    This is the test that guards the SIGN. It used to assert the opposite orientation
-    convention (``Log(R_refT R_act)``, position and orientation pointing opposite ways);
-    that half of ``base_pose`` was flipped so both halves mean the same thing, and this test
-    moved with :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`. The observation
-    width would be identical either way if only the sign changed, so nothing but this and
-    that string stands between a stale policy and a clean-looking load.
+    This is the test that guards the SIGN and the FRAME -- neither of which is visible in
+    the observation's width, so nothing but this and
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION` stands between a stale policy
+    and a clean-looking load. It has moved twice with that string: first when the orientation
+    half was flipped from ``Log(R_refT R_act)`` so both halves meant the same thing, then when
+    the anchor became yaw-only so the robot's own tilt stopped rotating the frame.
     """
     env, cmd = env_cmd
     offs = _window_offsets(cmd, strided_offsets(11, 5))
@@ -320,25 +321,32 @@ def test_base_pose_is_the_reference_pose_in_the_anchor_frame(env_cmd):
     base_pose = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
     base_pose = base_pose.reshape(n, k, per_step)[..., 0:9].reshape(-1, 9)
 
-    # position: R_actT (p_ref - p_act) -- robot -> reference, in the anchor frame
-    want_pos = quat_apply(quat_conjugate(act_q), ref_p.reshape(-1, 3) - act_p)
-    # orientation: R_actT R_ref, the SAME direction. Compared as a rotation matrix, since
+    # The anchor is YAW-ONLY: heading, never the robot's roll/pitch.
+    act_yaw = yaw_quat(act_q)
+    # position: R_yawT (p_ref - p_act) -- robot -> reference, in the anchor's heading frame
+    want_pos = quat_apply(quat_conjugate(act_yaw), ref_p.reshape(-1, 3) - act_p)
+    # orientation: R_yawT R_ref, the SAME direction. Compared as a rotation matrix, since
     # that is what the 6D pair encodes and it is insensitive to quaternion sign.
-    want_rot = matrix_from_quat(quat_mul(quat_conjugate(act_q), ref_q.reshape(-1, 4)))
+    want_rot = matrix_from_quat(quat_mul(quat_conjugate(act_yaw), ref_q.reshape(-1, 4)))
     torch.testing.assert_close(base_pose[:, 0:3], want_pos, atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(rot6d_to_matrix(base_pose[:, 3:9]), want_rot,
                                atol=1e-6, rtol=1e-6)
 
-    # ...and on the reference, position vanishes and the rotation becomes the identity --
-    # whose 6D encoding is (1,0,0, 0,1,0), NOT zero. Worth asserting explicitly: the old
-    # log-map block went to zero here, so anything still expecting an all-zero base_pose
-    # node is reading the previous representation.
+    # ...and sitting exactly on the reference zeroes the position half. The rotation half
+    # does NOT become the identity: with a yaw-only anchor it retains the reference's own
+    # roll and pitch, which is the whole point -- the frame drops the ANCHOR's tilt, never
+    # the reference's. So it equals rot6d(R_yawT R_ref) with R_yaw taken from the reference.
     cmd.robot.data.root_pos_w = _wp(ref_p[:, 0, :].contiguous())
     cmd.robot.data.root_quat_w = _wp(ref_q[:, 0, :].contiguous())
     on_ref = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
     on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:9]
-    identity = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-    torch.testing.assert_close(on_ref, identity.expand_as(on_ref), atol=1e-6, rtol=1e-6)
+    q0 = ref_q[:, 0, :]
+    torch.testing.assert_close(on_ref[:, 0:3], torch.zeros_like(on_ref[:, 0:3]),
+                               atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        rot6d_to_matrix(on_ref[:, 3:9]),
+        matrix_from_quat(quat_mul(quat_conjugate(yaw_quat(q0)), q0)),
+        atol=1e-6, rtol=1e-6)
 
 
 def test_layout_from_dims_matches_the_command_layout(env_cmd):

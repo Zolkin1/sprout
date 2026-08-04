@@ -16,6 +16,7 @@ from isaaclab.utils.math import (
     quat_conjugate,
     quat_inv,
     quat_mul,
+    yaw_quat,
 )
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
 
@@ -104,11 +105,12 @@ def _joint_output_indices(ordered_names: list[str]) -> list[int]:
 
 
 def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
-    """The reference base pose in the robot's current base frame.
+    """The reference base pose in the robot's current YAW (heading) frame.
 
-    Returns ``[N, 9]`` = position ``ref - actual`` (3) rotated into the robot's current base
-    frame, plus ``R_actT R_ref`` in the 6D rotation representation (6).  Fully
-    heading-invariant -- no absolute world heading leaks -- and deployable sim2real.
+    Returns ``[N, 9]`` = position ``ref - actual`` (3) rotated into the robot's heading frame,
+    plus ``R_yawT R_ref`` in the 6D rotation representation (6).  The anchor is yaw-only, so
+    the robot's own roll and pitch never enter; the REFERENCE's tilt is still carried in full.
+    Fully heading-invariant -- no absolute world heading leaks -- and deployable sim2real.
 
     Identical to node 0 of :func:`reference_window`'s ``base_pose`` block, and computed
     through the same :func:`~robot_rl.flow_matching.window.world_to_window` convention --
@@ -127,9 +129,10 @@ def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # xyzw
 
+    root_yaw = yaw_quat(root_quat_w)
     return torch.cat([
-        quat_apply_inverse(root_quat_w, ref_pos_w - root_pos_w),
-        quat_to_rot6d(quat_mul(quat_conjugate(root_quat_w), ref_quat_w)),   # R_actT R_ref
+        quat_apply_inverse(root_yaw, ref_pos_w - root_pos_w),
+        quat_to_rot6d(quat_mul(quat_conjugate(root_yaw), ref_quat_w)),   # R_yawT R_ref
     ], dim=-1)
 
 
@@ -222,7 +225,9 @@ def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_re
     ang_idx = [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
     lin_w = cmd.dy_des[:, lin_idx]
     ang_w = cmd.dy_des[:, ang_idx]
-    inv_root = quat_inv(wp.to_torch(cmd.robot.data.root_quat_w))
+    # Yaw-only, matching the reference window's base_vel block, which this term is the
+    # current-step oracle for: the anchor supplies heading, never the robot's roll/pitch.
+    inv_root = quat_inv(yaw_quat(wp.to_torch(cmd.robot.data.root_quat_w)))
     return torch.cat([quat_apply(inv_root, lin_w), quat_apply(inv_root, ang_w)], dim=-1)
 
 
@@ -626,9 +631,10 @@ def reference_window(
     look-ahead terms into ONE observation.  Per step, in
     :func:`reference_window_layout` order:
 
-    * ``base_pose`` (9) -- the reference base pose in the robot's *current actual*
-      base frame: position ``ref - actual`` (3) plus ``R_actT R_ref`` as a 6D
-      rotation (6).  Matches :func:`base_pose_error`; see
+    * ``base_pose`` (9) -- the reference base pose in the robot's *current* YAW
+      frame: position ``ref - actual`` (3) plus ``R_yawT R_ref`` as a 6D rotation
+      (6).  Yaw-only, so the robot's tilt does not rotate the frame.  Matches
+      :func:`base_pose_error`; see
       :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
     * ``base_vel`` (6) -- reference base linear+angular velocity rotated into the
       current actual base frame, matching :func:`ref_base_velocity_local`.

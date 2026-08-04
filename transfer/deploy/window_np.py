@@ -10,8 +10,10 @@ Per node::
 
     [base_pose(9), base_vel(6), joint_pos(nj), joint_vel(nj), ee_pos(3 * K)]
 
-``base_pose`` is ``[R_actT (p_ref - p_act), rot6d(R_actT R_ref)]`` -- the reference pose in
-the anchor's frame, both halves the same way round.
+``base_pose`` is ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]`` -- the reference pose in
+the anchor's YAW (heading) frame, both halves the same way round. The anchor supplies heading
+only, never roll or pitch, so a leaning robot does not rotate the frame its reference is
+observed in; see the torch original for why.
 
 Two maps live here:
 
@@ -42,6 +44,7 @@ from .quat_math_np import (
     quat_conjugate,
     quat_from_matrix,
     quat_mul,
+    yaw_quat,
 )
 
 
@@ -195,20 +198,21 @@ def world_to_window(
     """
     selected = resolve_reference_blocks(blocks)
     act_p = np.asarray(root_pos_w, dtype=np.float64)
-    act_q = np.asarray(root_quat_w, dtype=np.float64)
+    # Yaw-only anchor, matching the torch original: heading, never roll or pitch.
+    act_q = yaw_quat(np.asarray(root_quat_w, dtype=np.float64))
     ref_p = np.asarray(ref_pos_w, dtype=np.float64)
     ref_q = np.asarray(ref_quat_w, dtype=np.float64)
 
     def base_pose() -> np.ndarray:
-        """The reference base pose in the anchor's frame: ``[pos(3), rot6d(6)]``."""
+        """The reference base pose in the anchor's yaw frame: ``[pos(3), rot6d(6)]``."""
         return np.concatenate([
             quat_apply_inverse(act_q, ref_p - act_p),
             quat_to_rot6d(quat_mul(np.broadcast_to(quat_conjugate(act_q), ref_q.shape),
-                                   ref_q)),                        # R_actT R_ref
+                                   ref_q)),                        # R_yawT R_ref
         ], axis=-1)
 
     def base_vel() -> np.ndarray:
-        """Reference base linear+angular velocity rotated into the anchor frame."""
+        """Reference base linear+angular velocity rotated into the anchor's yaw frame."""
         return np.concatenate([
             quat_apply_inverse(act_q, np.asarray(ref_lin_w, dtype=np.float64)),
             quat_apply_inverse(act_q, np.asarray(ref_ang_w, dtype=np.float64)),
@@ -279,17 +283,19 @@ def reanchor_window(
     sl = window_block_slices(num_joints, num_ee_frames, selected)
     win = np.asarray(window, dtype=np.float64)
     old_p = np.asarray(old_pos_w, dtype=np.float64)
-    old_q = np.asarray(old_quat_w, dtype=np.float64)
+    old_q = yaw_quat(np.asarray(old_quat_w, dtype=np.float64))
     new_p = np.asarray(new_pos_w, dtype=np.float64)
-    new_q = np.asarray(new_quat_w, dtype=np.float64)
+    new_q = yaw_quat(np.asarray(new_quat_w, dtype=np.float64))
 
     out: list[np.ndarray] = []
     for name in selected:
         block = win[..., sl[name]]
         if name == "base_pose":
-            # Position round-trips through the world; the orientation half does not need
-            # to. R_newT R_ref = (R_newT R_old)(R_oldT R_ref), so each stored column is
-            # just rotated by the anchor delta -- exactly linear, no Gram-Schmidt.
+            # Both anchors are yaw-only, so every rotation here is a heading. Position
+            # round-trips through the world; the orientation half does not need to.
+            # R_yaw(new)T R_ref = (R_yaw(new)T R_yaw(old))(R_yaw(old)T R_ref), so each stored
+            # column is just rotated by the anchor delta -- a PURE YAW rotation, exactly
+            # linear, no Gram-Schmidt.
             ref_p = old_p + quat_apply(old_q, block[..., 0:3])
             q_delta = quat_mul(quat_conjugate(new_q), old_q)        # R_newT R_old
             out.append(np.concatenate([

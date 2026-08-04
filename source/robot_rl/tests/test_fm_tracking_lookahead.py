@@ -352,15 +352,35 @@ def test_teacher_window_fits_the_shipped_horizon():
     """
     from robot_rl.flow_matching import FlowMatchingConfig
     from robot_rl.flow_matching.config import MAX_SERVABLE_REPLAN_PERIOD
-    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import REFERENCE_OFFSETS
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
+        REFERENCE_OFFSETS,
+        REPLAN_PERIOD_K,
+    )
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
+        G1TeacherCommandsCfg,
+    )
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
         G1FmTrackerCommandsCfg,
     )
 
+    # ONE constant drives all three cadences. They were allowed to disagree and did:
+    # ego_anchor_every=1 against fm_snap_every=12, so the teacher trained on a reference
+    # refreshed every step while the generator serves a plan up to K-1 steps stale.
     period = G1FmTrackerCommandsCfg().traj_ref.fm_update_every
-    assert period == 1, (
-        "the DEPLOYED period is 1. That is a separate question from what the horizon can "
-        "serve -- see the headroom assertion below."
+    teacher = G1TeacherCommandsCfg().traj_ref
+    assert period == REPLAN_PERIOD_K, "the tracker's re-plan period must be REPLAN_PERIOD_K"
+    assert teacher.fm_snap_every == REPLAN_PERIOD_K, "the recorder cuts windows at K"
+    assert teacher.ego_anchor_every == REPLAN_PERIOD_K, (
+        "the teacher must re-place the clip on the SAME cadence the generator re-plans on, or "
+        "its observation never carries the drift a stale plan has at deploy."
+    )
+    # The history is one plan's tail, so K must be 1 or >= N; FmTrackingCommand enforces it.
+    assert period == 1 or period >= FlowMatchingConfig().num_history_states, (
+        f"K={period} straddles two plans' frames for N="
+        f"{FlowMatchingConfig().num_history_states} history tokens."
+    )
+    assert period <= MAX_SERVABLE_REPLAN_PERIOD, (
+        f"K={period} exceeds the horizon the generator is sized for."
     )
     # The deployed period is 1, but the horizon must cover the largest period we ever want
     # to be able to SELECT, because a checkpoint cannot gain horizon after the fact: at

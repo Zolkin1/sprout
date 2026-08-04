@@ -70,7 +70,7 @@ from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthObservationsCfg,
     apply_depth_play_trims,
 )
-from .g1_teacher_env_cfg import G1TeacherObservationsCfg
+from .g1_teacher_env_cfg import REPLAN_PERIOD_K, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import G1TeacherTerrainEnvCfg
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
@@ -172,9 +172,10 @@ class G1FmTrackerCommandsCfg:
         # this task cannot detect for you -- it loads, it predicts, and it is wrong -- so the
         # only safe default is none. Same reasoning as ``--clip`` having no default.
         fm_checkpoint="",
-        # 0.24 s. MUST equal the recording's fm_snap_every -- checked against the value
-        # carried on the checkpoint, because the FM's horizon is sized from this period.
-        fm_update_every=1,
+        # MUST equal the recording's fm_snap_every -- checked against the value carried on
+        # the checkpoint, because the FM's horizon is sized from this period and its history
+        # is a slice of one plan's tail. One shared constant so the two cannot drift.
+        fm_update_every=REPLAN_PERIOD_K,
         # No clip re-anchoring: nothing here reads the clip reference, so there is no
         # placement to keep on the robot. (The reset spawn pose still uses the library.)
         ego_anchor_fraction=0.0,

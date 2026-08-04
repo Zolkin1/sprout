@@ -9,20 +9,45 @@ A *window node* is one timestep of reference, expressed relative to a measured r
 
 with
 
-* ``base_pose[0:3]`` -- ``R_actT (p_ref - p_act)``, the reference base position relative to
-  the anchor, in the anchor's base frame;
-* ``base_pose[3:9]`` -- ``R_actT R_ref`` in the 6D rotation representation (its first two
-  COLUMNS), i.e. the reference base orientation expressed in the anchor's frame;
-* ``base_vel`` -- the reference base linear+angular velocity rotated into the anchor frame;
+* ``base_pose[0:3]`` -- ``R_yawT (p_ref - p_act)``, the reference base position relative to
+  the anchor, in the anchor's YAW (heading) frame;
+* ``base_pose[3:9]`` -- ``R_yawT R_ref`` in the 6D rotation representation (its first two
+  COLUMNS), i.e. the reference base orientation expressed in the anchor's yaw frame;
+* ``base_vel`` -- the reference base linear+angular velocity rotated into the yaw frame;
 * ``joint_pos`` / ``joint_vel`` -- frame-invariant, in the **robot's** joint order;
 * ``ee_pos`` -- each end-effector position relative to **that node's own reference base**
-  (posture, free of tracking error), 3 per frame.
+  (posture, free of tracking error), 3 per frame. This one uses the reference's FULL
+  rotation, not a yaw frame: it is posture in the reference's own body frame, which is what
+  posture means.
 
-Both halves of ``base_pose`` are now the same thing measured the same way: *the reference
-pose, in the anchor's frame*. They used to disagree -- position was ``ref - actual`` in the
+Both halves of ``base_pose`` are the same thing measured the same way: *the reference pose,
+in the anchor's yaw frame*. They used to disagree -- position was ``ref - actual`` in the
 robot frame while orientation was ``actual - ref`` in the reference frame, two vectors
 pointing opposite ways packed as one error vector -- which is what
 :data:`BASE_POSE_CONVENTION` records and refuses to mix.
+
+.. admonition:: Why the anchor is YAW-ONLY
+
+    ``R_yaw`` is ``yaw_quat(R_act)``: the anchor supplies heading, never roll or pitch. So a
+    leaning robot does not rotate the frame its reference is observed in, and the reference's
+    height above the terrain reads the same however the robot is tilted. Three reasons:
+
+    * **The generator cannot observe its own tilt.** Its conditioning is the history, the
+      depth and the command -- no proprioception, no ``projected_gravity``. Under a
+      full-rotation anchor, part of its regression target would depend on a quantity it has
+      no access to: irreducible noise in the target rather than a hard prediction.
+    * **Terrain is gravity-defined.** Under a tilted frame the same physical clearance maps
+      to a different ``z``, so both the policy and the generator would have to learn to undo
+      the tilt purely to keep the reference off the floor.
+    * **The rest of the pipeline is already yaw-only** -- ``motion_gen.world_lift`` is a
+      yaw-only lift and the inverse of ``base_trajectory_cmd._align_yaw``; the height scanner
+      is ``ray_alignment="yaw"``. This block was the outlier.
+
+    Heading invariance survives -- yaw is still divided out -- so no world coordinate reaches
+    the policy. The reference's OWN roll and pitch are still carried in full by
+    ``base_pose[3:9]``: the yaw frame drops the anchor's tilt, never the reference's. That is
+    the one semantic shift: the block means "the reference's orientation in my heading frame"
+    (so, its absolute tilt against gravity) rather than "relative to my body".
 
 .. admonition:: Why 6D rather than a log map
 
@@ -68,6 +93,7 @@ from isaaclab.utils.math import (
     quat_apply_inverse,
     quat_conjugate,
     quat_mul,
+    yaw_quat,
 )
 
 from .transforms import matrix_to_rot6d, quat_to_rot6d, rot6d_to_matrix, rot6d_to_quat
@@ -80,7 +106,7 @@ from .transforms import matrix_to_rot6d, quat_to_rot6d, rot6d_to_matrix, rot6d_t
 #: string really guards is the SIGN: flipping the orientation half was invisible in the
 #: observation's shape, and a policy trained under either convention loads clean against the
 #: other and walks sideways. Bump it in the same commit as the maths.
-BASE_POSE_CONVENTION = "pose_in_anchor_frame_pos_ref_minus_actual_ori_rot6d"
+BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 
 
 #: Per-block uniform-noise HALF-WIDTHS over one window node, in RAW units.
@@ -405,26 +431,30 @@ def world_to_window(
 
     act_p = _broadcast_anchor(root_pos_w, node_shape)         # (flat, 3)
     act_q = _broadcast_anchor(root_quat_w, node_shape)        # (flat, 4)
+    # The anchor is YAW-ONLY: the base blocks are observed in the anchor's heading frame, not
+    # its full body frame, so the robot's roll and pitch never enter. See the module
+    # docstring for why. Computed once -- both base blocks use it.
+    act_yaw = yaw_quat(act_q)                                 # (flat, 4)
     ref_p = ref_pos_w.reshape(flat, 3)
     ref_q = ref_quat_w.reshape(flat, 4)
 
     def base_pose() -> torch.Tensor:
-        """The reference base pose in the anchor's frame: ``[pos(3), rot6d(6)]``.
+        """The reference base pose in the anchor's YAW frame: ``[pos(3), rot6d(6)]``.
 
         Both halves measure the same thing the same way -- position ``ref - actual`` rotated
-        into the anchor frame, and the reference orientation ``R_actT R_ref`` as its first
-        two columns.
+        into the anchor's heading frame, and the reference orientation ``R_yawT R_ref`` as
+        its first two columns.
         """
         return torch.cat([
-            quat_apply_inverse(act_q, ref_p - act_p),
-            quat_to_rot6d(quat_mul(quat_conjugate(act_q), ref_q)),   # R_actT R_ref
+            quat_apply_inverse(act_yaw, ref_p - act_p),
+            quat_to_rot6d(quat_mul(quat_conjugate(act_yaw), ref_q)),   # R_yawT R_ref
         ], dim=-1)
 
     def base_vel() -> torch.Tensor:
-        """Reference base linear+angular velocity rotated into the anchor frame."""
+        """Reference base linear+angular velocity rotated into the anchor's yaw frame."""
         return torch.cat([
-            quat_apply_inverse(act_q, ref_lin_w.reshape(flat, 3)),
-            quat_apply_inverse(act_q, ref_ang_w.reshape(flat, 3)),
+            quat_apply_inverse(act_yaw, ref_lin_w.reshape(flat, 3)),
+            quat_apply_inverse(act_yaw, ref_ang_w.reshape(flat, 3)),
         ], dim=-1)
 
     def ee_pos() -> torch.Tensor:
@@ -497,23 +527,25 @@ def reanchor_window(
     node_shape = window.shape[:-1]
     flat = math.prod(node_shape)
     old_p = _broadcast_anchor(old_pos_w, node_shape)
-    old_q = _broadcast_anchor(old_quat_w, node_shape)
+    old_q = yaw_quat(_broadcast_anchor(old_quat_w, node_shape))
     new_p = _broadcast_anchor(new_pos_w, node_shape)
-    new_q = _broadcast_anchor(new_quat_w, node_shape)
+    new_q = yaw_quat(_broadcast_anchor(new_quat_w, node_shape))
 
     out: list[torch.Tensor] = []
     for name in selected:
         block = parts[name]
         if name == "base_pose":
+            # Both anchors are yaw-only (see above), so every rotation here is a heading.
+            #
             # Position: up to the world through the old anchor, back down through the new.
             #
             # Orientation: no round trip at all. The block holds the two leading COLUMNS of
-            # R_oldT R_ref, and R_newT R_ref = (R_newT R_old)(R_oldT R_ref), so each column
-            # is simply rotated by the anchor delta. Exactly linear, which is why this
-            # neither needs Gram-Schmidt nor quietly projects a raw generator output onto
-            # SO(3) behind the caller's back.
+            # R_yaw(old)T R_ref, and R_yaw(new)T R_ref = (R_yaw(new)T R_yaw(old)) (R_yaw(old)T
+            # R_ref), so each column is simply rotated by the anchor delta -- which is now a
+            # PURE YAW rotation. Exactly linear, which is why this neither needs Gram-Schmidt
+            # nor quietly projects a raw generator output onto SO(3) behind the caller's back.
             ref_p = old_p + quat_apply(old_q, block[..., 0:3].reshape(flat, 3))
-            q_delta = quat_mul(quat_conjugate(new_q), old_q)          # R_newT R_old
+            q_delta = quat_mul(quat_conjugate(new_q), old_q)          # yaw-only delta
             out.append(torch.cat([
                 quat_apply_inverse(new_q, ref_p - new_p),
                 quat_apply(q_delta, block[..., 3:6].reshape(flat, 3)),
@@ -580,7 +612,9 @@ def window_to_world(
     node_shape = window.shape[:-1]
     flat = math.prod(node_shape)
     act_p = _broadcast_anchor(root_pos_w, node_shape)
-    act_q = _broadcast_anchor(root_quat_w, node_shape)
+    # Yaw-only, matching the forward map: the base blocks were observed in the anchor's
+    # heading frame, so that is the frame they have to be lifted out of.
+    act_q = yaw_quat(_broadcast_anchor(root_quat_w, node_shape))
     shape3 = tuple(node_shape) + (3,)
     out: dict[str, torch.Tensor] = {}
 
@@ -589,10 +623,13 @@ def window_to_world(
         pos_err_b = parts["base_pose"][..., 0:3].reshape(flat, 3)
         ori6d_b = parts["base_pose"][..., 3:9].reshape(flat, 6)
         pos_w = act_p + quat_apply(act_q, pos_err_b)
-        # Forward: the block is R_actT R_ref, so R_ref = R_act (R_actT R_ref). This is the
+        # Forward: the block is R_yawT R_ref, so R_ref = R_yaw (R_yawT R_ref). This is the
         # one place a rotation MATRIX has to come back out of the 6D pair, so it is also the
         # one place Gram-Schmidt runs (inside rot6d_to_quat) -- a raw generator output is
         # only approximately orthonormal, and a quaternion has nowhere to put the residual.
+        #
+        # Note the recovered quaternion carries the reference's FULL orientation, roll and
+        # pitch included: the yaw frame drops the ANCHOR's tilt, never the reference's.
         quat_w = quat_mul(act_q, rot6d_to_quat(ori6d_b))
         out["base_pos_w"] = pos_w.reshape(shape3)
         out["base_quat_w"] = quat_w.reshape(tuple(node_shape) + (4,))

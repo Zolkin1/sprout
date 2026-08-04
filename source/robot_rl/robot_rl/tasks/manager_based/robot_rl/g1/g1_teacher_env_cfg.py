@@ -95,6 +95,20 @@ REFERENCE_OFFSETS: tuple[int, ...] = (
     0, 1, 2, *mdp.strided_offsets(REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE)[1:],
 )
 
+#: Re-plan period K, in control steps: how often the flow-matching generator produces a new
+#: plan at deploy, and therefore ALSO how often the clip's placement is re-solved here and how
+#: often the recorder cuts a window.  0.24 s at the 0.02 s control dt.
+#:
+#: ONE constant for all three, because they were allowed to disagree and did:
+#: ``ego_anchor_every`` was 1 while ``fm_snap_every`` was 12, so the teacher trained against a
+#: reference re-placed EVERY step while the generator it would be paired with serves a plan
+#: 12 steps old.  The free root DOFs never drifted in training and always drift at deploy.
+#:
+#: Must be <= ``MAX_SERVABLE_REPLAN_PERIOD``, which is what the generator's horizon is sized
+#: for (``FlowMatchingConfig.future_len``), and >= the generator's history length N, so all N
+#: history rows come from a single plan (``FmTrackingCommand`` enforces both).
+REPLAN_PERIOD_K: int = 12
+
 #: End-effector frames the reference window carries (clip output frames minus the base:
 #: both ankles + both wrists).  Only needed to size the per-channel noise vector below;
 #: the observation itself takes the list from the command's ``resolve_ee_frames``.  A
@@ -208,11 +222,16 @@ class G1TeacherCommandsCfg:
         # Drift is not un-graded, it is graded ONCE, by the termination, against the
         # globally-fixed clip -- see termination_reference_world_state.
         ego_anchor_fraction=1.0,
-        ego_anchor_every=1,
-        # The FM snap flag keeps its own, much slower cadence; sharing this one would
-        # flood the recorder and collapse the FM's training target. Must match the
-        # tracker's fm_update_every.
-        fm_snap_every=12,
+        # Re-place on the SAME cadence the generator re-plans on. These were 1 and 12: the
+        # teacher tracked a reference refreshed every step, while at deploy the generator
+        # serves a plan up to K-1 steps stale, so the free DOFs drift across the period. The
+        # observation (and the recorded FM target) now carry that drift, which is also what
+        # the generator must learn to read off the depth. The mask still pins the
+        # terrain-critical axes at any cadence, so terrain consistency is unaffected, and the
+        # REWARD is unaffected too -- the base is graded against the globally-placed clip
+        # (_write_global_base_des).
+        ego_anchor_every=REPLAN_PERIOD_K,
+        fm_snap_every=REPLAN_PERIOD_K,
     )
 
 
