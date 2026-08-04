@@ -229,8 +229,20 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     except KeyError:
         pass
 
-    # Add robot joint information
-    params["default_joint_angles"] = wp.to_torch(robot.data.default_joint_pos)[0].detach().cpu().numpy()
+    # Add robot joint information.
+    #
+    # NOMINAL, not env 0's: add_joint_default_pos randomizes default_joint_pos in place at
+    # startup to model calibration error, so the live buffer holds whatever env 0 happened to
+    # draw. Shipping that put a per-joint offset of up to the DR half-width straight into the
+    # deployed PD target -- verified in depth_v5_refslim's exported policy_parameters.yaml,
+    # where 0 of 29 angles were exactly 0.0 despite 9 joints being authored at 0.0.
+    # The event stashes the pre-randomization values for exactly this; same config-over-runtime
+    # rule the kp/kd block below follows.
+    nominal_default_pos = getattr(robot.data, "default_joint_pos_nominal", None)
+    if nominal_default_pos is None:
+        # No DR event ran (e.g. events disabled), so the live buffer IS nominal.
+        nominal_default_pos = wp.to_torch(robot.data.default_joint_pos)[0]
+    params["default_joint_angles"] = nominal_default_pos.detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
     # CLF output joint order (the joint:* channels of the trajectory command's

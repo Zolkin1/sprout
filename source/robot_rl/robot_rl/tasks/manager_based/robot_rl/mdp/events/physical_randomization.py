@@ -205,8 +205,15 @@ def randomize_joint_default_pos(
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
 
-    # save nominal value for export
-    asset.data.default_joint_pos_nominal = wp.to_torch(asset.data.default_joint_pos)[0].clone()
+    # Save the NOMINAL (authored) defaults for export, ONCE. export_parameters.py reads this
+    # instead of the live buffer, which by then holds env 0's perturbation -- shipping that as
+    # `default_joint_angles` puts a silent per-joint offset into the deployed PD target.
+    #
+    # Guarded so a second invocation cannot overwrite the nominal with an ALREADY randomized
+    # value. mode="startup" runs once, but PerturbationScheduler._apply_ood_dr re-applies DR
+    # terms by name, so adding this one to that list would otherwise corrupt the export.
+    if getattr(asset.data, "default_joint_pos_nominal", None) is None:
+        asset.data.default_joint_pos_nominal = wp.to_torch(asset.data.default_joint_pos)[0].clone()
 
     # resolve environment ids
     if env_ids is None:
