@@ -205,20 +205,37 @@ def main(env_cfg, agent_cfg) -> int:
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _md.version("rsl-rl-lib"))
     env = RslRlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(args_cli.checkpoint)
+    # Mirror play.py: a runner cfg can opt out of restoring the value function
+    # (``load_critic = False``), and the FM TRACKER does -- it has no privileged observation
+    # group, so the critic it builds does not match the one the teacher trained. Loading
+    # strictly here failed with a bare size mismatch on mlp.0 (1834 vs 2490) that reads like
+    # a policy/env mismatch and is not one: the ACTOR matches exactly. Actor weights stay
+    # strict, so a real mismatch still fails loudly.
+    if getattr(agent_cfg, "load_critic", True):
+        runner.load(args_cli.checkpoint)
+    else:
+        print("[INFO] Skipping the critic (play-only runner): loading actor weights only.")
+        runner.load(args_cli.checkpoint, load_cfg={"actor": True, "critic": False,
+                                                   "optimizer": False, "iteration": True,
+                                                   "rnd": True})
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     u = env.unwrapped
     robot = u.scene["robot"]
     cmd = u.command_manager.get_term("traj_ref")
     has_scan = "height_scanner" in u.scene.sensors
+    # Depth is this policy's exteroception, and it was the one signal no trace recorded on
+    # either side -- so a sim2sim divergence could never be attributed to what the two
+    # policies SAW. Captured normalised (mdp.depth_obs_stack), i.e. exactly the observation,
+    # so it lines up with the MuJoCo runner's <log>.depth.npy without a unit conversion.
+    has_depth = any(n.startswith("depth_camera") for n in u.scene.sensors)
     scan_sl = _obs_term_slice(u, "policy", "height_scan") if has_scan else None
     cmd_sl = _obs_term_slice(u, "policy", "command_vel")
     body_idx = [robot.body_names.index(f) for f in _FRAMES if f in robot.body_names]
     frames = [f for f in _FRAMES if f in robot.body_names]
     ncap = min(args_cli.episodes, u.num_envs)
     print(f"[INFO] capturing {ncap} envs x {args_cli.steps} steps; frames={frames}; "
-          f"scan={'yes' if has_scan else 'no'}")
+          f"scan={'yes' if has_scan else 'no'} depth={'yes' if has_depth else 'no'}")
 
     # Reference: the world state the CLF tracks, in the clip's output layout.
     pos_names = list(cmd.ordered_pos_output_names)
@@ -228,6 +245,7 @@ def main(env_cfg, agent_cfg) -> int:
 
     buf: dict[str, list] = {k: [] for k in
                             ("cmd_vel", "ach_vel", "scan_obs", "scan_raw", "scan_hits",
+                             "depth", "ctrl", "torque",
                              "root_pos", "root_quat", "joint_pos", "body_pos", "ref_pos",
                              "done", "fm_pred", "fm_pred_frames", "fm_pred_idx")}
     obs = env.get_observations()
@@ -244,6 +262,8 @@ def main(env_cfg, agent_cfg) -> int:
         else:
             raw = np.zeros((ncap, 1), "float32")
         buf["scan_raw"].append(raw)
+        if has_depth:
+            buf["depth"].append(_np(mdp.depth_obs_stack(u))[:ncap].astype("float32"))
         if has_scan:
             # World-frame ray HIT POINTS, so the viewer can draw the scan as 3D dots without
             # re-deriving the pattern geometry. Missed rays come back non-finite; the viewer
@@ -261,6 +281,21 @@ def main(env_cfg, agent_cfg) -> int:
         buf["ach_vel"].append(np.concatenate(
             [_yaw_rotate_inv(lin, rq), _yaw_rotate_inv(ang, rq)[:, 2:3]], axis=-1))  # vx, vy, vz, wz
         buf["joint_pos"].append(_np(robot.data.joint_pos)[:ncap])
+        # The COMMANDED joint target and the torque the actuators actually applied -- the
+        # two signals that make a cross-simulator comparison possible at all. Without them a
+        # divergence can only be seen in the OUTCOME, never attributed to the policy asking
+        # for something different or to the actuator delivering something different.
+        # ``processed_actions`` is the action after scale + default-pose offset, i.e. the
+        # same quantity MuJoCo logs as ``ctrl_<joint>``.
+        try:
+            term = u.action_manager.get_term(u.action_manager.active_terms[0])
+            buf["ctrl"].append(_np(term.processed_actions)[:ncap].astype("float32"))
+        except Exception:                                                 # noqa: BLE001
+            pass
+        try:
+            buf["torque"].append(_np(robot.data.applied_torque)[:ncap].astype("float32"))
+        except Exception:                                                 # noqa: BLE001
+            pass
         buf["body_pos"].append(_np(robot.data.body_pos_w)[:ncap][:, body_idx])
         y = _np(cmd.y_des)[:ncap]
         buf["ref_pos"].append(np.stack([y[:, ref_idx[f]] for f in frames if f in ref_idx], axis=1))
