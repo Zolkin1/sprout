@@ -145,14 +145,39 @@ def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
     return summary
 
 
+#: Isaac Lab's ``base_fallen`` thresholds (the tracker task's termination params). Kept here
+#: so a MuJoCo run is scored by the SAME predicate the RL side terminates on.
+FALL_MIN_HEIGHT = 0.5
+FALL_TILT_DEG = 70.0
+
+
 def _plot_survival(cols, out_dir, meta) -> dict:
-    """Base height + fall flag over time; returns survival summary."""
+    """Base height + fall over time; returns survival summary.
+
+    Survival is recomputed from the trajectory, NOT read from the logged ``fell`` column.
+    That column is ``Robot.failed()`` (``qpos[2] < 0.2``) sampled at log time, and it has two
+    problems: the run stops the moment it trips, so the failure usually never reaches the
+    log at all -- measured 1/100 flagged where the runner itself reported 30/100 fallen --
+    and even when it does fire it is height-only at 0.2 m, less than half Isaac Lab's 0.5 m,
+    with no orientation check. A robot face-down at 0.21 m and 96 degrees of pitch scored as
+    SURVIVED. Anything comparing MuJoCo against Isaac Lab on "success" inherits that.
+
+    The rule here is Isaac's: below :data:`FALL_MIN_HEIGHT`, or tilted past
+    :data:`FALL_TILT_DEG` in roll or pitch, at any logged step. Agrees with the runner's own
+    live verdict on 98/100 clips, and unlike it, means the same thing the RL side means.
+    """
     t = cols["time"]
-    fell = cols["fell"] > 0.5
-    fell_idx = np.argmax(fell) if fell.any() else -1
+    tilt = np.radians(FALL_TILT_DEG)
+    fell = cols["base_z"] < FALL_MIN_HEIGHT
+    for axis in ("act_roll", "act_pitch"):
+        if axis in cols:
+            fell = fell | (np.abs(cols[axis]) > tilt)
+    fell_idx = int(np.argmax(fell)) if fell.any() else -1
     time_to_fall = float(t[fell_idx]) if fell_idx >= 0 else None
     fig, ax = plt.subplots(figsize=(9, 3.5))
     ax.plot(t, cols["base_z"], lw=1.5, label="base height")
+    ax.axhline(FALL_MIN_HEIGHT, color="0.6", ls=":", lw=1.0,
+               label=f"fall height {FALL_MIN_HEIGHT} m")
     if time_to_fall is not None:
         ax.axvline(time_to_fall, color="r", ls="--", label=f"fall @ {time_to_fall:.2f}s")
     _mark_handoff(ax, meta)

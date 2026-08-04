@@ -173,6 +173,17 @@ def test_per_env_mean_matches_the_scalar_it_came_from(tmp_path):
 # ---------------------------------------------------------------------------
 # 3. The metric join in the driver.
 # ---------------------------------------------------------------------------
+def _write_sim_log(run: pathlib.Path, upright: bool, n: int = 40) -> None:
+    """A minimal ``sim_log.csv`` carrying just the columns success is judged on."""
+    z = 0.78 if upright else 0.21
+    pitch = 0.0 if upright else 1.8                      # 103 deg, well past the limit
+    with open(run / "sim_log.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "base_z", "act_roll", "act_pitch"])
+        for i in range(n):
+            w.writerow([i * 0.02, z, 0.0, pitch])
+
+
 def _driver():
     """The A/B driver module."""
     return _load("clip_ab_sweep", REPO / "scripts" / "rsl_rl" / "clip_ab_sweep.py")
@@ -205,6 +216,8 @@ def test_mujoco_side_reduces_orientation_and_joints_the_same_way(tmp_path):
             "reference_tracking": {"roll": roll, "pitch": 0.4, "yaw": 0.0},
             "joint_tracking": {"rms": {"a": 0.3, "b": 0.4}},
         }))
+        # clip 5 stays up, clip 6 goes down: success comes from the TRAJECTORY now.
+        _write_sim_log(run, upright=(cid == 5))
     cols = d.collect_mujoco(tmp_path, [5, 6])
     assert cols["clip_id"].tolist() == [5.0, 6.0]
     assert cols["success"].tolist() == [1.0, 0.0]
@@ -221,6 +234,7 @@ def test_missing_mujoco_runs_are_dropped_not_zero_filled(tmp_path):
     run = tmp_path / "mj" / "clip_00009"
     run.mkdir(parents=True)
     (run / "metrics_summary.json").write_text(json.dumps({"survival": {"survived": True}}))
+    _write_sim_log(run, upright=True)
     cols = d.collect_mujoco(tmp_path, [9, 99])          # clip 99 never ran
     assert cols["clip_id"].tolist() == [9.0]
     assert cols["success"].tolist() == [1.0]
@@ -254,3 +268,48 @@ def test_clip_choice_is_deterministic_and_length_filtered(tmp_path):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_mujoco_success_uses_isaac_fall_criterion_not_the_runners(tmp_path):
+    """The two sims must be scored by the SAME predicate.
+
+    MuJoCo's own ``Robot.failed()`` is ``qpos[2] < 0.2`` -- height only, at less than half
+    Isaac's 0.5 m, with no tilt check -- and the run stops the moment it trips, so the
+    failure usually never reaches the log. Measured on a real 100-clip sweep:
+    ``metrics_summary.json`` flagged 1 fall where the runner itself reported 30. Scoring each
+    sim by its own rule had MuJoCo beating Isaac 99 to 91; rescoring put MuJoCo at 68.
+    """
+    d = _driver()
+    # Upright by MuJoCo's rule (0.45 > 0.2) but DOWN by Isaac's (0.45 < 0.5).
+    run = tmp_path / "mj" / "clip_00001"
+    run.mkdir(parents=True)
+    (run / "metrics_summary.json").write_text(json.dumps({"survival": {"survived": True}}))
+    with open(run / "sim_log.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "base_z", "act_roll", "act_pitch"])
+        w.writerow([0.0, 0.78, 0.0, 0.0])
+        w.writerow([0.02, 0.45, 0.0, 0.0])
+    assert d.collect_mujoco(tmp_path, [1])["success"].tolist() == [0.0]
+
+    # Upright and level throughout -> survived, even though tilt is near the limit.
+    run2 = tmp_path / "mj" / "clip_00002"
+    run2.mkdir(parents=True)
+    (run2 / "metrics_summary.json").write_text(json.dumps({"survival": {"survived": False}}))
+    with open(run2 / "sim_log.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "base_z", "act_roll", "act_pitch"])
+        w.writerow([0.0, 0.78, 1.2, 0.0])                # 69 deg, just inside
+    assert d.collect_mujoco(tmp_path, [2])["success"].tolist() == [1.0]
+
+
+def test_tilt_alone_counts_as_a_fall(tmp_path):
+    """Height-only scoring called a robot face-down at 0.21 m and 96 deg a SURVIVOR."""
+    d = _driver()
+    run = tmp_path / "mj" / "clip_00003"
+    run.mkdir(parents=True)
+    (run / "metrics_summary.json").write_text(json.dumps({"survival": {"survived": True}}))
+    with open(run / "sim_log.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["time", "base_z", "act_roll", "act_pitch"])
+        w.writerow([0.0, 0.80, 0.0, 1.7])                # tall enough, but 97 deg over
+    assert d.collect_mujoco(tmp_path, [3])["success"].tolist() == [0.0]
