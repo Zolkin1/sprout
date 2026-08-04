@@ -26,6 +26,7 @@ from robot_rl.flow_matching import (
     FlowMatchingTransformer,
     FutureStateDataset,
     Normalizer,
+    body_pose_terms,
     build_train_val,
     fk_consistency_terms,
     flow_matching_loss,
@@ -567,6 +568,53 @@ def test_flow_loss_fk_terms_and_tau_gate():
     assert out_g["fk_pose"].item() == 0.0
 
 
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_flow_loss_body_pose_terms_are_wired_and_gated():
+    """The body-pose terms reach the objective, are τ-gated, and are OFF by default."""
+    torch.manual_seed(31)
+    body = FKChain(_FK_MJCF, _FK_JOINTS, _BODY_FRAMES, base_link="pelvis_link")
+    nj, k = len(_FK_JOINTS), 2
+    d, f, n = window_dim(nj, k), 8, 2
+    model = _model(d, f, n, cmd_dim=0)
+    x1, hist, height = torch.randn(16, f, d), torch.randn(16, n, d), torch.randn(16, _HK)
+    norm = _norm(x1)
+    base = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k)
+
+    def loss(**kw):
+        """One loss evaluation on a FIXED flow-batch draw.
+
+        ``sample_flow_batch`` draws ``x0`` and ``tau`` internally, so two calls are not
+        otherwise comparable -- and comparing them is the point of this test.
+        """
+        torch.manual_seed(1234)
+        return flow_matching_loss(model, x1, hist, height, None, **base, **kw)
+
+    # Off by default: no body_fk, no keys, and the loss is the flow MSE alone.
+    off = loss(tau_min=0.0)
+    assert "body_pose_root" not in off and "body_pose_world" not in off
+
+    on = loss(tau_min=0.0, body_fk=body,
+              body_pose_root_weight=0.1, body_pose_world_weight=0.1)
+    for key in ("body_pose_root", "body_pose_world"):
+        assert key in on and torch.isfinite(on[key])
+    assert torch.isfinite(on["loss"]) and on["loss"].requires_grad
+    assert on["loss"].item() > off["loss"].item()
+
+    # τ-gated with the FK term: nothing survives an unreachable gate.
+    gated = loss(tau_min=2.0, body_fk=body,
+                 body_pose_root_weight=0.1, body_pose_world_weight=0.1)
+    assert gated["body_pose_root"].item() == 0.0
+    assert gated["body_pose_world"].item() == 0.0
+
+    # A weight of zero still REPORTS its term (free to log, since FK ran anyway) but must
+    # not change the objective -- that is what makes the ablation a single flag.
+    root_only = loss(tau_min=0.0, body_fk=body,
+                     body_pose_root_weight=0.1, body_pose_world_weight=0.0)
+    assert "body_pose_world" in root_only
+    torch.testing.assert_close(root_only["body_pose_root"], on["body_pose_root"])
+    assert root_only["loss"].item() < on["loss"].item()
+
+
 # ---------------------------------------------------------------------------
 # 10. snap_windows + dataset + online round-trip (the new pipeline)
 # ---------------------------------------------------------------------------
@@ -998,3 +1046,136 @@ def test_skip_families_refuses_to_drop_everything():
     cfg = FlowMatchingConfig(skip_families=["family_jump_off"])
     with pytest.raises(ValueError, match="drop ALL"):
         keep_mask(data, meta, cfg, 3)
+
+
+# ---------------------------------------------------------------------------
+# Body-link pose terms: the CLF's metric, as a loss
+# ---------------------------------------------------------------------------
+_BODY_FRAMES = ["left_knee_link", "right_knee_link", "left_ankle_roll_link", "torso_link"]
+
+
+def _body_case(seed: int, nf: int = 4, b: int = 3, jitter: float = 0.0):
+    """A random window pair (pred, target) over the FK joint set, plus the FK chain.
+
+    ``jitter=0`` makes the prediction identical to the target, which is the case every
+    assertion about a pose error vanishing rests on.
+    """
+    nj, k = len(_FK_JOINTS), 2
+    chain = FKChain(_FK_MJCF, _FK_JOINTS, _BODY_FRAMES, base_link="pelvis_link",
+                    dtype=torch.float64)
+    g = torch.Generator().manual_seed(seed)
+    d = window_dim(nj, k)
+    tgt = torch.randn(b, nf, d, generator=g, dtype=torch.float64) * 0.2
+    slc = window_block_slices(nj, k)
+    bp = slc["base_pose"].start
+    # base_pose's orientation half must be a real rotation for the composition to mean
+    # anything, so build it from random quaternions rather than from the noise above.
+    q = torch.randn(b * nf, 4, generator=g, dtype=torch.float64)
+    q = q / q.norm(dim=-1, keepdim=True)
+    tgt[..., bp + 3:bp + 9] = quat_to_rot6d(q).reshape(b, nf, 6)
+    pred = tgt.clone()
+    if jitter:
+        pred[..., slc["joint_pos"]] += jitter * torch.randn(
+            b, nf, nj, generator=g, dtype=torch.float64)
+    return pred, tgt, chain, nj, k
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_terms_vanish_on_an_exact_prediction():
+    """Both terms are zero when the prediction IS the target -- and finite-gradient there.
+
+    The second half matters as much as the first: a pose loss spends its life near
+    coincidence, so an ``arccos``-style orientation metric would have an infinite gradient
+    exactly where the term is working. ``so3_log`` is built to avoid that.
+    """
+    pred, tgt, chain, nj, k = _body_case(0)
+    pred = pred.requires_grad_(True)
+    out = body_pose_terms(pred, tgt, nj, k, chain)
+    assert set(out) == {f"body_pose_{s}{h}" for s in ("root", "world")
+                        for h in ("", "_pos", "_ori")}
+    for name, v in out.items():
+        assert v.shape == (pred.shape[0],)
+        assert float(v.max()) < 1e-20, name
+    out["body_pose_world"].sum().backward()
+    assert torch.isfinite(pred.grad).all()
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_terms_grow_with_a_joint_error():
+    """A joint perturbation moves both terms off zero -- the joints do drive the loss."""
+    _, tgt, chain, nj, k = _body_case(1)
+    pred, _, _, _, _ = _body_case(1, jitter=0.05)
+    out = body_pose_terms(pred, tgt, nj, k, chain)
+    assert float(out["body_pose_root"].min()) > 0.0
+    assert float(out["body_pose_world"].min()) > 0.0
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_world_equals_the_world_frame_error():
+    """The composed term IS the world-frame error, which is the whole point of the design.
+
+    It is computed in the ANCHOR frame so that no world coordinate enters the
+    representation. That is only acceptable because the two are the same number:
+    prediction and target share one anchor, and a rigid transform preserves distances and
+    angles. Verified here against an explicit world-frame computation through a random
+    anchor -- if this ever fails, the term has stopped meaning what its name says.
+    """
+    pred, tgt, chain, nj, k = _body_case(2, jitter=0.05)
+    got = body_pose_terms(pred, tgt, nj, k, chain, ori_scale=0.0)["body_pose_world"]
+
+    # Lift both windows to a random WORLD anchor and difference there instead.
+    g = torch.Generator().manual_seed(7)
+    b, nf = pred.shape[:2]
+    ap = torch.randn(b, 3, generator=g, dtype=torch.float64)
+    aq = torch.randn(b, 4, generator=g, dtype=torch.float64)
+    aq = aq / aq.norm(dim=-1, keepdim=True)
+
+    def world_body_pos(x):
+        """Body positions in the WORLD, through the anchor and the window's base_pose."""
+        w = window_to_world(x, ap[:, None, :], aq[:, None, :], nj, k)
+        q = x[..., window_block_slices(nj, k)["joint_pos"]].reshape(b * nf, nj)
+        p_root, _r, _jv, _jw = chain.pose_and_jacobian(q)
+        p_root = p_root.reshape(b, nf, -1, 3)
+        base_r = matrix_from_quat(w["base_quat_w"].reshape(-1, 4)).reshape(b, nf, 3, 3)
+        return w["base_pos_w"][..., None, :] + torch.einsum("bfij,bfkj->bfki", base_r, p_root)
+
+    want = ((world_body_pos(pred) - world_body_pos(tgt)) ** 2).sum(dim=-1).mean(dim=(1, 2))
+    torch.testing.assert_close(got, want, atol=1e-12, rtol=1e-10)
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_root_ignores_the_base_while_world_does_not():
+    """The reason both terms exist: only the root term is ungameable by moving the base.
+
+    ``body_pose_world`` folds the base error in -- that is what makes it the CLF's metric
+    and what lets a base error partially cancel a joint one. ``body_pose_root`` is blind to
+    the base, so it pins posture on its own. ``fk_consistency_terms`` was rewritten to stop
+    composing through the root for exactly this reason.
+    """
+    pred, tgt, chain, nj, k = _body_case(3)
+    bp = window_block_slices(nj, k)["base_pose"].start
+    moved = pred.clone()
+    moved[..., bp:bp + 3] += 0.25                      # shift the predicted base only
+
+    base = body_pose_terms(pred, tgt, nj, k, chain)
+    shifted = body_pose_terms(moved, tgt, nj, k, chain)
+    torch.testing.assert_close(shifted["body_pose_root"], base["body_pose_root"])
+    assert float(shifted["body_pose_world"].min()) > float(base["body_pose_world"].max())
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_world_absent_without_base_pose():
+    """No base_pose block, nothing to compose with -- reported as absent, not as zero."""
+    pred, tgt, chain, nj, k = _body_case(4)
+    slim = ("joint_pos",)
+    d = window_dim(nj, k, slim)
+    out = body_pose_terms(pred[..., :d], tgt[..., :d], nj, k, chain, blocks=slim)
+    assert set(out) == {"body_pose_root", "body_pose_root_pos", "body_pose_root_ori"}
+
+
+@pytest.mark.skipif(not _have_fk_model(), reason="G1 MJCF not found")
+def test_body_pose_terms_need_joint_pos():
+    """Without joints there is no posture to grade, and the weight should have been zeroed."""
+    pred, tgt, chain, nj, k = _body_case(5)
+    with pytest.raises(ValueError, match="body_pose_terms"):
+        body_pose_terms(pred[..., :9], tgt[..., :9], nj, k, chain, blocks=("base_pose",))

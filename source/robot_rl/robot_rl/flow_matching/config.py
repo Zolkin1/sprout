@@ -258,6 +258,66 @@ class FlowMatchingConfig:
     # the extra frames are position-only in the state vector (see ``window.py``). The
     # ee-orientation FK residual and the ``J(q)·q̇`` term (the old ``fk_vel_weight``) went
     # with those channels.
+    #
+    # ``body_pose_*_weight`` are the BODY-LINK POSE terms: forward kinematics of the
+    # predicted joints against forward kinematics of the TARGET joints, over the tracked
+    # body frames. Accuracy, not self-consistency -- so unlike ``fk_pose_weight`` they need
+    # no ``ee_pos`` block, and they add no information: they are a change of METRIC, into
+    # the one the CLF actually grades. The teacher runs ``tracking_mode="body"``, where eta
+    # is the 13 ``<body>@root:*`` frames plus the pelvis and the world ee frames, with
+    # ``joint:*`` DROPPED -- while the flow MSE weights every joint equally in normalized
+    # angle space. See ``flow.body_pose_terms``.
+    #
+    #   * ``body_pose_root_weight`` -- poses in the reference's own pelvis frame. Pure
+    #     posture; independent of ``base_pose``, so it cannot be satisfied by moving the
+    #     base. Keep it on whenever the world term is, as its anti-cancellation partner.
+    #   * ``body_pose_world_weight`` -- the same poses composed with the predicted
+    #     ``base_pose``. Numerically the WORLD-frame error (prediction and target share one
+    #     anchor, and a rigid transform preserves distances), so it is what cares about
+    #     landing a foot on a given stair tread, and it re-weights base position up by the
+    #     body multiplicity in physical metres -- outside the pooled normalizer that
+    #     currently squashes ``base_pos``.
+    #   * ``body_pose_ori_scale`` -- metres per radian, converting the orientation half of
+    #     both terms so the two halves of one geometric quantity share a weight. Read it as
+    #     a LEVER ARM: the distance over which a link's angular error becomes a positional
+    #     one, so a typical link half-length (~0.25 m) makes the term roughly isotropic.
+    #
+    #     Not a free parameter -- measured. On the depth_v5 recording at init, the halves
+    #     are pos 0.0004 / ori 0.0080 (root) and pos 0.0135 / ori 0.1114 (world), i.e. ~2 cm
+    #     of position against ~0.09 rad of rotation. At 1.0 m/rad orientation would be ~90%
+    #     of both terms, which is not what a loss aimed at foot-placement precision should
+    #     be spending itself on. 0.25 puts the two halves within ~2x. The ``*_pos`` /
+    #     ``*_ori`` halves are logged separately so this stays tunable on evidence.
+    #
+    # Both default OFF: this is an ablation switch, one flag each. Nothing else about the
+    # generator changes -- same conditioning tokens, same output width, same normalizer, same
+    # exported metadata -- so this is FM-only: no teacher retrain, no re-record, and a stale
+    # artifact cannot arise from it.
+    #
+    # PICKING THE WEIGHTS. These are NOT dimensionless: the flow MSE is in NORMALIZED units
+    # while these terms are in physical m^2, so the weight carries the unit conversion. This
+    # is the OPPOSITE direction from vel_consistency_weight=0.01, whose term logs at ~144 --
+    # do not copy that magnitude across.
+    #
+    # Measured, XL (27.3M) over 100 epochs on the 200k depth_v5 recording, ori_scale=0.25,
+    # weights root=400 / world=20:
+    #
+    #     epoch   flow_mse   body_pose_root   body_pose_world   combined share
+    #         0     0.2742           0.0001            0.0009            ~21%
+    #        40     0.1011           0.0000            0.0002             ~5%
+    #        99     0.0829           0.0000            0.0001            ~2.4%
+    #
+    # THE SHARE DECAYS, and that is inherent to physical units: these are squared errors that
+    # shrink as the model improves, so a weight buys a share at a point in TIME, not a budget.
+    # By epoch 99 the root term contributes ~0% and the world term ~2.4%. Read that as the
+    # terms being largely SATISFIED rather than ignored -- root position is under ~2 mm RMS by
+    # then -- but do not expect either to still be shaping the solution at convergence.
+    #
+    # So this is closer to an early-training regularizer than a persistent objective. To make
+    # it bite late, the weights have to be far larger than the ones above, or the terms have
+    # to be normalized by a fixed reference scale -- which would cost the interpretability
+    # that let ori_scale be set by measurement rather than guessed.
+    #
     # Every term needs the blocks it ties together to BE in ``reference_blocks``:
     # velocity needs base_pose+base_vel, acceleration base_vel, joint-velocity
     # joint_pos+joint_vel, FK joint_pos+ee_pos, body-pose joint_pos (+base_pose for the
@@ -269,8 +329,16 @@ class FlowMatchingConfig:
     accel_consistency_weight: float = 0.0
     joint_vel_consistency_weight: float = 0.01 #0.0
     fk_pose_weight: float = 0.01 #0.0
+    body_pose_root_weight: float = 0.0
+    body_pose_world_weight: float = 0.0
+    body_pose_ori_scale: float = 0.25
     consistency_tau_min: float = 0.75
     fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
+    # Body frames the pose terms grade, as MJCF body names on ``fk_model_path``. ``None``
+    # resolves to ``motion_gen.joint_names.G1_BODY_TRACK_FRAMES`` -- the same 13 the clip
+    # library carries ``@root`` channels for and the body-mode CLF grades, so the loss and
+    # the reward see one frame set. Only read when a body-pose weight is nonzero.
+    body_fk_frames: list[str] | None = None
 
     # NOTE: the terrain-penetration losses (both the teacher-forced ``x1_hat`` term and the
     # sampled-rollout term) were DELETED. Both assumed a single flat ``ground_z`` floor,

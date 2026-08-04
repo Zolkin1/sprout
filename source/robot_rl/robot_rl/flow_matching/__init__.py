@@ -18,6 +18,7 @@ from .dataset import (
 )
 from motion_gen.fk import FKChain
 from .flow import (
+    body_pose_terms,
     fk_consistency_terms,
     flow_matching_loss,
     frame_consistency_terms,
@@ -78,6 +79,7 @@ __all__ = [
     "flow_matching_loss",
     "frame_consistency_terms",
     "joint_vel_consistency_term",
+    "body_pose_terms",
     "fk_consistency_terms",
     "sample_flow_batch",
     "sample_trajectory",

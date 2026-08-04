@@ -57,6 +57,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     snap_windows,
 )
 from robot_rl.flow_matching.ema import WeightEMA  # noqa: E402
+from motion_gen.joint_names import G1_BODY_TRACK_FRAMES  # noqa: E402
 
 
 def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
@@ -129,6 +130,23 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "conditioning command tokens: a recorded array name (e.g. 'target_vel'). 'auto' -> "
              "'target_vel' if present in the recording, else no command. 'none' -> no command.",
     )
+    parser.add_argument("--body_pose_root_weight", type=float,
+                        default=FlowMatchingConfig().body_pose_root_weight,
+                        help="Weight on the body-link pose error in the reference's own "
+                             "pelvis frame (pure posture, cannot be satisfied by moving "
+                             "the base). 0 = off. See flow.body_pose_terms.")
+    parser.add_argument("--body_pose_world_weight", type=float,
+                        default=FlowMatchingConfig().body_pose_world_weight,
+                        help="Weight on the body-link pose error composed with the "
+                             "predicted base_pose -- numerically the WORLD-frame error, "
+                             "which is what the body-mode CLF grades and what stair "
+                             "precision needs. 0 = off. Pair it with "
+                             "--body_pose_root_weight, which stops a base error "
+                             "cancelling a joint error.")
+    parser.add_argument("--body_pose_ori_scale", type=float,
+                        default=FlowMatchingConfig().body_pose_ori_scale,
+                        help="Metres per radian for the orientation half of both "
+                             "body-pose terms.")
     parser.add_argument("--cmd_stride", type=int, default=5,
                         help="Keep every cmd_stride-th step of the command profile as a token.")
     parser.add_argument(
@@ -230,6 +248,9 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         accel_consistency_weight=args.accel_consistency_weight,
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
         fk_pose_weight=args.fk_pose_weight,
+        body_pose_root_weight=args.body_pose_root_weight,
+        body_pose_world_weight=args.body_pose_world_weight,
+        body_pose_ori_scale=args.body_pose_ori_scale,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         skip_distractors=args.skip_distractors,
         skip_families=([f.strip() for f in args.skip_families.split(",") if f.strip()]
@@ -295,7 +316,9 @@ def channel_metrics(
     return out
 
 
-_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose")
+_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose",
+              "body_pose_root", "body_pose_root_pos", "body_pose_root_ori",
+              "body_pose_world", "body_pose_world_pos", "body_pose_world_ori")
 
 
 @torch.no_grad()
@@ -325,20 +348,23 @@ def _fk_sanity_check(fk, train_ds, num_joints, device, n_windows: int = 64) -> N
               "(joint order/names, base link, or model mismatch); the FK loss will have this floor.")
 
 
-def consistency_kwargs(cfg, num_joints, num_extra_frames, fk) -> dict:
+def consistency_kwargs(cfg, num_joints, num_extra_frames, fk, body_fk=None) -> dict:
     """Shared flow_matching_loss kwargs for the consistency + FK regularizers."""
     return dict(
         dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
         vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
         joint_vel_weight=cfg.joint_vel_consistency_weight,
         fk=fk, fk_pose_weight=cfg.fk_pose_weight,
+        body_fk=body_fk, body_pose_root_weight=cfg.body_pose_root_weight,
+        body_pose_world_weight=cfg.body_pose_world_weight,
+        body_pose_ori_scale=cfg.body_pose_ori_scale,
         tau_min=cfg.consistency_tau_min, blocks=cfg.reference_blocks,
     )
 
 
 @torch.no_grad()
 def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0,
-             fk=None) -> dict[str, float]:
+             fk=None, body_fk=None) -> dict[str, float]:
     """Compute conditioned/null-history flow loss and per-channel sampling metrics.
 
     Metrics are over the full F-step prediction; ``flow_mse`` is the history-conditioned
@@ -348,7 +374,7 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     flow_sum, flow_null_sum, n_batches = 0.0, 0.0, 0
     cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
-    ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk)
+    ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk, body_fk)
     for batch in loader:
         state = batch["state"].to(device)
         history = batch["history"].to(device)
@@ -502,6 +528,20 @@ def main() -> None:
             fk = FKChain(fk_path, list(meta.state_joint_names), list(train_ds.target_frame_names)).to(device)
             _fk_sanity_check(fk, train_ds, num_joints, device)
 
+    # The BODY-pose chain: a separate FKChain over the tracked body frames, which are a
+    # superset of the window's ee frames (13 vs 4 on the G1). Kept separate rather than
+    # slicing one chain, because fk_consistency_terms indexes its output by the WINDOW's
+    # ee-frame count and would silently mis-slice a wider one.
+    body_fk = None
+    if cfg.body_pose_root_weight > 0.0 or cfg.body_pose_world_weight > 0.0:
+        frames = list(cfg.body_fk_frames) if cfg.body_fk_frames else list(G1_BODY_TRACK_FRAMES)
+        fk_path = cfg.fk_model_path if os.path.isabs(cfg.fk_model_path) else os.path.join(_REPO_ROOT, cfg.fk_model_path)
+        body_fk = FKChain(fk_path, list(meta.state_joint_names), frames).to(device)
+        cfg.body_fk_frames = frames
+        print(f"[INFO] body-pose loss on {len(frames)} frames "
+              f"(root {cfg.body_pose_root_weight}, world {cfg.body_pose_world_weight}, "
+              f"ori_scale {cfg.body_pose_ori_scale} m/rad): {frames}")
+
     # EMA of the weights. Built AFTER .to(device) so the shadow lives on the same device,
     # and after any warning prints so the enable line lands next to them.
     ema = None
@@ -549,7 +589,7 @@ def main() -> None:
                 model, state, history, height, cmd_tokens,
                 history_null_mask=null_mask,
                 state_norm=train_ds.state_normalizer,
-                **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk),
+                **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk, body_fk),
             )
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -576,7 +616,7 @@ def main() -> None:
         if val_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             val = evaluate(
                 model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
-                num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
             )
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
@@ -588,7 +628,7 @@ def main() -> None:
                 with ema.swapped_in(model):
                     val_ema = evaluate(
                         model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
-                        num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                        num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
                     )
                 for k, v in val_ema.items():
                     writer.add_scalar(f"val_ema/{k}", v, epoch)
@@ -607,7 +647,7 @@ def main() -> None:
         if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
             ev = evaluate(
                 model, eval_loader, cfg, train_ds.state_normalizer, num_joints, device,
-                num_extra_frames=train_ds.num_extra_frames, fk=fk,
+                num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
             )
             for k, v in ev.items():
                 writer.add_scalar(f"eval/{k}", v, epoch)

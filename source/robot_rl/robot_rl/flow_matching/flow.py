@@ -193,6 +193,133 @@ def fk_consistency_terms(
     return ((ee - fk_pos) ** 2).mean(dim=(1, 2, 3))
 
 
+def body_pose_terms(
+    pred_phys: torch.Tensor,
+    data_phys: torch.Tensor,
+    num_joints: int,
+    num_extra_frames: int,
+    body_fk: object,
+    ori_scale: float = 1.0,
+    blocks: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Per-sample body-link pose error against the target -- the CLF's own metric.
+
+    The teacher this generator serves runs ``tracking_mode="body"``: the CLF grades the 13
+    ``<body>@root:*`` frames plus the pelvis and the WORLD end-effector frames, and drops
+    ``joint:*`` entirely. The flow loss, meanwhile, is a per-joint MSE in normalized angle
+    space. So the generator optimises a metric its consumer is not graded on -- a hip error
+    and a wrist error count the same, though one moves the foot an order of magnitude
+    further. These terms put the prediction back in the CLF's units.
+
+    ACCURACY against the target, not self-consistency: unlike
+    :func:`fk_consistency_terms` (which ties the predicted joints to the predicted
+    ``ee_pos`` block) this compares ``FK(predicted q)`` with ``FK(target q)``. It therefore
+    adds no information the model does not already have -- it is a change of METRIC, the
+    Jacobian reweighting -- and needs no extra window block, which matters because the slim
+    teacher dropped ``ee_pos``.
+
+    Two terms, because they fail differently:
+
+    * ``body_pose_root`` -- poses in the reference's own base (pelvis) frame. Pure posture,
+      and the one that cannot be gamed: it is independent of ``base_pose`` entirely.
+    * ``body_pose_world`` -- the same poses composed with the predicted ``base_pose``. This
+      is what the CLF's world ee frames see, so it is the term that cares about landing a
+      foot on a particular stair tread. It is computed in the ANCHOR frame, but the number
+      is the WORLD-frame error exactly: prediction and target share one anchor, and a rigid
+      transform preserves distances and angles, so ``|R_aT(p1-p_a) - R_aT(p2-p_a)| =
+      |p1-p2|``. No world coordinate enters, which is what keeps the representation
+      deploy-safe.
+
+      Because it folds the base error into all 13 bodies, it also re-weights base position
+      UP by that multiplicity, in physical metres -- outside the pooled normalizer that
+      currently squashes ``base_pos`` (node 0's error/signal is ~0.87, barely better than
+      predicting the mean). That is deliberate.
+
+      The cost of composing is that a base error can partially cancel a joint error, which
+      is exactly why ``body_pose_root`` is worth keeping alongside rather than instead --
+      see :func:`fk_consistency_terms`, which was rewritten to stop doing precisely this.
+
+    Both are squared errors in m^2, with the orientation half converted through
+    ``ori_scale`` (metres per radian) so the two halves of one geometric quantity can be
+    weighted together. Orientation goes through the group (``so3_log`` of the relative
+    rotation), which is stable and finite-gradient at coincidence -- where a pose loss
+    spends its time once it is working.
+
+    On the DENORMALIZED prediction, and expensive, so callers should τ-gate it.
+
+    Args:
+        pred_phys / data_phys: ``(B, F, D)`` predicted / target window, physical units.
+        num_joints: ``nj``.
+        num_extra_frames: The window's ee-frame count ``K`` -- for the block layout only.
+            ``body_fk`` has its own, larger frame set and its count is read off its output.
+        body_fk: An :class:`~motion_gen.fk.FKChain` over the tracked BODY frames (13 for
+            the G1, ``motion_gen.joint_names.G1_BODY_TRACK_FRAMES``), exposing
+            ``pose_and_jacobian``.
+        ori_scale: Metres per radian for the orientation half.
+        blocks: The packed selection.
+
+    Returns:
+        ``{"body_pose_root": (B,)}``, plus ``"body_pose_world"`` when the selection packs
+        ``base_pose`` (there is nothing to compose with otherwise).
+
+    Raises:
+        ValueError: If the selection lacks ``joint_pos`` -- there is no posture to grade.
+    """
+    slc = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "joint_pos" not in slc:
+        raise ValueError(
+            "body_pose_terms grades the forward kinematics of joint_pos, but this window "
+            f"packs {sorted(slc)}. Zero body_pose_root_weight / body_pose_world_weight "
+            "for this block selection."
+        )
+    b_, f_, _ = pred_phys.shape
+
+    def fk_of(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Root-frame body poses: ``(B,F,Nb,3)`` positions, ``(B,F,Nb,3,3)`` rotations."""
+        q = x[..., slc["joint_pos"]].reshape(b_ * f_, num_joints)
+        pos, rot, _jv, _jw = body_fk.pose_and_jacobian(q)
+        nb = pos.shape[-2]
+        return pos.reshape(b_, f_, nb, 3), rot.reshape(b_, f_, nb, 3, 3)
+
+    def err(p_a, r_a, p_b, r_b) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(position m^2, orientation rad^2)`` per sample, averaged over nodes+frames."""
+        pos = ((p_a - p_b) ** 2).sum(dim=-1).mean(dim=(1, 2))              # m^2
+        ang = so3_log(r_a.transpose(-1, -2) @ r_b)                        # (B,F,Nb,3)
+        return pos, (ang ** 2).sum(dim=-1).mean(dim=(1, 2))                # m^2, rad^2
+
+    def combine(name: str, halves: tuple[torch.Tensor, torch.Tensor]) -> dict:
+        """The weighted term plus its two halves, kept separately for logging.
+
+        The halves are what makes ``ori_scale`` tunable on evidence instead of by guess:
+        they are in m^2 and rad^2, so their ratio says how much the orientation is actually
+        contributing at the current setting. Only the combined key enters the loss.
+        """
+        pos, ori = halves
+        return {name: pos + (ori_scale ** 2) * ori,
+                f"{name}_pos": pos.detach(), f"{name}_ori": ori.detach()}
+
+    p_pred, r_pred = fk_of(pred_phys)
+    p_tgt, r_tgt = fk_of(data_phys)
+    out = combine("body_pose_root", err(p_pred, r_pred, p_tgt, r_tgt))
+
+    if "base_pose" in slc:
+        bp = slc["base_pose"].start
+
+        def compose(x: torch.Tensor, p_root: torch.Tensor, r_root: torch.Tensor):
+            """Lift root-frame body poses through the window's own ``base_pose``."""
+            base_p = x[..., bp:bp + 3]                                    # (B,F,3)
+            base_r = rot6d_to_matrix(x[..., bp + 3:bp + 9])               # (B,F,3,3)
+            return (
+                base_p[..., None, :] + torch.einsum("bfij,bfkj->bfki", base_r, p_root),
+                base_r[..., None, :, :] @ r_root,
+            )
+
+        out.update(combine("body_pose_world",
+                           err(*compose(pred_phys, p_pred, r_pred),
+                               *compose(data_phys, p_tgt, r_tgt))))
+    return out
+
+
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
@@ -209,6 +336,10 @@ def flow_matching_loss(
     joint_vel_weight: float = 0.0,
     fk: object | None = None,
     fk_pose_weight: float = 0.0,
+    body_fk: object | None = None,
+    body_pose_root_weight: float = 0.0,
+    body_pose_world_weight: float = 0.0,
+    body_pose_ori_scale: float = 1.0,
     tau_min: float = 0.0,
     blocks: Sequence[str] | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -259,7 +390,10 @@ def flow_matching_loss(
     do_jvel = state_norm is not None and has_joints and joint_vel_weight > 0.0
     do_fk = (fk is not None and state_norm is not None and fk_pose_weight > 0.0
              and {"joint_pos", "ee_pos"} <= packed)
-    if do_base or do_jvel or do_fk:
+    want_body_world = body_pose_world_weight > 0.0 and "base_pose" in packed
+    do_body = (body_fk is not None and state_norm is not None and "joint_pos" in packed
+               and (body_pose_root_weight > 0.0 or want_body_world))
+    if do_base or do_jvel or do_fk or do_body:
         t = tau.view(-1, *([1] * (x1.dim() - 1)))
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
         pred_phys = state_norm.denormalize(x1_hat)
@@ -288,6 +422,26 @@ def flow_matching_loss(
                 fkp = flow_mse.new_zeros(())
             out["fk_pose"] = fkp.detach()
             out["loss"] = out["loss"] + fk_pose_weight * fkp
+        if do_body:
+            # τ-gated with the FK term, and for the same reason: two FK evaluations (the
+            # prediction and the target) are the most expensive thing in this function.
+            idx = gate.nonzero(as_tuple=True)[0]
+            if idx.numel() > 0:
+                body = body_pose_terms(
+                    pred_phys[idx], data_phys[idx], num_joints, num_extra_frames,
+                    body_fk, body_pose_ori_scale, blocks)
+                body = {k: v.mean() for k, v in body.items()}
+            else:
+                zero = flow_mse.new_zeros(())
+                body = {f"body_pose_{s}{h}": zero for s in ("root", "world")
+                        for h in ("", "_pos", "_ori")}
+            weights = {"body_pose_root": body_pose_root_weight,
+                       "body_pose_world": body_pose_world_weight}
+            for name, value in body.items():
+                out[name] = value.detach()
+                weight = weights.get(name, 0.0)      # the _pos / _ori halves are diagnostics
+                if weight > 0.0:
+                    out["loss"] = out["loss"] + weight * value
     return out
 
 

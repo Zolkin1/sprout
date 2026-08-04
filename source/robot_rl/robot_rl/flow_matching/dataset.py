@@ -66,6 +66,8 @@ _LOSS_TERM_BLOCKS: dict[str, tuple[str, ...]] = {
     "accel_consistency_weight": ("base_vel",),
     "joint_vel_consistency_weight": ("joint_pos", "joint_vel"),
     "fk_pose_weight": ("joint_pos", "ee_pos"),
+    "body_pose_root_weight": ("joint_pos",),
+    "body_pose_world_weight": ("joint_pos", "base_pose"),
 }
 
 
