@@ -227,6 +227,16 @@ def _clip_speeds(rng, family_kind: str, args, cpt: int, vx_max: float | None = N
     ``vx_max`` narrows the band's top instead of clamping each draw afterwards, which matters for a
     BACKWARD family (``jump_off``): clamping would collapse most of the band onto the cap and make every
     clip on the tile the same motion, where narrowing keeps the variety inside what the bank can walk.
+
+    The speed picked here is the clip's STEADY command. It is no longer the whole story: pass 2 varies
+    it over the approach and exit (``mb_terrain_clips._rl_command_track``) while holding it across the
+    terrain interaction, so a terrain clip carries command CHANGES rather than one value end to end.
+    Measured on the pre-change ``clips/g1_mb_v5.h5`` with ``scripts/rsl_rl/clip_speed_distribution.py``:
+    every terrain/transition clip was a single held speed on a 50-level grid, which left ``flat`` (52% of
+    library time) and ``box`` as the only families the generator ever saw a command transition on.
+
+    The band's floor was also 0.6, so the library had no slow terrain traversal at all -- anything below
+    that was flat-only. It now starts at 0.2.
     """
     if family_kind == "stairs":
         lo, hi = args.stair_vel_range
@@ -250,9 +260,14 @@ def main() -> int:
     p.add_argument("--stair-tiles", type=int, default=20, help="TRANSITION tiles per stair direction.")
     p.add_argument("--box-tiles", default="20,15,15", help="jump_on,jump_off,jump_off_front tile counts.")
     p.add_argument("--clips-per-tile", type=int, default=50)
-    p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.6, 2.6), metavar=("MIN", "MAX"))
-    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.5, 3.5), metavar=("MIN", "MAX"),
-                   help="GROUND-level speed band for the box families (the run-up / walk-away).")
+    p.add_argument("--stair-vel-range", type=float, nargs=2, default=(0.2, 2.6), metavar=("MIN", "MAX"),
+                   help="GROUND-level speed band for the stair families (-> the terrain and "
+                        "transition clip families). The floor was 0.6, which left the library with "
+                        "no slow terrain traversal at all -- everything below it was flat-only.")
+    p.add_argument("--box-vel-range", type=float, nargs=2, default=(0.2, 3.5), metavar=("MIN", "MAX"),
+                   help="GROUND-level speed band for the box families (the run-up / walk-away). "
+                        "Floor lowered 0.5 -> 0.2 to match the stair band, so no family is missing "
+                        "slow traversal.")
     p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
                    metavar=("MIN", "MAX"),
                    help="Duration (s) of a box clip's LEAD-IN -- the segment before the interaction, "

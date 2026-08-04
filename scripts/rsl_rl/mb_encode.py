@@ -48,24 +48,33 @@ import mb_env  # noqa: E402
 def _seg_vel(rng: np.random.Generator, args) -> tuple[float, float, float, str]:
     """Random ``(vx, vy, wz, label)`` for one MOVING segment, covering the whole command space.
 
-    Mirrors ``generate_mm_clips._seg_vel`` (the DP flat family's distribution) mode-for-mode, so the MB
-    and DP flat libraries are directly comparable: forward / backward / sidestep / turn-while-walking /
-    diagonal, with forward over-weighted 3:1 and a 30% chance of a superimposed turn.
+    Modes follow ``generate_mm_clips._seg_vel``: forward / backward / sidestep / turn-while-walking /
+    diagonal, forward over-weighted 3:1, with a 30% chance of a superimposed turn on a forward segment.
+
+    The SPEEDS come from explicit bands (``--walk-vx-range`` / ``--run-vx-range`` / ``--back-vx-range``)
+    rather than the old scale-times-fraction form, which could not express a floor: forward used to be
+    ``U(0.45, 1.0) * scale``, so walk covered [0.45, 1.0] and run [1.125, 2.5] with a hole between them
+    and nothing at all below 0.45. Every forward-bearing mode now starts at the walk band's floor, so
+    slow locomotion is sampled directly instead of appearing only in the ramps between segments.
+    Turn and diagonal stay slower than a straight walk by capping at 70% / 80% of the walk band's top.
     """
     mode = str(rng.choice(["forward", "forward", "forward", "backward", "sidestep", "turn", "diagonal"]))
+    w_lo, w_hi = (float(v) for v in args.walk_vx_range)
     vx = vy = wz = 0.0
     if mode == "forward":
-        vx = float(rng.uniform(0.45, 1.0)) * (args.run_vx if rng.random() < 0.4 else args.walk_vx)
+        lo, hi = (args.run_vx_range if rng.random() < 0.4 else (w_lo, w_hi))
+        vx = float(rng.uniform(float(lo), float(hi)))
         wz = float(rng.uniform(-1.0, 1.0)) * args.turn_max if rng.random() < 0.3 else 0.0
     elif mode == "backward":
-        vx = -float(rng.uniform(0.4, 0.9)) * args.back_vx
+        b_lo, b_hi = (float(v) for v in args.back_vx_range)
+        vx = -float(rng.uniform(b_lo, b_hi))
     elif mode == "sidestep":
         vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.4, 1.0)) * args.side_vy
     elif mode == "turn":
-        vx = float(rng.uniform(0.2, 0.7)) * args.walk_vx
+        vx = float(rng.uniform(w_lo, 0.7 * w_hi))
         wz = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.5, 1.0)) * args.turn_max
     elif mode == "diagonal":
-        vx = float(rng.uniform(0.3, 0.8)) * args.walk_vx
+        vx = float(rng.uniform(w_lo, 0.8 * w_hi))
         vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.3, 0.7)) * args.side_vy
     return vx, vy, wz, mode
 
@@ -74,14 +83,16 @@ def sample_schedule(rng: np.random.Generator, args) -> list[tuple]:
     """One randomized ``[(duration_s, vx, vy, wz), ...]`` schedule for a clip of ``args.clip_length``.
 
     A clean standing lead-in (so every clip starts from a settled stand), then mostly-moving segments of
-    ``U(1.5, 3.0)`` s with a 12% chance of a pause -- the ``generate_mm_clips._schedule`` recipe. The
+    ``U(*--seg-dur-range)`` s with a 12% chance of a pause -- the ``generate_mm_clips._schedule`` recipe. The
     velocity is what MB is COMMANDED; the target pose is snapped to the nearest bank stride, so the
     achieved steady velocity is the snapped one (see ``--rl-vels`` on the Stage-2 side).
 
     The final segment is stretched/trimmed so the schedule totals EXACTLY ``clip_length``. Stage 2 fits to
     that length either way, so an overshoot would be generated GPU time thrown away and an undershoot would
     be repeat-last padding; pinning the total makes every clip full-length real motion (``clip_len == T``).
-    The adjustment is always < 1 s and can never zero the segment (the loop exits with at least 0.5 s left).
+    The trim is bounded by the segment band's width, so the final segment can end up anywhere in
+    ``(0.5, max)`` s -- wider than the band itself. It can never be zeroed or negative: the loop exits with
+    ``t >= clip_length - 0.5``, which makes the adjusted duration ``clip_length - (t - d) > 0.5`` s.
     """
     segs = [(1.0, 0.0, 0.0, 0.0)]
     t = 1.0
@@ -90,7 +101,7 @@ def sample_schedule(rng: np.random.Generator, args) -> list[tuple]:
             vx, vy, wz = 0.0, 0.0, 0.0
         else:
             vx, vy, wz, _ = _seg_vel(rng, args)
-        dur = float(rng.uniform(1.5, 3.0))
+        dur = float(rng.uniform(*(float(v) for v in args.seg_dur_range)))
         segs.append((dur, vx, vy, wz))
         t += dur
     d, vx, vy, wz = segs[-1]
@@ -167,13 +178,27 @@ def main() -> int:
     p.add_argument("--n-clips", type=int, default=None,
                    help="Generate N clips from RANDOMLY SAMPLED command schedules (library mode). Overrides "
                         "--schedule-set / --steady-vx; the schedule distribution mirrors the DP flat family.")
-    p.add_argument("--clip-length", type=float, default=9.0,
-                   help="Sampled-schedule clip duration (s); should match the Stage-2 --clip-length.")
+    p.add_argument("--clip-length", type=float, default=20.0,
+                   help="Sampled-schedule clip duration (s); should match the Stage-2 --clip-length. "
+                        "20 s is what the shipped libraries were built at (g1_mb_v5 carries "
+                        "clip_length_s=20.0, every flat clip 999 steps); the old 9.0 default was "
+                        "stale and never used for one.")
     p.add_argument("--schedule-set", default="demo", help="Named command-schedule set.")
-    # Velocity envelope of the sampled schedules (same knobs + defaults as generate_mm_clips.py).
-    p.add_argument("--run-vx", type=float, default=2.5, help="Forward RUN speed scale (m/s).")
-    p.add_argument("--walk-vx", type=float, default=1.0, help="Forward WALK speed scale (m/s).")
-    p.add_argument("--back-vx", type=float, default=1.2, help="Backward speed scale (m/s).")
+    p.add_argument("--seg-dur-range", type=float, nargs=2, default=(1.5, 5.5),
+                   metavar=("MIN", "MAX"),
+                   help="Duration band (s) of one command segment in a sampled schedule. Longer "
+                        "segments mean fewer command changes per clip but more settled time at each.")
+    # Velocity envelope of the sampled schedules. Expressed as explicit (min, max) BANDS rather than
+    # the old scale-times-fraction form: the fractions made the reachable range implicit (forward was
+    # U(0.45,1)*2.5 -> [1.125, 2.5] with a hole below it) and there was no way to set a floor.
+    # The walk and run bands are contiguous by default, so forward speed covers [0.1, 3.0] with no gap
+    # while keeping the 60/40 walk/run weighting.
+    p.add_argument("--walk-vx-range", type=float, nargs=2, default=(0.1, 1.0), metavar=("MIN", "MAX"),
+                   help="Forward WALK band (m/s); also the base band for turn/diagonal segments.")
+    p.add_argument("--run-vx-range", type=float, nargs=2, default=(1.0, 3.0), metavar=("MIN", "MAX"),
+                   help="Forward RUN band (m/s), used on the 40% of forward segments that run.")
+    p.add_argument("--back-vx-range", type=float, nargs=2, default=(0.1, 1.5), metavar=("MIN", "MAX"),
+                   help="Backward SPEED band (m/s), magnitudes; emitted as negative vx.")
     p.add_argument("--side-vy", type=float, default=1.0, help="Lateral (sidestep) speed scale (m/s).")
     p.add_argument("--turn-max", type=float, default=0.8, help="Yaw-rate scale (rad/s).")
     p.add_argument("--steady-vx", type=float, default=None,
@@ -215,7 +240,8 @@ def main() -> int:
         rng = np.random.default_rng(args.seed)
         schedules = [{"name": "rand", "segs": sample_schedule(rng, args)} for _ in range(args.n_clips)]
         print(f"[mb_encode] sampled {len(schedules)} schedules (clip_length={args.clip_length}s, "
-              f"run_vx={args.run_vx} walk_vx={args.walk_vx} back_vx={args.back_vx} "
+              f"seg_dur={tuple(args.seg_dur_range)}s, walk_vx={tuple(args.walk_vx_range)} "
+              f"run_vx={tuple(args.run_vx_range)} back_vx={tuple(args.back_vx_range)} "
               f"side_vy={args.side_vy} turn_max={args.turn_max})")
     elif args.steady_vx is not None:
         schedules = [{"name": f"steady_vx{args.steady_vx:.2f}",

@@ -271,8 +271,10 @@ def assemble_clip_terrain(
     num_flat_tiles: int | None = None,
     col_gap: float = 1.0,
     row_gap: float = 2.0,
-    size_margin: float = 1.0,
-    flat_buffer: float = 2.0,
+    # Keep these in step with ClipTerrainImporterCfg, which is what the live path passes; a
+    # direct caller relying on the signature default should get the same terrain the RL sees.
+    size_margin: float = 15.0,
+    flat_buffer: float = 15.0,
     transition_back_buffer: float = 1.0,
 ) -> tuple[trimesh.Trimesh, torch.Tensor, ClipTerrainLayout]:
     """Build the whole terrain mesh + env origins from a clip library manifest.

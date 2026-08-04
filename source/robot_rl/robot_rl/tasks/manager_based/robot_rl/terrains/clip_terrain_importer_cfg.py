@@ -44,11 +44,20 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     row_gap: float = 2.0
     """Void gap (m) between replica strips along y."""
 
-    size_margin: float = 1.0
-    """Extra flat (m) added to the terrain / transition footprints."""
+    size_margin: float = 15.0
+    """Extra flat (m) added to the terrain / transition footprints.
 
-    flat_buffer: float = 2.0
-    """Flat-tile margin (m) on each side beyond the flat clips' bbox."""
+    Sized so a rollout that drifts off its reference cannot reach the tile edge: falling off
+    is a termination that looks exactly like a tracking failure, so a too-small margin
+    silently converts "wandered" into "fell" in every survival number. 15 m covers ~5 s of
+    drift at the library's top commanded speed (3.0 m/s)."""
+
+    flat_buffer: float = 15.0
+    """Flat-tile margin (m) on each side beyond the flat clips' bbox.
+
+    Same rationale as :attr:`size_margin`. Flat clips are the long ones (20 s, up to 3.0 m/s
+    forward), so their bbox is already large and this is a margin ON TOP of the travel the
+    clips actually use."""
 
     transition_back_buffer: float = 1.0
     """Flat (m) prepended to each transition tile behind the robot's start."""
