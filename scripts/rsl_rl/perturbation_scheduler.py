@@ -77,7 +77,10 @@ class PerturbationScheduler:
         ood_dr_scale: float = 1.5,
         dr_term_names: Sequence[str] = (
             "joint_friction_params", "joint_armature_params", "gain_randomization",
-            "add_base_mass", "base_com", "randomize_ground_contact_friction",
+            # Must track G1ClfTrackingEventsCfg's attribute names: _apply_ood_dr resolves each
+            # through event_manager.get_term_cfg and CONTINUES on a miss, so a stale name here
+            # silently drops that term from the OOD set rather than failing.
+            "add_torso_mass", "torso_com", "randomize_ground_contact_friction",
         ),
         obs_noise_scale: float = 0.0,
         seed: int | None = None,

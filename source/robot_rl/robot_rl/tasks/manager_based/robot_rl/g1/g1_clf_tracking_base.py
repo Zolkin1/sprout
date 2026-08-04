@@ -74,7 +74,14 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
+            # MAX, not multiply: this material never sets ``restitution``, so it is 0.0, and
+            # under "multiply" the effective coefficient was 0.0 * foot = 0.0 no matter what
+            # randomize_ground_contact_friction drew -- the restitution DR was dead. PhysX
+            # resolves two disagreeing modes by enum precedence (average < min < multiply <
+            # max), so "max" here wins over whatever the robot's shapes carry, and
+            # max(0.0, foot) == foot makes the drawn range the EFFECTIVE range.
+            # There is no "add" mode; the four are average / min / multiply / max.
+            restitution_combine_mode="max",
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
@@ -156,8 +163,10 @@ class G1ClfTrackingEventsCfg:
         },
     )
 
-    # Adjust torso mass
-    add_base_mass = EventTerm(
+    # Adjust torso mass. Named for what it does: it scales the TORSO link, never the pelvis
+    # (the floating base), which the old name "add_base_mass" claimed. The base's own mass is
+    # still not randomized -- SONIC scales EVERY body at (0.8, 1.2) on reset instead.
+    add_torso_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
@@ -185,17 +194,26 @@ class G1ClfTrackingEventsCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=[".*_ankle_roll_link"]),
             "static_friction_range": (0.3, 1.6),
             "dynamic_friction_range": (0.3, 1.2),
-            "restitution_range": (0.0, 0.2),  # Consider upping this
+            # Now actually reaches physics -- see the terrain's restitution_combine_mode.
+            # 0.5 matches SONIC's range (whose own is inert for the same multiply-by-zero
+            # reason, so the number is borrowed, not the behaviour).
+            "restitution_range": (0.0, 0.5),
             "num_buckets": 64,
             "make_consistent": True,  # ensures dynamic friction <= static friction
         },
     )
 
-    base_com = EventTerm(
+    # On the TORSO, not the pelvis: on the 29-DOF robot the waist is un-merged
+    # (pelvis -> waist_yaw -> waist_roll -> torso_link) and the pelvis carries very little of
+    # the mass, so perturbing its CoM barely moves the whole-body CoM. The torso is where the
+    # mass is, which is also where add_torso_mass scales -- the two now agree on a body.
+    # SONIC randomizes the same link, at x (-0.025, 0.025), y/z (-0.05, 0.05); ours keeps the
+    # ranges it had, so z is still the pelvis-era (-0.01, 0.01) and is the tight one.
+    torso_com = EventTerm(
         func=mdp.randomize_rigid_body_com,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="pelvis_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
             "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
         },
     )
