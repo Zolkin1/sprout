@@ -84,6 +84,10 @@ class _FakePolicy(GenTrackerPolicy):
         self._anchor_pos = np.zeros(3)
         self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
         self._prev_served_node = None
+        # Joystick command-horizon shaping. "hold" is the deploy default and the mode these
+        # cadence tests assume: it never touches the ring, so the horizon plays no part here.
+        self._cmd_horizon_mode = "hold"
+        self._cmd_ring = None
         self._ctrl_step = -1
         self._plan_count = 0
         self.replans: list[int] = []          # _ctrl_step at each re-plan

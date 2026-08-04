@@ -1079,6 +1079,15 @@ def main() -> None:
     parser.add_argument("--spawn_z_offset", type=float, default=0.03,
                         help="Metres to raise the spawn pelvis above the standing-config height "
                              "(optimizer frame sits ~3 cm below the MuJoCo foot-contact height).")
+    parser.add_argument("--cmd_horizon", choices=("hold", "tail"), default="hold",
+                        help="How the live command fills the FM's F-node command horizon. "
+                             "'hold' (default) stamps it on every node -- the whole horizon "
+                             "jumps at once, which is NOT a shape training ever saw. 'tail' "
+                             "injects it at the last node and marches it forward one node per "
+                             "control step, reproducing the interior transition the clip's "
+                             "target_vel produces. Costs ~F steps (~1.2 s) of response lag. "
+                             "Ignored during a clip handoff, which feeds the true future "
+                             "command instead.")
     parser.add_argument("--cmd_max_acc", type=float, default=0.0,
                         help="Velocity-command rate limit (m/s^2, rad/s^2) on the live command. "
                              "DEFAULT 0 = DISABLED: the raw joystick/profile command passes "
@@ -1196,6 +1205,11 @@ def main() -> None:
         null_history_warmup=args.null_history_warmup,
     )
     policy.load()
+    policy.set_command_horizon_mode(args.cmd_horizon)
+    if args.cmd_horizon != "hold":
+        print(f"[INFO] command horizon = {args.cmd_horizon}: a new command enters at node "
+              f"F-1 and reaches node 0 after {policy.ctx.F} steps "
+              f"({policy.ctx.F * policy.get_dt():.2f} s).")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))

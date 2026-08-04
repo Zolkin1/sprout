@@ -195,6 +195,10 @@ class GenTrackerPolicy:
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
+        # Joystick command-horizon shaping; see set_command_horizon_mode. The ring holds the
+        # last F live commands (oldest first) and is only built when the mode needs it.
+        self._cmd_horizon_mode = "hold"
+        self._cmd_ring: np.ndarray | None = None
         # Per-term observation-history windows, keyed by term name (see _push_history).
         self._obs_history: dict[str, list[np.ndarray]] = {}
         self._reset_timing()
@@ -491,6 +495,7 @@ class GenTrackerPolicy:
         if not self.fm_enabled:
             return
         self._ctrl_step += 1
+        self._push_cmd_horizon(state)
         self._history.append(self._make_snapshot(state))
 
     def _update_generator(self, state: dict) -> None:
@@ -512,6 +517,7 @@ class GenTrackerPolicy:
         exact thereafter -- Isaac behaves the same way, so this is deliberate.
         """
         self._ctrl_step += 1
+        self._push_cmd_horizon(state)
         self._history.append(self._make_snapshot(state))
         null_hist = bool(self._history.null_mask()[0])
         use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
@@ -535,6 +541,47 @@ class GenTrackerPolicy:
             self._run_fm(state, history_null=(null_hist and use_null))
         if self._pred_valid:
             self._prev_served_node = self._serve_nodes(state, (0,))[0]
+
+    def _push_cmd_horizon(self, state: dict) -> None:
+        """Record this control step's live command in the ``tail`` delay line.
+
+        Called once per control step from both step paths (the stand warmup's
+        :meth:`observe` and the live :meth:`_update_generator`), so the ring advances with
+        wall time rather than with the re-plan cadence. That distinction matters at
+        ``fm_update_every > 1``: the FM samples every K steps but each of the F nodes is one
+        control step apart, so a ring keyed on FM calls would march the command K times too
+        slowly. No-op in ``hold`` mode, which never reads the ring.
+        """
+        if self._cmd_horizon_mode == "hold" or not self.fm_enabled:
+            return
+        cmd = np.asarray(state["command"], dtype=np.float64).reshape(-1)[: self.ctx.cmd_dim]
+        if self._cmd_ring is None:
+            # Start saturated at the current command: the horizon must not claim the robot
+            # was standing still a second ago when the run begins mid-command.
+            self._cmd_ring = np.tile(cmd, (self.ctx.F, 1))
+        else:
+            self._cmd_ring = np.roll(self._cmd_ring, -1, axis=0)
+            self._cmd_ring[-1] = cmd
+
+    def _joystick_cmd_horizon(self, cmd_now: np.ndarray) -> np.ndarray:
+        """The ``[1, F, cmd_dim]`` command horizon for the joystick (no-future-known) path.
+
+        ``hold`` broadcasts the current command over every node -- the deploy default, and
+        what the runtime has always done. ``tail`` instead serves the delay line, so a new
+        command enters at the LAST node and marches one node forward per control step until
+        it reaches node 0 about ``F`` steps later.
+
+        The point of ``tail`` is distributional, not dynamical: training conditions the FM on
+        the clip's actual ``target_vel`` over steps ``s+1 .. s+F``, in which a command change
+        appears at an interior node and sweeps toward the front. ``hold`` can never produce
+        that shape -- it jumps the whole horizon at once, a pattern the generator was never
+        trained on. The cost is that the commanded velocity now takes ~``F`` control steps to
+        reach the front of the window, so the robot responds to the stick that much later.
+        """
+        F, D = self.ctx.F, self.ctx.cmd_dim
+        if self._cmd_horizon_mode == "tail" and self._cmd_ring is not None:
+            return self._cmd_ring.reshape(1, F, D).copy()
+        return np.broadcast_to(cmd_now, (1, F, D)).copy()
 
     def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample the F-node reference window for this control step.
@@ -565,7 +612,7 @@ class GenTrackerPolicy:
             # IsaacLab during command ramps.
             fut_cmd = np.asarray(self._future_cmd_override, dtype=np.float64).reshape(1, ctx.F, ctx.cmd_dim)
         else:
-            fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
+            fut_cmd = self._joystick_cmd_horizon(cmd[:, -1:])
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
         noise = self._sample_noise()
 
@@ -959,6 +1006,21 @@ class GenTrackerPolicy:
         """
         self._future_cmd_override = None if future_cmd is None else np.asarray(future_cmd, dtype=np.float64)
 
+    def set_command_horizon_mode(self, mode: str) -> None:
+        """Select how the joystick command fills the FM's F-node command horizon.
+
+        ``"hold"`` (default) stamps the current command on every node. ``"tail"`` injects it
+        at the LAST node and lets it march forward one node per control step, which is the
+        shape training saw (see :meth:`_joystick_cmd_horizon`).
+
+        Affects only the joystick path: a clip handoff sets the true future command via
+        :meth:`set_future_command`, and that override still wins.
+        """
+        if mode not in ("hold", "tail"):
+            raise ValueError(f"unknown command-horizon mode {mode!r}; expected 'hold' or 'tail'")
+        self._cmd_horizon_mode = mode
+        self._cmd_ring = None
+
     def reset(self) -> None:
         """Reset the rolling histories + prediction state (the tracker net is stateless).
 
@@ -981,6 +1043,7 @@ class GenTrackerPolicy:
             self._anchor_pos = np.zeros(3)
             self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
             self._prev_served_node = None
+            self._cmd_ring = None
             self._reset_timing()
 
     def get_dt(self) -> float:
