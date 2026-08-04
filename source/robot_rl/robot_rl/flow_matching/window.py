@@ -130,9 +130,25 @@ BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 #: only ever carries node 0, whose error is the smallest of the horizon. So the history is
 #: noised slightly harder than reality -- the safe direction.
 #:
-#: Position-like entries are per-axis ``(x, y, z)``; the vertical axis is tighter.
+#: MEASURED, and the reason the numbers below are not obvious: the generator's error GROWS
+#: 3-10x from node 0 to node 50, so one number per block cannot be right at both ends. Run
+#: ``scripts/flow_matching/fm_error_by_offset.py`` after an FM retrain to re-check; against the
+#: 100-epoch XL generator (teacher-forced, so a LOWER bound on the closed-loop error these
+#: stand in for) the per-offset MEAN errors were base_pos ``[0.043, 0.028, 0.032]`` m,
+#: base_ori ``0.036``, base_lin_vel ``0.122``, base_ang_vel ``0.237``, joint_pos ``0.076``.
+#:
+#: Position-like entries are per-axis ``(x, y, z)``. The vertical axis is NOT tighter -- that
+#: assumption is what left ``base_pos`` z at ``0.01`` (0.18x of the measured error, by far the
+#: worst entry in the table) while the generator's z error is slightly LARGER than its y error.
+#: z is also where terrain lives, so under-noising it taught the policy to trust reference
+#: height it will not get. Now ``0.03``: 3x better, still ~0.5x of a lower bound, and
+#: deliberately short of full calibration because over-noising z costs stair clearance.
+#: base_ori and the velocity entries are left alone until there is a YAW-FRAME checkpoint to
+#: measure -- the representation change alters what base_ori even means. ``joint_pos`` measures
+#: 0.76x and is representation-independent, so it is a live candidate. ``joint_vel`` and
+#: ``ee_pos`` are unmeasured AND unobserved (see ``REFERENCE_WINDOW_BLOCKS``), hence inert.
 REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
-    "base_pos": [0.05, 0.05, 0.01],   # reference base position error, metres
+    "base_pos": [0.06, 0.06, 0.03],   # reference base position error, metres
     # Perturbation of each of the 6 rot6d components. DIMENSIONLESS, not radians -- but the
     # number carries over from when it was: the two columns are unit vectors, so displacing
     # a component by eps tilts the frame by ~eps rad for small eps. Kept at the old 0.03 so
