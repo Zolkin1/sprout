@@ -298,6 +298,22 @@ class FutureStateDataset(Dataset):
                 "target_source='ego_anchored_clip_future' requires a 'ref_future' array; "
                 "re-record with scripts/rsl_rl/record_data.py (ego_anchor_fraction=1.0)."
             )
+        # The history rows are only ever read as ANCHOR poses, so a recording whose rows are
+        # anchored per step has the same shape as one anchored on the plan and loads clean --
+        # while meaning something the generator is never served. At deploy the history IS a
+        # slice of the previous plan, in that plan's frame, with no transformation applied.
+        anchor = str(getattr(meta, "history_anchor", "") or "")
+        if anchor != "plan":
+            raise ValueError(
+                f"history_anchor={anchor or '<absent>'!r}, but the generator conditions on a "
+                "PLAN-frame history (its own previous prediction, untransformed). A per-step "
+                "anchored recording differences each reference against its own contemporaneous "
+                "robot pose, which cancels the reference's motion: measured, its per-lag means "
+                "are FLAT (0.0196/0.0197/0.0199/0.0199 m) and the rows sit 6.9 mm apart, "
+                "against 0.1231->0.1657 m and 45 mm plan-anchored. Re-record with "
+                "scripts/rsl_rl/record_data.py --num_windows (an absent field means the "
+                "recording predates the change, so it is per-step)."
+            )
         cfg.check_extero_source()
         if data.get(cfg.extero_source) is None:
             hint = (
@@ -412,6 +428,8 @@ class FutureStateDataset(Dataset):
                     "record_data.py (it writes history_ref unconditionally)."
                 )
             hr = torch.from_numpy(np.ascontiguousarray(data["history_ref"])).float()
+            # The recorder writes the PLAN ANCHOR into rows 0..H-2, so these n rows all carry
+            # the same pose -- the robot at the last re-plan. Row H-1 stays measured.
             hw_meas = hs_state[sel][:, H - 1 - n:H - 1, :]   # (Nw, n, node) anchors, lags n..1
             hw_ref = hr[sel][:, H - 1 - n:H - 1, :]          # (Nw, n, node) applied reference
             snap_meas = hs_state[sel][:, H - 1, :]           # (Nw, node) robot at the snap
@@ -437,7 +455,8 @@ class FutureStateDataset(Dataset):
 
         p_anchor, q_anchor = _p(snap_meas), _q(snap_meas)    # (Nw, 3) / (Nw, 4)
 
-        # -- history: the emitted reference at lags n..1, each in its OWN step's frame --
+        # -- history: the emitted reference at lags n..1, all in the PLAN's frame (windowed;
+        # the legacy per-step path still anchors each row on its own step) --
         history = _rows_to_window(
             lambda name: hw_ref[..., s_slc[name][0]:s_slc[name][1]],
             _p(hw_meas), _q(hw_meas), self.target_frame_names, self.blocks,

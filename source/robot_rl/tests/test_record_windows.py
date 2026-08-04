@@ -23,6 +23,8 @@ import torch
 
 from robot_rl.flow_matching.config import FlowMatchingConfig
 from robot_rl.flow_matching.dataset import build_train_val, snap_windows
+from robot_rl.flow_matching.window import world_to_window
+from robot_rl.flow_matching.transforms import quat_apply_inverse, yaw_quat
 from robot_rl.flow_matching.tests.recording_fixtures import episode_arrays
 
 
@@ -104,6 +106,9 @@ def _meta():
         state_term_names=list(_STATE_TERMS),
         state_term_dims=list(_STATE_DIMS),
         state_frame_names=[],
+        # The dataset refuses anything else; these fixtures write history rows by hand and
+        # this file is about the windowed writer matching the per-step path, not the anchor.
+        history_anchor="plan",
     )
 
 
@@ -186,6 +191,97 @@ def test_windowed_dataset_matches_per_step():
     if vl is not None:
         assert len(vl) == len(vw)
         _same(vl, vw)
+
+
+def test_plan_frame_history_rows_carry_the_plans_displacement():
+    """A constant (plan) anchor makes the N history rows DISTINCT; a per-step one collapses them.
+
+    The mechanism behind phase 2's recorder change, pinned exactly rather than statistically.
+    The derived ``base_pose`` position of history row ``j`` is:
+
+    * per-step anchor -- ``ref(t_j) - robot(t_j)``: the tracking error at that step. A trained
+      teacher tracks tightly and smoothly, so the rows differ only by how that small error
+      drifted, and they are near-duplicates.
+    * plan anchor -- ``ref(t_j) - robot(t_plan)``: additionally the robot's own displacement
+      from the plan step to ``t_j``. That displacement is the signal, i.e. the plan's motion
+      across the re-plan period.
+
+    Measured on two real recordings, same statistic, physical units, N=4:
+
+    ==========================  ==============================  ====================
+    ..                          per-lag mean |ref - anchor| [m]  row-to-row spread [m]
+    ==========================  ==============================  ====================
+    per-step (depth_v5)         0.0196 0.0197 0.0199 0.0199     0.0069
+    plan (rot6d_window_v1)      0.1231 0.1374 0.1515 0.1657     0.0454
+    ==========================  ==============================  ====================
+
+    Flat versus evenly stepping by ~14 mm per step (~0.7 m/s, the walking speed), and 6.6x the
+    row-to-row spread -- concentrated on x, the direction of travel, where the per-step version
+    had 2.3 mm.
+
+    NOT correlation across rows, which was the first statistic reached for and is a red
+    herring: it sits at 0.97-0.99 under BOTH anchorings, because most of the variance is across
+    WINDOWS (where the reference happens to be) rather than across rows, and both share that.
+
+    TIGHT TRACKING IS THE PREMISE, so it is constructed here rather than assumed: the shared
+    rollout fixture is deliberately loose (its per-step spread is as large as its whole
+    within-window displacement), which is exactly the regime where the collapse does NOT
+    happen. So the robot pose is rebuilt as the reference minus a small, slowly drifting
+    error -- the regime the recorder actually runs in.
+    """
+    data = _synthetic_per_step()
+    N = 3
+    w = _to_windowed(data, N)
+    hr = w["history_ref"]
+    W, H = hr.shape[0], hr.shape[1]
+
+    # A trained teacher, with both numbers taken from the depth_v5 measurement rather than
+    # chosen to pass: per-axis error [0.021, 0.008, 0.016] m, drifting ~0.1 mm/step (the row
+    # means move 0.0196 -> 0.0199 across the four rows).
+    err = np.zeros((W, H, 3), dtype=np.float32)
+    err[:] = np.array([0.021, 0.008, 0.016], dtype=np.float32)
+    err += 0.0001 * np.arange(H, dtype=np.float32)[None, :, None]
+    hs = w["history_state"].copy()
+    hs[:, :, 0:3] = hr[:, :, 0:3] - err
+    # ONE orientation in every row, so the per-step and plan anchors resolve to the SAME yaw
+    # frame and their difference is a pure translation. With a per-row orientation the two
+    # would also differ by a rotation, which the last assertion is not trying to measure.
+    hs[:, :, 3:7] = hr[:, 0:1, 3:7]
+
+    def base_pos(anchor_state):
+        """The position block of the derived history rows, unnormalized ``(W, N, 3)``."""
+        rows = slice(H - 1 - N, H - 1)
+        a = torch.from_numpy(anchor_state[:, rows]).float()
+        r = torch.from_numpy(hr[:, rows]).float()
+        node = world_to_window(
+            a[..., 0:3], a[..., 3:7], r[..., 0:3], r[..., 3:7], r[..., 7:10], r[..., 10:13],
+            r[..., 13:13 + _NJ], r[..., 13 + _NJ:13 + 2 * _NJ],
+            torch.zeros(*r.shape[:-1], 0, 3), blocks=("base_pose",),
+        )
+        return node[..., 0:3]
+
+    per_step = base_pos(hs)                              # each row on its own step
+    plan_state = hs.copy()
+    plan_state[:, :H - 1, 0:7] = hs[:, 0:1, 0:7]         # every history row on ONE pose
+    plan = base_pos(plan_state)
+
+    def spread(x):
+        """Mean over windows of how far apart the N rows are."""
+        return (x.amax(dim=1) - x.amin(dim=1)).norm(dim=-1).mean()
+
+    # The per-step rows collapse onto the (constructed) tracking-error drift; the plan rows
+    # additionally carry the robot's within-window displacement, which is ~an order larger.
+    assert spread(per_step) < 0.001, f"per-step rows should be near-duplicates, got {spread(per_step):.5f}"
+    assert spread(plan) > 10.0 * spread(per_step), (
+        f"plan-frame spread {spread(plan):.4f} m should dominate per-step {spread(per_step):.4f} m"
+    )
+
+    # And the two differ by EXACTLY the anchor displacement in the shared yaw frame -- a pure
+    # translation of the position block, since the references are untouched.
+    rows = slice(H - 1 - N, H - 1)
+    yaw = yaw_quat(torch.from_numpy(hs[:, 0, 3:7]).float()).unsqueeze(1).expand(-1, N, -1)
+    shift = torch.from_numpy(hs[:, rows, 0:3] - hs[:, 0:1, 0:3]).float()
+    assert torch.allclose(plan - per_step, quat_apply_inverse(yaw, shift), atol=1e-5)
 
 
 def test_windowed_rejects_too_short_history():

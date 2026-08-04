@@ -124,6 +124,27 @@ class RecordingMeta:
     DEFAULT for the generator trained on this file: an FM must predict exactly the blocks
     the policy it drives consumes. ``None`` for a recording written before the selection
     existed, which is necessarily a full five-block one."""
+    history_anchor: str = ""
+    """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
+    relative to.
+
+    * ``"plan"`` -- rows ``0..H-2`` carry the robot pose at the last re-anchor (the plan anchor),
+      so all the history rows the model conditions on share ONE frame. Row ``H-1`` keeps the
+      measured pose, since that is the target's anchor. This is what the generator sees at
+      deploy, where its history is a slice of its own previous plan and no transformation is
+      applied.
+    * ``"per_step"`` (or ``""`` for a recording predating this field) -- every row carries the
+      measured pose at that row's own step. Differencing each reference against its own
+      contemporaneous robot pose cancels the reference's motion: measured on depth_v5, the four
+      rows' means are FLAT at 0.0196/0.0197/0.0199/0.0199 m and sit 6.9 mm apart, against
+      0.1231 -> 0.1657 m and 45 mm for the same statistic plan-anchored. (Correlation ACROSS
+      rows is NOT the diagnostic: it is 0.97-0.99 either way, because most of the variance is
+      across windows -- where the reference happens to be -- rather than across rows.)
+
+    The dataset REFUSES anything but ``"plan"``: the two are the same shape, so a mismatch would
+    train the generator on a history distribution it will never be served. That also retires the
+    legacy per-step ``.npz`` path as an FM training source -- it has no recorded snapshot pose to
+    substitute, so it is stamped ``"per_step"`` and refused."""
 
 
 def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
@@ -464,6 +485,9 @@ class RecordedWindowWriter:
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
         meta: Provenance/layout metadata (stored as JSON attrs).
         compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
+        tag_families: Also store the per-window clip-family code (``clip_family``), which
+            ``FlowMatchingConfig.skip_families`` filters on. Opt-in for the same reason
+            ``tag_distractors`` is.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
     """
@@ -472,7 +496,8 @@ class RecordedWindowWriter:
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
-        tag_distractors: bool = False, record_history_ref: bool = False,
+        tag_distractors: bool = False, tag_families: bool = False,
+        record_history_ref: bool = False,
     ) -> None:
         import h5py
 
@@ -493,6 +518,12 @@ class RecordedWindowWriter:
         # tests stay valid. ``load_recorded_windows`` treats it as optional on read.
         if tag_distractors:
             shapes["is_distractor"] = (num_windows,)
+        # Same opt-in for the per-window family code, which is the general form of the
+        # distractor flag. This was MISSING while record_data.py assembled the key anyway, so
+        # write_batch silently dropped it (it iterates the declared keys) and
+        # ``--skip_families`` could never find its tag.
+        if tag_families:
+            shapes["clip_family"] = (num_windows,)
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
         if depth_shape is not None:

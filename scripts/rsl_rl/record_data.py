@@ -393,6 +393,7 @@ def _build_recording_meta(
     log_dir: str,
     num_pairs: int,
     state_frames: list[str],
+    windowed: bool,
 ) -> RecordingMeta:
     """Capture provenance and obs/action layout metadata once at the start.
 
@@ -403,6 +404,8 @@ def _build_recording_meta(
         log_dir: Directory the checkpoint lives in.
         num_pairs: Final number of pairs that will be saved.
         state_frames: Extra body frames appended to the state vector (in order).
+        windowed: Whether this is a windowed (.h5) recording. Only that path substitutes the
+            plan anchor into the history rows, so it decides ``history_anchor``.
 
     Returns:
         A populated :class:`RecordingMeta`.
@@ -464,6 +467,9 @@ def _build_recording_meta(
         # selection is the default the FM dataset resolves. Same producer the tracker
         # export reads, so the two artifacts cannot describe different windows.
         reference_blocks=(list(ref_blocks) if ref_blocks else None),
+        # Windowed recordings substitute the plan anchor into the history rows (see
+        # collect_windows); the per-step .npz path does not, and its rows stay measured.
+        history_anchor="plan" if windowed else "per_step",
     )
 
 
@@ -833,6 +839,7 @@ def collect_windows(
     writer,
     max_steps: int | None = None,
     distractor_clips=None,
+    family_codes=None,
 ) -> int:
     """Roll out and STREAM pre-formed FM snap windows to ``writer`` (bounded RAM).
 
@@ -885,6 +892,13 @@ def collect_windows(
     # measured robot state; ``hist_ref`` is the reference applied at the same steps.
     hist: torch.Tensor | None = None
     hist_ref: torch.Tensor | None = None
+    # The PLAN ANCHOR in force at each step: the robot root pose captured at the last
+    # re-anchor (``_snap_target_*``). Ringed per step rather than read once at emit, because
+    # at a snap step the re-anchor has already moved the snapshot onto the robot NOW -- reading
+    # it then would give the anchor of the plan being STARTED, not the one whose tail the
+    # history rows belong to. Per-step also makes a window that straddles a re-plan correct by
+    # construction instead of by argument.
+    hist_anchor: torch.Tensor | None = None
     valid = torch.zeros(n_envs, dtype=torch.long, device=device)
     # Distinct episode ids per env so the FM's by-episode train/val split has no leakage.
     episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
@@ -914,9 +928,11 @@ def collect_windows(
         # reference is resolved). The two must agree or the partially autoregressive history
         # is off by one.
         ref_t = _assemble_ref_state(ref_cmd, ref_base_frame, state_frames, n_envs)
+        anchor_t = torch.cat([ref_cmd._snap_target_pos, ref_cmd._snap_target_quat], dim=-1)
         if hist is None:
             hist = torch.zeros(n_envs, H, state_t.shape[1], device=device)
             hist_ref = torch.zeros(n_envs, H, ref_t.shape[1], device=device)
+            hist_anchor = torch.zeros(n_envs, H, anchor_t.shape[1], device=device)
         reanchor_t = ref_cmd._reanchor_active.to(torch.bool)                    # [N]
 
         # Push this step's rows into the rings; mark the row valid.
@@ -924,6 +940,8 @@ def collect_windows(
         hist[:, H - 1] = state_t
         hist_ref = torch.roll(hist_ref, shifts=-1, dims=1)
         hist_ref[:, H - 1] = ref_t
+        hist_anchor = torch.roll(hist_anchor, shifts=-1, dims=1)
+        hist_anchor[:, H - 1] = anchor_t
         valid = torch.clamp(valid + 1, max=H)
 
         # Emit a window for each env that snaps AND has a full valid ring AND whose whole
@@ -944,8 +962,21 @@ def collect_windows(
             idx = emit.nonzero(as_tuple=False).flatten()
             ref_future_t = _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs)
             cmd_future_t = ref_cmd.get_future_command_velocity(future_offsets)  # [N, F, 3]
+            # The dataset reads ONLY root_pos_w / root_quat_w out of history_state, and uses
+            # each history row's copy as the FRAME that row's reference is observed in. So
+            # substituting the plan anchor into rows 0..H-2 is the whole of "observe the
+            # history in its plan's frame" -- no format or dataset change.
+            #
+            # Row H-1 keeps the MEASURED pose: that row is the TARGET's anchor, and the target
+            # is observed relative to the robot as it actually is at the snap.
+            #
+            # The other columns of rows 0..H-2 stay measured and stay unread. That makes those
+            # rows a deliberate mix, which is why RecordingMeta.history_anchor records it and
+            # the dataset refuses a recording that does not say "plan".
+            hist_out = hist[idx].clone()
+            hist_out[:, :H - 1, 0:7] = hist_anchor[idx][:, :H - 1]
             batch = {
-                "history_state": hist[idx].detach().cpu().numpy(),
+                "history_state": hist_out.detach().cpu().numpy(),
                 "history_ref": hist_ref[idx].detach().cpu().numpy(),
                 "ref_future": ref_future_t[idx].detach().cpu().numpy(),
                 "cmd_future": cmd_future_t[idx].detach().cpu().numpy(),
@@ -1146,7 +1177,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         distractor_clips = _distractor_clip_mask(ref_cmd)
         family_codes, family_names = _clip_family_codes(ref_cmd)
 
-        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_records, state_frames)
+        meta = _build_recording_meta(
+            env, agent_cfg, resume_path, log_dir, num_records, state_frames, windowed=windowed
+        )
         # The code -> name table for the per-window 'clip_family' tag. Meaningless without
         # it, so it travels in the recording rather than being reconstructed from a library
         # that may have moved on.
@@ -1244,6 +1277,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
                 # drop" from "this recording predates the tag" and refuse the latter.
                 tag_distractors=True,
+                # And the family code it generalises. Without this the writer never declared
+                # the dataset, so the key record_data assembled was silently dropped and
+                # --skip_families could never match.
+                tag_families=True,
                 # Same reasoning for the applied-reference ring: recording it always makes
                 # `history_source=reference_partial` a train-time A/B, and its absence
                 # unambiguously means "this recording predates the mode".
@@ -1253,7 +1290,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
                     ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
                     state_frames=state_frames, future_len=rf_len, writer=writer,
-                    distractor_clips=distractor_clips,
+                    distractor_clips=distractor_clips, family_codes=family_codes,
                 )
             prov_dir = os.path.splitext(out_path)[0] + ".provenance"
             git_snapshot(prov_dir)
