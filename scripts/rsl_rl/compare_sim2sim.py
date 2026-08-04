@@ -257,6 +257,10 @@ def stage_mujoco(args) -> int:
            "--clip_id", "0",
            "--clip_ego_anchor", "--clip_ego_anchor_every", "1",
            "--fm_update_every", str(args.fm_update_every),
+           # The runner clamps this to the window length, so anything >= F logs the WHOLE
+           # predicted window. Its own default is 0 = log nothing, which silently left the
+           # viser ribbon and every downstream .pred.npy empty.
+           "--fm_traj_points", str(args.fm_traj_points),
            ("--gaussian_noise" if args.gaussian_noise else "--zero_noise"),
            "--headless", "--total_time", str(case["clip_len"] * 0.02), "--log"]
     # Clip-only: omit --clip_handoff_time entirely so no fm.onnx is loaded at all.
@@ -321,7 +325,18 @@ def _load_isaac(path: str, ep: int = 0) -> dict:
     meta = json.loads(str(d["meta_json"]))
     ep = int(ep)
     corner = np.asarray(d["cell_corner"][ep], dtype=np.float64)
-    has_overlay_tile = bool(np.any(corner != 0.0))
+    # Ask the env which tile it ran on rather than inferring it from the corner. The old test
+    # -- "a non-zero corner means an overlay tile" -- rests on the importer leaving a flat
+    # env's corner at exactly zero, and that is not true: flat clip 7208 came back with
+    # corner (-13.515, -3.177) while its real datum, clip_world_pos, was (-11.515, -0.449).
+    # Picking the corner there put the Isaac robot 2.0 m out in x and 2.7 m in y.
+    # It stayed invisible because on an OVERLAY tile the two datums are identical (verified
+    # on clip 4092: both (-6.385, -2.299)), so only flat clips are affected -- and this is
+    # the first flat clip run through these stages.
+    if "terrain_id" in d:
+        has_overlay_tile = int(np.asarray(d["terrain_id"]).ravel()[ep]) >= 0
+    else:                                    # pre-terrain_id bundles: the old heuristic
+        has_overlay_tile = bool(np.any(corner != 0.0))
     key = "cell_corner" if has_overlay_tile or "clip_world_pos" not in d else "clip_world_pos"
     off = np.asarray(d[key][ep], dtype=np.float64)                 # [3]
     return {
@@ -958,6 +973,11 @@ def main() -> int:
                    help="[mujoco] FM re-plan cadence. 1 (not 12) because the deploy runtime "
                         "takes it from the tracker artifact's metadata anyway, so a mismatched "
                         "default here was silently ignored.")
+    p.add_argument("--fm_traj_points", type=int, default=256,
+                   help="[mujoco] Predicted-window nodes to log per step. The runner clamps "
+                        "to the window length F, so any value >= F logs the WHOLE window; "
+                        "the default is deliberately above every F we ship. Its own default "
+                        "is 0 = log NOTHING, which leaves the viser ribbon empty.")
     p.add_argument("--gaussian_noise", action="store_true",
                    help="Sample the FM stochastically on BOTH sides (training-matched). The "
                         "default instead runs both sides zero-noise, i.e. deterministic given "

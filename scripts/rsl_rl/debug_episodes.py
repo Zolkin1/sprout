@@ -92,6 +92,7 @@ from isaaclab_rl.rsl_rl import (                                           # noq
     handle_deprecated_rsl_rl_cfg,
 )
 from isaaclab_tasks.utils.hydra import hydra_task_config                   # noqa: E402
+from robot_rl.flow_matching.window import window_to_world                  # noqa: E402
 from robot_rl.tasks.manager_based.robot_rl import mdp                      # noqa: E402
 from rsl_rl.runners import OnPolicyRunner                                  # noqa: E402
 
@@ -247,7 +248,8 @@ def main(env_cfg, agent_cfg) -> int:
                             ("cmd_vel", "ach_vel", "scan_obs", "scan_raw", "scan_hits",
                              "depth", "ctrl", "torque",
                              "root_pos", "root_quat", "joint_pos", "body_pos", "ref_pos",
-                             "done", "fm_pred", "fm_pred_frames", "fm_pred_idx")}
+                             "done", "fm_pred", "fm_pred_quat", "fm_pred_frames",
+                             "fm_pred_idx", "fm_anchor_pos", "fm_anchor_quat")}
     obs = env.get_observations()
     if isinstance(obs, tuple):          # rsl-rl returns (obs, extras) in some versions
         obs = obs[0]
@@ -305,15 +307,31 @@ def main(env_cfg, agent_cfg) -> int:
             # re-plan) so a viewer can show exactly what the FM emitted at any step; the window
             # is only refreshed every ``fm_update_every`` steps, so consecutive steps repeat it
             # while ``fm_pred_idx`` walks forward through it.
-            pred = getattr(cmd, "_pred_root_pos", None)
-            predf = getattr(cmd, "_pred_frame_pos", None)
-            pidx = getattr(cmd, "_pred_idx", None)
-            buf["fm_pred"].append(_np(pred)[:ncap] if pred is not None
-                                  else np.zeros((ncap, 1, 3), "float32"))
-            buf["fm_pred_frames"].append(_np(predf)[:ncap] if predf is not None
-                                         else np.zeros((ncap, 1, 0, 3), "float32"))
-            buf["fm_pred_idx"].append(_np(pidx)[:ncap].astype("int32") if pidx is not None
-                                      else np.zeros((ncap,), "int32"))
+            # Lift the WHOLE window through its OWN stored re-plan anchor, exactly as the
+            # debug ribbon does (FmTrackingCommand._debug_vis_callback). The anchor is the
+            # robot's FULL orientation at the re-plan, so the window it encodes pitches and
+            # rolls with the torso; using the CURRENT pose here instead would shear the
+            # result by the egomotion since that re-plan whenever fm_update_every > 1.
+            #
+            # This used to read ``_pred_root_pos``/``_pred_frame_pos``, which the
+            # reference-window refactor deleted. Both were fetched with a defaulting
+            # ``getattr``, so the capture silently degraded to a zero-filled [ncap, 1, 3]
+            # that still LOOKED like a prediction. Reach for the live attributes instead and
+            # let a rename fail loudly.
+            world = window_to_world(
+                cmd._pred_window[:ncap], cmd._anchor_pos[:ncap, None, :],
+                cmd._anchor_quat[:ncap, None, :], cmd.ctx.nj,
+                cmd.ctx.num_extra_frames, cmd._fm_blocks,
+            )
+            buf["fm_pred"].append(_np(world["base_pos_w"]))                    # [ncap, F, 3]
+            buf["fm_pred_quat"].append(_np(world["base_quat_w"])
+                                       if "base_quat_w" in world
+                                       else np.zeros((ncap, cmd.ctx.F, 4), "float32"))
+            buf["fm_pred_frames"].append(_np(world["ee_pos_w"]) if "ee_pos_w" in world
+                                         else np.zeros((ncap, cmd.ctx.F, 0, 3), "float32"))
+            buf["fm_pred_idx"].append(_np(cmd._pred_idx)[:ncap].astype("int32"))
+            buf["fm_anchor_pos"].append(_np(cmd._anchor_pos)[:ncap])
+            buf["fm_anchor_quat"].append(_np(cmd._anchor_quat)[:ncap])
 
         with torch.inference_mode():
             obs, _, dones, _ = env.step(act)
