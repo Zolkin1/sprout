@@ -155,6 +155,48 @@ def sample_command_schedule(
     return segs
 
 
+
+def hold_constant(schedule: Schedule, windows, dt: float = 0.02) -> Schedule:
+    """Force the command CONSTANT across each ``(t0, t1)`` window, keeping the value it had at ``t0``.
+
+    A terrain clip's approach and exit are stretches of steady walking whose whole contract is that the
+    command and the motion agree -- the approach is now an exact looped stride at the commanded speed, so
+    a command that CHANGES mid-approach asks for something the single loop cannot express and the clip
+    ends up showing the RL one velocity while commanding another.  The interaction is the opposite case:
+    the terrain overrides the command there by design, so that is exactly where a change belongs.
+
+    Confining changes to the interaction keeps the command varied within a clip (which is the point of
+    sampling one at all) without ever contradicting the segments that must track it.
+
+    Args:
+        schedule: the sampled schedule.
+        windows: iterable of ``(t0, t1)`` second spans to hold constant.
+        dt: resampling period used to rebuild the segment list.
+
+    Returns a schedule of the same total duration.
+    """
+    total = total_duration(schedule)
+    n = max(1, int(round(total / float(dt))))
+    grid = rasterize(schedule, n, float(dt)).astype(np.float64)
+    for w0, w1 in windows:
+        a = max(0, min(n, int(round(float(w0) / float(dt)))))
+        b = max(0, min(n, int(round(float(w1) / float(dt)))))
+        if b > a:
+            grid[a:b] = grid[a]
+    out: Schedule = []
+    start = 0
+    for i in range(1, n + 1):
+        if i == n or np.any(np.abs(grid[i] - grid[start]) > 1e-6):
+            out.append(((i - start) * float(dt), *(float(v) for v in grid[start])))
+            start = i
+    # Rounding can leave the total a frame short/long; the last segment absorbs it, as in the sampler.
+    drift = total - sum(d for d, *_ in out)
+    if out and abs(drift) > 1e-9:
+        d, vx, vy, wz = out[-1]
+        out[-1] = (d + drift, vx, vy, wz)
+    return out
+
+
 def cmd_at(schedule: Schedule, t_now: float) -> np.ndarray:
     """The ``(vx, vy, wz)`` command in effect at ``t_now`` seconds (saturating at the end)."""
     acc = 0.0

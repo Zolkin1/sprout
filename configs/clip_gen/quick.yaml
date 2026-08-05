@@ -24,6 +24,12 @@ distractor_tiles: 3
 distractor_s: 6.0
 
 # ---------------------------------------------------------------- flat family
+flat_loops: true              # exact looped strides + bounded MB transients
+flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
+flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
+flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
+flat_min_transient_s: 0.35
+flat_hop_slack: 1.15
 flat_clip_length: 20.0
 flat_seg_dur_range: [1.5, 5.5]
 flat_walk_vx_range: [0.1, 1.0]
@@ -57,12 +63,16 @@ pin_cmd: ramp                   # 'ramp' decelerates the approach command to the
                                 # fixed boundary sheds the speed by itself. MEASURED false: under
                                 # 'hold' the approach reaches the stairs at 2.4 m/s against a replay
                                 # starting near 0.7, a -12 m/s^2 velocity discontinuity at the splice
+bounded_approach: true      # exact loop + bounded transient approach
+approach_a_max: 2.0
+approach_min_transient_s: 0.35
+approach_hop_slack: 1.3
 ramp_s: 1.5                     # seconds to bleed the approach command down to the entry speed. 0.8
                                 # cannot shed ~2 m/s at any rate a walking robot achieves; the
                                 # measured speed-change response is ~1.5 s
 
 # ---------------------------------------------------------------- RL-visible command
-rl_cmd_vary: true
+rl_cmd_vary: false
 rl_cmd_seg_dur_range: [2.5, 5.5]
 segment_reuse: false            # share a generated MB segment between clips with identical
                                 # conditioning. OFF: with per-clip schedules two clips are only

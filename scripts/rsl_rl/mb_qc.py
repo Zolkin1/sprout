@@ -33,6 +33,7 @@ import argparse
 import numpy as np
 
 from motion_gen.clips.clip_io import load_clip_library
+from motion_gen.world_lift import _ANCHOR_MASK_FLAT
 
 _TERRAIN_TYPE_NAMES = ["flat", "terrain", "transition", "slope", "box"]
 
@@ -92,9 +93,74 @@ def _regime_mask(cmd: np.ndarray, dt: float, ramp_s: float) -> np.ndarray:
     return dist >= ramp_s
 
 
+def _cycle_avg_err(vx: np.ndarray, vy: np.ndarray, cmd: np.ndarray, steady: np.ndarray,
+                   win: int) -> tuple[float, float]:
+    """Velocity error AVERAGED OVER ABOUT A GAIT CYCLE -- the only honest tracking number here.
+
+    ``err_steady_*`` compares the INSTANTANEOUS body velocity to the command frame by frame, and a real
+    gait's pelvis accelerates and decelerates within every step.  A library of mathematically EXACT
+    looped replays -- velocity correct to 1e-6 m/s over whole periods -- still scores ``err_steady_p50``
+    of 0.188 m/s on that metric, so it cannot tell a perfect reference from a mediocre one.  Smoothing
+    over a cycle removes the oscillation and leaves the part that is actually a tracking error: measured
+    that way, exact loops score 0.017 and Motion Bricks' own flat motion 0.099 m/s.
+
+    Windows are only scored where the command is steady THROUGHOUT, so a smoothed sample never straddles
+    a command change.  Returns ``(p50, p95)`` of the forward-velocity error, NaN if nothing qualifies.
+    """
+    n = vx.shape[0]
+    if n < win + 2:
+        return float("nan"), float("nan")
+    k = np.ones(win) / win
+    sm = np.convolve(vx, k, mode="valid")                  # [n - win + 1]
+    tgt = cmd[win // 2: win // 2 + sm.size, 0]
+    ok = np.convolve(steady.astype(float), k, mode="valid") > 0.999   # steady across the whole window
+    if ok.sum() < 3:
+        return float("nan"), float("nan")
+    e = np.abs(sm[ok] - tgt[ok])
+    return float(np.percentile(e, 50)), float(np.percentile(e, 95))
+
+
+def _seam_accel_ratios(root_speed: np.ndarray, seams: np.ndarray) -> np.ndarray:
+    """PER-SEAM: how far each seam's velocity jump stands out against the clip's own variation.
+
+    ``seam_speed`` is the root speed AT the seam, which is dominated by how fast the clip is walking --
+    a 3 m/s clip reports a 3 m/s "seam speed" whether or not anything is wrong.  What matters is whether
+    the velocity CHANGES discontinuously there, and "discontinuous" only means anything relative to the
+    accelerations the gait already contains.  So: the seam's |dv| over the p95 of |dv| everywhere else.
+    ~1 means the seam looks like ordinary gait; >> 1 is a pop.
+
+    Returned PER SEAM, not reduced to the clip's worst.  A max-per-clip summary is not comparable across
+    families: a flat clip has 6-7 seams and a terrain clip 2, so the flat one scores worse for identical
+    per-seam quality simply by having more chances to be unlucky.  That structural unfairness read as a
+    flat regression (3.77 vs terrain 0.02) that did not exist -- pooled per-seam, flat was the better of
+    the two.  Pool these across the library and take percentiles of the pool.
+    """
+    if seams.size == 0 or root_speed.size < 4:
+        return np.zeros(0)
+    dv = np.abs(np.diff(root_speed))
+    # root_speed[k] spans the interval [k, k+1], so the interval STRADDLING a seam at frame b is
+    # root_speed[b-1], and the jump can show up on either side of it: dv[b-2] or dv[b-1].  Which one
+    # depends on the splice -- a weld duplicates a frame at the seam, making the straddling interval
+    # equal to a neighbour and zeroing that side.  Reading a single fixed offset therefore reported a
+    # flat 0.00 for every terrain ENTRY seam (all 20 of them, p50 through max) purely because the
+    # duplicate landed on the side being sampled.  Take the worst of the two.
+    ref_mask = np.ones(dv.size, dtype=bool)
+    for b in seams:
+        ref_mask[max(0, b - 3):min(dv.size, b + 2)] = False   # keep seam neighbourhoods out of the
+    if ref_mask.sum() < 8:                                    # reference, else a pop inflates its own
+        ref_mask[:] = True                                    # normalizer and hides itself
+    ref = float(np.percentile(dv[ref_mask], 95))
+    if ref <= 1e-9:
+        return np.zeros(0)
+    lo = np.clip(seams - 2, 0, dv.size - 1)
+    hi = np.clip(seams - 1, 0, dv.size - 1)
+    return np.maximum(dv[lo], dv[hi]) / ref
+
+
 def _clip_metrics(y: np.ndarray, dy: np.ndarray, contact: np.ndarray, cmd: np.ndarray,
                   amt: np.ndarray | None, dt: float, ramp_s: float,
-                  min_stance: int, edge: int) -> dict:
+                  min_stance: int, edge: int, stride_idx: np.ndarray | None = None,
+                  cycle_win: int = 40) -> dict:
     """Per-clip metrics over the clip's REAL frames (padding already stripped by the caller)."""
     yaw = _yaw_wxyz(y[:, 3:7])
     c, s = np.cos(yaw), np.sin(yaw)
@@ -103,7 +169,23 @@ def _clip_metrics(y: np.ndarray, dy: np.ndarray, contact: np.ndarray, cmd: np.nd
     wz = dy[:, 5]
     err = np.stack([vx - cmd[:, 0], vy - cmd[:, 1], wz - cmd[:, 2]], axis=-1)
     speed_err = np.linalg.norm(err[:, :2], axis=-1)       # planar velocity error magnitude
-    steady = _regime_mask(cmd, dt, ramp_s)
+    # Prefer the regime the GENERATOR recorded over one inferred from command change points: with exact
+    # looped steady stretches the two no longer coincide, because a transient's extent is Motion Bricks'
+    # choice rather than the command's.  ``stride_idx >= 0`` IS "this frame is an exact loop replay".
+    if stride_idx is not None and stride_idx.size == cmd.shape[0] and bool((stride_idx >= 0).any()):
+        # Only when this clip actually HAS looped frames.  A composed library declares ``has_regime``
+        # library-wide, but only the flat family carries loops -- terrain writes -1 throughout, so taking
+        # this branch there would mark the whole clip "not steady" and report no tracking at all.
+        steady = stride_idx >= 0
+    elif amt is not None and amt.size == cmd.shape[0] and np.unique(amt).size > 1:
+        # TERRAIN.  Its command is a deliberate per-clip CONSTANT (one terrain-agnostic user command for
+        # the whole clip), so change-point inference calls the entire clip steady and the tracking error
+        # comes out meaningless -- the traversal is exactly where command and motion are SUPPOSED to
+        # diverge, because the terrain overrides the command.  Score only the ego-anchored approach and
+        # exit, which is where the contract says they must agree.
+        steady = amt == _ANCHOR_MASK_FLAT
+    else:
+        steady = _regime_mask(cmd, dt, ramp_s)
 
     disp, spd, stance_s = [], [], []                       # per-stance net slide, both feet pooled
     for f, base in enumerate((7, 14)):                      # left / right ankle_roll pos_x
@@ -119,11 +201,47 @@ def _clip_metrics(y: np.ndarray, dy: np.ndarray, contact: np.ndarray, cmd: np.nd
     duty = float(contact.mean()) if contact.size else 0.0
 
     root_speed = np.linalg.norm(y[1:, 0:3] - y[:-1, 0:3], axis=-1) / dt
-    seam_speed = float("nan")
-    if amt is not None and amt.size == y.shape[0]:        # per-step anchor mask changes AT the seams
-        seams = np.nonzero(np.diff(amt.astype(np.int16)) != 0)[0]
+    seam_speed, seam_ratios = float("nan"), np.zeros(0)
+    # Seams come from the per-step anchor mask (terrain) or, on a loop-spliced flat clip, from where the
+    # exact-replay stretches start and stop.
+    # Whichever source actually VARIES marks this clip's seams: terrain segments them with the per-step
+    # anchor mask, flat with stride_idx.  In a COMPOSED library a flat clip still carries a per-step mask,
+    # but a constant one (its whole clip is ego-anchored), so keying on presence alone found no seams at
+    # all and reported n/a for the entire flat family.
+    # Both sources are read and the seams LABELLED by which one moved, because they mark different
+    # things and are worth scoring apart: the anchor mask changes only where the clip enters or leaves
+    # the terrain, while stride_idx changes at every loop<->transient handoff.  Keying on one source
+    # alone hides the other's seams entirely -- terrain reported 2 seams per clip (its boundaries) and
+    # none of its internal handoffs, so "25% of terrain seams are bad" could not be attributed.
+    seam_kinds: list[str] = []
+    parts = []
+    for cand, kind in ((amt, "boundary"), (stride_idx, "loop")):
+        if cand is not None and cand.size == y.shape[0] and np.unique(cand).size > 1:
+            idx = np.nonzero(np.diff(cand.astype(np.int32)) != 0)[0] + 1
+            parts.append((idx, kind))
+    if parts:
+        # A boundary and a loop handoff can coincide (the replay starts exactly where the approach loop
+        # ends); credit those to the boundary, which is the stronger constraint.
+        bidx = np.concatenate([i for i, k in parts if k == "boundary"]) if any(
+            k == "boundary" for _, k in parts) else np.zeros(0, dtype=int)
+        seams_l, kinds_l = [], []
+        for idx, kind in parts:
+            for j in idx:
+                if kind == "loop" and bidx.size and np.abs(bidx - j).min() <= 1:
+                    continue
+                seams_l.append(int(j)); kinds_l.append(kind)
+        order = np.argsort(np.asarray(seams_l))
+        seams = np.asarray(seams_l, dtype=int)[order]
+        seam_kinds = [kinds_l[i] for i in order]
+        # The two boundaries of a terrain clip are its entry and its exit, in timeline order.
+        bpos = [i for i, k in enumerate(seam_kinds) if k == "boundary"]
+        if len(bpos) == 2:
+            seam_kinds[bpos[0]] = "entry"
+            seam_kinds[bpos[1]] = "exit"
         if seams.size:
-            seam_speed = float(root_speed[np.clip(seams, 0, root_speed.size - 1)].max())
+            seam_speed = float(root_speed[np.clip(seams - 1, 0, root_speed.size - 1)].max())
+            seam_ratios = _seam_accel_ratios(root_speed, seams)
+    cyc50, cyc95 = _cycle_avg_err(vx, vy, cmd, steady, cycle_win)
 
     return {
         "n": int(y.shape[0]),
@@ -131,6 +249,14 @@ def _clip_metrics(y: np.ndarray, dy: np.ndarray, contact: np.ndarray, cmd: np.nd
         "err_steady_p50": _pct(speed_err[steady], 50), "err_steady_p95": _pct(speed_err[steady], 95),
         "err_trans_p50": _pct(speed_err[~steady], 50), "err_trans_p95": _pct(speed_err[~steady], 95),
         "err_wz_p95": _pct(np.abs(err[:, 2]), 95),
+        # The instantaneous errors above are dominated by within-stride gait oscillation; these two are
+        # the ones to read for tracking quality (see _cycle_avg_err).
+        "cyc_err_p50": cyc50, "cyc_err_p95": cyc95,
+        # The clip's WORST seam, for ranking bad clips only -- never compare it across families (see
+        # _seam_accel_ratios). The pooled per-seam distribution is reported separately.
+        "seam_accel_max": float(seam_ratios.max()) if seam_ratios.size else float("nan"),
+        "seam_ratios": seam_ratios,
+        "seam_kinds": seam_kinds,
         "steady_frac": float(steady.mean()),
         "n_stances": int(slide_disp.size),
         "contact_duty": duty,
@@ -188,6 +314,10 @@ def main() -> int:
                    help="Regime window (s) around a command change; matches mb_env.regime_weight's default.")
     p.add_argument("--max-clips", type=int, default=0,
                    help="Evenly subsample to at most this many clips (0 = all). For a 10k library.")
+    p.add_argument("--cycle-s", type=float, default=0.8,
+                   help="Averaging window (s) for cyc_err_*, about one gait cycle. The instantaneous "
+                        "err_steady_* cannot separate tracking error from within-stride oscillation: an "
+                        "EXACT looped replay scores 0.188 on it. Smoothing over a cycle can.")
     p.add_argument("--min-stance", type=int, default=5,
                    help="Minimum contact-run length (frames) counted as a stance; shorter runs are low "
                         "swing passes of the geometric contact flag, not stances.")
@@ -211,6 +341,12 @@ def main() -> int:
     clen = lib.clip_len_or_full().numpy()
     tcode = np.asarray(lib.terrain_type_code)
     amt_all = np.asarray(lib.anchor_mask_per_step()) if lib.anchor_mask_t.numel() else None
+    # ``stride_idx`` marks the exact-loop frames, but ONLY where the generator actually wrote it: the
+    # dataset is created with h5py's default fill of 0, so an older library reads as "stride 0
+    # everywhere" == 100% steady.  Gate on the explicit attr rather than on the dataset being present.
+    si_all = np.asarray(lib.stride_idx) if bool(lib.attrs.get("has_regime", False)) else None
+    if si_all is not None:
+        print("[mb_qc] using the generator-recorded regime (stride_idx >= 0 == exact loop replay)")
 
     idx = list(range(int(lib.num_clips)))
     if args.max_clips > 0 and len(idx) > args.max_clips:
@@ -223,7 +359,9 @@ def main() -> int:
         n = max(2, int(clen[i]))
         r = _clip_metrics(y_all[i, :n], dy_all[i, :n], ct_all[i, :n].astype(bool), tv_all[i, :n],
                           (amt_all[i, :n] if amt_all is not None else None), dt, args.ramp_s,
-                          args.min_stance, args.stance_edge)
+                          args.min_stance, args.stance_edge,
+                          stride_idx=(si_all[i, :n] if si_all is not None else None),
+                          cycle_win=max(4, int(round(args.cycle_s / dt))))
         r["clip"] = i
         r["type"] = _TERRAIN_TYPE_NAMES[int(tcode[i])] if int(tcode[i]) < len(_TERRAIN_TYPE_NAMES) else "?"
         (flat_rows if r["type"] == "flat" else terr_rows).append(r)
@@ -232,18 +370,52 @@ def main() -> int:
               ("contact_duty", "frac"), ("stance_s_med", "s"), ("n_stances", "-"),
               ("root_speed_max", "m/s"), ("seam_speed_max", "m/s"),
               ("pelvis_z_min", "m"), ("pelvis_z_max", "m")]
-    tracking = [("err_steady_p50", "m/s"), ("err_steady_p95", "m/s"),
+    tracking = [("cyc_err_p50", "m/s"), ("cyc_err_p95", "m/s"),
+                ("err_steady_p50", "m/s"), ("err_steady_p95", "m/s"),
                 ("err_trans_p50", "m/s"), ("err_trans_p95", "m/s"), ("err_wz_p95", "rad/s"),
-                ("steady_frac", "-")]
+                ("seam_accel_max", "x"), ("steady_frac", "-")]
+    def _seam_pool_by_kind(rows: list[dict], label: str) -> None:
+        """Pool per-seam ratios per seam KIND, so entry / exit / internal handoffs are ranked apart."""
+        buckets: dict[str, list[float]] = {}
+        for r in rows:
+            for ratio, kind in zip(r.get("seam_ratios", []), r.get("seam_kinds", [])):
+                buckets.setdefault(kind, []).append(float(ratio))
+        for kind in ("entry", "exit", "boundary", "loop"):
+            v = np.asarray(buckets.get(kind, []))
+            if not v.size:
+                continue
+            print(f"    {label} {kind:9s}: {v.size:4d} seams  ratio p50={np.percentile(v, 50):.2f} "
+                  f"p95={np.percentile(v, 95):.2f} max={v.max():.2f}  "
+                  f"({100.0 * float((v > 2.0).mean()):.0f}% above 2x the clip's own variation)")
+
+    def _seam_pool(rows: list[dict], label: str) -> None:
+        """Pooled PER-SEAM ratio -- the comparable number, unlike the per-clip max above."""
+        pool = np.concatenate([r["seam_ratios"] for r in rows if r["seam_ratios"].size]) \
+            if any(r["seam_ratios"].size for r in rows) else np.zeros(0)
+        if not pool.size:
+            return
+        print(f"    {label}: {pool.size} seams  ratio p50={np.median(pool):.2f} "
+              f"p95={np.percentile(pool, 95):.2f} max={pool.max():.2f}  "
+              f"({100.0 * (pool > 2.0).mean():.0f}% above 2x the clip's own variation)")
+
     if flat_rows:
         print(f"\n[mb_qc] === FLAT clips ===")
         _summarize(flat_rows, "command tracking (steady vs transition regime)", tracking)
         _summarize(flat_rows, "artefacts", common)
+        print("\n  --- seam discontinuity (pooled per seam; the per-clip max above is NOT comparable "
+              "across families) ---")
+        _seam_pool(flat_rows, "flat")
+        _seam_pool_by_kind(flat_rows, "flat")
         _speed_buckets(flat_rows, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 99.0])
     if terr_rows:
+        _summarize(terr_rows, "command tracking (approach + exit only; the traversal is excluded)",
+                   tracking)
         print(f"\n[mb_qc] === TERRAIN clips (tracking error is EXPECTED: the command is held at the "
               f"approach speed through the traversal) ===")
         _summarize(terr_rows, "artefacts", common)
+        print("\n  --- seam discontinuity (pooled per seam) ---")
+        _seam_pool(terr_rows, "terrain")
+        _seam_pool_by_kind(terr_rows, "terrain")
         by_type: dict[str, list[dict]] = {}
         for r in terr_rows:
             by_type.setdefault(r["type"], []).append(r)

@@ -275,7 +275,7 @@ def episodic_boundaries(n_frames: int) -> tuple[int, int]:
     return 0, n_frames - 1
 
 
-def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
+def pick_boundary(gate: BoundaryGate, *, prefer: str = "first", rng=None) -> int:
     """Choose ONE frame from a candidate gate -- the hand-picked hard-pin frame.
 
     ``prefer="first"`` takes the earliest candidate: for an ENTRY that is the earliest clean hand-off in
@@ -283,6 +283,13 @@ def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
     arrival on the far surface (the traversal stops as soon as it has landed, never stepping onto a
     phantom tread past the tile).  ``prefer="last"`` takes the latest, ``prefer="middle"`` the median
     candidate (a phase in the interior of the window, away from both edges).
+
+    ``prefer="sample"`` draws uniformly from the candidates using ``rng``, and is what an ENTRY should
+    use.  The entry frame IS the gait phase at which the approach hands over to the terrain, and it is
+    an input we choose, not something recovered afterwards -- with a fixed preference every clip sharing
+    a reference enters at the identical phase, so the teacher and the flow-matching model only ever see
+    one hand-off pose out of the whole gate.  The gate has already filtered the candidates down to
+    frames that stand on a tread with the swing foot clear, so any of them is a legal entry.
     """
     if gate.frames.size == 0:
         raise ValueError(f"no boundary candidates to pick from ({gate.reason})")
@@ -292,4 +299,8 @@ def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
         return int(gate.frames[-1])
     if prefer == "middle":
         return int(gate.frames[gate.frames.size // 2])
-    raise ValueError(f"unknown boundary preference {prefer!r} (first | last | middle)")
+    if prefer == "sample":
+        if rng is None:
+            raise ValueError("prefer='sample' needs an rng")
+        return int(gate.frames[int(rng.integers(0, gate.frames.size))])
+    raise ValueError(f"unknown boundary preference {prefer!r} (first | last | middle | sample)")

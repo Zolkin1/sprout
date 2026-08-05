@@ -94,14 +94,6 @@ def _resolve_mb_root(arg: str) -> str:
                      f"{tail} was found above {_REPO}. Pass --mb-root explicitly.")
 
 
-def _n_schedules(path: str) -> int:
-    """How many distractor motions the schedule file asks for (0 if it has not been written yet)."""
-    if not os.path.exists(path):
-        return 0
-    with open(path) as f:
-        return len(json.load(f))
-
-
 def _segments_pending(work: str) -> int:
     """How many unique segments are still missing (0 = stage b's terrain half is done)."""
     req = os.path.join(work, "requests.json")
@@ -150,7 +142,7 @@ def main() -> int:
     stage, cpt = args.stage, int(cfg.clips_per_tile)
     dis_argv = ["--source", args.source, "--num-tiles", str(cfg.distractor_tiles),
                 "--clips-per-tile", str(cpt), "--short-s", str(cfg.distractor_s),
-                "--seed", str(cfg.seed), "--device", args.device]
+                "--seed", str(cfg.seed), "--device", args.device, "--stride-bank", bank]
     box_on, box_off, box_off_front = (int(x) for x in cfg.box_tiles)
     n_flat_clips = cfg.flat_tiles * cpt
     t0 = time.time()
@@ -202,12 +194,36 @@ def main() -> int:
                 # Neither of these was reachable through this driver, so the ramp that decelerates
                 # an approach into the terrain could only be changed by editing
                 # mb_terrain_segments' defaults -- and its default ('hold') switches the ramp OFF.
-                "--pin-cmd", cfg.pin_cmd, "--ramp-s", str(cfg.ramp_s)],
+                "--pin-cmd", cfg.pin_cmd, "--ramp-s", str(cfg.ramp_s)]
+                + (["--bounded-approach", "--a-max", str(cfg.approach_a_max),
+                    "--min-transient-s", str(cfg.approach_min_transient_s),
+                    "--hop-slack", str(cfg.approach_hop_slack)] if cfg.bounded_approach else []),
                 conda_env=args.conda_env)
         else:
             print(f"\n===== [segments] all present, skipping")
+        flat_plans = os.path.join(work, "flat_plans.json")
+        flat_tr = os.path.join(work, "flat_transients")
+        if cfg.flat_loops:
+            # Plan the flat clips (pass A) then generate ONLY their transients (pass B). Steady state is
+            # an exact looped stride replayed in pass C, so Motion Bricks runs ~6 times per clip instead
+            # of ~37 and never produces the steady stretches it tracks poorly.
+            if not os.path.exists(os.path.join(_REPO, flat_plans)):
+                _run("flat-plan", "mb_flat_clips.py", [
+                    "--stride-bank", bank, "--dump-plan", flat_plans,
+                    "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
+                    "--hold-s-range", *(str(v) for v in cfg.flat_hold_s_range),
+                    "--seed", str(cfg.seed)])
+            _run("flat-transients", "mb_flat_transients.py", [
+                "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", flat_plans,
+                "--out-dir", flat_tr, "--ramp-dv", str(cfg.flat_ramp_dv),
+                "--a-max", str(cfg.flat_a_max), "--alpha-max", str(cfg.flat_a_max),
+                "--min-transient-s", str(cfg.flat_min_transient_s),
+                "--hop-slack", str(cfg.flat_hop_slack), "--seed", str(cfg.seed)],
+                conda_env=args.conda_env)
         n_have = len(glob.glob(os.path.join(_REPO, raw_flat, "*.npz")))
-        if n_have < n_flat_clips:
+        if cfg.flat_loops:
+            pass
+        elif n_have < n_flat_clips:
             # The flat velocity bands are forwarded EXPLICITLY. They are mb_encode's own args and
             # this driver never passed them, so the only way to change the flat family's speed
             # distribution was to edit that file's defaults -- i.e. a library was not reproducible
@@ -224,21 +240,26 @@ def main() -> int:
         else:
             print(f"\n===== [flat-gen] {n_have} raw flat motions present, skipping")
         if cfg.distractor_tiles > 0:
-            n_want = _n_schedules(os.path.join(_REPO, dis_sched))
-            n_got = len(glob.glob(os.path.join(_REPO, raw_dis, "*.npz")))
-            if n_got < n_want:
-                _run("distract-gen", "mb_encode.py", [
-                    "--mb-root", args.mb_root, "--stride-bank", bank, "--out-dir", raw_dis,
-                    "--schedules", dis_sched, "--seed", str(cfg.seed)], conda_env=args.conda_env)
-            else:
-                print(f"\n===== [distract-gen] {n_got} raw distractor motions present, skipping")
+            # The distractor family is built from the same loops + in-betweenings as the flat one, so
+            # its transients come from the same generator.  It used to run mb_encode.py, i.e. Motion
+            # Bricks tracking a command schedule for the whole clip -- which left 10% of the library
+            # on the pre-redesign path, with that path's steady-velocity error and foot slide.
+            _run("distract-gen", "mb_flat_transients.py", [
+                "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", dis_sched,
+                "--out-dir", raw_dis, "--ramp-dv", str(cfg.flat_ramp_dv),
+                "--a-max", str(cfg.flat_a_max), "--alpha-max", str(cfg.flat_a_max),
+                "--min-transient-s", str(cfg.flat_min_transient_s),
+                "--hop-slack", str(cfg.flat_hop_slack),
+                "--seed", str(cfg.seed)], conda_env=args.conda_env)
 
     # --- stage c: splice / ingest into per-family libraries (env_isaaclab) --------------------------
     if stage in ("all", "c"):
         if not glob.glob(os.path.join(_REPO, fam_dir, "family_stairs_*.h5")):
             _run("assemble", "mb_assemble_library.py", [
                 "--work-dir", work, "--source", args.source, "--out-dir", fam_dir,
-                "--device", args.device, "--workers", str(args.workers)])
+                "--device", args.device, "--workers", str(args.workers)]
+                # The bank is how pass C replays the loop that covers a bounded approach's budget.
+                + (["--stride-bank", bank] if cfg.bounded_approach else []))
         # PURE stair tiles: no approach or exit, so Motion Bricks has nothing to in-between and
         # mb_plan_library hardcodes n_pure=0. They used to come from the DEPRECATED
         # generate_box_clips.py and be stapled on by hand with --extra-mix, which is how the first
@@ -258,14 +279,23 @@ def main() -> int:
                     "--stair-float-frac", str(cfg.stair_float_frac),
                     "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
                     "--tile-seed", str(cfg.seed), "--device", args.device])
-        if not os.path.exists(os.path.join(_REPO, flat_h5)):
+        if cfg.flat_loops and not os.path.exists(os.path.join(_REPO, flat_h5)):
+            _run("flat-clips", "mb_flat_clips.py", [
+                "--assemble", "--stride-bank", bank,
+                "--plans", os.path.join(work, "flat_plans.json"),
+                "--transient-dir", os.path.join(work, "flat_transients"),
+                "--source", args.source, "--out", flat_h5,
+                "--clip-length", str(cfg.flat_clip_length),
+                "--device", args.device, "--seed", str(cfg.seed)])
+        elif not os.path.exists(os.path.join(_REPO, flat_h5)):
             _run("flat-clips", "generate_mb_clips.py", [
                 "--raw-dir", raw_flat, "--source", args.source, "--out", flat_h5,
                 "--clip-length", str(cfg.flat_clip_length), "--device", args.device,
                 "--rl-vels", cfg.rl_vels, "--workers", str(args.workers)])
         if cfg.distractor_tiles > 0 and not os.path.exists(os.path.join(_REPO, dis_h5)):
             _run("distract-clips", "mb_distractor_clips.py",
-                 dis_argv + ["--mb-raw-dir", raw_dis, "--out", dis_h5, "--workers", str(args.workers)])
+                 dis_argv + ["--transient-dir", raw_dis, "--plans", dis_sched, "--out", dis_h5,
+                             "--workers", str(args.workers)])
 
     # --- stage d: one training library at the requested tile proportions ---------------------------
     if stage in ("all", "d"):

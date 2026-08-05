@@ -116,6 +116,7 @@ def _tile_worker(i: int):
 
             job_args = SimpleNamespace(
                 source=args.source, seam_blend_s=args.seam_blend_s, weld_search=args.weld_search,
+                stride_bank=args.stride_bank,
                 arrival_search=args.arrival_search, approach_pin=pin, exit_pin=pin,
                 approach_keyframes=None, exit_keyframes=None,
                 approach_raw=_raw(j.get("approach_key")), exit_raw=_raw(j.get("exit_key")),
@@ -154,6 +155,7 @@ def _write_family(path: str, recs: list[dict], builder, dt: float, skill: str) -
             "pos_output_names": list(builder.pos_names), "vel_output_names": list(builder.vel_names),
             "contact_frames": _CONTACT_FRAMES, "ref_frame": "pelvis_link", "skill_list": [skill]}
     writer = ClipLibraryWriter(path, len(recs), meta)
+    writer.set_attr("has_regime", True)
     writer.set_attr("generator", f"motionbricks_terrain_{skill}_v1")
     writer.set_attr("terrain_manifest", [r["manifest"] for r in recs])   # one entry per clip; consumers dedup
     for i, r in enumerate(recs):
@@ -161,7 +163,9 @@ def _write_family(path: str, recs: list[dict], builder, dt: float, skill: str) -
             "y_des": _pad(r["y"]).unsqueeze(0), "dy_des": _pad(r["dy"]).unsqueeze(0),
             "contact": _pad(r["contact"]).unsqueeze(0),
             "skill_id": torch.zeros(1, T, dtype=torch.uint8),
-            "stride_idx": torch.full((1, T), -1, dtype=torch.int32),
+            "stride_idx": (_pad(r["stride_idx_t"].to(torch.int32)).unsqueeze(0)
+                           if r.get("stride_idx_t") is not None
+                           else torch.full((1, T), -1, dtype=torch.int32)),
             "target_vel": _pad(r["target_vel"]).unsqueeze(0),
             "terrain_id": torch.tensor([int(r["manifest"]["terrain_id"])], dtype=torch.int32),
             "terrain_type": r["manifest"]["type"],
@@ -190,6 +194,10 @@ def main() -> int:
                         "rigidly, 'auto' follows how each segment was generated. Pinned generation + eased "
                         "seams is the measured best combination.")
     p.add_argument("--seam-blend-s", type=float, default=0.25, help="Seam ease window (s) for eased seams.")
+    p.add_argument("--stride-bank", default=None,
+                   help="Stride bank .npz. Required to assemble BOUNDED approaches: the exact loop that "
+                        "covers the travel budget is replayed from it, using the same stride and gait "
+                        "phase the transient was seeded from.")
     p.add_argument("--weld-search", type=int, default=12)
     p.add_argument("--arrival-search", type=int, default=60,
                    help="Trailing approach frames searched for the in-betweened arrival. Must cover "
@@ -233,6 +241,16 @@ def main() -> int:
     print(f"[mb_asm] done: {got}/{want_n} clips assembled"
           + (f" ({want_n - got} SKIPPED)" if got < want_n else "")
           + f" -> {args.out_dir}")
+    # PLATFORM OVERRUNS.  A segment that outgrew the surface it walks on stays inside the tile footprint
+    # but has nothing underneath it, and the single-clip CLI was the only thing that ever reported it --
+    # at library scale it was silent.  It also gets more likely once an approach is specified by a travel
+    # BUDGET, because then its distance is emergent rather than commanded.
+    for skill, frecs in sorted(by_family.items()):
+        bad = [r for r in frecs if int(r.get("off_surface", 0)) > 0]
+        if bad:
+            worst = max(int(r["off_surface"]) for r in bad)
+            print(f"[mb_asm][WARN] {skill}: {len(bad)}/{len(frecs)} clips leave their walkable surface "
+                  f"(worst {worst} frames) -- the segment outgrew its platform")
     return 0
 
 

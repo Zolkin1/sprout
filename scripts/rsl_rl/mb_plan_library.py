@@ -47,8 +47,8 @@ from mb_terrain_clips import (                                            # noqa
     plan_from_spec,
 )
 
-from motion_gen.command_schedule import (as_json, sample_command_schedule,  # noqa: E402
-                                        total_duration)
+from motion_gen.command_schedule import (as_json, hold_constant,  # noqa: E402
+                                        sample_command_schedule, total_duration)
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
                                     save_terrain_plan)
@@ -78,6 +78,14 @@ def _skill_seed(skill: str) -> int:
     return int.from_bytes(hashlib.sha1(skill.encode()).digest()[:4], "big") % (2 ** 31)
 
 
+# Bump when the MEANING of a segment key changes, so the invalidation is one greppable line rather than a
+# remembered ``rm -rf segments/``.  Partial reuse across such a change is the dangerous outcome: the
+# library silently mixes segments generated under two different contracts.
+#   2: the approach is specified by a travel BUDGET (``approach_dist``) rather than a duration, so the same
+#      (reference, speed, duration) no longer describes the same motion.
+_KEY_VERSION = "v2"
+
+
 def _round_key(*vals) -> str:
     """Stable short hash of the given strings / scalars / arrays (rounded, so float noise cannot split a key).
 
@@ -85,6 +93,7 @@ def _round_key(*vals) -> str:
     would change between runs and break both segment reuse and resume.
     """
     h = hashlib.sha1()
+    h.update(_KEY_VERSION.encode())
     for v in vals:
         if isinstance(v, str):
             h.update(v.encode())
@@ -111,7 +120,7 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = 
     placement -- is absent from both keys by construction.
     """
     rep, ef, xf = plan.terrain_qpos, plan.entry_frame, plan.exit_frame
-    a_scalars = [plan.approach_vx, plan.entry_vx, plan.approach_s]
+    a_scalars = [plan.approach_vx, plan.entry_vx, plan.approach_s, plan.approach_dist]
     x_scalars = [plan.exit_vx, plan.exit_speed, plan.exit_s]
     # ``approach_start`` is part of the key: a run-up from a stand and an arrival already at speed are
     # different motions for the same command, so they must not share a generated segment.
@@ -255,8 +264,25 @@ def _clip_schedule(rng, family_kind: str, approach_s: float, exit_s: float,
         # segments by tracking it, so a constant schedule reproduces the old behaviour exactly
         # rather than approximately.
         return [(total, float(steady_vx), 0.0, 0.0)]
-    return sample_command_schedule(
+    sched = sample_command_schedule(
         rng, duration=total, seg_dur_range=tuple(args.rl_cmd_seg_dur_range), vx_range=band)
+    # HOLD the command across the approach and the exit.  Both are stretches of steady walking that are
+    # generated to track it -- the approach is an exact looped stride AT the commanded speed -- so a change
+    # inside one of them asks for a velocity the segment cannot express, and the clip then shows the RL one
+    # velocity while commanding another.  The interaction is where a change belongs: the terrain overrides
+    # the command there anyway, so the clip still carries a varied command without ever contradicting
+    # itself.  The exit window is left open-ended because the interaction's true length is not known until
+    # the replay is placed, and holding slightly too much is harmless.
+    #
+    # TODO(approach-vel-change): support a command that DOES change during the approach/exit, by building
+    # them as [loop@v0][transient][loop@v1][transient][replay] instead of a single loop + transient. Every
+    # piece already exists -- ``splice_pieces`` is N-ary, ``loop_frames`` takes any entry phase, and
+    # ``flat_plan.sample_plan`` builds exactly this alternation for flat clips. What is missing is pass A
+    # emitting the approach as a PIECE LIST rather than one ``approach_dist``, and pass B generating one
+    # bounded transient per command change instead of one per side. Until then this hold is what keeps the
+    # command and the motion consistent.
+    return hold_constant(sched, [(0.0, float(approach_s)),
+                                 (float(approach_s) + _INTERACTION_BUDGET_S, total)])
 
 
 def _clip_speeds(rng, family_kind: str, args, cpt: int, vx_max: float | None = None) -> list[float]:
@@ -379,7 +405,11 @@ def main() -> int:
                         "matched stride) rather than from a stand. 0 = every clip runs up from rest.")
     p.add_argument("--approach-pin", default="hard", choices=["hard", "soft"])
     p.add_argument("--exit-pin", default="hard", choices=["hard", "soft"])
-    p.add_argument("--entry-pick", default="first", choices=["first", "middle", "last"])
+    p.add_argument("--entry-pick", default="sample",
+                   choices=["first", "middle", "last", "sample"],
+                   help="Which gate candidate the terrain entry hands off at. 'sample' varies the "
+                        "hand-off gait phase per clip; a fixed preference gives every clip on a "
+                        "reference the identical entry pose.")
     p.add_argument("--exit-pick", default="first", choices=["first", "middle", "last"])
     p.add_argument("--contact-tol", type=float, default=0.02)
     p.add_argument("--swing-clear", type=float, default=None)
@@ -493,6 +523,8 @@ def main() -> int:
                     platform_vx=plat_vx, platform_top_vx=top_mag,
                     approach_s=a_s, exit_s=x_s,
                     entry_pick=args.entry_pick, exit_pick=args.exit_pick,
+                    clip_seed=int(np.random.default_rng(
+                        [args.seed + 11, _skill_seed(skill), int(tid), ci]).integers(0, 2 ** 31)),
                     contact_tol=args.contact_tol, swing_clear=args.swing_clear,
                     swing_band=args.swing_band, footprint_margin=args.footprint_margin,
                 )

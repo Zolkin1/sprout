@@ -67,6 +67,22 @@ _SCHEMA: dict[str, tuple] = {
     "pin_lead": ("float", 1),
     "pin_cmd": ("choice", ("ramp", "hold")),
     "ramp_s": ("float", 1),
+    # BOUNDED approach: an exact looped stride covers the tile's travel budget and Motion Bricks only
+    # bridges the last stretch. The duration-driven run-up it replaces did not track its command
+    # (measured 78% overspeed), which is how 41% of jump_on walked off its platform.
+    "bounded_approach": ("bool", 1),
+    # FLAT via exact looped strides + bounded Motion Bricks transients. The old path had Motion Bricks
+    # generate the whole clip, which tracked the commanded speed to ~0.10 m/s; the loops make steady
+    # state exact and leave the model only the transitions.
+    "flat_loops": ("bool", 1),
+    "flat_hold_s_range": ("range", 2),
+    "flat_ramp_dv": ("float", 1),
+    "flat_a_max": ("float", 1),
+    "flat_min_transient_s": ("float", 1),
+    "flat_hop_slack": ("float", 1),
+    "approach_a_max": ("float", 2),
+    "approach_min_transient_s": ("float", 2),
+    "approach_hop_slack": ("float", 2),
     # RL-visible command
     "rl_cmd_vary": ("bool", 1),
     "rl_cmd_seg_dur_range": ("range", 2),

@@ -104,6 +104,7 @@ def _generate_clip(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, segs: li
     command that was asked for; Stage 2 picks which one the RL sees (``--rl-vels``) and reports the gap.
     """
     mb.reset(seed)
+    targeter.reset_phase()                                    # gait phase is per-clip, not per stride index
     total_s = sum(d for d, *_ in segs)
     n_steps = max(2, int(round(total_s * mb.fps)))
     bounds = mb_env.schedule_bounds(segs)
@@ -157,7 +158,7 @@ def main() -> int:
     p.add_argument("--walk-vx-range", type=float, nargs=2, default=(0.1, 1.0), metavar=("MIN", "MAX"),
                    help="Forward WALK band (m/s); also the base band for turn/diagonal segments.")
     p.add_argument("--run-vx-range", type=float, nargs=2, default=(1.0, 3.0), metavar=("MIN", "MAX"),
-                   help="Forward RUN band (m/s), used on the 40% of forward segments that run.")
+                   help="Forward RUN band (m/s), used on the 40%% of forward segments that run.")
     p.add_argument("--back-vx-range", type=float, nargs=2, default=(0.1, 1.5), metavar=("MIN", "MAX"),
                    help="Backward SPEED band (m/s), magnitudes; emitted as negative vx.")
     p.add_argument("--side-vy", type=float, default=1.0, help="Lateral (sidestep) speed scale (m/s).")
@@ -167,6 +168,12 @@ def main() -> int:
                         "(m/s), e.g. a flat baseline matched to a terrain traversal speed.")
     p.add_argument("--steady-secs", type=float, default=6.0, help="Duration (s) of the --steady-vx clip.")
     p.add_argument("--repeats", type=int, default=1, help="Generate each schedule this many times (varied seed).")
+    p.add_argument("--bank-dt", type=float, default=None,
+                   help="DIAGNOSTIC: override the stride bank's own sampling period (s) when advancing the "
+                        "target-pose phase. The bank records its dt and that is what should be used; setting "
+                        "this to the MB frame period (1/30) reproduces the pre-fix behaviour, where the pinned "
+                        "pose walked the stride one BANK frame per MB frame -- 0.6x the cadence the root was "
+                        "driven at. Only useful for measuring what that cost.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--controller", default="random")          # unused; keeps build_demo_args happy
     p.add_argument("--allowed-mode", default=None)
@@ -187,7 +194,13 @@ def main() -> int:
           f"wz[{bmin[2]:+.2f},{bmax[2]:+.2f}]  ({len(np.unique(np.round(steady_vel[:, 0], 2)))} distinct vx)")
 
     mb = mb_env.MBAgent(args, capture_keyframes=True)
-    targeter = mb_env.StrideTargeter(strides, steady_vel, mb.nfpt)
+    # The bank is stored at the RL control period and MB generates at its own fps; the targeter needs both
+    # so the pinned pose walks the stride at the cadence the root is being driven at (see StrideTargeter).
+    bank_dt = float(args.bank_dt) if args.bank_dt else float(bank_meta["dt"])
+    if args.bank_dt:
+        print(f"[mb_encode] DIAGNOSTIC: bank dt overridden {bank_meta['dt']} -> {bank_dt} "
+              f"(pose cadence {bank_dt / mb.dt:.2f}x)")
+    targeter = mb_env.StrideTargeter(strides, steady_vel, mb.nfpt, bank_dt=bank_dt, mb_dt=mb.dt)
     print(f"[mb_encode] {mb.describe()}")
 
     # Three mutually exclusive modes: sampled library (--n-clips), one steady clip (--steady-vx), or a

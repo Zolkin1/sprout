@@ -25,11 +25,13 @@ the ease to absorb, and the ease keeps the feet on the surface).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from ..math_utils import quat_apply, quat_mul
-from ..terrain.box_clip import se2z_align  # noqa: F401  (also re-exported for keyframe transforms)
-from ..playback import inertialize_seam
+from ..terrain.box_clip import align_and_concat, se2z_align  # noqa: F401  (se2z_align re-exported)
+from ..playback import apply_seam_offset, inertialize_seam, seam_offset
 
 Segment = tuple[torch.Tensor, torch.Tensor, torch.Tensor]   # (root_pos[T,3], root_quat[T,4], joints[T,29])
 
@@ -56,17 +58,19 @@ def align_boundary(seg: Segment, boundary: int, tgt_p: torch.Tensor, tgt_q: torc
             plays for a flat clip).
 
     Returns:
-        ``(placed_segment, weld_z)`` where ``weld_z`` is the z shift a full weld applies.  Since a flat MB
-        segment carries its feet at z ~ 0, ``weld_z - surface_height`` is exactly the boundary-pose height
-        residual: how far a hard pin lifts the segment off (or sinks it into) its own walking surface, which
-        is what the hard pin trades the seam pop for.
+        ``(placed_segment, weld_z, gq, t_xyz)`` where ``weld_z`` is the z shift a full weld applies.  Since
+        a flat MB segment carries its feet at z ~ 0, ``weld_z - surface_height`` is exactly the
+        boundary-pose height residual: how far a hard pin lifts the segment off (or sinks it into) its own
+        walking surface, which is what the hard pin trades the seam pop for.  ``(gq, t_xyz)`` is the rigid
+        placement actually applied, so a caller can move things that ride ALONG with the segment but are
+        not part of it -- the pinned keyframes the viser overlay draws, above all.
     """
     P, Q, _J = seg
     gq, t = se2z_align(P[boundary], Q[boundary], tgt_p, tgt_q)
     weld_z = float(t[2])
     t_xyz = torch.tensor([float(t[0]), float(t[1]), weld_z if ground_z is None else float(ground_z)],
                          device=P.device, dtype=P.dtype)
-    return _transform(seg, gq, t_xyz), weld_z
+    return _transform(seg, gq, t_xyz), weld_z, gq, t_xyz
 
 
 def match_overlap(seg: Segment, tgt_p: torch.Tensor, tgt_q: torch.Tensor, tgt_j: torch.Tensor,
@@ -109,6 +113,167 @@ def match_arrival(seg: Segment, tgt_j: torch.Tensor, z_target: float, search: in
     d = torch.linalg.norm(J[-k:] - tgt_j.unsqueeze(0), dim=1) \
         + w_z * (P[-k:, 2] - float(z_target)).abs()
     return int(P.shape[0] - k + int(torch.argmin(d)))
+
+
+@dataclass
+class Piece:
+    """One segment of a spliced clip, plus how it joins its neighbours.
+
+    A clip is an ordered list of these.  Terrain is ``[approach, replay, exit]``; a flat clip is
+    ``[stand, transient, loop, transient, loop, ...]``.  Two independent flags, because they answer
+    different questions:
+
+    * ``anchored`` -- may this piece be MOVED?  The terrain replay sits on its treads exactly as solved,
+      so it defines the output frame and everything else is placed onto it.  A flat clip has no anchored
+      piece at all: nothing is world-pinned, so the chain simply starts wherever the first piece is.
+    * ``rigid`` -- may this piece be MODIFIED by seam easing?  Loops and replays are exact motion whose
+      whole point is that nobody touches them; transients are the give.  A seam eases its non-rigid side.
+    """
+
+    seg: Segment
+    kind: str = "transient"            # "loop" | "transient" | "replay" | "stand"
+    rigid: bool = False                # never modified by easing
+    anchored: bool = False             # never moved; defines the output frame
+    ground_z: float | None = None      # None welds the boundary z; a value places this piece's own
+    #                                    ground (feet at z ~ 0) at that height instead
+    trim: tuple[int, int] = (0, 0)     # (lead_skip, trail_cut), applied BEFORE placement
+    mask: int = 0                      # per-frame anchor-mask value for build_anchor_mask_t
+    stride_idx: int = -1               # loops carry their bank index; everything else -1
+
+
+def _trimmed(p: Piece) -> Segment:
+    lead, trail = int(p.trim[0]), int(p.trim[1])
+    end = p.seg[0].shape[0] - trail
+    if end - lead < 1:
+        raise ValueError(f"piece {p.kind!r}: trim {p.trim} leaves nothing of {p.seg[0].shape[0]} frames")
+    return tuple(x[lead:end] for x in p.seg)
+
+
+def splice_pieces(pieces: list[Piece], *, blend_n: int = 0, dt: float = 0.02):
+    """Join an arbitrary list of :class:`Piece` into one world-space clip.
+
+    Generalizes :func:`splice_terrain`'s fixed ``approach + terrain + exit`` to the
+    ``[loop, transient, loop, ...]`` shape flat generation needs.  Three stages:
+
+    1. **Trim**, so a piece's boundary frame is the one that will actually meet its neighbour.
+    2. **Place.**  Free runs are chained with
+       :func:`~motion_gen.terrain.box_clip.align_and_concat` (each piece's first frame rigidly welded onto
+       the running last frame, duplicate dropped).  A run adjacent to the anchored piece is then moved as
+       a whole onto it -- backwards for the run before, forwards for the run after -- so the anchor never
+       moves.  With no anchored piece the whole list is one chain and the first piece sets the frame.
+    3. **Ease.**  Every seam's offset is captured from the UNMODIFIED concatenation first, then applied
+       over windows clamped so two seams sharing a free piece cannot overlap.  Order-independent by
+       construction; easing lazily would let the second seam reopen the first.
+
+    Returns ``(root_pos[T,3], root_quat[T,4], joints[T,29], bounds, seams, diag)`` -- ``bounds[i]`` the
+    ``(start, end)`` slice of piece ``i``, ``seams[k]`` a per-seam dict, ``diag`` clip-level totals.
+    """
+    if not pieces:
+        raise ValueError("splice_pieces needs at least one piece")
+    anchors = [i for i, p in enumerate(pieces) if p.anchored]
+    if len(anchors) > 1:
+        raise NotImplementedError(
+            f"{len(anchors)} anchored pieces: a run between two fixed pieces is over-constrained (it "
+            f"would have to arrive at exactly the right place on its own). Split into one clip per "
+            f"anchored interaction, or leave all but one un-anchored.")
+    segs = [_trimmed(p) for p in pieces]
+    a = anchors[0] if anchors else None
+
+    def _chain(run_idx: list[int]):
+        """align_and_concat a run of pieces -> (segment, per-piece bounds within the run)."""
+        rp, rq, rj, sb, _ = align_and_concat([segs[i] for i in run_idx])
+        return (rp, rq, rj), sb
+
+    placed: list[tuple[Segment, list]] = []          # (segment, per-piece bounds) in output order
+    place: dict = {}                                 # placement info for the anchor-adjacent runs
+    if a is None:
+        placed.append(_chain(list(range(len(pieces)))))
+        order = [list(range(len(pieces)))]
+        welded = set(range(1, len(pieces)))          # every seam is an align_and_concat weld
+    else:
+        order = []
+        # Seams inside a chained run are position-welded; the two that MEET the anchor are grounded onto
+        # it, so those carry a real residual and keep the positional ease.
+        welded = {i for i in range(1, len(pieces)) if i != a and i != a + 1}
+        if a > 0:                                    # everything before the anchor, moved back onto it
+            run = list(range(a))
+            seg, sb = _chain(run)
+            seg, weld_z, gq, t_xyz = align_boundary(seg, -1, segs[a][0][0], segs[a][1][0],
+                                                    ground_z=pieces[a - 1].ground_z)
+            # Residual AT the intended boundary, i.e. the frame that was aligned -- measured before it is
+            # dropped, so it reports how well the segment reached the pose rather than how far the frame
+            # before it sits from the anchor.
+            place["before"] = {"weld_z": weld_z, "xform": (gq.tolist(), [float(v) for v in t_xyz]),
+                               "joint_res": float(torch.linalg.norm(seg[2][-1] - segs[a][2][0]))}
+            seg = tuple(x[:-1] for x in seg)         # drop the frame duplicating the anchor's first
+            sb = [(s, min(e, seg[0].shape[0])) for s, e in sb]
+            placed.append((seg, sb)); order.append(run)
+        placed.append((segs[a], [(0, segs[a][0].shape[0])])); order.append([a])
+        if a < len(pieces) - 1:                      # everything after, moved forward onto it
+            run = list(range(a + 1, len(pieces)))
+            seg, sb = _chain(run)
+            seg, weld_z, gq, t_xyz = align_boundary(seg, 0, segs[a][0][-1], segs[a][1][-1],
+                                                    ground_z=pieces[a + 1].ground_z)
+            place["after"] = {"weld_z": weld_z, "xform": (gq.tolist(), [float(v) for v in t_xyz]),
+                              "joint_res": float(torch.linalg.norm(seg[2][0] - segs[a][2][-1]))}
+            seg = tuple(x[1:] for x in seg)          # drop the frame duplicating the anchor's last
+            sb = [(max(0, s - 1), e - 1) for s, e in sb]
+            placed.append((seg, sb)); order.append(run)
+
+    wp = torch.cat([s[0] for s, _ in placed])
+    wq = torch.cat([s[1] for s, _ in placed])
+    wj = torch.cat([s[2] for s, _ in placed])
+
+    bounds: list[tuple[int, int]] = [(0, 0)] * len(pieces)
+    cursor = 0
+    for (seg, sb), run in zip(placed, order):
+        for i, (s, e) in zip(run, sb):
+            bounds[i] = (cursor + s, cursor + e)
+        cursor += seg[0].shape[0]
+
+    # --- ease: capture every offset BEFORE touching anything ------------------------------------
+    seams: list[dict] = []
+    plans = []
+    for k in range(len(pieces) - 1):
+        before, after = pieces[k], pieces[k + 1]
+        idx = bounds[k + 1][0]
+        rec = {"at": idx, "between": (before.kind, after.kind)}
+        if bounds[k][1] == bounds[k][0] or bounds[k + 1][1] == bounds[k + 1][0]:
+            seams.append({**rec, "eased": False, "why": "empty neighbour"}); continue
+        rec["joint_res"] = float(torch.linalg.norm(wj[idx] - wj[idx - 1]))
+        if before.rigid == after.rigid:
+            # Both exact (nothing to give) or both free (no side to preserve): report, do not ease.
+            seams.append({**rec, "eased": False,
+                          "why": "both rigid" if before.rigid else "neither rigid"})
+            continue
+        anchored_after = after.rigid
+        free = k if anchored_after else k + 1
+        plans.append((len(seams), idx, anchored_after, free, (k + 1) in welded))
+        seams.append({**rec, "eased": True, "anchored_after": anchored_after,
+                      "pos_welded": (k + 1) in welded})
+
+    shared: dict[int, int] = {}
+    for _, _, _, free, _ in plans:
+        shared[free] = shared.get(free, 0) + 1
+    offs = [(sl, idx, aa, free, seam_offset(wp, wq, wj, idx, anchored_after=aa, welded=w))
+            for sl, idx, aa, free, w in plans]
+    for sl, idx, aa, free, off in offs:
+        avail = (bounds[free][1] - bounds[free][0]) // shared[free]
+        b = max(0, min(int(blend_n), avail))
+        seams[sl]["blend_n_used"] = b
+        seams[sl]["clamped"] = b < int(blend_n)
+        if b >= 1:
+            wp, wq, wj = apply_seam_offset(wp, wq, wj, idx, off, b, anchored_after=aa)
+    for s in seams:
+        i = s["at"]
+        if 0 < i < wp.shape[0]:
+            s["seam_speed"] = float(torch.linalg.norm(wp[i] - wp[i - 1]) / dt)
+
+    diag = {"n_pieces": len(pieces), "n_frames": int(wp.shape[0]),
+            "anchored": None if a is None else a, "placements": place,
+            "seam_speed_max": max([s.get("seam_speed", 0.0) for s in seams], default=0.0),
+            "joint_res_max": max([s.get("joint_res", 0.0) for s in seams], default=0.0)}
+    return wp, wq, wj, bounds, seams, diag
 
 
 def splice_terrain(terrain: Segment, approach: Segment | None, exit_seg: Segment | None, *,
@@ -157,6 +322,10 @@ def splice_terrain(terrain: Segment, approach: Segment | None, exit_seg: Segment
     diag: dict = {"approach_seam": approach_seam, "exit_seam": exit_seam,
                   "approach_frame": approach_frame, "exit_frame": exit_frame}
 
+    def _to_dev(seg):
+        return tuple(x.to(device=dev, dtype=dtype) if x.dtype.is_floating_point else x.to(dev)
+                     for x in seg)
+
     def _ground(seam: str, frame: str, surf: float) -> float | None:
         """z handling: ``None`` welds the boundary height; a value is the additive lift for that frame."""
         if seam == "weld":
@@ -169,73 +338,57 @@ def splice_terrain(terrain: Segment, approach: Segment | None, exit_seg: Segment
             return 0.0
         return weld_z - float(surf) if frame == "flat" else weld_z
 
+    pieces: list[Piece] = []
     # --- approach: its LAST frame meets the terrain's FIRST -------------------------------------
     if approach is not None:
-        aseg = tuple(x.to(device=dev, dtype=dtype) if x.dtype.is_floating_point else x.to(dev)
-                     for x in approach)
+        aseg = _to_dev(approach)
+        trail = 0
         if arrival_search > 1:
             z_ref = float(tP[0, 2]) - (0.0 if approach_frame == "tile" else float(approach_surf_z))
             b = match_arrival(aseg, tJ[0], z_ref, search=arrival_search)
-            diag["approach_arrival_cut"] = aseg[0].shape[0] - 1 - b   # frames dropped after the arrival
-            aseg = (aseg[0][:b + 1], aseg[1][:b + 1], aseg[2][:b + 1])
-        gq_a, t_a = se2z_align(aseg[0][-1], aseg[1][-1], tP[0], tQ[0])
-        # The rigid placement this side was given, kept so a caller can move things that ride ALONG with
-        # the segment but are not part of it -- the pinned keyframes the viser overlay draws, above all.
-        diag["approach_xform"] = (gq_a.tolist(), [float(t_a[0]), float(t_a[1]),
-                                                  float(t_a[2]) if approach_seam == "weld"
-                                                  else (0.0 if approach_frame == "tile"
-                                                        else float(approach_surf_z))])
-        (aP, aQ, aJ), weld_z = align_boundary(
-            aseg, -1, tP[0], tQ[0], ground_z=_ground(approach_seam, approach_frame, approach_surf_z))
-        diag["approach_surface_err"] = _surface_err(approach_seam, approach_frame, weld_z, approach_surf_z)
-        diag["approach_joint_res"] = float(torch.linalg.norm(aJ[-1] - tJ[0]))
-        aP, aQ, aJ = aP[:-1], aQ[:-1], aJ[:-1]                 # drop the duplicated boundary frame
-    else:
-        aP, aQ, aJ = tP[:0], tQ[:0], tJ[:0]
-
+            trail = aseg[0].shape[0] - 1 - b          # frames dropped after the in-betweened arrival
+            diag["approach_arrival_cut"] = trail
+        pieces.append(Piece(seg=aseg, kind="transient", trim=(0, trail),
+                            ground_z=_ground(approach_seam, approach_frame, approach_surf_z)))
+    pieces.append(Piece(seg=terrain, kind="replay", rigid=True, anchored=True))
     # --- exit: its boundary frame meets the terrain's LAST ---------------------------------------
     if exit_seg is not None:
-        eseg = tuple(x.to(device=dev, dtype=dtype) if x.dtype.is_floating_point else x.to(dev)
-                     for x in exit_seg)
-        # A context-seeded exit opens by RE-PREDICTING its seed frames, so skip that overlap; a free flat
-        # exit starts new motion at frame 0 and needs no skip.  The seed is surface-relative, so score the
-        # overlap against the boundary in the SAME frame (drop the surface from the terrain's z).
+        eseg = _to_dev(exit_seg)
         j = 0
         if exit_seeded:
+            # A context-seeded exit opens by RE-PREDICTING its seed frames, so skip that overlap; a free
+            # flat exit starts new motion at frame 0.  The seed is surface-relative, so score the overlap
+            # against the boundary in the SAME frame (drop the surface from the terrain's z).
             tgt_p = tP[-1].clone()
             if exit_frame == "flat":
                 tgt_p[2] = tgt_p[2] - float(exit_surf_z)
             j = match_overlap(eseg, tgt_p, tQ[-1], tJ[-1], search=weld_search)
         diag["exit_overlap_skip"] = j
-        eseg = (eseg[0][j:], eseg[1][j:], eseg[2][j:])
-        gq_e, t_e = se2z_align(eseg[0][0], eseg[1][0], tP[-1], tQ[-1])
-        # As ``approach_xform``: the rigid placement, so things that ride ALONG with the segment (the
-        # pinned keyframes the viser overlay draws) can be moved with it.
-        diag["exit_xform"] = (gq_e.tolist(), [float(t_e[0]), float(t_e[1]),
-                                              float(t_e[2]) if exit_seam == "weld"
-                                              else (0.0 if exit_frame == "tile" else float(exit_surf_z))])
-        (eP, eQ, eJ), weld_z = align_boundary(
-            eseg, 0, tP[-1], tQ[-1], ground_z=_ground(exit_seam, exit_frame, exit_surf_z))
-        diag["exit_surface_err"] = _surface_err(exit_seam, exit_frame, weld_z, exit_surf_z)
-        diag["exit_joint_res"] = float(torch.linalg.norm(eJ[0] - tJ[-1]))
-        eP, eQ, eJ = eP[1:], eQ[1:], eJ[1:]                    # drop the duplicated boundary frame
-    else:
-        eP, eQ, eJ = tP[:0], tQ[:0], tJ[:0]
+        pieces.append(Piece(seg=eseg, kind="transient", trim=(j, 0),
+                            ground_z=_ground(exit_seam, exit_frame, exit_surf_z)))
 
-    Wp = torch.cat([aP, tP, eP]); Wq = torch.cat([aQ, tQ, eQ]); Wj = torch.cat([aJ, tJ, eJ])
-    na, nt, ne = aP.shape[0], tP.shape[0], eP.shape[0]
-    bounds = [(0, na), (na, na + nt), (na + nt, na + nt + ne)]
+    eased = int(blend_n) if (approach_seam == "ease" or exit_seam == "ease") else 0
+    Wp, Wq, Wj, pb, _seams, pdiag = splice_pieces(pieces, blend_n=eased, dt=dt)
 
-    # Ease only the EASED seams; the terrain is the anchored side on both.
-    if blend_n >= 2:
-        if na >= 1 and approach_seam == "ease":
-            Wp, Wq, Wj = inertialize_seam(Wp, Wq, Wj, na, blend_n, anchored_after=True)
-        if ne >= 1 and exit_seam == "ease":
-            Wp, Wq, Wj = inertialize_seam(Wp, Wq, Wj, na + nt, blend_n, anchored_after=False)
-    if na >= 1:
-        diag["approach_seam_speed"] = float(torch.linalg.norm(Wp[na] - Wp[na - 1]) / dt)
-    if ne >= 1:
-        diag["exit_seam_speed"] = float(torch.linalg.norm(Wp[na + nt] - Wp[na + nt - 1]) / dt)
+    # Re-express the generic result in this function's fixed [approach, terrain, exit] shape.
+    n_a = 0 if approach is None else pb[0][1] - pb[0][0]
+    n_t = tP.shape[0]
+    n_e = 0 if exit_seg is None else pb[-1][1] - pb[-1][0]
+    bounds = [(0, n_a), (n_a, n_a + n_t), (n_a + n_t, n_a + n_t + n_e)]
+    place = pdiag["placements"]
+    if approach is not None:
+        b4 = place["before"]
+        diag["approach_xform"] = b4["xform"]
+        diag["approach_surface_err"] = _surface_err(approach_seam, approach_frame, b4["weld_z"],
+                                                    approach_surf_z)
+        diag["approach_joint_res"] = b4["joint_res"]
+        diag["approach_seam_speed"] = float(torch.linalg.norm(Wp[n_a] - Wp[n_a - 1]) / dt)
+    if exit_seg is not None:
+        af = place["after"]
+        diag["exit_xform"] = af["xform"]
+        diag["exit_surface_err"] = _surface_err(exit_seam, exit_frame, af["weld_z"], exit_surf_z)
+        diag["exit_joint_res"] = af["joint_res"]
+        diag["exit_seam_speed"] = float(torch.linalg.norm(Wp[n_a + n_t] - Wp[n_a + n_t - 1]) / dt)
     return Wp, Wq, Wj, bounds, diag
 
 

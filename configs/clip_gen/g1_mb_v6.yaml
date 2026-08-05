@@ -31,6 +31,12 @@ distractor_s: 6.0               # distractor clip duration (s)
 # ranges, not scale x fraction: the old form could not express a floor, which is why nothing below
 # 0.45 m/s existed. walk and run are contiguous so forward speed covers [0.1, 3.0] with no hole,
 # while keeping the 60/40 walk/run weighting.
+flat_loops: true              # exact looped strides + bounded MB transients
+flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
+flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
+flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
+flat_min_transient_s: 0.35
+flat_hop_slack: 1.15
 flat_clip_length: 20.0          # s; every flat clip is this long, all real motion
 flat_seg_dur_range: [1.5, 5.5]  # s per command segment
 flat_walk_vx_range: [0.1, 1.0]  # also the base band for turn / diagonal segments
@@ -68,6 +74,10 @@ pin_cmd: ramp                   # 'ramp' decelerates the approach command to the
                                 # fixed boundary sheds the speed by itself. MEASURED false: under
                                 # 'hold' the approach reaches the stairs at 2.4 m/s against a replay
                                 # starting near 0.7, a -12 m/s^2 velocity discontinuity at the splice
+bounded_approach: true      # exact loop + bounded transient approach
+approach_a_max: 2.0
+approach_min_transient_s: 0.35
+approach_hop_slack: 1.3
 ramp_s: 1.5                     # seconds to bleed the approach command down to the entry speed. 0.8
                                 # cannot shed ~2 m/s at any rate a walking robot achieves; the
                                 # measured speed-change response is ~1.5 s                   # s of replay the MB approach is pinned against
@@ -76,7 +86,7 @@ ramp_s: 1.5                     # seconds to bleed the approach command down to 
 # The command written into the clip is TERRAIN-AGNOSTIC by design -- what a user or planner asked
 # for, with no knowledge of the terrain -- while the reference motion is terrain-aware. Bridging
 # that gap is what the flow model is for, so this is never derived from the motion.
-rl_cmd_vary: true               # vary it over each terrain clip instead of one held value
+rl_cmd_vary: false              # ONE held command per clip: a change mid-clip reads as a conflicting signal
 rl_cmd_seg_dur_range: [2.5, 5.5]  # s per command segment; shorter than flat's, terrain clips are shorter
 segment_reuse: false            # share a generated MB segment between clips with identical
                                 # conditioning. OFF: with per-clip schedules two clips are only
