@@ -94,7 +94,7 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     re-plan).  Smaller = more frequent, smaller per-step reference jumps.  Only
     used when ``ego_anchor_fraction > 0``.
 
-    ``1`` (what the teacher uses) makes the reference fully LOCAL: the free root
+    ``1`` makes the reference fully LOCAL: the free root
     DOFs coincide with the robot every step, so tracking error is measured
     locally and planar drift is not double-counted.  Drift is still graded --
     by the termination, against the globally-fixed clip.  See

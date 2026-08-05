@@ -87,6 +87,23 @@ Raising K helps the closed loop and does nothing for teacher forcing (compoundin
 frequency, not prediction quality). ``noise_scale=2.0`` bought 1-2 envs and made the
 history-free branch worse, so robustness-side fixes were shelved in favour of capacity.
 
+Measured 2026-08-05 on the YAW-FRAME teacher (``--teacher yaw_k12``), flat library, 200 envs,
+seed 42, 1100 steps -- the first cell on the reworked observation. Only clip_control exists so
+far: no generator matches this teacher's 44/node width AND the yaw convention yet.
+
+==========================  ==========  ================  =====  =====  =====
+teacher                      survival    config            vx     vy     wz
+==========================  ==========  ================  =====  =====  =====
+yaw_k12 @model_4400            180/200   clip control      0.660  0.327  0.410
+refslim @model_12000 (old)     182/200   clip control        -      -      -
+==========================  ==========  ================  =====  =====  =====
+
+Within 2 envs of the old teacher's ceiling at 4400 of 20000 iterations (22%), which is the only
+reading to take from it -- the two are NOT comparable, since the old number came from a
+12000-iteration teacher. Velocity is somewhat worse than the old 50-env clip control (0.617 /
+0.338 / 0.358), but that was a different env count and the docstring's own warning against
+comparing across ``--num_envs`` applies.
+
 Examples:
     # the headline pair for one generator
     python scripts/rsl_rl/fm_survival_sweep.py --models capacity \\
@@ -180,19 +197,35 @@ class Teacher:
         return REPO / "logs" / "rsl_rl" / "g1" / self.run / stem
 
 
-#: The 41/node teacher every generator below was trained against. Its reference_window packs
-#: (base_pose, base_vel, joint_pos); a generator predicting a different selection is refused
-#: at load by FmTrackingCommand.reference_window_obs, so teacher and generator move together.
-TEACHER = Teacher(
-    run="2026-08-01_08-49-20_depth_v5_refslim",
-    checkpoint="model_12000.pt",
-    note="12000 it, body-mode depth teacher, 41/node (451) reference window. Trained on talos. "
-         "PREDATES the reference-window rework (base_pose 6 -> 9 with the sign unified, and "
-         "13 sample offsets instead of 11), so it and every generator below are 41/node and "
-         "will be REFUSED at load: play.py raises on the base_pose_convention mismatch. Kept "
-         "as the record of what the 200-env table was measured on; register the retrained "
-         "teacher and its generators alongside rather than editing these.",
-)
+#: Named teachers. The teacher sets EVERY ceiling in this sweep -- clip_control IS its own
+#: tracking ability with the generator switched off -- so numbers are only comparable at a
+#: FIXED teacher. Registered side by side rather than edited in place, so the tables above
+#: keep pointing at the artifact that produced them.
+TEACHERS: dict[str, Teacher] = {
+    "refslim": Teacher(
+        run="2026-08-01_08-49-20_depth_v5_refslim",
+        checkpoint="model_12000.pt",
+        note="12000 it, body-mode depth teacher, 41/node (451) reference window. Trained on "
+             "talos. What every table in this docstring was measured on. PREDATES the "
+             "reference-window rework, so play.py on this branch REFUSES it on the "
+             "base_pose_convention mismatch -- it is a provenance record, not a runnable cell.",
+    ),
+    "yaw_k12": Teacher(
+        run="2026-08-04_21-55-17_yaw_k12_v1",
+        checkpoint="model_4400.pt",
+        note="44/node (572) reference window, yaw-aligned anchor, ego_anchor_every=12, torso "
+             "CoM + live restitution DR, base_pos noise (0.06, 0.06, 0.03). Trained on talos "
+             "against the MIXED library (g1_mb_v5_body.h5). STILL TRAINING -- 4400 of 20000 "
+             "iterations, so clip_control here is an under-trained policy and is NOT "
+             "comparable to the 182/200 recorded above (a 12000-it teacher). Pass "
+             "--teacher_checkpoint to move it as the run progresses.",
+    ),
+}
+
+#: The selected teacher. Rebound by :func:`main` from ``--teacher``; every helper reads it at
+#: call time. Defaults to the yaw-frame teacher because the older one cannot be played on this
+#: branch at all -- the convention guard refuses it before the env is built.
+TEACHER = TEACHERS["yaw_k12"]
 
 
 @dataclass(frozen=True)
@@ -309,6 +342,14 @@ class Config:
     #: cannot even be built without one -- but the generator is computed and discarded, so
     #: the sweep runs this ONCE rather than once per model and labels it without a name.
     generator_independent: bool = False
+    no_generator: bool = False
+    """Pass an EMPTY --fm_checkpoint, so FmTrackingCommand never loads a generator.
+
+    ``generator_independent`` only means the result does not depend on which generator was
+    named; the model was still loaded to satisfy the command term. This goes further and is
+    what fm_tracking_cmd_cfg documents as "the pure clip control": no FM cost, no FM
+    nondeterminism, and no need for a compatible checkpoint to exist on disk at all -- which
+    also means this cell survives a teacher whose width no generator matches yet."""
     #: Sweeping K is meaningless for configurations that do not consume the prediction.
     k_matters: bool = True
     extra: list[str] = field(default_factory=list)
@@ -331,12 +372,18 @@ CONFIGS: dict[str, Config] = {
                  "diverges; the two together = the MODEL is the limit.",
     ),
     "clip_control": Config(
-        overrides={"reference_source": "clip",
-                   "ego_anchor_fraction": "1.0", "ego_anchor_every": "1"},
-        isolates="The policy-side CEILING: the tracker follows the real clip and the "
-                 "generator is computed but discarded. No FM contribution at all.",
+        # NO ego_anchor_every override: it must match what the TEACHER trained under, and the
+        # cfg default now follows REPLAN_PERIOD_K (12). It used to be pinned to "1" here,
+        # correctly, back when the teacher also trained at 1 -- hardcoding it again is exactly
+        # how that goes stale. ego_anchor_fraction=1.0 still has to be forced: the tracker
+        # task defaults it to 0.0 (the deploy value), which would leave the clip on its fixed
+        # world placement instead of the ego-anchored one the policy saw.
+        overrides={"reference_source": "clip", "ego_anchor_fraction": "1.0"},
+        isolates="The policy-side CEILING: the tracker follows the real clip and NO generator "
+                 "is loaded at all. No FM contribution, and no FM nondeterminism either.",
         generator_independent=True,
         k_matters=False,
+        no_generator=True,
     ),
     "history_free": Config(
         overrides={"history_from": "generator", "fm_guidance_scale": "0.0"},
@@ -409,7 +456,11 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
         "--num_envs", str(num_envs), "--max_steps", str(max_steps),
         "--seed", str(seed), "--headless",
     ]
-    argv += ["--fm_checkpoint", str(fm_path)]
+    # OMIT the flag entirely for a no-generator cell. The tracker task already defaults
+    # fm_checkpoint to "" ("no generator at all" when reference_source=clip), and leaving the
+    # flag off also stops play.py trying to export an fm.onnx it has no checkpoint for.
+    if not cfg.no_generator:
+        argv += ["--fm_checkpoint", str(fm_path)]
     argv += [f"env.commands.traj_ref.fm_update_every={k}"]
     if sampling_steps is not None:
         argv += [f"env.commands.traj_ref.fm_num_sampling_steps={sampling_steps}"]
@@ -498,6 +549,9 @@ def parse_survival(log_text: str) -> dict | None:
 
 def main() -> None:
     """Parse arguments, run each (generator, configuration, K) cell, report a table."""
+    # Rebound from --teacher below, before any helper reads it. Declared up here because
+    # Python requires `global` to precede every use of the name in the function.
+    global TEACHER
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", default="capacity",
@@ -508,9 +562,14 @@ def main() -> None:
                         f"{','.join(CONFIGS)}")
     p.add_argument("--k", default="1",
                    help="Comma-separated fm_update_every values (re-plan period).")
+    p.add_argument("--teacher", default="yaw_k12", choices=sorted(TEACHERS),
+                   help="Which registered teacher to evaluate. 'refslim' is the artifact the "
+                        "docstring tables were measured on and is REFUSED at load on this "
+                        "branch (convention guard); it is kept for provenance.")
     p.add_argument("--teacher_checkpoint", default=None,
-                   help=f"Teacher iteration to evaluate, e.g. 'model_19999' (default "
-                        f"{TEACHER.checkpoint}). The teacher sets EVERY ceiling in this "
+                   help="Teacher iteration to evaluate, e.g. 'model_19999' (defaults to "
+                        "the selected --teacher's own checkpoint). The teacher sets EVERY "
+                        "ceiling in this "
                         "sweep -- clip_control is its own tracking ability with the "
                         "generator switched off -- so a newer one moves all of them, and "
                         "generator numbers are only comparable at a FIXED teacher.")
@@ -559,8 +618,15 @@ def main() -> None:
     steps_list = [None if v.strip() in ("", "default") else int(v)
                   for v in args.sampling_steps.split(",")]
 
+    # One teacher per invocation is the intended usage -- cells are only comparable at a
+    # fixed teacher, so the helpers all read this single selection.
+    TEACHER = TEACHERS[args.teacher]
     teacher_ckpt = args.teacher_checkpoint or TEACHER.checkpoint
-    _check_assets(models, ckpts, args.library, teacher_ckpt, fatal=not args.dry_run)
+    # Cells that load no generator must not require one on disk -- that is the whole point of
+    # no_generator, and it is what lets clip_control run against a teacher no generator fits.
+    needs_gen = [c for c in configs if not CONFIGS[c].no_generator]
+    _check_assets(models if needs_gen else [], ckpts, args.library, teacher_ckpt,
+                  fatal=not args.dry_run)
 
     # One cell per (generator, config, K). A configuration that ignores the generator
     # (clip_control) gets exactly ONE cell however many generators were named -- running it

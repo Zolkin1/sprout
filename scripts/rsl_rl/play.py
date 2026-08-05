@@ -567,7 +567,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             export_tracker_onnx(export_model_dir)
             _trk = os.path.join(export_model_dir, "tracker.onnx")
             print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
-            if args_cli.fm_checkpoint is not None:
+            # Truthy, not `is not None`: "" is the documented sentinel for "no generator at
+            # all" (see FmTrackingCommandCfg.fm_checkpoint), valid with reference_source=clip.
+            # Under `is not None` an explicitly empty value got as far as torch.load("") and
+            # died there, so the one configuration that means "no FM" could not be exported
+            # past -- which is what the clip-only survival cell needs.
+            if args_cli.fm_checkpoint:
                 fm_out = os.path.join(export_model_dir, "fm.onnx")
                 export_fm_onnx(args_cli.fm_checkpoint, fm_out)
                 print(f"[INFO] wrote {fm_out}")

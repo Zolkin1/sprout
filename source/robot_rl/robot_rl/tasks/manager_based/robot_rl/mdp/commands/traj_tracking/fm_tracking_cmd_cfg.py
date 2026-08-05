@@ -47,10 +47,13 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     already diverged. The FM-driven run answers "how does it behave"; this one answers
     "what would it have said here".
 
-    Pair ``"clip"`` with the TEACHER's anchoring (``ego_anchor_fraction=1.0``,
-    ``ego_anchor_every=1``) -- otherwise the clip reference is not the one the policy was
-    trained against and the baseline is not a baseline. ``fm_debug.py`` does this; the task
-    default stays at the deploy value.
+    Pair ``"clip"`` with the TEACHER's anchoring -- otherwise the clip reference is not the
+    one the policy was trained against and the baseline is not a baseline. That means
+    ``ego_anchor_fraction=1.0`` (the task defaults it to 0.0, the deploy value) and leaving
+    ``ego_anchor_every`` at its cfg default, which follows ``REPLAN_PERIOD_K``. This used to
+    say "pin it to 1", correct while the teacher also trained at 1; pinning a cadence here is
+    how that went stale, so match the teacher rather than a number. ``fm_debug.py`` and
+    ``fm_survival_sweep.py``'s ``clip_control`` both do this.
 
     With ``"clip"`` and an empty :attr:`fm_checkpoint` the generator is not loaded at all --
     the pure clip control, useful to rule out any FM-induced cost or nondeterminism."""
