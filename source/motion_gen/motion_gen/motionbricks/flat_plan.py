@@ -39,6 +39,13 @@ class Loop:
     phase0: int
     phase_out: int                 # the phase its LAST frame must land on (the next transient's context)
     hold_s: float                  # requested duration; pass C rounds to land on phase_out
+    # The CONTINUOUS commanded velocity this loop serves, which is NOT the stride's own achieved
+    # velocity: the stride is the nearest one the bank has, so the two differ by the snap error.  The
+    # clip records THIS as target_vel.  Recording the achieved velocity instead makes tracking error
+    # zero by construction but collapses the command distribution onto the bank's ~0.2 m/s lattice --
+    # measured on g1_mb_v6, the flat family had 73 distinct commanded vx with a p95 gap of 0.2000, so
+    # the teacher never saw a command between grid points.
+    cmd_vel: tuple = (0.0, 0.0, 0.0)
     kind: str = "loop"
 
 
@@ -46,8 +53,11 @@ class Loop:
 class Transient:
     """A Motion-Bricks in-betweening from one loop's phase to the next one's.
 
-    ``stride_out < 0`` marks the clip's opening transient, which has no outgoing loop to be seeded from
-    and starts Motion Bricks from its own standing reset instead.
+    ``stride_out < 0`` marks a transient with no outgoing loop to be seeded from, which starts Motion
+    Bricks from its own standing reset instead.  Plans no longer produce one: a clip OPENS on a loop, so
+    every transient has a real outgoing gait to be seeded from and starts at the speed it is leaving
+    rather than from a standing start.  The branch is kept because it is the only way to begin a clip
+    from rest if that is ever wanted deliberately.
     """
 
     stride_out: int
@@ -55,6 +65,7 @@ class Transient:
     stride_in: int
     phase_in: int
     key: str                       # segment filename stem; also how pass C finds the generated motion
+    cmd_vel: tuple = (0.0, 0.0, 0.0)   # the command it is heading TO (see Loop.cmd_vel)
     kind: str = "transient"
 
 
@@ -127,50 +138,59 @@ def from_json(path: str) -> list:
         pieces = []
         for x in p["pieces"]:
             k = x.pop("kind")
+            if "cmd_vel" in x:
+                x["cmd_vel"] = tuple(float(c) for c in x["cmd_vel"])
             pieces.append(Loop(**x, kind=k) if k == "loop" else Transient(**x, kind=k))
         plans.append(FlatClipPlan(name=p["name"], n_frames=int(p["n_frames"]), dt=float(p["dt"]),
                                   seed=int(p["seed"]), pieces=pieces))
     return plans
 
 
-def sample_plan(name: str, rng, *, bank_periods, bank_vel, n_frames: int, dt: float, seed: int,
-                hold_s_range=(1.5, 4.0), blend_n: int = 12, pick_stride=None) -> FlatClipPlan:
-    """Sample one clip plan: alternating transients and loops, always ending on a loop.
+def sample_plan(name: str, rng, *, bank_periods, bank_vel, schedule, n_frames: int, dt: float,
+                seed: int, blend_n: int = 12) -> FlatClipPlan:
+    """Build one clip plan from a CONTINUOUS command schedule: a loop per segment, in-betweenings between.
 
-    Ending on a loop is deliberate -- a clip that stops mid-in-betweening hands the tracker and the
-    flow-matching model a truncated motion.
+    The clip OPENS ON A LOOP, so it starts at a steady commanded speed.  It used to open on a transient
+    with ``stride_out = -1``, i.e. Motion Bricks' own standing reset, which made every one of the 3000
+    flat clips begin from rest and spend its first second initiating gait.  A standing start is now just
+    a plan whose first segment happens to command zero -- the bank has true zero-velocity strides -- so
+    it costs a leading loop like any other speed instead of a special case.
+
+    It still ENDS on a loop: a clip that stops mid-in-betweening hands the tracker and the flow-matching
+    model a truncated motion.
 
     Args:
-        rng: numpy Generator.
         bank_periods: ``[N]`` period (frames) per stride.
-        bank_vel: ``[N,3]`` achieved velocity per stride, used only by ``pick_stride``.
-        n_frames: exact clip length.
-        hold_s_range: requested steady duration per loop, before rounding to the hand-off phase.
+        bank_vel: ``[N,3]`` achieved velocity per stride; only used to snap a command to a stride.
+        schedule: ``[(duration_s, vx, vy, wz)]`` -- the continuous commands the clip serves.  Sampling
+            these rather than picking strides uniformly is what keeps the recorded command off the
+            bank's velocity lattice (see :attr:`Loop.cmd_vel`).
+        rng: numpy Generator, used only for the hand-off phases.
         blend_n: seam blend length, which sets the floor on a usable loop.
-        pick_stride: ``rng -> stride index``; defaults to uniform over the bank.
     """
-    pick = pick_stride or (lambda r: int(r.integers(0, len(bank_periods))))
     min_hold = max(int(2 * blend_n + 1), 1)
     pieces: list = []
     used = 0
     prev_stride, prev_phase = -1, 0
-    while True:
-        s_in = pick(rng)
-        p_in = int(rng.integers(0, max(1, int(bank_periods[s_in]))))
-        t = Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in, phase_in=p_in,
-                      key=f"{name}_t{len(pieces)}")
+    for j, (dur, vx, vy, wz) in enumerate(schedule):
+        cmd = (float(vx), float(vy), float(wz))
+        s_in = nearest_stride(bank_vel, cmd)
         period = int(bank_periods[s_in])
-        want = int(round(float(rng.uniform(*hold_s_range)) / dt))
+        p_in = int(rng.integers(0, max(1, period)))
         p_out = int(rng.integers(0, max(1, period)))
-        n_loop = loop_frames_for(p_in, p_out, period, want, min_frames=max(min_hold, period))
+        n_loop = loop_frames_for(p_in, p_out, period, int(round(float(dur) / dt)),
+                                 min_frames=max(min_hold, period))
         # A transient's own length is Motion Bricks' choice and is not known yet, so reserve its WORST
-        # case for EVERY transient, not just the next one.  Over-reserving is harmless -- pass C hands the
-        # slack to the final loop, i.e. more steady motion -- whereas under-reserving overruns the clip.
-        if used + _MAX_TRANSIENT_FRAMES + n_loop > n_frames and pieces:
+        # case for EVERY transient, not just the next one.  Over-reserving is harmless -- pass C hands
+        # the slack to the final loop, i.e. more steady motion -- whereas under-reserving overruns.
+        cost = n_loop + (_MAX_TRANSIENT_FRAMES if pieces else 0)
+        if used + cost > n_frames and pieces:
             break
-        pieces.append(t)
-        pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * dt))
-        used += _MAX_TRANSIENT_FRAMES + n_loop
+        if pieces:                                    # every loop but the first is entered via one
+            pieces.append(Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in,
+                                    phase_in=p_in, key=f"{name}_t{len(pieces)}", cmd_vel=cmd))
+        pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * dt, cmd_vel=cmd))
+        used += cost
         prev_stride, prev_phase = s_in, p_out
     return FlatClipPlan(name=name, n_frames=int(n_frames), dt=float(dt), seed=int(seed), pieces=pieces)
 
@@ -206,15 +226,17 @@ def plan_from_holds(name: str, holds, rng, *, bank_periods, bank_vel, n_frames: 
     pieces: list = []
     prev_stride, prev_phase = -1, 0
     for j, (hold_s, v) in enumerate(holds):
-        s_in = nearest_stride(bank_vel, v)
+        cmd = (float(v[0]), float(v[1]), float(v[2]))
+        s_in = nearest_stride(bank_vel, cmd)
         period = int(bank_periods[s_in])
         p_in = int(rng.integers(0, max(1, period)))
         p_out = int(rng.integers(0, max(1, period)))
-        pieces.append(Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in,
-                                phase_in=p_in, key=f"{name}_t{j}"))
+        if pieces:                                    # opens on a loop, like the flat plans
+            pieces.append(Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in,
+                                    phase_in=p_in, key=f"{name}_t{j}", cmd_vel=cmd))
         n_loop = loop_frames_for(p_in, p_out, period, int(round(float(hold_s) / dt)),
                                  min_frames=max(min_hold, period))
-        pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * dt))
+        pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * dt, cmd_vel=cmd))
         prev_stride, prev_phase = s_in, p_out
     return FlatClipPlan(name=name, n_frames=int(n_frames), dt=float(dt), seed=int(seed), pieces=pieces)
 

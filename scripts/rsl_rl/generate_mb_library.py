@@ -212,6 +212,14 @@ def main() -> int:
                     "--stride-bank", bank, "--dump-plan", flat_plans,
                     "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
                     "--hold-s-range", *(str(v) for v in cfg.flat_hold_s_range),
+                    # The CONTINUOUS command space the clips record. Same bands the old flat path used,
+                    # so the command distribution is unchanged by the loop redesign -- what changed is
+                    # that the motion snaps to the nearest bank stride while the command does not.
+                    "--walk-vx-range", *(str(v) for v in cfg.flat_walk_vx_range),
+                    "--run-vx-range", *(str(v) for v in cfg.flat_run_vx_range),
+                    "--back-vx-range", *(str(v) for v in cfg.flat_back_vx_range),
+                    "--side-vy", str(cfg.flat_side_vy), "--turn-max", str(cfg.flat_turn_max),
+                    "--stand-frac", str(cfg.flat_stand_frac),
                     "--seed", str(cfg.seed)])
             _run("flat-transients", "mb_flat_transients.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", flat_plans,

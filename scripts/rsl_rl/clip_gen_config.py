@@ -76,6 +76,10 @@ _SCHEMA: dict[str, tuple] = {
     # state exact and leave the model only the transitions.
     "flat_loops": ("bool", 1),
     "flat_hold_s_range": ("range", 2),
+    # Probability a flat command segment is a full stop.  A standing HOLD (the bank has true
+    # zero-velocity strides), entered via an ordinary in-betweening -- NOT the standing reset a clip
+    # used to open from.
+    "flat_stand_frac": ("float", 1),
     "flat_ramp_dv": ("float", 1),
     "flat_a_max": ("float", 1),
     "flat_min_transient_s": ("float", 1),

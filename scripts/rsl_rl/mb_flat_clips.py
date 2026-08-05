@@ -43,6 +43,7 @@ from motion_gen.motionbricks import flat_plan as fp
 from motion_gen.motionbricks.mb_ingest import raw_to_world
 from motion_gen.motionbricks.raw_schema import load_raw_motion
 from motion_gen.motionbricks.stride_bank import load_stride_bank
+from motion_gen.command_schedule import sample_command_schedule
 from motion_gen.motionbricks.terrain_splice import Piece, splice_pieces
 from motion_gen.terrain.box_clip import loop_frames
 from motion_gen.world_lift import anchor_mask_from_free
@@ -55,17 +56,20 @@ def _split(qpos, dev: str):
     return q[:, 0:3], q[:, 3:7], q[:, 7:36]
 
 
-def _loop_piece(bank, lp, n_exact: int, dev: str, mask: int) -> Piece:
+def _loop_piece(bank, lp, n_exact: int, dev: str, mask: int, *, first: bool = False) -> Piece:
     """An exact looped replay contributing ``n_exact`` frames starting at ``lp.phase0``.
 
     One frame of LEAD-IN is prepended: ``align_and_concat`` drops each piece's first frame as a duplicate
     of the previous piece's last, so without it the loop would lose its own ``phase0`` frame and start one
     frame late.  With it, every surviving frame of this piece is an exact stride frame.
+
+    ``first`` skips the lead-in.  The opening piece of a clip keeps all its frames -- there is nothing
+    before it to duplicate -- so a leading loop would otherwise contribute ``n_exact + 1`` and overrun.
     """
     period = int(bank.period_frames[lp.stride])
     rp, rq, jt = _split(bank.strides[lp.stride], dev)
-    lead = (int(lp.phase0) - 1) % period
-    lrp, lrq, ljt, _ = loop_frames(rp, rq, jt, None, n_exact + 1, start=lead)
+    lead = int(lp.phase0) if first else (int(lp.phase0) - 1) % period
+    lrp, lrq, ljt, _ = loop_frames(rp, rq, jt, None, n_exact + (0 if first else 1), start=lead)
     return Piece(seg=(lrp, lrq, ljt), kind="loop", rigid=True, mask=mask,
                  stride_idx=int(lp.stride))
 
@@ -115,13 +119,12 @@ def assemble_world(bank, plan, transient_dir: str, dt: float, t_frames: int, dev
         if not loops:
             return None, {"skip": "no loop survived the length solve"}
         n_tr_pieces = [pc for pc in plan_pieces if pc.kind == "transient"]
-        if plan_pieces[0].kind != "transient":
-            return None, {"skip": "plan does not start with a transient; the frame accounting assumes it"}
         # Frame accounting.  ``align_and_concat`` drops the FIRST frame of every piece but the first, and
-        # each loop already asks for one frame of lead-in to pay for exactly that (see _loop_piece), so a
-        # loop contributes precisely its ``want``.  Only the welds BETWEEN TRANSIENTS are unpaid, and the
-        # opening transient keeps all its frames -- hence ``n_t - 1``, not ``n_pieces - 1``.
-        n_tr = sum(trs[pc.key].seg[0].shape[0] for pc in n_tr_pieces) - max(0, len(n_tr_pieces) - 1)
+        # every loop but the opening one asks for a frame of lead-in to pay for exactly that (see
+        # _loop_piece), so a loop contributes precisely its ``want``.  What is left unpaid is one frame
+        # per transient, EXCEPT a transient that opens the clip, which keeps all of its frames.
+        unpaid = len(n_tr_pieces) - (1 if plan_pieces[0].kind == "transient" else 0)
+        n_tr = sum(trs[pc.key].seg[0].shape[0] for pc in n_tr_pieces) - max(0, unpaid)
         want = [fp.loop_frames_for(lp.phase0, lp.phase_out, int(bank.period_frames[lp.stride]),
                                    int(round(lp.hold_s / dt)),
                                    min_frames=max(2 * blend_n + 1, int(bank.period_frames[lp.stride])))
@@ -131,20 +134,22 @@ def assemble_world(bank, plan, transient_dir: str, dt: float, t_frames: int, dev
         if residual >= floor:
             want[-1] = residual
             break
-        if len(plan_pieces) <= 2:
-            return None, {"skip": f"even one pair overruns the clip (residual {residual} < {floor})"}
+        if len(plan_pieces) <= 1:
+            return None, {"skip": f"even one loop overruns the clip (residual {residual} < {floor})"}
         plan_pieces = plan_pieces[:-2]
 
     pieces: list[Piece] = []
     seg_vel: list[np.ndarray] = []
     li = 0
-    for pc in plan_pieces:
+    for j, pc in enumerate(plan_pieces):
+        # target_vel is the plan's CONTINUOUS command, not the stride's achieved velocity -- see
+        # flat_plan.Loop.cmd_vel for why recording the latter is a trap.
         if pc.kind == "transient":
             pieces.append(trs[pc.key])
-            seg_vel.append(tvels[pc.key][0])           # constant over the transient: where it is going
+            seg_vel.append(np.asarray(pc.cmd_vel, np.float32))   # where it is going, held constant
         else:
-            pieces.append(_loop_piece(bank, pc, want[li], dev, mask))
-            seg_vel.append(bank.achieved_vel[pc.stride])
+            pieces.append(_loop_piece(bank, pc, want[li], dev, mask, first=(j == 0)))
+            seg_vel.append(np.asarray(pc.cmd_vel, np.float32))
             li += 1
 
     wp, wq, wj, bounds, seams, diag = splice_pieces(pieces, blend_n=blend_n, dt=dt)
@@ -183,6 +188,17 @@ def main() -> int:
                    help="Seam ease length (s). Applies at loop<->transient seams only; a loop's own "
                         "period seams need nothing (the strides close bit-exactly).")
     p.add_argument("--flat-anchor", default="x,y,yaw")
+    # The command space, passed straight to command_schedule.sample_command_schedule -- the ONE sampler
+    # every clip family uses.  These are the CONTINUOUS commands the clip records; each is snapped to the
+    # nearest bank stride only for the motion.
+    p.add_argument("--walk-vx-range", type=float, nargs=2, default=(0.1, 1.0), metavar=("MIN", "MAX"))
+    p.add_argument("--run-vx-range", type=float, nargs=2, default=(1.0, 3.0), metavar=("MIN", "MAX"))
+    p.add_argument("--back-vx-range", type=float, nargs=2, default=(0.1, 1.5), metavar=("MIN", "MAX"))
+    p.add_argument("--side-vy", type=float, default=1.0)
+    p.add_argument("--turn-max", type=float, default=0.8)
+    p.add_argument("--stand-frac", type=float, default=0.08,
+                   help="Probability a segment is a full stop. A standing HOLD, entered via an ordinary "
+                        "in-betweening -- not the standing RESET a clip used to open from.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -193,11 +209,21 @@ def main() -> int:
 
     if args.dump_plan:
         rng = np.random.default_rng(args.seed)
-        plans = [fp.sample_plan(f"flat{i:05d}", rng, bank_periods=bank.period_frames,
-                                bank_vel=bank.achieved_vel, n_frames=t_frames, dt=args.dt,
-                                seed=args.seed + i, hold_s_range=tuple(args.hold_s_range),
-                                blend_n=blend_n)
-                 for i in range(args.n_clips)]
+        # Sample the command schedule with the HOLD range as its segment duration, not the tighter
+        # per-command range the old path used: a hold has to be long enough to be worth looping (~1.5-4 s
+        # against a ~1.1 s transient), or the clip is nearly all in-betweening.  lead_in_s=0 because the
+        # clip now opens on a loop rather than from rest.
+        plans = []
+        for i in range(args.n_clips):
+            sched = sample_command_schedule(
+                rng, duration=args.clip_length, seg_dur_range=tuple(args.hold_s_range),
+                vx_range=tuple(args.walk_vx_range), run_vx_range=tuple(args.run_vx_range),
+                back_vx_range=tuple(args.back_vx_range), side_vy=args.side_vy,
+                turn_max=args.turn_max, stand_frac=args.stand_frac, lead_in_s=0.0)
+            plans.append(fp.sample_plan(f"flat{i:05d}", rng, bank_periods=bank.period_frames,
+                                        bank_vel=bank.achieved_vel, schedule=sched,
+                                        n_frames=t_frames, dt=args.dt, seed=args.seed + i,
+                                        blend_n=blend_n))
         os.makedirs(os.path.dirname(args.dump_plan) or ".", exist_ok=True)
         fp.to_json(plans, args.dump_plan)
         n_tr = sum(len(pl.transients) for pl in plans)

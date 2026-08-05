@@ -72,7 +72,7 @@ def test_context_window_ends_exactly_on_the_handoff_phase():
 def test_json_round_trip():
     plan = FlatClipPlan(name="c0", n_frames=1000, dt=DT, seed=3, pieces=[
         Transient(stride_out=-1, phase_out=0, stride_in=4, phase_in=7, key="c0_t0"),
-        Loop(stride=4, phase0=7, phase_out=19, hold_s=1.6),
+        Loop(stride=4, phase0=7, phase_out=19, hold_s=1.6, cmd_vel=(1.25, 0.0, 0.0)),
         Transient(stride_out=4, phase_out=19, stride_in=9, phase_in=2, key="c0_t2"),
         Loop(stride=9, phase0=2, phase_out=5, hold_s=2.4),
     ])
@@ -86,29 +86,55 @@ def test_json_round_trip():
     assert b.name == "c0" and b.n_frames == 1000 and b.seed == 3
     assert [type(x).__name__ for x in b.pieces] == ["Transient", "Loop", "Transient", "Loop"]
     assert b.transients[0].stride_out == -1 and b.loops[1].stride == 9
+    assert b.loops[0].cmd_vel == (1.25, 0.0, 0.0)          # tuple, not the json list it round-tripped as
 
 
-def test_sampled_plan_alternates_and_ends_on_a_loop():
+def _sched(n, dur=2.0, vx=1.0):
+    return [(dur, vx + 0.13 * i, 0.0, 0.0) for i in range(n)]
+
+
+def test_sampled_plan_opens_on_a_loop_and_ends_on_a_loop():
     periods = np.array([40, 43, 31, 55])
-    vel = np.zeros((4, 3), np.float32)
-    rng = np.random.default_rng(0)
-    plan = sample_plan("c", rng, bank_periods=periods, bank_vel=vel, n_frames=1000, dt=DT, seed=0)
+    vel = np.array([[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [3.0, 0, 0]], np.float32)
+    plan = sample_plan("c", np.random.default_rng(0), bank_periods=periods, bank_vel=vel,
+                       schedule=_sched(6), n_frames=1000, dt=DT, seed=0)
     kinds = [p.kind for p in plan.pieces]
-    assert kinds[0] == "transient" and kinds[-1] == "loop"
-    assert kinds == ["transient", "loop"] * (len(kinds) // 2)
+    # Opening on a LOOP is the point: the clip starts at a steady commanded speed instead of from
+    # Motion Bricks' standing reset, which used to make every flat clip begin from rest.
+    assert kinds[0] == "loop" and kinds[-1] == "loop"
+    assert kinds == ["loop"] + ["transient", "loop"] * (len(kinds) // 2)
+    assert all(t.stride_out >= 0 for t in plan.transients)       # nothing starts from standing
     # Every transient's context phase must be the phase the PREVIOUS loop hands off at.
-    for i in range(2, len(plan.pieces), 2):
+    for i in range(1, len(plan.pieces), 2):
         t, prev = plan.pieces[i], plan.pieces[i - 1]
         assert t.stride_out == prev.stride and t.phase_out == prev.phase_out
-    assert plan.pieces[0].stride_out == -1                      # the opening one has no outgoing loop
+
+
+def test_recorded_command_is_the_schedule_not_the_snapped_stride():
+    """The regression this guards: recording the STRIDE's velocity collapses the command distribution.
+
+    The bank is a discrete set of strides, so writing ``bank_vel[stride]`` as the clip's command puts
+    every command on the bank's lattice -- measured at 0.2 m/s spacing on a real library.  The plan must
+    carry the continuous command it was asked for and let the stride be merely the nearest match.
+    """
+    periods = np.array([40, 43])
+    vel = np.array([[0.0, 0, 0], [1.0, 0, 0]], np.float32)       # a deliberately coarse bank
+    sched = [(2.0, 0.37, 0.0, 0.0), (2.0, 0.91, 0.0, 0.0), (2.0, 0.44, 0.0, 0.0)]
+    plan = sample_plan("c", np.random.default_rng(1), bank_periods=periods, bank_vel=vel,
+                       schedule=sched, n_frames=1000, dt=DT, seed=1)
+    cmds = [lp.cmd_vel[0] for lp in plan.loops]
+    assert cmds == [0.37, 0.91, 0.44][:len(cmds)]
+    assert not all(c in (0.0, 1.0) for c in cmds)                # i.e. NOT snapped to the bank
+    for lp in plan.loops:                                        # the motion still uses a real stride
+        assert 0 <= lp.stride < len(periods)
 
 
 def test_sampled_plan_leaves_room_for_its_transients():
     periods = np.array([40, 43, 31, 55])
-    vel = np.zeros((4, 3), np.float32)
+    vel = np.array([[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [3.0, 0, 0]], np.float32)
     for seed in range(8):
         plan = sample_plan("c", np.random.default_rng(seed), bank_periods=periods, bank_vel=vel,
-                           n_frames=1000, dt=DT, seed=seed)
+                           schedule=_sched(12), n_frames=1000, dt=DT, seed=seed)
         loop_frames = sum(int(round(p.hold_s / DT)) for p in plan.loops)
         assert loop_frames < 1000, (seed, loop_frames)
         assert len(plan.loops) >= 1
@@ -116,9 +142,9 @@ def test_sampled_plan_leaves_room_for_its_transients():
 
 def test_sampled_phases_are_in_range():
     periods = np.array([29, 107])
-    vel = np.zeros((2, 3), np.float32)
+    vel = np.array([[0.0, 0, 0], [2.0, 0, 0]], np.float32)
     plan = sample_plan("c", np.random.default_rng(5), bank_periods=periods, bank_vel=vel,
-                       n_frames=2000, dt=DT, seed=5)
+                       schedule=_sched(8), n_frames=2000, dt=DT, seed=5)
     for lp in plan.loops:
         per = int(periods[lp.stride])
         assert 0 <= lp.phase0 < per and 0 <= lp.phase_out < per

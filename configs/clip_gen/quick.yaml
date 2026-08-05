@@ -26,6 +26,7 @@ distractor_s: 6.0
 # ---------------------------------------------------------------- flat family
 flat_loops: true              # exact looped strides + bounded MB transients
 flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
+flat_stand_frac: 0.08          # chance a flat segment is a standing hold (entered via a transient)
 flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
 flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
 flat_min_transient_s: 0.35
