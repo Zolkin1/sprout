@@ -104,6 +104,63 @@ reading to take from it -- the two are NOT comparable, since the old number came
 0.338 / 0.358), but that was a different env count and the docstring's own warning against
 comparing across ``--num_envs`` applies.
 
+VERIFIED VISUALLY GOOD ON FLAT GROUND, 2026-08-05, in BOTH simulators -- the best the pipeline
+has looked. teacher ``yaw_k12 @model_4800`` + generator ``yaw_flat3k @best.pt`` at K=12, on the
+flat3k library. Judged by eye (Isaac viewer + MuJoCo sim2sim), NOT by a survival number: the
+sweep against 135/171/182 had not been run when this was written.
+
+NOTHING BELOW IS IN GIT -- ``clips/`` and ``logs/`` are both gitignored -- so this recipe is the
+only way back. Each step feeds the next.
+
+1. CLIP LIBRARY (3.4 GB, 3000 flat clips, 60 tiles). See LIBRARIES["flat3k"] for the exact
+   compose command and the --types trap. Needs clips/g1_mb_v5_body.h5.
+
+2. TEACHER (talos, 8192 envs; model_4800 is 4800 of 20000 -- only 24% trained):
+     python scripts/rsl_rl/train.py --task G1-teacher-clf-terrain-depth \
+         --clip clips/g1_mb_v5_body.h5 --num_envs 8192 --max_iterations 20000 \
+         --run_name yaw_k12_v1
+   Note it trained on the MIXED library while the FM below trained on flat.
+
+3. RECORDING (9.2 GB, 200000 windows, ~31 min at 256 envs, data sha 5a583069096b):
+     python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth-play \
+         --load_run 2026-08-04_21-55-17_yaw_k12_v1 --checkpoint <...>/model_4800.pt \
+         --clip clips/g1_mb_v5_flat3k_body.h5 \
+         --num_windows 200000 --num_envs 256 --clip_device cpu --headless
+   history_anchor=plan, H=8, F=62 (--ref_future_len defaults to FlowMatchingConfig.future_len).
+   KNOWN GAP: the -play task strips resample_depth_noise + the camera extrinsics/intrinsics DR,
+   so the recorded depth is CLEAN at the nominal camera pose -- while the teacher trained on
+   noisy depth from randomized poses, and at deploy ONE image feeds both. Use the non-play task
+   (G1-teacher-clf-terrain-depth) to keep it, and then set noise_depth=0 or it double-counts.
+   Barely matters on flat (depth is near-constant); it matters a lot on terrain.
+
+4. GENERATOR (27.3M XL, 40 epochs, ~4 min/epoch, body-pose OFF):
+     python scripts/flow_matching/train.py --data <the .h5 from step 3> \
+         --d_model 512 --nhead 8 --num_layers 8 --dim_feedforward 2048 \
+         --batch_size 256 --lr 3e-4 --num_epochs 40 --cosine --wandb \
+         --run_name xl_yawframe_flat3k_bp_off_40ep
+   Active losses are only flow_mse + 0.01 * vel_consistency; joint_vel_consistency and fk_pose
+   auto-gate to 0 (their blocks are not in the selection) and both body_pose terms were off.
+
+5. LOOK AT IT -- Isaac (K=12 comes from the task default):
+     python scripts/rsl_rl/play.py --task G1-tracker-clf-fm-terrain-depth-play \
+         --load_run 2026-08-04_21-55-17_yaw_k12_v1 --checkpoint <...>/model_4800.pt \
+         --fm_checkpoint <...>/best.pt --clip clips/g1_mb_v5_flat3k_body.h5 \
+         --clip_device cpu --num_envs 8
+
+6. LOOK AT IT -- MuJoCo (reads exported/{tracker,fm}.onnx, which step 5 writes):
+     cd transfer/sim && python gen_tracker_runner.py \
+         --load_run 2026-08-04_21-55-17_yaw_k12_v1 \
+         --robot_name g1_29j --scene basic_scene --mode joystick --command smooth_ramp_running
+   --robot_name g1_29j is REQUIRED (the default g1_21j is a 21-DoF model under a 29-DoF policy),
+   and you must cd first. --fm_update_every is DEAD here: the tracker.onnx metadata wins, which
+   is why step 5's K ends up governing this run. Verified both contracts carry a camera spec
+   (tracker policy_parameters.depth_camera_spec + fm_meta.extero_spec), which is what
+   GenTrackerPolicy.load() cross-checks. CPU-only, ~100 ms/step.
+
+CAVEATS THAT TRAVEL WITH THIS PAIR: the teacher is 24% trained; the FM saw flat ground only, so
+neither the depth conditioning nor the body-pose loss was meaningfully exercised; and the depth
+was clean. Do not read "looks good on flat" as a terrain result.
+
 Examples:
     # the headline pair for one generator
     python scripts/rsl_rl/fm_survival_sweep.py --models capacity \\
@@ -212,7 +269,7 @@ TEACHERS: dict[str, Teacher] = {
     ),
     "yaw_k12": Teacher(
         run="2026-08-04_21-55-17_yaw_k12_v1",
-        checkpoint="model_4400.pt",
+        checkpoint="model_4800.pt",
         note="44/node (572) reference window, yaw-aligned anchor, ego_anchor_every=12, torso "
              "CoM + live restitution DR, base_pos noise (0.06, 0.06, 0.03). Trained on talos "
              "against the MIXED library (g1_mb_v5_body.h5). STILL TRAINING -- 4400 of 20000 "
@@ -246,6 +303,19 @@ LIBRARIES: dict[str, Library] = {
                      "the full 10k-clip terrain library: flat + stairs + boxes + distractors."),
     "small": Library("clips/g1_mb_v5_small_body.h5",
                      "36 clips, mixed terrain. Quick viewer runs, too small to measure on."),
+    "flat3k": Library("clips/g1_mb_v5_flat3k_body.h5",
+                      "ALL 3000 flat clips of g1_mb_v5_body.h5, 60 flat tiles. What the "
+                      "yaw_flat3k generator was TRAINED on -- 'flat' above is an evenly "
+                      "sampled HALF of the same pool (--flat-clips 1500), so use flat3k for "
+                      "training data and flat for numbers comparable to the tables above. "
+                      "Rebuild (clips/ is gitignored):\n"
+                      "  python scripts/rsl_rl/compose_terrain_library.py \\\n"
+                      "      --mix \"clips/g1_mb_v5_body.h5:0\" \\\n"
+                      "      --flat-from clips/g1_mb_v5_body.h5 \\\n"
+                      "      --flat-clips 3000 --flat-tiles 60 \\\n"
+                      "      --out clips/g1_mb_v5_flat3k_body.h5\n"
+                      "Do NOT add --types flat: the mix source would then register as a "
+                      "second flat pool and every clip would be carried twice."),
 }
 
 
@@ -311,6 +381,23 @@ GENERATORS: dict[str, Generator] = {
         trained_on="depth_v5_200k",
         note="the one that worked: closed loop 2/24 -> 16/24. Still underfitting "
              "(val 0.1025 < train 0.1073), so more capacity may keep paying.",
+    ),
+    "yaw_flat3k": Generator(
+        run="2026-08-05_11-27-19_xl_yawframe_flat3k_bp_off_40ep",
+        params="27.3M (d_model 512, nhead 8, 8 layers, ff 2048) + cosine, body-pose OFF",
+        trained_on="flat3k_200k (data sha 5a583069096b)",
+        note="THE FIRST GENERATOR THAT FITS THE YAW-FRAME TEACHER: 44/node (D=44), F=62, so "
+             "K=12 is servable (F >= max_offset 50 + K). Every generator above is 41/node and "
+             "F=51, hence K=1-only and refused against this teacher. best.pt is epoch 35 of "
+             "40; final val flow_mse 0.1287 (null 0.1510, so the history IS being used), "
+             "rmse_base_pos 0.0447, ori_geodesic 0.0725, rmse_joint_pos 0.0977. Still "
+             "underfitting at 40 epochs (train 0.1297 and falling), and train.py has no "
+             "resume, so a longer run means starting over. Do NOT compare its flow_mse to the "
+             "F=51 rows above: the mean now includes offsets 51-61, whose x error runs "
+             "0.089-0.110, so extending the horizon raises any horizon-averaged metric "
+             "mechanically. At MATCHED offsets it is comparable or better -- but the data is "
+             "FLAT, which makes z nearly trivial (offset-50 z 0.019 vs 0.062 on mixed), so "
+             "that is a dataset effect and NOT evidence the yaw frame helped.",
     ),
     "xl_ema": Generator(
         run="2026-08-03_11-12-14_ar_window_v5_f62_41node_xl_ema",
