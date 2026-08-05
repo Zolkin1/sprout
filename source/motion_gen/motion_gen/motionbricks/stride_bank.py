@@ -31,7 +31,7 @@ written before this module still load.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -162,6 +162,14 @@ class StrideBank:
     dt: float                      # bank sampling period (s) -- the RL control period, not MB's fps
     names: list                    # [N] str
     meta: dict
+    # The SOLVER's own per-foot contact schedule, [N] of uint8 [F_i, 2], or None per stride for a bank
+    # written before it was carried.  Last, with a default, so old call sites keep working; padded in
+    # __post_init__ so ``bank.contact[i]`` is always safe to index.
+    contact: list = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if len(self.contact) < len(self.strides):
+            self.contact = list(self.contact) + [None] * (len(self.strides) - len(self.contact))
 
     @property
     def period_frames(self) -> np.ndarray:
@@ -203,6 +211,11 @@ def load_stride_bank(path: str) -> StrideBank:
     n = len(strides)
     periodic = d["periodic"] if "periodic" in d else np.ones(n, dtype=np.uint8)
     net = np.stack([period_net_se2(s) for s in strides], axis=0) if n else np.zeros((0, 4), np.float32)
+    # Older banks predate the solver contact schedule; absent is represented as None per stride so a
+    # caller has to decide what to do rather than silently getting a zero-filled "never in contact".
+    ca = d["contact_all"] if "contact_all" in d else None
+    contact = ([np.ascontiguousarray(ca[offsets[i]:offsets[i + 1]]) for i in range(n)]
+               if ca is not None else [None] * n)
     return StrideBank(
         strides=strides,
         steady_vel=d["steady_vel"].astype(np.float32),
@@ -211,12 +224,17 @@ def load_stride_bank(path: str) -> StrideBank:
         dt=float(meta["dt"]),
         names=list(meta.get("names", [f"stride_{i}" for i in range(n)])),
         meta=meta,
+        contact=contact,
     )
 
 
 def save_stride_bank(path: str, strides: list, steady_vel: np.ndarray, periodic: np.ndarray,
-                     meta: dict) -> None:
-    """Write a stride bank.  ``strides`` is a list of ``qpos[F_i, 36]`` float32 arrays."""
+                     meta: dict, contact: list | None = None) -> None:
+    """Write a stride bank.  ``strides`` is a list of ``qpos[F_i, 36]`` float32 arrays.
+
+    ``contact`` is the optional per-stride ``[F_i, 2]`` solver contact schedule, stored on the SAME
+    offsets as the poses so a loop replay can slice both identically.
+    """
     for i, s in enumerate(strides):
         if s.ndim != 2 or s.shape[1] != 36:
             raise ValueError(f"stride {i}: expected qpos [F,36], got {s.shape}")
@@ -229,4 +247,6 @@ def save_stride_bank(path: str, strides: list, steady_vel: np.ndarray, periodic:
         steady_vel=np.asarray(steady_vel, dtype=np.float32),
         periodic=np.asarray(periodic, dtype=np.uint8),
         meta=np.array(json.dumps(meta)),
+        **({"contact_all": np.concatenate(contact, axis=0).astype(np.uint8)}
+           if contact is not None and all(c is not None for c in contact) else {}),
     )

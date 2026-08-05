@@ -57,6 +57,14 @@ def main() -> int:
     p.add_argument("--source", required=True, help="Traj-opt library root (robot output-name layout).")
     p.add_argument("--out", required=True, help="Output clip library .h5.")
     p.add_argument("--clip-length", type=float, default=20.0, help="Seconds per clip.")
+    p.add_argument("--periods", type=int, default=0,
+                   help="If > 0, each clip is exactly this many GAIT PERIODS instead of --clip-length "
+                        "seconds. Strides differ in period, so clips end up different lengths -- which "
+                        "is the point when the question is what one cycle does, repeated.")
+    p.add_argument("--solver-contact", action="store_true",
+                   help="Write the traj-opt solver's own contact schedule instead of the geometric one "
+                        "ClipOutputBuilder derives. The geometric flag reports a per-foot duty of 0.86 "
+                        "on these frames against the solver's 0.32, i.e. it calls swing 'contact'.")
     p.add_argument("--dt", type=float, default=0.02, help="Clip control period (s); must match the bank's.")
     p.add_argument("--device", default="cpu")
     p.add_argument("--limit", type=int, default=None, help="Only the first N strides (a quick check).")
@@ -82,6 +90,10 @@ def main() -> int:
     builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT_FRAMES, device=dev)
     t_frames = max(1, int(round(args.clip_length / args.dt)))
+    if args.periods > 0:
+        # Padded width must cover the LONGEST clip; strides have different periods, so N periods is a
+        # different frame count per stride and each clip's own clip_len is what marks its real end.
+        t_frames = int(max(int(bank.period_frames[i]) * args.periods for i in idx))
     anchor = int(anchor_mask_from_free([x.strip() for x in args.flat_anchor.split(",") if x.strip()]))
     rng = np.random.default_rng(args.seed)
 
@@ -96,6 +108,9 @@ def main() -> int:
     print(f"[loop_clips] {len(idx)} strides -> {args.out}  (T={t_frames}, P={len(builder.pos_names)}, "
           f"V={len(builder.vel_names)}, start_phase={args.start_phase})")
 
+    if args.solver_contact and any(bank.contact[i] is None for i in idx):
+        raise SystemExit("--solver-contact: this bank carries no contact schedule; re-run "
+                         "export_stride_bank.py (it now stores one when the source npz has it)")
     writer = ClipLibraryWriter(args.out, len(idx), meta)
     writer.set_attr("generator", "loop_replay_v1")
     writer.set_attr("generator_config", {"stride_bank": os.path.abspath(args.stride_bank),
@@ -103,9 +118,24 @@ def main() -> int:
     for out_i, i in enumerate(idx):
         period = int(bank.period_frames[i])
         start = int(rng.integers(0, period)) if args.start_phase == "random" else 0
+        n_i = period * int(args.periods) if args.periods > 0 else t_frames
         rp, rq, jt = _split(bank.strides[i], dev)
-        lrp, lrq, ljt, _ = loop_frames(rp, rq, jt, None, t_frames, start=start)
+        # The solver schedule rides along on the SAME loop_frames call as the poses, so it cannot slip
+        # out of phase with the motion it describes however the loop wraps or is cut.
+        ct_src = (torch.as_tensor(bank.contact[i], dtype=torch.uint8, device=dev)
+                  if bank.contact[i] is not None else None)
+        lrp, lrq, ljt, lct = loop_frames(rp, rq, jt, ct_src, n_i, start=start)
         y, dy, contact = builder.build(lrp, lrq, ljt, args.dt)
+        if args.solver_contact and lct is not None:
+            contact = lct.to(torch.uint8)
+
+        def _pad(a):
+            """Pad to the library width by REPEATING the last row -- clip_len marks the real end."""
+            if a.shape[0] >= t_frames:
+                return a[:t_frames]
+            return torch.cat([a, a[-1:].expand(t_frames - a.shape[0], *a.shape[1:])], dim=0)
+
+        y, dy, contact = _pad(y), _pad(dy), _pad(contact)
         # The stride's OWN measured twist, so command and motion agree by construction; anything mb_qc
         # then reports as tracking error is a real defect, not a bookkeeping gap.
         tvel = torch.zeros(t_frames, 3, dtype=torch.float32, device=dev)
@@ -116,7 +146,7 @@ def main() -> int:
             "terrain_id": torch.tensor([-1], dtype=torch.int32),
             "terrain_type": "flat",
             "anchor_mask": torch.tensor([anchor], dtype=torch.uint8),
-            "clip_len": torch.tensor([t_frames], dtype=torch.int32),
+            "clip_len": torch.tensor([n_i], dtype=torch.int32),
             "stride_idx": torch.full((1, t_frames), i, dtype=torch.int32),
         })
     writer.close()

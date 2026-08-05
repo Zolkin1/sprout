@@ -54,6 +54,7 @@ def main() -> int:
         raise SystemExit(f"no clean strides ingested from {args.library}")
 
     qpos_chunks: list[np.ndarray] = []
+    contact_chunks: list = []
     steady_vel = np.zeros((len(sources), 3), dtype=np.float32)
     periodic = np.zeros(len(sources), dtype=np.uint8)
     names: list[str] = []
@@ -63,17 +64,27 @@ def main() -> int:
         if qpos.shape[1] != 36:
             raise ValueError(f"stride {s.name}: expected qpos [Fi,36], got {qpos.shape}")
         qpos_chunks.append(qpos)
+        contact_chunks.append(None if s.contact is None
+                              else s.contact.cpu().numpy().astype(np.uint8))
         steady_vel[i] = (s.steady_vel.cpu().numpy() if s.steady_vel is not None else 0.0)
         periodic[i] = 1 if s.wrap == "periodic" else 0
         names.append(s.name)
 
     meta = {"dt": args.dt, "library": args.library, "hf_repo": args.hf_repo,
             "n_strides": len(sources), "joint_order": "G1_JOINT_NAMES", "names": names}
-    save_stride_bank(args.out, qpos_chunks, steady_vel, periodic, meta)
+    n_ct = sum(c is not None for c in contact_chunks)
+    if n_ct and n_ct != len(contact_chunks):
+        raise SystemExit(f"[stride_bank] only {n_ct}/{len(contact_chunks)} strides carry a solver "
+                         f"contact schedule -- refusing to write a bank where it is present for some "
+                         f"strides and silently absent for others")
+    save_stride_bank(args.out, qpos_chunks, steady_vel, periodic, meta,
+                     contact=(contact_chunks if n_ct else None))
 
     n_frames = sum(c.shape[0] for c in qpos_chunks)
     vmin, vmax = steady_vel.min(axis=0), steady_vel.max(axis=0)
     print(f"[stride_bank] wrote {args.out}: {len(sources)} strides, {n_frames} total frames, dt={args.dt}")
+    print(f"[stride_bank]   solver contact schedule: "
+          f"{'carried' if n_ct else 'ABSENT (source npz had no contact_flags)'}")
     print(f"[stride_bank]   steady_vel range: vx[{vmin[0]:.2f},{vmax[0]:.2f}] "
           f"vy[{vmin[1]:.2f},{vmax[1]:.2f}] wz[{vmin[2]:.2f},{vmax[2]:.2f}]; "
           f"periodic={int(periodic.sum())}/{len(sources)}")

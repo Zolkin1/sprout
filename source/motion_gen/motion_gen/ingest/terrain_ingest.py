@@ -103,7 +103,9 @@ def ingest_terrain_library(
         st = _clip_to_state(npz_path, dt, device)
         if st is None or st[0].shape[0] < min_frames:
             continue
-        joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel = st
+        # _clip_to_state also returns the solver contact now; terrain reads contact_flags itself
+        # below (same nearest-resampling), so that copy stays authoritative here.
+        joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel, _ = st
         F = int(joint_pos.shape[0])
 
         z = np.load(npz_path, allow_pickle=True)
