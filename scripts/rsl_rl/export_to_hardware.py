@@ -33,6 +33,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
+from deploy.hardware import DEFAULT_HF_REPO_ID  # noqa: E402
 
 #: What the robot downloads. Both are required: the tracker alone cannot walk.
 ARTIFACTS = ("tracker.onnx", "fm.onnx")
@@ -96,8 +97,11 @@ def main() -> None:
         description="Upload tracker.onnx + fm.onnx to HuggingFace for hardware deployment.")
     parser.add_argument("--run_dir", required=True,
                         help="Run directory; uploads from <run_dir>/exported.")
-    parser.add_argument("--hf_repo_id", required=True,
-                        help="HuggingFace repository ID (e.g. 'username/repo-name').")
+    parser.add_argument("--hf_repo_id", default=DEFAULT_HF_REPO_ID,
+                        help=f"HuggingFace repository ID (e.g. 'username/repo-name'). "
+                             f"Defaults to {DEFAULT_HF_REPO_ID}, the same constant the "
+                             f"on-robot prefetch reads, so upload and download cannot "
+                             f"drift apart.")
     parser.add_argument("--folder_name", default=None,
                         help="Folder within the repo to upload the two ONNX files to. "
                              "Defaults to the RUN DIRECTORY's own name (timestamp + run "

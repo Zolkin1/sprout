@@ -30,7 +30,10 @@ control:
       # parameter out of their metadata: joint order, gains, observation terms and clips,
       # and the depth-camera contract. There is no policy_parameters.yaml any more -- if
       # you find yourself wanting to add one here, the value belongs in the export instead.
-      hf_repo_id: "zolkin/robot-rl-policies"
+      # Must match deploy.hardware.DEFAULT_HF_REPO_ID, which the uploader
+      # (scripts/rsl_rl/export_to_hardware.py) and prefetch_policy.py both read. A ROS
+      # param cannot import it, so this one restatement is by hand -- change both together.
+      hf_repo_id: "zolkin/robot_rl"
       hf_policy_folder: "REPLACE_ME"
       # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
       # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by

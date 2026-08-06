@@ -37,6 +37,15 @@ from .tracker_session import convert_joint_order
 #: The two files a deployment needs, relative to the policy folder in the repo.
 ARTIFACT_NAMES = ("tracker.onnx", "fm.onnx")
 
+#: The HuggingFace repo policies are published to and pulled from. Defined here, next to
+#: the fetch, because the UPLOADER (``scripts/rsl_rl/export_to_hardware.py``) and the
+#: on-robot PREFETCH must name the same repo -- they were previously two independent
+#: literals, and the string they both held (``zolkin/robot-rl-policies``) named a repo that
+#: had never been created, so uploading and prefetching both failed at the point of use.
+#: The obelisk controller config restates it as a ROS param and so cannot import this;
+#: keep ``g1_control/config/common/low_level.yml`` in step by hand.
+DEFAULT_HF_REPO_ID = "zolkin/robot_rl"
+
 #: Bounds on the online fetch. The download happens inside the controller's lifecycle
 #: ``on_configure``; an unbounded HTTP call there hangs BRING-UP, and the only cure is
 #: killing the launch. A robot LAN with no route out must fail in seconds, not block.
