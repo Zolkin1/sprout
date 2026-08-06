@@ -145,9 +145,11 @@ python scripts/rsl_rl/play.py --task=G1-teacher-clf-terrain-play \
     --load_run <run_dir> --clip clips/g1_mb_v5.h5 --clip_device cpu
 ```
 
-`play.py` also writes the deploy artifacts: `exported/policy.pt`, `policy.onnx`,
+`play.py` also writes the deploy artifacts: `exported/policy.pt`,
 `policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + `fm.onnx`. Pass
-`--no_deploy_onnx` to skip the ONNX pair.
+`--no_deploy_onnx` to skip the ONNX pair. `tracker.onnx` is the ONLY ONNX form of the
+tracker — it is `policy.pt` re-exported self-contained, batch-dynamic and with the
+deployment parameters embedded, and it is what MuJoCo and the robot load.
 
 ### 3. Train the flow-matching generator
 
