@@ -124,6 +124,22 @@ class RecordingMeta:
     DEFAULT for the generator trained on this file: an FM must predict exactly the blocks
     the policy it drives consumes. ``None`` for a recording written before the selection
     existed, which is necessarily a full five-block one."""
+    extero_corrupted: bool = False
+    """Whether the recorded exteroception already carries the sim's sensor DR.
+
+    True when a depth noiser was installed at record time (the ``resample_depth_noise`` event),
+    i.e. the recorded ``depth`` went through the same plane deviation, blur, dropout and
+    randomized camera pose the RL policy saw. At deploy ONE physical image feeds both the
+    policy and the generator, so they must be corrupted alike -- and the sim's model is
+    STRUCTURED (per-episode plane + blur + pose, per-step additive + dropout) in a way an
+    additive scalar cannot reproduce.
+
+    False for a recording made on a ``-play`` task, which strips those events: the depth is
+    clean at the nominal camera pose, and ``FlowMatchingConfig.noise_depth`` is then the only
+    corruption the generator ever sees.
+
+    The FM dataset reads this and ZEROES ``noise_depth`` when it is True, so the two do not
+    stack. Nothing else consults it."""
     history_anchor: str = ""
     """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
     relative to.

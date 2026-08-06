@@ -382,6 +382,25 @@ GENERATORS: dict[str, Generator] = {
         note="the one that worked: closed loop 2/24 -> 16/24. Still underfitting "
              "(val 0.1025 < train 0.1073), so more capacity may keep paying.",
     ),
+    "dr27M": Generator(
+        run="2026-08-05_17-05-00_xl27M_drdepth_flat3k_100ep",
+        params="27.3M (d_model 512, nhead 8, 8 layers, ff 2048) + cosine, body-pose OFF",
+        trained_on="flat3k_200k_DRdepth",
+        note="First generator trained on depth carrying the sim's SENSOR DR (recorded on the "
+             "TRAIN task, so resample_depth_noise + the camera extrinsics/intrinsics DR are "
+             "live; extero_corrupted=True, so the dataset zeroed noise_depth). 100 epochs; "
+             "best.pt is epoch 95. val flow_mse 0.1170 (null 0.1434), rmse_base_pos 0.0378. "
+             "Pairs with dr9M below -- identical data and settings, only width differs.",
+    ),
+    "dr9M": Generator(
+        run="2026-08-05_23-59-27_m9_drdepth_flat3k_100ep",
+        params="9.55M (d_model 384, nhead 6, 6 layers, ff 1024) + cosine, body-pose OFF",
+        trained_on="flat3k_200k_DRdepth",
+        note="The capacity control for dr27M: same 200k DR-depth windows, same schedule, only "
+             "d_model/layers/ff reduced. nhead 6 keeps head_dim at 64, matching the XL. val "
+             "flow_mse 0.1351 (null 0.1612), rmse_base_pos 0.0460 -- 15%/22% worse than the "
+             "27M, so capacity was STILL paying at 100 epochs on this data.",
+    ),
     "yaw_flat3k": Generator(
         run="2026-08-05_11-27-19_xl_yawframe_flat3k_bp_off_40ep",
         params="27.3M (d_model 512, nhead 8, 8 layers, ff 2048) + cosine, body-pose OFF",
@@ -452,8 +471,21 @@ CONFIGS: dict[str, Config] = {
                  "verified byte-identical at ego_anchor_fraction 0.0 and 1.0.",
     ),
     "teacher_forced": Config(
-        overrides={"history_from": "clip",
-                   "ego_anchor_fraction": "1.0", "ego_anchor_every": "1"},
+        # BROKEN for a PLAN-FRAME generator, and not by anything this config can fix.
+        # FmTrackingCommand._clip_history_node builds its row via reference_window_obs, which
+        # anchors on the MEASURED ROBOT AT THAT STEP. Its docstring still claims that is
+        # "byte-for-byte the row the DATASET builds a history from" -- true until 3b3af11, which
+        # moved the recorder to substitute the PLAN anchor into history rows 0..H-2. So this cell
+        # now feeds per-step-anchored history to a generator trained on plan-anchored history,
+        # while closed_loop (which pushes _prev_served_node raw, already in its plan's frame) is
+        # correct. Measured consequence: teacher_forced 158/200 BELOW closed_loop 176/200 -- not
+        # a ceiling at all. Fix belongs in _clip_history_node, not here.
+        #
+        # The ego_anchor_every="1" pin was also removed (same staleness as clip_control below:
+        # match the TEACHER's cadence, do not hardcode). That is correct on principle but was
+        # NOT the cause of the inversion -- removing it moved 163 -> 158, i.e. nothing beyond
+        # run-to-run spread.
+        overrides={"history_from": "clip", "ego_anchor_fraction": "1.0"},
         isolates="The generator still predicts and the tracker still follows, but the "
                  "context is always correct. closed_loop far below this = the LOOP "
                  "diverges; the two together = the MODEL is the limit.",

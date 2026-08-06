@@ -620,10 +620,19 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _clip_history_node(self) -> torch.Tensor:
         """The CLIP's window node for the current step, anchored on the robot now.
 
-        The teacher-forcing counterpart of the served node, and byte-for-byte the row the
-        DATASET builds a history from: ``MotionSequenceCommand.reference_window_obs`` at
-        offset 0 is the applied reference at this step expressed relative to the measured
-        robot at this step, which is exactly ``history_ref[h]`` against ``history_state[h]``.
+        The teacher-forcing counterpart of the served node, in the SAME frame the closed loop
+        pushes: the PLAN's frame, i.e. the robot as it was at the last re-plan.
+
+        ``reference_window_obs`` anchors on the measured robot at THIS step, so the row is
+        re-expressed onto ``_anchor_pos``/``_anchor_quat`` -- the exact inverse of
+        :meth:`_reanchor_to_now`, and a no-op at ``fm_update_every=1`` where the two coincide.
+
+        This used to return the robot-now row and claim it was "byte-for-byte the row the
+        DATASET builds a history from" (``history_ref[h]`` against ``history_state[h]``). That
+        was true until 3b3af11, which moved the recorder to substitute the PLAN anchor into
+        history rows ``0..H-2`` -- so the claim silently inverted, and teacher forcing fed the
+        generator per-step-anchored history it was never trained on. It measured 158/200 against
+        closed_loop's 176/200: below the loop it is supposed to bound.
 
         Built with the CHECKPOINT's block selection, not the layout default: this row goes
         into the same history ring as the generator's own nodes, so an 82-wide clip node
@@ -639,9 +648,19 @@ class FmTrackingCommand(MotionSequenceCommand):
         prev = self._serve_override
         self._serve_override = "clip"
         try:
-            return super().reference_window_obs(self._zero_offset, self._fm_blocks)[:, 0]
+            node = super().reference_window_obs(self._zero_offset, self._fm_blocks)
         finally:
             self._serve_override = prev
+        # robot-now -> plan anchor. Computed HERE, at stash time, so the row carries the anchor
+        # in force at the step it describes; a re-plan between the stash and the push (one step
+        # later) must not retroactively change it.
+        return reanchor_window(
+            node,
+            wp.to_torch(self.robot.data.root_pos_w)[:, None, :],
+            wp.to_torch(self.robot.data.root_quat_w)[:, None, :],
+            self._anchor_pos[:, None, :], self._anchor_quat[:, None, :],
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
+        )[:, 0]
 
     def _push_served_node(self) -> None:
         """Push one row into the autoregressive history (see ``cfg.history_from``).

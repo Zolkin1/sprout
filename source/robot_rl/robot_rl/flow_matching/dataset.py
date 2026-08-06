@@ -314,6 +314,18 @@ class FutureStateDataset(Dataset):
                 "scripts/rsl_rl/record_data.py --num_windows (an absent field means the "
                 "recording predates the change, so it is per-step)."
             )
+        # Do NOT stack the sim's sensor DR with the train-time additive noise. When the
+        # recording already carries the noiser's corruption (structured: per-episode plane +
+        # blur + camera pose, per-step additive + dropout), adding a scalar on top over-noises
+        # the one signal the generator uses to place the reference on terrain. Same gating
+        # style as the block-tied loss weights below, and only depth is affected: the recorder
+        # captures height_scan through the raw obs FUNCTION, which bypasses the term's noise.
+        if getattr(meta, "extero_corrupted", False) and cfg.extero_source == "depth":
+            if cfg.noise_depth > 0.0:
+                print(f"[fm-data] noise_depth={cfg.noise_depth} -> 0.0: this recording already "
+                      "carries the sim's depth DR (extero_corrupted=True), so the train-time "
+                      "noise would double-count it.")
+                cfg.noise_depth = 0.0
         cfg.check_extero_source()
         if data.get(cfg.extero_source) is None:
             hint = (

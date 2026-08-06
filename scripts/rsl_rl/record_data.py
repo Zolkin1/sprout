@@ -128,6 +128,15 @@ parser.add_argument(
          "root+joints only.",
 )
 parser.add_argument(
+    "--skip_height_scan", action="store_true", default=False,
+    help="Do not record the 'height_scan' array. The recorder normally stores BOTH "
+         "exteroception signals so one recording can train either FM (cfg.extero_source picks "
+         "at train time); pass this when the depth path is the only one you intend to use. "
+         "Note the recorded scan is CLEAN either way -- its noise lives on the obs term and the "
+         "recorder calls mdp.height_scan directly -- whereas depth carries its DR inside the "
+         "obs function, so the two are not symmetric.",
+)
+parser.add_argument(
     "--ref_future_len", type=int, default=FlowMatchingConfig().future_len,
     help="Number of FUTURE nodes F to record per step in 'ref_future' (the ego-anchored "
          "clip future = the robot-state-conditioned FM target). Defaults to (and MUST "
@@ -386,6 +395,27 @@ def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
     return codes, names
 
 
+def _extero_is_corrupted(env) -> bool:
+    """Whether a depth noiser is installed, i.e. the recorded depth carries the sim's sensor DR.
+
+    The ``-play`` tasks strip ``resample_depth_noise`` (and the camera extrinsics/intrinsics DR),
+    so a play recording captures CLEAN depth at the nominal pose. Recording on the train task
+    keeps them. Checked through the noiser registry because that is the thing ``depth_image``
+    consults -- an event that is configured but never ran would not corrupt anything.
+
+    Args:
+        env: The unwrapped environment.
+
+    Returns:
+        True when at least one depth observation term has a noiser installed.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import get_depth_noiser
+    for sensor_name, _ in mdp.find_depth_obs_terms(env):
+        if get_depth_noiser(env, sensor_name) is not None:
+            return True
+    return False
+
+
 def _build_recording_meta(
     env: RslRlVecEnvWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
@@ -470,6 +500,9 @@ def _build_recording_meta(
         # Windowed recordings substitute the plan anchor into the history rows (see
         # collect_windows); the per-step .npz path does not, and its rows stay measured.
         history_anchor="plan" if windowed else "per_step",
+        # Probes the LIVE noiser rather than the event config: depth_image applies noise only
+        # when resample_depth_noise installed one, so this is what actually reached the data.
+        extero_corrupted=_extero_is_corrupted(env.unwrapped),
     )
 
 
@@ -639,7 +672,8 @@ def collect_pairs(
     # Height scan (the FM's height-conditioning token), captured when the recording task
     # has a height_scanner sensor active (e.g. G1-teacher-clf-terrain-play). Same mdp.height_scan
     # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
-    has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                and not args_cli.skip_height_scan)
     # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
     # whenever the task has depth observation terms, so ONE recording can train either FM
     # and the choice is made at FM-train time via cfg.extero_source.
@@ -873,7 +907,8 @@ def collect_windows(
     device = env.unwrapped.device
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
-    has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                and not args_cli.skip_height_scan)
     has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
 
     state_frames = list(state_frames or [])
@@ -1244,14 +1279,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "clip-tracking task exposing get_future_world_base + a command velocity, "
                     "and do not pass --no_ref_future."
                 )
-            if "height_scanner" not in env.unwrapped.scene.sensors:
+            if ("height_scanner" not in env.unwrapped.scene.sensors
+                    and not args_cli.skip_height_scan
+                    and not mdp.find_depth_obs_terms(env.unwrapped)):
                 raise ValueError(
-                    "--num_windows requires a height_scanner sensor (the FM's height token); "
-                    "record on a task that has one (e.g. G1-teacher-clf-terrain-play)."
+                    "--num_windows needs SOME exteroception: a height_scanner sensor, depth obs "
+                    "terms, or --skip_height_scan on a depth task. Record on a task that has "
+                    "one (e.g. G1-teacher-clf-terrain-depth)."
                 )
             H = int(args_cli.history_len)
             node_dim = int(sum(meta.state_term_dims))
-            K = int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
+            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
+            # collect_windows' own `has_scan`, which is why both read the same two conditions:
+            # the writer accepts only keys it declared, so declaring height_scan while the loop
+            # never fills it is a KeyError on the first emitted batch.
+            _rec_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                         and not args_cli.skip_height_scan)
+            K = (int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
+                 if _rec_scan else 0)
             cmd_dim = int(
                 ref_cmd.get_future_command_velocity(
                     torch.arange(1, device=env.unwrapped.device)

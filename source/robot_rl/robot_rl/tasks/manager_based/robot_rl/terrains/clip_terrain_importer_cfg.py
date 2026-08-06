@@ -47,8 +47,24 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     size_margin: float = 1.0
     """Extra flat (m) added to the terrain / transition footprints."""
 
-    flat_buffer: float = 2.0
-    """Flat-tile margin (m) on each side beyond the flat clips' bbox."""
+    flat_buffer: float = 20.0
+    """Flat-tile margin (m) on each side beyond the flat clips' bbox.
+
+    20 m, not the original 2 m, because 2 m SILENTLY BOUNDED the survival metric: the tracker
+    task terminates only on ``time_out`` and ``base_fallen``, so a robot that drifts off the
+    platform registers as a fall and is indistinguishable from falling over. Measured on the
+    yaw_flat3k pair, closed loop, 200 envs, seed 42 -- 2 m: 176/200, 10 m: 188, 20 m: 194,
+    40 m: 189. So ~14-18 of the 24 "failures" at 2 m were the platform ending, not the policy.
+
+    TODO(flat-buffer): the series is NOT monotonic (194 -> 189 from 20 m to 40 m), which cannot
+    be an edge effect -- on flat ground a bigger platform is strictly more permissive. Most
+    likely this resizes the TILES, which moves env origins and clip placement, so each value is
+    a different set of initial conditions rather than one variable swept. Decisive test: re-run
+    one margin at a second seed and see whether the 188/194/189 spread is just that. Until then
+    20 m is a pragmatic choice, not a measured optimum, and survival numbers are only comparable
+    at a FIXED value. The real fix is probably a divergence termination on the tracker (the
+    teacher stops at 0.3 m of base error; the tracker has no such term), so survival measures
+    tracking rather than how long until the robot leaves the mesh."""
 
     transition_back_buffer: float = 1.0
     """Flat (m) prepended to each transition tile behind the robot's start."""
