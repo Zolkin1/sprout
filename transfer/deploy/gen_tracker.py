@@ -164,6 +164,28 @@ class GenTrackerPolicy:
         # fm_update_every, since the field lives on FmTrackingCommandCfg rather than on the
         # clip command) should take the caller's value rather than the recording's.
         meta_every = self._trk.params.get("fm_update_every")
+        if meta_every is None and self.fm_enabled:
+            raise ValueError(
+                f"{self.tracker_onnx} carries no 'fm_update_every', but an fm.onnx was given, "
+                "so the re-plan cadence would fall back to the caller's default and the "
+                "generator would be sampled at a rate the tracker never trained with. Against a "
+                "K=12 pair the MuJoCo runner's default of 2 re-plans 6x too often, and it "
+                "presents as a wobbly policy rather than as a configuration error -- which is "
+                "exactly how it was found.\n"
+                "\n"
+                "Cause: export_parameters.py reads the cadence off the traj_ref command term "
+                "inside a try/except and OMITS the key when the term has no such field. So any "
+                "play.py run without --fm_checkpoint rewrites tracker.onnx without it, while "
+                "leaving the older fm.onnx untouched -- a tracker.onnx noticeably newer than its "
+                "fm.onnx is the tell.\n"
+                "\n"
+                "Fix: re-export with play.py on the TRACKER task WITH --fm_checkpoint, so both "
+                "artifacts come from one run.\n"
+                "\n"
+                "Only raised when a generator is actually loaded: a teacher export legitimately "
+                "carries no cadence (the field lives on FmTrackingCommandCfg, not on the clip "
+                "command), and a tracker-only deploy re-plans nothing."
+            )
         if meta_every is not None:
             self.fm_update_every, src = max(int(meta_every), 1), "tracker metadata"
         else:
@@ -595,6 +617,11 @@ class GenTrackerPolicy:
         self._pred = sample_window(ctx, history, height, cmd_tokens, noise,
                                    history_null=np.array([bool(history_null)]))
         self._fm_infer_s += time.perf_counter() - t0
+        # Counting the calls, not just their total time: pop_avg_infer_ms divides by this, and
+        # the runner suppresses the FM half of its timing line when the count is 0. Without it
+        # the generator's inference cost -- ~99% of the deploy step budget -- was invisible in
+        # sim2sim while the tracker's was reported every 5 s.
+        self._fm_infer_n += 1
         # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
         # Both are needed to serve the window later: the cursor to index it, the anchor to
         # undo the staleness once the robot has moved on.

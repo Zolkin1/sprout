@@ -991,6 +991,13 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
+    parser.add_argument("--providers", default="",
+                        help="Comma-separated onnxruntime execution providers for BOTH nets, "
+                             "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Empty = CPU "
+                             "only, the deployment default -- a GPU is opt-in so nothing "
+                             "silently starts using one. CPU is always appended as a fallback "
+                             "for ops the accelerator lacks. Needs the onnxruntime-gpu wheel; "
+                             "resolve_providers raises naming it if the provider is absent.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1169,6 +1176,7 @@ def main() -> None:
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
         null_history_warmup=args.null_history_warmup,
+        providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
     )
     policy.load()
 
