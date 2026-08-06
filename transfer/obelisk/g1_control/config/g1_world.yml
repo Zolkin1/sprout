@@ -56,13 +56,23 @@ robot:
         # fragment into this nested list, so a path is what keeps generated content out of
         # a hand-written file. Inline is otherwise preferred on this obelisk pin.
         #
-        # UNCOMMENT once a depth-trained policy has been exported and the config generated;
-        # a height-scan policy needs config/scan/height_scan.yml here instead.
-        # - topic: /depth/image_processed
-        #   dt: 0.02
-        #   msg_type: DepthImage
-        #   config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_near.yml
-        #   sensor_names: {depth_pos_sensor: framepos}
+        # ONE ENTRY PER CAMERA, in the artifact's CONTRACT ORDER -- the controller reads the
+        # count from tracker.onnx and refuses to arm if depth_topics does not match it
+        # one-to-one. A height-scan policy needs config/scan/height_scan.yml here instead.
+        #
+        # The topic names are the convention for a TWO-camera policy; the older single
+        # /depth/image_processed predates the pair. The Jetson ZED node must publish on these
+        # same names on hardware -- see config/scan/zed_targets.yml for what it has to emit.
+          - topic: /depth/near/image_processed
+            dt: 0.02
+            msg_type: DepthImage
+            config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_near.yml
+            sensor_names: {depth_near_pos_sensor: framepos}
+          - topic: /depth/far/image_processed
+            dt: 0.02
+            msg_type: DepthImage
+            config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_far.yml
+            sensor_names: {depth_far_pos_sensor: framepos}
         # ----- Lidar: simulated MID360 feeding the REAL FAST-LIO ----- #
           - topic: /livox/lidar
             dt: 0.1

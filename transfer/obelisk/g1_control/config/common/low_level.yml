@@ -35,21 +35,30 @@ control:
       # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
       # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by
       # `fm_update_every` in the tracker metadata when the export carries it.
-      # 1 = re-plan every control tick. The generator is ~99% of per-step inference, so
-      # this makes EVERY tick pay the full FM cost rather than one tick in N -- check the
-      # latency line against the 20 ms budget before trusting it on the robot.
+      # FALLBACK ONLY -- tracker.onnx's `fm_update_every` overrides this, and since that
+      # metadata became mandatory (GenTrackerPolicy refuses a cadence-less pair when an
+      # fm.onnx is given) the artifact decides. Kept because the tracker-only path has no
+      # metadata to read. The value that matters is the one the policy TRAINED with: the
+      # current pair is K=12, so the FM fires one tick in twelve, not every tick.
       fm_update_every: 1
-      # onnxruntime execution provider. false = CPU (the onboard minipc has no GPU);
-      # true requests CUDA and falls back to CPU if the installed runtime has no CUDA build.
-      use_cuda: false
-      onnx_threads: 2
+      # onnxruntime execution provider. The robot's onboard minipc has no GPU, but CPU
+      # CANNOT meet the 20 ms budget: measured step_worst 103.5 ms (27M) / 38.8 ms (9.5M)
+      # against 9.8 / 6.0 ms on CUDA, where both fit with headroom. So this is TRUE by
+      # default and a CPU deployment needs a deliberate flip plus a plan for the deficit.
+      # resolve_providers appends CPU as the fallback, and a CUDA request on a CPU-only
+      # wheel raises loudly at bring-up rather than silently running where it promised not to.
+      use_cuda: true
+      # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
+      # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
+      # not a portable constant.
+      onnx_threads: 4
 
       # ---- Exteroception ----
       # One topic per depth camera, in the artifact's CONTRACT ORDER. The controller
       # cross-checks the count against tracker.onnx's depth_camera_spec and refuses to arm
       # on a mismatch, so a policy trained on two cameras cannot be run on one by accident.
       # Leave empty for a height-scan or blind policy.
-      depth_topics: ["/depth/image_processed"]
+      depth_topics: ["/depth/near/image_processed", "/depth/far/image_processed"]
       # Zero the velocity command if no depth frame arrives within this many seconds
       # (<=0 disables). Judged on LOCAL RECEIPT time, not the header stamp: the camera
       # clock is not synchronised to this machine.
