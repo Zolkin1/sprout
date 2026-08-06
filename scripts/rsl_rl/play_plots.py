@@ -1797,6 +1797,34 @@ def _time_mean_per_env(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     return np.where(cnt > 0, out, np.nan)
 
 
+def first_episode_survived(dones: np.ndarray, time_outs: np.ndarray) -> np.ndarray:
+    """Per env: did its FIRST episode end via ``time_out`` rather than a fall.
+
+    Replaces ``timeout_mask.any(axis=0)`` -- "did ANY completed episode end in time_out" --
+    which is biased by how much rollout budget is left after a fall. At ``max_steps=1100``
+    over 1000-step episodes, an env that falls at step 50 gets a SECOND episode spanning
+    50..1050 that completes inside the budget and scores identically to an env that never
+    fell, while one that falls at step 500 gets no such credit (500..1500 is cut off). That
+    rewards failing EARLY and lets max_steps leak into a number meant to describe the policy.
+
+    First-episode scoring removes both: one episode per env, and a fall counts the same
+    whenever it happens.
+
+    Envs whose first episode never completes are False -- unfinished is not survival. With
+    max_steps > episode length that only happens if the env never resets at all.
+
+    Args:
+        dones: ``[T, N]`` bool, True where env ``n`` reset at step ``t``.
+        time_outs: ``[T, N]`` bool, True where that reset was a time_out.
+
+    Returns:
+        ``[N]`` bool, True where the env's first completed episode ended via time_out.
+    """
+    has_done = dones.any(axis=0)
+    first = dones.argmax(axis=0)                    # 0 when no done; gated by has_done
+    return has_done & time_outs[first, np.arange(dones.shape[1])]
+
+
 def _emit_tracking_stats(
     _log: Callable,
     _csv: Callable,
@@ -2009,17 +2037,43 @@ def compute_and_save_stats(
         total = int(mask.size)
         n_keep = int(mask.sum())
         n_envs_mask = int(mask.shape[1])
-        envs_with = int(mask.any(axis=0).sum())
+        # FIRST-episode survival, not `any` -- see first_episode_survived for why `any`
+        # rewarded falling early. Falls back to the old convention only when the raw signals
+        # are absent (an older recording), and labels the line when it does.
+        _dn, _to = data.get("dones"), data.get("time_outs")
+        _first_ep = _dn is not None and _to is not None
+        survived = (first_episode_survived(_dn, _to) if _first_ep else mask.any(axis=0))
+        envs_with = int(survived.sum())
         pct = (100.0 * n_keep / total) if total else 0.0
         _log("")
         _log("-" * 60)
         _log("  Successful Tracking  (steps in time_out episodes only)")
         _log("-" * 60)
         _log(f"  steps kept: {n_keep}/{total} ({pct:.1f}%)   "
-             f"envs with >=1 kept step: {envs_with}/{n_envs_mask}")
+             f"envs with >=1 kept step: {envs_with}/{n_envs_mask}"
+             f"{'' if _first_ep else '  [LEGACY any-episode: no dones/time_outs]'}")
         # Per-env survival, the one metric that needs no time-averaging: did this env's
-        # episode end via time_out rather than a fall.
-        per_env_cols["survived"] = mask.any(axis=0).astype(np.float64)
+        # FIRST episode end via time_out rather than a fall.
+        per_env_cols["survived"] = survived.astype(np.float64)
+        if _first_ep:
+            # Diagnostic columns, so one run can explain a survival number instead of
+            # needing a second run under the other convention:
+            #   survived_any    -- the OLD metric ("any completed time_out episode"), kept
+            #                      so the two can be diffed per env rather than in aggregate;
+            #   first_fall_step -- when the first episode ended, -1 if it never did. An env
+            #                      can only differ between the two metrics by falling early
+            #                      enough that a SECOND full episode still fits in the
+            #                      rollout, so this column is what makes that testable:
+            #                      differing envs must all have first_fall_step <=
+            #                      max_steps - episode_len.
+            #   clip_id         -- the clip this env was on at step 0, so a specific failure
+            #                      can be replayed with pin_clip_ids instead of hunted for.
+            per_env_cols["survived_any"] = mask.any(axis=0).astype(np.float64)
+            _fd = np.where(_dn.any(axis=0), _dn.argmax(axis=0), -1)
+            per_env_cols["first_fall_step"] = _fd.astype(np.float64)
+            _ti = data.get("traj_idx")
+            if _ti is not None and getattr(_ti, "ndim", 0) == 2:
+                per_env_cols["clip_id"] = np.asarray(_ti)[0].astype(np.float64)
         _log("  note: keeps only logged steps in episodes that ended via time_out;")
         _log("        excludes fallen/early-terminated and trailing in-progress episodes.")
         if n_keep == 0:

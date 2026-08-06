@@ -30,6 +30,7 @@ def reset_on_motion_sequence(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pin_clip_ids=None,
     pin_start_step: int | None = None,
+    spawn_z_offset: float = 0.0,
 ):
     """Reset each env onto a randomly chosen pre-generated motion clip.
 
@@ -54,6 +55,8 @@ def reset_on_motion_sequence(
         pin_start_step: Evaluation only -- start every env at this clip step instead of
             sampling one. Negative (the default) means sample; ``0`` matches a MuJoCo
             ``--clip_start_time 0`` playback.
+        spawn_z_offset: Diagnostic -- metres to raise the robot's spawn height above the
+            clip's own root height, without moving the clip. 0.0 (the default) is off.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
@@ -103,7 +106,8 @@ def reset_on_motion_sequence(
     #      state and commit the command's per-env clip state via the shared tail.
     ego_frac = float(getattr(cmd.cfg, "ego_anchor_fraction", 0.0))
     ego_mask = torch.rand(k, device=device) < ego_frac
-    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask)
+    _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask,
+                       spawn_z_offset=spawn_z_offset)
 
 
 def _commit_clip_reset(
@@ -117,6 +121,7 @@ def _commit_clip_reset(
     ego_mask: torch.Tensor,
     snap_mask: torch.Tensor | None = None,
     mask_frame_yaw: torch.Tensor | None = None,
+    spawn_z_offset: float = 0.0,
 ) -> None:
     """Shared tail of the clip resets: reference world state -> sim + command state.
 
@@ -177,6 +182,16 @@ def _commit_clip_reset(
     # placement resolves to the terrain-cell anchor until the first ego re-anchor fires.
     cmd.seed_reanchor_snapshot(env_ids, clip_id, start_step, base_pose)
 
+    if spawn_z_offset:
+        # Lift ONLY the robot, not the clip placement above: the clip's frame-0 root height
+        # can disagree with its own frame-0 joint pose, putting the foot soles below the
+        # ground so PhysX ejects them and the episode opens with a kick. Leaving the
+        # reference where it is keeps the offset visible as a small initial tracking error
+        # rather than hiding it by moving the target too.
+        # TODO(spawn-z): a workaround for a CLIP-GENERATION bug -- see the measurements and
+        #   the removal condition on ``reset_on_clip`` in g1_teacher_env_cfg.py.
+        base_pose = base_pose.clone()
+        base_pose[:, 2] += spawn_z_offset
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
     asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)
@@ -323,6 +338,7 @@ def reset_on_terrain_motion_sequence(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pin_clip_ids=None,
     pin_start_step: int | None = None,
+    spawn_z_offset: float = 0.0,
 ):
     """Reset each env onto a clip whose terrain matches the env's terrain tile.
 
@@ -469,4 +485,4 @@ def reset_on_terrain_motion_sequence(
     # world y, which silently became the traversal axis for a family baked on a rotated heading.
     frame_yaw = importer.env_terrain_yaw[env_ids].to(device)
     _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask,
-                       mask_frame_yaw=frame_yaw)
+                       mask_frame_yaw=frame_yaw, spawn_z_offset=spawn_z_offset)

@@ -397,8 +397,16 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
         # from its default, so a ``None`` default makes the field NoneType and rejects the
         # string/int the override supplies. Hence "" and -1 for "off".
         # See mdp.events.resets.resolve_pinned_clips.
+        # ``spawn_z_offset`` (metres) lifts the robot's spawn height WITHOUT moving the clip.
+        #
+        # TODO(spawn-z): workaround, not the fix. A clip's frame-0 root height disagrees with
+        #   its own frame-0 joint pose, so the foot soles spawn ~1 cm below the ground and
+        #   PhysX ejects the robot, opening every episode with a kick. Lifting the spawn
+        #   measurably helps survival, so it stays on until clip GENERATION makes frame 0
+        #   self-consistent -- then this goes back to 0. Survival numbers are only comparable
+        #   across runs at the same value.
         params={"command_name": "traj_ref", "base_frame_name": "pelvis_link",
-                "pin_clip_ids": "", "pin_start_step": -1},
+                "pin_clip_ids": "", "pin_start_step": -1, "spawn_z_offset": 0.005},
     )
 
 

@@ -220,14 +220,26 @@ class DataLogger:
                         self._warn(f"traj_attr:{attr}",
                                    f"Trajectory term '{self._traj_term_name}' has no attribute '{attr}'")
 
-                # Per-step trajectory indices (multiskill only — others have
-                # a single global trajectory and don't need this).
-                manager = getattr(ref, "manager", None)
-                if manager is not None and hasattr(manager, "get_current_trajectory_indices"):
-                    try:
-                        step["traj_idx"] = manager.get_current_trajectory_indices().clone()
-                    except Exception as exc:
-                        self._warn("traj_idx", f"Could not read traj_idx: {exc}")
+                # Per-step clip index, so a per-env result can be traced back to the CLIP it
+                # ran and replayed with reset_on_clip's pin_clip_ids. Read straight off the
+                # command's `clip_id` buffer, which every MotionSequenceCommand (and the FM
+                # tracker deriving from it) maintains per env.
+                #
+                # This used to go through manager.get_current_trajectory_indices(), which
+                # belonged to the multiskill manager deleted with the online stack -- so the
+                # attribute check silently failed for EVERY current task and traj_idx was
+                # never logged at all. The `hasattr` guard turned a dead path into no data
+                # rather than an error.
+                cid = getattr(ref, "clip_id", None)
+                if isinstance(cid, torch.Tensor):
+                    step["traj_idx"] = cid.clone()
+                else:
+                    manager = getattr(ref, "manager", None)
+                    if manager is not None and hasattr(manager, "get_current_trajectory_indices"):
+                        try:
+                            step["traj_idx"] = manager.get_current_trajectory_indices().clone()
+                        except Exception as exc:
+                            self._warn("traj_idx", f"Could not read traj_idx: {exc}")
 
                 # Contact-gate state (multiskill phase-based command only).
                 # ``gate_rel_phi_pre_snap`` is the post-update, pre-snap

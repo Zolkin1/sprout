@@ -26,7 +26,6 @@ from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
     RslRlVecEnvWrapper,
     export_policy_as_jit,
-    export_policy_as_onnx,
     handle_deprecated_rsl_rl_cfg,
 )
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
@@ -114,6 +113,12 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--dr_fingerprint", action="store_true", default=False,
+    help="Print a hash of the per-env domain-randomisation state (joint friction, armature, "
+         "PD gains, default joint pos) after env creation, then continue. Use it to confirm "
+         "that env i is the SAME robot across two runs before comparing them per env -- the "
+         "draws come off the seeded RNG, so a changed --num_envs or event set re-rolls them.")
 parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
@@ -405,6 +410,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+        # Per-env DR fingerprint. The survival sweep compares env i across runs, which is only
+        # sound if env i is the SAME ROBOT in both -- and the startup DR draws come off the
+        # seeded torch RNG, so anything that shifts that stream (a different --num_envs, an
+        # added/removed event, or a config change that consumes randomness during scene build)
+        # silently re-rolls every env's physics. This prints a hash so that assumption is
+        # checkable rather than assumed: same seed + same fingerprint => env i is comparable.
+        if args_cli.dr_fingerprint:
+            import hashlib
+            import warp as wp
+            _rb = env.unwrapped.scene.articulations["robot"]
+            _parts = []
+            for _name in ("joint_friction", "joint_armature", "joint_stiffness",
+                          "joint_damping", "default_joint_pos"):
+                _v = getattr(_rb.data, _name, None)
+                if _v is None:
+                    continue
+                _a = (wp.to_torch(_v) if not isinstance(_v, torch.Tensor) else _v).detach().cpu().numpy()
+                _parts.append((_name, _a))
+            print("[dr-fingerprint] seed=%s num_envs=%d" % (args_cli.seed, env.unwrapped.num_envs))
+            for _name, _a in _parts:
+                _h = hashlib.sha256(np.ascontiguousarray(_a).tobytes()).hexdigest()[:16]
+                _pe = hashlib.sha256(np.ascontiguousarray(_a[0]).tobytes()).hexdigest()[:8]
+                print(f"[dr-fingerprint]   {_name:20s} shape={tuple(_a.shape)} all={_h} env0={_pe}")
+
         # --- DEBUG: contact sensor ---
         for name, sensor in env.unwrapped.scene.sensors.items():
             if hasattr(sensor, 'body_names'):
@@ -473,13 +502,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner.alg.train_mode()
             print("[INFO] Running policy in torch .train() mode with stochastic actions.")
 
-        # export the trained policy to JIT and ONNX formats
+        # Export the trained policy to TorchScript. NOT to ONNX here: rsl-rl's own ONNX
+        # exporter wrote `policy.onnx` + a `policy.onnx.data` sidecar (weights as external
+        # data, batch axis pinned to 1, no metadata) which nothing in this repo read, and
+        # which sat next to the real deploy artifact `tracker.onnx` looking like an
+        # alternative to it. `tracker.onnx` is the same network re-exported from this
+        # `policy.pt`, but self-contained, batch-dynamic, and carrying the deployment
+        # parameters in its metadata -- see export_tracker_onnx.py below.
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
         if version.parse(installed_version) >= version.parse("4.0.0"):
             # use the new export functions for rsl-rl >= 4.0.0
             runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
             policy_nn = None  # Not needed for rsl-rl >= 4.0.0
         else:
             # extract the neural network for rsl-rl < 4.0.0
@@ -496,9 +530,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             else:
                 normalizer = None
 
-            # export to JIT and ONNX
+            # export to JIT only (see above for why no policy.onnx)
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
         _policy_model = runner.alg.student if isinstance(runner, DistillationRunner) else runner.alg.actor
         teacher_model = runner.alg.teacher if isinstance(runner, DistillationRunner) else None

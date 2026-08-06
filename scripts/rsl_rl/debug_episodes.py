@@ -56,6 +56,13 @@ parser.add_argument("--clip", default=None, help="Clip library .h5 (also repoint
 parser.add_argument("--clip_device", default=None, help="Hold the clip library here, e.g. 'cpu'.")
 parser.add_argument("--num_envs", type=int, default=16, help="Envs to simulate.")
 parser.add_argument("--episodes", type=int, default=6, help="Envs to CAPTURE (one bundle entry each).")
+parser.add_argument("--envs", default=None,
+                    help="Comma-separated env INDICES to capture, instead of the first "
+                         "--episodes. Needed to record a specific finding: the survival sweep "
+                         "reports per-env outcomes, and the interesting env is rarely env 0-5. "
+                         "Simulate the SAME --num_envs the sweep used -- env i's terrain tile "
+                         "and DR draw depend on it, so capturing env 91 out of 16 envs is a "
+                         "different robot than env 91 out of 200.")
 parser.add_argument("--steps", type=int, default=1000, help="Steps to capture per env.")
 parser.add_argument("--random-start", action="store_true", default=False,
                     help="Sample a random start step within each clip (the TRAINING behaviour). "
@@ -92,6 +99,7 @@ from isaaclab_rl.rsl_rl import (                                           # noq
     handle_deprecated_rsl_rl_cfg,
 )
 from isaaclab_tasks.utils.hydra import hydra_task_config                   # noqa: E402
+from robot_rl.flow_matching.window import window_to_world                  # noqa: E402
 from robot_rl.tasks.manager_based.robot_rl import mdp                      # noqa: E402
 from rsl_rl.runners import OnPolicyRunner                                  # noqa: E402
 
@@ -205,7 +213,16 @@ def main(env_cfg, agent_cfg) -> int:
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _md.version("rsl-rl-lib"))
     env = RslRlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(args_cli.checkpoint)
+    # Actor-only for a play runner, exactly as play.py does. The tracker task builds a WIDER
+    # critic than the teacher checkpoint carries (2490 vs 1961 here), so a strict load dies on
+    # a tensor nothing in this script uses -- only the inference policy is read below. The
+    # actor is still loaded strictly, so a genuine policy mismatch fails loudly.
+    if getattr(agent_cfg, "load_critic", True):
+        runner.load(args_cli.checkpoint)
+    else:
+        runner.load(args_cli.checkpoint, load_cfg={"actor": True, "critic": False,
+                                                   "optimizer": False, "iteration": True,
+                                                   "rnd": True})
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
     u = env.unwrapped
@@ -216,8 +233,19 @@ def main(env_cfg, agent_cfg) -> int:
     cmd_sl = _obs_term_slice(u, "policy", "command_vel")
     body_idx = [robot.body_names.index(f) for f in _FRAMES if f in robot.body_names]
     frames = [f for f in _FRAMES if f in robot.body_names]
-    ncap = min(args_cli.episodes, u.num_envs)
-    print(f"[INFO] capturing {ncap} envs x {args_cli.steps} steps; frames={frames}; "
+    if args_cli.envs:
+        cap_idx = [int(x) for x in str(args_cli.envs).replace(" ", "").split(",") if x != ""]
+        bad = [i for i in cap_idx if not 0 <= i < u.num_envs]
+        if bad:
+            raise ValueError(f"--envs {bad} out of range for num_envs={u.num_envs}; pass "
+                             "--num_envs at least as large as the sweep used.")
+    else:
+        cap_idx = list(range(min(args_cli.episodes, u.num_envs)))
+    ncap = len(cap_idx)
+    # Gather by INDEX rather than slicing [:ncap], so an arbitrary set can be captured. The
+    # index is applied to the NUMPY result: several sources (joint_pos, body_pos_w) are warp
+    # arrays that reject a fancy index, so _np() has to run first.
+    print(f"[INFO] capturing {ncap} envs {cap_idx} x {args_cli.steps} steps; frames={frames}; "
           f"scan={'yes' if has_scan else 'no'}")
 
     # Reference: the world state the CLF tracks, in the clip's output layout.
@@ -226,21 +254,27 @@ def main(env_cfg, agent_cfg) -> int:
                for f in frames if f"{f}:pos_x" in pos_names}
     is_fm = type(cmd).__name__ == "FmTrackingCommand"
 
+    # The DEPTH cameras are what the policy actually sees on these tasks -- the height scan
+    # survives only as a critic input -- so their world-frame hit points are recorded next to
+    # the scan's. ``ray_hits_w`` lives on the SENSOR here, not on ``sensor.data``, unlike the
+    # height scanner.
+    depth_cams = [c for c in ("depth_camera_near", "depth_camera_far") if c in u.scene.sensors]
     buf: dict[str, list] = {k: [] for k in
                             ("cmd_vel", "ach_vel", "scan_obs", "scan_raw", "scan_hits",
                              "root_pos", "root_quat", "joint_pos", "body_pos", "ref_pos",
-                             "done", "fm_pred", "fm_pred_frames", "fm_pred_idx")}
+                             "done", "time_out", "fm_pred", "fm_pred_frames", "fm_pred_idx",
+                             "depth_hits", "depth_img")}
     obs = env.get_observations()
     if isinstance(obs, tuple):          # rsl-rl returns (obs, extras) in some versions
         obs = obs[0]
     for _ in range(args_cli.steps):
         with torch.inference_mode():
             act = policy(obs)
-        obs_np = _np(_policy_obs(obs))[:ncap]
+        obs_np = _np(_policy_obs(obs))[cap_idx]
         buf["cmd_vel"].append(obs_np[:, cmd_sl] if cmd_sl else np.zeros((ncap, 3), "float32"))
         buf["scan_obs"].append(obs_np[:, scan_sl] if scan_sl else np.zeros((ncap, 1), "float32"))
         if has_scan:
-            raw = _np(mdp.height_scan(u, SceneEntityCfg("height_scanner")))[:ncap]
+            raw = _np(mdp.height_scan(u, SceneEntityCfg("height_scanner")))[cap_idx]
         else:
             raw = np.zeros((ncap, 1), "float32")
         buf["scan_raw"].append(raw)
@@ -249,20 +283,32 @@ def main(env_cfg, agent_cfg) -> int:
             # re-deriving the pattern geometry. Missed rays come back non-finite; the viewer
             # filters them rather than clamping.
             sens = u.scene.sensors["height_scanner"]
-            buf["scan_hits"].append(_np(sens.data.ray_hits_w)[:ncap].astype("float32"))
+            buf["scan_hits"].append(_np(sens.data.ray_hits_w)[cap_idx].astype("float32"))
+        if depth_cams:
+            # [ncap, sum(num_rays), 3], cameras concatenated in ``depth_cams`` order so the
+            # viewer can split them back apart with the per-camera counts in the meta.
+            buf["depth_hits"].append(np.concatenate(
+                [_np(u.scene.sensors[c].ray_hits_w)[cap_idx] for c in depth_cams],
+                axis=1).astype("float32"))
+            # The METRIC depth image straight off each camera, [ncap, ncam, H, W] in metres.
+            # This is the raw sensor, not what the policy sees: the obs terms additionally
+            # noise, offset-and-scale, and clip it.
+            buf["depth_img"].append(np.stack(
+                [_np(u.scene.sensors[c].data.output["distance_to_image_plane"])[cap_idx].squeeze(-1)
+                 for c in depth_cams], axis=1).astype("float32"))
 
-        rp, rq = _np(robot.data.root_pos_w)[:ncap], _np(robot.data.root_quat_w)[:ncap]
-        lin = _np(robot.data.root_lin_vel_w)[:ncap] if hasattr(robot.data, "root_lin_vel_w") \
+        rp, rq = _np(robot.data.root_pos_w)[cap_idx], _np(robot.data.root_quat_w)[cap_idx]
+        lin = _np(robot.data.root_lin_vel_w)[cap_idx] if hasattr(robot.data, "root_lin_vel_w") \
             else _np(robot.data.root_com_vel_w)[:ncap, :3]
-        ang = _np(robot.data.root_ang_vel_w)[:ncap] if hasattr(robot.data, "root_ang_vel_w") \
+        ang = _np(robot.data.root_ang_vel_w)[cap_idx] if hasattr(robot.data, "root_ang_vel_w") \
             else _np(robot.data.root_com_vel_w)[:ncap, 3:]
         buf["root_pos"].append(rp)
         buf["root_quat"].append(rq)
         buf["ach_vel"].append(np.concatenate(
             [_yaw_rotate_inv(lin, rq), _yaw_rotate_inv(ang, rq)[:, 2:3]], axis=-1))  # vx, vy, vz, wz
-        buf["joint_pos"].append(_np(robot.data.joint_pos)[:ncap])
-        buf["body_pos"].append(_np(robot.data.body_pos_w)[:ncap][:, body_idx])
-        y = _np(cmd.y_des)[:ncap]
+        buf["joint_pos"].append(_np(robot.data.joint_pos)[cap_idx])
+        buf["body_pos"].append(_np(robot.data.body_pos_w)[cap_idx][:, body_idx])
+        y = _np(cmd.y_des)[cap_idx]
         buf["ref_pos"].append(np.stack([y[:, ref_idx[f]] for f in frames if f in ref_idx], axis=1))
         if is_fm:
             # The generator's whole predicted WINDOW at this step, root and extra frames, plus
@@ -270,27 +316,49 @@ def main(env_cfg, agent_cfg) -> int:
             # re-plan) so a viewer can show exactly what the FM emitted at any step; the window
             # is only refreshed every ``fm_update_every`` steps, so consecutive steps repeat it
             # while ``fm_pred_idx`` walks forward through it.
-            pred = getattr(cmd, "_pred_root_pos", None)
-            predf = getattr(cmd, "_pred_frame_pos", None)
-            pidx = getattr(cmd, "_pred_idx", None)
-            buf["fm_pred"].append(_np(pred)[:ncap] if pred is not None
-                                  else np.zeros((ncap, 1, 3), "float32"))
-            buf["fm_pred_frames"].append(_np(predf)[:ncap] if predf is not None
-                                         else np.zeros((ncap, 1, 0, 3), "float32"))
-            buf["fm_pred_idx"].append(_np(pidx)[:ncap].astype("int32") if pidx is not None
-                                      else np.zeros((ncap,), "int32"))
+            # There is no world-frame mirror of the prediction on the command: the window is
+            # relative by construction and ``window_to_world`` derives the world frame on
+            # demand. So do exactly what the in-sim ribbon does
+            # (``FmTrackingCommand._draw_fm_prediction_ribbon``) -- same buffers, same call --
+            # rather than reading an attribute that would have to be maintained in parallel.
+            world = window_to_world(cmd._pred_window, cmd._anchor_pos[:, None, :],
+                                    cmd._anchor_quat[:, None, :], cmd.ctx.nj,
+                                    cmd.ctx.num_extra_frames, cmd._fm_blocks)
+            # This window drops the explicit ``ee_pos`` block, so the feet come back through
+            # FK on the predicted joints -- the ribbon's own fallback. It returns a zero-WIDTH
+            # (not zero-length) tensor when the FK chain is unavailable, which the viewer
+            # reads as "no extra frames".
+            ee = world.get("ee_pos_w")
+            if ee is None:
+                ee = cmd._fk_ee_positions(world)
+            buf["fm_pred"].append(_np(world["base_pos_w"])[cap_idx])          # [ncap, F, 3]
+            buf["fm_pred_frames"].append(_np(ee)[cap_idx])                    # [ncap, F, K, 3]
+            buf["fm_pred_idx"].append(_np(cmd._pred_idx)[cap_idx].astype("int32"))
 
         with torch.inference_mode():
             obs, _, dones, _ = env.step(act)
-        buf["done"].append(_np(dones)[:ncap].astype("uint8"))
+        buf["done"].append(_np(dones)[cap_idx].astype("uint8"))
+        # ``dones`` is terminated OR truncated, so on its own it cannot tell a FALL from the
+        # episode simply running out of clock -- and a survivor's time_out at the episode cap
+        # would read as a termination. The termination manager keeps them separate; record
+        # both so the viewer never has to infer it from the step index.
+        buf["time_out"].append(_np(u.termination_manager.time_outs)[cap_idx].astype("uint8"))
 
     out: dict[str, np.ndarray] = {k: np.asarray(np.stack(v)) for k, v in buf.items() if v}
+    # Step 0 is sampled BEFORE the first ``env.step``, so the command term has not produced a
+    # reference or an FM window yet and these buffers are still at their zero init. Zero is a
+    # real world coordinate, so leaving it in draws a ribbon from the robot to the world
+    # origin -- hundreds of metres. NaN is the honest value for "not computed yet" and every
+    # consumer already filters non-finite (the ee frames arrive NaN here on their own).
+    for key in ("ref_pos", "fm_pred", "fm_pred_frames"):
+        if key in out and out[key].shape[0]:
+            out[key][0] = np.nan
     # Static context the viewer needs: geometry, joint names, tile assignment, dt.
     lib_manifest, tid, corner = [], np.zeros(ncap, "int32"), np.zeros((ncap, 3), "float32")
     imp = getattr(u.scene, "terrain", None)
     if imp is not None and hasattr(imp, "env_terrain_id"):
-        tid = _np(imp.env_terrain_id)[:ncap].astype("int32")
-        corner = _np(imp.env_cell_corner)[:ncap].astype("float32")
+        tid = _np(imp.env_terrain_id)[cap_idx].astype("int32")
+        corner = _np(imp.env_cell_corner)[cap_idx].astype("float32")
         lib = getattr(cmd, "_clip_lib", None)
         if lib is not None:
             lib_manifest = lib.attrs.get("terrain_manifest", [])
@@ -302,6 +370,14 @@ def main(env_cfg, agent_cfg) -> int:
         "terrain_manifest": lib_manifest, "num_captured": int(ncap),
         # Order of the K extra frames in ``fm_pred_frames`` (the FM's predicted ee frames).
         "fm_frame_names": (list(cmd.ctx.frame_names) if is_fm and hasattr(cmd, "ctx") else []),
+        # Names and ray counts of the cameras concatenated into ``depth_hits``, in order, so
+        # the viewer can colour each camera separately without hardcoding the resolution.
+        "depth_cameras": depth_cams,
+        "depth_ray_counts": [int(u.scene.sensors[c].ray_hits_w.shape[1]) for c in depth_cams],
+        # (H, W) of each ``depth_img`` plane, so the viewer never restates the resolution.
+        "depth_image_hw": ([list(u.scene.sensors[depth_cams[0]]
+                                 .data.output["distance_to_image_plane"].shape[1:3])]
+                           if depth_cams else []),
     }
     out["terrain_id"] = tid
     out["cell_corner"] = corner
@@ -311,7 +387,7 @@ def main(env_cfg, agent_cfg) -> int:
     # placement is the env origin, tens of metres out in the tile grid. Consumers comparing
     # against clip-authored coordinates (e.g. a MuJoCo scene) must subtract this.
     cwp = getattr(cmd, "clip_world_pos", None)
-    out["clip_world_pos"] = (_np(cwp)[:ncap].astype("float32") if cwp is not None
+    out["clip_world_pos"] = (_np(cwp)[cap_idx].astype("float32") if cwp is not None
                              else np.zeros((ncap, 3), "float32"))
     out["meta_json"] = np.asarray(json.dumps(meta))
     os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)) or ".", exist_ok=True)

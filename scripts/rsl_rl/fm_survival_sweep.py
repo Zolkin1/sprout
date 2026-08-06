@@ -583,6 +583,22 @@ def build_command(fm_path: pathlib.Path, cfg: Config, library: str, k: int,
     argv += [f"env.commands.traj_ref.fm_update_every={k}"]
     if sampling_steps is not None:
         argv += [f"env.commands.traj_ref.fm_num_sampling_steps={sampling_steps}"]
+    # SWEEP-WIDE DETERMINISM, emitted BEFORE cfg.overrides so a config can still opt out
+    # (hydra takes the last occurrence of a key).
+    #
+    # fm_zero_noise: the generator otherwise draws x0 ~ N(0, I) per inference, so two runs of
+    # the same cell differ by the draw. Measured survival-neutral (176 vs 174 at 200 envs,
+    # inside the ~4.8-env binomial sd), so this costs nothing and removes one variance source.
+    # It also aligns Isaac with the MuJoCo runner, which already defaults zero_noise ON -- the
+    # two were NOT comparing like with like. The TASK default stays stochastic, which is what
+    # training and hardware should keep; this is an evaluation choice only.
+    #
+    # pin_start_step: every env starts at the clip's first frame instead of a sampled one, so
+    # env i is the same trajectory in every run and cells are diffable per env. Note this
+    # narrows COVERAGE -- only clip openings are exercised -- and it changes the numbers, so
+    # nothing measured before this is comparable to anything measured after.
+    argv += ["env.commands.traj_ref.fm_zero_noise=true",
+             "env.events.reset_on_clip.params.pin_start_step=0"]
     argv += [f"env.commands.traj_ref.{key}={val}" for key, val in cfg.overrides.items()]
     argv += cfg.extra
     return argv
@@ -717,6 +733,13 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", default=None,
                    help="Output directory (default logs/fm_survival/<timestamp>).")
+    p.add_argument("--viser", action="store_true",
+                   help="Keep each cell's tracking_per_env.csv (survived / clip_id / "
+                        "first_fall_step) so two cells can be diffed BY ENV and the "
+                        "disagreeing ones replayed. Recording the replay itself is a separate "
+                        "step: debug_episodes.py --envs <ids> writes the viser bundle (robot "
+                        "joints, reference ribbons, FM horizon, terrain), which "
+                        "view_debug_episodes.py serves. Cheap -- a table per cell, not arrays.")
     p.add_argument("--dry_run", action="store_true",
                    help="Print the resolved commands and exit without launching a simulator.")
     args = p.parse_args()
@@ -794,7 +817,8 @@ def main() -> None:
         # and copying those reports the previous cell's survival for a run that never
         # started. That happened: two failed 32-step cells printed their predecessor's
         # 42/50 with only rc=1 to give it away.
-        for stale in ("stats.txt", "tracking_stats.csv"):
+        for stale in ("stats.txt", "tracking_stats.csv",
+                      "tracking_per_env.csv", "play_data.npz"):
             (_artifact_dir() / stale).unlink(missing_ok=True)
         print(f"[{time.strftime('%H:%M:%S')}] {tag} ...", flush=True)
         with log.open("w") as fh:
@@ -807,8 +831,15 @@ def main() -> None:
         # survival source: it is written from an accumulated list, whereas the tail of
         # stdout can be lost when the simulator exits.
         art, kept = _artifact_dir(), {}
-        for fname, suffix in (("stats.txt", "_stats.txt"),
-                              ("tracking_stats.csv", "_tracking_stats.csv")):
+        _keep = [("stats.txt", "_stats.txt"), ("tracking_stats.csv", "_tracking_stats.csv")]
+        if args.viser:
+            # ONLY the per-env table. play_data.npz was kept here at first, but it cannot feed
+            # the viser viewer: it holds y_act / y_des_clip / y_des_fm (pelvis + ee frame poses)
+            # and NO joint angles, root quat, body poses or scans, so the robot cannot be posed
+            # from it. debug_episodes.py records the bundle that can. This table is what says
+            # WHICH envs to record -- survived / clip_id / first_fall_step.
+            _keep += [("tracking_per_env.csv", "_per_env.csv")]
+        for fname, suffix in _keep:
             src = art / fname
             if src.is_file():
                 kept[fname] = out_dir / f"{tag}{suffix}"

@@ -40,6 +40,15 @@ parser.add_argument("--num_rows", type=int, default=1,
                     help="Replica strips of the WHOLE tile set along y (each an identical copy, for env "
                          "capacity). Default 1 = show each terrain once; the training scene uses 10.")
 parser.add_argument("--env_spacing", type=float, default=2.5)
+parser.add_argument("--flat_buffer", type=float, default=None,
+                    help="Flat-tile margin (m) per side beyond the flat clips' bbox; None = the "
+                         "cfg default. Exposed because this margin BOUNDS the survival metric -- "
+                         "a robot that drifts off the platform reads as base_fallen -- and the "
+                         "measured series is not monotonic (2 m 176/200, 10 m 188, 20 m 194, "
+                         "40 m 189), which an edge effect alone cannot explain. Render two values "
+                         "and compare the tile extents AND the env->tile assignment printed below: "
+                         "if origins move, each margin is a different set of initial conditions "
+                         "rather than one variable swept. See TODO(flat-buffer).")
 parser.add_argument("--textured", action="store_true",
                     help="Use the training marble MDL material (needs nucleus); default = plain gray.")
 parser.add_argument("--max_steps", type=int, default=0, help="If >0, step this many then exit (headless smoke).")
@@ -125,6 +134,7 @@ def main() -> None:
         max_init_terrain_level=None,          # use all replica rows (no difficulty curriculum)
         num_envs=args.num_envs,
         env_spacing=args.env_spacing,
+        **({} if args.flat_buffer is None else {"flat_buffer": args.flat_buffer}),
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply", restitution_combine_mode="multiply",
@@ -136,6 +146,27 @@ def main() -> None:
     importer = ClipTerrainImporter(terrain_cfg)   # assembles + imports the mesh; sets env->tile arrays
 
     _report_distribution(importer, args.lib)
+
+    # Tile geometry + env placement, because flat_buffer changes BOTH and the survival metric
+    # is sensitive to how much platform sits beyond where the robot walks. Printed rather than
+    # only drawn so two margins can be diffed headlessly.
+    import torch as _torch
+    _eo = importer.env_origins.reshape(-1, 3)
+    _to = importer.terrain_origins.reshape(-1, 3) if importer.terrain_origins is not None else _eo
+    _span = (_to.amax(0) - _to.amin(0)).tolist()
+    _gap = None
+    if _to.shape[0] > 1:
+        _u = _torch.unique(_to[:, 0]).sort().values
+        if _u.numel() > 1:
+            _gap = float((_u[1:] - _u[:-1]).min())
+    print(f"  --- geometry at flat_buffer={terrain_cfg.flat_buffer} ---")
+    print(f"    tile origins       : {_to.shape[0]}, span xyz "
+          f"[{_span[0]:.1f}, {_span[1]:.1f}, {_span[2]:.1f}] m"
+          + (f", min x-pitch {_gap:.1f} m" if _gap else ""))
+    print(f"    env origins        : {_eo.shape[0]}, span xy "
+          f"[{(_eo.amax(0) - _eo.amin(0))[0]:.1f}, {(_eo.amax(0) - _eo.amin(0))[1]:.1f}] m")
+    print(f"    env origin[0]      : {[round(v, 3) for v in _eo[0].tolist()]}")
+    print("=" * 74 + "\n")
 
     # Aim the camera at the tile-grid center.
     origins = importer.terrain_origins if importer.terrain_origins is not None else importer.env_origins
