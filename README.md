@@ -330,8 +330,13 @@ the tail of the observed window. The same rule applies at record time (windows w
 would cross the clip end are dropped) and in training (`clip_end_reached` truncates one full
 observation window before the clip's last frame).
 
-The MuJoCo/hardware deploy is still blocked on observation history in
-`transfer/deploy/gen_tracker.py:_assemble` — see the TODO there.
+Observation history off-sim is handled: `_assemble` in `transfer/deploy/gen_tracker.py` pushes
+each term through its own window using the `history_length` the export records, so no consumer
+restates a window length. What is still unimplemented there is the BODY-tracking FM path — a
+tracker trained with `tracking_mode="body"` wants root-frame body targets (`body_pos_ref` /
+`body_vel_ref`), which clip playback supplies but the generator cannot, since turning its
+predicted joint angles into root-frame link poses needs a torch-free FK. `_assemble` raises
+rather than guessing.
 
 > **The two `-sym` tasks do not currently run.** They raise
 > `ValueError: Symmetry augmentation has no handler for obs term ...` at the first PPO

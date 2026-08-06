@@ -409,31 +409,46 @@ def reference_window_selection(
 
 #: Per-block multipliers applied to :func:`reference_window` AFTER noise and clipping.
 #:
-#: Only the joint-velocity block is scaled, by the same 0.05 the proprioceptive
-#: ``joint_vel`` observation uses.  Raw reference joint velocities run to ~6.5 rad/s while
-#: every other block in the window is O(1), so unscaled they would be ~10x hotter than
-#: their neighbours and 20x hotter than the *same physical quantity* entering the trunk
-#: through proprioception -- a pure conditioning problem for the (unnormalized) encoder,
-#: since the noise is applied before the scale and so the signal-to-noise ratio is
-#: untouched.
+#: CURRENTLY A NO-OP, and deliberately kept anyway.  The only non-unity entry is the
+#: joint-velocity 0.05, and ``joint_vel`` is not in the live block selection
+#: (``g1_teacher_env_cfg.REFERENCE_WINDOW_BLOCKS`` = base_pose, base_vel, joint_pos), so
+#: :func:`reference_window_scale` expands to all ones -- :func:`expand_window_blocks`
+#: only builds the SELECTED blocks.  The table survives because it is the restore path:
+#: set ``REFERENCE_WINDOW_BLOCKS = None`` and the 0.05 is live again, immediately.  Do not
+#: prune the unselected keys for tidiness; the expansion would then ``KeyError`` on that
+#: restore.
 #:
-#: DEFERRED (no compute to spend on it now, not a dead end): this is a first pass, tuned
-#: only to put the blocks in the same ballpark.  Two things to revisit:
+#: Why the 0.05 exists, for when it comes back: raw reference joint velocities run to
+#: ~6.5 rad/s while every other block in the window is O(1), so unscaled they would be
+#: ~10x hotter than their neighbours and 20x hotter than the *same physical quantity*
+#: entering the trunk through proprioception (which applies the same 0.05) -- a pure
+#: conditioning problem for the (unnormalized) encoder, since the noise is applied before
+#: the scale and so the signal-to-noise ratio is untouched.
 #:
-#: 1. These numbers are NOT normalization -- they are hand-picked, and the remaining
-#:    spread is still ~5x (measured p99 after scaling: base_pose 0.68, base_vel 1.14,
-#:    joint_pos 1.61, joint_vel 0.32, ee_pos 0.74).  ``agent.actor.obs_normalization=true``
-#:    would handle it properly (``RefEncoderMLPModel`` normalizes the encoder branch
-#:    separately), at the cost of changing training dynamics vs. the unnormalized runs.
-#: 2. The scale does DOUBLE DUTY: it also re-weights the optional reconstruction loss,
-#:    because an MSE weights each channel by its magnitude squared.  Measured share of that
-#:    loss -- before this scale: joint_vel 92%, everything else 8% combined; after:
-#:    joint_pos 62%, base_vel 18%, ee_pos 13%, base_pose 4%, joint_vel 3%.  So the
-#:    ablation's objective is decided by unit magnitudes rather than deliberately.  Fix it
-#:    with a per-block weight vector inside
-#:    ``RefEncoderMLPModel.reconstruction_loss`` rather than by distorting this scale
-#:    further -- this one also feeds the actor's forward pass, so the two cannot be tuned
-#:    independently through it.
+#: DEFERRED (no compute to spend on it now, not a dead end).  Both items below were
+#: measured with the FULL five-block window; dropping ``joint_vel`` and ``ee_pos`` changed
+#: each of them, in opposite directions:
+#:
+#: 1. Conditioning -- now WEAK, and it was mostly a joint_vel problem.  These numbers are
+#:    hand-picked, not normalization; the measured p99 after scaling was base_pose 0.68,
+#:    base_vel 1.14, joint_pos 1.61, joint_vel 0.32, ee_pos 0.74, i.e. a ~5x spread.  Over
+#:    the three LIVE blocks that is 0.68 / 1.14 / 1.61 -- 2.4x, all O(1).
+#:    ``agent.actor.obs_normalization=true`` would handle it properly
+#:    (``RefEncoderMLPModel`` normalizes the encoder branch separately), but it costs a run
+#:    and there is much less left to win.
+#: 2. Reconstruction-loss weighting -- now STEEPER, but no longer coupled to anything.  An
+#:    MSE weights each channel by its magnitude squared, so unit magnitudes rather than
+#:    intent decide what "reconstruct the reference" means.  Measured share of that loss
+#:    with all five blocks -- before this scale: joint_vel 92%, everything else 8%
+#:    combined; after: joint_pos 62%, base_vel 18%, ee_pos 13%, base_pose 4%, joint_vel 3%.
+#:    Renormalizing the post-scale figures over the live blocks ESTIMATES joint_pos ~74%,
+#:    base_vel ~21%, base_pose ~5% -- so the objective is now three-quarters "reconstruct
+#:    the joint angles".  Treat that as an estimate, not a measurement: the encoder's
+#:    per-block error will have shifted now that its input is much narrower.  Fix it with a
+#:    per-block weight vector inside ``RefEncoderMLPModel.reconstruction_loss``.  That used
+#:    to be forced (the scale also feeds the actor's forward pass, so the two could not be
+#:    tuned independently through it); with the scale all ones the constraint is vacuous and
+#:    a weight vector in the loss is a free-standing change.
 #:
 #: When it IS worth spending a run on: (1) is a one-flag A/B
 #: (``agent.actor.obs_normalization=true``, and the critic's) and (2) is dormant while the
@@ -447,7 +462,7 @@ REFERENCE_WINDOW_SCALE: dict[str, float | list[float]] = {
     "base_lin_vel": 1.0,
     "base_ang_vel": 1.0,
     "joint_pos": 1.0,
-    "joint_vel": 0.05,   # matches the proprioceptive joint_vel term
+    "joint_vel": 0.05,   # matches the proprioceptive joint_vel term; UNSELECTED, see above
     "ee_pos": 1.0,
 }
 

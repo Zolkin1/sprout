@@ -151,10 +151,12 @@ _REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
 )
 
 #: Per-channel multiplier for the reference window, applied AFTER noise and clipping.
-#: Only the joint-velocity block moves (x0.05, matching the proprioceptive ``joint_vel``
-#: term) so the encoder's inputs sit in a comparable range; see
-#: ``mdp.REFERENCE_WINDOW_SCALE``.  Because the scale comes last, the noise half-widths
-#: and the +-20 clip above stay in raw units, exactly as the old joint_vel_ref term had.
+#: ALL ONES as configured: the only non-unity entry in ``mdp.REFERENCE_WINDOW_SCALE`` is the
+#: joint-velocity 0.05, and ``joint_vel`` is not in ``REFERENCE_WINDOW_BLOCKS``.  Kept
+#: because it is built from the same selection as the noise and the observation, so
+#: restoring the full block set restores the scale with it (see that table's note).  Because
+#: the scale comes last, the noise half-widths and the +-20 clip above stay in raw units
+#: either way.
 _REF_SCALE = mdp.reference_window_scale(
     num_steps=len(REFERENCE_OFFSETS),
     num_joints=len(G1_JOINT_NAMES),

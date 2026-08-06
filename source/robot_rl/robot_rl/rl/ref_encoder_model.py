@@ -225,12 +225,15 @@ class RefEncoderMLPModel(MLPModel):
 
         * The noise is unpredictable by construction, so the loss floors at the injected
           noise variance rather than at zero.  A plateau is not the encoder giving up.
-        * An MSE weights each channel by its magnitude squared, so the observation term's
-          per-block ``scale`` silently decides what "reconstruct the reference" means.
-          TODO(scaling): as configured, joint position accounts for ~62% of this loss and
-          joint velocity ~3%; see the TODO on ``mdp.REFERENCE_WINDOW_SCALE``.  If that
-          balance needs fixing, add a per-block weight vector HERE -- the observation
-          scale also feeds the forward pass, so it cannot be retuned independently.
+        * An MSE weights each channel by its magnitude squared, so the raw unit magnitudes
+          of the window silently decide what "reconstruct the reference" means.
+          TODO(scaling): with the live three-block window the objective is ESTIMATED at
+          joint_pos ~74% / base_vel ~21% / base_pose ~5% -- see the DEFERRED note on
+          ``mdp.REFERENCE_WINDOW_SCALE`` for the measurement this is renormalized from, and
+          for why that scale is currently all ones.  If the balance needs fixing, add a
+          per-block weight vector HERE.  Nothing constrains it: the observation scale is a
+          no-op under the current block selection, so there is no longer a shared knob
+          between this loss and the actor's forward pass.
 
         Args:
             obs: Observation dictionary containing the encoder groups.

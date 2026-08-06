@@ -376,8 +376,9 @@ def main() -> int:
             # The tile's walking surfaces are sized for the FASTEST clip on it, and every clip authors the
             # geometry with that same speed -- otherwise a slow clip authors a short platform, the tile
             # meshes some other clip's geometry, and the slow clip stands metres away from the staircase.
-            # (Platforms are long because the approach accelerates from a stand; see
-            # TODO(steady-approach) in mb_terrain_segments.py -- a steady start would shorten both.)
+            # (Platforms are long because a STAND start has to accelerate from rest, and any tile may host
+            # one -- ``starts`` above mixes the two per clip.  A steady-only library would shorten them;
+            # see ``_generate_approach`` in mb_terrain_segments.py for what each start actually does.)
             # Commands are MAGNITUDES here (the family owns every direction), clamped per side to what the
             # stride bank can actually walk that way.
             ground_mags = [_cmd_mag(v, ground_sign, args) for v in speeds]
