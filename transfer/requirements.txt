@@ -1,0 +1,90 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The DOWNSTREAM environment: everything under transfer/ that runs WITHOUT IsaacLab --
+# MuJoCo sim2sim (transfer/sim) and the torch-free ONNX deploy runtime (transfer/deploy).
+# Isaac Sim is ~10 GB and x86-only; none of it is needed to run a policy pair, so a box
+# that only plays or benchmarks policies (a Jetson, a candidate deploy machine, a laptop)
+# installs this instead of env_isaaclab.
+#
+#   bash transfer/setup_venv.sh          # creates env_transfer/ from this file
+#
+# The hardware deploy is containerized instead (transfer/obelisk/docker for the ROS 2
+# controller, transfer/deploy/docker/Dockerfile.bench for the ONNX benchmark); this file
+# is the bare-metal equivalent for sim2sim, which no image covers.
+#
+# Deliberately NOT here:
+#   torch       -- only transfer/sim/rl_policy.py (the legacy non-generator runner) and
+#                  transfer/torch_math (the test-only oracle) import it. The generator +
+#                  tracker path is ONNX-only.
+#   isaaclab    -- see above.
+#   onnxruntime-gpu -- the CPU wheel below is the portable default; a GPU is opt-in
+#                  (`--providers cuda`) so nothing silently starts using one. See the
+#                  GPU section at the bottom of this file for how to swap it in.
+
+# --- core: needed by every entry point below ------------------------------------------
+numpy>=1.26,<2            # onnxruntime wheels are still built against the 1.x ABI
+mujoco>=3.3               # the sim itself, plus mj_multiRay for the depth cameras
+onnxruntime>=1.19         # tracker.onnx + fm.onnx (transfer/deploy/tracker_session.py)
+pyyaml>=6                 # exported/policy_parameters.yaml, sim_meta.yaml
+scipy>=1.11               # transfer/sim/robot.py -- Rotation, at module import
+h5py>=3.10                # transfer/sim/clip_reference.py -- the clip .h5 library
+pygame>=2.5               # transfer/sim/robot.py imports it at module level, so it is
+                          # required even for --mode eval (only USED by --mode joystick)
+
+# --- fetching a published policy pair --------------------------------------------------
+huggingface_hub>=0.24     # transfer/deploy/hardware.py, transfer/obelisk/scripts/prefetch_policy.py
+
+# --- post-processing a run -------------------------------------------------------------
+matplotlib>=3.8           # transfer/sim/gen_tracker_metrics.py, plot_from_sim.py
+
+
+# ==========================================================================================
+# GPU inference (NOT installed by setup_venv.sh -- do it by hand, after)
+# ==========================================================================================
+# The FM is a transformer unrolling num_steps Euler steps and it dominates the tick it
+# fires on, so on a Jetson this is the difference between a policy that fits the control
+# period and one that does not. The tracker is a sub-ms MLP either way.
+#
+# How to measure it, since the wrong method gives a confidently wrong answer:
+#   * Pin the clocks first -- `sudo nvpmodel -q` for the active ceiling, then
+#     `sudo jetson_clocks`. Unpinned, a device comparison measures governor and thermal
+#     state rather than the graphs, and the error is large enough to invert a conclusion
+#     (a net that looks slower on the GPU can simply be one the governor never clocked up).
+#   * Discard the first timing window on a GPU -- warmup, and with TensorRT an engine build.
+#   * The runner's timing lines are NET inference only; they exclude obs assembly and, in
+#     MuJoCo, the depth cameras. The FM replan is synchronous, so the tick it fires on pays
+#     FM + tracker + obs together -- benchmark.py's step_worst p99 against the control
+#     period is the go/no-go, not the per-net means.
+#   * On a shared GPU (the ZED pipeline), an idle-GPU number answers the wrong question;
+#     benchmark.py --sample-gpu reads tegrastats, since the iGPU is not in nvidia-smi.
+#
+# onnxruntime-gpu REPLACES onnxruntime: both install the same `onnxruntime` module, so
+# installing one over the other leaves a broken mix. Uninstall first, and note that
+# re-running setup_venv.sh puts the CPU wheel back alongside the GPU one.
+#
+# --- Jetson Thor / JetPack 7.1 (L4T r38.4, CUDA 13.0, python 3.12) -- VERIFIED ------------
+# PyPI has no aarch64 onnxruntime-gpu wheel at all (1.28 is x86_64 + Windows only), and
+# there is no `jp7` index: JetPack 7 ships the arm64-SBSA CUDA packaging, so Thor is served
+# by the same index as Grace. `+simple/` matters -- it is a devpi server, and the bare
+# directory URL is not a PEP 503 index.
+#
+#   pip uninstall -y onnxruntime
+#   pip install --index-url https://pypi.jetson-ai-lab.io/sbsa/cu130/+simple/ \
+#               --extra-index-url https://pypi.org/simple onnxruntime-gpu
+#
+# That resolves onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64.whl. Confirm the provider
+# is REALLY there before trusting a number -- a mismatch reports CPU-only rather than
+# failing, and the run then produces plausible CPU numbers:
+#
+#   python -c "import onnxruntime as ort; ort.preload_dlls(); print(ort.get_available_providers())"
+#   # -> ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+#
+# --- Jetson Orin / JetPack 6.2 (L4T r36.4, CUDA 12.6) ------------------------------------
+# Same shape, different index: https://pypi.jetson-ai-lab.io/jp6/cu126/+simple/
+#
+# --- x86_64 + discrete NVIDIA ------------------------------------------------------------
+#   pip install "onnxruntime-gpu[cuda,cudnn]"     # the extras pull the nvidia-* wheels ORT
+#                                                 # needs; tracker_session._preload_gpu_dlls
+#                                                 # puts them on the loader path
+#
+# Containerized equivalents of all three: transfer/deploy/docker/Dockerfile.bench.

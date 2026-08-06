@@ -18,19 +18,30 @@
 #   docker build -f transfer/deploy/docker/Dockerfile.bench --target cpu  -t fmbench:cpu  .
 #   docker build -f transfer/deploy/docker/Dockerfile.bench --target cuda -t fmbench:cuda .
 #
-#   # Jetson: the wheel is NOT on PyPI. PyPI's aarch64 onnxruntime-gpu targets SBSA/Grace
-#   # with datacenter CUDA, not L4T; installing it yields an import that works and reports
-#   # no CUDA provider. Take NVIDIA's JetPack-matched build and pin it to the JetPack the
-#   # box runs (`cat /etc/nv_tegra_release`); JP 6.2 = CUDA 12.6 / TensorRT 10.3, matching
-#   # transfer/jetson/zed/docker/Dockerfile.jp6.2.
-#   #   https://elinux.org/Jetson_Zoo#ONNX_Runtime   |   https://pypi.jetson-ai-lab.dev
+#   # Jetson: the wheel is NOT on PyPI -- as of onnxruntime 1.28 PyPI publishes NO aarch64
+#   # onnxruntime-gpu wheel at all (x86_64 + Windows only), so `pip install onnxruntime-gpu`
+#   # on an L4T box either finds nothing or (on older versions, which DID ship an aarch64
+#   # wheel targeting SBSA/Grace with datacenter CUDA) imports fine and reports no CUDA
+#   # provider. Take a JetPack-matched build and pin it to the JetPack the box runs
+#   # (`cat /etc/nv_tegra_release`), from the index below:
+#   #   https://elinux.org/Jetson_Zoo#ONNX_Runtime   |   https://pypi.jetson-ai-lab.io
+#   # (the .dev domain in older notes now redirects to .io). Pick the index by BOARD:
+#   #   Orin / JP 6.2 = L4T r36.4 = CUDA 12.6 / TRT 10.3 -> jp6/cu126
+#   #   Thor / JP 7.x = L4T r38.x = CUDA 13.0           -> sbsa/cu130
+#   # There is no `jp7` index and there will not be one: JP7 ships the arm64-SBSA CUDA
+#   # packaging, so Thor is served by the same index as Grace. That inverts the warning
+#   # above -- on Thor, SBSA is the RIGHT wheel, not the wrong one.
 #   # Either a direct wheel URL:
 #   docker build -f transfer/deploy/docker/Dockerfile.bench --target jetson \
 #       --build-arg L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0 \
 #       --build-arg ORT_WHEEL=<direct .whl URL> -t fmbench:jetson .
-#   # ...or the index, letting pip resolve it:
+#   # ...or the index, letting pip resolve it (note the +simple/ suffix -- it is a devpi
+#   # server, and the bare directory URL is not a PEP 503 index):
 #   docker build -f transfer/deploy/docker/Dockerfile.bench --target jetson \
-#       --build-arg ORT_INDEX_URL=https://pypi.jetson-ai-lab.dev/jp6/cu126 -t fmbench:jetson .
+#       --build-arg ORT_INDEX_URL=https://pypi.jetson-ai-lab.io/jp6/cu126/+simple/ -t fmbench:jetson .
+#   # L4T_BASE above is the Orin/JP6.2 tag; a Thor build needs the r38 tag matching its
+#   # JetPack. VERIFIED so far only bare-metal on Thor (see transfer/requirements.txt), not
+#   # as a container build.
 #
 #   # If building is a hassle, the ZED image already has the whole JetPack CUDA stack, so
 #   # `pip3 install <the same wheel>` inside it works as a base too -- and puts the

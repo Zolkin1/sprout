@@ -119,7 +119,7 @@ term the way training did instead of consulting a hardcoded table (kept only as 
 
 # General Guidelines
 - Don't care for backwards compatibility.
-- Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`.
+- Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`. The exception is `transfer/` off-sim work (MuJoCo sim2sim + the ONNX deploy runtime), which imports no IsaacLab and runs in the much smaller `env_transfer` — built by `bash transfer/setup_venv.sh` from `transfer/requirements.txt`, so a Jetson or any candidate deploy box can play and benchmark policies without a 10 GB Isaac install. On a training box `env_isaaclab` covers both.
 - When writing a function, always provide a doc string.
 - In general, we should always use type hints where it is idiomatic.
 - In python variable names should be snake_case and function should be snake_case and classes should be UpperCamelCase.

@@ -46,8 +46,10 @@ docker/artifacts/
 **/docs/_build/*
 **/generated/*
 
-# Python virtual environments (e.g. the uv-managed IsaacLab venv)
+# Python virtual environments (e.g. the uv-managed IsaacLab venv, and the small
+# Isaac-free downstream env built by transfer/setup_venv.sh)
 env_isaaclab/
+env_transfer/
 *.venv/
 
 # Isaac-Sim packman
@@ -75,6 +77,8 @@ datasets
 transfer/obelisk/install/
 transfer/obelisk/log/
 transfer/obelisk/build/
+# Policy pairs pulled from HuggingFace by prefetch_policy.py (~130 MB per pair)
+transfer/obelisk/g1_control/resource/hf_cache/
 transfer/obelisk/docker/.env
 transfer/obelisk/MUJOCO_LOG.TXT
 g1_hardware_log/

@@ -497,6 +497,25 @@ Both read the artifacts `play.py` exports (`exported/policy_parameters.yaml` +
 `tracker.onnx` / `fm.onnx`), so export before running either. To add a robot, drop its sim
 files in `transfer/sim/robots/` and add a runner.
 
+Neither needs Isaac: on a box without `env_isaaclab`, build the small downstream venv
+(`bash transfer/setup_venv.sh`, see [Other Dependencies](#other-dependencies)) and pull a
+published pair instead of exporting one. `gen_tracker_runner.py` resolves the pair from
+`logs/rsl_rl/<experiment>/<run>/exported/`, so point that at the fetched folder:
+
+```bash
+RUN=<hf folder>                                  # e.g. a run-named folder in zolkin/robot_rl
+python3 transfer/obelisk/scripts/prefetch_policy.py --hf_policy_folder $RUN   # + validates the pair
+mkdir -p logs/rsl_rl/g1/$RUN
+ln -s "$PWD/transfer/obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/$RUN" \
+      logs/rsl_rl/g1/$RUN/exported
+cd transfer/sim && python gen_tracker_runner.py --mode eval --command smooth_ramp_running \
+    --load_run $RUN --robot_name g1_29j --scene basic_scene --headless --total_time 20
+```
+
+The run prints mean FM and tracker inference times every 5 sim seconds. For the numbers
+that decide a deploy box — p50/p95/p99 and `step_worst` against the control period —
+use `transfer/deploy/benchmark.py`, which needs only the two `.onnx` files.
+
 ## Code formatting
 
 We have a pre-commit template to automatically format your code.
@@ -539,10 +558,22 @@ Obelisk folder for further instructions.
 
 
 ## Other Dependencies
-To run the sim2sim transfer, you will to install these dependencies in your conda environment:
-- `pygame`
-- `mujoco`
-- `huggingface_hub`
+Everything under `transfer/` that does **not** import IsaacLab — MuJoCo sim2sim and the
+torch-free ONNX deploy runtime — runs in its own small venv, built from
+`transfer/requirements.txt`:
+
+```bash
+bash transfer/setup_venv.sh          # -> env_transfer/  (uses uv if present, else python3 -m venv)
+source env_transfer/bin/activate
+```
+
+That is the whole install on a box that only plays or benchmarks policies (a Jetson, a
+candidate deploy machine, a laptop): no Isaac Sim, no torch. On a training box
+`env_isaaclab` already has these and you can keep using it.
+
+The venv is CPU-only by default. To run inference on a GPU (`--providers cuda`), swap in
+the matching `onnxruntime-gpu` wheel afterwards — the per-platform recipes, including the
+Jetson ones, are in the GPU section at the bottom of `transfer/requirements.txt`.
 
 ## Updating IsaacLab
 Sometimes you will want to updated the version of IsaacLab you are using. To do this, go to the IsaacLab directory
