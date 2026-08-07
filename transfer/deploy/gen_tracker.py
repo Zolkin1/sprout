@@ -300,6 +300,28 @@ class GenTrackerPolicy:
         """
         return self._trk.get_obs_terms()
 
+    def active_providers(self) -> dict[str, list[str]]:
+        """The execution providers each loaded ONNX session is ACTUALLY running on.
+
+        Not the same question as :func:`onnxruntime.get_available_providers`, which reports
+        what the installed wheel was compiled with and is a static list. A session can be
+        created with ``providers=["cuda"]`` on a CUDA-capable wheel and still register only
+        the CPU provider -- missing runtime libraries, no nvidia container runtime, a driver
+        too old for the CUDA minor -- and onnxruntime reports that as a warning, not an
+        error. This is the only authority on what a graph will run on.
+
+        Both sessions are reported because the generator is ~99% of the per-step cost, so a
+        tracker that made it onto the GPU says almost nothing about the budget.
+
+        Returns:
+            Session name (``"tracker"``, and ``"generator"`` when one is loaded) mapped to
+            its registered provider list, most-preferred first.
+        """
+        sessions = {"tracker": self._trk.sess}
+        if self.fm_enabled:
+            sessions["generator"] = self.ctx.sess
+        return {name: list(sess.get_providers()) for name, sess in sessions.items()}
+
     def needs_height_scan(self) -> bool:
         """Whether this deployment must supply ``state["height_scan"]``.
 

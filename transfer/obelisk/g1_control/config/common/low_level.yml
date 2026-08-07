@@ -34,7 +34,7 @@ control:
       # (scripts/rsl_rl/export_to_hardware.py) and prefetch_policy.py both read. A ROS
       # param cannot import it, so this one restatement is by hand -- change both together.
       hf_repo_id: "zolkin/robot_rl"
-      hf_policy_folder: "REPLACE_ME"
+      hf_policy_folder: "2026-08-04_21-55-17_yaw_k12_v1"
       # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
       # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by
       # `fm_update_every` in the tracker metadata when the export carries it.
@@ -48,8 +48,12 @@ control:
       # CANNOT meet the 20 ms budget: measured step_worst 103.5 ms (27M) / 38.8 ms (9.5M)
       # against 9.8 / 6.0 ms on CUDA, where both fit with headroom. So this is TRUE by
       # default and a CPU deployment needs a deliberate flip plus a plan for the deficit.
-      # resolve_providers appends CPU as the fallback, and a CUDA request on a CPU-only
-      # wheel raises loudly at bring-up rather than silently running where it promised not to.
+      # TWO separate guards stand behind this, because they catch different failures:
+      # resolve_providers raises when the WHEEL has no CUDA provider (a CPU-only install),
+      # and G1Controller._require_cuda raises when the wheel has one but the SESSION still
+      # landed on the CPU (no nvidia container runtime, missing CUDA libs, the no-gpu
+      # compose file, too old a driver) -- onnxruntime treats that as a warning, so without
+      # the second check the robot comes up looking healthy and 5x over budget.
       use_cuda: true
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
       # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,

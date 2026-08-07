@@ -337,6 +337,12 @@ exceeds budget unless `verbose: true`. Text goes to the tmux pane and to obelisk
   run comes up with `base_pos`/`base_lin_vel` pinned at zero and the odom watchdog inert
   (it returns False until the first message ever arrives). `scripts/launch_lidar_odom.sh`
   also points at workspaces the current Dockerfile does not build.
+  **In SIM this no longer applies**: `g1_world.yml` publishes `/Odometry` from a MuJoCo
+  ground-truth sensor quartet on the pelvis (`TODO(sim-odometry)`), so `base_pos` tracks.
+  That makes the gap *harder* to notice, not smaller — the sim has no drift, no latency and
+  no dropouts, so everything downstream of localisation is still untested. Running the real
+  FAST-LIO in sim is the fix; when it lands, delete the world's `/Odometry` entry or two
+  publishers will fight over the topic.
 - **`/obelisk/g1/odom` from the driver is published and subscribed by nobody** — a free
   cross-check against FAST-LIO, discarded.
 - **`obk_mark_jetson` is defined and never called**, so `/tmp/obk_jetson_active` never

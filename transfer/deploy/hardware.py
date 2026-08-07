@@ -183,7 +183,6 @@ def build_hardware_state(
     joint_names: list[str],
     command: np.ndarray,
     base_ang_vel_w: np.ndarray | None = None,
-    frames: np.ndarray | None = None,
     depth: np.ndarray | None = None,
     depth_raw=None,
     height_scan: np.ndarray | None = None,
@@ -202,10 +201,6 @@ def build_hardware_state(
         command: Velocity command ``(vx, vy, wz)``.
         base_ang_vel_w: Base world-frame angular velocity ``(3,)``; if ``None`` it is
             derived as ``quat_apply(base_quat, base_ang_vel_b)``.
-        frames: End-effector frame world states ``(K, 13)`` =
-            ``[pos(3), quat(4 xyzw), lin_vel(3), ang_vel(3)]`` in
-            ``policy.ctx.frame_names`` order, required when the FM conditions on extra
-            frames (compute them from forward kinematics on the measured joints).
         depth: Already-normalised depth ``(T, H*W)`` in camera-contract order. Use this
             when something upstream normalised for you; otherwise pass ``depth_raw``.
         depth_raw: One raw reading per camera in **metres along the optical axis**, in
@@ -235,15 +230,24 @@ def build_hardware_state(
         "joint_vel": convert_joint_order(np.asarray(joint_vel, dtype=np.float64), list(joint_names), isaac),
         "command": np.asarray(command, dtype=np.float64),
     }
-    if policy.ctx.num_extra_frames > 0:
-        if frames is None:
-            raise ValueError(
-                f"This FM conditions on {policy.ctx.num_extra_frames} end-effector frames "
-                f"({policy.ctx.frame_names}); pass `frames` (K, 13) in that order "
-                "(compute them from forward kinematics on the measured joints)."
-            )
-        fr = np.asarray(frames, dtype=np.float64)
-        state.update(frame_pos=fr[:, 0:3], frame_quat=fr[:, 3:7], frame_lin=fr[:, 7:10], frame_ang=fr[:, 10:13])
+    # NO measured end-effector frames here, deliberately.
+    #
+    # This used to raise unless the caller supplied `frames` (K, 13) whenever the FM
+    # declared `target_frame_names` -- telling hardware to run forward kinematics on the
+    # measured joints. That requirement is obsolete and was never satisfiable on the robot:
+    # under the AUTOREGRESSIVE window the generator's history is its OWN previous output
+    # (GenTrackerPolicy._make_snapshot reads only `_prev_served_node` and `command`), so no
+    # measured state reaches it at all. The keys the guard wrote -- frame_pos / frame_quat /
+    # frame_lin / frame_ang -- are read NOWHERE in transfer/deploy. `_reference_window`'s
+    # `r["frame_pos"]` is a row of a CLIP reference window handed to create_obs, a different
+    # object, and it is not reached on the FM branch at all.
+    #
+    # It stayed hidden because MuJoCo sim2sim assembles its own state dict and never calls
+    # this function; the obelisk controller does, so the guard killed the node one tick
+    # after arming, with a message telling the operator to implement FK they do not need.
+    #
+    # `target_frame_names` still matters for the WINDOW LAYOUT (it sizes the `ee_pos` block,
+    # which this artifact does not select) -- that comes from the metadata, not from here.
 
     # Exteroception. Required-ness comes from the artifacts, not from the caller: a
     # policy that reads terrain and is handed none would otherwise fail deep inside the

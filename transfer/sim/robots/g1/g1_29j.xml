@@ -651,26 +651,30 @@ Position and velocity actuators added. -->
     <jointpos name="right_ankle_pitch_joint_pos_sensor" joint="right_ankle_pitch_joint" noise="0.001"/>
     <jointpos name="right_ankle_roll_joint_pos_sensor" joint="right_ankle_roll_joint" noise="0.001"/>
 
-    <!-- Waist -->
+    <!-- Waist. All THREE, not just yaw: obelisk builds ObkJointEncoders.joint_names from
+         the joints these sensors point at, and the controller refuses to arm unless that
+         set equals the policy's 29 exactly (G1Controller._resolve_joint_mapping). -->
     <jointpos name="waist_yaw_joint_pos_sensor" joint="waist_yaw_joint" noise="0.001"/>
+    <jointpos name="waist_roll_joint_pos_sensor" joint="waist_roll_joint" noise="0.001"/>
+    <jointpos name="waist_pitch_joint_pos_sensor" joint="waist_pitch_joint" noise="0.001"/>
 
     <!-- Left Arm -->
     <jointpos name="left_shoulder_pitch_joint_pos_sensor" joint="left_shoulder_pitch_joint" noise="0.001"/>
     <jointpos name="left_shoulder_roll_joint_pos_sensor" joint="left_shoulder_roll_joint" noise="0.001"/>
     <jointpos name="left_shoulder_yaw_joint_pos_sensor" joint="left_shoulder_yaw_joint" noise="0.001"/>
     <jointpos name="left_elbow_joint_pos_sensor" joint="left_elbow_joint" noise="0.001"/>
-<!--    <jointpos name="left_wrist_roll_joint_pos_sensor" joint="left_wrist_roll_joint" noise="0.001"/>-->
-<!--    <jointpos name="left_wrist_pitch_joint_pos_sensor" joint="left_wrist_pitch_joint" noise="0.001"/>-->
-<!--    <jointpos name="left_wrist_yaw_joint_pos_sensor" joint="left_wrist_yaw_joint" noise="0.001"/>-->
+    <jointpos name="left_wrist_roll_joint_pos_sensor" joint="left_wrist_roll_joint" noise="0.001"/>
+    <jointpos name="left_wrist_pitch_joint_pos_sensor" joint="left_wrist_pitch_joint" noise="0.001"/>
+    <jointpos name="left_wrist_yaw_joint_pos_sensor" joint="left_wrist_yaw_joint" noise="0.001"/>
 
     <!-- Right Arm -->
     <jointpos name="right_shoulder_pitch_joint_pos_sensor" joint="right_shoulder_pitch_joint"/>
     <jointpos name="right_shoulder_roll_joint_pos_sensor" joint="right_shoulder_roll_joint"/>
     <jointpos name="right_shoulder_yaw_joint_pos_sensor" joint="right_shoulder_yaw_joint"/>
     <jointpos name="right_elbow_joint_pos_sensor" joint="right_elbow_joint"/>
-<!--    <jointpos name="right_wrist_roll_joint_pos_sensor" joint="right_wrist_roll_joint"/>-->
-<!--    <jointpos name="right_wrist_pitch_joint_pos_sensor" joint="right_wrist_pitch_joint"/>-->
-<!--    <jointpos name="right_wrist_yaw_joint_pos_sensor" joint="right_wrist_yaw_joint"/>-->
+    <jointpos name="right_wrist_roll_joint_pos_sensor" joint="right_wrist_roll_joint"/>
+    <jointpos name="right_wrist_pitch_joint_pos_sensor" joint="right_wrist_pitch_joint"/>
+    <jointpos name="right_wrist_yaw_joint_pos_sensor" joint="right_wrist_yaw_joint"/>
 
     <!-- ###################### -->
     <!-- Joint velocity sensors -->
@@ -691,26 +695,30 @@ Position and velocity actuators added. -->
     <jointvel name="right_ankle_pitch_joint_vel_sensor" joint="right_ankle_pitch_joint" noise="0.001"/>
     <jointvel name="right_ankle_roll_joint_vel_sensor" joint="right_ankle_roll_joint" noise="0.001"/>
 
-    <!-- Waist -->
+    <!-- Waist. This block must stay in the SAME ORDER as the jointpos block above:
+         obelisk zips the two positionally and only the jointpos sensors contribute
+         joint_names, so a reorder silently mislabels every velocity. -->
     <jointvel name="waist_yaw_joint_vel_sensor" joint="waist_yaw_joint" noise="0.001"/>
+    <jointvel name="waist_roll_joint_vel_sensor" joint="waist_roll_joint" noise="0.001"/>
+    <jointvel name="waist_pitch_joint_vel_sensor" joint="waist_pitch_joint" noise="0.001"/>
 
     <!-- Left Arm -->
     <jointvel name="left_shoulder_pitch_joint_vel_sensor" joint="left_shoulder_pitch_joint" noise="0.001"/>
     <jointvel name="left_shoulder_roll_joint_vel_sensor" joint="left_shoulder_roll_joint" noise="0.001"/>
     <jointvel name="left_shoulder_yaw_joint_vel_sensor" joint="left_shoulder_yaw_joint" noise="0.001"/>
     <jointvel name="left_elbow_joint_vel_sensor" joint="left_elbow_joint" noise="0.001"/>
-<!--    <jointvel name="left_wrist_roll_joint_vel_sensor" joint="left_wrist_roll_joint" noise="0.001"/>-->
-<!--    <jointvel name="left_wrist_pitch_joint_vel_sensor" joint="left_wrist_pitch_joint" noise="0.001"/>-->
-<!--    <jointvel name="left_wrist_yaw_joint_vel_sensor" joint="left_wrist_yaw_joint" noise="0.001"/>-->
+    <jointvel name="left_wrist_roll_joint_vel_sensor" joint="left_wrist_roll_joint" noise="0.001"/>
+    <jointvel name="left_wrist_pitch_joint_vel_sensor" joint="left_wrist_pitch_joint" noise="0.001"/>
+    <jointvel name="left_wrist_yaw_joint_vel_sensor" joint="left_wrist_yaw_joint" noise="0.001"/>
 
     <!-- Right Arm -->
     <jointvel name="right_shoulder_pitch_joint_vel_sensor" joint="right_shoulder_pitch_joint"/>
     <jointvel name="right_shoulder_roll_joint_vel_sensor" joint="right_shoulder_roll_joint"/>
     <jointvel name="right_shoulder_yaw_joint_vel_sensor" joint="right_shoulder_yaw_joint"/>
     <jointvel name="right_elbow_joint_vel_sensor" joint="right_elbow_joint"/>
-<!--    <jointvel name="right_wrist_roll_joint_vel_sensor" joint="right_wrist_roll_joint"/>-->
-<!--    <jointvel name="right_wrist_pitch_joint_vel_sensor" joint="right_wrist_pitch_joint"/>-->
-<!--    <jointvel name="right_wrist_yaw_joint_vel_sensor" joint="right_wrist_yaw_joint"/>-->
+    <jointvel name="right_wrist_roll_joint_vel_sensor" joint="right_wrist_roll_joint"/>
+    <jointvel name="right_wrist_pitch_joint_vel_sensor" joint="right_wrist_pitch_joint"/>
+    <jointvel name="right_wrist_yaw_joint_vel_sensor" joint="right_wrist_yaw_joint"/>
 
     <!-- Torso IMU -->
     <accelerometer name="torso_imu_acc_sensor" site="torso_imu" noise="0.1"/>
@@ -725,6 +733,26 @@ Position and velocity actuators added. -->
     <!-- Pelvis Mocap -->
     <framepos name="base_mocap_pos_sensor" objtype="site" objname="pelvis_mocap_site" noise="0.01"/>
     <framequat name="base_mocap_quat_sensor" objtype="site" objname="pelvis_mocap_site" noise="0.01"/>
+
+    <!-- Pelvis Odometry: the sim's GROUND-TRUTH stand-in for FAST-LIO's /Odometry.
+         Obelisk's Odometry message is assembled from exactly this quartet -- framepos ->
+         pose.position (world, since the framepos has no refid), framequat ->
+         pose.orientation, velocimeter -> twist.linear, gyro -> twist.angular. The wiring
+         and the TODO that governs it live in g1_control/config/g1_world.yml; that is the
+         file to edit when the sim finally runs real localisation.
+
+         On pelvis_mocap_site (pos 0 0 0, identity euler) = the pelvis BODY ORIGIN, which is
+         what qpos[0:3] and the generator's root_pos mean. The pelvis_imu site is offset and
+         would publish a position the FM's re-anchor cannot use. A velocimeter reads in the
+         SITE frame, i.e. body frame, matching the estimator's odom_twist_is_body_frame.
+
+         A separate group from base_mocap_* above rather than a reuse: a velocimeter has to
+         be added regardless, and those two carry a noise attribute this must not inherit
+         if MuJoCo ever honours it again (it has been inert since v3.14). -->
+    <framepos name="base_odom_pos_sensor" objtype="site" objname="pelvis_mocap_site"/>
+    <framequat name="base_odom_quat_sensor" objtype="site" objname="pelvis_mocap_site"/>
+    <velocimeter name="base_odom_vel_sensor" site="pelvis_mocap_site"/>
+    <gyro name="base_odom_gyro_sensor" site="pelvis_mocap_site"/>
 
     <!-- Torso Mocap -->
     <framepos name="torso_mocap_pos_sensor" objtype="site" objname="torso_mocap_site" noise="0.01"/>
@@ -741,9 +769,16 @@ Position and velocity actuators added. -->
          to hang off. NOISELESS on purpose: these locate the sensor, and jittering that
          would move the whole ray fan rather than perturb the readings; depth noise is
          applied to the IMAGE (mdp.sensors.noise), which is where training put it.
-         transfer/sim/depth_camera.py does not use these; it reads the mount body directly. -->
-    <framepos name="depth_pos_sensor" objtype="site" objname="torso_link_origin_site"/>
-    <framequat name="depth_quat_sensor" objtype="site" objname="torso_link_origin_site"/>
+         transfer/sim/depth_camera.py does not use these; it reads the mount body directly.
+
+         ONE PER DEPTH CAMERA, named to match g1_world.yml. Both hang off the SAME site
+         because both cameras mount on torso_link -- the per-camera extrinsics live in
+         pattern.offset inside the generated config/scan/depth_{near,far}.yml, not here.
+         Obelisk's DepthImage callback happens to ignore sensor_names and take its site from
+         the scan config, so a dangling name here would go unnoticed; its Odometry and Imu
+         callbacks throw on one, and this should not be the odd path out. -->
+    <framepos name="depth_near_pos_sensor" objtype="site" objname="torso_link_origin_site"/>
+    <framepos name="depth_far_pos_sensor" objtype="site" objname="torso_link_origin_site"/>
     <framepos name="head_lidar_pos_sensor" objtype="site" objname="head_lidar_site"/>
     <framequat name="head_lidar_orientation_sensor" objtype="site" objname="head_lidar_site"/>
 

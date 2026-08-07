@@ -96,7 +96,9 @@ ARG L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
 FROM python:3.10-slim AS cpu
 # PyPI ships manylinux wheels for both x86_64 and aarch64, so this target covers the
 # Meerkat and a CPU-only baseline on the Jetson from the same Dockerfile.
-RUN pip install --no-cache-dir numpy onnxruntime
+# Pinned to the same minor as the cuda target below: this file exists to COMPARE devices,
+# and a CPU row and a GPU row from different onnxruntime minors are not a comparison.
+RUN pip install --no-cache-dir numpy onnxruntime==1.22.0
 CMD ["python3", "-c", "import onnxruntime as ort; print(ort.__version__, ort.get_available_providers())"]
 
 
@@ -109,7 +111,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 python3
 # loader path at session-creation time: transfer/deploy/tracker_session._preload_gpu_dlls
 # calls onnxruntime.preload_dlls() whenever a non-CPU provider is requested, because
 # without it ORT fails to load libcublasLt and SILENTLY falls back to CPU.
-RUN pip3 install --no-cache-dir numpy "onnxruntime-gpu[cuda,cudnn]"
+#
+# ==1.22.0, and the pin is load-bearing rather than cautious: 1.28.0's [cuda] extra
+# resolves the -cu13 wheels and dies with "libcublasLt.so.13: cannot open shared object
+# file" against this CUDA 12.8 base. 1.22.0's extras pin nvidia-*-cu12~=12.0 + cudnn 9.
+# Unpinned, this target also silently stopped reproducing the benchmark numbers recorded
+# against it. Match transfer/obelisk/docker/requirements.txt when bumping either.
+RUN pip3 install --no-cache-dir numpy "onnxruntime-gpu[cuda,cudnn]==1.22.0"
+# Assert the GPU wheel got installed. That is all a build can check: get_available_providers()
+# is a static property of the wheel, and actually dlopen'ing libonnxruntime_providers_cuda.so
+# SEGFAULTS without a GPU (measured: exit 139 in a plain container, 0 under --gpus all -- the
+# .so does not link libcuda.so.1, but loading it still reaches the driver). So a CUDA-major
+# mismatch cannot be caught here; catch it on first run, where the CMD below prints the
+# providers and benchmark.py warns when a row silently fell back to CPU.
+RUN python3 -c "\
+import onnxruntime as ort; \
+p = ort.get_available_providers(); \
+assert 'CUDAExecutionProvider' in p, 'CPU-only wheel: %s' % p; print('providers:', p)"
 CMD ["python3", "-c", "import onnxruntime as ort; ort.preload_dlls(); print(ort.__version__, ort.get_available_providers())"]
 
 

@@ -34,9 +34,78 @@ robot:
           - topic: /obelisk/g1/joint_encoders
             dt: 0.002
             msg_type: ObkJointEncoders
+            # EVERY MuJoCo sensor, BY NAME. The map key is the sensor's name in the MJCF and
+            # the value is its type -- obelisk calls mj_name2id on each key, so the previous
+            # `joint_pos: jointpos` / `joint_vel: jointvel` placeholders made the world node
+            # fail its configure transition outright ("Sensor not found in Mujoco! Sensor
+            # name: joint_pos") and the whole sim came up with no sensors at all.
+            #
+            # ORDER IS LOAD-BEARING and is not checked anywhere: obelisk fills joint_names
+            # from the jointpos entries in this order and appends the jointvel readings in
+            # theirs, so mismatched orders silently pair each joint's position with another
+            # joint's velocity. Generated from g1_29j.xml's sensor block; regenerate both
+            # together. All 29 joints must appear or the controller refuses to arm.
             sensor_names:
-              joint_pos: jointpos
-              joint_vel: jointvel
+            # ---------- Joint positions (order defines joint_names) ---------- #
+              left_hip_pitch_joint_pos_sensor: jointpos
+              left_hip_roll_joint_pos_sensor: jointpos
+              left_hip_yaw_joint_pos_sensor: jointpos
+              left_knee_joint_pos_sensor: jointpos
+              left_ankle_pitch_joint_pos_sensor: jointpos
+              left_ankle_roll_joint_pos_sensor: jointpos
+              right_hip_pitch_joint_pos_sensor: jointpos
+              right_hip_roll_joint_pos_sensor: jointpos
+              right_hip_yaw_joint_pos_sensor: jointpos
+              right_knee_joint_pos_sensor: jointpos
+              right_ankle_pitch_joint_pos_sensor: jointpos
+              right_ankle_roll_joint_pos_sensor: jointpos
+              waist_yaw_joint_pos_sensor: jointpos
+              waist_roll_joint_pos_sensor: jointpos
+              waist_pitch_joint_pos_sensor: jointpos
+              left_shoulder_pitch_joint_pos_sensor: jointpos
+              left_shoulder_roll_joint_pos_sensor: jointpos
+              left_shoulder_yaw_joint_pos_sensor: jointpos
+              left_elbow_joint_pos_sensor: jointpos
+              left_wrist_roll_joint_pos_sensor: jointpos
+              left_wrist_pitch_joint_pos_sensor: jointpos
+              left_wrist_yaw_joint_pos_sensor: jointpos
+              right_shoulder_pitch_joint_pos_sensor: jointpos
+              right_shoulder_roll_joint_pos_sensor: jointpos
+              right_shoulder_yaw_joint_pos_sensor: jointpos
+              right_elbow_joint_pos_sensor: jointpos
+              right_wrist_roll_joint_pos_sensor: jointpos
+              right_wrist_pitch_joint_pos_sensor: jointpos
+              right_wrist_yaw_joint_pos_sensor: jointpos
+            # ---------- Joint velocities, SAME ORDER ---------- #
+              left_hip_pitch_joint_vel_sensor: jointvel
+              left_hip_roll_joint_vel_sensor: jointvel
+              left_hip_yaw_joint_vel_sensor: jointvel
+              left_knee_joint_vel_sensor: jointvel
+              left_ankle_pitch_joint_vel_sensor: jointvel
+              left_ankle_roll_joint_vel_sensor: jointvel
+              right_hip_pitch_joint_vel_sensor: jointvel
+              right_hip_roll_joint_vel_sensor: jointvel
+              right_hip_yaw_joint_vel_sensor: jointvel
+              right_knee_joint_vel_sensor: jointvel
+              right_ankle_pitch_joint_vel_sensor: jointvel
+              right_ankle_roll_joint_vel_sensor: jointvel
+              waist_yaw_joint_vel_sensor: jointvel
+              waist_roll_joint_vel_sensor: jointvel
+              waist_pitch_joint_vel_sensor: jointvel
+              left_shoulder_pitch_joint_vel_sensor: jointvel
+              left_shoulder_roll_joint_vel_sensor: jointvel
+              left_shoulder_yaw_joint_vel_sensor: jointvel
+              left_elbow_joint_vel_sensor: jointvel
+              left_wrist_roll_joint_vel_sensor: jointvel
+              left_wrist_pitch_joint_vel_sensor: jointvel
+              left_wrist_yaw_joint_vel_sensor: jointvel
+              right_shoulder_pitch_joint_vel_sensor: jointvel
+              right_shoulder_roll_joint_vel_sensor: jointvel
+              right_shoulder_yaw_joint_vel_sensor: jointvel
+              right_elbow_joint_vel_sensor: jointvel
+              right_wrist_roll_joint_vel_sensor: jointvel
+              right_wrist_pitch_joint_vel_sensor: jointvel
+              right_wrist_yaw_joint_vel_sensor: jointvel
         # ----- Pelvis IMU ----- #
           - topic: /obelisk/g1/pelvis_imu
             dt: 0.001
@@ -86,6 +155,43 @@ robot:
               head_lidar_acc_sensor: accelerometer
               head_lidar_gyro_sensor: gyro
               head_lidar_orientation_sensor: framequat
+        # ----- Odometry: a GROUND-TRUTH stand-in for FAST-LIO ----- #
+        # TODO(sim-odometry): MuJoCo ground truth, published on the topic real localisation
+        # owns. On hardware /Odometry is FAST-LIO (config/relocalization/, scan_rate 10) and
+        # carries drift, latency and dropouts; this has none of them, so the estimator's
+        # dropout path is UNREACHABLE in sim and a policy validated only here has never met
+        # its real input.
+        #
+        # It exists because the `sim` docker target does not build LIO-Localization (that is
+        # the `hardware` stage) and OBK_SERVICE defaults to `sim`, so the real stack cannot
+        # run here yet. The ingredients are already above: /livox/lidar and /livox/imu are
+        # published under their real names for exactly this reason.
+        #
+        # DELETE THIS ENTRY the day the sim runs FAST-LIO. Two publishers on /Odometry does
+        # not error -- the estimator just interleaves ground truth with localisation, which
+        # reads as a jittery generator reference. `ros2 topic hz /Odometry` at ~20 instead
+        # of ~10 is the tell.
+        #
+        # Straight onto /Odometry, not a sim-only topic, because g1.yml is launched BYTE
+        # IDENTICAL in sim and on hardware; a remap would have to live in the brain, which
+        # is the one thing this split exists to prevent.
+        #
+        # dt 0.1 = the MID360's 10 Hz, which is what FAST-LIO's rate actually is (and what
+        # /livox/lidar above already uses); odom_timeout 0.5 leaves 5 frames of margin.
+        # Do NOT raise it to make sim feel smoother: the controller ticks at 50 Hz, so
+        # base_pos is up to 100 ms stale at each tick and the FM history eats that staleness
+        # on the real robot too. Hiding it here is hiding the one thing this cannot model.
+        #
+        # The twist is BODY frame: obelisk builds it from a velocimeter, which reads in the
+        # site frame. That matches low_level.yml's odom_twist_is_body_frame: true.
+          - topic: /Odometry
+            dt: 0.1
+            msg_type: Odometry
+            sensor_names:
+              base_odom_pos_sensor: framepos
+              base_odom_quat_sensor: framequat
+              base_odom_vel_sensor: velocimeter
+              base_odom_gyro_sensor: gyro
     subscribers:
       - ros_parameter: sub_ctrl_setting
         topic: /obelisk/g1/ctrl

@@ -22,6 +22,32 @@ OBK_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"          # ..
 OBK_DOCKER_DIR="$(cd "$OBK_SCRIPTS_DIR/../docker" && pwd)"
 OBK_SERVICE="${OBK_SERVICE:-sim}"
 
+# Make docker/.env AUTHORITATIVE for compose interpolation.
+#
+# Compose resolves `$VAR` from the SHELL environment FIRST and only then from .env, so any
+# of these exported in a login shell silently overrides the file that is documented as the
+# source of truth. That is not hypothetical: a stale `export ROBOT_RL_ROOT=...` in ~/.bashrc
+# (pointing at a previous repo layout) produced a container whose $ROBOT_RL_ROOT named a
+# directory that did not exist, while $REPO_ROOT -- not exported, so read from .env -- was
+# correct. The mount was right and the paths inside it were wrong, which reads as "the repo
+# is not mounted" and sends you looking in the wrong place entirely.
+#
+# Exporting .env here means the shell env and .env AGREE, so precedence stops mattering.
+# Only affects this shell and the compose/exec children it spawns.
+#
+# Assigned line by line rather than `set -a; . .env`: bash's UID is READONLY, so sourcing
+# the file errors on that line -- and under the callers' `set -e` that aborts the launcher
+# outright. Skipping UID costs nothing, because bash does not export UID either, so compose
+# finds no shell value and reads it from .env directly, which is what we want anyway.
+if [ -z "${OBK_IN_CONTAINER:-}" ] && [ -f "$OBK_DOCKER_DIR/.env" ]; then
+    while IFS= read -r _obk_line || [ -n "$_obk_line" ]; do
+        case "$_obk_line" in ''|'#'*|*[!A-Za-z0-9_]*=*) continue ;; esac
+        case "${_obk_line%%=*}" in UID|EUID|PPID|SHELLOPTS|BASHOPTS) continue ;; esac
+        export "${_obk_line?}"
+    done < "$OBK_DOCKER_DIR/.env"
+    unset _obk_line
+fi
+
 # Compose file selection. An explicit OBK_COMPOSE_FILE always wins. Otherwise auto-detect
 # on the HOST: the GPU compose file requests `runtime: nvidia`, which docker can only
 # honour with the nvidia container runtime registered; without it `docker compose up`
@@ -117,6 +143,21 @@ obk_host_launch() {
 # ---------------------------------------------------------------------------
 # CONTAINER side (tmux pane construction)
 # ---------------------------------------------------------------------------
+
+# Pre-create obelisk's shared log directory, because two obk-launches racing to create it
+# is a coin flip over whether the stack comes up.
+#
+# obelisk's setup_logging_dir() does `if not os.path.exists(d): os.makedirs(d)` -- a TOCTOU
+# race. Every stack here launches the brain and the robot as TWO obk-launches started
+# together, so on a container whose obk_logs does not exist yet they both see it missing and
+# the loser dies with "[Errno 17] File exists: .../obk_logs". Only the SECOND launch is lost,
+# so the symptom is a world with no brain (or vice versa) and one buried [ERROR] line.
+# Deterministic to pre-create; nothing here depends on the directory being fresh.
+# TODO(obelisk-upstream): `os.makedirs(..., exist_ok=True)` in launch_utils.setup_logging_dir
+# removes the need for this.
+if [ -n "${OBK_IN_CONTAINER:-}" ]; then
+    mkdir -p "${ROS_HOME:-${OBELISK_ROOT:-$HOME/obelisk}}/obk_logs" 2>/dev/null || true
+fi
 
 # obk_mk_rcfile <name> <command> [mode]: write a per-pane rcfile that sources the full env
 # and, depending on <mode>:

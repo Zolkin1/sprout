@@ -44,9 +44,32 @@ from sensor_msgs.msg import Image
 # The torch-free deploy runtime lives in the repo, not in this ROS package: it is shared
 # with the MuJoCo sim2sim runner and must not fork. This file sits at
 # <repo>/transfer/obelisk/g1_control/g1_control/, so <repo>/transfer is three levels up.
-_TRANSFER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+#
+# REALPATH, not abspath. colcon --symlink-install imports this module through
+# build/g1_control/g1_control/, a symlink into the source tree; abspath does not resolve
+# symlinks, so the three hops landed on <repo>/transfer/obelisk and the node died at import
+# with "ModuleNotFoundError: No module named 'deploy'" -- while running the file just fine
+# from a source checkout. realpath resolves back into the source tree first, so both layouts
+# give the same answer.
+_TRANSFER = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..")
+)
+if not os.path.isdir(os.path.join(_TRANSFER, "deploy")):
+    raise RuntimeError(
+        f"the shared deploy runtime is not at {_TRANSFER}/deploy (derived from "
+        f"{os.path.realpath(__file__)}). In the container this means REPO_ROOT is not "
+        "mounted, or this package was copied out of <repo>/transfer/obelisk/."
+    )
 if _TRANSFER not in sys.path:
     sys.path.insert(0, _TRANSFER)
+
+#: Where the policy artifacts are cached on disk. Anchored on ``_TRANSFER`` rather than
+#: counting ``..`` from ``__file__`` so it survives the symlink-install layout, and because
+#: it MUST equal ``prefetch_policy.DEFAULT_CACHE`` -- which derives the same anchor the same
+#: way. It previously did not: two ``..`` from an unresolved ``__file__`` pointed at
+#: ``transfer/obelisk/build/resource/hf_cache``, so the node re-downloaded (and offline,
+#: failed) even though prefetch_policy had warmed the real directory.
+HF_CACHE_DIR = os.path.join(_TRANSFER, "obelisk", "g1_control", "resource", "hf_cache")
 
 from deploy.hardware import build_hardware_state, load_gen_tracker_from_hf  # noqa: E402
 
@@ -158,24 +181,59 @@ class G1Controller(ObeliskController):
                 "hf_repo_id / hf_policy_folder must name the policy to run "
                 f"(got {repo!r} / {folder!r}); set them in the controller config."
             )
-        cache = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resource", "hf_cache"))
+        cache = HF_CACHE_DIR
         # `use_cuda` was declared and then read by nothing, so the config documented a GPU
         # option the node could not take. It now reaches onnxruntime; resolve_providers
         # appends CPU as the fallback, so a CUDA request on a CPU-only wheel raises at load
         # (loudly, at bring-up) rather than silently running on the CPU it promised to leave.
-        providers = ["cuda"] if bool(self.get_parameter("use_cuda").value) else None
+        want_cuda = bool(self.get_parameter("use_cuda").value)
+        providers = ["cuda"] if want_cuda else None
         policy = load_gen_tracker_from_hf(
             repo, folder, cache,
             fm_update_every=int(self.get_parameter("fm_update_every").value),
             num_threads=int(self.get_parameter("onnx_threads").value),
             providers=providers,
         )
+        active = policy.active_providers()
+        if want_cuda:
+            self._require_cuda(active)
         self.get_logger().info(
             f"Policy {repo}/{folder}: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
             f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())} "
-            f"providers={policy._trk.sess.get_providers()}"
+            f"providers={active}"
         )
         return policy
+
+    def _require_cuda(self, active: dict[str, list[str]]) -> None:
+        """Refuse to run on the CPU after asking for the GPU.
+
+        ``resolve_providers`` only checks that the wheel WAS BUILT with a CUDA provider --
+        a static property. It cannot see a session that was created and then fell back:
+        missing CUDA runtime libraries, no nvidia container runtime, the no-GPU compose
+        file, a driver too old for the CUDA minor. onnxruntime logs that and continues, so
+        without this the robot comes up looking healthy and misses its control period by
+        5x. Refusing is the right call because CPU is not a degraded mode for this pair, it
+        is an unusable one (103.5 ms against a 20 ms budget).
+
+        Args:
+            active: Session name -> registered providers, from ``active_providers()``.
+
+        Raises:
+            RuntimeError: If any loaded session did not register the CUDA provider.
+        """
+        fell_back = {name: got for name, got in active.items()
+                     if "CUDAExecutionProvider" not in got}
+        if not fell_back:
+            return
+        raise RuntimeError(
+            "use_cuda is true but onnxruntime put "
+            f"{' and '.join(sorted(fell_back))} on the CPU: {fell_back}. The wheel "
+            "advertises CUDA, so this is the runtime, not the install -- check that the "
+            "container has the nvidia runtime (`nvidia-smi` inside it) and that the launch "
+            "picked docker-compose.yml rather than docker-compose-no-gpu.yml. To run on "
+            "the CPU deliberately, set use_cuda:=false and expect ~103 ms per generator "
+            "tick against a 20 ms budget."
+        )
 
     def _setup_depth(self) -> None:
         """Subscribe one topic per camera in the artifact's contract.

@@ -2,7 +2,22 @@
 # numpy + onnxruntime only and is tested to keep torch out of sys.modules
 # (test_hardware_offline.py). The legacy TorchScript controller that needed it is gone, and
 # torch is ~2-3 GB of image for code that would never be imported. casadi went with the MPC.
-onnxruntime          # the generator + tracker ONNX pair (transfer/deploy)
+#
+# The GPU wheel, not the CPU one, and PINNED. This pair cannot run on CPU: measured
+# step_worst 103.5 ms (27M generator) / 38.8 ms (9.5M) against a 20 ms control period,
+# versus 9.8 / 6.0 ms on CUDA. low_level.yml therefore defaults use_cuda: true, and
+# resolve_providers raises on a wheel with no CUDA provider -- so a CPU wheel here is a
+# bring-up crash, not a slow robot.
+#
+# ==1.22.0 is not caution, it is a fix: onnxruntime-gpu 1.28.0's [cuda] extra resolves the
+# -cu13 wheels and dies at session creation with "libcublasLt.so.13: cannot open shared
+# object file" on a CUDA 12.x host. 1.22.0's extras pin nvidia-*-cu12~=12.0 (and cudnn 9),
+# which is what this fleet runs. The extras ship the CUDA libraries themselves, which is
+# why the image needs no CUDA base and no system CUDA -- tracker_session._preload_gpu_dlls
+# puts them on the loader path. Revisit only against a measured box.
+#
+# onnxruntime-gpu REPLACES onnxruntime -- same `onnxruntime` module, so never both.
+onnxruntime-gpu[cuda,cudnn]==1.22.0   # the generator + tracker ONNX pair (transfer/deploy)
 huggingface_hub      # policy artifact fetch, offline-first (deploy.hardware)
 numpy
 

@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     evtest \
     net-tools \
+    tmux \
     sudo && \
     rm -rf /var/lib/apt/lists/* && \
     locale-gen en_US.UTF-8
@@ -67,9 +68,16 @@ RUN echo "Pulling Obelisk..."
 # config values, inline `scan_config:`, ObkImu removed in favour of sensor_msgs/Imu, and
 # optional control/estimation/robot sections so a config can launch any subset.
 #
+# Bumped 9f52216 -> abf37fe for TWO DepthImage sensors. At 9f52216 obelisk held ONE
+# `depth_scan_interface_`, reassigned per sensor entry, so g1_world.yml's near+far pair
+# published two topics at the right rates that both carried the FAR camera's image -- no
+# error, just a policy fed a wrong observation. abf37fe keys the caster by sensor_key.
+# Also picks up f97a2c9 (lidar per-direction occlusion mask), the only other change in
+# between; it touches the ObkScan/PointCloud2 path we use for /livox/lidar.
+#
 # TODO(before hardware testing): replace this with an Obelisk RELEASE tag. Tracking a
 # moving ref is fine while developing against the sim; it is not fine on the robot.
-ARG OBELISK_REF=9f52216a6b91c44b67f53f48343dea74d5dbee79
+ARG OBELISK_REF=abf37fe71aa42db15266a12c5a7b9e9729c21d7a
 ARG OBELISK_REFRESH=0
 RUN echo "obelisk refresh token: ${OBELISK_REFRESH}" && \
     git clone https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk && \
@@ -99,6 +107,27 @@ WORKDIR /home/${USER}
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN rm requirements.txt
+
+# Assert the installed wheel is the GPU one. This is the only CUDA question answerable at
+# BUILD time, and it is worth asserting because it is the regression that actually happens:
+# someone edits requirements.txt back to plain `onnxruntime` and the failure then surfaces
+# on the robot as resolve_providers raising during bring-up.
+#
+# get_available_providers() reports what the wheel was COMPILED with -- a static list. It
+# cannot tell you the provider will LOAD, which is the other half (the "libcublasLt.so.13
+# on a CUDA 12 host" trap that pinning ==1.22.0 avoids).
+#
+# That second half deliberately is NOT checked here: dlopen'ing
+# libonnxruntime_providers_cuda.so SEGFAULTS (exit 139) without a GPU, and `docker build`
+# has no GPU -- measured both ways on this image. The .so does not LINK libcuda.so.1, but
+# loading it still reaches the driver. The check therefore lives at runtime, where a GPU
+# exists and where it matters: G1Controller._require_cuda compares the requested provider
+# against what each ONNX session actually registered, and refuses to run on a fallback.
+RUN python3 -c "\
+import onnxruntime as ort; \
+p = ort.get_available_providers(); \
+assert 'CUDAExecutionProvider' in p, 'CPU-only onnxruntime wheel installed: %s' % p; \
+print('[image] onnxruntime', ort.__version__, 'providers:', p)"
 
 # ============================================
 # Stage 2: Hardware (adds lidar stack)

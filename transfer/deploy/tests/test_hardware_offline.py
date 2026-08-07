@@ -93,16 +93,13 @@ def test_hardware_offline() -> None:
     enc_names = list(reversed(isaac))
     rng = np.random.default_rng(0)
 
-    # The FM conditions on (and predicts) the same ee frames, so the hardware state
-    # supplies them every step (from FK on the measured joints).
-    khist = policy.ctx.num_extra_frames
+    # NOTE: no measured end-effector frames are supplied, and that is the point. The
+    # generator's history is its own previous output, so nothing on the robot needs forward
+    # kinematics; build_hardware_state used to demand `frames` here and would kill the
+    # controller one tick after arming. If this test ever needs FK again, something has
+    # reintroduced a measured-state dependency into the FM conditioning.
 
     def reading(cmd):
-        frames = None
-        if khist > 0:
-            q = rng.standard_normal((khist, 4)); q /= np.linalg.norm(q, axis=-1, keepdims=True)
-            frames = np.concatenate([rng.standard_normal((khist, 3)) * 0.1, q,
-                                     rng.standard_normal((khist, 6)) * 0.05], axis=-1)
         # Exteroception goes in RAW, exactly as the robot supplies it: metres along each
         # camera's optical axis (with a few invalid pixels, which every camera produces),
         # or metres of ground clearance. build_hardware_state owns the normalisation, so
@@ -126,7 +123,6 @@ def test_hardware_offline() -> None:
             joint_vel=rng.standard_normal(nj) * 0.1,
             joint_names=enc_names,
             command=np.asarray(cmd, dtype=np.float64),
-            frames=frames,
             depth_raw=depth_raw,
             height_scan=height_scan,
         )

@@ -41,10 +41,10 @@ install(
   DESTINATION share/${PROJECT_NAME}/rviz
 )
 
-install(
-  DIRECTORY include/
-  DESTINATION include
-)
+# No `install(DIRECTORY include/)`: this package ships no headers, and the directory was
+# never committed (git does not track empty ones), so ament_cmake_symlink_install aborted
+# the build with "can't find .../lidar_scan/include/" on any fresh checkout -- taking
+# g1_model, robot_sim and robot_viz down with it. Left over from the deleted C++ stub.
 
 # --------------------
 # Testing / lint
