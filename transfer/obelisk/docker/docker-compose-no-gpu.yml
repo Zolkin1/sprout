@@ -36,9 +36,9 @@ x-common: &common
     - $REPO_ROOT:$REPO_ROOT
     - /tmp/.X11-unix:/tmp/.X11-unix
     - $HOME/.Xauthority:$HOME/.Xauthority:rw
-    - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
+    # No $HOME/.bashrc here either -- see docker-compose.yml for why it was removed.
     - /dev/input:/dev/input
     # Joystick hot-reconnect: without this, joy_node misses the re-add when the pad wakes.
     - /run/udev:/run/udev:ro

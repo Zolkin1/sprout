@@ -4,9 +4,23 @@
 cd transfer/obelisk/docker && cp .env_example .env && $EDITOR .env   # once, per machine
 cd ..
 scripts/build.sh                 # once, after a clone or image rebuild
-scripts/run_sim_low.sh           # brain + MuJoCo world + FSM echo, in tmux
-scripts/stop.sh                  # tear it all down
+python3 scripts/prefetch_policy.py --hf_policy_folder <name>   # once per policy
+
+scripts/run_sim_low.sh                                # 1. the BRAIN  (terminal A)
+scripts/run_sim_world.sh --scene g1_29j_basic_scene   # 2. the WORLD  (terminal B)
+
+scripts/stop.sh                  # tear both down
 ```
+
+**Order matters, and it is not cosmetic.** The brain needs ~10 s to load the policy pair
+(ONNX + CUDA) while the MuJoCo world activates in ~2 s, and MuJoCo has no `user_pose`
+equivalent holding the robot up. Bring the world up first and the robot is lying on the
+floor before you can walk the FSM to `LOW_LEVEL_CONTROL` -- you then measure a policy trying
+to recover from a heap, which is not what it was trained to do. Wait for
+`g1_controller up, DISARMED` in terminal A before starting the world.
+
+Each script attaches its own tmux session, so use two terminals, or `Ctrl-b d` to detach the
+first. They coexist on one ROS graph by design; `stop.sh` stops both.
 
 On the robot, the only change is which robot config comes up alongside the same brain:
 
@@ -21,11 +35,22 @@ Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
 
 | script | what it launches |
 |---|---|
-| `run_sim_low.sh` | brain + MuJoCo world + FSM echo (session `simlow`) |
+| `run_sim_low.sh` | the BRAIN alone -- `g1.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
+| `run_sim_world.sh` | the sim ROBOT -- MuJoCo world + FSM echo (session `simworld`) |
 | `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
-| `run_world.sh` | the MuJoCo world alone, for the split-machine test (session `world`) |
 | `build.sh` | colcon build inside the container |
 | `stop.sh` | kill the tmux server, reap orphaned launches (`--zed`, `--stop`, `--down`) |
+
+The sim is two launches, not one, for the same reason hardware is: `g1.yml` is robot-less
+and the robot comes from its own config, so the brain you test in sim is byte-identical to
+the one that runs on the robot. `run_sim_world.sh` stands in for `run_hardware_low.sh`'s
+robot half -- it publishes the same topics, including the FSM state (`fsm_state_echo` lives
+there because on hardware that state comes from the robot, and running it on both sides
+would put two same-named nodes on one graph). It also pairs with
+`run_hardware_low.sh --sim-test` for the split-machine test with no robot powered.
+
+Either can be restarted without cycling the other, which is the point: the world can be
+reset without losing a brain that took a careful bring-up to arm.
 
 `stop.sh` reaps orphaned `ros2 launch` trees, not just the panes. This matters: the configs
 reuse node names, so one surviving launch re-emits lifecycle transitions at the *next*

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# Shared helpers for the obk launch scripts (run_sim_low.sh, run_world.sh,
+# Shared helpers for the obk launch scripts (run_sim_low.sh, run_sim_world.sh,
 # run_hardware_low.sh, stop.sh). Source this from a variant script.
 #
 # Each variant runs in two halves:
@@ -170,9 +170,25 @@ obk_mk_rcfile() {
     local f="/tmp/obk_rc_$name"
     {
         echo 'source ~/.bashrc'
+        # RE-ASSERT the container's paths AFTER ~/.bashrc, which is bind-mounted from the
+        # HOST and is free to export whatever it likes. A stale `export ROBOT_RL_ROOT=...`
+        # in a developer's .bashrc (pointing at a previous repo layout) broke EVERY pane of
+        # EVERY run script, and did so invisibly: .bashrc returns early for non-interactive
+        # shells, so `bash -lc` was unaffected and only the panes -- which are interactive --
+        # picked up the stale value. `install/setup.bash` then did not exist, the workspace
+        # went unsourced, and the failure surfaced three layers later as
+        # "package 'g1_control' not found" from ros2 launch.
+        #
+        # Baked in as literals because this rcfile is generated INSIDE the container, where
+        # the values came from compose (which obk_launch.sh already forces to agree with
+        # docker/.env) and are correct at this moment.
+        printf 'export ROBOT_RL_ROOT=%q\n' "$ROBOT_RL_ROOT"
+        [ -n "${REPO_ROOT:-}" ] && printf 'export REPO_ROOT=%q\n' "$REPO_ROOT"
         echo 'obk'
-        echo 'source "$ROBOT_RL_ROOT/install/setup.bash" 2>/dev/null \
-              || echo "[pane] workspace not built yet -- run: colcon build --symlink-install"'
+        # No `2>/dev/null`: swallowing the error here is what turned a one-line "no such
+        # file" into the package-not-found hunt above.
+        echo 'source "$ROBOT_RL_ROOT/install/setup.bash" \
+              || echo "[pane] NOT SOURCED: $ROBOT_RL_ROOT/install/setup.bash -- run scripts/build.sh"'
         if [ -n "$cmd" ]; then
             # %q keeps the history entry intact (including literal ${ROBOT_RL_ROOT}) so
             # Up-arrow shows exactly what you would have typed.

@@ -9,7 +9,7 @@
 # real execution-FSM state, which is the ONLY thing that arms the controller.
 #
 #   --sim-test   do NOT launch the real hardware -- neither the G1 driver nor the Jetson
-#                ZED node. Expect them from a desktop `run_world.sh` over the ROS graph.
+#                ZED node. Expect them from a desktop `run_sim_world.sh` over the ROS graph.
 #                Use this to exercise the real bring-up path with no robot powered.
 #
 #   window "main": controller (AUTO-RUN) | debug shell [| robot driver | ZED depth]
@@ -22,7 +22,7 @@
 #
 # Usage:
 #   scripts/run_hardware_low.sh                  brain + robot + depth
-#   scripts/run_hardware_low.sh --sim-test       brain only; pair with run_world.sh
+#   scripts/run_hardware_low.sh --sim-test       brain only; pair with run_sim_world.sh
 #   scripts/run_hardware_low.sh --policy FOLDER  override the checkpoint for this run
 #   scripts/run_hardware_low.sh --build          colcon build first
 set -euo pipefail

@@ -29,9 +29,17 @@ x-common: &common
     - $REPO_ROOT:$REPO_ROOT
     - /tmp/.X11-unix:/tmp/.X11-unix
     - $HOME/.Xauthority:$HOME/.Xauthority:rw
-    - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
+    # NO $HOME/.bashrc. It used to be mounted and it bought nothing: `obk` comes from
+    # ~/.bash_aliases, which obelisk's setup writes INTO the image, and the image's own
+    # stock ~/.bashrc already sources it. What the host file added was arbitrary host
+    # state -- and a stale `export ROBOT_RL_ROOT` in it silently broke EVERY tmux pane of
+    # EVERY run script (the workspace went unsourced, surfacing much later as ros2 launch
+    # reporting "package 'g1_control' not found"). It also injected whatever else lives in
+    # a developer's shell profile, secrets included, into every process in the container.
+    # obk_mk_rcfile re-asserts the container's paths after ~/.bashrc regardless, so this is
+    # belt and braces -- but the mount is the part that made the class of bug possible.
     # Joystick / input devices, so joy_node finds the controller at all.
     - /dev/input:/dev/input
     # udev runtime dir, so SDL2's libudev hotplug monitor INSIDE the container sees the
